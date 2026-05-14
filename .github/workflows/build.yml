@@ -1,0 +1,44 @@
+name: PyInstaller自动打包pyw为exe
+
+on:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+    # 1. 拉取你的仓库代码
+    - uses: actions/checkout@v4
+
+    # 2. 设置 Python 环境
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+        architecture: 'x64'
+
+    # 3. 安装 PyInstaller 和项目依赖
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller
+        pip install tkinterdnd2
+
+    # 4. 使用 PyInstaller 进行打包
+    - name: Build with PyInstaller
+      run: |
+        # -F (--onefile) 打包成单个exe
+        # -w (--windowed) 禁用黑色控制台窗口（适配.pyw）
+        # --name 指定生成的exe名字
+        # --add-data 添加外部数据文件（Windows下格式为 源路径;目标路径）
+        # 最后跟上你的主脚本路径
+        pyinstaller -F -w --name "FFmpeg简易转换合并" --add-data "ffmpeg_presets.json;." FFmpeg简易转换合并.pyw
+
+    # 5. 上传打包好的 exe 文件
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: PyInstaller-Windows-Build
+        # PyInstaller 打包后的文件默认在 dist 目录下
+        path: dist/FFmpeg简易转换合并.exe
