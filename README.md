@@ -15,6 +15,10 @@
 
 第二页是轻量的mkvtoolnix, 没有实现轨道的默认 语言 这些设置, 只有简单的流复制和转码合并 ,画中画功能是聊了很久才聊成功的, 免费的ai不行,我也不会写代码,找bug都没办法
 
+后续也是有点聊不动了,主要代码量有点多了,每次免费ai都偷工减料要我自己替换,不给我一次输出全部的,python的缩进又严格,天天出bug
+
+可能不会更新别的功能了,现在的我自己是够用了,在复杂点我都直接去用shotcut了
+
 <img width="1372" height="907" alt="m1" src="https://github.com/user-attachments/assets/48055308-4d0a-421f-9329-aba95a363925" />
 
 <img width="1372" height="907" alt="m2" src="https://github.com/user-attachments/assets/45089900-6a12-45e8-9997-a46054b2507c" />
