@@ -2240,49 +2240,71 @@ class FFmpegBatchGUI:
         self.chapter_file.trace_add("write", lambda *a: self.merge_update_command_preview())
         
     def merge_add_external_video(self):
-        """添加外部视频作为画中画（需要启用画中画模式）"""
+        """添加外部视频或图片作为画中画（需要启用画中画模式）"""
         if not self.pip_enabled.get():
-            messagebox.showwarning("提示", "请先勾选「启用画中画」后再添加外部视频作为画中画层。\n注意给视频流选择重新编码，不能使用copy了。\n普通模式下只能有一个主视频轨道。")
+            messagebox.showwarning("提示", "请先勾选「启用画中画」后再添加外部视频或图片作为水印。\n注意给视频流选择重新编码，不能使用copy了。")
             return
         if not self.merge_video.get():
             self.append_info("[封装] 请先设置主视频")
             return
-        path = filedialog.askopenfilename(
-            title="选择视频文件（画中画）",
-            filetypes=[("视频文件", "*.mp4 *.mkv *.avi *.mov *.flv *.webm")]
-        )
+    
+        # 支持视频 + 图片格式
+        filetypes = [
+            ("媒体文件", "*.mp4 *.mkv *.avi *.mov *.flv *.webm *.png *.jpg *.jpeg *.bmp *.gif *.webp"),
+            ("视频文件", "*.mp4 *.mkv *.avi *.mov *.flv *.webm"),
+            ("图片文件", "*.png *.jpg *.jpeg *.bmp *.gif *.webp")
+        ]
+        path = filedialog.askopenfilename(title="选择视频或图片文件", filetypes=filetypes)
         if not path:
             return
-        info = self.merge_get_media_info(path)
-        if not info:
-            self.append_info(f"[封装] 无法解析视频文件: {path}")
-            return
-        # 添加视频流
-        video_streams = [s for s in info["streams"] if s.get("codec_type") == "video"]
-        if not video_streams:
-            self.append_info("[封装] 所选文件不包含视频流")
-            return
-        s = video_streams[0]
-        track = Track(s["index"], "video", s.get("codec_name", "unknown"), path, True)
-        # 默认启用缩放并缩放到较小尺寸
-        track.enc_settings["scale_enabled"] = True
-        track.enc_settings["scale_width"] = "320"
-        track.enc_settings["scale_height"] = ""
-        # 启用叠加
-        track.overlay_enabled = True
-        track.overlay_x = "W-w-10"
-        track.overlay_y = "H-h-10"
-        self.merge_tracks.append(track)
-        # 询问是否添加音频
-        audio_streams = [s for s in info["streams"] if s.get("codec_type") == "audio"]
-        if audio_streams and messagebox.askyesno("添加音频", f"是否同时将文件中的音频流添加为独立音轨？\n{os.path.basename(path)}"):
-            for s_audio in audio_streams:
-                audio_track = Track(s_audio["index"], "audio", s_audio.get("codec_name", "unknown"), path, True)
-                self.merge_tracks.append(audio_track)
+    
+        # 判断是否为图片
+        img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
+        is_image = os.path.splitext(path)[1].lower() in img_exts
+    
+        if is_image:
+            # 图片：不需要特殊参数，FFmpeg 会自动处理
+            track = Track(0, "video", "image2", path, True)
+            # 不再设置 is_image 标记
+            track.enc_settings["scale_enabled"] = True
+            track.enc_settings["scale_width"] = "320"
+            track.enc_settings["scale_height"] = ""
+            track.enc_settings["scale_method"] = "width"
+            track.overlay_enabled = True
+            track.overlay_x = "W-w-10"
+            track.overlay_y = "H-h-10"
+            self.merge_tracks.append(track)
+            self.append_info(f"[封装] 已添加图片水印: {os.path.basename(path)}")
+        else:
+            # 视频：原有逻辑
+            info = self.merge_get_media_info(path)
+            if not info:
+                self.append_info(f"[封装] 无法解析文件: {path}")
+                return
+            video_streams = [s for s in info["streams"] if s.get("codec_type") == "video"]
+            if not video_streams:
+                self.append_info("[封装] 所选文件不包含视频流")
+                return
+            s = video_streams[0]
+            track = Track(s["index"], "video", s.get("codec_name", "unknown"), path, True)
+            track.enc_settings["scale_enabled"] = True
+            track.enc_settings["scale_width"] = "320"
+            track.enc_settings["scale_height"] = ""
+            track.overlay_enabled = True
+            track.overlay_x = "W-w-10"
+            track.overlay_y = "H-h-10"
+            self.merge_tracks.append(track)
+            # 询问是否添加音频
+            audio_streams = [s for s in info["streams"] if s.get("codec_type") == "audio"]
+            if audio_streams and messagebox.askyesno("添加音频", f"是否同时将文件中的音频流添加为独立音轨？\n{os.path.basename(path)}"):
+                for s_audio in audio_streams:
+                    audio_track = Track(s_audio["index"], "audio", s_audio.get("codec_name", "unknown"), path, True)
+                    self.merge_tracks.append(audio_track)
+    
         self.merge_update_track_list()
         self.merge_auto_recommend_container()
         self.merge_update_command_preview()
-        self.append_info(f"[封装] 已添加画中画视频: {os.path.basename(path)}")
+        self.append_info(f"[封装] 已添加画中画视频或图片水印: {os.path.basename(path)}")
 
     def browse_chapter_file(self):
         path = filedialog.askopenfilename(title="选择章节文件", filetypes=[("FFmetadata", "*.txt *.chapters")])
