@@ -1,3 +1,4 @@
 # FFmpegLiteGUI
 python FFmpeg
-![界面](https://github.com/kli2013/FFmpegLiteGUI/blob/adcc9a42d09684cee67c30209b26f28eefe23f54/1.png)
+<img width="1372" height="907" alt="m1" src="https://github.com/user-attachments/assets/48055308-4d0a-421f-9329-aba95a363925" />
+
