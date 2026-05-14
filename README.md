@@ -1,7 +1,7 @@
 # FFmpegLiteGUI
 找 AI 用 python 写的 FFmpeg GUI
 
-契机是 HandBrake 又又又换了新的库 net10 ,我的老Windows 10 装了net10, 运行 HandBrake也要报错, 我当时就在想,一个破 FFmpeg 的外壳, 需要这么追新吗?
+契机是 HandBrake 又又又又又又又又又换了.NET 10（软件开发框架） ,我的老Windows 10 ltsc 2021 装了.NET 10 ,运行 HandBrake还是要报错, 我当时就在想,一个破 FFmpeg 的外壳, 需要这么追新吗?
 
 然后在52pj看到了另外一个 FFmpeg的 gui外壳 https://www.52pojie.cn/forum.php?mod=viewthread&tid=2099752&highlight=FFmpeg
 
