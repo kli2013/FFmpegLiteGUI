@@ -853,11 +853,12 @@ class Track:
 class FFmpegBatchGUI:
     def __init__(self, root):
         self.root = root
+
         self.root.title("FFmpeg 多功能工具")
         screen_width = root.winfo_screenwidth()
         screen_height = root.winfo_screenheight()
         # 设置最大宽度和高度（避免超出屏幕）
-        max_width = int(screen_width * 0.95)
+        max_width = int(screen_width * 0.9)
         max_height = int(screen_height * 0.9)
         width = min(1600, max_width)
         height = min(940, max_height)
@@ -3549,9 +3550,23 @@ class FFmpegBatchGUI:
 
 
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except AttributeError:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except:
+                pass
+
     if DND_AVAILABLE:
-        root = TkinterDnD.Tk()  # 有库，创建支持拖拽的窗口
+        root = TkinterDnD.Tk()
     else:
-        root = tk.Tk()          # 没库，创建普通窗口，保证程序能正常跑起来
+        root = tk.Tk()
+
+    # 注意：不再调用 root.tk.call('tk', 'scaling', ...)
+    # 让 Tkinter 保持默认的 1.0 缩放，我们手动控制字体大小
+
     app = FFmpegBatchGUI(root)
     root.mainloop()
