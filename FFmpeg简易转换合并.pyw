@@ -538,7 +538,24 @@ class VideoFilterFrame(ttk.LabelFrame):
         self.crop_top = tk.StringVar(value="0")
         self.crop_width = tk.StringVar(value="iw/2")
         self.crop_height = tk.StringVar(value="ih")
-        ttk.Checkbutton(crop_frame, text="启用裁剪", variable=self.crop_enabled).pack(side=tk.LEFT)
+        # 创建 Checkbutton 并保存引用
+        crop_check = ttk.Checkbutton(crop_frame, text="启用裁剪", variable=self.crop_enabled)
+        crop_check.pack(side=tk.LEFT)
+        # 将 ToolTip 绑定到这个 Checkbutton 上
+        ToolTip(crop_check, 
+                "裁剪滤镜 (crop) 使用说明：\n"
+                "格式：crop=宽:高:左:上\n"
+                "支持表达式：iw(原宽), ih(原高), 算术运算(如 iw/2, ih-100)\n"
+                "\n"
+                "注意事项：\n"
+                "• 宽和高 必须为正整数或运算结果为正数！\n"
+                "• 宽/高 不能为 0 或负数，也不支持 -2 自动计算（与 scale 不同）\n"
+                "• 左/上 可以为 0 或正整数，超出视频边缘会报错\n"
+                "• 例如裁剪右半部分：宽=iw/2, 左=iw/2, 高=ih, 上=0\n"
+                "• 例如裁剪上半部分：宽=iw, 高=ih/2, 左=0, 上=0\n"
+                "• 如果宽高为奇数，FFmpeg 会自动向下取整，一般不影响播放",
+                wraplength=400)
+        # 其余 Entry 控件不变
         ttk.Label(crop_frame, text="宽:").pack(side=tk.LEFT)
         ttk.Entry(crop_frame, textvariable=self.crop_width, width=8).pack(side=tk.LEFT)
         ttk.Label(crop_frame, text="高:").pack(side=tk.LEFT)
@@ -547,7 +564,8 @@ class VideoFilterFrame(ttk.LabelFrame):
         ttk.Entry(crop_frame, textvariable=self.crop_left, width=6).pack(side=tk.LEFT)
         ttk.Label(crop_frame, text="上:").pack(side=tk.LEFT)
         ttk.Entry(crop_frame, textvariable=self.crop_top, width=6).pack(side=tk.LEFT)
-    
+
+
         rot_frame = ttk.Frame(left_frame)
         rot_frame.pack(fill=tk.X, pady=2)
         ttk.Label(rot_frame, text="旋转:").pack(side=tk.LEFT)
@@ -838,10 +856,13 @@ class FFmpegBatchGUI:
         self.root.title("FFmpeg 多功能工具")
         screen_width = root.winfo_screenwidth()
         screen_height = root.winfo_screenheight()
-        width = 1600
-        height = 940
+        # 设置最大宽度和高度（避免超出屏幕）
+        max_width = int(screen_width * 0.95)
+        max_height = int(screen_height * 0.9)
+        width = min(1600, max_width)
+        height = min(940, max_height)
         x = (screen_width - width) // 2
-        y = (screen_height - height) // 3
+        y = (screen_height - height) // 2
         root.geometry(f"{width}x{height}+{x}+{y}")
 
         self.ffmpeg_cmd = find_executable("ffmpeg.exe") or find_executable("ffmpeg")
