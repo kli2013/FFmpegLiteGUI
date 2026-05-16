@@ -16,40 +16,30 @@ import concurrent.futures
 # --- 优化：自动检测拖拽依赖，缺失时仅提示而不退出 ---
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
-    DND_AVAILABLE = True  # 标记拖拽库可用
+    DND_AVAILABLE = True
 except ImportError:
-    DND_AVAILABLE = False # 标记拖拽库不可用
-    # 弹出普通警告提示框，告知用户当前无法使用拖拽
+    DND_AVAILABLE = False
     root_temp = tk.Tk()
-    root_temp.withdraw() 
+    root_temp.withdraw()
     messagebox.showwarning("功能受限提示", "未检测到 tkinterdnd2 库，当前不支持文件拖拽功能！\n\n如需使用拖拽，请在终端运行：pip install tkinterdnd2")
     root_temp.destroy()
 # ----------------------------------------
 
 def get_script_dir():
-    """获取脚本所在的目录（兼容打包后的 exe）"""
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
     else:
         return os.path.dirname(os.path.abspath(__file__))
 
 def find_executable(name):
-    """
-    优先在脚本目录下查找可执行文件，再查找系统 PATH。
-    返回完整的可执行文件路径，如果都没找到则返回 None。
-    """
-    # 1. 脚本目录下查找
     local_path = os.path.join(get_script_dir(), name)
     if os.path.isfile(local_path) and os.access(local_path, os.X_OK):
         return local_path
-    # 2. 系统 PATH 中查找
     return shutil.which(name)
 
-
 PRESET_FILE = "ffmpeg_presets.json"
-CUSTOM_PRESET_PATH = None       # None 用上面的本地目录json，硬编码d:\123.json 就用具体路径
+CUSTOM_PRESET_PATH = None
 
-# 2. 你的智能路径处理逻辑
 if getattr(sys, 'frozen', False):
     BUNDLE_DIR = os.path.dirname(sys.executable)
 else:
@@ -64,7 +54,6 @@ if CUSTOM_PRESET_PATH:
 else:
     FINAL_PRESET_PATH = os.path.join(USER_DATA_DIR, PRESET_FILE)
 
-# 释放默认配置（如果用户目录下还没有）
 bundled_default_config = os.path.join(BUNDLE_DIR, PRESET_FILE)
 if not os.path.exists(FINAL_PRESET_PATH) and os.path.exists(bundled_default_config):
     try:
@@ -72,8 +61,6 @@ if not os.path.exists(FINAL_PRESET_PATH) and os.path.exists(bundled_default_conf
         print(f"首次运行，已从内部释放默认配置到：{FINAL_PRESET_PATH}")
     except Exception as e:
         print(f"释放配置文件失败: {e}")
-
-
 
 # ================== FFmpeg 编码器选项 ==================
 ALL_VIDEO_ENCODERS = [
@@ -89,7 +76,6 @@ ALL_VIDEO_ENCODERS = [
 ALL_AUDIO_ENCODERS = ["aac", "libmp3lame", "opus", "ac3", "eac3",
                       "flac", "alac", "pcm_s16le", "libfdk_aac", "copy"]
 
-# ================== 硬件解码器选项 ==================
 HARDWARE_DECODER_OPTIONS = [
     "无",
     "auto (自动通用)",
@@ -105,7 +91,6 @@ HARDWARE_DECODER_OPTIONS = [
     "videotoolbox (macOS)"
 ]
 
-# 映射选项到实际的 ffmpeg 参数格式
 DECODER_MAP = {
     "auto (自动通用)": "auto",
     "cuda (NVIDIA通用)": "cuda",
@@ -121,7 +106,7 @@ DECODER_MAP = {
     "无": "none"
 }
 
-#-----提示类-----
+# -----提示类-----
 class ToolTip:
     def __init__(self, widget, text, offset_x=15, offset_y=15, wraplength=400):
         self.widget = widget
@@ -136,39 +121,29 @@ class ToolTip:
     def show_tip(self, event=None):
         if self.tip_window:
             self.hide_tip()
-
         mouse_x = self.widget.winfo_pointerx()
         mouse_y = self.widget.winfo_pointery()
         ideal_x = mouse_x + self.offset_x
         ideal_y = mouse_y + self.offset_y
-
         self.tip_window = tw = tk.Toplevel(self.widget)
         tw.wm_overrideredirect(True)
         tw.wm_geometry(f"+{ideal_x}+{ideal_y}")
-
         label = tk.Label(tw, text=self.text, justify=tk.LEFT,
                          background="#ffffe0", relief=tk.SOLID, borderwidth=1,
                          wraplength=self.wraplength)
         label.pack()
-
         tw.update_idletasks()
         win_width = tw.winfo_width()
         win_height = tw.winfo_height()
         screen_width = tw.winfo_screenwidth()
         screen_height = tw.winfo_screenheight()
-
-        # Clamp 坐标到屏幕内
         x = max(0, min(ideal_x, screen_width - win_width))
         y = max(0, min(ideal_y, screen_height - win_height))
-
-        # 防止窗口遮挡鼠标（可选增强）
         if x <= mouse_x <= x + win_width and y <= mouse_y <= y + win_height:
-            # 简单反方向偏移 10 像素
             dx = 10 if ideal_x < screen_width // 2 else -10
             dy = 10 if ideal_y < screen_height // 2 else -10
             x = max(0, min(ideal_x + dx, screen_width - win_width))
             y = max(0, min(ideal_y + dy, screen_height - win_height))
-
         tw.wm_geometry(f"+{x}+{y}")
 
     def hide_tip(self, event=None):
@@ -230,7 +205,7 @@ class ParamValidator:
                 errors.append(f"音频比特率: {msg}")
         return errors
 
-# ================== 编码器策略==================
+# ================== 编码器策略 ==================
 class EncoderStrategy:
     def build_params(self, settings, parts):
         raise NotImplementedError
@@ -448,7 +423,6 @@ class VideoEncoderFrame(ttk.LabelFrame):
         self.global_quality.set(settings.get("global_quality", 26))
         self.bitrate_video.set(settings.get("bitrate_video", "1900k"))
 
-
 # ================== 视频滤镜组件 ==================
 class VideoFilterFrame(ttk.LabelFrame):
     PIX_FMTS = [
@@ -459,11 +433,10 @@ class VideoFilterFrame(ttk.LabelFrame):
     ]
 
     def __init__(self, parent, **kwargs):
-        super().__init__(parent, text="视频滤镜 (缩放/裁剪/旋转/变速)", padding="5", **kwargs)
+        super().__init__(parent, text="视频滤镜 (缩放/裁剪/旋转/变速/反交错/像素格式)", padding="5", **kwargs)
         self.create_widgets()
 
     def create_widgets(self):
-        # 创建左右分栏的主容器
         main_pane = ttk.Frame(self)
         main_pane.pack(fill=tk.BOTH, expand=True)
     
@@ -474,11 +447,8 @@ class VideoFilterFrame(ttk.LabelFrame):
         right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
     
         # ========== 左侧：原有所有控件 ==========
-        # 第一行：帧率 + 烧录字幕（放在同一行）
         line1 = ttk.Frame(left_frame)
         line1.pack(fill=tk.X, pady=2)
-    
-        # 帧率部分
         ttk.Label(line1, text="帧率:").pack(side=tk.LEFT)
         self.frame_rate_type = tk.StringVar(value="keep")
         self.frame_rate_custom = tk.StringVar(value="30")
@@ -488,14 +458,13 @@ class VideoFilterFrame(ttk.LabelFrame):
                         value="custom").pack(side=tk.LEFT, padx=5)
         self.fps_combo = ttk.Combobox(
             line1,
-            textvariable=self.frame_rate_custom,   # 仍使用原来的变量
+            textvariable=self.frame_rate_custom,
             width=9,
-            values=["30", "29.970030", "23.976024", "24", "25", "48", "59.940060", "60", "50"]  # 常用帧率
+            values=["30", "29.970030", "23.976024", "24", "25", "48", "59.940060", "60", "50"]
         )
         self.fps_combo.pack(side=tk.LEFT, padx=(0, 2))
         ttk.Label(line1, text="fps").pack(side=tk.LEFT, padx=(0, 10))
     
-        # 烧录字幕部分（放在同一行，紧跟在 fps 后面）
         self.subtitle_enabled = tk.BooleanVar(value=False)
         self.subtitle_path = tk.StringVar()
         ttk.Checkbutton(line1, text="烧录字幕", variable=self.subtitle_enabled,
@@ -506,13 +475,10 @@ class VideoFilterFrame(ttk.LabelFrame):
         self.browse_subtitle_btn = ttk.Button(line1, text="浏览字幕",
                                               command=self.browse_subtitle, width=9)
         self.browse_subtitle_btn.pack(side=tk.LEFT)
-    
-        # 初始状态（字幕未启用）
         if not self.subtitle_enabled.get():
             self.subtitle_entry.config(state="disabled")
             self.browse_subtitle_btn.config(state="disabled")
     
-        # 缩放、裁剪、旋转、变速等原有控件保持不变（从下一行开始）
         scale_frame = ttk.Frame(left_frame)
         scale_frame.pack(fill=tk.X, pady=2)
         self.scale_enabled = tk.BooleanVar(value=False)
@@ -538,10 +504,8 @@ class VideoFilterFrame(ttk.LabelFrame):
         self.crop_top = tk.StringVar(value="0")
         self.crop_width = tk.StringVar(value="iw/2")
         self.crop_height = tk.StringVar(value="ih")
-        # 创建 Checkbutton 并保存引用
         crop_check = ttk.Checkbutton(crop_frame, text="启用裁剪", variable=self.crop_enabled)
         crop_check.pack(side=tk.LEFT)
-        # 将 ToolTip 绑定到这个 Checkbutton 上
         ToolTip(crop_check, 
                 "裁剪滤镜 (crop) 使用说明：\n"
                 "格式：crop=宽:高:左:上\n"
@@ -555,7 +519,6 @@ class VideoFilterFrame(ttk.LabelFrame):
                 "• 例如裁剪上半部分：宽=iw, 高=ih/2, 左=0, 上=0\n"
                 "• 如果宽高为奇数，FFmpeg 会自动向下取整，一般不影响播放",
                 wraplength=400)
-        # 其余 Entry 控件不变
         ttk.Label(crop_frame, text="宽:").pack(side=tk.LEFT)
         ttk.Entry(crop_frame, textvariable=self.crop_width, width=8).pack(side=tk.LEFT)
         ttk.Label(crop_frame, text="高:").pack(side=tk.LEFT)
@@ -564,7 +527,6 @@ class VideoFilterFrame(ttk.LabelFrame):
         ttk.Entry(crop_frame, textvariable=self.crop_left, width=6).pack(side=tk.LEFT)
         ttk.Label(crop_frame, text="上:").pack(side=tk.LEFT)
         ttk.Entry(crop_frame, textvariable=self.crop_top, width=6).pack(side=tk.LEFT)
-
 
         rot_frame = ttk.Frame(left_frame)
         rot_frame.pack(fill=tk.X, pady=2)
@@ -701,19 +663,17 @@ class VideoFilterFrame(ttk.LabelFrame):
         self.speed_enabled.set(settings.get("speed_enabled", False))
         self.speed_factor.set(settings.get("speed_factor", "1.0"))
         self.deinterlace_filter.set(settings.get("deinterlace_filter", "none"))
-        # 兼容旧预设
         if "deinterlace" in settings and not "deinterlace_filter" in settings:
             self.deinterlace_filter.set("yadif" if settings["deinterlace"] else "none")
         self.pix_fmt_enabled.set(settings.get("pix_fmt_enabled", True))
         self.pix_fmt.set(settings.get("pix_fmt", "yuv420p"))
         self.subtitle_enabled.set(settings.get("subtitle_enabled", False))
         self.subtitle_path.set(settings.get("subtitle_path", ""))
-        # 截取片段设置
         self.trim_enabled.set(settings.get("trim_enabled", False))
         self.trim_start_v.set(settings.get("trim_start", "0"))
         self.trim_end_v.set(settings.get("trim_end", ""))
         self.toggle_subtitle()
-        self.on_trim_toggle()   # 控制输入框的启用/禁用状态
+        self.on_trim_toggle()
 
 # ================== 音频组件 ==================
 class AudioFrame(ttk.LabelFrame):
@@ -725,12 +685,7 @@ class AudioFrame(ttk.LabelFrame):
     def create_widgets(self):
         inner = ttk.Frame(self)
         inner.pack(fill=tk.X, expand=True)
-
-    def create_widgets(self):
-        inner = ttk.Frame(self)
-        inner.pack(fill=tk.X, expand=True)
     
-        # 第一行：保留音频和仅提取音频顺序左对齐
         top_row = ttk.Frame(inner)
         top_row.pack(fill=tk.X, pady=(0,5))
 
@@ -741,7 +696,7 @@ class AudioFrame(ttk.LabelFrame):
 
         self.only_audio = tk.BooleanVar(value=False)
         self.only_audio_cb = ttk.Checkbutton(top_row, text="仅提取音频", variable=self.only_audio)
-        self.only_audio_cb.pack(side=tk.LEFT, padx=(50,2))   # 左侧加一点间距，不要太大
+        self.only_audio_cb.pack(side=tk.LEFT, padx=(50,2))
 
         ttk.Label(top_row, text="输出容器:").pack(side=tk.LEFT, padx=(12,2))
         self.audio_format = tk.StringVar(value="mp3")
@@ -751,20 +706,17 @@ class AudioFrame(ttk.LabelFrame):
         audio_format_combo.pack(side=tk.LEFT, padx=2)
         ToolTip(self.only_audio_cb, "勾选后，将只输出音频文件（自动添加 -vn 忽略视频），输出容器将使用右边选择的音频格式", offset_x=0, offset_y=5)
     
-        # 第二行：编码器、比特率、采样率
         controls_frame = ttk.Frame(inner)
         controls_frame.pack(fill=tk.X, expand=True, pady=(5,0))
         ttk.Label(controls_frame, text="编码器:").pack(side=tk.LEFT)
         self.audio_codec = tk.StringVar(value="aac")
         ttk.Combobox(controls_frame, textvariable=self.audio_codec,
                      values=ALL_AUDIO_ENCODERS, state="readonly", width=10).pack(side=tk.LEFT, padx=5)
-        # 比特率下拉
         ttk.Label(controls_frame, text="比特率:").pack(side=tk.LEFT)
         self.audio_bitrate = tk.StringVar(value="128k")
         bitrate_combo = ttk.Combobox(controls_frame, textvariable=self.audio_bitrate, width=6, values=["64k","96k", "128k", "192k", "256k", "320k"], state='readonly')
         bitrate_combo.pack(side=tk.LEFT, padx=5)
         
-        # 采样率下拉
         ttk.Label(controls_frame, text="采样率:").pack(side=tk.LEFT)
         self.audio_samplerate = tk.StringVar(value="44100")
         samplerate_combo = ttk.Combobox(controls_frame, textvariable=self.audio_samplerate, width=8, values=["8000","12000","16000","22050","32000", "44100", "48000", "96000"], state='readonly')
@@ -817,11 +769,9 @@ class Track:
         self.enabled = enabled
         if enc_settings is None:
             if typ == "video":
-                # 从视频叠加位置（表达式，例如 "W-w-10"）
-                self.overlay_enabled = False         # 是否叠加到主画布上
+                self.overlay_enabled = False
                 self.overlay_x = "W-w-10"
                 self.overlay_y = "H-h-10"
-                # 主视频偏移属性（仅当该轨道是主视频时使用）
                 self.pad_enabled = False
                 self.pad_width = ""
                 self.pad_height = ""
@@ -857,11 +807,37 @@ class FFmpegBatchGUI:
         self.root.title("FFmpeg 多功能工具")
         screen_width = root.winfo_screenwidth()
         screen_height = root.winfo_screenheight()
-        # 设置最大宽度和高度（避免超出屏幕）
-        max_width = int(screen_width * 0.9)
-        max_height = int(screen_height * 0.9)
-        width = min(1600, max_width)
-        height = min(940, max_height)
+        
+        # --- 替换原有尺寸计算逻辑 ---
+        # 获取系统缩放比例
+        try:
+            scaling = root.winfo_fpixels('1i') / 96.0
+        except:
+            scaling = 1.0
+        self.scaling = scaling
+        
+        # 基准尺寸（100% 缩放时）
+        base_width = 1400
+        base_height = 850
+        
+        # 移除最大90%屏幕尺寸的限制，或者将其设置为一个更大的值（如95%）
+        # 原有代码：width = min(width, max_width)
+        # 修改后：仅在计算出的尺寸过大时才限制，否则使用计算出的尺寸
+        
+        width = int(base_width * scaling)
+        height = int(base_height * scaling)
+        
+        # 获取屏幕尺寸
+        screen_width = root.winfo_screenwidth()
+        screen_height = root.winfo_screenheight()
+        
+        # 仅在计算出的尺寸超过屏幕物理分辨率时才限制
+        max_width = int(screen_width * 0.95)  # 放宽限制
+        max_height = int(screen_height * 0.95)
+        width = min(width, max_width)
+        height = min(height, max_height)
+        
+        # 计算居中位置
         x = (screen_width - width) // 2
         y = (screen_height - height) // 2
         root.geometry(f"{width}x{height}+{x}+{y}")
@@ -893,16 +869,13 @@ class FFmpegBatchGUI:
         self.merge_delete_source = tk.BooleanVar(value=False)
         self.merge_verify = tk.BooleanVar(value=True)
 
-        # 硬件解码相关变量
         self.hwaccel_enabled = tk.BooleanVar(value=False)
-        self.hwaccel_decoder = tk.StringVar(value="无")  # 存储用户选择的显示文本
+        self.hwaccel_decoder = tk.StringVar(value="无")
 
         self.custom_args = tk.StringVar(value="")
 
         self.copy_chapters = tk.BooleanVar(value=True)
         self.chapter_file = tk.StringVar(value="")
-
-
 
         self.create_widgets()
         self.update_task_list()
@@ -911,18 +884,15 @@ class FFmpegBatchGUI:
         self.root.drop_target_register(DND_FILES)
         self.root.dnd_bind('<<Drop>>', self.on_files_dropped)
 
-        #============核心程序检查============
         self.show_quick_warning()
 
     def check_ffmpeg_dependencies(self):
-        """检查 ffmpeg, ffplay, ffprobe 是否存在（优先本地目录，再查 PATH）"""
         ffmpeg = find_executable("ffmpeg.exe") or shutil.which("ffmpeg")
         ffplay = find_executable("ffplay.exe") or shutil.which("ffplay")
         ffprobe = find_executable("ffprobe.exe") or shutil.which("ffprobe")
         return ffmpeg, ffplay, ffprobe
 
     def show_quick_warning(self):
-        """检查 FFmpeg 组件，若缺失则输出提示到右侧日志（不弹窗）"""
         missing = []
         if not self.ffmpeg_cmd: missing.append("ffmpeg")
         if not self.ffplay_cmd: missing.append("ffplay")
@@ -938,18 +908,14 @@ class FFmpegBatchGUI:
             self.append_info("选择文件名中包含 'shared' 的版本，例如: ffmpeg-master-latest-win64-gpl-shared.zip")
             self.append_info("解压后，将 bin 文件夹内的三个 exe 文件复制到本脚本目录，或添加 bin 路径到 Path。")
             self.append_info("提示：您可以在此日志框中直接选中上面的链接文字，右键复制。")
-    #============核心程序检查结束============
-
 
     def center_window(self, win, width, height):
-        """将 Toplevel 窗口居中显示"""
         screen_width = win.winfo_screenwidth()
         screen_height = win.winfo_screenheight()
         x = (screen_width - width) // 2
         y = (screen_height - height) // 2
         win.geometry(f"{width}x{height}+{x}+{y}")
 
-    # ---------- 辅助方法 ----------
     def normalize_path(self, path):
         return path.replace('\\', '/')
 
@@ -989,7 +955,7 @@ class FFmpegBatchGUI:
         settings["custom_output_name"] = self.custom_output_name.get()
         settings["output_container"] = self.output_container.get()
         settings["hwaccel_enabled"] = self.hwaccel_enabled.get()
-        settings["hwaccel_decoder"] = self.hwaccel_decoder.get()   # 存储显示文本
+        settings["hwaccel_decoder"] = self.hwaccel_decoder.get()
         settings["custom_args"] = self.custom_args.get().strip()
         settings["pip_enabled"] = self.pip_enabled.get()
 
@@ -1005,11 +971,9 @@ class FFmpegBatchGUI:
         self.audio_frame.set_settings(settings)
         self.hwaccel_enabled.set(settings.get("hwaccel_enabled", False))
         self.pip_enabled.set(settings.get("pip_enabled", False))
-        # 兼容旧版预设：如果 old style 存在则转换
         old_type = settings.get("hwaccel_type")
         new_decoder = settings.get("hwaccel_decoder")
         if old_type and not new_decoder:
-            # 尝试映射旧值到新选项
             mapping = {
                 "auto": "auto (自动通用)",
                 "cuvid": "cuda (NVIDIA通用)",
@@ -1022,7 +986,7 @@ class FFmpegBatchGUI:
             self.hwaccel_decoder.set(settings.get("hwaccel_decoder", "无"))
         self.custom_args.set(settings.get("custom_args", ""))
         self.toggle_hwaccel()
-        self.toggle_only_audio_mode()  # 根据加载的预设同步控件禁用状态
+        self.toggle_only_audio_mode()
 
     def build_filter_chain(self, settings):
         filters = []
@@ -1083,7 +1047,6 @@ class FFmpegBatchGUI:
         dir_path = self.normalize_path(dir_path)
         base_name = os.path.basename(input_path)
         name, _ = os.path.splitext(base_name)
-        # 仅音频模式优先使用 audio_format，否则使用 output_container
         if settings.get("only_audio", False):
             container = settings.get("audio_format", "mp3")
         else:
@@ -1113,9 +1076,8 @@ class FFmpegBatchGUI:
         output_path = self.normalize_path(output_path)
         parts = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
     
-        only_audio = settings.get("only_audio", False)   # <-- 提前定义
+        only_audio = settings.get("only_audio", False)
     
-        # 截取参数（放在 -i 之前，实现快速 seek）
         if not only_audio and settings.get("trim_enabled", False):
             start = settings.get("trim_start", "").strip()
             end = settings.get("trim_end", "").strip()
@@ -1124,7 +1086,6 @@ class FFmpegBatchGUI:
             if end:
                 parts.extend(["-to", end])
     
-        # 硬件解码 (仅当不只有音频时才有意义)
         if not only_audio and settings.get("hwaccel_enabled", False):
             decoder_display = settings.get("hwaccel_decoder", "无")
             decoder_key = DECODER_MAP.get(decoder_display, "none")
@@ -1146,23 +1107,18 @@ class FFmpegBatchGUI:
 
         parts.extend(["-i", self.quote_path(input_path)])
 
-        # 仅音频模式：添加 -vn，跳过所有视频相关参数
         if only_audio:
             parts.append("-vn")
         else:
-            # 视频滤镜
             vf = self.build_filter_chain(settings)
             if vf:
                 parts.append(f"-vf {vf}")
-            # 帧率
             if settings.get("frame_rate_type") == "custom" and settings.get("frame_rate_custom"):
                 parts.append(f"-r {settings['frame_rate_custom']}")
-            # 视频编码器参数
             vcodec = settings["encoder"]
             strategy = get_encoder_strategy(vcodec)
             parts = strategy.build_params(settings, parts)
 
-        # 音频参数 (保持不变)
         try:
             speed_val = float(settings.get("speed_factor", "1.0"))
             if speed_val <= 0:
@@ -1215,7 +1171,6 @@ class FFmpegBatchGUI:
                         af_filters = [f"atempo={self._format_atempo(v)}" for v in chain]
                         parts.append(f"-af {','.join(af_filters)}")
 
-        # 自定义参数
         custom = settings.get("custom_args", "").strip()
         if custom:
             try:
@@ -1224,7 +1179,6 @@ class FFmpegBatchGUI:
             except:
                 parts.extend(custom.split())
 
-        # 容器优化 (仅当不是仅音频模式或者仅音频模式但容器为 mp4/mov 时？一般只对视频容器添加 faststart，纯音频通常不需要，但仍可保留，无大碍)
         if not only_audio:
             container = settings.get("output_container", "mp4").lower()
             if container in ("mp4", "mov"):
@@ -1235,11 +1189,9 @@ class FFmpegBatchGUI:
 
     @staticmethod
     def _format_atempo(factor):
-        """格式化 atempo 参数，去掉多余的小数点和尾随零"""
         s = f"{factor:.10f}".rstrip('0').rstrip('.')
         return s
 
-    # ---------- 预览功能 ----------
     def preview_current_file(self):
         path = self.input_file.get().strip()
         if not path or not os.path.exists(path):
@@ -1268,22 +1220,18 @@ class FFmpegBatchGUI:
             return
 
         try:
-            # 构建视频滤镜：原始 filter_chain + 强制缩放到高度 960（宽度自动）
             if filter_chain and filter_chain.strip():
                 final_vf = f"{filter_chain},scale=-2:960"
             else:
                 final_vf = "scale=-2:960"
             
-            # 基础命令
             cmd = [self.ffplay_cmd, "-i", path, "-vf", final_vf, "-volume", "10"]
     
-            # 添加音频变速滤镜（如果启用）
             settings = self.get_current_settings()
             if settings.get("speed_enabled", False):
                 try:
                     factor = float(settings.get("speed_factor", "1.0"))
                     if factor > 0 and factor != 1.0:
-                        # 分解因子到 [0.5, 2.0] 区间
                         chain = []
                         r = factor
                         while r > 2.0:
@@ -1299,7 +1247,7 @@ class FFmpegBatchGUI:
                             af_filters = [f"atempo={self._format_atempo(v)}" for v in chain]
                             cmd.extend(["-af", ",".join(af_filters)])
                 except Exception:
-                    pass  # 忽略错误，不影响预览
+                    pass
     
             subprocess.Popen(cmd)
             self.append_info(f"正在预览: {path}")
@@ -1307,14 +1255,12 @@ class FFmpegBatchGUI:
             messagebox.showerror("错误", f"无法启动 ffplay:\n{str(e)}")
 
     def toggle_hwaccel(self):
-        # 如果启用时用户选择的是"无"，则自动切换到"auto (自动通用)"
         if self.hwaccel_enabled.get() and self.hwaccel_decoder.get() == "无":
             self.hwaccel_decoder.set("auto (自动通用)")
         self.update_command_preview()
 
     def toggle_only_audio_mode(self):
         state = tk.DISABLED if self.audio_frame.only_audio.get() else tk.NORMAL
-        # 禁用/启用视频相关控件
         for child in self.video_encoder.winfo_children():
             if isinstance(child, (ttk.Combobox, ttk.Entry, ttk.Scale, tk.Button, ttk.Radiobutton, ttk.Checkbutton)):
                 try:
@@ -1344,7 +1290,6 @@ class FFmpegBatchGUI:
         self.cmd_preview.delete(1.0, tk.END)
         self.cmd_preview.insert(tk.END, cmd)
 
-    # ---------- 任务管理 ----------
     def is_duplicate_task(self, input_path, output_path):
         norm_in = self.normalize_path(input_path)
         norm_out = self.normalize_path(output_path)
@@ -1445,12 +1390,10 @@ class FFmpegBatchGUI:
         return any(kw in encoder_lower for kw in hw_keywords)
 
     def _submit_next_batch(self):
-        # 如果设置了停止标志且没有正在运行的任务 -> 结束队列
         if self.stop_flag and not self.running_futures:
             self._finish_queue()
             return
 
-        # 正常完成：没有待处理任务且没有正在运行的任务 -> 自动结束队列
         if not self.stop_flag and not self.pending_tasks and not self.running_futures:
             self._finish_queue()
             return
@@ -1577,12 +1520,10 @@ class FFmpegBatchGUI:
         except Exception as e:
             self.append_info(f"⚠️ 执行异常: {e}")
 
-    # ---------- 预设管理 ----------
     def get_preset_path(self):
-        return FINAL_PRESET_PATH   # 直接使用全局变量
+        return FINAL_PRESET_PATH
 
     def load_preset_list(self):
-        FINAL_PRESET_PATH = self.get_preset_path()
         presets = {}
         if os.path.exists(FINAL_PRESET_PATH):
             try:
@@ -1595,7 +1536,6 @@ class FFmpegBatchGUI:
         preset_name = simpledialog.askstring("保存预设", "请输入预设名称:", parent=self.root)
         if not preset_name: return
         preset_settings = self.get_current_settings()
-        FINAL_PRESET_PATH = self.get_preset_path()
         presets = {}
         if os.path.exists(FINAL_PRESET_PATH):
             try:
@@ -1610,7 +1550,6 @@ class FFmpegBatchGUI:
 
     def load_preset(self, preset_name):
         if not preset_name: return
-        FINAL_PRESET_PATH = self.get_preset_path()
         if not os.path.exists(FINAL_PRESET_PATH): return
         with open(FINAL_PRESET_PATH, 'r', encoding='utf-8') as f:
             presets = json.load(f)
@@ -1625,7 +1564,6 @@ class FFmpegBatchGUI:
             return
         if not messagebox.askyesno("确认删除", f"确定要删除预设“{preset_name}”吗？"):
             return
-        FINAL_PRESET_PATH = self.get_preset_path()
         if not os.path.exists(FINAL_PRESET_PATH): return
         with open(FINAL_PRESET_PATH, 'r', encoding='utf-8') as f:
             presets = json.load(f)
@@ -1636,6 +1574,77 @@ class FFmpegBatchGUI:
             self.load_preset_list()
             self.preset_name.set("")
             messagebox.showinfo("成功", f"预设“{preset_name}”已删除")
+
+    def export_all_presets(self):
+        if not os.path.exists(FINAL_PRESET_PATH):
+            if messagebox.askyesno("提示", "当前没有预设文件，是否创建一个空的预设文件并导出？"):
+                with open(FINAL_PRESET_PATH, 'w', encoding='utf-8') as f:
+                    json.dump({}, f, indent=4)
+            else:
+                return
+        save_path = filedialog.asksaveasfilename(
+            title="导出全部预设 (备份)",
+            defaultextension=".json",
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+            initialfile="ffmpeg_presets_backup.json"
+        )
+        if not save_path:
+            return
+        try:
+            shutil.copy2(FINAL_PRESET_PATH, save_path)
+            self.append_info(f"✅ 全部预设已备份到: {save_path}")
+            messagebox.showinfo("导出成功", f"预设库已导出至:\n{save_path}")
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
+
+    def import_presets(self):
+        import_path = filedialog.askopenfilename(
+            title="导入预设库",
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")]
+        )
+        if not import_path:
+            return
+        try:
+            with open(import_path, 'r', encoding='utf-8') as f:
+                imported = json.load(f)
+        except Exception as e:
+            messagebox.showerror("读取失败", f"无法读取文件:\n{e}")
+            return
+        if not isinstance(imported, dict):
+            messagebox.showerror("格式错误", "导入的文件必须是 JSON 对象（键为预设名称，值为设置字典）")
+            return
+        current_presets = {}
+        if os.path.exists(FINAL_PRESET_PATH):
+            try:
+                with open(FINAL_PRESET_PATH, 'r', encoding='utf-8') as f:
+                    current_presets = json.load(f)
+            except:
+                pass
+        answer = messagebox.askyesno(
+            "导入方式",
+            f"当前有 {len(current_presets)} 个预设，导入文件包含 {len(imported)} 个预设。\n"
+            "是否替换整个预设库？\n"
+            "（选“是”将完全替换；选“否”则合并，同名预设将被覆盖）"
+        )
+        if answer:
+            new_presets = imported
+            self.append_info(f"🔄 替换模式：使用导入的 {len(imported)} 个预设替换现有预设库")
+        else:
+            new_presets = current_presets.copy()
+            overlapped = [name for name in imported if name in new_presets]
+            new_presets.update(imported)
+            if overlapped:
+                self.append_info(f"✏️ 合并模式：覆盖了 {len(overlapped)} 个同名预设，新增 {len(imported) - len(overlapped)} 个预设")
+            else:
+                self.append_info(f"➕ 合并模式：新增 {len(imported)} 个预设")
+        try:
+            with open(FINAL_PRESET_PATH, 'w', encoding='utf-8') as f:
+                json.dump(new_presets, f, indent=4, ensure_ascii=False)
+            self.load_preset_list()
+            self.append_info(f"✅ 预设库已更新，共 {len(new_presets)} 个预设")
+            messagebox.showinfo("导入成功", f"预设库已更新，当前共 {len(new_presets)} 个预设")
+        except Exception as e:
+            messagebox.showerror("保存失败", str(e))
 
     def export_script(self):
         if not self.tasks:
@@ -1662,7 +1671,6 @@ class FFmpegBatchGUI:
         except Exception as e:
             messagebox.showerror("导出失败", str(e))
 
-    # ---------- 任务编辑 ----------
     def edit_task(self, task, task_index):
         if task.status not in ("等待", "失败"):
             messagebox.showwarning("无法编辑", f"任务状态为“{task.status}”，只能编辑等待或失败的任务。")
@@ -1717,7 +1725,6 @@ class FFmpegBatchGUI:
         adv_frame.pack(fill=tk.X, padx=5, pady=5)
         hw_var = tk.BooleanVar(value=task.settings.get("hwaccel_enabled", False))
         ttk.Checkbutton(adv_frame, text="硬件解码", variable=hw_var).pack(anchor=tk.W)
-        # 使用新的解码器选项
         hw_decoder_var = tk.StringVar(value=task.settings.get("hwaccel_decoder", "无"))
         ttk.Combobox(adv_frame, textvariable=hw_decoder_var, values=HARDWARE_DECODER_OPTIONS, state="readonly").pack(anchor=tk.W, padx=20, pady=5)
         ttk.Label(adv_frame, text="自定义参数:").pack(anchor=tk.W, pady=(10,0))
@@ -1741,7 +1748,7 @@ class FFmpegBatchGUI:
             new_settings["hwaccel_enabled"] = hw_var.get()
             new_settings["hwaccel_decoder"] = hw_decoder_var.get()
             new_settings["custom_args"] = self.custom_args.get()
-            new_settings["only_audio"] = task.settings.get("only_audio", False)  # 任务编辑时不显示，保持原值
+            new_settings["only_audio"] = task.settings.get("only_audio", False)
             new_settings["audio_format"] = task.settings.get("audio_format", "mp3")
             new_out = self.generate_output_path(task.input, new_settings)
             try:
@@ -1799,16 +1806,38 @@ class FFmpegBatchGUI:
         idx = int(selected[0])
         self.edit_task(self.tasks[idx], idx)
 
-    # ---------- 界面创建 ----------
+    # -------------------- 界面创建 --------------------
     def create_widgets(self):
         main_hpane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         main_hpane.pack(fill=tk.BOTH, expand=True)
+        try:
+            import ctypes
+            hdc = ctypes.windll.user32.GetDC(0)
+            LOGPIXELSX = 88
+            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, LOGPIXELSX)
+            ctypes.windll.user32.ReleaseDC(0, hdc)
+            scaling = dpi / 96.0
+        except:
+            scaling = 1.0
+        if scaling >= 1.25:
+            self.root.after(100, lambda: main_hpane.sashpos(0, 1200))
+        
+        
+        # 使用 grid 布局：左侧自适应，右侧固定宽度 320 像素
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(fill=tk.BOTH, expand=True)
 
-        left_container = ttk.Frame(main_hpane)
-        main_hpane.add(left_container, weight=2)
+        left_container = ttk.Frame(main_frame)
+        right_panel = ttk.Frame(main_frame)
 
-        right_panel = ttk.Frame(main_hpane)
-        main_hpane.add(right_panel, weight=1)
+        # 固定右侧宽度，并禁止内部组件影响尺寸
+        right_panel.pack_propagate(False)
+        right_panel.config(width=420)
+
+        left_container.grid(row=0, column=0, sticky="nsew")
+        right_panel.grid(row=0, column=1, sticky="nsew")
+        main_frame.grid_columnconfigure(0, weight=1)   # 左侧列伸缩
+        main_frame.grid_columnconfigure(1, weight=0)   # 右侧列固定
 
         info_frame = ttk.LabelFrame(right_panel, text="关键信息", padding="5")
         info_frame.pack(fill=tk.BOTH, expand=True, pady=(0,5))
@@ -1842,11 +1871,11 @@ class FFmpegBatchGUI:
         transcode_vpane = ttk.PanedWindow(transcode_tab, orient=tk.VERTICAL)
         transcode_vpane.pack(fill=tk.BOTH, expand=True)
 
+        # 上部：设置区域（基本设置 + 标签页）
         settings_frame = ttk.Frame(transcode_vpane)
         transcode_vpane.add(settings_frame, weight=1)
-        tasks_frame = ttk.Frame(transcode_vpane)
-        transcode_vpane.add(tasks_frame, weight=2)
 
+        # 1. 基本设置（输入/输出 + 预设）
         io_frame = ttk.LabelFrame(settings_frame, text="输入 / 输出", padding="5")
         io_frame.pack(fill=tk.X, pady=5)
         ttk.Label(io_frame, text="输入文件:").grid(row=0, column=0, sticky="w")
@@ -1884,17 +1913,21 @@ class FFmpegBatchGUI:
         btn_import = ttk.Button(preset_frame, text="导入预设(恢复)", command=self.import_presets)
         btn_import.pack(side=tk.LEFT, padx=5)
 
-        enc_adv_frame = ttk.Frame(settings_frame)
-        enc_adv_frame.pack(fill=tk.X, pady=5)
+        # 2. 三个标签页：视频编码 / 视频滤镜 / 音频
+        param_notebook = ttk.Notebook(settings_frame)
+        param_notebook.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        # 视频编码页
+        video_enc_page = ttk.Frame(param_notebook)
+        param_notebook.add(video_enc_page, text="视频编码")
+        enc_adv_frame = ttk.Frame(video_enc_page)
+        enc_adv_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         enc_adv_frame.columnconfigure(0, weight=55)
         enc_adv_frame.columnconfigure(1, weight=45)
-
         self.video_encoder = VideoEncoderFrame(enc_adv_frame)
         self.video_encoder.grid(row=0, column=0, sticky="nsew", padx=(0,5))
-
         adv_frame = ttk.LabelFrame(enc_adv_frame, text="高级选项 (硬件解码/自定义参数)", padding="5")
         adv_frame.grid(row=0, column=1, sticky="nsew", padx=(5,0))
-
         hw_frame = ttk.Frame(adv_frame)
         hw_frame.pack(fill=tk.X, pady=2)
         self.hwaccel_check = ttk.Checkbutton(hw_frame, text="启用硬件解码",
@@ -1904,69 +1937,72 @@ class FFmpegBatchGUI:
         ToolTip(self.hwaccel_check,
         "【NVIDIA推荐】\n1.cuda（首选）：自动识别H264/HEVC/AV1，支持全程显存加速。\n2.auto：传统模式，兼容性好但效率略低。\n\n【Intel推荐】\n3.qsv：Intel通用模式，自动适配格式并直通显存。\n\n【手动指定】\n仅在全自动失败时使用。HEVC即H.265，AV1需新显卡支持。",
         offset_x=0, offset_y=0, wraplength=500)
-        # 新的解码器下拉列表
         self.hwaccel_decoder_combo = ttk.Combobox(hw_frame, textvariable=self.hwaccel_decoder,
                                                   values=HARDWARE_DECODER_OPTIONS,
                                                   state="readonly", width=22)
         self.hwaccel_decoder_combo.pack(side=tk.LEFT, padx=5)
         self.hwaccel_decoder_combo.bind("<<ComboboxSelected>>", lambda e: self.update_command_preview())
-
         custom_frame = ttk.Frame(adv_frame)
         custom_frame.pack(fill=tk.X, pady=5)
         ttk.Label(custom_frame, text="自定义FFmpeg参数 (例如: -tune grain -profile:v high):").pack(anchor=tk.W)
         self.custom_entry = ttk.Entry(custom_frame, textvariable=self.custom_args, width=50)
         self.custom_entry.pack(fill=tk.X, pady=2)
 
-        self.video_filter = VideoFilterFrame(settings_frame)
-        self.video_filter.pack(fill=tk.X, pady=5)
+        # 视频滤镜页
+        filter_page = ttk.Frame(param_notebook)
+        param_notebook.add(filter_page, text="视频滤镜")
+        self.video_filter = VideoFilterFrame(filter_page)
+        self.video_filter.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        audio_row = ttk.Frame(settings_frame)
-        audio_row.pack(fill=tk.X, pady=5)
-        audio_row.columnconfigure(0, weight=1)
-        audio_row.columnconfigure(1, weight=1)
-        
-        self.audio_frame = AudioFrame(audio_row, enable_checkbox=True)
-        self.audio_frame.grid(row=0, column=0, sticky="nsew", padx=(0,5))
+        # 音频页
+        audio_page = ttk.Frame(param_notebook)
+        param_notebook.add(audio_page, text="音频")
+        audio_frame_wrapper = ttk.Frame(audio_page)
+        audio_frame_wrapper.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.audio_frame = AudioFrame(audio_frame_wrapper, enable_checkbox=True)
+        self.audio_frame.pack(fill=tk.BOTH, expand=True)
         self.audio_frame.only_audio.trace_add("write", lambda *a: self.toggle_only_audio_mode())
-        
-        btn_container = ttk.Frame(audio_row)
-        btn_container.grid(row=0, column=1, sticky="ew", padx=(5,0))
 
-        
-        
-        # 按钮组（开始转码、预览、刷新）
-        btn_container = ttk.Frame(audio_row)
-        btn_container.grid(row=0, column=1, sticky="ew", padx=(5,0))
-        btn_container.columnconfigure(0, weight=1)
-        btn_container.columnconfigure(1, weight=0)
-        btn_container.columnconfigure(2, weight=0)
-        btn_container.columnconfigure(3, weight=0)
-        btn_container.columnconfigure(4, weight=1)
-        
-        btn_single = tk.Button(btn_container, text="开始转码",
+        # 3. 底部三个按钮（开始编码、预览当前命令、刷新命令）
+        bottom_btn_frame = ttk.Frame(settings_frame)
+        bottom_btn_frame.pack(fill=tk.X, pady=5)
+
+        # 获取缩放比例（与窗口初始化时保持一致）
+        try:
+            scaling = self.root.winfo_fpixels('1i') / 96.0
+        except:
+            scaling = 1.0
+
+        # 缩放≥1.5时按钮高度为1，否则为2
+        btn_height = 1 if scaling >= 1.4 else 2
+
+        btn_single = tk.Button(bottom_btn_frame, text="开始编码",
                                command=self.transcode_single,
-                               height=2, width=18, relief=tk.RAISED,
+                               height=btn_height, width=18, relief=tk.RAISED,
                                bg="#4CAF50", fg="white", font=("",12,"bold"))
-        btn_single.grid(row=0, column=1, padx=5, pady=10)
-        ToolTip(btn_single, "开始当前浏览选择的文件转码", offset_x=0, offset_y=5)
-        
-        btn_preview = tk.Button(btn_container, text="预览当前命令",
-                                command=self.preview_current_file,
-                                height=2, width=18, relief=tk.RAISED,
-                                bg="#2196F3", fg="white", font=("",12,"bold"))
-        btn_preview.grid(row=0, column=2, padx=5, pady=10)
-        
-        btn_refresh = tk.Button(btn_container, text="刷新命令",
-                                command=self.update_command_preview,
-                                height=2, width=12, relief=tk.RAISED)
-        btn_refresh.grid(row=0, column=3, padx=5, pady=10)
+        btn_single.pack(side=tk.LEFT, padx=5, pady=5)
 
+        btn_preview = tk.Button(bottom_btn_frame, text="预览当前命令",
+                                command=self.preview_current_file,
+                                height=btn_height, width=18, relief=tk.RAISED,
+                                bg="#2196F3", fg="white", font=("",12,"bold"))
+        btn_preview.pack(side=tk.LEFT, padx=5, pady=5)
+
+        btn_refresh = tk.Button(bottom_btn_frame, text="刷新命令",
+                                command=self.update_command_preview,
+                                height=btn_height, width=12, relief=tk.RAISED)
+        btn_refresh.pack(side=tk.LEFT, padx=5, pady=5)
+
+        # 命令预览框（依然放在设置区最底部）
         preview_frame = ttk.LabelFrame(settings_frame, text="当前命令模板", padding="5")
-        preview_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        self.cmd_preview = scrolledtext.ScrolledText(preview_frame, height=8, wrap=tk.WORD, font=("Microsoft YaHei",9))
+        preview_frame.pack(fill=tk.X, pady=5)
+        self.cmd_preview = scrolledtext.ScrolledText(preview_frame, height=3, wrap=tk.WORD, font=("Microsoft YaHei",9))
         self.cmd_preview.pack(fill=tk.BOTH, expand=True)
         self.cmd_preview.insert(tk.END, "请选择输入文件，或调整参数...")
 
+        # 下部：任务列表区域（保持不变）
+        tasks_frame = ttk.Frame(transcode_vpane)
+        transcode_vpane.add(tasks_frame, weight=2)
         task_control_frame = ttk.Frame(tasks_frame)
         task_control_frame.pack(fill=tk.X, pady=5)
         btn_start = tk.Button(task_control_frame, text="开始队列", command=self.start_queue,
@@ -1992,7 +2028,7 @@ class FFmpegBatchGUI:
             ttk.Button(task_control_frame, text=text, command=cmd).pack(side=tk.LEFT, padx=5)
 
         columns = ("文件名", "输出路径", "命令 (简洁)", "状态", "错误信息")
-        self.task_tree = ttk.Treeview(tasks_frame, columns=columns, show="headings", height=12)
+        self.task_tree = ttk.Treeview(tasks_frame, columns=columns, show="headings")
         widths = {"文件名":150, "输出路径":200, "命令 (简洁)":400, "状态":80, "错误信息":200}
         for col in columns:
             self.task_tree.heading(col, text=col)
@@ -2000,11 +2036,12 @@ class FFmpegBatchGUI:
         self.task_tree.pack(fill=tk.BOTH, expand=True, pady=5)
         self.task_tree.bind("<Double-1>", self.on_task_double_click)
 
+        # ---------- 封装/合并标签页 ----------
         merge_tab = ttk.Frame(self.notebook)
         self.notebook.add(merge_tab, text="封装/合并/画中画")
         self.create_merge_tab(merge_tab)
 
-        # 绑定事件刷新预览（增加新解码器变量的跟踪）
+        # 绑定事件刷新预览
         self.video_encoder.vcodec.trace_add("write", lambda *a: self.update_command_preview())
         self.video_encoder.rate_control_type.trace_add("write", lambda *a: self.update_command_preview())
         self.video_encoder.crf_value.trace_add("write", lambda *a: self.update_command_preview())
@@ -2039,7 +2076,6 @@ class FFmpegBatchGUI:
         self.hwaccel_enabled.trace_add("write", lambda *a: self.update_command_preview())
         self.hwaccel_decoder.trace_add("write", lambda *a: self.update_command_preview())
         self.custom_args.trace_add("write", lambda *a: self.update_command_preview())
-        # 仅音频模式变量跟踪
         self.audio_frame.only_audio.trace_add("write", lambda *a: self.update_command_preview())
         self.audio_frame.audio_format.trace_add("write", lambda *a: self.update_command_preview())
 
@@ -2058,102 +2094,10 @@ class FFmpegBatchGUI:
             dirpath = self.normalize_path(dirpath)
             self.output_dir.set(dirpath)
             self.update_command_preview()
-            
-    #---导出预设
-    def export_all_presets(self):
-        """导出整个预设库到外部 JSON 文件（备份）"""
-        FINAL_PRESET_PATH = self.get_preset_path()
-        if not os.path.exists(FINAL_PRESET_PATH):
-            # 如果预设文件不存在，可以创建一个空预设文件再导出
-            if messagebox.askyesno("提示", "当前没有预设文件，是否创建一个空的预设文件并导出？"):
-                with open(FINAL_PRESET_PATH, 'w', encoding='utf-8') as f:
-                    json.dump({}, f, indent=4)
-            else:
-                return
-    
-        save_path = filedialog.asksaveasfilename(
-            title="导出全部预设 (备份)",
-            defaultextension=".json",
-            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
-            initialfile="ffmpeg_presets_backup.json"
-        )
-        if not save_path:
-            return
-    
-        try:
-            shutil.copy2(FINAL_PRESET_PATH, save_path)
-            self.append_info(f"✅ 全部预设已备份到: {save_path}")
-            messagebox.showinfo("导出成功", f"预设库已导出至:\n{save_path}")
-        except Exception as e:
-            messagebox.showerror("导出失败", str(e))
-    
-    
-    def import_presets(self):
-        """从外部 JSON 文件导入预设库（可选择合并或替换）"""
-        import_path = filedialog.askopenfilename(
-            title="导入预设库",
-            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")]
-        )
-        if not import_path:
-            return
-    
-        try:
-            with open(import_path, 'r', encoding='utf-8') as f:
-                imported = json.load(f)
-        except Exception as e:
-            messagebox.showerror("读取失败", f"无法读取文件:\n{e}")
-            return
-    
-        if not isinstance(imported, dict):
-            messagebox.showerror("格式错误", "导入的文件必须是 JSON 对象（键为预设名称，值为设置字典）")
-            return
-    
-        # 读取当前预设库
-        FINAL_PRESET_PATH = self.get_preset_path()
-        current_presets = {}
-        if os.path.exists(FINAL_PRESET_PATH):
-            try:
-                with open(FINAL_PRESET_PATH, 'r', encoding='utf-8') as f:
-                    current_presets = json.load(f)
-            except:
-                pass
-    
-        # 询问操作方式
-        answer = messagebox.askyesno(
-            "导入方式",
-            f"当前有 {len(current_presets)} 个预设，导入文件包含 {len(imported)} 个预设。\n"
-            "是否替换整个预设库？\n"
-            "（选“是”将完全替换；选“否”则合并，同名预设将被覆盖）"
-        )
-    
-        if answer:
-            # 替换模式
-            new_presets = imported
-            self.append_info(f"🔄 替换模式：使用导入的 {len(imported)} 个预设替换现有预设库")
-        else:
-            # 合并模式：更新或添加
-            new_presets = current_presets.copy()
-            overlapped = [name for name in imported if name in new_presets]
-            new_presets.update(imported)
-            if overlapped:
-                self.append_info(f"✏️ 合并模式：覆盖了 {len(overlapped)} 个同名预设，新增 {len(imported) - len(overlapped)} 个预设")
-            else:
-                self.append_info(f"➕ 合并模式：新增 {len(imported)} 个预设")
-    
-        # 保存到预设文件
-        try:
-            with open(FINAL_PRESET_PATH, 'w', encoding='utf-8') as f:
-                json.dump(new_presets, f, indent=4, ensure_ascii=False)
-            self.load_preset_list()   # 刷新下拉列表
-            self.append_info(f"✅ 预设库已更新，共 {len(new_presets)} 个预设")
-            messagebox.showinfo("导入成功", f"预设库已更新，当前共 {len(new_presets)} 个预设")
-        except Exception as e:
-            messagebox.showerror("保存失败", str(e))
 
-
-
-    # -------------------- 封装/合并模块--------------------
+    # -------------------- 封装/合并模块 --------------------
     def create_merge_tab(self, parent):
+        # 主视频文件行
         f1 = ttk.Frame(parent)
         f1.pack(fill=tk.X, pady=5)
         ttk.Label(f1, text="主视频文件:").pack(side=tk.LEFT)
@@ -2161,9 +2105,39 @@ class FFmpegBatchGUI:
         ttk.Button(f1, text="浏览", command=self.merge_select_video).pack(side=tk.RIGHT, padx=(2,15))
 
         ttk.Label(parent, text="轨道列表（可单独设置编码参数）").pack(anchor=tk.W, pady=(10,2))
-        self.merge_track_frame = ttk.Frame(parent, relief=tk.SUNKEN, borderwidth=1)
-        self.merge_track_frame.pack(fill=tk.BOTH, expand=True, pady=5)
 
+        # --- 轨道列表容器（可拖拽改变高度）---
+        list_container = ttk.Frame(parent)
+        list_container.pack(fill=tk.X, pady=5)
+        list_container.pack_propagate(False)
+        min_height = int(300 * self.scaling) 
+        list_container.config(height=min_height)
+
+        self.merge_track_frame = ttk.Frame(list_container, relief=tk.SUNKEN, borderwidth=1)
+        self.merge_track_frame.pack(fill=tk.BOTH, expand=True)
+
+        # 拖拽条（放置于 list_container 的底部）
+        resize_bar = ttk.Frame(list_container, height=6, cursor="sb_v_double_arrow")
+        resize_bar.pack(fill=tk.X, side=tk.BOTTOM)
+
+        self._drag_start_y = None
+        self._start_height = None
+
+        def on_resize_start(event):
+            self._drag_start_y = event.y_root
+            self._start_height = list_container.winfo_height()
+
+        def on_resize_motion(event):
+            if self._drag_start_y is not None:
+                delta = event.y_root - self._drag_start_y
+                new_height = max(150, self._start_height + delta)
+                list_container.config(height=new_height)
+                event.widget.master.update_idletasks()
+
+        resize_bar.bind("<Button-1>", on_resize_start)
+        resize_bar.bind("<B1-Motion>", on_resize_motion)
+
+        # 按钮框架（位于列表容器下方）
         btn_frame = ttk.Frame(parent)
         btn_frame.pack(fill=tk.X, pady=5)
         ttk.Button(btn_frame, text="添加外部音轨", command=lambda: self.merge_add_external("audio")).pack(side=tk.LEFT, padx=2)
@@ -2176,35 +2150,27 @@ class FFmpegBatchGUI:
         ttk.Button(btn_frame, text="添加外部视频（画中画）", 
             command=self.merge_add_external_video).pack(side=tk.LEFT, padx=2)
 
-        # ========== 章节处理（改为一行） ==========
+        # 章节处理
         chapter_frame = ttk.LabelFrame(parent, text="章节处理", padding="3")
         chapter_frame.pack(fill=tk.X, pady=5)
-        
-        # 水平容器
         chapter_row = ttk.Frame(chapter_frame)
         chapter_row.pack(fill=tk.X, padx=5, pady=2)
-        
-        # 左侧：复制章节复选框
         ttk.Checkbutton(
             chapter_row, text="从源文件复制章节 (map_chapters)", 
             variable=self.copy_chapters
         ).pack(side=tk.LEFT, padx=(0, 15))
-        
-        # 右侧：导入章节文件（标签+输入框+浏览按钮）
         right_area = ttk.Frame(chapter_row)
         right_area.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        
         ttk.Label(right_area, text="导入外部章节文件 (FFmetadata):").pack(side=tk.LEFT)
         chapter_entry = ttk.Entry(right_area, textvariable=self.chapter_file)
         chapter_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         ttk.Button(
             right_area, text="浏览...", command=self.browse_chapter_file
         ).pack(side=tk.LEFT)
-        
-        # ========== 输出容器 + 输出文件（同一行，保持原有） ==========
+
+        # 输出容器与输出文件
         row_frame = ttk.Frame(parent)
         row_frame.pack(fill=tk.X, pady=2)
-        
         left_container = ttk.Frame(row_frame)
         left_container.pack(side=tk.LEFT, padx=(0, 5))
         ttk.Label(left_container, text="输出容器:").pack(side=tk.LEFT)
@@ -2225,52 +2191,51 @@ class FFmpegBatchGUI:
             right_container, text="浏览...",
             command=self.merge_select_output, width=8
         ).pack(side=tk.LEFT, padx=(0, 15))
+
+        # 选项和操作按钮（同一行）
+        opt_action_frame = ttk.Frame(parent)
+        opt_action_frame.pack(fill=tk.X, pady=2)
         
-        # ========== 选项 ==========
-        opt_frame = ttk.Frame(parent)
-        opt_frame.pack(anchor=tk.W, pady=2)
         ttk.Checkbutton(
-            opt_frame, text="合并成功后删除源文件", variable=self.merge_delete_source
-        ).pack(side=tk.LEFT, padx=5)
-        ttk.Checkbutton(
-            opt_frame, text="验证输出文件", variable=self.merge_verify
+            opt_action_frame, text="合并成功后删除源文件", variable=self.merge_delete_source
         ).pack(side=tk.LEFT, padx=5)
         
-        # ========== 命令预览框（固定较大高度，不自动垂直扩展） ==========
+        ttk.Checkbutton(
+            opt_action_frame, text="验证输出文件", variable=self.merge_verify
+        ).pack(side=tk.LEFT, padx=(5,50))
+        
+        self.merge_btn = tk.Button(opt_action_frame, text="开始合并", command=self.merge_start,
+                                   height=1, width=12, bg="#4CAF50", fg="white")
+        self.merge_btn.pack(side=tk.LEFT, padx=5)
+        
+        btn_copy = tk.Button(opt_action_frame, text="复制命令到剪贴板", command=self.merge_copy_command,
+                             height=1, width=20, relief=tk.RAISED)
+        btn_copy.pack(side=tk.LEFT, padx=5)
+
+        # 命令预览区域（无拖拽条）
         preview_frame = ttk.LabelFrame(parent, text="即将执行的命令预览", padding="5")
-        preview_frame.pack(fill=tk.X, pady=5)          # 仅水平填充，不垂直扩展
-        
+        preview_frame.pack(fill=tk.BOTH, expand=True, pady=5)
         content_frame = ttk.Frame(preview_frame)
         content_frame.pack(fill=tk.BOTH, expand=True)
         self.merge_cmd_preview = scrolledtext.ScrolledText(
-            content_frame, height=8, wrap=tk.WORD, font=("Microsoft YaHei", 9)  # 高度从6增加到8
+            content_frame, height=1, wrap=tk.WORD, font=("Microsoft YaHei", 9)
         )
         self.merge_cmd_preview.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
-        btn_copy = ttk.Button(
-            content_frame, text="复制命令\n到剪贴板", width=10, command=self.merge_copy_command
-        )
-        btn_copy.pack(side=tk.RIGHT, padx=(5, 0))
 
-        self.merge_btn = tk.Button(parent, text="开始合并", command=self.merge_start, height=1,width=14,
-                                  bg="#4CAF50", fg="white", font=("", 12, "bold"))
-        self.merge_btn.pack(pady=10)
-
+        # 事件绑定
         self.merge_video.trace_add("write", lambda *a: self.merge_load_video_info())
         self.merge_container.trace_add("write", lambda *a: self.merge_update_command_preview())
         self.merge_output.trace_add("write", lambda *a: self.merge_update_command_preview())
         self.copy_chapters.trace_add("write", lambda *a: self.merge_update_command_preview())
         self.chapter_file.trace_add("write", lambda *a: self.merge_update_command_preview())
-        
+
     def merge_add_external_video(self):
-        """添加外部视频或图片作为画中画（需要启用画中画模式）"""
         if not self.pip_enabled.get():
             messagebox.showwarning("提示", "请先勾选「启用画中画」后再添加外部视频或图片作为水印。\n注意给视频流选择重新编码，不能使用copy了。")
             return
         if not self.merge_video.get():
             self.append_info("[封装] 请先设置主视频")
             return
-    
-        # 支持视频 + 图片格式
         filetypes = [
             ("媒体文件", "*.mp4 *.mkv *.avi *.mov *.flv *.webm *.png *.jpg *.jpeg *.bmp *.gif *.webp"),
             ("视频文件", "*.mp4 *.mkv *.avi *.mov *.flv *.webm"),
@@ -2279,15 +2244,10 @@ class FFmpegBatchGUI:
         path = filedialog.askopenfilename(title="选择视频或图片文件", filetypes=filetypes)
         if not path:
             return
-    
-        # 判断是否为图片
         img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
         is_image = os.path.splitext(path)[1].lower() in img_exts
-    
         if is_image:
-            # 图片：不需要特殊参数，FFmpeg 会自动处理
             track = Track(0, "video", "image2", path, True)
-            # 不再设置 is_image 标记
             track.enc_settings["scale_enabled"] = True
             track.enc_settings["scale_width"] = "320"
             track.enc_settings["scale_height"] = ""
@@ -2298,7 +2258,6 @@ class FFmpegBatchGUI:
             self.merge_tracks.append(track)
             self.append_info(f"[封装] 已添加图片水印: {os.path.basename(path)}")
         else:
-            # 视频：原有逻辑
             info = self.merge_get_media_info(path)
             if not info:
                 self.append_info(f"[封装] 无法解析文件: {path}")
@@ -2316,13 +2275,11 @@ class FFmpegBatchGUI:
             track.overlay_x = "W-w-10"
             track.overlay_y = "H-h-10"
             self.merge_tracks.append(track)
-            # 询问是否添加音频
             audio_streams = [s for s in info["streams"] if s.get("codec_type") == "audio"]
             if audio_streams and messagebox.askyesno("添加音频", f"是否同时将文件中的音频流添加为独立音轨？\n{os.path.basename(path)}"):
                 for s_audio in audio_streams:
                     audio_track = Track(s_audio["index"], "audio", s_audio.get("codec_name", "unknown"), path, True)
                     self.merge_tracks.append(audio_track)
-    
         self.merge_update_track_list()
         self.merge_auto_recommend_container()
         self.merge_update_command_preview()
@@ -2348,22 +2305,16 @@ class FFmpegBatchGUI:
         if not self.ffmpeg_cmd:
             self.append_info("❌ 未找到 ffmpeg，无法生成合并命令。")
             return []
-
-        """生成合并/封装命令，支持普通单视频封装和画中画叠加模式"""
         output = self.merge_output.get().strip()
         if not output:
             return []
-    
         enabled_tracks = [t for t in self.merge_tracks if t.enabled]
         if not enabled_tracks:
             return []
-    
-        # 收集所有输入文件（去重）
         input_files = []
         for t in enabled_tracks:
             if t.file_path not in input_files:
                 input_files.append(t.file_path)
-    
         def normalize_win_path(p):
             if sys.platform != "win32":
                 return p
@@ -2380,27 +2331,18 @@ class FFmpegBatchGUI:
                 return buf.value
             except Exception:
                 return p
-    
         input_files_norm = [normalize_win_path(f) for f in input_files]
         output_norm = normalize_win_path(output)
-    
         cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
-        
-        # 为每个输入文件确定是否需要添加截取参数
-        # 遍历所有启用的视频轨道，收集每个文件的截取设置（以一个文件一个为准，如有冲突取第一个）
-        file_trim = {}  # key: 文件路径, value: (start, end)
+        file_trim = {}
         for track in enabled_tracks:
             if track.type == "video":
-                # 从 enc_settings 中读取截取设置
                 trim_enabled = track.enc_settings.get("trim_enabled", False)
                 if trim_enabled:
                     start = track.enc_settings.get("trim_start", "").strip()
                     end = track.enc_settings.get("trim_end", "").strip()
                     if start or end:
-                        # 如果同一个文件有多个视频轨道（罕见），后添加的会覆盖前面的，这里简单处理
                         file_trim[track.file_path] = (start, end)
-        
-        # 添加输入文件，同时为需要截取的文件在 -i 前加上 -ss 和 -to
         for f in input_files_norm:
             if f in file_trim:
                 start, end = file_trim[f]
@@ -2409,26 +2351,17 @@ class FFmpegBatchGUI:
                 if end:
                     cmd.extend(["-to", end])
             cmd.extend(["-i", f])
-    
-        # 分离轨道
         video_tracks = [t for t in enabled_tracks if t.type == "video"]
         audio_tracks = [t for t in enabled_tracks if t.type == "audio"]
         subtitle_tracks = [t for t in enabled_tracks if t.type == "subtitle"]
-    
         if not video_tracks:
             self.append_info("[封装] 没有启用的视频轨道")
             return []
-
-        # ========== 画中画模式 ==========
         if self.pip_enabled.get():
-            # 第一个视频为主视频，其余为从视频（叠加）
             main_video = video_tracks[0]
             sub_videos = video_tracks[1:]
-
             filter_parts = []
             main_idx = input_files_norm.index(normalize_win_path(main_video.file_path))
-
-            # 主视频自身滤镜
             main_filters = self.build_video_filter_chain(main_video.enc_settings)
             if main_filters and main_filters != "null":
                 filter_parts.append(f"[{main_idx}:v]{main_filters}[v_main_proc]")
@@ -2436,8 +2369,6 @@ class FFmpegBatchGUI:
             else:
                 filter_parts.append(f"[{main_idx}:v]null[v_main_proc]")
                 current_v = "v_main_proc"
-
-            # 主视频偏移
             if getattr(main_video, 'pad_enabled', False) and main_video.pad_width and main_video.pad_height:
                 pw = main_video.pad_width.strip()
                 ph = main_video.pad_height.strip()
@@ -2446,8 +2377,6 @@ class FFmpegBatchGUI:
                 filter_parts.append(f"nullsrc=size={pw}x{ph}[canvas]")
                 filter_parts.append(f"[canvas][{current_v}]overlay={ox}:{oy}:shortest=1[v_main_pad]")
                 current_v = "v_main_pad"
-
-            # 依次叠加从视频
             for i, sv in enumerate(sub_videos):
                 sv_idx = input_files_norm.index(normalize_win_path(sv.file_path))
                 sv_filters = self.build_video_filter_chain(sv.enc_settings)
@@ -2464,12 +2393,9 @@ class FFmpegBatchGUI:
                     current_v = f"v_out_{i}"
                 else:
                     filter_parts.append(f"[{current_v}]null[{current_v}]")
-
             complex_filter = ";".join(filter_parts)
             cmd.extend(["-filter_complex", complex_filter])
             cmd.extend(["-map", f"[{current_v}]"])
-
-            # 视频编码参数（画中画模式必须重新编码）
             v_settings = main_video.enc_settings
             vcodec = v_settings.get("encoder", "libx265")
             rc = v_settings.get("rate_control_type", "crf")
@@ -2488,8 +2414,6 @@ class FFmpegBatchGUI:
                 cmd.extend(["-r", v_settings.get("frame_rate_custom", "30")])
             if v_settings.get("pix_fmt_enabled", True):
                 cmd.extend(["-pix_fmt", v_settings.get("pix_fmt", "yuv420p")])
-
-            # ========== 音频处理（画中画模式也支持多音轨）==========
             audio_map_count = 0
             for audio in audio_tracks:
                 a_idx = input_files_norm.index(normalize_win_path(audio.file_path))
@@ -2508,8 +2432,6 @@ class FFmpegBatchGUI:
                 audio_map_count += 1
             if audio_map_count == 0:
                 cmd.append("-an")
-
-            # ========== 字幕处理（画中画模式也支持）==========
             sub_map_count = 0
             first_sub_default = False
             for sub in subtitle_tracks:
@@ -2530,15 +2452,10 @@ class FFmpegBatchGUI:
                     cmd.extend([f"-disposition:s:{sub_map_count}", "default"])
                     first_sub_default = True
                 sub_map_count += 1
-    
         else:
-            # ========== 普通模式：只有一个视频轨道（已限制添加额外视频）==========
-            # 取第一个视频轨道
             video_track = video_tracks[0]
             v_idx = input_files_norm.index(normalize_win_path(video_track.file_path))
             cmd.extend(["-map", f"{v_idx}:v:0"])
-    
-            # 视频编码：根据用户设置决定是复制还是重新编码
             v_settings = video_track.enc_settings
             vcodec = v_settings.get("encoder", "copy")
             if vcodec == "copy":
@@ -2560,8 +2477,6 @@ class FFmpegBatchGUI:
                     cmd.extend(["-r", v_settings.get("frame_rate_custom", "30")])
                 if v_settings.get("pix_fmt_enabled", True):
                     cmd.extend(["-pix_fmt", v_settings.get("pix_fmt", "yuv420p")])
-    
-            # 音频处理（多轨，每个可独立编码）
             audio_map_count = 0
             for audio in audio_tracks:
                 a_idx = input_files_norm.index(normalize_win_path(audio.file_path))
@@ -2580,8 +2495,6 @@ class FFmpegBatchGUI:
                 audio_map_count += 1
             if audio_map_count == 0:
                 cmd.append("-an")
-    
-            # 字幕处理
             sub_map_count = 0
             first_sub_default = False
             for sub in subtitle_tracks:
@@ -2602,8 +2515,6 @@ class FFmpegBatchGUI:
                     cmd.extend([f"-disposition:s:{sub_map_count}", "default"])
                     first_sub_default = True
                 sub_map_count += 1
-    
-        # ========== 公共部分：章节处理 ==========
         if self.copy_chapters.get() and input_files_norm:
             cmd.extend(["-map_chapters", "0"])
         chapter_file = self.chapter_file.get().strip()
@@ -2612,19 +2523,14 @@ class FFmpegBatchGUI:
             cmd.insert(1, "-i")
             cmd.insert(2, chapter_file_norm)
             cmd.extend(["-map_chapters", "1"])
-    
-        # 容器优化
         container = self.merge_container.get().lower()
         if container in ("mp4", "mov"):
             cmd.extend(["-movflags", "+faststart"])
-    
         cmd.append(output_norm)
         return cmd
 
     def build_video_filter_chain(self, settings):
-        """根据 VideoFilterFrame 的设置生成滤镜字符串（用于 filter_complex）"""
         filters = []
-        # 裁剪
         if settings.get("crop_enabled", False):
             w = settings.get("crop_width", "").strip()
             h = settings.get("crop_height", "").strip()
@@ -2632,7 +2538,6 @@ class FFmpegBatchGUI:
             top = settings.get("crop_top", "0").strip()
             if w and h:
                 filters.append(f"crop={w}:{h}:{left}:{top}")
-        # 缩放
         if settings.get("scale_enabled", False):
             method = settings.get("scale_method", "width")
             w = settings.get("scale_width", "").strip()
@@ -2643,7 +2548,6 @@ class FFmpegBatchGUI:
                 filters.append(f"scale=-2:{h}")
             elif method == "exact" and w and h:
                 filters.append(f"scale={w}:{h}")
-        # 旋转
         rot = settings.get("rotate", "none")
         if rot == "90":
             filters.append("transpose=1")
@@ -2651,16 +2555,13 @@ class FFmpegBatchGUI:
             filters.append("transpose=2,transpose=2")
         elif rot == "270":
             filters.append("transpose=2")
-        # 翻转
         if settings.get("vflip", False):
             filters.append("vflip")
         if settings.get("hflip", False):
             filters.append("hflip")
-        # 反交错
         deint = settings.get("deinterlace_filter", "none")
         if deint != "none":
             filters.append(deint)
-        # 注意：像素格式一般不在这里设置，避免影响叠加，由编码参数中的 -pix_fmt 控制
         return ",".join(filters) if filters else "null"
 
     def merge_update_command_preview(self):
@@ -2690,10 +2591,8 @@ class FFmpegBatchGUI:
         if not self.ffprobe_cmd:
             self.append_info("❌ 未找到 ffprobe，无法获取媒体信息。")
             return None
-            
         if not path or not os.path.exists(path):
             return None
-    
         cmd = [self.ffprobe_cmd, "-v", "error", "-print_format", "json", "-show_streams", path]
         try:
             res = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace',
@@ -2717,22 +2616,18 @@ class FFmpegBatchGUI:
             self.merge_update_track_list()
             self.merge_update_output_preview()
             return
-
         ext = os.path.splitext(path)[1].lower().lstrip('.')
         self.original_container = ext if ext in ['mp4', 'mkv', 'mov', 'avi', 'webm'] else 'mp4'
-
         info = self.merge_get_media_info(path)
         if not info:
             self.root.after(0, lambda: self.append_info(f"[封装] 无法解析媒体信息: {path}，可能 ffprobe 失败"))
             self.merge_tracks = []
             self.merge_update_track_list()
             return
-
         streams = info.get("streams", [])
         if not streams:
             self.root.after(0, lambda: self.append_info(f"[封装] {path} 中没有发现任何流"))
             return
-
         self.merge_tracks = []
         for s in streams:
             st = s.get("codec_type")
@@ -2740,10 +2635,8 @@ class FFmpegBatchGUI:
                 continue
             track = Track(s["index"], st, s.get("codec_name", "unknown"), path, True)
             self.merge_tracks.append(track)
-
         if not self.merge_tracks:
             self.root.after(0, lambda: self.append_info(f"[封装] {path} 中未找到视频/音频/字幕轨道"))
-
         self.merge_update_track_list()
         self.merge_auto_recommend_container()
         self.merge_update_output_preview()
@@ -2751,27 +2644,16 @@ class FFmpegBatchGUI:
     def merge_update_track_list(self):
         for w in self.merge_track_frame.winfo_children():
             w.destroy()
-
         if not self.merge_tracks:
             tk.Label(self.merge_track_frame, text="未加载轨道").pack()
             return
-
         container = self.merge_track_frame
         main_video = self.merge_video.get().strip()
-
-        # 彩色备份
-#         col_bg_headers = ["#e0e0e0", "#cce5ff", "#ffcccc", "#e6f2e6", "#e0e0e0", "#e0e0e0", "#e0e0e0", "#e0e0e0", "#e0e0e0"]
-#         ROW_BG_EVEN = ["#f5f5f5", "#e6f3ff", "#ffe6f0", "#f0fcf0", "#ffffff", "#ffffff", "#ffffff", "#ffffff", "#ffffff"]
-#         ROW_BG_ODD  = ["#e6f3ff", "#f5f5f5", "#f0fcf0", "#ffe6f0", "#ffffff", "#ffffff", "#ffffff", "#ffffff", "#ffffff"]
-        # 表头背景（固定）
         col_bg_headers = ["#cccccc", "#e0e0e0", "#cccccc", "#e0e0e0", "#cccccc", "#e0e0e0", "#cccccc", "#e0e0e0", "#cccccc"]
-        # 行交错背景（偶数行 / 奇数行）
         ROW_BG_EVEN = ["#e0e0e0", "#cccccc", "#e0e0e0", "#cccccc", "#e0e0e0", "#cccccc", "#e0e0e0", "#cccccc", "#e0e0e0"]
         ROW_BG_ODD  = ["#cccccc", "#e0e0e0", "#cccccc", "#e0e0e0", "#cccccc", "#e0e0e0", "#cccccc", "#e0e0e0", "#cccccc"]
-
         headers = ["启用", "类型", "编码", "来源", "编码设置", "预览", "上移", "下移", "删除"]
         col_widths = [5, 8, 10, None, 10, 6, 4, 4, 6]
-
         for col, text in enumerate(headers):
             width = col_widths[col]
             if width is None:
@@ -2780,18 +2662,15 @@ class FFmpegBatchGUI:
             else:
                 label = tk.Label(container, text=text, anchor="center", width=width, bg=col_bg_headers[col])
                 label.grid(row=0, column=col, sticky="nsew", padx=0, pady=0)
-
         for i, track in enumerate(self.merge_tracks):
             row_num = i + 1
             row_bg = ROW_BG_EVEN if (i % 2 == 0) else ROW_BG_ODD
-
             chk_frame = tk.Frame(container, bg=row_bg[0])
             chk_frame.grid(row=row_num, column=0, sticky="nsew", padx=0, pady=0)
             var = tk.BooleanVar(value=track.enabled)
             cb = tk.Checkbutton(chk_frame, variable=var, bg=row_bg[0], activebackground=row_bg[0],
                                 command=lambda idx=i, v=var: self.merge_set_track_enabled(idx, v.get()))
             cb.pack(expand=True)
-
             if track.type == "video":
                 type_bg = "#cce5ff"
             elif track.type == "audio" and track.file_path == main_video:
@@ -2803,39 +2682,31 @@ class FFmpegBatchGUI:
             display_type = "视频(主)" if is_main_video and track.type == "video" else track.type
             lbl_type = tk.Label(container, text=display_type, anchor="center", width=col_widths[1], bg=type_bg)
             lbl_type.grid(row=row_num, column=1, sticky="nsew", padx=0, pady=0)
-
             lbl_codec = tk.Label(container, text=track.codec[:10], anchor="center", width=col_widths[2], bg=row_bg[2])
             lbl_codec.grid(row=row_num, column=2, sticky="nsew", padx=0, pady=0)
-
             src = os.path.basename(track.file_path) if track.file_path else "外部"
             lbl_src = tk.Label(container, text=src, anchor="w", bg=row_bg[3])
             lbl_src.grid(row=row_num, column=3, sticky="nsew", padx=0, pady=0)
-
             enc_text = "复制流" if not track.is_encoding() else track.enc_settings.get("encoder", "?")
             btn_enc = ttk.Button(container, text=enc_text, width=col_widths[4],
                                  command=lambda idx=i: self.merge_edit_track_settings(idx))
             btn_enc.grid(row=row_num, column=4, padx=1, pady=1)
-
             btn_preview = ttk.Button(container, text="预览", width=col_widths[5],
                                      command=lambda idx=i: self.merge_preview_track(idx))
             btn_preview.grid(row=row_num, column=5, padx=1, pady=1)
-
             btn_up = ttk.Button(container, text="↑", width=col_widths[6],
                                 command=lambda idx=i: self.merge_move_track_up(idx))
             if i == 0:
                 btn_up.state(['disabled'])
             btn_up.grid(row=row_num, column=6, padx=1, pady=1)
-
             btn_down = ttk.Button(container, text="↓", width=col_widths[7],
                                   command=lambda idx=i: self.merge_move_track_down(idx))
             if i == len(self.merge_tracks) - 1:
                 btn_down.state(['disabled'])
             btn_down.grid(row=row_num, column=7, padx=1, pady=1)
-
             btn_del = ttk.Button(container, text="删除", width=col_widths[8],
                                  command=lambda idx=i: self.merge_remove_track(idx))
             btn_del.grid(row=row_num, column=8, padx=1, pady=1)
-
         for col in range(len(headers)):
             if col == 3:
                 container.columnconfigure(col, weight=1)
@@ -2919,7 +2790,6 @@ class FFmpegBatchGUI:
         if not dim:
             return None
         w, h = dim
-    
         settings = track.enc_settings
         crop_enabled = settings.get("crop_enabled", False)
         if crop_enabled:
@@ -2927,14 +2797,12 @@ class FFmpegBatchGUI:
             crop_h_str = settings.get("crop_height", "").strip()
             crop_left_str = settings.get("crop_left", "0").strip()
             crop_top_str = settings.get("crop_top", "0").strip()
-
             crop_w = self.eval_crop_expr(crop_w_str, w, h) if crop_w_str else None
             crop_h = self.eval_crop_expr(crop_h_str, w, h) if crop_h_str else None
             if crop_w is not None and crop_h is not None and crop_w > 0 and crop_h > 0:
                 w, h = crop_w, crop_h
             else:
                 self.append_info(f"[预览] 无法解析裁剪尺寸: {crop_w_str}x{crop_h_str}，使用原尺寸 {w}x{h}")
-    
         if settings.get("scale_enabled", False):
             method = settings.get("scale_method", "width")
             scale_w_str = settings.get("scale_width", "").strip()
@@ -2974,14 +2842,12 @@ class FFmpegBatchGUI:
             h = streams[0].get("height")
             if w is None or h is None:
                 return None
-            
             rotation = 0
             side_data = streams[0].get("side_data_list", [])
             for sd in side_data:
                 if sd.get("rotation") is not None:
                     rotation = int(sd.get("rotation"))
                     break
-            
             rotate_val = enc_settings.get("rotate", "none")
             if rotate_val == "90":
                 rotation = 90
@@ -2989,7 +2855,6 @@ class FFmpegBatchGUI:
                 rotation = 270
             elif rotate_val == "180":
                 rotation = 180
-            
             if rotation % 180 == 90:
                 w, h = h, w
             return w, h
@@ -3001,11 +2866,9 @@ class FFmpegBatchGUI:
         if not os.path.exists(track.file_path):
             self.append_info(f"[预览] 文件不存在: {track.file_path}")
             return
-            
         if not self.ffplay_cmd:
             self.append_info("❌ 未找到 ffplay，无法预览。请将 ffplay.exe 放在脚本目录或添加到 PATH。")
             return
-
         if track.type == "video":
             filters = self.build_video_filter_chain(track.enc_settings)
             pip_enabled = self.pip_enabled.get()
@@ -3018,7 +2881,6 @@ class FFmpegBatchGUI:
                     if main_w is None:
                         self.append_info("[预览] 无法获取主视频尺寸，使用默认 1280x720")
                         main_w, main_h = 1280, 720
-                    
                     drawboxes = []
                     for sub in sub_videos:
                         if not getattr(sub, 'overlay_enabled', True):
@@ -3029,7 +2891,6 @@ class FFmpegBatchGUI:
                         else:
                             box_w, box_h = 200, 150
                             self.append_info(f"[预览] 无法获取从视频渲染尺寸，使用默认 {box_w}x{box_h}")
-                        
                         x_expr = sub.overlay_x if hasattr(sub, 'overlay_x') else "0"
                         y_expr = sub.overlay_y if hasattr(sub, 'overlay_y') else "0"
                         x_val = self.evaluate_expression(x_expr, main_w, main_h, box_w, box_h)
@@ -3037,32 +2898,26 @@ class FFmpegBatchGUI:
                         drawbox = f"drawbox=x={x_val}:y={y_val}:w={box_w}:h={box_h}:color=red@0.5:t=2"
                         drawboxes.append(drawbox)
                         self.append_info(f"[预览] 从视频 {os.path.basename(sub.file_path)} 实际渲染尺寸: {box_w}x{box_h}, 位置: ({x_val}, {y_val})")
-                    
                     if drawboxes:
                         drawbox_chain = ",".join(drawboxes)
                         if filters and filters != "null":
                             filters = f"{filters},{drawbox_chain}"
                         else:
                             filters = drawbox_chain
-    
             if filters and filters != "null":
                 full_filters = f"{filters},scale=-2:960"
             else:
                 full_filters = "scale=-2:960"
-    
             cmd = [self.ffplay_cmd, "-i", track.file_path, "-vf", full_filters,
                    "-volume", "10", "-window_title", f"预览: {os.path.basename(track.file_path)}"]
-    
             self.append_info(f"[预览] 执行命令: {' '.join(cmd)}")
             try:
                 subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception as e:
                 self.append_info(f"[预览] 启动 ffplay 失败: {e}")
                 return
-    
             if pip_enabled and is_main_video and sub_videos:
                 self.append_info("[预览] 占位框尺寸为从视频实际渲染大小")
-    
         elif track.type == "audio":
             cmd = [self.ffplay_cmd, "-i", track.file_path, "-nodisp", "-autoexit", "-volume", "10",
                    "-window_title", f"预览音频: {os.path.basename(track.file_path)}"]
@@ -3071,7 +2926,6 @@ class FFmpegBatchGUI:
                 subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception as e:
                 self.append_info(f"[预览音频] 启动 ffplay 失败: {e}")
-    
         else:
             self.append_info("[预览] 不支持预览字幕轨")
 
@@ -3088,29 +2942,23 @@ class FFmpegBatchGUI:
         track = self.merge_tracks[track_idx]
         win = tk.Toplevel(self.root)
         win.title(f"视频轨道设置 - {track.codec}")
-        # 先设置窗口大小，再居中
         self.center_window(win, 1000, 300)
         win.transient(self.root)
         win.grab_set()
-
         notebook = ttk.Notebook(win)
         notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
         page_enc = ttk.Frame(notebook)
         notebook.add(page_enc, text="编码器与质量")
         enc_frame = VideoEncoderFrame(page_enc)
         enc_frame.pack(fill=tk.X, padx=5, pady=5)
         enc_frame.set_settings(track.enc_settings)
-
         page_filt = ttk.Frame(notebook)
         notebook.add(page_filt, text="视频滤镜")
         filt_frame = VideoFilterFrame(page_filt)
         filt_frame.pack(fill=tk.X, padx=5, pady=5)
         filt_frame.set_settings(track.enc_settings)
-
         page_overlay = ttk.Frame(notebook)
         notebook.add(page_overlay, text="叠加/偏移")
-
         if not self.pip_enabled.get():
             msg = "当前未启用画中画模式。\n如需调整叠加/偏移参数，请先在主界面勾选“启用画中画”。\n注意给视频流选择重新编码，不能使用copy了。"
             label = tk.Label(page_overlay, text=msg, justify="center", fg="gray", 
@@ -3119,20 +2967,16 @@ class FFmpegBatchGUI:
         else:
             enabled_video_tracks = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
             is_main = (enabled_video_tracks and enabled_video_tracks[0] == track)
-
             if is_main:
                 pad_frame = ttk.LabelFrame(page_overlay, text="主视频画布偏移", padding="5")
                 pad_frame.pack(fill=tk.X, pady=5)
-
                 pad_enabled_var = tk.BooleanVar(value=getattr(track, 'pad_enabled', False))
                 ttk.Checkbutton(pad_frame, text="启用画布偏移", variable=pad_enabled_var).pack(anchor=tk.W)
-
                 w_frame = ttk.Frame(pad_frame)
                 w_frame.pack(fill=tk.X, pady=2)
                 ttk.Label(w_frame, text="画布宽度:").pack(side=tk.LEFT)
                 pad_w_var = tk.StringVar(value=getattr(track, 'pad_width', ''))
                 ttk.Entry(w_frame, textvariable=pad_w_var, width=10).pack(side=tk.LEFT, padx=5)
-
                 def fetch_size():
                     w, h = self.get_video_dimensions(track.file_path)
                     if w is not None:
@@ -3142,46 +2986,37 @@ class FFmpegBatchGUI:
                     else:
                         self.append_info("获取主视频尺寸失败")
                 ttk.Button(w_frame, text="获取主视频尺寸", command=fetch_size).pack(side=tk.LEFT, padx=5)
-
                 h_frame = ttk.Frame(pad_frame)
                 h_frame.pack(fill=tk.X, pady=2)
                 ttk.Label(h_frame, text="画布高度:").pack(side=tk.LEFT)
                 pad_h_var = tk.StringVar(value=getattr(track, 'pad_height', ''))
                 ttk.Entry(h_frame, textvariable=pad_h_var, width=10).pack(side=tk.LEFT, padx=5)
-
                 ox_frame = ttk.Frame(pad_frame)
                 ox_frame.pack(fill=tk.X, pady=2)
                 ttk.Label(ox_frame, text="偏移 X:").pack(side=tk.LEFT)
                 off_x_var = tk.StringVar(value=getattr(track, 'offset_x', '0'))
                 ttk.Entry(ox_frame, textvariable=off_x_var, width=10).pack(side=tk.LEFT, padx=5)
-
                 oy_frame = ttk.Frame(pad_frame)
                 oy_frame.pack(fill=tk.X, pady=2)
                 ttk.Label(oy_frame, text="偏移 Y:").pack(side=tk.LEFT)
                 off_y_var = tk.StringVar(value=getattr(track, 'offset_y', '0'))
                 ttk.Entry(oy_frame, textvariable=off_y_var, width=10).pack(side=tk.LEFT, padx=5)
-
                 tip_label = ttk.Label(pad_frame, text="⚠ 预览模式下无法体现主视频偏移效果，请转码后查看 ⚠",
                                       foreground="red", font=("", 12, "bold"))
                 tip_label.pack(fill=tk.X, pady=(10, 0))
-
             else:
                 ov_frame = ttk.LabelFrame(page_overlay, text="画中画叠加位置", padding="5")
                 ov_frame.pack(fill=tk.X, pady=5)
-
                 ov_enabled_var = tk.BooleanVar(value=getattr(track, 'overlay_enabled', True))
                 ttk.Checkbutton(ov_frame, text="启用叠加", variable=ov_enabled_var).pack(anchor=tk.W)
-
                 ttk.Label(ov_frame, text="X 位置 (支持表达式，如 W-w-10):").pack(anchor=tk.W)
                 ov_x_var = tk.StringVar(value=getattr(track, 'overlay_x', 'W-w-10'))
                 x_entry = ttk.Entry(ov_frame, textvariable=ov_x_var, width=30)
                 x_entry.pack(fill=tk.X, pady=2)
-
                 ttk.Label(ov_frame, text="Y 位置 (支持表达式):").pack(anchor=tk.W)
                 ov_y_var = tk.StringVar(value=getattr(track, 'overlay_y', 'H-h-10'))
                 y_entry = ttk.Entry(ov_frame, textvariable=ov_y_var, width=30)
                 y_entry.pack(fill=tk.X, pady=2)
-
                 preset_frame = ttk.LabelFrame(ov_frame, text="快速预设", padding="3")
                 preset_frame.pack(fill=tk.X, pady=5)
                 positions = {
@@ -3199,13 +3034,11 @@ class FFmpegBatchGUI:
                     btn = ttk.Button(preset_frame, text=text,
                                      command=lambda x=x_val, y=y_val: set_position(x, y))
                     btn.pack(side=tk.LEFT, padx=2, pady=2)
-
         def save():
             new_settings = {}
             new_settings.update(enc_frame.get_settings())
             new_settings.update(filt_frame.get_settings())
             track.enc_settings = new_settings
-
             if self.pip_enabled.get():
                 if is_main:
                     track.pad_enabled = pad_enabled_var.get()
@@ -3217,11 +3050,9 @@ class FFmpegBatchGUI:
                     track.overlay_enabled = ov_enabled_var.get()
                     track.overlay_x = ov_x_var.get().strip()
                     track.overlay_y = ov_y_var.get().strip()
-
             self.merge_update_track_list()
             self.merge_update_command_preview()
             win.destroy()
-
         ttk.Button(win, text="保存", command=save).pack(pady=10)
 
     def merge_edit_audio_track(self, track_idx):
@@ -3240,7 +3071,6 @@ class FFmpegBatchGUI:
         ttk.Label(win, text="采样率:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
         samplerate_var = tk.StringVar(value=track.enc_settings.get("samplerate", "44100"))
         ttk.Entry(win, textvariable=samplerate_var, width=10).grid(row=2, column=1, sticky="w", padx=5, pady=5)
-
         def save():
             track.enc_settings = {"encoder": encoder_var.get(), "bitrate": bitrate_var.get(), "samplerate": samplerate_var.get()}
             self.merge_update_track_list()
@@ -3276,11 +3106,9 @@ class FFmpegBatchGUI:
         original_ext = os.path.splitext(main_video)[1].lower().lstrip('.')
         if original_ext not in ['mp4', 'mkv', 'mov', 'avi', 'webm']:
             original_ext = 'mp4'
-
         current_enabled = [t for t in self.merge_tracks if t.enabled]
         need_encode = any(t.is_encoding() for t in current_enabled)
         has_external = any(t.file_path != main_video for t in current_enabled)
-
         rec = "mkv" if (need_encode or has_external) else original_ext
         if self.merge_container.get() != rec:
             self.merge_container.set(rec)
@@ -3353,10 +3181,8 @@ class FFmpegBatchGUI:
         if not [t for t in self.merge_tracks if t.enabled]:
             messagebox.showerror("错误", "没有启用的轨道")
             return
-    
         if not self._check_pip_video_encoders():
             return
-    
         self.merge_btn.config(state="disabled")
         threading.Thread(target=self.merge_do_merge, daemon=True).start()
 
@@ -3366,7 +3192,6 @@ class FFmpegBatchGUI:
             self.append_info("[封装] 无法生成命令，请检查设置")
             self.root.after(0, lambda: self.merge_btn.config(state="normal"))
             return
-
         self.append_info("[封装] 开始合并/转码...")
         output_file = self.merge_output.get().strip()
         source_files = set()
@@ -3374,7 +3199,6 @@ class FFmpegBatchGUI:
         for t in self.merge_tracks:
             if t.enabled and t.file_path not in source_files:
                 source_files.add(t.file_path)
-
         try:
             proc = subprocess.Popen(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, encoding='utf-8', errors='replace',
@@ -3411,11 +3235,9 @@ class FFmpegBatchGUI:
     def _check_pip_video_encoders(self):
         if not self.pip_enabled.get():
             return True
-    
         enabled_videos = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
         if not enabled_videos:
             return True
-    
         copy_tracks = [t for t in enabled_videos if t.enc_settings.get("encoder") == "copy"]
         if copy_tracks:
             self.append_info("❌ 画中画模式错误：所有视频轨道都必须重新编码，不能使用「复制流」。")
@@ -3471,7 +3293,6 @@ class FFmpegBatchGUI:
             video_exts = ['.mp4','.mkv','.avi','.mov','.flv','.ts','.webm','.m2ts']
             video_files = [f for f in files_sorted if os.path.splitext(f)[1].lower() in video_exts]
             other_files = [f for f in files_sorted if f not in video_files]
-
             root_tk = self.root
             dialog = tk.Toplevel(root_tk)
             dialog.title("批量处理选项")
@@ -3479,12 +3300,9 @@ class FFmpegBatchGUI:
             dialog.geometry(f"600x{height}")
             dialog.transient(root_tk)
             dialog.grab_set()
-
             has_main = bool(self.merge_video.get().strip())
-
             info_text = "请选择操作：\n\n• [All] 按钮：仅添加音频（不改变主视频）\n• 点击下方视频按钮：设为主视频，其余添加音频"
             tk.Label(dialog, text=info_text, justify=tk.LEFT).pack(pady=10, padx=10)
-
             def all_action():
                 if not has_main and video_files:
                     main = video_files[0]
@@ -3501,24 +3319,20 @@ class FFmpegBatchGUI:
                 self.root.after(200, self.merge_update_track_list)
                 self.root.after(200, self.merge_auto_recommend_container)
                 self.root.after(200, self.merge_update_command_preview)
-
             btn_all = tk.Button(dialog, text="[All] 仅音频", command=all_action,
                                 bg="#4CAF50", fg="white", width=22, wraplength=300)
             btn_all.pack(pady=5, padx=10)
-
             canvas_frame = ttk.Frame(dialog)
             canvas_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
             canvas = tk.Canvas(canvas_frame, highlightthickness=0)
             scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=canvas.yview)
             scrollable_frame = ttk.Frame(canvas)
-
             scrollable_frame.bind(
                 "<Configure>",
                 lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
             )
             canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
             canvas.configure(yscrollcommand=scrollbar.set)
-
             def select_main_video(idx):
                 main = video_files[idx]
                 self.root.after(0, lambda: self.merge_video.set(main))
@@ -3532,20 +3346,15 @@ class FFmpegBatchGUI:
                 self.root.after(200, self.merge_update_track_list)
                 self.root.after(200, self.merge_auto_recommend_container)
                 self.root.after(200, self.merge_update_command_preview)
-
             for i, vf in enumerate(video_files):
                 btn = tk.Button(scrollable_frame, text=f"{i+1}. {os.path.basename(vf)}",
                                 wraplength=550, anchor="w", justify=tk.LEFT,
                                 command=lambda idx=i: select_main_video(idx))
                 btn.pack(fill=tk.X, pady=2, padx=5)
-
             canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
             scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
             tk.Button(dialog, text="取消", command=dialog.destroy).pack(pady=10)
-
             dialog.wait_window()
-
         threading.Thread(target=run_in_thread, daemon=True).start()
 
 
@@ -3559,14 +3368,9 @@ if __name__ == "__main__":
                 ctypes.windll.user32.SetProcessDPIAware()
             except:
                 pass
-
     if DND_AVAILABLE:
         root = TkinterDnD.Tk()
     else:
         root = tk.Tk()
-
-    # 注意：不再调用 root.tk.call('tk', 'scaling', ...)
-    # 让 Tkinter 保持默认的 1.0 缩放，我们手动控制字体大小
-
     app = FFmpegBatchGUI(root)
     root.mainloop()
