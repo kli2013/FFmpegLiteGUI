@@ -803,37 +803,36 @@ class Track:
 class FFmpegBatchGUI:
     def __init__(self, root):
         self.root = root
-
+        self.root.config(bg='yellow')
         self.root.title("FFmpeg 多功能工具")
         screen_width = root.winfo_screenwidth()
         screen_height = root.winfo_screenheight()
-        
-        # --- 替换原有尺寸计算逻辑 ---
-        # 获取系统缩放比例
+
+        # 获取系统缩放比例（仅用于判断，不再用于乘法运算）
         try:
             scaling = root.winfo_fpixels('1i') / 96.0
         except:
             scaling = 1.0
         self.scaling = scaling
-        
+
         # 基准尺寸（100% 缩放时）
-        base_width = 1400
+        base_width = 1420
         base_height = 850
-        
-        # 移除最大90%屏幕尺寸的限制，或者将其设置为一个更大的值（如95%）
-        # 原有代码：width = min(width, max_width)
-        # 修改后：仅在计算出的尺寸过大时才限制，否则使用计算出的尺寸
-        
-        width = int(base_width * scaling)
-        height = int(base_height * scaling)
-        
+
+        # 【关键修改】直接使用基准尺寸，不再乘以 scaling
+        # 让 Tkinter 和 Windows DPI 感知自动处理缩放
+        width = base_width
+        height = base_height
+
         # 获取屏幕尺寸
         screen_width = root.winfo_screenwidth()
         screen_height = root.winfo_screenheight()
-        
-        # 仅在计算出的尺寸超过屏幕物理分辨率时才限制
-        max_width = int(screen_width * 0.95)  # 放宽限制
+
+        # 仅在计算出的尺寸过大时才限制
+        max_width = int(screen_width * 0.95)
         max_height = int(screen_height * 0.95)
+        
+        # 确保不超过屏幕限制
         width = min(width, max_width)
         height = min(height, max_height)
         
@@ -885,6 +884,8 @@ class FFmpegBatchGUI:
         self.root.dnd_bind('<<Drop>>', self.on_files_dropped)
 
         self.show_quick_warning()
+        
+        
 
     def check_ffmpeg_dependencies(self):
         ffmpeg = find_executable("ffmpeg.exe") or shutil.which("ffmpeg")
@@ -1808,24 +1809,23 @@ class FFmpegBatchGUI:
 
     # -------------------- 界面创建 --------------------
     def create_widgets(self):
-        main_hpane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
-        main_hpane.pack(fill=tk.BOTH, expand=True)
-        try:
-            import ctypes
-            hdc = ctypes.windll.user32.GetDC(0)
-            LOGPIXELSX = 88
-            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, LOGPIXELSX)
-            ctypes.windll.user32.ReleaseDC(0, hdc)
-            scaling = dpi / 96.0
-        except:
-            scaling = 1.0
-        if scaling >= 1.25:
-            self.root.after(100, lambda: main_hpane.sashpos(0, 1200))
-        
-        
-        # 使用 grid 布局：左侧自适应，右侧固定宽度 320 像素
+        # --- 使用 Grid 布局替代 PanedWindow ---
         main_frame = ttk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # 左侧容器 (可伸缩)
+        self.left_container = ttk.Frame(main_frame)
+        self.left_container.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
+
+        # 右侧固定宽度面板
+        self.right_panel = ttk.Frame(main_frame)
+        self.right_panel.grid(row=0, column=1, sticky="ns", padx=0, pady=0)
+        self.right_panel.pack_propagate(False) # 防止内部组件改变其大小
+        self.right_panel.config(width=420) # 保持原有的固定宽度
+
+        # 配置权重：左侧伸缩，右侧固定
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=0)
 
         left_container = ttk.Frame(main_frame)
         right_panel = ttk.Frame(main_frame)
