@@ -30,4 +30,4 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: Nuitka-Standalone-Build
-        path: dist/FFmpeg简易转换合并mpv.dist
+        path: dist/*.dist
