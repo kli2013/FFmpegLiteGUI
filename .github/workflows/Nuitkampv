@@ -1,0 +1,33 @@
+name: Nuitka 手动打包 MPV PRVW‌ ver
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        architecture: 'x64'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install nuitka
+        pip install tkinterdnd2
+
+    - name: Build with Nuitka
+      shell: cmd
+      run: |
+        nuitka --standalone --onefile --windows-disable-console --enable-plugin=tk-inter --include-data-files=ffmpeg_presets.json=./ffmpeg_presets.json --output-dir=dist --output-filename=FFmpeg简易转换合并MPV.exe --assume-yes-for-downloads mpvPRVW‌ver.pyw
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Nuitka-Windows-Build
+        path: dist/FFmpeg简易转换合并MPV.exe
