@@ -1,0 +1,37 @@
+name: PyInstaller 打包为文件夹 mpv ver
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+        architecture: 'x64'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller
+        pip install tkinterdnd2
+
+    - name: Build with PyInstaller (folder mode)
+      run: |
+        # 默认就是文件夹模式（-D），显式指定 -D 也无妨
+        # -w 隐藏控制台，适配 .pyw
+        # --name 指定生成的主 exe 名称
+        # --add-data 添加额外数据文件
+        pyinstaller -D -w --name "FFmpeg简易转换合并" --add-data "ffmpeg_presets.json;." mpvPRVW‌ver.pyw
+
+    - name: Upload artifact (entire dist folder)
+      uses: actions/upload-artifact@v4
+      with:
+        name: PyInstaller-Folder-Build
+        # 上传整个 dist 目录（其中包含生成的文件夹和 exe）
+        path: dist/
