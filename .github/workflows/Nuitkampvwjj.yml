@@ -9,6 +9,10 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: List files in repository (debug)
+      run: dir
+      shell: cmd
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
@@ -21,12 +25,17 @@ jobs:
         pip install nuitka
         pip install tkinterdnd2
 
-    - name: Build with Nuitka (standalone folder, no runtime extraction)
+    - name: Build with Nuitka (standalone folder)
       shell: cmd
       run: |
+        REM 请根据你的实际脚本名修改下面的文件名
         nuitka --standalone --windows-disable-console --enable-plugin=tk-inter --include-data-files=ffmpeg_presets.json=ffmpeg_presets.json --output-dir=dist --assume-yes-for-downloads "mpvPRVW‌ver.pyw"
 
-    - name: Upload artifact (entire dist folder)
+    - name: List output directory (debug)
+      run: dir dist
+      shell: cmd
+
+    - name: Upload artifact (use wildcard to catch any .dist folder)
       uses: actions/upload-artifact@v4
       with:
         name: Nuitka-Standalone-Build
