@@ -1,8 +1,7 @@
 name: PyInstaller自动打包pyw为exe
 
 on:
-  push:
-    branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
   build-windows:
