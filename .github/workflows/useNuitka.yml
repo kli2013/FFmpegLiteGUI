@@ -1,8 +1,7 @@
 name: Nuitka 自动打包 pyw 为 exe
 
 on:
-  push:
-    branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
   build-windows:
