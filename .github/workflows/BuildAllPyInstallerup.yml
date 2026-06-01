@@ -1,0 +1,158 @@
+name: Build All PyInstaller and Upload to Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release 版本号（例如 v1.0.0），不填则自动生成'
+        required: false
+        default: ''
+
+# 需要写入权限才能创建 Release 和上传附件
+permissions:
+  contents: write
+
+jobs:
+  # ---------- 1. 并行构建任务 ----------
+  build:
+    strategy:
+      matrix:
+        include:
+          - ui: 'newui'
+            mode: 'folder'
+            script: 'FFmpeg简易转换合并newui.pyw'
+            output_base: 'FFmpeg简易转换合并_newui_folder'
+          - ui: 'newui'
+            mode: 'single'
+            script: 'FFmpeg简易转换合并newui.pyw'
+            output_base: 'FFmpeg简易转换合并_newui_single'
+          - ui: 'oldui'
+            mode: 'folder'
+            script: 'FFmpeg简易转换合并.pyw'
+            output_base: 'FFmpeg简易转换合并_oldui_folder'
+          - ui: 'oldui'
+            mode: 'single'
+            script: 'FFmpeg简易转换合并.pyw'
+            output_base: 'FFmpeg简易转换合并_oldui_single'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+          architecture: 'x64'
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install tkinterdnd2
+
+      - name: 获取版本号（每个任务独立获取，仅用于产物命名）
+        id: version
+        run: |
+          if ("${{ github.event.inputs.version }}" -ne "") {
+            $VER = "${{ github.event.inputs.version }}"
+          } else {
+            # 自动生成：使用 run_number 或 git describe
+            $VER = git describe --tags --always --dirty 2>$null
+            if (-not $VER) { $VER = "continuous-${{ github.run_number }}" }
+          }
+          echo "VERSION=$VER" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "版本号: $VER"
+
+      - name: 构建（文件夹或单文件）
+        run: |
+          if ("${{ matrix.mode }}" -eq "folder") {
+            $modeFlag = "-D"
+          } else {
+            $modeFlag = "-F"
+          }
+          $finalName = "${{ matrix.output_base }}_${{ env.VERSION }}"
+          pyinstaller $modeFlag -w --name $finalName --add-data "ffmpeg_presets.json;." "${{ matrix.script }}"
+
+      - name: 上传构建产物（供后续 Release 使用）
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.output_base }}_${{ env.VERSION }}
+          path: dist/
+
+  # ---------- 2. 汇总并发布到 Release ----------
+  release:
+    needs: build          # 等待所有构建任务完成
+    runs-on: ubuntu-latest
+    if: success()
+    steps:
+      - name: 下载所有构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: all_artifacts
+
+      - name: 整理产物（压缩文件夹、收集 exe）
+        run: |
+          mkdir upload_files
+          # 遍历所有下载的 artifact 目录
+          for dir in all_artifacts/*/; do
+            # 获取 artifact 名称（目录名）
+            artifact_name=$(basename "$dir")
+            echo "处理 artifact: $artifact_name"
+            
+            # 该 artifact 内应该是 dist/ 下的内容（可能是一个文件夹或一个 .exe）
+            # 实际路径为 all_artifacts/$artifact_name/dist/*
+            content_path="$dir/dist"
+            if [ ! -d "$content_path" ]; then
+              echo "警告: $content_path 不存在，跳过"
+              continue
+            fi
+            
+            # 进入 content_path 查看内部
+            cd "$content_path"
+            for item in *; do
+              if [ -d "$item" ]; then
+                # 文件夹模式：打包成 zip
+                zip -r "../../../upload_files/${item}.zip" "$item"
+              elif [ -f "$item" ] && [[ "$item" == *.exe ]]; then
+                # 单文件 .exe：直接复制
+                cp "$item" "../../../upload_files/"
+              else
+                echo "忽略非 exe 文件: $item"
+              fi
+            done
+            cd - > /dev/null
+          done
+          
+          echo "准备上传的文件列表:"
+          ls -l upload_files/
+
+      - name: 确定 Release 版本号
+        id: release_version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            # 从任意一个构建产物的名称中提取版本号
+            # 找到第一个目录，取出 _ 之后的部分
+            first_dir=$(ls all_artifacts | head -1)
+            VERSION="${first_dir##*_}"
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Release 版本: $VERSION"
+
+      - name: 创建 Release 并上传附件
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: "Release ${{ env.VERSION }}"
+          body: |
+            自动构建版本 ${{ env.VERSION }}
+            
+            - **newui** 采用全新界面
+            - **oldui** 为兼容旧版界面
+            - 包含文件夹版（便携）和单文件版
+          files: upload_files/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
