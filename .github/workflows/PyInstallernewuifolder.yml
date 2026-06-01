@@ -27,7 +27,7 @@ jobs:
         # -w 隐藏控制台，适配 .pyw
         # --name 指定生成的主 exe 名称
         # --add-data 添加额外数据文件
-        pyinstaller -D -w --name "FFmpeg简易转换合并" --add-data "ffmpeg_presets.json;." mpvPRVW‌ver.pyw
+        pyinstaller -D -w --name "FFmpeg简易转换合并newui" --add-data "ffmpeg_presets.json;." FFmpeg简易转换合并newui.pyw
 
     - name: Upload artifact (entire dist folder)
       uses: actions/upload-artifact@v4
