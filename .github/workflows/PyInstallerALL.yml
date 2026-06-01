@@ -1,4 +1,4 @@
-name: Build All Versions
+name: Build All PyInstaller Versions
 
 on:
   workflow_dispatch:
