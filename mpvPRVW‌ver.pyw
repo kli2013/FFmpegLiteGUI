@@ -537,7 +537,7 @@ class VideoFilterFrame(ttk.LabelFrame):
         ttk.Label(crop_frame, text="上:").pack(side=tk.LEFT)
         ttk.Entry(crop_frame, textvariable=self.crop_top, width=6).pack(side=tk.LEFT)
 
-        # ---------- 新增自动检测黑边按钮 ----------
+        # ---------- 自动检测黑边按钮 ----------
         auto_crop_btn = ttk.Button(crop_frame, text="自动检测黑边",
                                    command=self.auto_detect_crop, width=14)
         auto_crop_btn.pack(side=tk.LEFT, padx=(10,0))
@@ -1096,12 +1096,12 @@ class FFmpegBatchGUI:
                 self.append_info(f"预览失败: {e}")
 
 #-------------主视频位置绘制开始----------
-    def open_visual_pad_editor(self, track_idx, pad_w_var, pad_h_var, off_x_var, off_y_var):
-        """可视化编辑主视频的画布偏移，并显示所有从视频的绿色虚线框"""
+    def open_visual_pad_editor(self, track_idx, pad_w_var, pad_h_var, off_x_var, off_y_var, live_filt_frame=None):
+        """可视化编辑主视频的画布偏移，并显示所有从视频的绿色虚线框（支持实时读取滤镜设置）"""
         track = self.merge_tracks[track_idx]
         if track.type != "video":
             return
-
+    
         # 获取所有启用的视频轨道
         enabled_videos = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
         if not enabled_videos:
@@ -1109,20 +1109,64 @@ class FFmpegBatchGUI:
             return
         main_track = enabled_videos[0]
         sub_tracks = enabled_videos[1:]  # 所有从视频
-
+    
         # 获取主视频原始尺寸（考虑旋转）
-        orig_w, orig_h = self.get_video_rotated_dimensions(track.file_path, track.enc_settings)
+        orig_w, orig_h = self.get_video_rotated_dimensions(main_track.file_path, main_track.enc_settings)
         if orig_w is None or orig_h is None:
             messagebox.showerror("错误", "无法获取主视频原始尺寸")
             return
-
-        # 获取主视频渲染尺寸（考虑裁剪/缩放）
-        rendered_size = self.get_rendered_size(main_track)
-        if rendered_size:
-            disp_w_orig, disp_h_orig = rendered_size
+    
+        # ---------- 关键修改：根据是否提供 live_filt_frame 来决定尺寸计算 ----------
+        if live_filt_frame is not None:
+            # 实时模式：从滤镜控件读取当前值
+            crop_enabled = live_filt_frame.crop_enabled.get()
+            crop_w_str = live_filt_frame.crop_width.get().strip()
+            crop_h_str = live_filt_frame.crop_height.get().strip()
+            scale_enabled = live_filt_frame.scale_enabled.get()
+            scale_method = live_filt_frame.scale_method.get()
+            scale_w_str = live_filt_frame.scale_width.get().strip()
+            scale_h_str = live_filt_frame.scale_height.get().strip()
         else:
-            disp_w_orig, disp_h_orig = orig_w, orig_h
-
+            # 降级模式：从已保存的设置读取
+            crop_enabled = main_track.enc_settings.get("crop_enabled", False)
+            crop_w_str = main_track.enc_settings.get("crop_width", "").strip()
+            crop_h_str = main_track.enc_settings.get("crop_height", "").strip()
+            scale_enabled = main_track.enc_settings.get("scale_enabled", False)
+            scale_method = main_track.enc_settings.get("scale_method", "width")
+            scale_w_str = main_track.enc_settings.get("scale_width", "").strip()
+            scale_h_str = main_track.enc_settings.get("scale_height", "").strip()
+    
+        # 计算主视频的渲染尺寸（裁剪+缩放）
+        w, h = orig_w, orig_h
+        # 裁剪
+        if crop_enabled and crop_w_str and crop_h_str:
+            def eval_crop(expr):
+                expr2 = expr.replace('iw', str(orig_w)).replace('ih', str(orig_h))
+                try:
+                    return int(eval(expr2, {"__builtins__": {}}, {}))
+                except:
+                    return None
+            cw = eval_crop(crop_w_str)
+            ch = eval_crop(crop_h_str)
+            if cw and ch and cw > 0 and ch > 0:
+                w, h = cw, ch
+        # 缩放
+        if scale_enabled:
+            try:
+                if scale_method == "width" and scale_w_str:
+                    target_w = int(scale_w_str)
+                    target_h = int(round(target_w * h / w))
+                    w, h = target_w, target_h
+                elif scale_method == "height" and scale_h_str:
+                    target_h = int(scale_h_str)
+                    target_w = int(round(target_h * w / h))
+                    w, h = target_w, target_h
+                elif scale_method == "exact" and scale_w_str and scale_h_str:
+                    w, h = int(scale_w_str), int(scale_h_str)
+            except:
+                pass
+        disp_w_orig, disp_h_orig = w, h
+    
         # 判断是否启用画布偏移
         pad_enabled = getattr(main_track, 'pad_enabled', False)
         if pad_enabled:
@@ -1139,27 +1183,27 @@ class FFmpegBatchGUI:
         else:
             current_canvas_w, current_canvas_h = orig_w, orig_h
             current_off_x, current_off_y = 0, 0
-
+    
         # 限制偏移范围
         def clamp_offset(x, y):
             x = max(-disp_w_orig + 10, min(x, current_canvas_w - 10))
             y = max(-disp_h_orig + 10, min(y, current_canvas_h - 10))
             return x, y
         current_off_x, current_off_y = clamp_offset(current_off_x, current_off_y)
-
+    
         # 创建窗口（优化：先计算好最终geometry，避免黑框闪烁）
         win = tk.Toplevel(self.root)
         win.title("可视化编辑画布偏移 - 拖拽蓝色矩形")
         win.transient(self.root)
         win.grab_set()
-
+    
         # 画布显示缩放
         max_display_w = 800
         max_display_h = 600
         scale = min(max_display_w / current_canvas_w, max_display_h / current_canvas_h, 1.0)
         disp_w = int(current_canvas_w * scale)
         disp_h = int(current_canvas_h * scale)
-
+    
         # 计算居中位置
         screen_width = win.winfo_screenwidth()
         screen_height = win.winfo_screenheight()
@@ -1167,15 +1211,14 @@ class FFmpegBatchGUI:
         y = (screen_height - (disp_h + 200)) // 2
         win.geometry(f"{disp_w + 20}x{disp_h + 200}+{x}+{y}")
         win.update_idletasks()  # 强制立即应用位置大小
-
+    
         canvas = tk.Canvas(win, width=disp_w, height=disp_h, bg="black", highlightthickness=1, highlightbackground="gray")
         canvas.pack(pady=10)
-
-        # 其余代码与原函数完全相同（从 status_var = tk.StringVar(...) 开始）
+    
         status_var = tk.StringVar(value="拖拽蓝色矩形移动，调整主视频内容在画布中的位置。绿色虚线框为从视频")
         status_label = ttk.Label(win, textvariable=status_var, justify=tk.LEFT)
         status_label.pack(pady=5)
-
+    
         # 画布尺寸输入行
         size_frame = ttk.Frame(win)
         size_frame.pack(pady=5)
@@ -1188,18 +1231,18 @@ class FFmpegBatchGUI:
         canvas_h_entry = ttk.Entry(size_frame, textvariable=canvas_h_var, width=8)
         canvas_h_entry.pack(side=tk.LEFT, padx=5)
         ttk.Button(size_frame, text="应用画布尺寸", command=lambda: update_canvas_size()).pack(side=tk.LEFT, padx=5)
-
+    
         coord_var = tk.StringVar(value=f"偏移: X={current_off_x}, Y={current_off_y}")
         coord_label = ttk.Label(win, textvariable=coord_var, font=("Courier", 10))
         coord_label.pack(pady=2)
-
+    
         # 辅助函数
         def to_canvas_coords(x, y):
             return int(x * scale), int(y * scale)
-
+    
         def to_real_coords(cx, cy):
             return int(cx / scale), int(cy / scale)
-
+    
         # 安全表达式求值（用于从视频坐标）
         def safe_eval(expr, extra_namespace):
             if not isinstance(expr, str):
@@ -1212,12 +1255,12 @@ class FFmpegBatchGUI:
                 return int(val)
             except:
                 return None
-
+    
         # 绘制所有从视频的矩形（绿色虚线，带序号）
         sub_order = {}
         for idx, sub in enumerate(sub_tracks, start=1):
             sub_order[sub] = idx
-
+    
         def draw_subtitles():
             """绘制所有从视频（绿色虚线）"""
             for sub in sub_tracks:
@@ -1241,15 +1284,15 @@ class FFmpegBatchGUI:
                 canvas.create_rectangle(cx1, cy1, cx2, cy2, outline="lightgreen", width=2, dash=(4, 4), fill="")
                 canvas.create_text(cx1 + 5, cy1 + 5, anchor="nw", text=str(sub_order[sub]),
                                    fill="red", font=("Arial", 10, "bold"))
-
+    
         draw_subtitles()
-
+    
         # 主视频矩形（蓝色实线，可拖拽）
         rect_id = None
         text_id = None
         warning_id = None
         drag_data = {"x": 0, "y": 0}
-
+    
         def draw_rectangle():
             nonlocal rect_id, text_id, warning_id
             x1 = current_off_x
@@ -1285,9 +1328,9 @@ class FFmpegBatchGUI:
                     warning_id = canvas.create_text(disp_w//2, disp_h//2, text="主视频完全不可见", fill="red", font=("Arial", 10))
                 else:
                     canvas.coords(warning_id, disp_w//2, disp_h//2)
-
+    
         draw_rectangle()
-
+    
         # 鼠标拖拽移动主视频矩形
         def on_mouse_down(event):
             if rect_id is None:
@@ -1300,7 +1343,7 @@ class FFmpegBatchGUI:
                 drag_data["x"] = event.x
                 drag_data["y"] = event.y
                 status_var.set("拖拽移动主视频位置")
-
+    
         def on_mouse_move(event):
             nonlocal current_off_x, current_off_y
             if "x" not in drag_data:
@@ -1318,15 +1361,15 @@ class FFmpegBatchGUI:
             draw_rectangle()
             drag_data["x"] = event.x
             drag_data["y"] = event.y
-
+    
         def on_mouse_up(event):
             drag_data.clear()
             status_var.set("拖拽完成，点击「保存」应用偏移")
-
+    
         canvas.bind("<Button-1>", on_mouse_down)
         canvas.bind("<B1-Motion>", on_mouse_move)
         canvas.bind("<ButtonRelease-1>", on_mouse_up)
-
+    
         def update_canvas_size():
             nonlocal current_canvas_w, current_canvas_h, scale, disp_w, disp_h, current_off_x, current_off_y
             nonlocal rect_id, text_id, warning_id
@@ -1356,7 +1399,7 @@ class FFmpegBatchGUI:
                 win.geometry(f"+{x}+{y}")
             except:
                 messagebox.showerror("错误", "画布尺寸无效")
-
+    
         def save():
             pad_w_var.set(str(current_canvas_w))
             pad_h_var.set(str(current_canvas_h))
@@ -1367,10 +1410,10 @@ class FFmpegBatchGUI:
             self.merge_update_command_preview()
             win.destroy()
             self.append_info(f"[可视化] 已设置画布 {current_canvas_w}x{current_canvas_h}, 偏移 ({current_off_x}, {current_off_y})")
-
+    
         def cancel():
             win.destroy()
-
+    
         btn_frame = ttk.Frame(win)
         btn_frame.pack(pady=10)
         ttk.Button(btn_frame, text="保存", command=save).pack(side=tk.LEFT, padx=10)
@@ -1518,11 +1561,18 @@ class FFmpegBatchGUI:
 
         def draw_background():
             canvas.delete("bg")
-            # 主视频蓝色虚线框（保持不变）
+            # 主视频蓝色虚线框
+            # 获取主视频的实际渲染尺寸（考虑裁剪/缩放）
+            main_rendered = self.get_rendered_size(main_track)
+            if main_rendered:
+                main_render_w, main_render_h = main_rendered
+            else:
+                main_render_w, main_render_h = main_orig_w, main_orig_h  # 降级使用原始尺寸
+            
             main_left = offset_x
             main_top = offset_y
-            main_right = offset_x + main_orig_w
-            main_bottom = offset_y + main_orig_h
+            main_right = offset_x + main_render_w
+            main_bottom = offset_y + main_render_h
             vis_left = max(0, main_left)
             vis_top = max(0, main_top)
             vis_right = min(canvas_width, main_right)
@@ -1533,7 +1583,7 @@ class FFmpegBatchGUI:
                 canvas.create_rectangle(cx1, cy1, cx2, cy2, outline="deepskyblue", width=2, dash=(4, 4), fill="", tags="bg")
                 canvas.create_text(cx1 + 5, cy1 + 5, anchor="nw", text="主视频", fill="deepskyblue", font=("Arial", 9), tags="bg")
         
-            # 其他从视频绿色虚线框（关键修复）
+            # 其他从视频绿色虚线框
             sub_order = {}
             for idx, sub in enumerate(sub_tracks, start=1):
                 sub_order[sub] = idx
@@ -2234,6 +2284,7 @@ class FFmpegBatchGUI:
         self.cmd_preview.delete(1.0, tk.END)
         self.cmd_preview.insert(tk.END, cmd)
 
+    # ---------- 任务管理 ----------
     def is_duplicate_task(self, input_path, output_path):
         norm_in = self.normalize_path(input_path)
         norm_out = self.normalize_path(output_path)
@@ -2464,6 +2515,7 @@ class FFmpegBatchGUI:
         except Exception as e:
             self.append_info(f"⚠️ 执行异常: {e}")
 
+    # ---------- 预设管理 ----------
     def get_preset_path(self):
         return FINAL_PRESET_PATH
 
@@ -3085,12 +3137,12 @@ class FFmpegBatchGUI:
         self.notebook.add(merge_tab, text="封装/合并/画中画")
         self.create_merge_tab(merge_tab)
 
-        # ---------- 播放器设置标签页 ----------
+        # ---------- 信息与播放器标签页 ----------
         player_tab = ttk.Frame(self.notebook)
         self.notebook.add(player_tab, text="信息与播放器")
         self.create_player_settings_tab(player_tab)
 
-        # 绑定事件刷新预览
+        # 绑定事件刷新命令预览
         self.video_encoder.vcodec.trace_add("write", lambda *a: self.update_command_preview())
         self.video_encoder.rate_control_type.trace_add("write", lambda *a: self.update_command_preview())
         self.video_encoder.crf_value.trace_add("write", lambda *a: self.update_command_preview())
@@ -4329,7 +4381,7 @@ class FFmpegBatchGUI:
                     if not pad_enabled_var.get():
                         messagebox.showinfo("提示", "请先勾选「启用画布偏移」再使用可视化编辑功能。")
                         return
-                    self.open_visual_pad_editor(track_idx, pad_w_var, pad_h_var, off_x_var, off_y_var)
+                    self.open_visual_pad_editor(track_idx, pad_w_var, pad_h_var, off_x_var, off_y_var, live_filt_frame=filt_frame)
                 ttk.Button(ox_frame, text="🎨 可视化编辑画布偏移", command=open_pad_editor).pack(side=tk.LEFT, padx=5)
                 # 第四行：偏移 Y
                 oy_frame = ttk.Frame(pad_frame)
