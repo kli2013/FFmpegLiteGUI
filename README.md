@@ -30,6 +30,7 @@
 　　多个从视频位置都可以相互预览    
 
 <img width="798" height="833" alt="Img20260601104744502" src="https://github.com/user-attachments/assets/b45de0ca-a0bc-471d-b944-228b78b058c4" />
-<img width="798" height="873" alt="Img20260601104509045" src="https://github.com/user-attachments/assets/d72817bd-46d4-4cce-bb0b-acb83051425c" />
+<img width="798" height="873" alt="Img20260601104509045" src="https://github.com/user-attachments/assets/ff7de6e3-8c3b-426c-8a65-c56e93faf5a2" />
+
 
 
