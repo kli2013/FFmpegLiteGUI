@@ -29,6 +29,7 @@
 　　如果绘制框没有实时应用新的缩放比例,先保存一下重新打开,可以用iw/2测试,这个时候绘制框和预览框应该是显眼的一长条,    
 　　多个从视频位置都可以相互预览    
 
-<img width="815" height="631" alt="Img20260601101715360" src="https://github.com/user-attachments/assets/90e34b97-3cea-45bf-99d5-629e9013486e" />
-<img width="350" height="781" alt="Img20260601103950813" src="https://github.com/user-attachments/assets/42ab4456-47aa-4b9f-9777-df95fb2b3a24" />
+<img width="798" height="833" alt="Img20260601104744502" src="https://github.com/user-attachments/assets/b45de0ca-a0bc-471d-b944-228b78b058c4" />
+<img width="798" height="873" alt="Img20260601104509045" src="https://github.com/user-attachments/assets/d72817bd-46d4-4cce-bb0b-acb83051425c" />
+
 
