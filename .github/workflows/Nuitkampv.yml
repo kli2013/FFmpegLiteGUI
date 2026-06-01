@@ -24,7 +24,7 @@ jobs:
     - name: Build with Nuitka
       shell: cmd
       run: |
-        nuitka --standalone --onefile --windows-disable-console --enable-plugin=tk-inter --include-data-files=ffmpeg_presets.json=./ffmpeg_presets.json --output-dir=dist --output-filename=FFmpeg简易转换合并MPV.exe --assume-yes-for-downloads mpvPRVW‌ver.pyw
+        nuitka --standalone --onefile --windows-disable-console --enable-plugin=tk-inter --include-data-files=ffmpeg_presets.json=./ffmpeg_presets.json --output-dir=dist --output-filename=FFmpeg简易转换合并MPV.exe --assume-yes-for-downloads FFmpeg简易转换合并newui.pyw
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
