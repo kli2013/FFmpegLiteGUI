@@ -1,4 +1,4 @@
-name: PyInstaller自动打包pyw为exe
+name: PyInstaller oldui 单文件
 
 on:
   workflow_dispatch:
