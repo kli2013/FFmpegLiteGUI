@@ -48,11 +48,13 @@ APP_NAME = "FFLiteGUI"
 USER_DATA_DIR = os.path.join(os.path.expanduser("~"), f".{APP_NAME}")
 os.makedirs(USER_DATA_DIR, exist_ok=True)
 
+# 计算本地路径
 local_preset = os.path.join(get_script_dir(), PRESET_FILE)
 
 if CUSTOM_PRESET_PATH:
     FINAL_PRESET_PATH = CUSTOM_PRESET_PATH
 else:
+    # 优先使用脚本目录下的配置文件（便携模式）
     if os.path.exists(local_preset):
         FINAL_PRESET_PATH = local_preset
     else:
@@ -534,7 +536,7 @@ class VideoFilterFrame(ttk.LabelFrame):
         ttk.Label(crop_frame, text="上:").pack(side=tk.LEFT)
         ttk.Entry(crop_frame, textvariable=self.crop_top, width=6).pack(side=tk.LEFT)
 
-        # 自动检测黑边按钮
+        # ---------- 自动检测黑边按钮 ----------
         auto_crop_btn = ttk.Button(crop_frame, text="自动检测黑边",
                                    command=self.auto_detect_crop, width=14)
         auto_crop_btn.pack(side=tk.LEFT, padx=(10,0))
@@ -611,6 +613,8 @@ class VideoFilterFrame(ttk.LabelFrame):
         self.on_trim_toggle()
 
     def auto_detect_crop(self):
+        """使用 ffmpeg cropdetect 滤镜自动检测黑边参数，并填入裁剪输入框"""
+        # 优先使用 current_file，如果没有则使用主界面的输入文件
         input_file = getattr(self, 'current_file', None)
         if not input_file or not os.path.exists(input_file):
             input_file = self.app.input_file.get().strip()
@@ -623,6 +627,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             messagebox.showerror("错误", "未找到 ffmpeg，无法检测黑边")
             return
 
+        # 禁用按钮，防止重复点击
         for child in self.winfo_children():
             if isinstance(child, ttk.Button) and "自动检测黑边" in child.cget("text"):
                 child.config(state=tk.DISABLED)
@@ -922,7 +927,7 @@ class FFmpegBatchGUI:
         self.copy_chapters = tk.BooleanVar(value=True)
         self.chapter_file = tk.StringVar(value="")
 
-        # 播放器设置
+        # 播放器设置变量
         self.use_mpv = tk.BooleanVar(value=False)
         self.mpv_path = tk.StringVar(value="mpv")
         self.load_player_settings()
@@ -938,8 +943,9 @@ class FFmpegBatchGUI:
 
         self.show_quick_warning()
 
-    # ---------- 播放器相关 ----------
+    # 播放器设置相关方法
     def load_player_settings(self):
+        """从预设 JSON 文件中加载播放器设置"""
         if os.path.exists(FINAL_PRESET_PATH):
             try:
                 with open(FINAL_PRESET_PATH, 'r', encoding='utf-8') as f:
@@ -951,6 +957,8 @@ class FFmpegBatchGUI:
                 pass
 
     def save_player_settings(self):
+        """保存播放器设置到预设 JSON 文件（独立于视频预设）"""
+        # 读取现有数据
         if os.path.exists(FINAL_PRESET_PATH):
             try:
                 with open(FINAL_PRESET_PATH, 'r', encoding='utf-8') as f:
@@ -959,6 +967,7 @@ class FFmpegBatchGUI:
                 data = {}
         else:
             data = {}
+        # 更新播放器设置
         data["player_settings"] = {
             "use_mpv": self.use_mpv.get(),
             "mpv_path": self.mpv_path.get()
@@ -967,9 +976,11 @@ class FFmpegBatchGUI:
             json.dump(data, f, indent=4, ensure_ascii=False)
 
     def preview_with_player(self, input_path, filters=None, audio_only=False, volume=10, extra_args=None):
+        """使用用户选择的播放器预览视频或音频，并输出完整命令到日志"""
         def quote_for_cmd(p):
             return f'"{p}"'
         if audio_only:
+            # 音频预览
             if self.use_mpv.get():
                 player = self.mpv_path.get().strip()
                 if not player:
@@ -977,6 +988,7 @@ class FFmpegBatchGUI:
                 cmd_str = f'{quote_for_cmd(player)} {quote_for_cmd(input_path)} --no-video --volume={volume} --autoexit'
                 self.append_info("执行命令: " + cmd_str)
                 try:
+                    # 不捕获输出，独立进程
                     subprocess.Popen(cmd_str, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     self.append_info(f"正在预览音频: {os.path.basename(input_path)}")
                 except Exception as e:
@@ -1008,7 +1020,9 @@ class FFmpegBatchGUI:
             cmd_str = " ".join(cmd_parts)
             self.append_info("执行命令: " + cmd_str)
             try:
+                # 关键修改：使用 DETACHED_PROCESS 让 mpv 独立于 Python 进程，并且不捕获输出
                 if sys.platform == "win32":
+                    # 创建独立进程，不继承控制台
                     subprocess.Popen(cmd_str, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                      creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW)
                 else:
@@ -1018,7 +1032,9 @@ class FFmpegBatchGUI:
             except Exception as e:
                 self.append_info(f"预览失败: {e}")
                 self.append_info("提示：请检查 mpv 路径是否正确，或是否已安装 mpv。")
+                self.append_info("你可以取消「启用 mpv」使用 ffplay 预览，或重新设置 mpv 路径。")
         else:
+            # ffplay 预览
             if not self.ffplay_cmd:
                 self.append_info("❌ 未找到 ffplay，无法预览。")
                 return
@@ -1033,6 +1049,7 @@ class FFmpegBatchGUI:
             display_cmd = " ".join(quote_for_cmd(p) if os.path.sep in p else p for p in cmd)
             self.append_info("执行命令: " + display_cmd)
             try:
+                # ffplay 也使用独立进程，避免阻塞
                 if sys.platform == "win32":
                     subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                      creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW)
@@ -1044,8 +1061,8 @@ class FFmpegBatchGUI:
                 self.append_info(f"预览失败: {e}")
 
 #-------------主视频位置绘制开始----------
-    def open_visual_pad_editor(self, track_idx, pad_w_var, pad_h_var, off_x_var, off_y_var):
-        """可视化编辑主视频的画布偏移，并显示所有从视频的绿色虚线框"""
+    def open_visual_pad_editor(self, track_idx, pad_w_var, pad_h_var, off_x_var, off_y_var, live_filt_frame=None):
+        """可视化编辑主视频的画布偏移，并显示所有从视频的绿色虚线框（支持实时读取滤镜设置）"""
         track = self.merge_tracks[track_idx]
         if track.type != "video":
             return
@@ -1059,17 +1076,60 @@ class FFmpegBatchGUI:
         sub_tracks = enabled_videos[1:]  # 所有从视频
 
         # 获取主视频原始尺寸（考虑旋转）
-        orig_w, orig_h = self.get_video_rotated_dimensions(track.file_path, track.enc_settings)
+        orig_w, orig_h = self.get_video_rotated_dimensions(main_track.file_path, main_track.enc_settings)
         if orig_w is None or orig_h is None:
             messagebox.showerror("错误", "无法获取主视频原始尺寸")
             return
 
-        # 获取主视频渲染尺寸（考虑裁剪/缩放）
-        rendered_size = self.get_rendered_size(main_track)
-        if rendered_size:
-            disp_w_orig, disp_h_orig = rendered_size
+        # ---------- 关键修改：根据是否提供 live_filt_frame 来决定尺寸计算 ----------
+        if live_filt_frame is not None:
+            # 实时模式：从滤镜控件读取当前值
+            crop_enabled = live_filt_frame.crop_enabled.get()
+            crop_w_str = live_filt_frame.crop_width.get().strip()
+            crop_h_str = live_filt_frame.crop_height.get().strip()
+            scale_enabled = live_filt_frame.scale_enabled.get()
+            scale_method = live_filt_frame.scale_method.get()
+            scale_w_str = live_filt_frame.scale_width.get().strip()
+            scale_h_str = live_filt_frame.scale_height.get().strip()
         else:
-            disp_w_orig, disp_h_orig = orig_w, orig_h
+            # 降级模式：从已保存的设置读取
+            crop_enabled = main_track.enc_settings.get("crop_enabled", False)
+            crop_w_str = main_track.enc_settings.get("crop_width", "").strip()
+            crop_h_str = main_track.enc_settings.get("crop_height", "").strip()
+            scale_enabled = main_track.enc_settings.get("scale_enabled", False)
+            scale_method = main_track.enc_settings.get("scale_method", "width")
+            scale_w_str = main_track.enc_settings.get("scale_width", "").strip()
+            scale_h_str = main_track.enc_settings.get("scale_height", "").strip()
+        # 计算主视频的渲染尺寸（裁剪+缩放）
+        w, h = orig_w, orig_h
+        # 裁剪
+        if crop_enabled and crop_w_str and crop_h_str:
+            def eval_crop(expr):
+                expr2 = expr.replace('iw', str(orig_w)).replace('ih', str(orig_h))
+                try:
+                    return int(eval(expr2, {"__builtins__": {}}, {}))
+                except:
+                    return None
+            cw = eval_crop(crop_w_str)
+            ch = eval_crop(crop_h_str)
+            if cw and ch and cw > 0 and ch > 0:
+                w, h = cw, ch
+        # 缩放
+        if scale_enabled:
+            try:
+                if scale_method == "width" and scale_w_str:
+                    target_w = int(scale_w_str)
+                    target_h = int(round(target_w * h / w))
+                    w, h = target_w, target_h
+                elif scale_method == "height" and scale_h_str:
+                    target_h = int(scale_h_str)
+                    target_w = int(round(target_h * w / h))
+                    w, h = target_w, target_h
+                elif scale_method == "exact" and scale_w_str and scale_h_str:
+                    w, h = int(scale_w_str), int(scale_h_str)
+            except:
+                pass
+        disp_w_orig, disp_h_orig = w, h
 
         # 判断是否启用画布偏移
         pad_enabled = getattr(main_track, 'pad_enabled', False)
@@ -1467,10 +1527,16 @@ class FFmpegBatchGUI:
         def draw_background():
             canvas.delete("bg")
             # 主视频蓝色虚线框
+            # 获取主视频的实际渲染尺寸（考虑裁剪/缩放）
+            main_rendered = self.get_rendered_size(main_track)
+            if main_rendered:
+                main_render_w, main_render_h = main_rendered
+            else:
+                main_render_w, main_render_h = main_orig_w, main_orig_h  # 降级使用原始尺寸
             main_left = offset_x
             main_top = offset_y
-            main_right = offset_x + main_orig_w
-            main_bottom = offset_y + main_orig_h
+            main_right = offset_x + main_render_w
+            main_bottom = offset_y + main_render_h
             vis_left = max(0, main_left)
             vis_top = max(0, main_top)
             vis_right = min(canvas_width, main_right)
@@ -2414,6 +2480,7 @@ class FFmpegBatchGUI:
                 with open(FINAL_PRESET_PATH, 'r', encoding='utf-8') as f:
                     presets = json.load(f)
             except: pass
+        # 过滤掉播放器设置条目（非预设）
         preset_names = [k for k in presets.keys() if k != "player_settings"]
         self.preset_combo['values'] = preset_names
 
@@ -2421,6 +2488,7 @@ class FFmpegBatchGUI:
         preset_name = simpledialog.askstring("保存预设", "请输入预设名称:", parent=self.root)
         if not preset_name: return
         preset_settings = self.get_current_settings()
+        # 读取现有数据
         if os.path.exists(FINAL_PRESET_PATH):
             try:
                 with open(FINAL_PRESET_PATH, 'r', encoding='utf-8') as f:
@@ -2429,8 +2497,9 @@ class FFmpegBatchGUI:
                 data = {}
         else:
             data = {}
+        # 保留播放器设置
         player_cfg = data.get("player_settings", {})
-        data = {k: v for k, v in data.items() if k == "player_settings"}
+        data = {k: v for k, v in data.items() if k == "player_settings"}  # 清除非播放器设置
         data[preset_name] = preset_settings
         data["player_settings"] = player_cfg
         with open(FINAL_PRESET_PATH, 'w', encoding='utf-8') as f:
@@ -2984,12 +3053,12 @@ class FFmpegBatchGUI:
         self.task_tree.pack(fill=tk.BOTH, expand=True)
         self.task_tree.bind("<Double-1>", self.on_task_double_click)
 
-        # 封装/合并标签页
+        # ---------- 封装/合并/画中画 ----------
         merge_tab = ttk.Frame(self.notebook)
         self.notebook.add(merge_tab, text="封装/合并/画中画")
         self.create_merge_tab(merge_tab)
 
-        # 信息与播放器标签页
+        # ---------- 信息与播放器标签页 ----------
         player_tab = ttk.Frame(self.notebook)
         self.notebook.add(player_tab, text="信息与播放器")
         self.create_player_settings_tab(player_tab)
@@ -3032,43 +3101,52 @@ class FFmpegBatchGUI:
         self.audio_frame.only_audio.trace_add("write", lambda *a: self.update_command_preview())
         self.audio_frame.audio_format.trace_add("write", lambda *a: self.update_command_preview())
 
+    # ---------- 播放器设置标签页 ----------
     def create_player_settings_tab(self, parent):
         frame = ttk.Frame(parent, padding="10")
         frame.pack(fill=tk.BOTH, expand=True)
+        # 启用 mpv 复选框
         self.mpv_check = ttk.Checkbutton(frame, text="启用 mpv 作为预览播放器（推荐，支持进度条等）",
                                          variable=self.use_mpv,
                                          command=self.on_player_changed)
         self.mpv_check.pack(anchor=tk.W, pady=5)
+        # mpv 路径行
         path_frame = ttk.Frame(frame)
         path_frame.pack(fill=tk.X, pady=5)
         ttk.Label(path_frame, text="mpv 可执行文件路径:").pack(side=tk.LEFT, padx=(0,5))
         self.mpv_path_entry = ttk.Entry(path_frame, textvariable=self.mpv_path, width=40)
         self.mpv_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         ttk.Button(path_frame, text="浏览", command=self.browse_mpv).pack(side=tk.LEFT, padx=5)
+        # 状态信息区域
         status_frame = ttk.LabelFrame(frame, text="状态检测", padding="5")
         status_frame.pack(fill=tk.X, pady=(15, 5))
         self.status_text = tk.Text(status_frame, height=20, width=80, wrap=tk.WORD,
                                    bg="#f8f8f8", relief=tk.FLAT)
         self.status_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # 设置为只读
         self.status_text.config(state=tk.DISABLED)
+        # 按钮行
         btn_frame = ttk.Frame(status_frame)
         btn_frame.pack(fill=tk.X, pady=(0, 5))
         ttk.Button(btn_frame, text="在文件管理器中打开预设文件夹",
                    command=self.open_preset_folder).pack(side=tk.LEFT, padx=5)
+        # 提示信息
         tip = ttk.Label(frame, text="提示：mpv 支持进度条、拖拽等交互，且兼容 FFmpeg 大部分滤镜。\n"
                                      "请确保已安装 mpv 并正确设置路径（例如 C:\\mpv\\mpv.exe 或直接输入 mpv）。\n"
                                      "未启用时使用 ffplay 预览。",
                         foreground="gray", wraplength=500, justify=tk.LEFT)
         tip.pack(anchor=tk.W, pady=(10,0))
         self.update_mpv_path_state()
+        # 绑定变量变化以更新状态
         self.use_mpv.trace_add("write", lambda *a: self.update_player_status())
         self.mpv_path.trace_add("write", lambda *a: self.update_player_status())
-        self.update_player_status()
+        self.update_player_status()  # 初始更新
 
     def open_preset_folder(self):
+        """在系统文件管理器中打开预设文件所在的文件夹"""
         folder = os.path.dirname(self.preset_file_path)
         if not os.path.exists(folder):
-            folder = get_script_dir()
+            folder = get_script_dir()  # 回退到脚本目录
         try:
             if sys.platform == "win32":
                 os.startfile(folder)
@@ -3080,15 +3158,18 @@ class FFmpegBatchGUI:
             self.append_info(f"打开文件夹失败: {e}")
 
     def update_player_status(self):
+        """更新播放器设置页面的状态信息"""
         if not hasattr(self, 'status_text'):
             return
         self.status_text.config(state=tk.NORMAL)
         self.status_text.delete(1.0, tk.END)
+        # --- 预设文件信息 ---
         preset_path = self.preset_file_path
         if os.path.exists(preset_path):
             preset_status = "✓ 文件存在"
         else:
             preset_status = "✗ 文件不存在（将自动创建）"
+        # 判断来源
         local_preset = os.path.join(get_script_dir(), PRESET_FILE)
         if preset_path == local_preset:
             source = "脚本目录（便携模式）"
@@ -3096,6 +3177,7 @@ class FFmpegBatchGUI:
             source = "用户目录（%USERPROFILE%\\.FFLiteGUI）"
         self.status_text.insert(tk.END, f"预设配置文件: {preset_path}\n")
         self.status_text.insert(tk.END, f"配置来源: {source}  | 状态: {preset_status}\n\n")
+        # --- 播放器状态 ---
         if self.use_mpv.get():
             mpv_path = self.mpv_path.get().strip()
             self.status_text.insert(tk.END, "mpv 预览: 已启用\n")
@@ -3113,9 +3195,11 @@ class FFmpegBatchGUI:
                 self.status_text.insert(tk.END, f"  ffplay 路径: {self.ffplay_cmd}  →  ✓ 可用\n")
             else:
                 self.status_text.insert(tk.END, f"  ffplay 未找到，请将 ffplay.exe 放在脚本目录或添加到 PATH。\n")
+        # --- FFmpeg 全家桶检测 ---
         self.status_text.insert(tk.END, "\n--- FFmpeg 全家桶检测 ---\n")
         tools = ['ffmpeg', 'ffplay', 'ffprobe']
         script_dir = get_script_dir()
+        # 1. 当前目录（脚本所在目录）
         self.status_text.insert(tk.END, f"当前目录 ({script_dir}):\n")
         for tool in tools:
             if sys.platform == "win32":
@@ -3126,6 +3210,7 @@ class FFmpegBatchGUI:
             exists = os.path.isfile(local_path) and os.access(local_path, os.X_OK)
             status = "✓ 存在" if exists else "✗ 不存在"
             self.status_text.insert(tk.END, f"  {exe_name}: {status}\n")
+        # 2. 环境变量 PATH
         self.status_text.insert(tk.END, "环境变量 PATH:\n")
         import shutil
         for tool in tools:
@@ -3169,7 +3254,7 @@ class FFmpegBatchGUI:
             self.output_dir.set(dirpath)
             self.update_command_preview()
 
-    # ---------- 封装/合并模块（完整复制自新版，保持功能）----------
+    # -------------------- 封装/合并模块 --------------------
     def create_merge_tab(self, parent):
         # 主视频文件行
         f1 = ttk.Frame(parent)
@@ -3479,9 +3564,11 @@ class FFmpegBatchGUI:
             sub_videos = video_tracks[1:]
             main_idx = input_files_norm.index(normalize_win_path(main_video.file_path))
     
+            # ----- 构建主视频滤镜（完全由用户在编码设置中定义，不做自动缩放）-----
             user_filters = self.build_video_filter_chain(main_video.enc_settings)
             main_filters = user_filters if user_filters != "null" else None
     
+            # ----- 构建 filter_complex -----
             filter_parts = []
             if main_filters:
                 filter_parts.append(f"[{main_idx}:v]{main_filters}[v_main_proc]")
@@ -3490,15 +3577,18 @@ class FFmpegBatchGUI:
                 filter_parts.append(f"[{main_idx}:v]null[v_main_proc]")
                 current_v = "v_main_proc"
     
+            # 画布偏移（如果启用）
             if getattr(main_video, 'pad_enabled', False) and main_video.pad_width and main_video.pad_height:
                 pw = main_video.pad_width.strip()
                 ph = main_video.pad_height.strip()
                 ox = main_video.offset_x.strip() if main_video.offset_x else "0"
                 oy = main_video.offset_y.strip() if main_video.offset_y else "0"
+                # 使用 color 滤镜创建黑色背景画布
                 filter_parts.append(f"color=c=black:s={pw}x{ph}[canvas]")
                 filter_parts.append(f"[canvas][{current_v}]overlay={ox}:{oy}:shortest=1[v_main_pad]")
                 current_v = "v_main_pad"
     
+            # 叠加子视频
             for i, sv in enumerate(sub_videos):
                 sv_idx = input_files_norm.index(normalize_win_path(sv.file_path))
                 sv_filters = self.build_video_filter_chain(sv.enc_settings)
@@ -3520,6 +3610,7 @@ class FFmpegBatchGUI:
             cmd.extend(["-filter_complex", complex_filter])
             cmd.extend(["-map", f"[{current_v}]"])
     
+            # 主视频编码参数
             v_settings = main_video.enc_settings
             vcodec = v_settings.get("encoder", "libx265")
             rc = v_settings.get("rate_control_type", "crf")
@@ -3539,6 +3630,7 @@ class FFmpegBatchGUI:
             if v_settings.get("pix_fmt_enabled", True):
                 cmd.extend(["-pix_fmt", v_settings.get("pix_fmt", "yuv420p")])
     
+            # 音频轨道
             audio_map_count = 0
             for audio in audio_tracks:
                 a_idx = input_files_norm.index(normalize_win_path(audio.file_path))
@@ -3560,6 +3652,7 @@ class FFmpegBatchGUI:
             else:
                 cmd.extend(["-disposition:a:0", "default"])   # 新增：将第一个音频设为默认
     
+            # 字幕轨道
             sub_map_count = 0
             first_sub_default = False
             for sub in subtitle_tracks:
@@ -3581,7 +3674,7 @@ class FFmpegBatchGUI:
                     first_sub_default = True
                 sub_map_count += 1
     
-        # ================== 非画中画模式 ==================
+        # ================== 非画中画模式（普通封装/合并） ==================
         else:
             video_track = video_tracks[0]
             v_idx = input_files_norm.index(normalize_win_path(video_track.file_path))
@@ -3590,8 +3683,10 @@ class FFmpegBatchGUI:
             v_settings = video_track.enc_settings
             vcodec = v_settings.get("encoder", "copy")
     
+            # 构建视频滤镜链（缩放/裁剪/旋转等）
             video_filters = self.build_video_filter_chain(v_settings)
             has_filters = video_filters and video_filters != "null"
+            # 如果启用了滤镜但编码器是 copy，自动改为重新编码
             if has_filters and vcodec == "copy":
                 self.append_info("[封装] 警告：主视频启用了滤镜（缩放/裁剪等），但编码器设为「copy」。自动将编码器改为 libx264 以应用滤镜。")
                 vcodec = "libx264"
@@ -3619,6 +3714,7 @@ class FFmpegBatchGUI:
                 if v_settings.get("pix_fmt_enabled", True):
                     cmd.extend(["-pix_fmt", v_settings.get("pix_fmt", "yuv420p")])
     
+            # 音频轨道
             audio_map_count = 0
             for audio in audio_tracks:
                 a_idx = input_files_norm.index(normalize_win_path(audio.file_path))
@@ -3640,7 +3736,7 @@ class FFmpegBatchGUI:
             else:
                 cmd.extend(["-disposition:a:0", "default"])   # 新增：将第一个音频设为默认
 
-
+            # 字幕轨道
 
             sub_map_count = 0
             first_sub_default = False
@@ -3663,6 +3759,7 @@ class FFmpegBatchGUI:
                     first_sub_default = True
                 sub_map_count += 1
     
+        # 章节处理
         if self.copy_chapters.get() and input_files_norm:
             cmd.extend(["-map_chapters", "0"])
         chapter_file = self.chapter_file.get().strip()
@@ -4090,19 +4187,22 @@ class FFmpegBatchGUI:
         notebook = ttk.Notebook(win)
         notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
     
+        # 编码器与质量页面
         page_enc = ttk.Frame(notebook)
         notebook.add(page_enc, text="编码器与质量")
         enc_frame = VideoEncoderFrame(page_enc)
         enc_frame.pack(fill=tk.X, padx=5, pady=5)
         enc_frame.set_settings(track.enc_settings)
     
+        # 视频滤镜页面（关键修复：传入 app=self 并指定 current_file）
         page_filt = ttk.Frame(notebook)
         notebook.add(page_filt, text="视频滤镜")
         filt_frame = VideoFilterFrame(page_filt, app=self)
-        filt_frame.current_file = track.file_path
+        filt_frame.current_file = track.file_path   # 让黑边检测针对当前轨道文件
         filt_frame.pack(fill=tk.X, padx=5, pady=5)
         filt_frame.set_settings(track.enc_settings)
     
+        # 叠加/偏移页面（画中画相关，保持不变）
         page_overlay = ttk.Frame(notebook)
         notebook.add(page_overlay, text="叠加/偏移")
         if not self.pip_enabled.get():
@@ -4199,7 +4299,7 @@ class FFmpegBatchGUI:
                     if not pad_enabled_var.get():
                         messagebox.showinfo("提示", "请先勾选「启用画布偏移」再使用可视化编辑功能。")
                         return
-                    self.open_visual_pad_editor(track_idx, pad_w_var, pad_h_var, off_x_var, off_y_var)
+                    self.open_visual_pad_editor(track_idx, pad_w_var, pad_h_var, off_x_var, off_y_var, live_filt_frame=filt_frame)
                 
                 ttk.Button(ox_frame, text="🎨 可视化编辑画布偏移", command=open_pad_editor).pack(side=tk.LEFT, padx=5)
                 
