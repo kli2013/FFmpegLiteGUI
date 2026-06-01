@@ -1,0 +1,78 @@
+name: Build All Versions
+
+on:
+  workflow_dispatch:
+    # 可选：允许手动输入版本号
+    inputs:
+      version:
+        description: '版本号（例如 v1.0.0），若不填则自动生成'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - ui: 'newui'
+            mode: 'folder'
+            script: 'FFmpeg简易转换合并newui.pyw'
+            output_base: 'FFmpeg简易转换合并_newui_folder'
+          - ui: 'newui'
+            mode: 'single'
+            script: 'FFmpeg简易转换合并newui.pyw'
+            output_base: 'FFmpeg简易转换合并_newui_single'
+          - ui: 'oldui'
+            mode: 'folder'
+            script: 'FFmpeg简易转换合并.pyw'
+            output_base: 'FFmpeg简易转换合并_oldui_folder'
+          - ui: 'oldui'
+            mode: 'single'
+            script: 'FFmpeg简易转换合并.pyw'
+            output_base: 'FFmpeg简易转换合并_oldui_single'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+          architecture: 'x64'
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install tkinterdnd2
+
+      - name: 获取版本号
+        id: version
+        run: |
+          if ( "${{ github.event.inputs.version }}" -ne "" ) {
+            $VER = "${{ github.event.inputs.version }}"
+          } else {
+            # 尝试从 Git 标签获取，否则使用 run_number
+            $VER = git describe --tags --always --dirty 2>$null
+            if (-not $VER) { $VER = "r${{ github.run_number }}" }
+          }
+          echo "VERSION=$VER" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "版本号: $VER"
+
+      - name: 构建（文件夹或单文件）
+        run: |
+          if ("${{ matrix.mode }}" -eq "folder") {
+            $modeFlag = "-D"
+            $suffix = "_folder"
+          } else {
+            $modeFlag = "-F"
+            $suffix = "_single"
+          }
+          $finalName = "${{ matrix.output_base }}_${{ env.VERSION }}"
+          pyinstaller $modeFlag -w --name $finalName --add-data "ffmpeg_presets.json;." "${{ matrix.script }}"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.output_base }}_${{ env.VERSION }}
+          path: dist/
