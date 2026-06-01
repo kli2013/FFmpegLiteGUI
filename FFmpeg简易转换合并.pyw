@@ -1489,11 +1489,11 @@ class FFmpegBatchGUI:
                     continue
                 if not getattr(sub, 'overlay_enabled', True):
                     continue
-                sub_orig = self.get_video_rotated_dimensions(sub.file_path, sub.enc_settings)
-                if sub_orig:
-                    sw, sh = sub_orig
-                else:
-                    sw, sh = 200, 150
+                # 使用 get_rendered_size 获取裁剪/缩放后的实际尺寸
+                size = self.get_rendered_size(sub)
+                if not size:
+                    continue
+                sw, sh = size
                 x_expr = getattr(sub, 'overlay_x', '0')
                 y_expr = getattr(sub, 'overlay_y', '0')
                 namespace = {"w": sw, "h": sh}
@@ -3932,21 +3932,20 @@ class FFmpegBatchGUI:
         # 替换变量名（iw, ih）
         expr = expr.replace('iw', str(iw)).replace('ih', str(ih))
         try:
-            # 只允许基本算术运算
             val = eval(expr, {"__builtins__": {}}, {})
             return int(val)
         except Exception as e:
             self.append_info(f"[裁剪表达式错误] {expr} -> {e}")
             return None
-    
+
     def get_rendered_size(self, track):
-        """获取视频轨道经过裁剪和缩放后的最终渲染尺寸"""
+        """获取视频轨道经过裁剪和缩放后的最终渲染尺寸（整数）"""
         dim = self.get_video_rotated_dimensions(track.file_path, track.enc_settings)
         if not dim:
             return None
         w, h = dim
-        settings = track.enc_settings
     
+        settings = track.enc_settings
         # 裁剪
         if settings.get("crop_enabled", False):
             crop_w_str = settings.get("crop_width", "").strip()
@@ -3956,13 +3955,8 @@ class FFmpegBatchGUI:
                 crop_h = self._eval_crop_expr(crop_h_str, w, h)
                 if crop_w and crop_h and crop_w > 0 and crop_h > 0:
                     w, h = crop_w, crop_h
-                    self.append_info(f"[尺寸] 裁剪后: {w}x{h}")
                 else:
-                    self.append_info(f"[尺寸] 裁剪表达式无效，使用原始 {w}x{h}")
-            else:
-                self.append_info(f"[尺寸] 裁剪启用但表达式不完整，使用原始 {w}x{h}")
-        else:
-            self.append_info(f"[尺寸] 未启用裁剪，原始 {w}x{h}")
+                    self.append_info(f"[警告] 裁剪表达式无效: {crop_w_str}/{crop_h_str}，使用原始尺寸 {w}x{h}")
     
         # 缩放（如果启用，返回缩放后的尺寸）
         if settings.get("scale_enabled", False):
@@ -3971,18 +3965,22 @@ class FFmpegBatchGUI:
             sh = settings.get("scale_height", "").strip()
             try:
                 if method == "width" and sw:
-                    target_w = int(sw)
+                    target_w = int(float(sw))
                     target_h = int(round(target_w * h / w))
                     return target_w, target_h
                 elif method == "height" and sh:
-                    target_h = int(sh)
+                    target_h = int(float(sh))
                     target_w = int(round(target_h * w / h))
                     return target_w, target_h
                 elif method == "exact" and sw and sh:
-                    return int(sw), int(sh)
-            except:
-                pass
+                    return int(float(sw)), int(float(sh))
+            except Exception as e:
+                self.append_info(f"[缩放尺寸错误] {e}")
+                # 降级返回裁剪后尺寸
         return w, h
+
+
+
 
     def get_video_rotated_dimensions(self, file_path, enc_settings):
         if not self.ffprobe_cmd:
