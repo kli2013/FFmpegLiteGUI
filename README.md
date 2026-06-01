@@ -1,4 +1,7 @@
 # FFmpegLiteGUI
+
+--写在前面,编译文件可能更新不及时,可以fork一下,自己编译,我写了好几个不同的自动编译脚本,按需编译--  
+
 　　找 AI 用 python 写的 FFmpeg GUI
 
 　　契机是 HandBrake 又又又又又又又又又换了.NET 10（软件开发框架） ,我的老Windows 10 ltsc 2021 装了.NET 10 ,运行 HandBrake还是要报错, 我当时就在想,一个破 FFmpeg 的外壳, 需要这么追新吗?
