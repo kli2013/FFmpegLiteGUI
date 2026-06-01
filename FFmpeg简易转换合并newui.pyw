@@ -2691,14 +2691,14 @@ class FFmpegBatchGUI:
     
         win = tk.Toplevel(self.root)
         win.title(f"编辑任务 - {os.path.basename(task.input)}")
-        win.geometry("1100x350")
+        win.geometry("1100x400")
         win.transient(self.root)
         win.grab_set()
         
         # 使窗口相对于主窗口居中
         win.update_idletasks()
         x = self.root.winfo_x() + (self.root.winfo_width() - 1100) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - 350) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - 400) // 2
         win.geometry(f"+{x}+{y}")
     
         notebook = ttk.Notebook(win)
@@ -2771,6 +2771,7 @@ class FFmpegBatchGUI:
         page_filt = ttk.Frame(notebook)
         notebook.add(page_filt, text="视频滤镜")
         filt_frame = VideoFilterFrame(page_filt, app=self)
+        filt_frame.current_file = task.input   # ← 新增这一行
         filt_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         filt_frame.set_settings(task.settings)
     
