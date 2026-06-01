@@ -29,7 +29,7 @@ jobs:
       shell: cmd
       run: |
         REM 请根据你的实际脚本名修改下面的文件名
-        nuitka --standalone --windows-disable-console --enable-plugin=tk-inter --include-data-files=ffmpeg_presets.json=ffmpeg_presets.json --output-dir=dist --assume-yes-for-downloads "mpvPRVW‌ver.pyw"
+        nuitka --standalone --windows-disable-console --enable-plugin=tk-inter --include-data-files=ffmpeg_presets.json=ffmpeg_presets.json --output-dir=dist --assume-yes-for-downloads "FFmpeg简易转换合并newui.pyw"
 
     - name: List output directory (debug)
       run: dir dist
