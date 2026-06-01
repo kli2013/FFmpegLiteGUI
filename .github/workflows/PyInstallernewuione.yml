@@ -1,4 +1,4 @@
-name: PyInstaller 打包为单文件 mpv ver
+name: PyInstaller newui 打包为单文件
 
 on:
   workflow_dispatch:
