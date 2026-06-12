@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+#20260613  添加了可视化绘制裁剪功能 新增了pil图片库的使用
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 import subprocess
@@ -15,6 +17,7 @@ import ctypes
 import concurrent.futures
 from typing import List, Tuple, Optional, Dict, Any, Callable
 import shlex
+import tempfile
 
 # --- 依赖检测 ---
 try:
@@ -971,29 +974,41 @@ class VideoFilterFrame(ttk.LabelFrame):
         ttk.Label(crop_frame, text="上:").pack(side=tk.LEFT)
         ttk.Entry(crop_frame, textvariable=self.crop_top, width=6).pack(side=tk.LEFT)
 
-        # 自动检测黑边按钮
-        auto_crop_btn = ttk.Button(crop_frame, text="自动检测黑边",
-                                   command=self.auto_detect_crop, width=11)
+
+#         # 自动检测黑边按钮
+        auto_crop_btn = ttk.Button(crop_frame, text="自动去黑边",
+                                   command=self.auto_detect_crop, width=9)
         auto_crop_btn.pack(side=tk.LEFT, padx=(10,0))
         ToolTip(auto_crop_btn,
                 "自动分析当前输入文件，推荐裁剪参数（去除四周黑边）。\n"
                 "参数说明：\n"
-                "• 分析帧数：检测多少帧画面（默认10帧）。帧数越多越准确，但耗时稍长（150帧=5秒内容约1秒）；\n"
-                "• round：裁剪宽/高对齐数值（默认2，保证偶数）。设为16可满足旧编码器兼容性，但可能少切无黑边方向8像素；\n"
+                "• 分析帧数：检测多少帧画面（默认10帧）。帧数越多越准确，但耗时稍长；\n"
+                "• round：裁剪宽/高对齐数值（默认2，保证偶数）。设为16可满足旧编码器兼容性；\n"
                 "• 检测从第1帧开始（skip=0）。若第一帧为黑屏，请手动增加分析帧数或跳过片头。\n"
-                "提示：检测仅需约0.5秒，可快速尝试调整参数。",
-                )
+                "提示：以上两个参数的详细调整请点击右侧的「可视化裁剪」按钮，在打开的窗口中进行设置。\n"
+                "检测仅需约0.5秒，可快速尝试调整参数。",
+                wraplength=400)
+
 
         # 增加分析帧数和round设置
-        ttk.Label(crop_frame, text="分析帧数:").pack(side=tk.LEFT, padx=(5,0))
+        ttk.Label(crop_frame, text="帧:").pack(side=tk.LEFT, padx=(5,0))
         self.crop_detect_frames = tk.StringVar(value="10")
         frames_spin = ttk.Spinbox(crop_frame, from_=1, to=100, width=3, textvariable=self.crop_detect_frames)
         frames_spin.pack(side=tk.LEFT, padx=2)
-        ttk.Label(crop_frame, text="round:").pack(side=tk.LEFT, padx=(5,0))
+        ttk.Label(crop_frame, text="Rd:").pack(side=tk.LEFT, padx=(5,0))
         self.crop_detect_round = tk.StringVar(value="2")
         round_spin = ttk.Spinbox(crop_frame, from_=1, to=16, width=3, textvariable=self.crop_detect_round)
         round_spin.pack(side=tk.LEFT, padx=2)
 
+        crop_edit_btn = ttk.Button(crop_frame, text="可视化",
+                                   command=self.open_crop_editor, width=7)
+        crop_edit_btn.pack(side=tk.LEFT, padx=(10,0))
+        ToolTip(crop_edit_btn,
+                "打开可视化裁剪窗口：\n"
+                "• 显示视频首帧画面，可用鼠标拖拽绘制矩形选区\n"
+                "• 选区参数会回填到「启用裁剪」的各项输入框中\n"
+                "• 下方仍保留「自动检测黑边」功能，可辅助定位",
+                wraplength=400)
 
         rot_frame = ttk.Frame(left_frame)
         rot_frame.pack(fill=tk.X, pady=2)
@@ -1037,6 +1052,378 @@ class VideoFilterFrame(ttk.LabelFrame):
         self.pix_fmt_combo = ttk.Combobox(hybrid_frame, textvariable=self.pix_fmt, 
                                           values=self.PIX_FMTS, width=12, state="normal")
         self.pix_fmt_combo.pack(side=tk.LEFT, padx=5)
+
+
+
+    def extract_video_frame_ppm(self, input_file, output_ppm_path, frame_sec=0.0):
+        """使用 ffmpeg 抽取指定时间点的一帧，保存为 PPM 格式（二进制 P6）。
+           返回 (宽度, 高度) 或 (None, None) 表示失败。"""
+        if not self.app.ffmpeg_cmd:
+            return None, None
+        cmd = [
+            self.app.ffmpeg_cmd,
+            "-ss", str(frame_sec),
+            "-i", input_file,
+            "-vframes", "1",
+            "-f", "image2pipe",
+            "-vcodec", "ppm",
+            "-y",
+            output_ppm_path
+        ]
+        try:
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            subprocess.run(cmd, check=True, capture_output=True, creationflags=flags, timeout=10)
+            # 解析 PPM 头部获取宽高
+            with open(output_ppm_path, 'rb') as f:
+                header = f.readline().strip()  # P6
+                if header != b'P6':
+                    return None, None
+                # 跳过注释行
+                line = f.readline()
+                while line.startswith(b'#'):
+                    line = f.readline()
+                width, height = map(int, line.split())
+            return width, height
+        except Exception as e:
+            self.app.append_info(f"[裁剪辅助] 提取视频帧失败: {e}")
+            return None, None
+    
+    def open_crop_editor(self):
+        """打开可视化裁剪窗口，图像自动缩放适应窗口，支持鼠标拖拽绘制矩形"""
+        # 获取当前输入文件
+        input_file = getattr(self, 'current_file', None)
+        if not input_file or not os.path.exists(input_file):
+            input_file = self.app.input_file.get().strip()
+        if not input_file or not os.path.exists(input_file):
+            messagebox.showerror("错误", "请先选择一个有效的输入文件")
+            return
+    
+        ffmpeg = self.app.ffmpeg_cmd
+        if not ffmpeg:
+            messagebox.showerror("错误", "未找到 ffmpeg，无法提取视频帧")
+            return
+    
+        # 提取第一帧到临时 PPM 文件
+        fd, ppm_path = tempfile.mkstemp(suffix='.ppm', prefix='ffgui_crop_')
+        os.close(fd)
+        w_orig, h_orig = self.extract_video_frame_ppm(input_file, ppm_path, frame_sec=0.0)
+        if w_orig is None or h_orig is None:
+            os.unlink(ppm_path)
+            return
+    
+        # 尝试导入 Pillow 进行图像缩放
+        try:
+            from PIL import Image, ImageTk
+            PIL_AVAILABLE = True
+        except ImportError:
+            PIL_AVAILABLE = False
+            messagebox.showwarning("提示", "未安装 Pillow 库，无法自动缩放图像，将使用滚动条模式。\n\n如需缩放功能，请运行：pip install Pillow")
+    
+        # 创建顶层窗口
+        win = tk.Toplevel(self.app.root)
+        win.title("可视化裁剪 - 鼠标拖拽绘制矩形选区")
+        win.transient(self.app.root)
+        win.grab_set()
+        win.geometry("1100x800")
+        win.update_idletasks()
+        x = (win.winfo_screenwidth() - 1100) // 2
+        y = (win.winfo_screenheight() - 800) // 2
+        win.geometry(f"+{x}+{y}")
+    
+        main_pane = ttk.Frame(win)
+        main_pane.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+    
+        # 右侧控制面板（先创建，以便确定 Canvas 剩余空间）
+        right_frame = ttk.Frame(main_pane, width=280)
+        right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(10,0))
+        right_frame.pack_propagate(False)
+    
+        # 左侧 Canvas 容器
+        canvas_frame = ttk.Frame(main_pane)
+        canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    
+        # 创建 Canvas 和滚动条（如果 Pillow 不可用则保留滚动条）
+        h_scroll = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL)
+        v_scroll = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL)
+        canvas = tk.Canvas(canvas_frame, bg='gray',
+                           xscrollcommand=h_scroll.set,
+                           yscrollcommand=v_scroll.set)
+        h_scroll.config(command=canvas.xview)
+        v_scroll.config(command=canvas.yview)
+    
+        # 使用 grid 布局滚动条
+        canvas.grid(row=0, column=0, sticky="nsew")
+        v_scroll.grid(row=0, column=1, sticky="ns")
+        h_scroll.grid(row=1, column=0, sticky="ew")
+        canvas_frame.grid_rowconfigure(0, weight=1)
+        canvas_frame.grid_columnconfigure(0, weight=1)
+    
+        # 先让窗口刷新一次，获取 Canvas 的实际显示区域尺寸
+        win.update_idletasks()
+        canvas.update_idletasks()
+        canvas_width = canvas.winfo_width()
+        canvas_height = canvas.winfo_height()
+    
+        # 初始化缩放比例和原始图像尺寸
+        scale = 1.0
+        img_tk = None
+        orig_w, orig_h = w_orig, h_orig
+    
+        if PIL_AVAILABLE and canvas_width > 0 and canvas_height > 0:
+            # 计算缩放比例，使图像完整显示在 Canvas 内
+            scale = min(canvas_width / w_orig, canvas_height / h_orig)
+            new_w = int(w_orig * scale)
+            new_h = int(h_orig * scale)
+            # 使用 Pillow 缩放图像
+            pil_img = Image.open(ppm_path)
+            pil_img_resized = pil_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            img_tk = ImageTk.PhotoImage(pil_img_resized)
+            # 设置 Canvas 滚动区域为缩放后的图像尺寸（不需要滚动）
+            canvas.config(scrollregion=(0, 0, new_w, new_h))
+            canvas.create_image(0, 0, anchor=tk.NW, image=img_tk, tags="bg_img")
+            canvas.image = img_tk
+            # 隐藏滚动条（因为没有必要）
+            h_scroll.pack_forget()
+            v_scroll.pack_forget()
+            # 重新调整 grid 布局，让 Canvas 单独占满
+            v_scroll.grid_remove()
+            h_scroll.grid_remove()
+        else:
+            # 回退到滚动条模式，不缩放
+            canvas.config(scrollregion=(0, 0, w_orig, h_orig))
+            try:
+                img_tk = tk.PhotoImage(file=ppm_path)
+                canvas.create_image(0, 0, anchor=tk.NW, image=img_tk, tags="bg_img")
+                canvas.image = img_tk
+            except:
+                messagebox.showerror("错误", "无法加载图像帧")
+                os.unlink(ppm_path)
+                win.destroy()
+                return
+            # 确保滚动条可见
+            v_scroll.grid()
+            h_scroll.grid()
+            # 添加提示
+            tip_text = "图像较大，请使用右侧/底部滚动条查看完整画面。"
+        os.unlink(ppm_path)
+    
+        # 创建右侧按钮和信息区域
+        info_var = tk.StringVar(value="尚未绘制矩形")
+        ttk.Label(right_frame, textvariable=info_var, wraplength=260, justify=tk.LEFT).pack(pady=5, fill=tk.X)
+    
+        btn_frame = ttk.Frame(right_frame)
+        btn_frame.pack(fill=tk.X, pady=5)
+    
+        # 矩形绘制状态
+        rect_id = None
+        rect_tmp_id = None
+        start_x = start_y = 0
+        current_rect = None
+        drawing = False
+    
+        # 坐标转换函数（根据是否缩放）
+        if PIL_AVAILABLE and scale != 1.0:
+            def canvas_to_image_coords(cx, cy):
+                # 画布坐标转原始图像坐标
+                x = cx / scale
+                y = cy / scale
+                return max(0, min(x, orig_w)), max(0, min(y, orig_h))
+    
+            def image_to_canvas_coords(x, y):
+                return x * scale, y * scale
+        else:
+            def canvas_to_image_coords(cx, cy):
+                x = canvas.canvasx(cx)
+                y = canvas.canvasy(cy)
+                return max(0, min(x, orig_w)), max(0, min(y, orig_h))
+    
+            def image_to_canvas_coords(x, y):
+                return x, y
+    
+        def update_info():
+            if current_rect:
+                x1, y1, x2, y2 = current_rect
+                x = min(x1, x2)
+                y = min(y1, y2)
+                w = abs(x2 - x1)
+                h = abs(y2 - y1)
+                info_var.set(f"左上: ({int(x)}, {int(y)})  宽: {int(w)}  高: {int(h)}\ncrop={int(w)}:{int(h)}:{int(x)}:{int(y)}")
+            else:
+                info_var.set("未绘制矩形")
+    
+        def redraw_rect():
+            nonlocal rect_id
+            if rect_id:
+                canvas.delete(rect_id)
+            if current_rect:
+                x1, y1, x2, y2 = current_rect
+                # 转换为画布坐标
+                cx1, cy1 = image_to_canvas_coords(x1, y1)
+                cx2, cy2 = image_to_canvas_coords(x2, y2)
+                rect_id = canvas.create_rectangle(cx1, cy1, cx2, cy2, outline='red', width=2)
+    
+        def on_down(event):
+            nonlocal start_x, start_y, drawing, current_rect, rect_id, rect_tmp_id
+            drawing = True
+            start_x, start_y = canvas_to_image_coords(event.x, event.y)
+            if rect_id:
+                canvas.delete(rect_id)
+                rect_id = None
+            if rect_tmp_id:
+                canvas.delete(rect_tmp_id)
+                rect_tmp_id = None
+            current_rect = None
+            update_info()
+    
+        def on_move(event):
+            if not drawing:
+                return
+            cur_x, cur_y = canvas_to_image_coords(event.x, event.y)
+            nonlocal rect_tmp_id
+            if rect_tmp_id:
+                canvas.delete(rect_tmp_id)
+            # 在画布上绘制临时矩形（使用画布坐标）
+            cx1, cy1 = image_to_canvas_coords(start_x, start_y)
+            cx2, cy2 = image_to_canvas_coords(cur_x, cur_y)
+            rect_tmp_id = canvas.create_rectangle(cx1, cy1, cx2, cy2, outline='lime', width=2)
+    
+        def on_up(event):
+            nonlocal drawing, current_rect, rect_tmp_id
+            if not drawing:
+                return
+            drawing = False
+            end_x, end_y = canvas_to_image_coords(event.x, event.y)
+            if rect_tmp_id:
+                canvas.delete(rect_tmp_id)
+                rect_tmp_id = None
+            if abs(end_x - start_x) < 2 or abs(end_y - start_y) < 2:
+                if current_rect:
+                    redraw_rect()
+                update_info()
+                return
+            current_rect = (start_x, start_y, end_x, end_y)
+            redraw_rect()
+            update_info()
+    
+        canvas.bind("<Button-1>", on_down)
+        canvas.bind("<B1-Motion>", on_move)
+        canvas.bind("<ButtonRelease-1>", on_up)
+    
+        # 自动检测黑边
+        def auto_detect():
+            self.crop_detect_frames.set(frames_var.get())
+            self.crop_detect_round.set(round_var.get())
+            old = self.current_file
+            self.current_file = input_file
+            try:
+                self.auto_detect_crop()
+            finally:
+                self.current_file = old
+            if self.crop_enabled.get():
+                try:
+                    w = int(self.crop_width.get())
+                    h = int(self.crop_height.get())
+                    x = int(self.crop_left.get())
+                    y = int(self.crop_top.get())
+                    nonlocal current_rect, rect_id
+                    current_rect = (x, y, x+w, y+h)
+                    redraw_rect()
+                    update_info()
+                except:
+                    pass
+    
+        def clear_rect():
+            nonlocal current_rect, rect_id
+            current_rect = None
+            if rect_id:
+                canvas.delete(rect_id)
+                rect_id = None
+            update_info()
+    
+        def apply_crop():
+            if not current_rect:
+                messagebox.showwarning("警告", "请先绘制矩形")
+                return
+            x1, y1, x2, y2 = current_rect
+            x = min(x1, x2)
+            y = min(y1, y2)
+            w = abs(x2 - x1)
+            h = abs(y2 - y1)
+            if w <= 0 or h <= 0:
+                messagebox.showerror("错误", "矩形尺寸无效")
+                return
+            # 修正为偶数
+            if w % 2:
+                if x + w + 1 <= orig_w:
+                    w += 1
+                else:
+                    w -= 1
+            if h % 2:
+                if y + h + 1 <= orig_h:
+                    h += 1
+                else:
+                    h -= 1
+            if x + w > orig_w:
+                w = orig_w - x
+            if y + h > orig_h:
+                h = orig_h - y
+            if w <= 0 or h <= 0:
+                messagebox.showerror("错误", "修正后矩形无效")
+                return
+            self.crop_enabled.set(True)
+            self.crop_width.set(str(int(w)))
+            self.crop_height.set(str(int(h)))
+            self.crop_left.set(str(int(x)))
+            self.crop_top.set(str(int(y)))
+            self.app.append_info(f"[裁剪] 应用 crop={int(w)}:{int(h)}:{int(x)}:{int(y)}")
+            win.destroy()
+    
+        # 创建右侧按钮
+        ttk.Button(btn_frame, text="自动检测黑边", command=auto_detect).pack(fill=tk.X, pady=2)
+    
+        # 分析帧数和 round 同一行
+        param_frame = ttk.Frame(btn_frame)
+        param_frame.pack(fill=tk.X, pady=5)
+        row = ttk.Frame(param_frame)
+        row.pack(fill=tk.X)
+        # 分析帧数
+        frames_container = ttk.Frame(row)
+        frames_container.pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(frames_container, text="分析帧数:").pack(side=tk.LEFT)
+        frames_var = tk.StringVar(value=self.crop_detect_frames.get())
+        ttk.Spinbox(frames_container, from_=1, to=100, width=5, textvariable=frames_var, state="normal").pack(side=tk.LEFT, padx=5)
+        frames_var.trace_add("write", lambda *a: self.crop_detect_frames.set(frames_var.get()))
+        # round
+        round_container = ttk.Frame(row)
+        round_container.pack(side=tk.LEFT)
+        ttk.Label(round_container, text="round:").pack(side=tk.LEFT)
+        round_var = tk.StringVar(value=self.crop_detect_round.get())
+        ttk.Spinbox(round_container, from_=1, to=16, width=5, textvariable=round_var, state="normal").pack(side=tk.LEFT, padx=5)
+        round_var.trace_add("write", lambda *a: self.crop_detect_round.set(round_var.get()))
+    
+        ttk.Button(btn_frame, text="清除矩形", command=clear_rect).pack(fill=tk.X, pady=2)
+        ttk.Button(btn_frame, text="保存并应用裁剪", command=apply_crop).pack(fill=tk.X, pady=2)
+        ttk.Button(btn_frame, text="取消", command=win.destroy).pack(fill=tk.X, pady=2)
+    
+        if PIL_AVAILABLE and scale != 1.0:
+            tip_text = "图像已自动缩放适应窗口，鼠标拖拽绘制矩形即可，无需滚动。"
+        else:
+            tip_text = "未安装 Pillow，图像未缩放，请使用滚动条查看完整画面。"
+        ttk.Label(right_frame, text=tip_text, foreground="gray", wraplength=260).pack(pady=10)
+    
+        # 如果已有裁剪参数，同步显示
+        if self.crop_enabled.get():
+            try:
+                w = int(self.crop_width.get())
+                h = int(self.crop_height.get())
+                x = int(self.crop_left.get())
+                y = int(self.crop_top.get())
+                current_rect = (x, y, x+w, y+h)
+                redraw_rect()
+                update_info()
+            except:
+                pass
+
 
     def auto_detect_crop(self):
         input_file = getattr(self, 'current_file', None)
@@ -1171,6 +1558,9 @@ class VideoFilterFrame(ttk.LabelFrame):
         self.subtitle_enabled.set(settings.get("subtitle_enabled", False))
         self.subtitle_path.set(settings.get("subtitle_path", ""))
         self.toggle_subtitle()
+
+
+
 
 # ================== 音频组件 ==================
 class AudioFrame(ttk.LabelFrame):
@@ -3845,18 +4235,20 @@ class FFmpegBatchGUI:
         track = self.merge_tracks[track_idx]
         win = tk.Toplevel(self.root)
         win.title(f"视频轨道设置 - {track.codec}")
-        center_window(win, 700, 300)
+        center_window(win, 700, 300)  # 适当增加高度以容纳新页面
         win.transient(self.root)
         win.grab_set()
         notebook = ttk.Notebook(win)
         notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
     
+        # ----- 页面1：编码器与质量 -----
         page_enc = ttk.Frame(notebook)
         notebook.add(page_enc, text="编码器与质量")
         enc_frame = VideoEncoderFrame(page_enc)
         enc_frame.pack(fill=tk.X, padx=5, pady=5)
         enc_frame.set_settings(track.enc_settings)
     
+        # ----- 页面2：视频滤镜 -----
         page_filt = ttk.Frame(notebook)
         notebook.add(page_filt, text="视频滤镜")
         filt_frame = VideoFilterFrame(page_filt, app=self)
@@ -3864,34 +4256,109 @@ class FFmpegBatchGUI:
         filt_frame.pack(fill=tk.X, padx=5, pady=5)
         filt_frame.set_settings(track.enc_settings)
     
+        # ----- 页面3：截取片段 -----
         page_trim = ttk.Frame(notebook)
         notebook.add(page_trim, text="截取片段")
         trim_frame = TrimFrame(page_trim)
         trim_frame.pack(fill=tk.X, padx=5, pady=5)
         trim_frame.set_settings(track.enc_settings)
     
+        # ========== 页面4：循环水印与绿幕抠像（始终存在，不受画中画影响） ==========
+        page_loop = ttk.Frame(notebook)
+        notebook.add(page_loop, text="循环/绿幕控制")
+    
+        # 左右并排的主容器
+        main_row = ttk.Frame(page_loop)
+        main_row.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+    
+        # ========== 左侧：循环控制 ==========
+        left_frame = ttk.LabelFrame(main_row, text="循环播放", padding="5")
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0,5))
+    
+        loop_enabled_var = tk.BooleanVar(value=track.enc_settings.get("loop_enabled", False))
+        ttk.Checkbutton(left_frame, text="启用循环播放", variable=loop_enabled_var).pack(anchor=tk.W, pady=(0,5))
+    
+        ttk.Label(left_frame, text="循环模式:").pack(anchor=tk.W, pady=(5,0))
+        loop_mode_var = tk.StringVar(value=track.enc_settings.get("loop_mode", "infinite"))
+        ttk.Radiobutton(left_frame, text="无限循环", variable=loop_mode_var, value="infinite").pack(anchor=tk.W, padx=10)
+    
+        count_frame = ttk.Frame(left_frame)
+        count_frame.pack(anchor=tk.W, padx=10, pady=2)
+        ttk.Radiobutton(count_frame, text="指定次数", variable=loop_mode_var, value="count").pack(side=tk.LEFT)
+        loop_count_var = tk.IntVar(value=track.enc_settings.get("loop_count", 3))
+        count_spin = ttk.Spinbox(count_frame, from_=1, to=100, width=5, textvariable=loop_count_var, state="readonly")
+        count_spin.pack(side=tk.LEFT, padx=5)
+    
+        # ========== 右侧：绿幕抠像 ==========
+        right_frame = ttk.LabelFrame(main_row, text="绿幕抠像 (色度键)", padding="5")
+        right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5,0))
+    
+        chroma_enabled_var = tk.BooleanVar(value=track.enc_settings.get("chroma_enabled", False))
+        ttk.Checkbutton(right_frame, text="启用绿幕抠像", variable=chroma_enabled_var).pack(anchor=tk.W)
+    
+        # 颜色选择
+        color_row = ttk.Frame(right_frame)
+        color_row.pack(fill=tk.X, pady=2)
+        ttk.Label(color_row, text="抠除颜色:").pack(side=tk.LEFT)
+        chroma_color_var = tk.StringVar(value=track.enc_settings.get("chroma_color", "green"))
+        color_combo = ttk.Combobox(color_row, textvariable=chroma_color_var,
+                                   values=["green", "blue", "black", "white"], state="readonly", width=10)
+        color_combo.pack(side=tk.LEFT, padx=5)
+    
+        # 相似度滑块
+        sim_frame = ttk.Frame(right_frame)
+        sim_frame.pack(fill=tk.X, pady=2)
+        sim_label = ttk.Label(sim_frame, text="相似度 (0~1，越小越严格):")
+        sim_label.pack(side=tk.LEFT)
+        init_sim = track.enc_settings.get("chroma_similarity", 0.3)
+        if init_sim <= 0:
+            init_sim = 0.3
+        chroma_similarity_var = tk.DoubleVar(value=init_sim)
+        sim_slider = ttk.Scale(sim_frame, from_=0.0, to=1.0, variable=chroma_similarity_var,
+                               orient=tk.HORIZONTAL, length=150)
+        sim_slider.pack(side=tk.LEFT, padx=5)
+        sim_value_label = ttk.Label(sim_frame, text=f"{chroma_similarity_var.get():.4f}")
+        sim_value_label.pack(side=tk.LEFT)
+        sim_slider.configure(command=lambda v: sim_value_label.config(text=f"{float(v):.4f}"))
+    
+        # 混合度滑块
+        blend_frame = ttk.Frame(right_frame)
+        blend_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(blend_frame, text="混合度/平滑 (0~1):").pack(side=tk.LEFT)
+        chroma_blend_var = tk.DoubleVar(value=track.enc_settings.get("chroma_blend", 0.1))
+        blend_slider = ttk.Scale(blend_frame, from_=0.0, to=1.0, variable=chroma_blend_var,
+                                 orient=tk.HORIZONTAL, length=150)
+        blend_slider.pack(side=tk.LEFT, padx=5)
+        blend_label = ttk.Label(blend_frame, text=f"{chroma_blend_var.get():.2f}")
+        blend_label.pack(side=tk.LEFT)
+        blend_slider.configure(command=lambda v: blend_label.config(text=f"{float(v):.2f}"))
+    
+        # ========== 页面5：叠加/偏移（仅在画中画启用时显示控件，否则显示提示） ==========
         page_overlay = ttk.Frame(notebook)
         notebook.add(page_overlay, text="叠加/偏移")
-        if not self.pip_enabled.get():
-            msg = "当前未启用画中画模式。\n如需调整叠加/偏移参数，请先在主界面勾选“启用画中画”。\n注意给视频流选择重新编码，不能使用copy了。"
-            label = tk.Label(page_overlay, text=msg, justify="center", fg="gray",
-                             font=("Microsoft YaHei", 14, "bold"))
-            label.pack(expand=True, pady=50)
-        else:
+    
+        if self.pip_enabled.get():
+            # 画中画模式：显示叠加/偏移设置
             enabled_video_tracks = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
             is_main = (enabled_video_tracks and enabled_video_tracks[0] == track)
+    
             if is_main:
+                # 主视频：画布偏移
                 pad_frame = ttk.LabelFrame(page_overlay, text="主视频画布偏移", padding="5")
                 pad_frame.pack(fill=tk.X, pady=5)
+    
                 pad_enabled_var = tk.BooleanVar(value=getattr(track, 'pad_enabled', False))
                 ttk.Checkbutton(pad_frame, text="启用画布偏移", variable=pad_enabled_var).pack(anchor=tk.W)
+    
                 w_frame = ttk.Frame(pad_frame)
                 w_frame.pack(fill=tk.X, pady=2)
                 ttk.Label(w_frame, text="画布宽度:").pack(side=tk.LEFT)
                 pad_w_var = tk.StringVar(value=getattr(track, 'pad_width', ''))
                 pad_w_entry = ttk.Entry(w_frame, textvariable=pad_w_var, width=10)
                 pad_w_entry.pack(side=tk.LEFT, padx=5)
+    
                 def fetch_size():
+                    # 获取主视频最终渲染尺寸（考虑裁剪和缩放）
                     crop_enabled = filt_frame.crop_enabled.get()
                     crop_w_str = filt_frame.crop_width.get().strip()
                     crop_h_str = filt_frame.crop_height.get().strip()
@@ -3930,45 +4397,59 @@ class FFmpegBatchGUI:
                     pad_w_var.set(str(w))
                     pad_h_var.set(str(h))
                     self._append_info_ui(f"最终渲染尺寸: {w}x{h}")
+    
                 ttk.Button(w_frame, text="获取主视频尺寸", command=fetch_size).pack(side=tk.LEFT, padx=5)
+    
                 h_frame = ttk.Frame(pad_frame)
                 h_frame.pack(fill=tk.X, pady=2)
                 ttk.Label(h_frame, text="画布高度:").pack(side=tk.LEFT)
                 pad_h_var = tk.StringVar(value=getattr(track, 'pad_height', ''))
                 ttk.Entry(h_frame, textvariable=pad_h_var, width=10).pack(side=tk.LEFT, padx=5)
+    
                 ox_frame = ttk.Frame(pad_frame)
                 ox_frame.pack(fill=tk.X, pady=2)
                 ttk.Label(ox_frame, text="偏移 X:").pack(side=tk.LEFT)
                 off_x_var = tk.StringVar(value=getattr(track, 'offset_x', '0'))
                 off_x_entry = ttk.Entry(ox_frame, textvariable=off_x_var, width=10)
                 off_x_entry.pack(side=tk.LEFT, padx=5)
+    
                 def open_pad_editor():
                     if not pad_enabled_var.get():
                         messagebox.showinfo("提示", "请先勾选「启用画布偏移」再使用可视化编辑功能。")
                         return
                     self.open_visual_pad_editor(track_idx, pad_w_var, pad_h_var, off_x_var, off_y_var, live_filt_frame=filt_frame)
+    
                 ttk.Button(ox_frame, text="🎨 可视化编辑画布偏移", command=open_pad_editor).pack(side=tk.LEFT, padx=5)
+    
                 oy_frame = ttk.Frame(pad_frame)
                 oy_frame.pack(fill=tk.X, pady=2)
                 ttk.Label(oy_frame, text="偏移 Y:").pack(side=tk.LEFT)
                 off_y_var = tk.StringVar(value=getattr(track, 'offset_y', '0'))
                 ttk.Entry(oy_frame, textvariable=off_y_var, width=10).pack(side=tk.LEFT, padx=5)
+    
                 tip_label = ttk.Label(pad_frame, text="⚠ 预览模式下无法体现主视频偏移效果，请转码后查看 ⚠ 可用编辑框简易查看",
                                       foreground="red", font=("", 12, "bold"))
                 tip_label.pack(fill=tk.X, pady=(10, 0))
+    
             else:
+                # 从视频：叠加位置
                 ov_frame = ttk.LabelFrame(page_overlay, text="画中画叠加位置", padding="5")
                 ov_frame.pack(fill=tk.X, pady=5)
+    
                 ov_enabled_var = tk.BooleanVar(value=getattr(track, 'overlay_enabled', True))
                 ttk.Checkbutton(ov_frame, text="启用叠加", variable=ov_enabled_var).pack(anchor=tk.W)
+    
                 ttk.Label(ov_frame, text="X 位置 (支持表达式，如 W-w-10):").pack(anchor=tk.W)
                 ov_x_var = tk.StringVar(value=getattr(track, 'overlay_x', 'W-w-10'))
                 x_entry = ttk.Entry(ov_frame, textvariable=ov_x_var, width=30)
                 x_entry.pack(fill=tk.X, pady=2)
+    
                 ttk.Label(ov_frame, text="Y 位置 (支持表达式):").pack(anchor=tk.W)
                 ov_y_var = tk.StringVar(value=getattr(track, 'overlay_y', 'H-h-10'))
                 y_entry = ttk.Entry(ov_frame, textvariable=ov_y_var, width=30)
                 y_entry.pack(fill=tk.X, pady=2)
+    
+                # 快速预设
                 preset_frame = ttk.LabelFrame(ov_frame, text="快速预设", padding="3")
                 preset_frame.pack(fill=tk.X, pady=5)
                 positions = {
@@ -3986,202 +4467,66 @@ class FFmpegBatchGUI:
                     btn = ttk.Button(preset_frame, text=text,
                                      command=lambda x=x_val, y=y_val: set_position(x, y))
                     btn.pack(side=tk.LEFT, padx=2, pady=2)
+    
+                # 可视化编辑按钮
                 vis_btn = ttk.Button(preset_frame, text="🎨 可视化编辑坐标",
                                      command=lambda: self.open_visual_overlay_editor(track_idx, ov_x_var, ov_y_var, filt_frame))
                 vis_btn.pack(side=tk.LEFT, padx=5, pady=2)
-
     
-            # ================= 新增：循环水印控制页面 =================
-            page_loop = ttk.Frame(notebook)
-            notebook.add(page_loop, text="循环水印控制")
+        else:
+            # 未启用画中画：显示灰色提示
+            msg = "当前未启用画中画模式。\n如需调整叠加/偏移参数，请先在主界面勾选“启用画中画”。\n注意给视频流选择重新编码，不能使用copy了。"
+            label = tk.Label(page_overlay, text=msg, justify="center", fg="gray",
+                             font=("Microsoft YaHei", 14, "bold"))
+            label.pack(expand=True, pady=50)
     
-            # 左右并排的主容器
-            main_row = ttk.Frame(page_loop)
-            main_row.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-    
-            # ========== 左侧：循环控制 ==========
-            left_frame = ttk.LabelFrame(main_row, text="循环播放", padding="5")
-            left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
-    
-            loop_enabled_var = tk.BooleanVar(value=track.enc_settings.get("loop_enabled", False))
-            ttk.Checkbutton(left_frame, text="启用循环播放", variable=loop_enabled_var).pack(anchor=tk.W, pady=(0,5))
-    
-            # 循环模式选项垂直排列
-            ttk.Label(left_frame, text="循环模式:").pack(anchor=tk.W, pady=(5,0))
-            loop_mode_var = tk.StringVar(value=track.enc_settings.get("loop_mode", "infinite"))
-            ttk.Radiobutton(left_frame, text="无限循环", variable=loop_mode_var, value="infinite").pack(anchor=tk.W, padx=10)
-            
-            count_frame = ttk.Frame(left_frame)
-            count_frame.pack(anchor=tk.W, padx=10, pady=2)
-            ttk.Radiobutton(count_frame, text="指定次数", variable=loop_mode_var, value="count").pack(side=tk.LEFT)
-            loop_count_var = tk.IntVar(value=track.enc_settings.get("loop_count", 3))
-            count_spin = ttk.Spinbox(count_frame, from_=1, to=100, width=5, textvariable=loop_count_var, state="readonly")
-            count_spin.pack(side=tk.LEFT, padx=5)
-    
-            # ========== 右侧：绿幕抠像 ==========
-            right_frame = ttk.LabelFrame(main_row, text="绿幕抠像 (色度键)", padding="5")
-            right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
-    
-            chroma_enabled_var = tk.BooleanVar(value=track.enc_settings.get("chroma_enabled", False))
-    
-            def toggle_chroma():
-                state = tk.NORMAL if chroma_enabled_var.get() else tk.DISABLED
-                for w in (color_combo, sim_slider, blend_slider):
-                    w.config(state=state)
-    
-            ttk.Checkbutton(right_frame, text="启用绿幕抠像", variable=chroma_enabled_var,
-                            command=toggle_chroma).pack(anchor=tk.W)
-    
-            # 颜色选择
-            # 颜色选择（带吸管按钮）
-            color_row = ttk.Frame(right_frame)
-            color_row.pack(fill=tk.X, pady=2)
-            ttk.Label(color_row, text="抠除颜色:").pack(side=tk.LEFT)
-            chroma_color_var = tk.StringVar(value=track.enc_settings.get("chroma_color", "green"))
-            color_combo = ttk.Combobox(color_row, textvariable=chroma_color_var,
-                                       values=["green", "blue", "black", "white"], state="readonly", width=10)
-            color_combo.pack(side=tk.LEFT, padx=5)
-
-            # 色块：显示当前颜色的小矩形
-            color_swatch = tk.Label(color_row, width=4, height=1, relief=tk.SUNKEN, bg=chroma_color_var.get())
-            color_swatch.pack(side=tk.LEFT, padx=5)
-    
-            # 更新色块的函数
-            def update_swatch(*args):
-                color_swatch.config(bg=chroma_color_var.get())
-            chroma_color_var.trace_add("write", update_swatch)
-
-            # 自定义颜色选择窗口（带吸管）
-            def pick_color_with_eyedropper():
-                import ctypes
-                import ctypes.wintypes
-
-                # 获取屏幕某点的原始颜色 (Windows API)
-                def get_pixel_color(x, y):
-                    hdc = ctypes.windll.user32.GetDC(0)
-                    pixel = ctypes.windll.gdi32.GetPixel(hdc, x, y)
-                    ctypes.windll.user32.ReleaseDC(0, hdc)
-                    r = pixel & 0xFF
-                    g = (pixel >> 8) & 0xFF
-                    b = (pixel >> 16) & 0xFF
-                    return f"#{r:02x}{g:02x}{b:02x}"
-
-                # 创建半透明全屏遮罩
-                mask = tk.Toplevel(win)
-                mask.attributes('-fullscreen', True)
-                mask.attributes('-alpha', 0.3)          # 半透明，可以看到背后画面
-                mask.configure(bg='black', cursor='crosshair')
-                mask.attributes('-topmost', True)
-
-                # 提示标签
-                tip = tk.Label(mask, text="点击屏幕任意位置取色 (ESC 取消)", 
-                               font=("Microsoft YaHei", 16, "bold"),
-                               fg="white", bg="black", padx=20, pady=10)
-                tip.pack(expand=True)
-
-                def on_click(event):
-                    # 先隐藏遮罩，以便获取底层真实颜色
-                    mask.withdraw()
-                    mask.update_idletasks()   # 确保窗口立即隐藏
-                    # 获取鼠标位置的颜色（此时遮罩已隐藏，读取的是原始屏幕）
-                    hex_color = get_pixel_color(event.x_root, event.y_root)
-                    mask.destroy()            # 关闭遮罩
-                    chroma_color_var.set(hex_color)
-
-                def on_escape(event):
-                    mask.destroy()
-
-                mask.bind("<Button-1>", on_click)
-                mask.bind("<Escape>", on_escape)
-
-                # 等待遮罩窗口关闭
-                win.wait_window(mask)
-    
-            ttk.Button(color_row, text="🔍吸取颜色", command=pick_color_with_eyedropper).pack(side=tk.LEFT, padx=5)
-
-            # 标准色盘按钮（原来的色盘选择）
-            def pick_standard_color():
-                from tkinter import colorchooser
-                color_code = colorchooser.askcolor(title="选择抠像颜色", parent=win, initialcolor=chroma_color_var.get())[1]
-                if color_code:
-                    chroma_color_var.set(color_code)
-    
-            ttk.Button(color_row, text="标准色盘", command=pick_standard_color).pack(side=tk.LEFT, padx=5)
-
-
-            # 相似度滑块
-            sim_frame = ttk.Frame(right_frame)
-            sim_frame.pack(fill=tk.X, pady=2)
-            sim_label = ttk.Label(sim_frame, text="相似度 (0~1，越小越严格):")
-            sim_label.pack(side=tk.LEFT)
-            # 添加ToolTip
-            ToolTip(sim_label,
-                    "【绿幕/蓝幕】推荐 0.3 左右，可适当调整。\n"
-                    "【黑色背景】即使相似度设为极小值(0.0001)也很难完美抠除，\n"
-                    "因为黑色区域通常包含阴影、渐变，会导致边缘残留或误抠。\n"
-                    "【建议】纯色背景抠图最好使用带透明通道的 PNG 图片，\n"
-                    "或者先用图像处理软件将背景彻底擦除。",
-                    wraplength=400)
-            init_sim = track.enc_settings.get("chroma_similarity", 0.3)
-            if init_sim <= 0:
-                init_sim = 0.3
-            chroma_similarity_var = tk.DoubleVar(value=init_sim)
-            sim_slider = ttk.Scale(sim_frame, from_=0.0, to=1.0, variable=chroma_similarity_var,
-                                   orient=tk.HORIZONTAL, length=150)
-            sim_slider.pack(side=tk.LEFT, padx=5)
-            sim_value_label = ttk.Label(sim_frame, text=f"{chroma_similarity_var.get():.4f}")
-            sim_value_label.pack(side=tk.LEFT)
-            sim_slider.configure(command=lambda v: sim_value_label.config(text=f"{float(v):.4f}"))
-    
-            # 混合度滑块
-            blend_frame = ttk.Frame(right_frame)
-            blend_frame.pack(fill=tk.X, pady=2)
-            ttk.Label(blend_frame, text="混合度/平滑 (0~1):").pack(side=tk.LEFT)
-            chroma_blend_var = tk.DoubleVar(value=track.enc_settings.get("chroma_blend", 0.1))
-            blend_slider = ttk.Scale(blend_frame, from_=0.0, to=1.0, variable=chroma_blend_var,
-                                     orient=tk.HORIZONTAL, length=150)
-            blend_slider.pack(side=tk.LEFT, padx=5)
-            blend_label = ttk.Label(blend_frame, text=f"{chroma_blend_var.get():.2f}")
-            blend_label.pack(side=tk.LEFT)
-            blend_slider.configure(command=lambda v: blend_label.config(text=f"{float(v):.2f}"))
-    
-            # 初始化控件状态
-            toggle_chroma()
-
-
+        # ========== 保存按钮 ==========
         def save():
-            new_settings = {}
-            new_settings.update(enc_frame.get_settings())
-            new_settings.update(filt_frame.get_settings())
-            new_settings.update(trim_frame.get_settings())
-            track.enc_settings = new_settings
-            if self.pip_enabled.get():
-                if is_main:
-                    track.pad_enabled = pad_enabled_var.get()
-                    track.pad_width = pad_w_var.get().strip()
-                    track.pad_height = pad_h_var.get().strip()
-                    track.offset_x = off_x_var.get().strip()
-                    track.offset_y = off_y_var.get().strip()
-                else:
-                    track.overlay_enabled = ov_enabled_var.get()
-                    track.overlay_x = ov_x_var.get().strip()
-                    track.overlay_y = ov_y_var.get().strip()
-
-            # 保存循环和绿幕设置
-            track.enc_settings["loop_enabled"] = loop_enabled_var.get()
-            track.enc_settings["loop_mode"] = loop_mode_var.get()
-            track.enc_settings["loop_count"] = loop_count_var.get()
-            track.enc_settings["chroma_enabled"] = chroma_enabled_var.get()
-            track.enc_settings["chroma_color"] = chroma_color_var.get()
-            similarity = chroma_similarity_var.get()
-            if similarity < 1e-5:   # 避免值为0导致chromakey出错
-                similarity = 1e-5
-            track.enc_settings["chroma_similarity"] = similarity
-            track.enc_settings["chroma_blend"] = chroma_blend_var.get()
-
-            self.merge_update_track_list()
-            self.merge_update_command_preview()
-            win.destroy()
+            try:
+                # 收集编码、滤镜、截取设置
+                new_settings = {}
+                new_settings.update(enc_frame.get_settings())
+                new_settings.update(filt_frame.get_settings())
+                new_settings.update(trim_frame.get_settings())
+                track.enc_settings = new_settings
+    
+                # 循环和绿幕设置（始终存在）
+                track.enc_settings["loop_enabled"] = loop_enabled_var.get()
+                track.enc_settings["loop_mode"] = loop_mode_var.get()
+                track.enc_settings["loop_count"] = loop_count_var.get()
+                track.enc_settings["chroma_enabled"] = chroma_enabled_var.get()
+                track.enc_settings["chroma_color"] = chroma_color_var.get()
+                similarity = chroma_similarity_var.get()
+                if similarity < 1e-5:
+                    similarity = 1e-5
+                track.enc_settings["chroma_similarity"] = similarity
+                track.enc_settings["chroma_blend"] = chroma_blend_var.get()
+    
+                # 画中画相关设置（仅在启用画中画时保存）
+                if self.pip_enabled.get():
+                    enabled_video_tracks = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
+                    is_main = (enabled_video_tracks and enabled_video_tracks[0] == track)
+                    if is_main:
+                        # 主视频
+                        track.pad_enabled = pad_enabled_var.get()
+                        track.pad_width = pad_w_var.get().strip()
+                        track.pad_height = pad_h_var.get().strip()
+                        track.offset_x = off_x_var.get().strip()
+                        track.offset_y = off_y_var.get().strip()
+                    else:
+                        # 从视频
+                        track.overlay_enabled = ov_enabled_var.get()
+                        track.overlay_x = ov_x_var.get().strip()
+                        track.overlay_y = ov_y_var.get().strip()
+    
+                # 刷新界面并关闭窗口
+                self.merge_update_track_list()
+                self.merge_update_command_preview()
+                win.destroy()
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                messagebox.showerror("保存错误", f"保存设置时发生错误：\n{e}\n请检查参数是否有效。")
     
         ttk.Button(win, text="保存", command=save).pack(pady=10)
 
