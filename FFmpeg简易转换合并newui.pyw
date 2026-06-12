@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-#20260613  添加了可视化绘制裁剪功能 新增了pil图片库的使用
+# 换绘制方法, 移除pil库的使用,尽量保持只引用一个第三方库 就是拖拽库
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
@@ -1089,8 +1089,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             return None, None
     
     def open_crop_editor(self):
-        """打开可视化裁剪窗口，图像自动缩放适应窗口，支持鼠标拖拽绘制矩形"""
-        # 获取当前输入文件
+        """可视化裁剪窗口：点击第一个点，移动鼠标显示虚线框，点击第二个点确定矩形"""
         input_file = getattr(self, 'current_file', None)
         if not input_file or not os.path.exists(input_file):
             input_file = self.app.input_file.get().strip()
@@ -1103,7 +1102,6 @@ class VideoFilterFrame(ttk.LabelFrame):
             messagebox.showerror("错误", "未找到 ffmpeg，无法提取视频帧")
             return
     
-        # 提取第一帧到临时 PPM 文件
         fd, ppm_path = tempfile.mkstemp(suffix='.ppm', prefix='ffgui_crop_')
         os.close(fd)
         w_orig, h_orig = self.extract_video_frame_ppm(input_file, ppm_path, frame_sec=0.0)
@@ -1111,38 +1109,56 @@ class VideoFilterFrame(ttk.LabelFrame):
             os.unlink(ppm_path)
             return
     
-        # 尝试导入 Pillow 进行图像缩放
         try:
-            from PIL import Image, ImageTk
-            PIL_AVAILABLE = True
-        except ImportError:
-            PIL_AVAILABLE = False
-            messagebox.showwarning("提示", "未安装 Pillow 库，无法自动缩放图像，将使用滚动条模式。\n\n如需缩放功能，请运行：pip install Pillow")
+            img = tk.PhotoImage(file=ppm_path)
+        except Exception as e:
+            messagebox.showerror("错误", f"无法加载图像帧: {e}")
+            os.unlink(ppm_path)
+            return
+        os.unlink(ppm_path)
     
-        # 创建顶层窗口
+        screen_w = self.app.root.winfo_screenwidth()
+        screen_h = self.app.root.winfo_screenheight()
+        max_w = int(screen_w * 0.9)
+        max_h = int(screen_h * 0.9)
+    
+        RIGHT_PANEL_WIDTH = 280
+        EXTRA_HEIGHT = 120
+        img_w, img_h = img.width(), img.height()
+    
+        need_scroll = (img_w > max_w - RIGHT_PANEL_WIDTH - 30) or (img_h > max_h - EXTRA_HEIGHT)
+    
+        if not need_scroll:
+            total_w = img_w + RIGHT_PANEL_WIDTH + 30
+            total_h = img_h + EXTRA_HEIGHT
+            total_w = min(total_w, max_w)
+            total_h = min(total_h, max_h)
+            win_geometry = f"{total_w}x{total_h}"
+        else:
+            total_w = max_w
+            total_h = max_h
+            win_geometry = f"{total_w}x{total_h}"
+    
         win = tk.Toplevel(self.app.root)
-        win.title("可视化裁剪 - 鼠标拖拽绘制矩形选区")
+        win.title("可视化裁剪 - 点击两点确定矩形（移动鼠标有虚线辅助）")
         win.transient(self.app.root)
         win.grab_set()
-        win.geometry("1100x800")
+        win.geometry(win_geometry)
         win.update_idletasks()
-        x = (win.winfo_screenwidth() - 1100) // 2
-        y = (win.winfo_screenheight() - 800) // 2
+        x = (screen_w - win.winfo_width()) // 2
+        y = (screen_h - win.winfo_height()) // 2
         win.geometry(f"+{x}+{y}")
     
         main_pane = ttk.Frame(win)
         main_pane.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
     
-        # 右侧控制面板（先创建，以便确定 Canvas 剩余空间）
-        right_frame = ttk.Frame(main_pane, width=280)
+        right_frame = ttk.Frame(main_pane, width=RIGHT_PANEL_WIDTH)
         right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(10,0))
         right_frame.pack_propagate(False)
     
-        # 左侧 Canvas 容器
         canvas_frame = ttk.Frame(main_pane)
         canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     
-        # 创建 Canvas 和滚动条（如果 Pillow 不可用则保留滚动条）
         h_scroll = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL)
         v_scroll = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL)
         canvas = tk.Canvas(canvas_frame, bg='gray',
@@ -1151,165 +1167,160 @@ class VideoFilterFrame(ttk.LabelFrame):
         h_scroll.config(command=canvas.xview)
         v_scroll.config(command=canvas.yview)
     
-        # 使用 grid 布局滚动条
         canvas.grid(row=0, column=0, sticky="nsew")
         v_scroll.grid(row=0, column=1, sticky="ns")
         h_scroll.grid(row=1, column=0, sticky="ew")
         canvas_frame.grid_rowconfigure(0, weight=1)
         canvas_frame.grid_columnconfigure(0, weight=1)
     
-        # 先让窗口刷新一次，获取 Canvas 的实际显示区域尺寸
-        win.update_idletasks()
-        canvas.update_idletasks()
-        canvas_width = canvas.winfo_width()
-        canvas_height = canvas.winfo_height()
+        canvas.config(scrollregion=(0, 0, img_w, img_h))
+        canvas.create_image(0, 0, anchor=tk.NW, image=img, tags="bg_img")
+        canvas.image = img
     
-        # 初始化缩放比例和原始图像尺寸
-        scale = 1.0
-        img_tk = None
-        orig_w, orig_h = w_orig, h_orig
+        # 状态变量
+        points = []            # 存储两个点 [(x1,y1), (x2,y2)]
+        temp_rect_id = None    # 移动鼠标时的虚线矩形ID
+        start_point = None     # 第一个点（临时）
+        rect_id = None         # 最终红色矩形ID
+        info_var = tk.StringVar(value="👉 点击图像上的第一个点，标记矩形起始位置")
     
-        if PIL_AVAILABLE and canvas_width > 0 and canvas_height > 0:
-            # 计算缩放比例，使图像完整显示在 Canvas 内
-            scale = min(canvas_width / w_orig, canvas_height / h_orig)
-            new_w = int(w_orig * scale)
-            new_h = int(h_orig * scale)
-            # 使用 Pillow 缩放图像
-            pil_img = Image.open(ppm_path)
-            pil_img_resized = pil_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-            img_tk = ImageTk.PhotoImage(pil_img_resized)
-            # 设置 Canvas 滚动区域为缩放后的图像尺寸（不需要滚动）
-            canvas.config(scrollregion=(0, 0, new_w, new_h))
-            canvas.create_image(0, 0, anchor=tk.NW, image=img_tk, tags="bg_img")
-            canvas.image = img_tk
-            # 隐藏滚动条（因为没有必要）
-            h_scroll.pack_forget()
-            v_scroll.pack_forget()
-            # 重新调整 grid 布局，让 Canvas 单独占满
-            v_scroll.grid_remove()
-            h_scroll.grid_remove()
-        else:
-            # 回退到滚动条模式，不缩放
-            canvas.config(scrollregion=(0, 0, w_orig, h_orig))
-            try:
-                img_tk = tk.PhotoImage(file=ppm_path)
-                canvas.create_image(0, 0, anchor=tk.NW, image=img_tk, tags="bg_img")
-                canvas.image = img_tk
-            except:
-                messagebox.showerror("错误", "无法加载图像帧")
-                os.unlink(ppm_path)
-                win.destroy()
-                return
-            # 确保滚动条可见
-            v_scroll.grid()
-            h_scroll.grid()
-            # 添加提示
-            tip_text = "图像较大，请使用右侧/底部滚动条查看完整画面。"
-        os.unlink(ppm_path)
+        # 信息标签（高亮显示）
+        info_label = tk.Label(right_frame, textvariable=info_var, wraplength=RIGHT_PANEL_WIDTH-20,
+                              justify=tk.LEFT, bg="#FFFFCC", relief=tk.SUNKEN, padx=5, pady=5)
+        info_label.pack(pady=5, fill=tk.X)
     
-        # 创建右侧按钮和信息区域
-        info_var = tk.StringVar(value="尚未绘制矩形")
-        ttk.Label(right_frame, textvariable=info_var, wraplength=260, justify=tk.LEFT).pack(pady=5, fill=tk.X)
-    
-        btn_frame = ttk.Frame(right_frame)
-        btn_frame.pack(fill=tk.X, pady=5)
-    
-        # 矩形绘制状态
-        rect_id = None
-        rect_tmp_id = None
-        start_x = start_y = 0
-        current_rect = None
-        drawing = False
-    
-        # 坐标转换函数（根据是否缩放）
-        if PIL_AVAILABLE and scale != 1.0:
-            def canvas_to_image_coords(cx, cy):
-                # 画布坐标转原始图像坐标
-                x = cx / scale
-                y = cy / scale
-                return max(0, min(x, orig_w)), max(0, min(y, orig_h))
-    
-            def image_to_canvas_coords(x, y):
-                return x * scale, y * scale
-        else:
-            def canvas_to_image_coords(cx, cy):
-                x = canvas.canvasx(cx)
-                y = canvas.canvasy(cy)
-                return max(0, min(x, orig_w)), max(0, min(y, orig_h))
-    
-            def image_to_canvas_coords(x, y):
-                return x, y
+        def canvas_to_image(cx, cy):
+            x = canvas.canvasx(cx)
+            y = canvas.canvasy(cy)
+            return max(0, min(x, img_w)), max(0, min(y, img_h))
     
         def update_info():
-            if current_rect:
-                x1, y1, x2, y2 = current_rect
+            """根据 points 状态更新右侧信息"""
+            if len(points) == 2:
+                x1, y1 = points[0]
+                x2, y2 = points[1]
                 x = min(x1, x2)
                 y = min(y1, y2)
                 w = abs(x2 - x1)
                 h = abs(y2 - y1)
-                info_var.set(f"左上: ({int(x)}, {int(y)})  宽: {int(w)}  高: {int(h)}\ncrop={int(w)}:{int(h)}:{int(x)}:{int(y)}")
+                info_var.set(f"✅ 矩形已确定\n起始点: ({int(x1)}, {int(y1)})\n结束点: ({int(x2)}, {int(y2)})\n"
+                             f"左上: ({int(x)}, {int(y)})  宽: {int(w)}  高: {int(h)}\n"
+                             f"裁剪参数: crop={int(w)}:{int(h)}:{int(x)}:{int(y)}\n"
+                             "👉 可以继续点击其他位置重置矩形")
+            elif len(points) == 1:
+                x1, y1 = points[0]
+                info_var.set(f"📍 已标记第一个点: ({int(x1)}, {int(y1)})\n👉 移动鼠标查看虚线矩形，点击第二个点确定")
             else:
-                info_var.set("未绘制矩形")
+                info_var.set("👉 点击图像上的第一个点，标记矩形起始位置")
     
-        def redraw_rect():
-            nonlocal rect_id
-            if rect_id:
-                canvas.delete(rect_id)
-            if current_rect:
-                x1, y1, x2, y2 = current_rect
-                # 转换为画布坐标
-                cx1, cy1 = image_to_canvas_coords(x1, y1)
-                cx2, cy2 = image_to_canvas_coords(x2, y2)
-                rect_id = canvas.create_rectangle(cx1, cy1, cx2, cy2, outline='red', width=2)
+        def draw_temp_rect(event):
+            """鼠标移动时绘制从起点到当前鼠标位置的虚线矩形"""
+            nonlocal temp_rect_id
+            if start_point is None:
+                if temp_rect_id:
+                    canvas.delete(temp_rect_id)
+                    temp_rect_id = None
+                return
+            cur_x, cur_y = canvas_to_image(event.x, event.y)
+            if temp_rect_id:
+                canvas.delete(temp_rect_id)
+            temp_rect_id = canvas.create_rectangle(start_point[0], start_point[1], cur_x, cur_y,
+                                                   outline='yellow', width=2, dash=(4, 2), tags="temp_rect")
     
-        def on_down(event):
-            nonlocal start_x, start_y, drawing, current_rect, rect_id, rect_tmp_id
-            drawing = True
-            start_x, start_y = canvas_to_image_coords(event.x, event.y)
+        def on_canvas_click(event):
+            nonlocal points, rect_id, start_point, temp_rect_id
+            x_img, y_img = canvas_to_image(event.x, event.y)
+    
+            # 清空之前的最终矩形
             if rect_id:
                 canvas.delete(rect_id)
                 rect_id = None
-            if rect_tmp_id:
-                canvas.delete(rect_tmp_id)
-                rect_tmp_id = None
-            current_rect = None
-            update_info()
+            # 清除临时矩形
+            if temp_rect_id:
+                canvas.delete(temp_rect_id)
+                temp_rect_id = None
     
-        def on_move(event):
-            if not drawing:
-                return
-            cur_x, cur_y = canvas_to_image_coords(event.x, event.y)
-            nonlocal rect_tmp_id
-            if rect_tmp_id:
-                canvas.delete(rect_tmp_id)
-            # 在画布上绘制临时矩形（使用画布坐标）
-            cx1, cy1 = image_to_canvas_coords(start_x, start_y)
-            cx2, cy2 = image_to_canvas_coords(cur_x, cur_y)
-            rect_tmp_id = canvas.create_rectangle(cx1, cy1, cx2, cy2, outline='lime', width=2)
-    
-        def on_up(event):
-            nonlocal drawing, current_rect, rect_tmp_id
-            if not drawing:
-                return
-            drawing = False
-            end_x, end_y = canvas_to_image_coords(event.x, event.y)
-            if rect_tmp_id:
-                canvas.delete(rect_tmp_id)
-                rect_tmp_id = None
-            if abs(end_x - start_x) < 2 or abs(end_y - start_y) < 2:
-                if current_rect:
-                    redraw_rect()
+            if len(points) == 0:
+                # 第一个点
+                points = [(x_img, y_img)]
+                start_point = (x_img, y_img)
                 update_info()
-                return
-            current_rect = (start_x, start_y, end_x, end_y)
-            redraw_rect()
+                canvas.bind("<Motion>", draw_temp_rect)
+            elif len(points) == 1:
+                # 第二个点
+                points.append((x_img, y_img))
+                start_point = None
+                canvas.unbind("<Motion>")
+                # 绘制最终矩形
+                x1, y1 = points[0]
+                x2, y2 = points[1]
+                rect_id = canvas.create_rectangle(x1, y1, x2, y2, outline='red', width=2)
+                update_info()
+                # 自动滚动到矩形中心
+                cx = (x1 + x2) // 2
+                cy = (y1 + y2) // 2
+                canvas.see(cx, cy)
+            else:
+                # 已有两个点，再次点击：重置所有，以当前点为新的第一个点
+                points = [(x_img, y_img)]
+                start_point = (x_img, y_img)
+                update_info()
+                canvas.bind("<Motion>", draw_temp_rect)
+    
+        canvas.bind("<Button-1>", on_canvas_click)
+    
+        def clear_rect():
+            nonlocal points, rect_id, start_point, temp_rect_id
+            points = []
+            if rect_id:
+                canvas.delete(rect_id)
+                rect_id = None
+            if temp_rect_id:
+                canvas.delete(temp_rect_id)
+                temp_rect_id = None
+            start_point = None
+            canvas.unbind("<Motion>")
             update_info()
     
-        canvas.bind("<Button-1>", on_down)
-        canvas.bind("<B1-Motion>", on_move)
-        canvas.bind("<ButtonRelease-1>", on_up)
+        def apply_crop():
+            if len(points) != 2:
+                messagebox.showwarning("提示", "请先在图像上点击两个点来确定裁剪矩形")
+                return
+            x1, y1 = points[0]
+            x2, y2 = points[1]
+            x = min(x1, x2)
+            y = min(y1, y2)
+            w = abs(x2 - x1)
+            h = abs(y2 - y1)
+            if w <= 0 or h <= 0:
+                messagebox.showerror("错误", "矩形尺寸无效")
+                return
+            # 奇偶修正
+            if w % 2:
+                if x + w + 1 <= img_w:
+                    w += 1
+                else:
+                    w -= 1
+            if h % 2:
+                if y + h + 1 <= img_h:
+                    h += 1
+                else:
+                    h -= 1
+            if x + w > img_w:
+                w = img_w - x
+            if y + h > img_h:
+                h = img_h - y
+            if w <= 0 or h <= 0:
+                messagebox.showerror("错误", "修正后矩形无效")
+                return
+            self.crop_enabled.set(True)
+            self.crop_width.set(str(int(w)))
+            self.crop_height.set(str(int(h)))
+            self.crop_left.set(str(int(x)))
+            self.crop_top.set(str(int(y)))
+            self.app.append_info(f"[裁剪] 应用 crop={int(w)}:{int(h)}:{int(x)}:{int(y)}")
+            win.destroy()
     
-        # 自动检测黑边
         def auto_detect():
             self.crop_detect_frames.set(frames_var.get())
             self.crop_detect_round.set(round_var.get())
@@ -1325,75 +1336,38 @@ class VideoFilterFrame(ttk.LabelFrame):
                     h = int(self.crop_height.get())
                     x = int(self.crop_left.get())
                     y = int(self.crop_top.get())
-                    nonlocal current_rect, rect_id
-                    current_rect = (x, y, x+w, y+h)
-                    redraw_rect()
+                    nonlocal points, rect_id, start_point, temp_rect_id
+                    # 清除旧状态
+                    if rect_id:
+                        canvas.delete(rect_id)
+                    if temp_rect_id:
+                        canvas.delete(temp_rect_id)
+                    canvas.unbind("<Motion>")
+                    points = [(x, y), (x+w, y+h)]
+                    start_point = None
+                    rect_id = canvas.create_rectangle(x, y, x+w, y+h, outline='red', width=2)
                     update_info()
+                    canvas.see(x + w//2, y + h//2)
                 except:
                     pass
     
-        def clear_rect():
-            nonlocal current_rect, rect_id
-            current_rect = None
-            if rect_id:
-                canvas.delete(rect_id)
-                rect_id = None
-            update_info()
+        btn_frame = ttk.Frame(right_frame)
+        btn_frame.pack(fill=tk.X, pady=5)
     
-        def apply_crop():
-            if not current_rect:
-                messagebox.showwarning("警告", "请先绘制矩形")
-                return
-            x1, y1, x2, y2 = current_rect
-            x = min(x1, x2)
-            y = min(y1, y2)
-            w = abs(x2 - x1)
-            h = abs(y2 - y1)
-            if w <= 0 or h <= 0:
-                messagebox.showerror("错误", "矩形尺寸无效")
-                return
-            # 修正为偶数
-            if w % 2:
-                if x + w + 1 <= orig_w:
-                    w += 1
-                else:
-                    w -= 1
-            if h % 2:
-                if y + h + 1 <= orig_h:
-                    h += 1
-                else:
-                    h -= 1
-            if x + w > orig_w:
-                w = orig_w - x
-            if y + h > orig_h:
-                h = orig_h - y
-            if w <= 0 or h <= 0:
-                messagebox.showerror("错误", "修正后矩形无效")
-                return
-            self.crop_enabled.set(True)
-            self.crop_width.set(str(int(w)))
-            self.crop_height.set(str(int(h)))
-            self.crop_left.set(str(int(x)))
-            self.crop_top.set(str(int(y)))
-            self.app.append_info(f"[裁剪] 应用 crop={int(w)}:{int(h)}:{int(x)}:{int(y)}")
-            win.destroy()
-    
-        # 创建右侧按钮
         ttk.Button(btn_frame, text="自动检测黑边", command=auto_detect).pack(fill=tk.X, pady=2)
     
-        # 分析帧数和 round 同一行
         param_frame = ttk.Frame(btn_frame)
         param_frame.pack(fill=tk.X, pady=5)
         row = ttk.Frame(param_frame)
         row.pack(fill=tk.X)
-        # 分析帧数
+    
         frames_container = ttk.Frame(row)
-        frames_container.pack(side=tk.LEFT, padx=(0, 10))
+        frames_container.pack(side=tk.LEFT, padx=(0,10))
         ttk.Label(frames_container, text="分析帧数:").pack(side=tk.LEFT)
         frames_var = tk.StringVar(value=self.crop_detect_frames.get())
         ttk.Spinbox(frames_container, from_=1, to=100, width=5, textvariable=frames_var, state="normal").pack(side=tk.LEFT, padx=5)
         frames_var.trace_add("write", lambda *a: self.crop_detect_frames.set(frames_var.get()))
-        # round
+    
         round_container = ttk.Frame(row)
         round_container.pack(side=tk.LEFT)
         ttk.Label(round_container, text="round:").pack(side=tk.LEFT)
@@ -1405,22 +1379,23 @@ class VideoFilterFrame(ttk.LabelFrame):
         ttk.Button(btn_frame, text="保存并应用裁剪", command=apply_crop).pack(fill=tk.X, pady=2)
         ttk.Button(btn_frame, text="取消", command=win.destroy).pack(fill=tk.X, pady=2)
     
-        if PIL_AVAILABLE and scale != 1.0:
-            tip_text = "图像已自动缩放适应窗口，鼠标拖拽绘制矩形即可，无需滚动。"
+        if need_scroll:
+            tip = "图像较大，请使用滚动条查看。点击第一个点，移动鼠标有虚线辅助，点击第二个点确定矩形"
         else:
-            tip_text = "未安装 Pillow，图像未缩放，请使用滚动条查看完整画面。"
-        ttk.Label(right_frame, text=tip_text, foreground="gray", wraplength=260).pack(pady=10)
+            tip = "点击第一个点，移动鼠标查看虚线辅助，点击第二个点确定矩形"
+        ttk.Label(right_frame, text=tip, foreground="gray", wraplength=RIGHT_PANEL_WIDTH-20).pack(pady=10)
     
-        # 如果已有裁剪参数，同步显示
+        # 如果主界面已有裁剪参数，同步显示
         if self.crop_enabled.get():
             try:
                 w = int(self.crop_width.get())
                 h = int(self.crop_height.get())
                 x = int(self.crop_left.get())
                 y = int(self.crop_top.get())
-                current_rect = (x, y, x+w, y+h)
-                redraw_rect()
+                points = [(x, y), (x+w, y+h)]
+                rect_id = canvas.create_rectangle(x, y, x+w, y+h, outline='red', width=2)
                 update_info()
+                canvas.see(x + w//2, y + h//2)
             except:
                 pass
 
