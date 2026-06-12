@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# 换绘制方法, 移除pil库的使用,尽量保持只引用一个第三方库 就是拖拽库
-
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 import subprocess
@@ -133,8 +131,6 @@ def is_valid_timestamp(ts: str) -> bool:
         return False
     return False
 
-
-
 # ================== 预设管理 ==================
 class PresetManager:
     def __init__(self, preset_path: str, app_name: str = "FFLiteGUI"):
@@ -224,7 +220,6 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
     include_speed: 是否包含变速滤镜
     """
     filters = []
-
     # 裁剪
     if settings.get("crop_enabled", False):
         w = settings.get("crop_width", "").strip()
@@ -233,7 +228,6 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
         top = settings.get("crop_top", "0").strip()
         if w and h:
             filters.append(f"crop={w}:{h}:{left}:{top}")
-
     # 缩放
     if settings.get("scale_enabled", False):
         method = settings.get("scale_method", "width")
@@ -245,7 +239,6 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
             filters.append(f"scale=-2:{h}")
         elif method == "exact" and w and h:
             filters.append(f"scale={w}:{h}")
-
     # 旋转
     rot = settings.get("rotate", "none")
     if rot == "90":
@@ -254,22 +247,18 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
         filters.append("transpose=2,transpose=2")
     elif rot == "270":
         filters.append("transpose=2")
-
     # 翻转
     if settings.get("vflip", False):
         filters.append("vflip")
     if settings.get("hflip", False):
         filters.append("hflip")
-
     # 反交错
     deint = settings.get("deinterlace_filter", "none")
     if deint != "none":
         filters.append(deint)
-
     # 像素格式
     if settings.get("pix_fmt_enabled", True):
         filters.append(f"format={settings.get('pix_fmt', 'yuv420p')}")
-
     # 变速（视频）
     if include_speed and settings.get("speed_enabled", False):
         try:
@@ -278,7 +267,6 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
                 filters.append(f"setpts={1.0/factor}*PTS")
         except ValueError:
             pass
-
     # 字幕烧录
     if include_subtitle and settings.get("subtitle_enabled", False):
         sub_path = settings.get("subtitle_path", "").strip()
@@ -287,7 +275,6 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
             sub_path = sub_path.replace(':', '\\:')
             sub_path = sub_path.replace("'", "\\'")
             filters.append(f"subtitles='{sub_path}'")
-
     return ",".join(filters) if filters else "null"
 
 def build_preview_filter_chain(settings: Dict[str, Any], target_height: int = 960) -> str:
@@ -384,7 +371,6 @@ def compute_rendered_size(original_w: int, original_h: int, settings: Dict[str, 
             ch = eval_crop(crop_h)
             if cw and ch and cw > 0 and ch > 0:
                 w, h = cw, ch
-
     # 缩放
     if settings.get("scale_enabled", False):
         method = settings.get("scale_method", "width")
@@ -405,7 +391,7 @@ def compute_rendered_size(original_w: int, original_h: int, settings: Dict[str, 
             pass
     return w, h
 
-# ================== 子进程执行封装（安全版，无 shell=True） ==================
+# ================== 子进程执行封装 ==================
 def run_ffmpeg_command(cmd: List[str], on_output_line: Optional[Callable] = None, timeout: Optional[float] = None) -> Tuple[int, str]:
     """
     执行 FFmpeg 命令，实时输出行。返回 (返回码, 完整stderr文本)
@@ -469,7 +455,7 @@ def detect_crop(ffmpeg_cmd: str, input_file: str, timeout: float = 15) -> Option
     except:
         return None
 
-# ================== 播放器预览（安全列表式，无 shell=True） ==================
+# ================== 播放器预览 ==================
 def launch_player(file_path: str, filters: str = "", audio_only: bool = False, volume: int = 10,
                   extra_args: Optional[List[str]] = None,
                   use_mpv: bool = False, mpv_path: str = "mpv", ffplay_path: Optional[str] = None):
@@ -493,7 +479,6 @@ def launch_player(file_path: str, filters: str = "", audio_only: bool = False, v
                 cmd.append(f"--vf={filters}")
             if extra_args:
                 cmd.extend(extra_args)
-            # 不添加 --volume
         else:
             if not ffplay_path:
                 return
@@ -655,7 +640,7 @@ class ParamValidator:
                 errors.append(f"音频比特率: {msg}")
         return errors
 
-# ================== 编码器策略（列表式，安全） ==================
+# ================== 编码器策略 ==================
 class EncoderStrategy:
     def build_params(self, cmd_list: List[str], settings: Dict[str, Any]) -> List[str]:
         raise NotImplementedError
@@ -715,7 +700,6 @@ def get_encoder_strategy(encoder: str) -> EncoderStrategy:
         return QSVEncoderStrategy()
     else:
         return OtherEncoderStrategy()
-
 
 # ================== 视频编码与质量组件 ==================
 class VideoEncoderFrame(ttk.LabelFrame):
@@ -870,6 +854,7 @@ class VideoEncoderFrame(ttk.LabelFrame):
         self.global_quality.set(settings.get("global_quality", 26))
         self.bitrate_video.set(settings.get("bitrate_video", "1900k"))
 
+
 # ================== 视频滤镜组件 ==================
 class VideoFilterFrame(ttk.LabelFrame):
     PIX_FMTS = [
@@ -974,7 +959,6 @@ class VideoFilterFrame(ttk.LabelFrame):
         ttk.Label(crop_frame, text="上:").pack(side=tk.LEFT)
         ttk.Entry(crop_frame, textvariable=self.crop_top, width=6).pack(side=tk.LEFT)
 
-
 #         # 自动检测黑边按钮
         auto_crop_btn = ttk.Button(crop_frame, text="自动去黑边",
                                    command=self.auto_detect_crop, width=9)
@@ -988,7 +972,6 @@ class VideoFilterFrame(ttk.LabelFrame):
                 "提示：以上两个参数的详细调整请点击右侧的「可视化裁剪」按钮，在打开的窗口中进行设置。\n"
                 "检测仅需约0.5秒，可快速尝试调整参数。",
                 wraplength=400)
-
 
         # 增加分析帧数和round设置
         ttk.Label(crop_frame, text="帧:").pack(side=tk.LEFT, padx=(5,0))
@@ -1053,8 +1036,6 @@ class VideoFilterFrame(ttk.LabelFrame):
                                           values=self.PIX_FMTS, width=12, state="normal")
         self.pix_fmt_combo.pack(side=tk.LEFT, padx=5)
 
-
-
     def extract_video_frame_ppm(self, input_file, output_ppm_path, frame_sec=0.0):
         """使用 ffmpeg 抽取指定时间点的一帧，保存为 PPM 格式（二进制 P6）。
            返回 (宽度, 高度) 或 (None, None) 表示失败。"""
@@ -1075,7 +1056,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             subprocess.run(cmd, check=True, capture_output=True, creationflags=flags, timeout=10)
             # 解析 PPM 头部获取宽高
             with open(output_ppm_path, 'rb') as f:
-                header = f.readline().strip()  # P6
+                header = f.readline().strip()
                 if header != b'P6':
                     return None, None
                 # 跳过注释行
@@ -1085,7 +1066,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                 width, height = map(int, line.split())
             return width, height
         except Exception as e:
-            self.app.append_info(f"[裁剪辅助] 提取视频帧失败: {e}")
+            self.app._append_info_ui(f"[裁剪辅助] 提取视频帧失败: {e}")
             return None, None
     
     def open_crop_editor(self):
@@ -1139,266 +1120,253 @@ class VideoFilterFrame(ttk.LabelFrame):
             total_h = max_h
             win_geometry = f"{total_w}x{total_h}"
     
-        win = tk.Toplevel(self.app.root)
-        win.title("可视化裁剪 - 点击两点确定矩形（移动鼠标有虚线辅助）")
-        win.transient(self.app.root)
-        win.grab_set()
-        win.geometry(win_geometry)
-        win.update_idletasks()
-        x = (screen_w - win.winfo_width()) // 2
-        y = (screen_h - win.winfo_height()) // 2
-        win.geometry(f"+{x}+{y}")
+        # 使用 SafeToplevel
+        with self.app.SafeToplevel(self.app.root) as win:
+            win.title("可视化裁剪 - 点击两点确定矩形（移动鼠标有虚线辅助）")
+            win.transient(self.app.root)
+            win.geometry(win_geometry)
+            win.update_idletasks()
+            x = (screen_w - win.winfo_width()) // 2
+            y = (screen_h - win.winfo_height()) // 2
+            win.geometry(f"+{x}+{y}")
     
-        main_pane = ttk.Frame(win)
-        main_pane.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+            main_pane = ttk.Frame(win)
+            main_pane.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
     
-        right_frame = ttk.Frame(main_pane, width=RIGHT_PANEL_WIDTH)
-        right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(10,0))
-        right_frame.pack_propagate(False)
+            right_frame = ttk.Frame(main_pane, width=RIGHT_PANEL_WIDTH)
+            right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(10,0))
+            right_frame.pack_propagate(False)
     
-        canvas_frame = ttk.Frame(main_pane)
-        canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            canvas_frame = ttk.Frame(main_pane)
+            canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     
-        h_scroll = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL)
-        v_scroll = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL)
-        canvas = tk.Canvas(canvas_frame, bg='gray',
-                           xscrollcommand=h_scroll.set,
-                           yscrollcommand=v_scroll.set)
-        h_scroll.config(command=canvas.xview)
-        v_scroll.config(command=canvas.yview)
+            h_scroll = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL)
+            v_scroll = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL)
+            canvas = tk.Canvas(canvas_frame, bg='gray',
+                               xscrollcommand=h_scroll.set,
+                               yscrollcommand=v_scroll.set)
+            h_scroll.config(command=canvas.xview)
+            v_scroll.config(command=canvas.yview)
     
-        canvas.grid(row=0, column=0, sticky="nsew")
-        v_scroll.grid(row=0, column=1, sticky="ns")
-        h_scroll.grid(row=1, column=0, sticky="ew")
-        canvas_frame.grid_rowconfigure(0, weight=1)
-        canvas_frame.grid_columnconfigure(0, weight=1)
+            canvas.grid(row=0, column=0, sticky="nsew")
+            v_scroll.grid(row=0, column=1, sticky="ns")
+            h_scroll.grid(row=1, column=0, sticky="ew")
+            canvas_frame.grid_rowconfigure(0, weight=1)
+            canvas_frame.grid_columnconfigure(0, weight=1)
     
-        canvas.config(scrollregion=(0, 0, img_w, img_h))
-        canvas.create_image(0, 0, anchor=tk.NW, image=img, tags="bg_img")
-        canvas.image = img
+            canvas.config(scrollregion=(0, 0, img_w, img_h))
+            canvas.create_image(0, 0, anchor=tk.NW, image=img, tags="bg_img")
+            canvas.image = img
     
-        # 状态变量
-        points = []            # 存储两个点 [(x1,y1), (x2,y2)]
-        temp_rect_id = None    # 移动鼠标时的虚线矩形ID
-        start_point = None     # 第一个点（临时）
-        rect_id = None         # 最终红色矩形ID
-        info_var = tk.StringVar(value="👉 点击图像上的第一个点，标记矩形起始位置")
+            points = []
+            temp_rect_id = None
+            start_point = None
+            rect_id = None
+            info_var = tk.StringVar(value="👉 点击图像上的第一个点，标记矩形起始位置")
     
-        # 信息标签（高亮显示）
-        info_label = tk.Label(right_frame, textvariable=info_var, wraplength=RIGHT_PANEL_WIDTH-20,
-                              justify=tk.LEFT, bg="#FFFFCC", relief=tk.SUNKEN, padx=5, pady=5)
-        info_label.pack(pady=5, fill=tk.X)
+            info_label = tk.Label(right_frame, textvariable=info_var, wraplength=RIGHT_PANEL_WIDTH-20,
+                                  justify=tk.LEFT, bg="#FFFFCC", relief=tk.SUNKEN, padx=5, pady=5)
+            info_label.pack(pady=5, fill=tk.X)
     
-        def canvas_to_image(cx, cy):
-            x = canvas.canvasx(cx)
-            y = canvas.canvasy(cy)
-            return max(0, min(x, img_w)), max(0, min(y, img_h))
+            def canvas_to_image(cx, cy):
+                x = canvas.canvasx(cx)
+                y = canvas.canvasy(cy)
+                return max(0, min(x, img_w)), max(0, min(y, img_h))
     
-        def update_info():
-            """根据 points 状态更新右侧信息"""
-            if len(points) == 2:
+            def update_info():
+                if len(points) == 2:
+                    x1, y1 = points[0]
+                    x2, y2 = points[1]
+                    x = min(x1, x2)
+                    y = min(y1, y2)
+                    w = abs(x2 - x1)
+                    h = abs(y2 - y1)
+                    info_var.set(f"✅ 矩形已确定\n起始点: ({int(x1)}, {int(y1)})\n结束点: ({int(x2)}, {int(y2)})\n"
+                                 f"左上: ({int(x)}, {int(y)})  宽: {int(w)}  高: {int(h)}\n"
+                                 f"裁剪参数: crop={int(w)}:{int(h)}:{int(x)}:{int(y)}\n"
+                                 "👉 可以继续点击其他位置重置矩形")
+                elif len(points) == 1:
+                    x1, y1 = points[0]
+                    info_var.set(f"📍 已标记第一个点: ({int(x1)}, {int(y1)})\n👉 移动鼠标查看虚线矩形，点击第二个点确定")
+                else:
+                    info_var.set("👉 点击图像上的第一个点，标记矩形起始位置")
+    
+            def draw_temp_rect(event):
+                nonlocal temp_rect_id
+                if start_point is None:
+                    if temp_rect_id:
+                        canvas.delete(temp_rect_id)
+                        temp_rect_id = None
+                    return
+                cur_x, cur_y = canvas_to_image(event.x, event.y)
+                if temp_rect_id:
+                    canvas.delete(temp_rect_id)
+                temp_rect_id = canvas.create_rectangle(start_point[0], start_point[1], cur_x, cur_y,
+                                                       outline='yellow', width=2, dash=(4, 2), tags="temp_rect")
+    
+            def on_canvas_click(event):
+                nonlocal points, rect_id, start_point, temp_rect_id
+                x_img, y_img = canvas_to_image(event.x, event.y)
+                if rect_id:
+                    canvas.delete(rect_id)
+                    rect_id = None
+                if temp_rect_id:
+                    canvas.delete(temp_rect_id)
+                    temp_rect_id = None
+                if len(points) == 0:
+                    points = [(x_img, y_img)]
+                    start_point = (x_img, y_img)
+                    update_info()
+                    canvas.bind("<Motion>", draw_temp_rect)
+                elif len(points) == 1:
+                    points.append((x_img, y_img))
+                    start_point = None
+                    canvas.unbind("<Motion>")
+                    x1, y1 = points[0]
+                    x2, y2 = points[1]
+                    rect_id = canvas.create_rectangle(x1, y1, x2, y2, outline='red', width=2)
+                    update_info()
+                    cx = (x1 + x2) // 2
+                    cy = (y1 + y2) // 2
+                    canvas.see(cx, cy)
+                else:
+                    points = [(x_img, y_img)]
+                    start_point = (x_img, y_img)
+                    update_info()
+                    canvas.bind("<Motion>", draw_temp_rect)
+    
+            canvas.bind("<Button-1>", on_canvas_click)
+    
+            def clear_rect():
+                nonlocal points, rect_id, start_point, temp_rect_id
+                points = []
+                if rect_id:
+                    canvas.delete(rect_id)
+                    rect_id = None
+                if temp_rect_id:
+                    canvas.delete(temp_rect_id)
+                    temp_rect_id = None
+                start_point = None
+                canvas.unbind("<Motion>")
+                update_info()
+    
+            def apply_crop():
+                if len(points) != 2:
+                    messagebox.showwarning("提示", "请先在图像上点击两个点来确定裁剪矩形")
+                    return
                 x1, y1 = points[0]
                 x2, y2 = points[1]
                 x = min(x1, x2)
                 y = min(y1, y2)
                 w = abs(x2 - x1)
                 h = abs(y2 - y1)
-                info_var.set(f"✅ 矩形已确定\n起始点: ({int(x1)}, {int(y1)})\n结束点: ({int(x2)}, {int(y2)})\n"
-                             f"左上: ({int(x)}, {int(y)})  宽: {int(w)}  高: {int(h)}\n"
-                             f"裁剪参数: crop={int(w)}:{int(h)}:{int(x)}:{int(y)}\n"
-                             "👉 可以继续点击其他位置重置矩形")
-            elif len(points) == 1:
-                x1, y1 = points[0]
-                info_var.set(f"📍 已标记第一个点: ({int(x1)}, {int(y1)})\n👉 移动鼠标查看虚线矩形，点击第二个点确定")
+                if w <= 0 or h <= 0:
+                    messagebox.showerror("错误", "矩形尺寸无效")
+                    return
+                if w % 2:
+                    if x + w + 1 <= img_w:
+                        w += 1
+                    else:
+                        w -= 1
+                if h % 2:
+                    if y + h + 1 <= img_h:
+                        h += 1
+                    else:
+                        h -= 1
+                if x + w > img_w:
+                    w = img_w - x
+                if y + h > img_h:
+                    h = img_h - y
+                if w <= 0 or h <= 0:
+                    messagebox.showerror("错误", "修正后矩形无效")
+                    return
+                self.crop_enabled.set(True)
+                self.crop_width.set(str(int(w)))
+                self.crop_height.set(str(int(h)))
+                self.crop_left.set(str(int(x)))
+                self.crop_top.set(str(int(y)))
+                self.app._append_info_ui(f"[裁剪] 应用 crop={int(w)}:{int(h)}:{int(x)}:{int(y)}")
+                win.destroy()
+    
+            def auto_detect():
+                self.crop_detect_frames.set(frames_var.get())
+                self.crop_detect_round.set(round_var.get())
+                old = self.current_file
+                self.current_file = input_file
+                try:
+                    self.auto_detect_crop()
+                finally:
+                    self.current_file = old
+                if self.crop_enabled.get():
+                    try:
+                        w = int(self.crop_width.get())
+                        h = int(self.crop_height.get())
+                        x = int(self.crop_left.get())
+                        y = int(self.crop_top.get())
+                        nonlocal points, rect_id, start_point, temp_rect_id
+                        # 清除旧状态
+                        if rect_id:
+                            canvas.delete(rect_id)
+                        if temp_rect_id:
+                            canvas.delete(temp_rect_id)
+                        canvas.unbind("<Motion>")
+                        points = [(x, y), (x+w, y+h)]
+                        start_point = None
+                        rect_id = canvas.create_rectangle(x, y, x+w, y+h, outline='red', width=2)
+                        update_info()
+                        canvas.see(x + w//2, y + h//2)
+                    except:
+                        pass
+    
+            btn_frame = ttk.Frame(right_frame)
+            btn_frame.pack(fill=tk.X, pady=5)
+    
+            ttk.Button(btn_frame, text="自动检测黑边", command=auto_detect).pack(fill=tk.X, pady=2)
+    
+            param_frame = ttk.Frame(btn_frame)
+            param_frame.pack(fill=tk.X, pady=5)
+            row = ttk.Frame(param_frame)
+            row.pack(fill=tk.X)
+    
+            frames_container = ttk.Frame(row)
+            frames_container.pack(side=tk.LEFT, padx=(0,10))
+            ttk.Label(frames_container, text="分析帧数:").pack(side=tk.LEFT)
+            frames_var = tk.StringVar(value=self.crop_detect_frames.get())
+            ttk.Spinbox(frames_container, from_=1, to=100, width=5, textvariable=frames_var, state="normal").pack(side=tk.LEFT, padx=5)
+            frames_var.trace_add("write", lambda *a: self.crop_detect_frames.set(frames_var.get()))
+    
+            round_container = ttk.Frame(row)
+            round_container.pack(side=tk.LEFT)
+            ttk.Label(round_container, text="round:").pack(side=tk.LEFT)
+            round_var = tk.StringVar(value=self.crop_detect_round.get())
+            ttk.Spinbox(round_container, from_=1, to=16, width=5, textvariable=round_var, state="normal").pack(side=tk.LEFT, padx=5)
+            round_var.trace_add("write", lambda *a: self.crop_detect_round.set(round_var.get()))
+    
+            ttk.Button(btn_frame, text="清除矩形", command=clear_rect).pack(fill=tk.X, pady=2)
+            ttk.Button(btn_frame, text="保存并应用裁剪", command=apply_crop).pack(fill=tk.X, pady=2)
+            ttk.Button(btn_frame, text="取消", command=win.destroy).pack(fill=tk.X, pady=2)
+    
+            if need_scroll:
+                tip = "图像较大，请使用滚动条查看。点击第一个点，移动鼠标有虚线辅助，点击第二个点确定矩形"
             else:
-                info_var.set("👉 点击图像上的第一个点，标记矩形起始位置")
+                tip = "点击第一个点，移动鼠标查看虚线辅助，点击第二个点确定矩形"
+            ttk.Label(right_frame, text=tip, foreground="gray", wraplength=RIGHT_PANEL_WIDTH-20).pack(pady=10)
     
-        def draw_temp_rect(event):
-            """鼠标移动时绘制从起点到当前鼠标位置的虚线矩形"""
-            nonlocal temp_rect_id
-            if start_point is None:
-                if temp_rect_id:
-                    canvas.delete(temp_rect_id)
-                    temp_rect_id = None
-                return
-            cur_x, cur_y = canvas_to_image(event.x, event.y)
-            if temp_rect_id:
-                canvas.delete(temp_rect_id)
-            temp_rect_id = canvas.create_rectangle(start_point[0], start_point[1], cur_x, cur_y,
-                                                   outline='yellow', width=2, dash=(4, 2), tags="temp_rect")
-    
-        def on_canvas_click(event):
-            nonlocal points, rect_id, start_point, temp_rect_id
-            x_img, y_img = canvas_to_image(event.x, event.y)
-    
-            # 清空之前的最终矩形
-            if rect_id:
-                canvas.delete(rect_id)
-                rect_id = None
-            # 清除临时矩形
-            if temp_rect_id:
-                canvas.delete(temp_rect_id)
-                temp_rect_id = None
-    
-            if len(points) == 0:
-                # 第一个点
-                points = [(x_img, y_img)]
-                start_point = (x_img, y_img)
-                update_info()
-                canvas.bind("<Motion>", draw_temp_rect)
-            elif len(points) == 1:
-                # 第二个点
-                points.append((x_img, y_img))
-                start_point = None
-                canvas.unbind("<Motion>")
-                # 绘制最终矩形
-                x1, y1 = points[0]
-                x2, y2 = points[1]
-                rect_id = canvas.create_rectangle(x1, y1, x2, y2, outline='red', width=2)
-                update_info()
-                # 自动滚动到矩形中心
-                cx = (x1 + x2) // 2
-                cy = (y1 + y2) // 2
-                canvas.see(cx, cy)
-            else:
-                # 已有两个点，再次点击：重置所有，以当前点为新的第一个点
-                points = [(x_img, y_img)]
-                start_point = (x_img, y_img)
-                update_info()
-                canvas.bind("<Motion>", draw_temp_rect)
-    
-        canvas.bind("<Button-1>", on_canvas_click)
-    
-        def clear_rect():
-            nonlocal points, rect_id, start_point, temp_rect_id
-            points = []
-            if rect_id:
-                canvas.delete(rect_id)
-                rect_id = None
-            if temp_rect_id:
-                canvas.delete(temp_rect_id)
-                temp_rect_id = None
-            start_point = None
-            canvas.unbind("<Motion>")
-            update_info()
-    
-        def apply_crop():
-            if len(points) != 2:
-                messagebox.showwarning("提示", "请先在图像上点击两个点来确定裁剪矩形")
-                return
-            x1, y1 = points[0]
-            x2, y2 = points[1]
-            x = min(x1, x2)
-            y = min(y1, y2)
-            w = abs(x2 - x1)
-            h = abs(y2 - y1)
-            if w <= 0 or h <= 0:
-                messagebox.showerror("错误", "矩形尺寸无效")
-                return
-            # 奇偶修正
-            if w % 2:
-                if x + w + 1 <= img_w:
-                    w += 1
-                else:
-                    w -= 1
-            if h % 2:
-                if y + h + 1 <= img_h:
-                    h += 1
-                else:
-                    h -= 1
-            if x + w > img_w:
-                w = img_w - x
-            if y + h > img_h:
-                h = img_h - y
-            if w <= 0 or h <= 0:
-                messagebox.showerror("错误", "修正后矩形无效")
-                return
-            self.crop_enabled.set(True)
-            self.crop_width.set(str(int(w)))
-            self.crop_height.set(str(int(h)))
-            self.crop_left.set(str(int(x)))
-            self.crop_top.set(str(int(y)))
-            self.app.append_info(f"[裁剪] 应用 crop={int(w)}:{int(h)}:{int(x)}:{int(y)}")
-            win.destroy()
-    
-        def auto_detect():
-            self.crop_detect_frames.set(frames_var.get())
-            self.crop_detect_round.set(round_var.get())
-            old = self.current_file
-            self.current_file = input_file
-            try:
-                self.auto_detect_crop()
-            finally:
-                self.current_file = old
+        # 如果主界面已有裁剪参数，同步显示
             if self.crop_enabled.get():
                 try:
                     w = int(self.crop_width.get())
                     h = int(self.crop_height.get())
                     x = int(self.crop_left.get())
                     y = int(self.crop_top.get())
-                    nonlocal points, rect_id, start_point, temp_rect_id
-                    # 清除旧状态
-                    if rect_id:
-                        canvas.delete(rect_id)
-                    if temp_rect_id:
-                        canvas.delete(temp_rect_id)
-                    canvas.unbind("<Motion>")
                     points = [(x, y), (x+w, y+h)]
-                    start_point = None
                     rect_id = canvas.create_rectangle(x, y, x+w, y+h, outline='red', width=2)
                     update_info()
                     canvas.see(x + w//2, y + h//2)
                 except:
                     pass
     
-        btn_frame = ttk.Frame(right_frame)
-        btn_frame.pack(fill=tk.X, pady=5)
-    
-        ttk.Button(btn_frame, text="自动检测黑边", command=auto_detect).pack(fill=tk.X, pady=2)
-    
-        param_frame = ttk.Frame(btn_frame)
-        param_frame.pack(fill=tk.X, pady=5)
-        row = ttk.Frame(param_frame)
-        row.pack(fill=tk.X)
-    
-        frames_container = ttk.Frame(row)
-        frames_container.pack(side=tk.LEFT, padx=(0,10))
-        ttk.Label(frames_container, text="分析帧数:").pack(side=tk.LEFT)
-        frames_var = tk.StringVar(value=self.crop_detect_frames.get())
-        ttk.Spinbox(frames_container, from_=1, to=100, width=5, textvariable=frames_var, state="normal").pack(side=tk.LEFT, padx=5)
-        frames_var.trace_add("write", lambda *a: self.crop_detect_frames.set(frames_var.get()))
-    
-        round_container = ttk.Frame(row)
-        round_container.pack(side=tk.LEFT)
-        ttk.Label(round_container, text="round:").pack(side=tk.LEFT)
-        round_var = tk.StringVar(value=self.crop_detect_round.get())
-        ttk.Spinbox(round_container, from_=1, to=16, width=5, textvariable=round_var, state="normal").pack(side=tk.LEFT, padx=5)
-        round_var.trace_add("write", lambda *a: self.crop_detect_round.set(round_var.get()))
-    
-        ttk.Button(btn_frame, text="清除矩形", command=clear_rect).pack(fill=tk.X, pady=2)
-        ttk.Button(btn_frame, text="保存并应用裁剪", command=apply_crop).pack(fill=tk.X, pady=2)
-        ttk.Button(btn_frame, text="取消", command=win.destroy).pack(fill=tk.X, pady=2)
-    
-        if need_scroll:
-            tip = "图像较大，请使用滚动条查看。点击第一个点，移动鼠标有虚线辅助，点击第二个点确定矩形"
-        else:
-            tip = "点击第一个点，移动鼠标查看虚线辅助，点击第二个点确定矩形"
-        ttk.Label(right_frame, text=tip, foreground="gray", wraplength=RIGHT_PANEL_WIDTH-20).pack(pady=10)
-    
-        # 如果主界面已有裁剪参数，同步显示
-        if self.crop_enabled.get():
-            try:
-                w = int(self.crop_width.get())
-                h = int(self.crop_height.get())
-                x = int(self.crop_left.get())
-                y = int(self.crop_top.get())
-                points = [(x, y), (x+w, y+h)]
-                rect_id = canvas.create_rectangle(x, y, x+w, y+h, outline='red', width=2)
-                update_info()
-                canvas.see(x + w//2, y + h//2)
-            except:
-                pass
-
+            win.wait_window()
 
     def auto_detect_crop(self):
         input_file = getattr(self, 'current_file', None)
@@ -1446,21 +1414,21 @@ class VideoFilterFrame(ttk.LabelFrame):
                 pattern = re.compile(r'crop=(\d+):(\d+):(\d+):(\d+)')
                 matches = pattern.findall(stderr)
                 if not matches:
-                    self.app.append_info("[黑边检测] 未检测到明显的黑边，请手动调整。")
+                    self.app._append_info_ui("[黑边检测] 未检测到明显的黑边，请手动调整。")
                     return
     
                 w, h, x, y = matches[-1]
-                self.crop_width.set(w)
-                self.crop_height.set(h)
-                self.crop_left.set(x)
-                self.crop_top.set(y)
-                self.crop_enabled.set(True)
-    
-                self.app.append_info(f"[黑边检测] 推荐裁剪参数: crop={w}:{h}:{x}:{y}，已自动填入并启用裁剪。")
+                # 线程安全更新 UI
+                self.app.root.after(0, lambda: self.crop_width.set(w))
+                self.app.root.after(0, lambda: self.crop_height.set(h))
+                self.app.root.after(0, lambda: self.crop_left.set(x))
+                self.app.root.after(0, lambda: self.crop_top.set(y))
+                self.app.root.after(0, lambda: self.crop_enabled.set(True))
+                self.app._append_info_ui(f"[黑边检测] 推荐裁剪参数: crop={w}:{h}:{x}:{y}，已自动填入并启用裁剪。")
             except subprocess.TimeoutExpired:
-                self.app.append_info("[黑边检测] 检测超时，请检查 ffmpeg 是否正常。")
+                self.app._append_info_ui("[黑边检测] 检测超时，请检查 ffmpeg 是否正常。")
             except Exception as e:
-                self.app.append_info(f"[黑边检测] 出错: {e}")
+                self.app._append_info_ui(f"[黑边检测] 出错: {e}")
             finally:
                 def enable_btn():
                     for child in self.winfo_children():
@@ -1535,8 +1503,6 @@ class VideoFilterFrame(ttk.LabelFrame):
         self.toggle_subtitle()
 
 
-
-
 # ================== 音频组件 ==================
 class AudioFrame(ttk.LabelFrame):
     def __init__(self, parent, enable_checkbox=False, **kwargs):
@@ -1584,7 +1550,7 @@ class AudioFrame(ttk.LabelFrame):
         samplerate_combo = ttk.Combobox(controls_frame, textvariable=self.audio_samplerate, width=8, values=["8000","12000","16000","22050","32000", "44100", "48000", "96000"], state='readonly')
         samplerate_combo.pack(side=tk.LEFT, padx=5)
 
-        # ---------- 新增：音量控件单独一行 ----------
+        # ---------- 音量控件单独一行 ----------
         volume_frame = ttk.Frame(inner)
         volume_frame.pack(fill=tk.X, pady=(2,0))
         self.volume_enabled = tk.BooleanVar(value=False)
@@ -1606,14 +1572,20 @@ class AudioFrame(ttk.LabelFrame):
         self.volume_enabled.trace_add("write", on_volume_enabled)
 
     def get_settings(self):
+        volume = self.volume_value.get()
+        # 钳制音量范围
+        if volume < 0.1:
+            volume = 0.1
+        elif volume > 3.0:
+            volume = 3.0
         res = {
             "audio_codec": self.audio_codec.get(),
             "audio_bitrate": self.audio_bitrate.get(),
             "audio_samplerate": self.audio_samplerate.get(),
             "only_audio": self.only_audio.get(),
             "audio_format": self.audio_format.get(),
-            "volume": self.volume_value.get(),
-            "volume_enabled": self.volume_enabled.get()   # 新增
+            "volume": volume,
+            "volume_enabled": self.volume_enabled.get()
         }
         if self.enable_checkbox:
             res["audio_enabled"] = self.audio_enabled.get()
@@ -1683,7 +1655,8 @@ class TrimFrame(ttk.LabelFrame):
         self.trim_end.set(settings.get("trim_end", ""))
         self.on_trim_toggle()
 
-# ================== 高级选项组件（硬件解码/自定义参数） ==================
+
+# ================== 高级选项组件 ==================
 class AdvancedFrame(ttk.LabelFrame):
     def __init__(self, parent, update_callback=None, **kwargs):
         super().__init__(parent, text="高级选项 (硬件解码/自定义参数)", padding="5", **kwargs)
@@ -1745,7 +1718,7 @@ class Task:
         self.input = input_path
         self.output = output_path
         self.settings = copy.deepcopy(settings)
-        self.cmd = cmd_list  # 列表形式的命令
+        self.cmd = cmd_list
         self.status = "等待"
         self.error_msg = ""
 
@@ -1762,6 +1735,7 @@ class Task:
         short = re.sub(rf'(["\']?){in_quoted}\1', r'{input}', full_cmd)
         short = re.sub(rf'(["\']?){out_quoted}\1', r'{output}', short)
         return short
+
 
 # ================== Track 类 ==================
 class Track:
@@ -1807,7 +1781,7 @@ class Track:
             if typ == "subtitle":
                 self.language = self.enc_settings.get("language", "")
                 self.title = self.enc_settings.get("title", "")
-            # 对于视频，恢复叠加/偏移属性（原有逻辑）
+            # 对于视频，恢复叠加/偏移属性
             if typ == "video":
                 self.overlay_enabled = self.enc_settings.get("overlay_enabled", False)
                 self.overlay_x = self.enc_settings.get("overlay_x", "W-w-10")
@@ -1822,8 +1796,31 @@ class Track:
     def is_encoding(self):
         return self.enc_settings.get("encoder") != "copy"
 
+
 # ================== 主界面 ==================
 class FFmpegBatchGUI:
+    # ---------- SafeToplevel 上下文管理器 ----------
+    class SafeToplevel:
+        """安全的 Toplevel 上下文管理器，确保异常时销毁窗口并释放 grab"""
+        def __init__(self, master, **kwargs):
+            self.master = master
+            self.kwargs = kwargs
+            self.window = None
+
+        def __enter__(self):
+            self.window = tk.Toplevel(self.master, **self.kwargs)
+            self.window.grab_set()
+            return self.window
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            if self.window and self.window.winfo_exists():
+                self.window.destroy()
+            if self.master:
+                try:
+                    self.master.grab_release()
+                except:
+                    pass
+
     def __init__(self, root):
         self.root = root
         self.root.title("FFmpeg 多功能工具")
@@ -1893,7 +1890,6 @@ class FFmpegBatchGUI:
 
         self.show_quick_warning()
 
-
     # ---------- 播放器设置相关方法 ----------
     def load_player_settings(self):
         settings = self.preset_manager.load_player_settings()
@@ -1950,7 +1946,6 @@ class FFmpegBatchGUI:
                 cmd_str = " ".join(f'"{p}"' if os.path.sep in p and p != "-vf" and not p.startswith('--') else p for p in cmd_list)
         
         self._append_info_ui("执行命令: " + cmd_str)
-        
         # 启动播放器（后台）
         launch_player(input_path, filters or "", audio_only, volume, extra_args,
                       self.use_mpv.get(), self.mpv_path.get(), self.ffplay_cmd)
@@ -2123,167 +2118,168 @@ class FFmpegBatchGUI:
         disp_w = int(canvas_w * scale)
         disp_h = int(canvas_h * scale)
     
-        win = tk.Toplevel(self.root)
-        win.title("可视化编辑画布偏移 - 拖拽蓝色矩形")
-        win.transient(self.root)
-        win.grab_set()
-        sw = win.winfo_screenwidth()
-        sh = win.winfo_screenheight()
-        x = (sw - (disp_w + 20)) // 2
-        y = (sh - (disp_h + 200)) // 2
-        win.geometry(f"{disp_w + 20}x{disp_h + 200}+{x}+{y}")
-        win.update_idletasks()
+        # 使用 SafeToplevel
+        with self.SafeToplevel(self.root) as win:
+            win.title("可视化编辑画布偏移 - 拖拽蓝色矩形")
+            win.transient(self.root)
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+            x = (sw - (disp_w + 20)) // 2
+            y = (sh - (disp_h + 200)) // 2
+            win.geometry(f"{disp_w + 20}x{disp_h + 200}+{x}+{y}")
+            win.update_idletasks()
     
-        canvas = tk.Canvas(win, width=disp_w, height=disp_h, bg="black", highlightthickness=1, highlightbackground="gray")
-        canvas.pack(pady=10)
+            canvas = tk.Canvas(win, width=disp_w, height=disp_h, bg="black", highlightthickness=1, highlightbackground="gray")
+            canvas.pack(pady=10)
     
-        status_var = tk.StringVar(value="拖拽蓝色矩形移动，调整主视频内容在画布中的位置。绿色虚线框为从视频")
-        ttk.Label(win, textvariable=status_var, justify=tk.LEFT).pack(pady=5)
+            status_var = tk.StringVar(value="拖拽蓝色矩形移动，调整主视频内容在画布中的位置。绿色虚线框为从视频")
+            ttk.Label(win, textvariable=status_var, justify=tk.LEFT).pack(pady=5)
     
-        size_frame = ttk.Frame(win)
-        size_frame.pack(pady=5)
-        ttk.Label(size_frame, text="画布宽度:").pack(side=tk.LEFT)
-        canvas_w_var = tk.StringVar(value=str(canvas_w))
-        ttk.Entry(size_frame, textvariable=canvas_w_var, width=8).pack(side=tk.LEFT, padx=5)
-        ttk.Label(size_frame, text="画布高度:").pack(side=tk.LEFT)
-        canvas_h_var = tk.StringVar(value=str(canvas_h))
-        ttk.Entry(size_frame, textvariable=canvas_h_var, width=8).pack(side=tk.LEFT, padx=5)
-        ttk.Button(size_frame, text="应用画布尺寸", command=lambda: update_canvas_size()).pack(side=tk.LEFT, padx=5)
+            size_frame = ttk.Frame(win)
+            size_frame.pack(pady=5)
+            ttk.Label(size_frame, text="画布宽度:").pack(side=tk.LEFT)
+            canvas_w_var = tk.StringVar(value=str(canvas_w))
+            ttk.Entry(size_frame, textvariable=canvas_w_var, width=8).pack(side=tk.LEFT, padx=5)
+            ttk.Label(size_frame, text="画布高度:").pack(side=tk.LEFT)
+            canvas_h_var = tk.StringVar(value=str(canvas_h))
+            ttk.Entry(size_frame, textvariable=canvas_h_var, width=8).pack(side=tk.LEFT, padx=5)
+            ttk.Button(size_frame, text="应用画布尺寸", command=lambda: update_canvas_size()).pack(side=tk.LEFT, padx=5)
     
-        coord_var = tk.StringVar(value=f"偏移: X={off_x}, Y={off_y}")
-        ttk.Label(win, textvariable=coord_var, font=("Courier", 10)).pack(pady=2)
+            coord_var = tk.StringVar(value=f"偏移: X={off_x}, Y={off_y}")
+            ttk.Label(win, textvariable=coord_var, font=("Courier", 10)).pack(pady=2)
     
-        self._draw_background(canvas, canvas_w, canvas_h, scale, main_track, sub_tracks,
-                              off_x, off_y, (main_render_w, main_render_h), tag="bg")
+            self._draw_background(canvas, canvas_w, canvas_h, scale, main_track, sub_tracks,
+                                  off_x, off_y, (main_render_w, main_render_h), tag="bg")
     
-        rect_id = None
-        text_id = None
-        warning_id = None
-        drag_data = {"x": 0, "y": 0}
-        current_off_x, current_off_y = off_x, off_y
+            rect_id = None
+            text_id = None
+            warning_id = None
+            drag_data = {"x": 0, "y": 0}
+            current_off_x, current_off_y = off_x, off_y
     
-        def draw_rectangle():
-            nonlocal rect_id, text_id, warning_id
-            x1 = current_off_x
-            y1 = current_off_y
-            x2 = current_off_x + main_render_w
-            y2 = current_off_y + main_render_h
-            vis_x1 = max(0, x1)
-            vis_y1 = max(0, y1)
-            vis_x2 = min(canvas_w, x2)
-            vis_y2 = min(canvas_h, y2)
-            if vis_x2 > vis_x1 and vis_y2 > vis_y1:
-                cx1, cy1 = self._to_canvas_coords(vis_x1, vis_y1, scale)
-                cx2, cy2 = self._to_canvas_coords(vis_x2, vis_y2, scale)
-                if rect_id:
-                    canvas.coords(rect_id, cx1, cy1, cx2, cy2)
+            def draw_rectangle():
+                nonlocal rect_id, text_id, warning_id
+                x1 = current_off_x
+                y1 = current_off_y
+                x2 = current_off_x + main_render_w
+                y2 = current_off_y + main_render_h
+                vis_x1 = max(0, x1)
+                vis_y1 = max(0, y1)
+                vis_x2 = min(canvas_w, x2)
+                vis_y2 = min(canvas_h, y2)
+                if vis_x2 > vis_x1 and vis_y2 > vis_y1:
+                    cx1, cy1 = self._to_canvas_coords(vis_x1, vis_y1, scale)
+                    cx2, cy2 = self._to_canvas_coords(vis_x2, vis_y2, scale)
+                    if rect_id:
+                        canvas.coords(rect_id, cx1, cy1, cx2, cy2)
+                        if text_id:
+                            canvas.coords(text_id, cx1 + 5, cy1 + 5)
+                    else:
+                        rect_id = canvas.create_rectangle(cx1, cy1, cx2, cy2, outline="deepskyblue", width=2,
+                                                          fill="skyblue", stipple="gray50")
+                        text_id = canvas.create_text(cx1 + 5, cy1 + 5, anchor="nw", text="主视频", fill="blue", font=("Arial", 9))
+                    if warning_id:
+                        canvas.delete(warning_id)
+                        warning_id = None
+                else:
+                    if rect_id:
+                        canvas.delete(rect_id)
+                        rect_id = None
                     if text_id:
-                        canvas.coords(text_id, cx1 + 5, cy1 + 5)
-                else:
-                    rect_id = canvas.create_rectangle(cx1, cy1, cx2, cy2, outline="deepskyblue", width=2,
-                                                      fill="skyblue", stipple="gray50")
-                    text_id = canvas.create_text(cx1 + 5, cy1 + 5, anchor="nw", text="主视频", fill="blue", font=("Arial", 9))
-                if warning_id:
-                    canvas.delete(warning_id)
-                    warning_id = None
-            else:
-                if rect_id:
-                    canvas.delete(rect_id)
-                    rect_id = None
-                if text_id:
-                    canvas.delete(text_id)
-                    text_id = None
-                if warning_id is None:
-                    warning_id = canvas.create_text(disp_w//2, disp_h//2, text="主视频完全不可见", fill="red", font=("Arial", 10))
-                else:
-                    canvas.coords(warning_id, disp_w//2, disp_h//2)
+                        canvas.delete(text_id)
+                        text_id = None
+                    if warning_id is None:
+                        warning_id = canvas.create_text(disp_w//2, disp_h//2, text="主视频完全不可见", fill="red", font=("Arial", 10))
+                    else:
+                        canvas.coords(warning_id, disp_w//2, disp_h//2)
     
-        draw_rectangle()
+            draw_rectangle()
     
-        def on_mouse_down(event):
-            if rect_id is None:
-                return
-            coords = canvas.coords(rect_id)
-            if len(coords) != 4:
-                return
-            cx1, cy1, cx2, cy2 = coords
-            if cx1 <= event.x <= cx2 and cy1 <= event.y <= cy2:
+            def on_mouse_down(event):
+                if rect_id is None:
+                    return
+                coords = canvas.coords(rect_id)
+                if len(coords) != 4:
+                    return
+                cx1, cy1, cx2, cy2 = coords
+                if cx1 <= event.x <= cx2 and cy1 <= event.y <= cy2:
+                    drag_data["x"] = event.x
+                    drag_data["y"] = event.y
+                    status_var.set("拖拽移动主视频位置")
+    
+            def on_mouse_move(event):
+                nonlocal current_off_x, current_off_y
+                if "x" not in drag_data:
+                    return
+                dx = event.x - drag_data["x"]
+                dy = event.y - drag_data["y"]
+                if dx == 0 and dy == 0:
+                    return
+                new_x = current_off_x + dx / scale
+                new_y = current_off_y + dy / scale
+                new_x, new_y = clamp_offset(new_x, new_y)
+                current_off_x = int(new_x)
+                current_off_y = int(new_y)
+                coord_var.set(f"偏移: X={current_off_x}, Y={current_off_y}")
+                draw_rectangle()
                 drag_data["x"] = event.x
                 drag_data["y"] = event.y
-                status_var.set("拖拽移动主视频位置")
     
-        def on_mouse_move(event):
-            nonlocal current_off_x, current_off_y
-            if "x" not in drag_data:
-                return
-            dx = event.x - drag_data["x"]
-            dy = event.y - drag_data["y"]
-            if dx == 0 and dy == 0:
-                return
-            new_x = current_off_x + dx / scale
-            new_y = current_off_y + dy / scale
-            new_x, new_y = clamp_offset(new_x, new_y)
-            current_off_x = int(new_x)
-            current_off_y = int(new_y)
-            coord_var.set(f"偏移: X={current_off_x}, Y={current_off_y}")
-            draw_rectangle()
-            drag_data["x"] = event.x
-            drag_data["y"] = event.y
+            def on_mouse_up(event):
+                drag_data.clear()
+                status_var.set("拖拽完成，点击「保存」应用偏移")
     
-        def on_mouse_up(event):
-            drag_data.clear()
-            status_var.set("拖拽完成，点击「保存」应用偏移")
+            canvas.bind("<Button-1>", on_mouse_down)
+            canvas.bind("<B1-Motion>", on_mouse_move)
+            canvas.bind("<ButtonRelease-1>", on_mouse_up)
     
-        canvas.bind("<Button-1>", on_mouse_down)
-        canvas.bind("<B1-Motion>", on_mouse_move)
-        canvas.bind("<ButtonRelease-1>", on_mouse_up)
+            def update_canvas_size():
+                nonlocal canvas_w, canvas_h, scale, disp_w, disp_h, current_off_x, current_off_y
+                nonlocal rect_id, text_id, warning_id
+                try:
+                    new_w = int(canvas_w_var.get())
+                    new_h = int(canvas_h_var.get())
+                    if new_w <= 0 or new_h <= 0:
+                        raise ValueError
+                    canvas_w, canvas_h = new_w, new_h
+                    scale = min(max_display_w / canvas_w, max_display_h / canvas_h, 1.0)
+                    disp_w = int(canvas_w * scale)
+                    disp_h = int(canvas_h * scale)
+                    win.geometry(f"{disp_w + 20}x{disp_h + 200}")
+                    canvas.config(width=disp_w, height=disp_h)
+                    current_off_x, current_off_y = clamp_offset(current_off_x, current_off_y)
+                    coord_var.set(f"偏移: X={current_off_x}, Y={current_off_y}")
+                    canvas.delete("all")
+                    rect_id = text_id = warning_id = None
+                    self._draw_background(canvas, canvas_w, canvas_h, scale, main_track, sub_tracks,
+                                          current_off_x, current_off_y, (main_render_w, main_render_h), tag="bg")
+                    draw_rectangle()
+                    win.update_idletasks()
+                    x = self.root.winfo_x() + (self.root.winfo_width() - win.winfo_width()) // 2
+                    y = self.root.winfo_y() + (self.root.winfo_height() - win.winfo_height()) // 2
+                    win.geometry(f"+{x}+{y}")
+                except:
+                    messagebox.showerror("错误", "画布尺寸无效")
     
-        def update_canvas_size():
-            nonlocal canvas_w, canvas_h, scale, disp_w, disp_h, current_off_x, current_off_y
-            nonlocal rect_id, text_id, warning_id
-            try:
-                new_w = int(canvas_w_var.get())
-                new_h = int(canvas_h_var.get())
-                if new_w <= 0 or new_h <= 0:
-                    raise ValueError
-                canvas_w, canvas_h = new_w, new_h
-                scale = min(max_display_w / canvas_w, max_display_h / canvas_h, 1.0)
-                disp_w = int(canvas_w * scale)
-                disp_h = int(canvas_h * scale)
-                win.geometry(f"{disp_w + 20}x{disp_h + 200}")
-                canvas.config(width=disp_w, height=disp_h)
-                current_off_x, current_off_y = clamp_offset(current_off_x, current_off_y)
-                coord_var.set(f"偏移: X={current_off_x}, Y={current_off_y}")
-                canvas.delete("all")
-                rect_id = text_id = warning_id = None
-                self._draw_background(canvas, canvas_w, canvas_h, scale, main_track, sub_tracks,
-                                      current_off_x, current_off_y, (main_render_w, main_render_h), tag="bg")
-                draw_rectangle()
-                win.update_idletasks()
-                x = self.root.winfo_x() + (self.root.winfo_width() - win.winfo_width()) // 2
-                y = self.root.winfo_y() + (self.root.winfo_height() - win.winfo_height()) // 2
-                win.geometry(f"+{x}+{y}")
-            except:
-                messagebox.showerror("错误", "画布尺寸无效")
+            def save():
+                pad_w_var.set(str(canvas_w))
+                pad_h_var.set(str(canvas_h))
+                off_x_var.set(str(current_off_x))
+                off_y_var.set(str(current_off_y))
+                track.pad_enabled = True
+                self.merge_update_track_list()
+                self.merge_update_command_preview()
+                win.destroy()
+                self._append_info_ui(f"[可视化] 已设置画布 {canvas_w}x{canvas_h}, 偏移 ({current_off_x}, {current_off_y})")
     
-        def save():
-            pad_w_var.set(str(canvas_w))
-            pad_h_var.set(str(canvas_h))
-            off_x_var.set(str(current_off_x))
-            off_y_var.set(str(current_off_y))
-            track.pad_enabled = True
-            self.merge_update_track_list()
-            self.merge_update_command_preview()
-            win.destroy()
-            self._append_info_ui(f"[可视化] 已设置画布 {canvas_w}x{canvas_h}, 偏移 ({current_off_x}, {current_off_y})")
+            def cancel():
+                win.destroy()
     
-        def cancel():
-            win.destroy()
-    
-        btn_frame = ttk.Frame(win)
-        btn_frame.pack(pady=10)
-        ttk.Button(btn_frame, text="保存", command=save).pack(side=tk.LEFT, padx=10)
-        ttk.Button(btn_frame, text="取消", command=cancel).pack(side=tk.LEFT, padx=10)
+            btn_frame = ttk.Frame(win)
+            btn_frame.pack(pady=10)
+            ttk.Button(btn_frame, text="保存", command=save).pack(side=tk.LEFT, padx=10)
+            ttk.Button(btn_frame, text="取消", command=cancel).pack(side=tk.LEFT, padx=10)
+            win.wait_window()
 
     # ---------- 从视频位置可视化编辑器 ----------
     def open_visual_overlay_editor(self, track_idx, ov_x_var=None, ov_y_var=None, filt_frame=None):
@@ -2323,318 +2319,385 @@ class FFmpegBatchGUI:
         disp_w = int(canvas_w * scale)
         disp_h = int(canvas_h * scale)
     
-        win = tk.Toplevel(self.root)
-        win.title(f"可视化编辑叠加位置 - {os.path.basename(track.file_path)}")
-        win.transient(self.root)
-        win.grab_set()
-        sw = win.winfo_screenwidth()
-        sh = win.winfo_screenheight()
-        x = (sw - (disp_w + 20)) // 2
-        y = (sh - (disp_h + 240)) // 2
-        win.geometry(f"{disp_w + 20}x{disp_h + 240}+{x}+{y}")
-        win.update_idletasks()
+        # 使用 SafeToplevel
+        with self.SafeToplevel(self.root) as win:
+            win.title(f"可视化编辑叠加位置 - {os.path.basename(track.file_path)}")
+            win.transient(self.root)
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+            x = (sw - (disp_w + 20)) // 2
+            y = (sh - (disp_h + 240)) // 2
+            win.geometry(f"{disp_w + 20}x{disp_h + 240}+{x}+{y}")
+            win.update_idletasks()
     
-        canvas = tk.Canvas(win, width=disp_w, height=disp_h, bg="black", highlightthickness=1, highlightbackground="gray")
-        canvas.pack(pady=10)
+            canvas = tk.Canvas(win, width=disp_w, height=disp_h, bg="black", highlightthickness=1, highlightbackground="gray")
+            canvas.pack(pady=10)
     
-        status_var = tk.StringVar(value="红色矩形可拖拽移动。点击「绘制新矩形」可重新定义大小。")
-        ttk.Label(win, textvariable=status_var, justify=tk.LEFT).pack(pady=5)
+            status_var = tk.StringVar(value="红色矩形可拖拽移动。点击「绘制新矩形」可重新定义大小。")
+            ttk.Label(win, textvariable=status_var, justify=tk.LEFT).pack(pady=5)
     
-        coord_var = tk.StringVar(value="未设置")
-        ttk.Label(win, textvariable=coord_var, font=("Courier", 10)).pack(pady=2)
+            coord_var = tk.StringVar(value="未设置")
+            ttk.Label(win, textvariable=coord_var, font=("Courier", 10)).pack(pady=2)
     
-        ttk.Label(win, text=f"主视频偏移: X={offset_x}, Y={offset_y}", foreground="orange").pack(pady=2)
+            ttk.Label(win, text=f"主视频偏移: X={offset_x}, Y={offset_y}", foreground="orange").pack(pady=2)
     
-        self._draw_background(canvas, canvas_w, canvas_h, scale, main_track, sub_tracks,
-                              offset_x, offset_y, main_render_size, current_edit_track=track, tag="bg")
+            self._draw_background(canvas, canvas_w, canvas_h, scale, main_track, sub_tracks,
+                                  offset_x, offset_y, main_render_size, current_edit_track=track, tag="bg")
     
-        rect_x, rect_y, rect_w, rect_h = 0, 0, curr_w, curr_h
-        rect_id = None
-        text_id = None
+            rect_x, rect_y, rect_w, rect_h = 0, 0, curr_w, curr_h
+            rect_id = None
+            text_id = None
     
-        def load_current():
-            nonlocal rect_x, rect_y, rect_w, rect_h
-            rect_w, rect_h = curr_w, curr_h
-            x_expr = getattr(track, 'overlay_x', '0')
-            y_expr = getattr(track, 'overlay_y', '0')
-            x_val = safe_eval_expr(x_expr, {"W": canvas_w, "H": canvas_h, "w": rect_w, "h": rect_h})
-            y_val = safe_eval_expr(y_expr, {"W": canvas_w, "H": canvas_h, "w": rect_w, "h": rect_h})
-            if x_val is None or y_val is None:
-                x_val = canvas_w - rect_w - 10
-                y_val = canvas_h - rect_h - 10
-            rect_x = max(0, min(x_val, canvas_w - rect_w))
-            rect_y = max(0, min(y_val, canvas_h - rect_h))
-            coord_var.set(f"左上角: ({rect_x}, {rect_y})  宽: {rect_w}  高: {rect_h}")
-    
-        def create_rect():
-            cx1, cy1 = self._to_canvas_coords(rect_x, rect_y, scale)
-            cx2, cy2 = self._to_canvas_coords(rect_x + rect_w, rect_y + rect_h, scale)
-            rid = canvas.create_rectangle(cx1, cy1, cx2, cy2, outline="red", width=2, fill="red", stipple="gray50", tags="rect")
-            tid = canvas.create_text(cx1 + 5, cy1 + 5, anchor="nw", text="视频", fill="white", font=("Arial", 9), tags="rect")
-            return rid, tid
-    
-        def update_rect_position():
-            cx1, cy1 = self._to_canvas_coords(rect_x, rect_y, scale)
-            cx2, cy2 = self._to_canvas_coords(rect_x + rect_w, rect_y + rect_h, scale)
-            canvas.coords(rect_id, cx1, cy1, cx2, cy2)
-            canvas.coords(text_id, cx1 + 5, cy1 + 5)
-    
-        drag_start_x = 0
-        drag_start_y = 0
-        drag_mouse_start = (0, 0)
-        dragging = False
-        draw_mode_active = False
-    
-        def start_move(event):
-            nonlocal drag_start_x, drag_start_y, drag_mouse_start, dragging, draw_mode_active
-            if draw_mode_active:
-                return
-            cx, cy = event.x, event.y
-            bbox = canvas.bbox(rect_id)
-            if bbox and bbox[0] <= cx <= bbox[2] and bbox[1] <= cy <= bbox[3]:
-                drag_start_x = rect_x
-                drag_start_y = rect_y
-                drag_mouse_start = (cx, cy)
-                dragging = True
-                status_var.set("拖拽移动矩形")
-    
-        def on_move(event):
-            nonlocal rect_x, rect_y, dragging, draw_mode_active, drag_start_x, drag_start_y, drag_mouse_start
-            if not dragging or draw_mode_active:
-                return
-            dx_pixel = event.x - drag_mouse_start[0]
-            dy_pixel = event.y - drag_mouse_start[1]
-            dx = dx_pixel / scale
-            dy = dy_pixel / scale
-            new_x = int(drag_start_x + dx)
-            new_y = int(drag_start_y + dy)
-            new_x = max(0, min(new_x, canvas_w - rect_w))
-            new_y = max(0, min(new_y, canvas_h - rect_h))
-            if new_x != rect_x or new_y != rect_y:
-                rect_x, rect_y = new_x, new_y
-                update_rect_position()
+            def load_current():
+                nonlocal rect_x, rect_y, rect_w, rect_h
+                rect_w, rect_h = curr_w, curr_h
+                x_expr = getattr(track, 'overlay_x', '0')
+                y_expr = getattr(track, 'overlay_y', '0')
+                x_val = safe_eval_expr(x_expr, {"W": canvas_w, "H": canvas_h, "w": rect_w, "h": rect_h})
+                y_val = safe_eval_expr(y_expr, {"W": canvas_w, "H": canvas_h, "w": rect_w, "h": rect_h})
+                if x_val is None or y_val is None:
+                    x_val = canvas_w - rect_w - 10
+                    y_val = canvas_h - rect_h - 10
+                rect_x = max(0, min(x_val, canvas_w - rect_w))
+                rect_y = max(0, min(y_val, canvas_h - rect_h))
                 coord_var.set(f"左上角: ({rect_x}, {rect_y})  宽: {rect_w}  高: {rect_h}")
     
-        def stop_move(event):
-            nonlocal dragging
+            def create_rect():
+                cx1, cy1 = self._to_canvas_coords(rect_x, rect_y, scale)
+                cx2, cy2 = self._to_canvas_coords(rect_x + rect_w, rect_y + rect_h, scale)
+                rid = canvas.create_rectangle(cx1, cy1, cx2, cy2, outline="red", width=2, fill="red", stipple="gray50", tags="rect")
+                tid = canvas.create_text(cx1 + 5, cy1 + 5, anchor="nw", text="视频", fill="white", font=("Arial", 9), tags="rect")
+                return rid, tid
+    
+            def update_rect_position():
+                cx1, cy1 = self._to_canvas_coords(rect_x, rect_y, scale)
+                cx2, cy2 = self._to_canvas_coords(rect_x + rect_w, rect_y + rect_h, scale)
+                canvas.coords(rect_id, cx1, cy1, cx2, cy2)
+                canvas.coords(text_id, cx1 + 5, cy1 + 5)
+    
+            drag_start_x = 0
+            drag_start_y = 0
+            drag_mouse_start = (0, 0)
             dragging = False
-            status_var.set("红色矩形可拖拽移动。点击「绘制新矩形」可重新定义大小。")
+            draw_mode_active = False
     
-        canvas.tag_bind("rect", "<Button-1>", start_move)
-        canvas.tag_bind("rect", "<B1-Motion>", on_move)
-        canvas.tag_bind("rect", "<ButtonRelease-1>", stop_move)
+            def start_move(event):
+                nonlocal drag_start_x, drag_start_y, drag_mouse_start, dragging, draw_mode_active
+                if draw_mode_active:
+                    return
+                cx, cy = event.x, event.y
+                bbox = canvas.bbox(rect_id)
+                if bbox and bbox[0] <= cx <= bbox[2] and bbox[1] <= cy <= bbox[3]:
+                    drag_start_x = rect_x
+                    drag_start_y = rect_y
+                    drag_mouse_start = (cx, cy)
+                    dragging = True
+                    status_var.set("拖拽移动矩形")
     
-        draw_rect_temp = None
-        draw_start = None
+            def on_move(event):
+                nonlocal rect_x, rect_y, dragging, draw_mode_active, drag_start_x, drag_start_y, drag_mouse_start
+                if not dragging or draw_mode_active:
+                    return
+                dx_pixel = event.x - drag_mouse_start[0]
+                dy_pixel = event.y - drag_mouse_start[1]
+                dx = dx_pixel / scale
+                dy = dy_pixel / scale
+                new_x = int(drag_start_x + dx)
+                new_y = int(drag_start_y + dy)
+                new_x = max(0, min(new_x, canvas_w - rect_w))
+                new_y = max(0, min(new_y, canvas_h - rect_h))
+                if new_x != rect_x or new_y != rect_y:
+                    rect_x, rect_y = new_x, new_y
+                    update_rect_position()
+                    coord_var.set(f"左上角: ({rect_x}, {rect_y})  宽: {rect_w}  高: {rect_h}")
     
-        def start_draw(event):
-            nonlocal draw_start, draw_rect_temp, draw_mode_active
-            if not draw_mode_active:
-                return
-            if draw_rect_temp:
-                canvas.delete(draw_rect_temp)
-                draw_rect_temp = None
-            draw_start = self._to_real_coords(event.x, event.y, scale)
+            def stop_move(event):
+                nonlocal dragging
+                dragging = False
+                status_var.set("红色矩形可拖拽移动。点击「绘制新矩形」可重新定义大小。")
     
-        def on_draw_move(event):
-            nonlocal draw_rect_temp, draw_start, draw_mode_active
-            if not draw_mode_active or draw_start is None:
-                return
-            cur = self._to_real_coords(event.x, event.y, scale)
-            x1 = min(draw_start[0], cur[0])
-            y1 = min(draw_start[1], cur[1])
-            x2 = max(draw_start[0], cur[0])
-            y2 = max(draw_start[1], cur[1])
-            w = x2 - x1
-            h = y2 - y1
-            if w == 0 or h == 0:
-                return
-            if w / h > aspect:
-                new_w = h * aspect
-                new_x2 = x1 + new_w
-                new_y2 = y2
-            else:
-                new_h = w / aspect
-                new_x2 = x2
-                new_y2 = y1 + new_h
-            draw_x = x1
-            draw_y = y1
-            draw_w = new_x2 - x1
-            draw_h = new_y2 - y1
-            if draw_x < 0:
-                draw_w += draw_x
-                draw_x = 0
-            if draw_y < 0:
-                draw_h += draw_y
-                draw_y = 0
-            if draw_x + draw_w > canvas_w:
-                draw_w = canvas_w - draw_x
-                draw_h = int(draw_w / aspect) if aspect != 0 else 1
-            if draw_y + draw_h > canvas_h:
-                draw_h = canvas_h - draw_y
-                draw_w = int(draw_h * aspect) if aspect != 0 else 1
-            if draw_w <= 0 or draw_h <= 0:
-                return
-            cx1, cy1 = self._to_canvas_coords(draw_x, draw_y, scale)
-            cx2, cy2 = self._to_canvas_coords(draw_x + draw_w, draw_y + draw_h, scale)
-            if draw_rect_temp:
-                canvas.coords(draw_rect_temp, cx1, cy1, cx2, cy2)
-            else:
-                draw_rect_temp = canvas.create_rectangle(cx1, cy1, cx2, cy2, outline="yellow", width=2, dash=(2, 2))
+            canvas.tag_bind("rect", "<Button-1>", start_move)
+            canvas.tag_bind("rect", "<B1-Motion>", on_move)
+            canvas.tag_bind("rect", "<ButtonRelease-1>", stop_move)
     
-        def end_draw(event):
-            nonlocal draw_mode_active, draw_start, draw_rect_temp, rect_x, rect_y, rect_w, rect_h, rect_id, text_id
-            if not draw_mode_active or draw_start is None:
-                return
-            if draw_rect_temp:
-                coords = canvas.coords(draw_rect_temp)
-                if len(coords) == 4:
-                    cx1, cy1, cx2, cy2 = coords
-                    x1, y1 = self._to_real_coords(cx1, cy1, scale)
-                    x2, y2 = self._to_real_coords(cx2, cy2, scale)
-                    new_w = x2 - x1
-                    new_h = y2 - y1
-                    if new_w > 0 and new_h > 0:
-                        rect_x, rect_y, rect_w, rect_h = x1, y1, new_w, new_h
-                        canvas.delete(rect_id)
-                        canvas.delete(text_id)
-                        rect_id, text_id = create_rect()
-                        coord_var.set(f"左上角: ({rect_x}, {rect_y})  宽: {rect_w}  高: {rect_h}")
-                        status_var.set("新矩形已创建，可拖拽移动或应用")
+            draw_rect_temp = None
+            draw_start = None
+    
+            def start_draw(event):
+                nonlocal draw_start, draw_rect_temp, draw_mode_active
+                if not draw_mode_active:
+                    return
                 if draw_rect_temp:
                     canvas.delete(draw_rect_temp)
                     draw_rect_temp = None
-            draw_mode_active = False
-            draw_btn.config(state="normal")
-            draw_abort_btn.config(state="disabled")
-            draw_start = None
+                draw_start = self._to_real_coords(event.x, event.y, scale)
     
-        def abort_draw():
-            nonlocal draw_mode_active, draw_rect_temp, draw_start
-            draw_mode_active = False
-            draw_btn.config(state="normal")
-            draw_abort_btn.config(state="disabled")
-            if draw_rect_temp:
-                canvas.delete(draw_rect_temp)
-                draw_rect_temp = None
-            draw_start = None
-            status_var.set("已取消绘制，红色矩形可拖拽移动")
+            def on_draw_move(event):
+                nonlocal draw_rect_temp, draw_start, draw_mode_active
+                if not draw_mode_active or draw_start is None:
+                    return
+                cur = self._to_real_coords(event.x, event.y, scale)
+                x1 = min(draw_start[0], cur[0])
+                y1 = min(draw_start[1], cur[1])
+                x2 = max(draw_start[0], cur[0])
+                y2 = max(draw_start[1], cur[1])
+                w = x2 - x1
+                h = y2 - y1
+                if w == 0 or h == 0:
+                    return
+                if w / h > aspect:
+                    new_w = h * aspect
+                    new_x2 = x1 + new_w
+                    new_y2 = y2
+                else:
+                    new_h = w / aspect
+                    new_x2 = x2
+                    new_y2 = y1 + new_h
+                draw_x = x1
+                draw_y = y1
+                draw_w = new_x2 - x1
+                draw_h = new_y2 - y1
+                if draw_x < 0:
+                    draw_w += draw_x
+                    draw_x = 0
+                if draw_y < 0:
+                    draw_h += draw_y
+                    draw_y = 0
+                if draw_x + draw_w > canvas_w:
+                    draw_w = canvas_w - draw_x
+                    draw_h = int(draw_w / aspect) if aspect != 0 else 1
+                if draw_y + draw_h > canvas_h:
+                    draw_h = canvas_h - draw_y
+                    draw_w = int(draw_h * aspect) if aspect != 0 else 1
+                if draw_w <= 0 or draw_h <= 0:
+                    return
+                cx1, cy1 = self._to_canvas_coords(draw_x, draw_y, scale)
+                cx2, cy2 = self._to_canvas_coords(draw_x + draw_w, draw_y + draw_h, scale)
+                if draw_rect_temp:
+                    canvas.coords(draw_rect_temp, cx1, cy1, cx2, cy2)
+                else:
+                    draw_rect_temp = canvas.create_rectangle(cx1, cy1, cx2, cy2, outline="yellow", width=2, dash=(2, 2))
     
-        def enter_draw_mode():
-            nonlocal draw_mode_active
-            if draw_mode_active:
+            def end_draw(event):
+                nonlocal draw_mode_active, draw_start, draw_rect_temp, rect_x, rect_y, rect_w, rect_h, rect_id, text_id
+                if not draw_mode_active or draw_start is None:
+                    return
+                if draw_rect_temp:
+                    coords = canvas.coords(draw_rect_temp)
+                    if len(coords) == 4:
+                        cx1, cy1, cx2, cy2 = coords
+                        x1, y1 = self._to_real_coords(cx1, cy1, scale)
+                        x2, y2 = self._to_real_coords(cx2, cy2, scale)
+                        new_w = x2 - x1
+                        new_h = y2 - y1
+                        if new_w > 0 and new_h > 0:
+                            rect_x, rect_y, rect_w, rect_h = x1, y1, new_w, new_h
+                            canvas.delete(rect_id)
+                            canvas.delete(text_id)
+                            rect_id, text_id = create_rect()
+                            coord_var.set(f"左上角: ({rect_x}, {rect_y})  宽: {rect_w}  高: {rect_h}")
+                            status_var.set("新矩形已创建，可拖拽移动或应用")
+                    if draw_rect_temp:
+                        canvas.delete(draw_rect_temp)
+                        draw_rect_temp = None
+                draw_mode_active = False
+                draw_btn.config(state="normal")
+                draw_abort_btn.config(state="disabled")
+                draw_start = None
+    
+            def abort_draw():
+                nonlocal draw_mode_active, draw_rect_temp, draw_start
+                draw_mode_active = False
+                draw_btn.config(state="normal")
+                draw_abort_btn.config(state="disabled")
+                if draw_rect_temp:
+                    canvas.delete(draw_rect_temp)
+                    draw_rect_temp = None
+                draw_start = None
+                status_var.set("已取消绘制，红色矩形可拖拽移动")
+    
+            def enter_draw_mode():
+                nonlocal draw_mode_active
+                if draw_mode_active:
+                    return
+                draw_mode_active = True
+                draw_btn.config(state="disabled")
+                draw_abort_btn.config(state="normal")
+                status_var.set("绘制模式：按住左键拖拽绘制新矩形（保持宽高比），松开后自动替换")
+    
+            canvas.bind("<Button-1>", start_draw, add=True)
+            canvas.bind("<B1-Motion>", on_draw_move, add=True)
+            canvas.bind("<ButtonRelease-1>", end_draw, add=True)
+    
+            btn_frame = ttk.Frame(win)
+            btn_frame.pack(pady=5)
+            draw_btn = ttk.Button(btn_frame, text="绘制新矩形", command=enter_draw_mode)
+            draw_btn.pack(side=tk.LEFT, padx=5)
+            draw_abort_btn = ttk.Button(btn_frame, text="取消绘制", command=abort_draw, state="disabled")
+            draw_abort_btn.pack(side=tk.LEFT, padx=5)
+    
+            def apply():
+                track.overlay_x = str(int(rect_x))
+                track.overlay_y = str(int(rect_y))
+                if ov_x_var is not None:
+                    ov_x_var.set(str(int(rect_x)))
+                if ov_y_var is not None:
+                    ov_y_var.set(str(int(rect_y)))
+                track.enc_settings["scale_enabled"] = True
+                track.enc_settings["scale_width"] = str(int(rect_w))
+                track.enc_settings["scale_height"] = str(int(rect_h))
+                track.enc_settings["scale_method"] = "exact"
+                self._append_info_ui(f"[可视化] 设置缩放: {rect_w}x{rect_h}")
+                if filt_frame is not None:
+                    filt_frame.scale_enabled.set(True)
+                    filt_frame.scale_method.set("exact")
+                    filt_frame.scale_width.set(str(int(rect_w)))
+                    filt_frame.scale_height.set(str(int(rect_h)))
+                self.video_filter.scale_enabled.set(True)
+                self.video_filter.scale_method.set("exact")
+                self.video_filter.scale_width.set(str(int(rect_w)))
+                self.video_filter.scale_height.set(str(int(rect_h)))
+                self.merge_update_track_list()
+                self.merge_update_command_preview()
+                win.destroy()
+                self._append_info_ui(f"[可视化] 已保存位置: ({rect_x}, {rect_y}) 大小: {rect_w}x{rect_h}")
+    
+            def cancel():
+                win.destroy()
+    
+            def reset_position():
+                nonlocal rect_x, rect_y
+                rect_x = canvas_w - rect_w - 10
+                rect_y = canvas_h - rect_h - 10
+                update_rect_position()
+                coord_var.set(f"左上角: ({rect_x}, {rect_y})  宽: {rect_w}  高: {rect_h}")
+                status_var.set("已重置到右下角（可继续拖拽）")
+    
+            load_current()
+            rect_id, text_id = create_rect()
+            draw_mode_active = False
+    
+            action_frame = ttk.Frame(win)
+            action_frame.pack(pady=10)
+            ttk.Button(action_frame, text="应用", command=apply).pack(side=tk.LEFT, padx=10)
+            ttk.Button(action_frame, text="取消", command=cancel).pack(side=tk.LEFT, padx=10)
+            ttk.Button(action_frame, text="重置位置（右下角）", command=reset_position).pack(side=tk.LEFT, padx=10)
+            tip_label = ttk.Label(win, text="提示：重新绘制矩形时，如果比例不对，请先返回上一个界面取消「缩放」的勾选，已保存的上一次缩放会干扰裁剪属性。",
+                                  foreground="gray", justify=tk.LEFT, wraplength=win.winfo_width() - 20)
+            tip_label.pack(fill=tk.X, padx=10, pady=10)
+    
+            def update_wraplength(event=None):
+                tip_label.config(wraplength=win.winfo_width() - 20)
+            win.bind("<Configure>", update_wraplength)
+            update_wraplength()
+            win.wait_window()
+
+    # ---------- 预设管理 ----------
+    def load_preset_list(self):
+        presets = self.preset_manager.load_all()
+        preset_names = list(presets.keys())
+        self.preset_combo['values'] = preset_names
+
+    def save_preset(self):
+        preset_name = simpledialog.askstring("保存预设", "请输入预设名称:", parent=self.root)
+        if not preset_name: 
+            return
+        preset_settings = self.get_current_settings()
+        self.preset_manager.save_preset(preset_name, preset_settings)
+        self.load_preset_list()
+        messagebox.showinfo("成功", f"预设“{preset_name}”已保存到:\n{self.preset_file_path}")
+
+    def load_preset(self, preset_name):
+        if not preset_name:
+            return
+        presets = self.preset_manager.load_all()
+        if preset_name not in presets:
+            return
+        self.load_settings_into_ui(presets[preset_name])
+        messagebox.showinfo("成功", f"已加载预设“{preset_name}”")
+
+    def delete_preset(self):
+        preset_name = self.preset_name.get()
+        if not preset_name:
+            messagebox.showwarning("警告", "请先选择一个预设")
+            return
+        if not messagebox.askyesno("确认删除", f"确定要删除预设“{preset_name}”吗？"):
+            return
+        if self.preset_manager.delete_preset(preset_name):
+            self.load_preset_list()
+            self.preset_name.set("")
+            messagebox.showinfo("成功", f"预设“{preset_name}”已删除")
+        else:
+            messagebox.showerror("错误", "删除失败")
+
+    def export_all_presets(self):
+        if not os.path.exists(self.preset_file_path):
+            if messagebox.askyesno("提示", "当前没有预设文件，是否创建一个空的预设文件并导出？"):
+                with open(self.preset_file_path, 'w', encoding='utf-8') as f:
+                    json.dump({}, f, indent=4)
+            else:
                 return
-            draw_mode_active = True
-            draw_btn.config(state="disabled")
-            draw_abort_btn.config(state="normal")
-            status_var.set("绘制模式：按住左键拖拽绘制新矩形（保持宽高比），松开后自动替换")
-    
-        canvas.bind("<Button-1>", start_draw, add=True)
-        canvas.bind("<B1-Motion>", on_draw_move, add=True)
-        canvas.bind("<ButtonRelease-1>", end_draw, add=True)
-    
-        btn_frame = ttk.Frame(win)
-        btn_frame.pack(pady=5)
-        draw_btn = ttk.Button(btn_frame, text="绘制新矩形", command=enter_draw_mode)
-        draw_btn.pack(side=tk.LEFT, padx=5)
-        draw_abort_btn = ttk.Button(btn_frame, text="取消绘制", command=abort_draw, state="disabled")
-        draw_abort_btn.pack(side=tk.LEFT, padx=5)
-    
-        def apply():
-            track.overlay_x = str(int(rect_x))
-            track.overlay_y = str(int(rect_y))
-            if ov_x_var is not None:
-                ov_x_var.set(str(int(rect_x)))
-            if ov_y_var is not None:
-                ov_y_var.set(str(int(rect_y)))
-            track.enc_settings["scale_enabled"] = True
-            track.enc_settings["scale_width"] = str(int(rect_w))
-            track.enc_settings["scale_height"] = str(int(rect_h))
-            track.enc_settings["scale_method"] = "exact"
-            self._append_info_ui(f"[可视化] 设置缩放: {rect_w}x{rect_h}")
-            if filt_frame is not None:
-                filt_frame.scale_enabled.set(True)
-                filt_frame.scale_method.set("exact")
-                filt_frame.scale_width.set(str(int(rect_w)))
-                filt_frame.scale_height.set(str(int(rect_h)))
-            self.video_filter.scale_enabled.set(True)
-            self.video_filter.scale_method.set("exact")
-            self.video_filter.scale_width.set(str(int(rect_w)))
-            self.video_filter.scale_height.set(str(int(rect_h)))
-            self.merge_update_track_list()
-            self.merge_update_command_preview()
-            win.destroy()
-            self._append_info_ui(f"[可视化] 已保存位置: ({rect_x}, {rect_y}) 大小: {rect_w}x{rect_h}")
-    
-        def cancel():
-            win.destroy()
-    
-        def reset_position():
-            nonlocal rect_x, rect_y
-            rect_x = canvas_w - rect_w - 10
-            rect_y = canvas_h - rect_h - 10
-            update_rect_position()
-            coord_var.set(f"左上角: ({rect_x}, {rect_y})  宽: {rect_w}  高: {rect_h}")
-            status_var.set("已重置到右下角（可继续拖拽）")
-    
-        load_current()
-        rect_id, text_id = create_rect()
-        draw_mode_active = False
-    
-        action_frame = ttk.Frame(win)
-        action_frame.pack(pady=10)
-        ttk.Button(action_frame, text="应用", command=apply).pack(side=tk.LEFT, padx=10)
-        ttk.Button(action_frame, text="取消", command=cancel).pack(side=tk.LEFT, padx=10)
-        ttk.Button(action_frame, text="重置位置（右下角）", command=reset_position).pack(side=tk.LEFT, padx=10)
-        tip_label = ttk.Label(win, text="提示：重新绘制矩形时，如果比例不对，请先返回上一个界面取消「缩放」的勾选，已保存的上一次缩放会干扰裁剪属性。",
-                              foreground="gray", justify=tk.LEFT, wraplength=win.winfo_width() - 20)
-        tip_label.pack(fill=tk.X, padx=10, pady=10)
+        save_path = filedialog.asksaveasfilename(
+            title="导出全部预设 (备份)",
+            defaultextension=".json",
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+            initialfile="ffmpeg_presets_backup.json"
+        )
+        if not save_path:
+            return
+        try:
+            shutil.copy2(self.preset_file_path, save_path)
+            self._append_info_ui(f"✅ 全部预设已备份到: {save_path}")
+            messagebox.showinfo("导出成功", f"预设库已导出至:\n{save_path}")
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
 
-        def update_wraplength(event=None):
-            tip_label.config(wraplength=win.winfo_width() - 20)
-        win.bind("<Configure>", update_wraplength)
-        update_wraplength()
-    # ---------- 可视化编辑器结束 ----------
+    def import_presets(self):
+        import_path = filedialog.askopenfilename(
+            title="导入预设库",
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")]
+        )
+        if not import_path:
+            return
+        try:
+            with open(import_path, 'r', encoding='utf-8') as f:
+                imported = json.load(f)
+        except Exception as e:
+            messagebox.showerror("读取失败", f"无法读取文件:\n{e}")
+            return
+        if not isinstance(imported, dict):
+            messagebox.showerror("格式错误", "导入的文件必须是 JSON 对象（键为预设名称，值为设置字典）")
+            return
+        for preset_name, settings in imported.items():
+            if isinstance(settings, dict) and "custom_args" in settings:
+                custom = settings["custom_args"].strip()
+                if re.search(r'[;&|`$]', custom):
+                    self._append_info_ui(f"警告：预设 '{preset_name}' 中的自定义参数包含危险字符，已清空")
+                    settings["custom_args"] = ""
+        current = self.preset_manager.load_all()
+        player_cfg = self.preset_manager.load_player_settings()
+        answer = messagebox.askyesno(
+            "导入方式",
+            f"当前有 {len(current)} 个预设，导入文件包含 {len(imported)} 个预设。\n"
+            "是否替换整个预设库？\n（选“是”将完全替换；选“否”则合并，同名预设将被覆盖）"
+        )
+        if answer:
+            new_presets = imported
+        else:
+            new_presets = current.copy()
+            new_presets.update(imported)
+        full_data = new_presets.copy()
+        full_data["player_settings"] = player_cfg
+        try:
+            with open(self.preset_file_path, 'w', encoding='utf-8') as f:
+                json.dump(full_data, f, indent=4, ensure_ascii=False)
+            self.load_preset_list()
+            self._append_info_ui(f"✅ 预设库已更新，共 {len(new_presets)} 个预设")
+            messagebox.showinfo("导入成功", f"预设库已更新，当前共 {len(new_presets)} 个预设")
+        except Exception as e:
+            messagebox.showerror("保存失败", str(e))
 
-    # ---------- 基本方法 ----------
-    def check_ffmpeg_dependencies(self):
-        return self.ffmpeg_cmd, self.ffplay_cmd, self.ffprobe_cmd
-
-    def show_quick_warning(self):
-        missing = []
-        if not self.ffmpeg_cmd: missing.append("ffmpeg")
-        if not self.ffplay_cmd: missing.append("ffplay")
-        if not self.ffprobe_cmd: missing.append("ffprobe")
-        if missing:
-            missing_str = "、".join(missing)
-            self._append_info_ui("⚠️ 必要组件缺失: " + missing_str)
-            self._append_info_ui("请确保 FFmpeg 已正确安装。快捷方法：")
-            self._append_info_ui("  ① 将 ffmpeg.exe、ffplay.exe、ffprobe.exe 放在本脚本同一目录下（推荐，绿色便携）")
-            self._append_info_ui("  ② 或者将它们所在文件夹的路径添加到系统 Path 环境变量中")
-            self._append_info_ui("推荐下载 FFmpeg 的 **shared** 版本（体积小，节约空间）：")
-            self._append_info_ui("下载地址: https://github.com/BtbN/FFmpeg-Builds/releases")
-            self._append_info_ui("选择文件名中包含 'shared' 的版本，例如: ffmpeg-master-latest-win64-gpl-shared.zip")
-            self._append_info_ui("解压后，将 bin 文件夹内的三个 exe 文件复制到本脚本目录，或添加 bin 路径到 Path。")
-            self._append_info_ui("提示：您可以在此日志框中直接选中上面的链接文字，右键复制。")
-
-    def append_info(self, text):
-        self.info_text.insert(tk.END, text + "\n")
-        self.info_text.see(tk.END)
-
-    def append_detail(self, text):
-        self.detail_text.insert(tk.END, text)
-        self.detail_text.see(tk.END)
-
-    def save_log(self, text_widget):
-        file_path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("文本文件", "*.txt")])
-        if file_path:
-            try:
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(text_widget.get(1.0, tk.END))
-                self._append_info_ui(f"日志已保存到 {file_path}")
-            except Exception as e:
-                messagebox.showerror("保存失败", str(e))
-
+    # ---------- 参数获取与加载 ----------
     def get_current_settings(self):
         settings = {}
         settings.update(self.video_encoder.get_settings())
@@ -2662,6 +2725,7 @@ class FFmpegBatchGUI:
         self.pip_enabled.set(settings.get("pip_enabled", False))
         self.toggle_only_audio_mode()
 
+    # ---------- 输出路径生成与命令构建 ----------
     def generate_output_path(self, input_path, settings):
         dir_path = settings.get("output_dir") or os.path.dirname(input_path)
         dir_path = normalize_path(dir_path)
@@ -2676,9 +2740,12 @@ class FFmpegBatchGUI:
         if custom_name:
             # 取路径的 basename，去除任何目录部分
             custom_name = os.path.basename(custom_name)
-            # 额外检查是否为空或只有点
-            if not custom_name or custom_name in ('.', '..'):
-                self._append_info_ui("警告：自定义文件名无效，已忽略")
+            # 拒绝空名、单点、双点、Windows 保留设备名
+            forbidden = {'.', '..', 'CON', 'PRN', 'AUX', 'NUL',
+                         'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
+                         'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'}
+            if not custom_name or custom_name in forbidden or (sys.platform == "win32" and custom_name.upper() in forbidden):
+                self._append_info_ui("警告：自定义文件名无效（空或保留名），已忽略")
                 custom_name = ""
         if custom_name:
             out_name = custom_name
@@ -2764,7 +2831,7 @@ class FFmpegBatchGUI:
             if audio_needs_volume:
                 audio_filters.append(f"volume={volume:.2f}")
             if audio_needs_speed:
-                atempo_chain = build_atempo_chain(speed_factor)   # 全局函数，无 self.
+                atempo_chain = build_atempo_chain(speed_factor)
                 if atempo_chain:
                     audio_filters.append(atempo_chain)
     
@@ -2799,6 +2866,7 @@ class FFmpegBatchGUI:
         cmd_list.append(output_path)
         return cmd_list
 
+    # ---------- 预览与 UI 辅助 ----------
     def preview_current_file(self):
         path = self.input_file.get().strip()
         if not path or not os.path.exists(path):
@@ -2960,6 +3028,13 @@ class FFmpegBatchGUI:
         if self.stop_flag and not self.running_futures:
             self._finish_queue()
 
+    # ---------- 并行队列处理 ----------
+    @staticmethod
+    def is_hardware_encoder(encoder):
+        hw_keywords = ('nvenc', 'qsv', 'amf', 'vaapi', 'videotoolbox')
+        encoder_lower = encoder.lower()
+        return any(kw in encoder_lower for kw in hw_keywords)
+
     def start_queue(self):
         if self.is_processing:
             if not self.running_futures and not self.pending_tasks:
@@ -2967,6 +3042,10 @@ class FFmpegBatchGUI:
             else:
                 messagebox.showinfo("提示", "队列已在运行中")
             return
+        # 确保旧的 executor 被关闭（防止泄漏）
+        if self.executor:
+            self.executor.shutdown(wait=False)
+            self.executor = None
         self.pending_tasks = [t for t in self.tasks if t.status == "等待"]
         if not self.pending_tasks:
             messagebox.showinfo("提示", "没有等待中的任务")
@@ -2975,14 +3054,8 @@ class FFmpegBatchGUI:
         self.stop_flag = False
         max_workers = self.max_parallel.get()
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-        self._append_info_ui(f"🚀 启动并行队列，最大并行任务数: {max_workers}，硬件编码最大并发: {self.max_hw_parallel.get()}")
+        self._append_info_ui(f"启动并行队列，最大并行任务数: {max_workers}，硬件编码最大并发: {self.max_hw_parallel.get()}")
         self._submit_next_batch()
-
-    @staticmethod
-    def is_hardware_encoder(encoder):
-        hw_keywords = ('nvenc', 'qsv', 'amf', 'vaapi', 'videotoolbox')
-        encoder_lower = encoder.lower()
-        return any(kw in encoder_lower for kw in hw_keywords)
 
     def _submit_next_batch(self):
         if self.stop_flag and not self.running_futures:
@@ -3080,9 +3153,6 @@ class FFmpegBatchGUI:
     def _append_info_ui(self, text: str):
         self.root.after(0, lambda: self.append_info(text))
 
-    def _append_detail_ui(self, text):
-        self.root.after(0, lambda: self.append_detail(text))
-
     def transcode_single(self):
         input_file = self.input_file.get()
         if not input_file or not os.path.exists(input_file):
@@ -3113,114 +3183,14 @@ class FFmpegBatchGUI:
     def ensure_output_dir(self, output_path):
         dirname = os.path.dirname(output_path)
         if dirname and not os.path.exists(dirname):
+            # 防止在 Windows 下将输出文件直接写入磁盘根目录
+            if sys.platform == "win32":
+                root_dirs = ('C:\\', 'C:/')
+                if dirname.upper() in root_dirs:
+                    raise ValueError(f"禁止将输出文件直接写入C盘根目录: {dirname}")
             os.makedirs(dirname, exist_ok=True)
 
-    # ---------- 预设管理 ----------
-    def load_preset_list(self):
-        presets = self.preset_manager.load_all()
-        preset_names = list(presets.keys())
-        self.preset_combo['values'] = preset_names
-
-    def save_preset(self):
-        preset_name = simpledialog.askstring("保存预设", "请输入预设名称:", parent=self.root)
-        if not preset_name: 
-            return
-        preset_settings = self.get_current_settings()
-        self.preset_manager.save_preset(preset_name, preset_settings)
-        self.load_preset_list()
-        messagebox.showinfo("成功", f"预设“{preset_name}”已保存到:\n{self.preset_file_path}")
-
-    def load_preset(self, preset_name):
-        if not preset_name:
-            return
-        presets = self.preset_manager.load_all()
-        if preset_name not in presets:
-            return
-        self.load_settings_into_ui(presets[preset_name])
-        messagebox.showinfo("成功", f"已加载预设“{preset_name}”")
-
-    def delete_preset(self):
-        preset_name = self.preset_name.get()
-        if not preset_name:
-            messagebox.showwarning("警告", "请先选择一个预设")
-            return
-        if not messagebox.askyesno("确认删除", f"确定要删除预设“{preset_name}”吗？"):
-            return
-        if self.preset_manager.delete_preset(preset_name):
-            self.load_preset_list()
-            self.preset_name.set("")
-            messagebox.showinfo("成功", f"预设“{preset_name}”已删除")
-        else:
-            messagebox.showerror("错误", "删除失败")
-
-    def export_all_presets(self):
-        if not os.path.exists(self.preset_file_path):
-            if messagebox.askyesno("提示", "当前没有预设文件，是否创建一个空的预设文件并导出？"):
-                with open(self.preset_file_path, 'w', encoding='utf-8') as f:
-                    json.dump({}, f, indent=4)
-            else:
-                return
-        save_path = filedialog.asksaveasfilename(
-            title="导出全部预设 (备份)",
-            defaultextension=".json",
-            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
-            initialfile="ffmpeg_presets_backup.json"
-        )
-        if not save_path:
-            return
-        try:
-            shutil.copy2(self.preset_file_path, save_path)
-            self._append_info_ui(f"✅ 全部预设已备份到: {save_path}")
-            messagebox.showinfo("导出成功", f"预设库已导出至:\n{save_path}")
-        except Exception as e:
-            messagebox.showerror("导出失败", str(e))
-
-    def import_presets(self):
-        import_path = filedialog.askopenfilename(
-            title="导入预设库",
-            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")]
-        )
-        if not import_path:
-            return
-        try:
-            with open(import_path, 'r', encoding='utf-8') as f:
-                imported = json.load(f)
-        except Exception as e:
-            messagebox.showerror("读取失败", f"无法读取文件:\n{e}")
-            return
-        if not isinstance(imported, dict):
-            messagebox.showerror("格式错误", "导入的文件必须是 JSON 对象（键为预设名称，值为设置字典）")
-            return
-        # 安全过滤：移除预设中可能危险的 custom_args
-        for preset_name, settings in imported.items():
-            if isinstance(settings, dict) and "custom_args" in settings:
-                custom = settings["custom_args"].strip()
-                if re.search(r'[;&|`$]', custom):
-                    self._append_info_ui(f"警告：预设 '{preset_name}' 中的自定义参数包含危险字符，已清空")
-                    settings["custom_args"] = ""
-        current = self.preset_manager.load_all()
-        player_cfg = self.preset_manager.load_player_settings()
-        answer = messagebox.askyesno(
-            "导入方式",
-            f"当前有 {len(current)} 个预设，导入文件包含 {len(imported)} 个预设。\n"
-            "是否替换整个预设库？\n（选“是”将完全替换；选“否”则合并，同名预设将被覆盖）"
-        )
-        if answer:
-            new_presets = imported
-        else:
-            new_presets = current.copy()
-            new_presets.update(imported)
-        full_data = new_presets.copy()
-        full_data["player_settings"] = player_cfg
-        try:
-            with open(self.preset_file_path, 'w', encoding='utf-8') as f:
-                json.dump(full_data, f, indent=4, ensure_ascii=False)
-            self.load_preset_list()
-            self._append_info_ui(f"✅ 预设库已更新，共 {len(new_presets)} 个预设")
-            messagebox.showinfo("导入成功", f"预设库已更新，当前共 {len(new_presets)} 个预设")
-        except Exception as e:
-            messagebox.showerror("保存失败", str(e))
-
+    # ---------- 导出脚本、编辑任务 ----------
     def export_script(self):
         if not self.tasks:
             messagebox.showinfo("提示", "任务列表为空，无法导出")
@@ -3255,177 +3225,178 @@ class FFmpegBatchGUI:
             messagebox.showwarning("无法编辑", f"任务状态为“{task.status}”，只能编辑等待或失败的任务。")
             return
     
-        win = tk.Toplevel(self.root)
-        win.title(f"编辑任务 - {os.path.basename(task.input)}")
-        win.geometry("800x450")
-        win.transient(self.root)
-        win.grab_set()
-        
-        win.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() - 800) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - 450) // 2
-        win.geometry(f"+{x}+{y}")
+        # 使用 SafeToplevel 创建编辑窗口
+        with self.SafeToplevel(self.root) as win:
+            win.title(f"编辑任务 - {os.path.basename(task.input)}")
+            win.geometry("800x450")
+            win.transient(self.root)
+            win.update_idletasks()
+            x = self.root.winfo_x() + (self.root.winfo_width() - 800) // 2
+            y = self.root.winfo_y() + (self.root.winfo_height() - 450) // 2
+            win.geometry(f"+{x}+{y}")
     
-        notebook = ttk.Notebook(win)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+            notebook = ttk.Notebook(win)
+            notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
     
-        # 输入/输出页面
-        page_io = ttk.Frame(notebook)
-        notebook.add(page_io, text="输入/输出")
-        out_dir_var = tk.StringVar(value=task.settings.get("output_dir", ""))
-        suffix_var = tk.StringVar(value=task.settings.get("output_suffix", ""))
-        custom_var = tk.StringVar(value=task.settings.get("custom_output_name", ""))
-        container_var = tk.StringVar(value=task.settings.get("output_container", "mp4"))
-        ttk.Label(page_io, text="输出目录:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        ttk.Entry(page_io, textvariable=out_dir_var, width=60).grid(row=0, column=1, padx=5, pady=5)
-        ttk.Button(page_io, text="浏览", command=lambda: out_dir_var.set(normalize_path(filedialog.askdirectory() or out_dir_var.get()))).grid(row=0, column=2, padx=5)
-        ttk.Label(page_io, text="文件名后缀:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
-        ttk.Entry(page_io, textvariable=suffix_var, width=30).grid(row=1, column=1, sticky="w", padx=5)
-        ttk.Label(page_io, text="自定义完整名称:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
-        ttk.Entry(page_io, textvariable=custom_var, width=60).grid(row=2, column=1, padx=5)
-        ttk.Label(page_io, text="输出容器:").grid(row=3, column=0, sticky="w", padx=5, pady=5)
-        ttk.Combobox(page_io, textvariable=container_var, values=["mp4","mkv","mov","avi","webm"], state="readonly", width=8).grid(row=3, column=1, sticky="w", padx=5)
+            # 输入/输出页面
+            page_io = ttk.Frame(notebook)
+            notebook.add(page_io, text="输入/输出")
+            out_dir_var = tk.StringVar(value=task.settings.get("output_dir", ""))
+            suffix_var = tk.StringVar(value=task.settings.get("output_suffix", ""))
+            custom_var = tk.StringVar(value=task.settings.get("custom_output_name", ""))
+            container_var = tk.StringVar(value=task.settings.get("output_container", "mp4"))
+            ttk.Label(page_io, text="输出目录:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+            ttk.Entry(page_io, textvariable=out_dir_var, width=60).grid(row=0, column=1, padx=5, pady=5)
+            ttk.Button(page_io, text="浏览", command=lambda: out_dir_var.set(normalize_path(filedialog.askdirectory() or out_dir_var.get()))).grid(row=0, column=2, padx=5)
+            ttk.Label(page_io, text="文件名后缀:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+            ttk.Entry(page_io, textvariable=suffix_var, width=30).grid(row=1, column=1, sticky="w", padx=5)
+            ttk.Label(page_io, text="自定义完整名称:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+            ttk.Entry(page_io, textvariable=custom_var, width=60).grid(row=2, column=1, padx=5)
+            ttk.Label(page_io, text="输出容器:").grid(row=3, column=0, sticky="w", padx=5, pady=5)
+            ttk.Combobox(page_io, textvariable=container_var, values=["mp4","mkv","mov","avi","webm"], state="readonly", width=8).grid(row=3, column=1, sticky="w", padx=5)
     
-        # 视频编码页面
-        page_enc = ttk.Frame(notebook)
-        notebook.add(page_enc, text="视频编码")
-        enc_frame = VideoEncoderFrame(page_enc)
-        enc_frame.pack(fill=tk.X, padx=5, pady=5)
-        enc_frame.set_settings(task.settings)
+            # 视频编码页面
+            page_enc = ttk.Frame(notebook)
+            notebook.add(page_enc, text="视频编码")
+            enc_frame = VideoEncoderFrame(page_enc)
+            enc_frame.pack(fill=tk.X, padx=5, pady=5)
+            enc_frame.set_settings(task.settings)
     
-        # 视频滤镜页面
-        page_filt = ttk.Frame(notebook)
-        notebook.add(page_filt, text="视频滤镜")
-        filt_frame = VideoFilterFrame(page_filt, app=self)
-        filt_frame.current_file = task.input
-        filt_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        filt_frame.set_settings(task.settings)
+            # 视频滤镜页面
+            page_filt = ttk.Frame(notebook)
+            notebook.add(page_filt, text="视频滤镜")
+            filt_frame = VideoFilterFrame(page_filt, app=self)
+            filt_frame.current_file = task.input
+            filt_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+            filt_frame.set_settings(task.settings)
     
-        # 音频页面
-        page_audio = ttk.Frame(notebook)
-        notebook.add(page_audio, text="音频")
-        container = ttk.Frame(page_audio)
-        container.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
-        audio_frame = AudioFrame(container, enable_checkbox=True)
-        audio_frame.pack(fill=tk.X)
-        audio_frame.set_settings(task.settings)
+            # 音频页面
+            page_audio = ttk.Frame(notebook)
+            notebook.add(page_audio, text="音频")
+            container = ttk.Frame(page_audio)
+            container.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+            audio_frame = AudioFrame(container, enable_checkbox=True)
+            audio_frame.pack(fill=tk.X)
+            audio_frame.set_settings(task.settings)
     
-        # 截取片段页面
-        page_trim = ttk.Frame(notebook)
-        notebook.add(page_trim, text="截取片段")
-        trim_frame = TrimFrame(page_trim)
-        trim_frame.pack(fill=tk.X, padx=5, pady=5)
-        trim_frame.set_settings(task.settings)
+            # 截取片段页面
+            page_trim = ttk.Frame(notebook)
+            notebook.add(page_trim, text="截取片段")
+            trim_frame = TrimFrame(page_trim)
+            trim_frame.pack(fill=tk.X, padx=5, pady=5)
+            trim_frame.set_settings(task.settings)
     
-        # 高级选项页面
-        page_adv = ttk.Frame(notebook)
-        notebook.add(page_adv, text="高级选项")
-        adv_frame = AdvancedFrame(page_adv, update_callback=None)
-        adv_frame.pack(fill=tk.X, padx=5, pady=5)
-        adv_frame.set_settings(task.settings)
+            # 高级选项页面
+            page_adv = ttk.Frame(notebook)
+            notebook.add(page_adv, text="高级选项")
+            adv_frame = AdvancedFrame(page_adv, update_callback=None)
+            adv_frame.pack(fill=tk.X, padx=5, pady=5)
+            adv_frame.set_settings(task.settings)
     
-        # 命令预览区
-        preview_frame = ttk.LabelFrame(win, text="新命令预览", padding="5")
-        preview_frame.pack(fill=tk.X, pady=10, padx=5)
-        preview_text = scrolledtext.ScrolledText(preview_frame, height=10, wrap=tk.WORD)
-        preview_text.pack(fill=tk.BOTH, expand=True)
+            # 命令预览区
+            preview_frame = ttk.LabelFrame(win, text="新命令预览", padding="5")
+            preview_frame.pack(fill=tk.X, pady=10, padx=5)
+            preview_text = scrolledtext.ScrolledText(preview_frame, height=10, wrap=tk.WORD)
+            preview_text.pack(fill=tk.BOTH, expand=True)
     
-        def update_preview(*args):
-            new_settings = {}
-            new_settings.update(enc_frame.get_settings())
-            new_settings.update(filt_frame.get_settings())
-            new_settings.update(audio_frame.get_settings())
-            new_settings.update(trim_frame.get_settings())
-            new_settings.update(adv_frame.get_settings())
-            new_settings["output_dir"] = out_dir_var.get()
-            new_settings["output_suffix"] = suffix_var.get()
-            new_settings["custom_output_name"] = custom_var.get()
-            new_settings["output_container"] = container_var.get()
-            new_out = self.generate_output_path(task.input, new_settings)
-            try:
-                new_cmd_list = self.generate_ffmpeg_command(task.input, new_out, new_settings)
-                new_cmd_str = format_cmd_for_display(new_cmd_list)
-            except ValueError as e:
-                new_cmd_str = f"参数错误: {e}"
-            preview_text.delete(1.0, tk.END)
-            preview_text.insert(tk.END, new_cmd_str)
+            def update_preview(*args):
+                new_settings = {}
+                new_settings.update(enc_frame.get_settings())
+                new_settings.update(filt_frame.get_settings())
+                new_settings.update(audio_frame.get_settings())
+                new_settings.update(trim_frame.get_settings())
+                new_settings.update(adv_frame.get_settings())
+                new_settings["output_dir"] = out_dir_var.get()
+                new_settings["output_suffix"] = suffix_var.get()
+                new_settings["custom_output_name"] = custom_var.get()
+                new_settings["output_container"] = container_var.get()
+                new_out = self.generate_output_path(task.input, new_settings)
+                try:
+                    new_cmd_list = self.generate_ffmpeg_command(task.input, new_out, new_settings)
+                    new_cmd_str = format_cmd_for_display(new_cmd_list)
+                except ValueError as e:
+                    new_cmd_str = f"参数错误: {e}"
+                preview_text.delete(1.0, tk.END)
+                preview_text.insert(tk.END, new_cmd_str)
     
-        # 绑定控件变化
-        enc_frame.vcodec.trace_add("write", update_preview)
-        enc_frame.rate_control_type.trace_add("write", update_preview)
-        enc_frame.crf_value.trace_add("write", update_preview)
-        enc_frame.cq_value.trace_add("write", update_preview)
-        enc_frame.global_quality.trace_add("write", update_preview)
-        enc_frame.bitrate_video.trace_add("write", update_preview)
-        filt_frame.frame_rate_type.trace_add("write", update_preview)
-        filt_frame.frame_rate_custom.trace_add("write", update_preview)
-        filt_frame.scale_enabled.trace_add("write", update_preview)
-        filt_frame.scale_width.trace_add("write", update_preview)
-        filt_frame.scale_height.trace_add("write", update_preview)
-        filt_frame.scale_method.trace_add("write", update_preview)
-        filt_frame.crop_enabled.trace_add("write", update_preview)
-        filt_frame.crop_left.trace_add("write", update_preview)
-        filt_frame.crop_top.trace_add("write", update_preview)
-        filt_frame.crop_width.trace_add("write", update_preview)
-        filt_frame.crop_height.trace_add("write", update_preview)
-        filt_frame.rotate.trace_add("write", update_preview)
-        filt_frame.vflip.trace_add("write", update_preview)
-        filt_frame.hflip.trace_add("write", update_preview)
-        filt_frame.speed_enabled.trace_add("write", update_preview)
-        filt_frame.speed_factor.trace_add("write", update_preview)
-        filt_frame.deinterlace_filter.trace_add("write", update_preview)
-        filt_frame.pix_fmt_enabled.trace_add("write", update_preview)
-        filt_frame.pix_fmt.trace_add("write", update_preview)
-        filt_frame.subtitle_enabled.trace_add("write", update_preview)
-        filt_frame.subtitle_path.trace_add("write", update_preview)
-        audio_frame.audio_enabled.trace_add("write", update_preview)
-        audio_frame.audio_codec.trace_add("write", update_preview)
-        audio_frame.audio_bitrate.trace_add("write", update_preview)
-        audio_frame.audio_samplerate.trace_add("write", update_preview)
-        audio_frame.only_audio.trace_add("write", update_preview)
-        audio_frame.audio_format.trace_add("write", update_preview)
-        trim_frame.trim_enabled.trace_add("write", update_preview)
-        trim_frame.trim_start.trace_add("write", update_preview)
-        trim_frame.trim_end.trace_add("write", update_preview)
-        adv_frame.hwaccel_enabled.trace_add("write", update_preview)
-        adv_frame.hwaccel_decoder.trace_add("write", update_preview)
-        adv_frame.custom_args.trace_add("write", update_preview)
-        out_dir_var.trace_add("write", update_preview)
-        suffix_var.trace_add("write", update_preview)
-        custom_var.trace_add("write", update_preview)
-        container_var.trace_add("write", update_preview)
+            # 绑定控件变化（简化，只绑定主要控件）
+            enc_frame.vcodec.trace_add("write", update_preview)
+            enc_frame.rate_control_type.trace_add("write", update_preview)
+            enc_frame.crf_value.trace_add("write", update_preview)
+            enc_frame.cq_value.trace_add("write", update_preview)
+            enc_frame.global_quality.trace_add("write", update_preview)
+            enc_frame.bitrate_video.trace_add("write", update_preview)
+            filt_frame.frame_rate_type.trace_add("write", update_preview)
+            filt_frame.frame_rate_custom.trace_add("write", update_preview)
+            filt_frame.scale_enabled.trace_add("write", update_preview)
+            filt_frame.scale_width.trace_add("write", update_preview)
+            filt_frame.scale_height.trace_add("write", update_preview)
+            filt_frame.scale_method.trace_add("write", update_preview)
+            filt_frame.crop_enabled.trace_add("write", update_preview)
+            filt_frame.crop_left.trace_add("write", update_preview)
+            filt_frame.crop_top.trace_add("write", update_preview)
+            filt_frame.crop_width.trace_add("write", update_preview)
+            filt_frame.crop_height.trace_add("write", update_preview)
+            filt_frame.rotate.trace_add("write", update_preview)
+            filt_frame.vflip.trace_add("write", update_preview)
+            filt_frame.hflip.trace_add("write", update_preview)
+            filt_frame.speed_enabled.trace_add("write", update_preview)
+            filt_frame.speed_factor.trace_add("write", update_preview)
+            filt_frame.deinterlace_filter.trace_add("write", update_preview)
+            filt_frame.pix_fmt_enabled.trace_add("write", update_preview)
+            filt_frame.pix_fmt.trace_add("write", update_preview)
+            filt_frame.subtitle_enabled.trace_add("write", update_preview)
+            filt_frame.subtitle_path.trace_add("write", update_preview)
+            audio_frame.audio_enabled.trace_add("write", update_preview)
+            audio_frame.audio_codec.trace_add("write", update_preview)
+            audio_frame.audio_bitrate.trace_add("write", update_preview)
+            audio_frame.audio_samplerate.trace_add("write", update_preview)
+            audio_frame.only_audio.trace_add("write", update_preview)
+            audio_frame.audio_format.trace_add("write", update_preview)
+            trim_frame.trim_enabled.trace_add("write", update_preview)
+            trim_frame.trim_start.trace_add("write", update_preview)
+            trim_frame.trim_end.trace_add("write", update_preview)
+            adv_frame.hwaccel_enabled.trace_add("write", update_preview)
+            adv_frame.hwaccel_decoder.trace_add("write", update_preview)
+            adv_frame.custom_args.trace_add("write", update_preview)
+            out_dir_var.trace_add("write", update_preview)
+            suffix_var.trace_add("write", update_preview)
+            custom_var.trace_add("write", update_preview)
+            container_var.trace_add("write", update_preview)
+
     
-        update_preview()
+            update_preview()
     
-        def save_changes():
-            new_settings = {}
-            new_settings.update(enc_frame.get_settings())
-            new_settings.update(filt_frame.get_settings())
-            new_settings.update(audio_frame.get_settings())
-            new_settings.update(trim_frame.get_settings())
-            new_settings.update(adv_frame.get_settings())
-            new_settings["output_dir"] = out_dir_var.get()
-            new_settings["output_suffix"] = suffix_var.get()
-            new_settings["custom_output_name"] = custom_var.get()
-            new_settings["output_container"] = container_var.get()
-            new_output = self.generate_output_path(task.input, new_settings)
-            try:
-                new_cmd_list = self.generate_ffmpeg_command(task.input, new_output, new_settings)
-            except ValueError as e:
-                messagebox.showerror("参数错误", str(e))
-                return
-            task.settings = new_settings
-            task.output = new_output
-            task.cmd = new_cmd_list
-            task.status = "等待"
-            self.update_task_list()
-            win.destroy()
-            self._append_info_ui(f"已编辑任务: {os.path.basename(task.input)}")
+            def save_changes():
+                new_settings = {}
+                new_settings.update(enc_frame.get_settings())
+                new_settings.update(filt_frame.get_settings())
+                new_settings.update(audio_frame.get_settings())
+                new_settings.update(trim_frame.get_settings())
+                new_settings.update(adv_frame.get_settings())
+                new_settings["output_dir"] = out_dir_var.get()
+                new_settings["output_suffix"] = suffix_var.get()
+                new_settings["custom_output_name"] = custom_var.get()
+                new_settings["output_container"] = container_var.get()
+                new_output = self.generate_output_path(task.input, new_settings)
+                try:
+                    new_cmd_list = self.generate_ffmpeg_command(task.input, new_output, new_settings)
+                except ValueError as e:
+                    messagebox.showerror("参数错误", str(e))
+                    return
+                task.settings = new_settings
+                task.output = new_output
+                task.cmd = new_cmd_list
+                task.status = "等待"
+                self.update_task_list()
+                win.destroy()
+                self._append_info_ui(f"已编辑任务: {os.path.basename(task.input)}")
     
-        btn_frame = ttk.Frame(win)
-        btn_frame.pack(pady=10)
-        ttk.Button(btn_frame, text="保存修改", command=save_changes).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="取消", command=win.destroy).pack(side=tk.LEFT, padx=5)
+            btn_frame = ttk.Frame(win)
+            btn_frame.pack(pady=10)
+            ttk.Button(btn_frame, text="保存修改", command=save_changes).pack(side=tk.LEFT, padx=5)
+            ttk.Button(btn_frame, text="取消", command=win.destroy).pack(side=tk.LEFT, padx=5)
+            win.wait_window()
 
     def on_task_double_click(self, event):
         selected = self.task_tree.selection()
@@ -3434,7 +3405,8 @@ class FFmpegBatchGUI:
         idx = int(selected[0])
         self.edit_task(self.tasks[idx], idx)
 
-    # -------------------- 封装/合并模块 --------------------
+
+    # ==================== 封装/合并模块 ====================
     def create_merge_tab(self, parent):
         # 主视频文件行
         f1 = ttk.Frame(parent)
@@ -3577,7 +3549,6 @@ class FFmpegBatchGUI:
         self.copy_chapters.trace_add("write", lambda *a: self.merge_update_command_preview())
         self.chapter_file.trace_add("write", lambda *a: self.merge_update_command_preview())
 
-    # ---------- 封装/合并剩余方法 ----------
     def merge_add_external_video(self):
         if not self.pip_enabled.get():
             messagebox.showwarning("提示", "请先勾选「启用画中画」后再添加外部视频或图片作为水印。\n注意给视频流选择重新编码，不能使用copy了。")
@@ -3633,12 +3604,14 @@ class FFmpegBatchGUI:
         self.merge_auto_recommend_container()
         self.merge_update_command_preview()
         self._append_info_ui(f"[封装] 已添加画中画视频或图片水印: {os.path.basename(path)}")
+
     def browse_chapter_file(self):
         path = filedialog.askopenfilename(title="选择章节文件", filetypes=[("FFmetadata", "*.txt *.chapters")])
         if path:
             self.chapter_file.set(normalize_path(path))
             if path:
                 self.copy_chapters.set(False)
+
     def merge_copy_command(self):
         cmd_str = self.merge_cmd_preview.get(1.0, tk.END).strip()
         if cmd_str:
@@ -3647,6 +3620,7 @@ class FFmpegBatchGUI:
             self._append_info_ui("[封装] 命令已复制到剪贴板")
         else:
             self._append_info_ui("[封装] 无命令可复制")
+
     def merge_build_cmd_list(self) -> List[str]:
         if not self.ffmpeg_cmd:
             self._append_info_ui("❌ 未找到 ffmpeg，无法生成合并命令。")
@@ -3657,34 +3631,11 @@ class FFmpegBatchGUI:
         enabled_tracks = [t for t in self.merge_tracks if t.enabled]
         if not enabled_tracks:
             return []
-        input_files = []
-        for t in enabled_tracks:
-            if t.file_path not in input_files:
-                input_files.append(t.file_path)
-    
-        # ========== 统一的路径标准化函数 ==========
-        def _norm_path(p):
-            if sys.platform != "win32":
-                return normalize_path(p)
-            try:
-                import ctypes
-                GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW
-                GetShortPathNameW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint]
-                GetShortPathNameW.restype = ctypes.c_uint
-                buf_len = GetShortPathNameW(p, None, 0)
-                if buf_len == 0:
-                    return normalize_path(p)
-                buf = ctypes.create_unicode_buffer(buf_len)
-                GetShortPathNameW(p, buf, buf_len)
-                return buf.value
-            except Exception:
-                return normalize_path(p)
-    
-        # --- 收集循环参数（键使用标准化路径）---
+        # 收集循环参数
         input_loop_opts = {}
         for track in enabled_tracks:
             if track.type == "video" and track.enc_settings.get("loop_enabled", False):
-                norm_key = _norm_path(track.file_path)
+                norm_key = normalize_path(track.file_path)
                 mode = track.enc_settings.get("loop_mode", "infinite")
                 if mode == "infinite":
                     loop_arg = ("-stream_loop", "-1")
@@ -3692,18 +3643,15 @@ class FFmpegBatchGUI:
                     count = track.enc_settings.get("loop_count", 3)
                     loop_arg = ("-stream_loop", str(count))
                 input_loop_opts[norm_key] = loop_arg
-    
-        # --- 收集输入文件列表（去重，使用相同标准化）---
+        # 收集去重输入文件
         input_files = []
         for t in enabled_tracks:
             if t.file_path not in input_files:
                 input_files.append(t.file_path)
-        input_files_norm = [_norm_path(f) for f in input_files]
-    
-        output_norm = _norm_path(output)
+        input_files_norm = [normalize_path(f) for f in input_files]
+        output_norm = normalize_path(output)
         cmd_list = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
-    
-        # --- 收集截取参数（键使用标准化路径）---
+        # 收集截取参数
         file_trim = {}
         for track in enabled_tracks:
             if track.type == "video":
@@ -3712,10 +3660,8 @@ class FFmpegBatchGUI:
                     start = track.enc_settings.get("trim_start", "").strip()
                     end = track.enc_settings.get("trim_end", "").strip()
                     if start or end:
-                        norm_key = _norm_path(track.file_path)
+                        norm_key = normalize_path(track.file_path)
                         file_trim[norm_key] = (start, end)
-    
-        # --- 添加输入文件及对应的循环/截取参数 ---
         for f in input_files_norm:
             if f in input_loop_opts:
                 cmd_list.extend(input_loop_opts[f])
@@ -3726,24 +3672,19 @@ class FFmpegBatchGUI:
                 if end:
                     cmd_list.extend(["-to", end])
             cmd_list.extend(["-i", f])
-    
         video_tracks = [t for t in enabled_tracks if t.type == "video"]
         audio_tracks = [t for t in enabled_tracks if t.type == "audio"]
         subtitle_tracks = [t for t in enabled_tracks if t.type == "subtitle"]
-    
         if not video_tracks:
             self._append_info_ui("[封装] 没有启用的视频轨道")
             return []
-    
-        # ================= 画中画模式 =================
+        # 画中画模式
         if self.pip_enabled.get():
             main_video = video_tracks[0]
             sub_videos = video_tracks[1:]
-            main_idx = input_files_norm.index(_norm_path(main_video.file_path))
-    
+            main_idx = input_files_norm.index(normalize_path(main_video.file_path))
             user_filters = build_video_filter_chain(main_video.enc_settings, include_subtitle=False, include_speed=False)
             main_filters = user_filters if user_filters != "null" else None
-    
             filter_parts = []
             if main_filters:
                 filter_parts.append(f"[{main_idx}:v]{main_filters}[v_main_proc]")
@@ -3751,7 +3692,6 @@ class FFmpegBatchGUI:
             else:
                 filter_parts.append(f"[{main_idx}:v]null[v_main_proc]")
                 current_v = "v_main_proc"
-    
             # 主视频画布偏移
             if getattr(main_video, 'pad_enabled', False) and main_video.pad_width and main_video.pad_height:
                 pw = main_video.pad_width.strip()
@@ -3761,10 +3701,9 @@ class FFmpegBatchGUI:
                 filter_parts.append(f"color=c=black:s={pw}x{ph}[canvas]")
                 filter_parts.append(f"[canvas][{current_v}]overlay={ox}:{oy}:shortest=1[v_main_pad]")
                 current_v = "v_main_pad"
-    
             # 处理从视频（画中画）
             for i, sv in enumerate(sub_videos):
-                sv_idx = input_files_norm.index(_norm_path(sv.file_path))
+                sv_idx = input_files_norm.index(normalize_path(sv.file_path))
                 # 基础滤镜（缩放、裁剪等）
                 sv_filters = build_video_filter_chain(sv.enc_settings, include_subtitle=False, include_speed=False)
                 if sv_filters and sv_filters != "null":
@@ -3773,8 +3712,7 @@ class FFmpegBatchGUI:
                 else:
                     filter_parts.append(f"[{sv_idx}:v]null[v_temp_{i}]")
                     current_label = f"v_temp_{i}"
-    
-                # 绿幕抠像（色度键）
+                # 绿幕抠像
                 if sv.enc_settings.get("chroma_enabled", False):
                     color = sv.enc_settings.get("chroma_color", "green")
                     if color.startswith("#"):
@@ -3788,7 +3726,6 @@ class FFmpegBatchGUI:
                 else:
                     filter_parts.append(f"[{current_label}]null[v_sub_{i}]")
                     sub_src = f"v_sub_{i}"
-    
                 # 叠加（如果启用）
                 if getattr(sv, 'overlay_enabled', True):
                     x = sv.overlay_x.strip() if sv.overlay_x else "0"
@@ -3797,12 +3734,10 @@ class FFmpegBatchGUI:
                     current_v = f"v_out_{i}"
                 else:
                     filter_parts.append(f"[{current_v}]null[{current_v}]")
-    
             complex_filter = ";".join(filter_parts)
             cmd_list.extend(["-filter_complex", complex_filter])
             cmd_list.extend(["-map", f"[{current_v}]"])
-    
-            # 主视频编码参数
+            # 编码参数
             v_settings = main_video.enc_settings
             vcodec = v_settings.get("encoder", "libx265")
             rc = v_settings.get("rate_control_type", "crf")
@@ -3821,11 +3756,10 @@ class FFmpegBatchGUI:
                 cmd_list.extend(["-r", v_settings.get("frame_rate_custom", "30")])
             if v_settings.get("pix_fmt_enabled", True):
                 cmd_list.extend(["-pix_fmt", v_settings.get("pix_fmt", "yuv420p")])
-    
-            # 音频轨道映射
+            # 音频映射
             audio_map_count = 0
             for audio in audio_tracks:
-                a_idx = input_files_norm.index(_norm_path(audio.file_path))
+                a_idx = input_files_norm.index(normalize_path(audio.file_path))
                 enc = audio.enc_settings.get("encoder", "copy")
                 cmd_list.extend(["-map", f"{a_idx}:a:0"])
                 if enc == "copy":
@@ -3843,12 +3777,11 @@ class FFmpegBatchGUI:
                 cmd_list.append("-an")
             else:
                 cmd_list.extend(["-disposition:a:0", "default"])
-    
-            # 字幕轨道映射
+            # 字幕映射
             sub_map_count = 0
             first_sub_default = False
             for sub in subtitle_tracks:
-                s_idx = input_files_norm.index(_norm_path(sub.file_path))
+                s_idx = input_files_norm.index(normalize_path(sub.file_path))
                 enc = sub.enc_settings.get("encoder", "copy")
                 container = self.merge_container.get().lower()
                 if container == "mp4":
@@ -3861,38 +3794,31 @@ class FFmpegBatchGUI:
                         enc = "mov_text"
                         self._append_info_ui(f"[封装] 字幕编码 {enc} 不兼容 MP4，自动转换为 mov_text")
                 cmd_list.extend(["-map", f"{s_idx}:s:0", f"-c:s:{sub_map_count}", enc])
-    
                 lang = sub.enc_settings.get("language", "")
                 title = sub.enc_settings.get("title", "")
                 if lang:
                     cmd_list.extend([f"-metadata:s:s:{sub_map_count}", f"language={lang}"])
                 if title:
                     cmd_list.extend([f"-metadata:s:s:{sub_map_count}", f"title={title}"])
-    
                 if not first_sub_default:
                     cmd_list.extend([f"-disposition:s:{sub_map_count}", "default"])
                     first_sub_default = True
                 sub_map_count += 1
-    
-        # ================= 非画中画模式 =================
         else:
+            # 非画中画
             video_track = video_tracks[0]
-            v_idx = input_files_norm.index(_norm_path(video_track.file_path))
+            v_idx = input_files_norm.index(normalize_path(video_track.file_path))
             cmd_list.extend(["-map", f"{v_idx}:v:0"])
-    
             v_settings = video_track.enc_settings
             vcodec = v_settings.get("encoder", "copy")
             video_filters = build_video_filter_chain(v_settings, include_subtitle=False, include_speed=False)
             has_filters = video_filters and video_filters != "null"
-    
             if has_filters and vcodec == "copy":
-                self._append_info_ui("[封装] 警告：主视频启用了滤镜（缩放/裁剪等），但编码器设为「copy」。自动将编码器改为 libx264 以应用滤镜。")
+                self._append_info_ui("[封装] 警告：主视频启用了滤镜，但编码器设为「copy」。自动将编码器改为 libx264 以应用滤镜。")
                 vcodec = "libx264"
                 v_settings["encoder"] = "libx264"
-    
             if has_filters:
                 cmd_list.extend(["-vf", video_filters])
-    
             if vcodec == "copy":
                 cmd_list.extend(["-c:v", "copy"])
             else:
@@ -3912,11 +3838,10 @@ class FFmpegBatchGUI:
                     cmd_list.extend(["-r", v_settings.get("frame_rate_custom", "30")])
                 if v_settings.get("pix_fmt_enabled", True):
                     cmd_list.extend(["-pix_fmt", v_settings.get("pix_fmt", "yuv420p")])
-    
-            # 音频轨道映射
+            # 音频映射
             audio_map_count = 0
             for audio in audio_tracks:
-                a_idx = input_files_norm.index(_norm_path(audio.file_path))
+                a_idx = input_files_norm.index(normalize_path(audio.file_path))
                 enc = audio.enc_settings.get("encoder", "copy")
                 cmd_list.extend(["-map", f"{a_idx}:a:0"])
                 if enc == "copy":
@@ -3934,12 +3859,11 @@ class FFmpegBatchGUI:
                 cmd_list.append("-an")
             else:
                 cmd_list.extend(["-disposition:a:0", "default"])
-    
-            # 字幕轨道映射
+            # 字幕映射
             sub_map_count = 0
             first_sub_default = False
             for sub in subtitle_tracks:
-                s_idx = input_files_norm.index(_norm_path(sub.file_path))
+                s_idx = input_files_norm.index(normalize_path(sub.file_path))
                 enc = sub.enc_settings.get("encoder", "copy")
                 container = self.merge_container.get().lower()
                 if container == "mp4":
@@ -3952,34 +3876,29 @@ class FFmpegBatchGUI:
                         enc = "mov_text"
                         self._append_info_ui(f"[封装] 字幕编码 {enc} 不兼容 MP4，自动转换为 mov_text")
                 cmd_list.extend(["-map", f"{s_idx}:s:0", f"-c:s:{sub_map_count}", enc])
-    
                 lang = sub.enc_settings.get("language", "")
                 title = sub.enc_settings.get("title", "")
                 if lang:
                     cmd_list.extend([f"-metadata:s:s:{sub_map_count}", f"language={lang}"])
                 if title:
                     cmd_list.extend([f"-metadata:s:s:{sub_map_count}", f"title={title}"])
-    
                 if not first_sub_default:
                     cmd_list.extend([f"-disposition:s:{sub_map_count}", "default"])
                     first_sub_default = True
                 sub_map_count += 1
-    
         # 章节处理
         if self.copy_chapters.get() and input_files_norm:
             cmd_list.extend(["-map_chapters", "0"])
         chapter_file = self.chapter_file.get().strip()
         if chapter_file and os.path.exists(chapter_file):
-            chapter_file_norm = _norm_path(chapter_file)
+            chapter_file_norm = normalize_path(chapter_file)
             cmd_list.insert(1, "-i")
             cmd_list.insert(2, chapter_file_norm)
             cmd_list.extend(["-map_chapters", "1"])
-    
         # 输出容器优化
         container = self.merge_container.get().lower()
         if container in ("mp4", "mov"):
             cmd_list.extend(["-movflags", "+faststart"])
-    
         cmd_list.append(output_norm)
         return cmd_list
 
@@ -4004,17 +3923,25 @@ class FFmpegBatchGUI:
             self.merge_update_track_list()
             self.merge_update_output_preview()
             return
-        ext = os.path.splitext(path)[1].lower().lstrip('.')
-        self.original_container = ext if ext in ['mp4', 'mkv', 'mov', 'avi', 'webm'] else 'mp4'
-        info = ffprobe_json(self.ffprobe_cmd, path)
+    
+        self._append_info_ui(f"[封装] 正在解析媒体信息: {os.path.basename(path)} ...")
+        # 可选：禁用主视频选择按钮，防止重复触发（根据需要自行添加）
+    
+        def load_info():
+            info = ffprobe_json(self.ffprobe_cmd, path)
+            self.root.after(0, lambda: self._on_merge_video_info_loaded(path, info))
+    
+        threading.Thread(target=load_info, daemon=True).start()
+    
+    def _on_merge_video_info_loaded(self, path, info):
         if not info:
-            self.root.after(0, lambda: self.append_info(f"[封装] 无法解析媒体信息: {path}，可能 ffprobe 失败"))
+            self._append_info_ui(f"[封装] 无法解析媒体信息: {path}，可能 ffprobe 失败")
             self.merge_tracks = []
             self.merge_update_track_list()
             return
         streams = info.get("streams", [])
         if not streams:
-            self.root.after(0, lambda: self.append_info(f"[封装] {path} 中没有发现任何流"))
+            self._append_info_ui(f"[封装] {path} 中没有发现任何流")
             return
         self.merge_tracks = []
         for s in streams:
@@ -4024,10 +3951,11 @@ class FFmpegBatchGUI:
             track = Track(s["index"], st, s.get("codec_name", "unknown"), path, True)
             self.merge_tracks.append(track)
         if not self.merge_tracks:
-            self.root.after(0, lambda: self.append_info(f"[封装] {path} 中未找到视频/音频/字幕轨道"))
+            self._append_info_ui(f"[封装] {path} 中未找到视频/音频/字幕轨道")
         self.merge_update_track_list()
         self.merge_auto_recommend_container()
         self.merge_update_output_preview()
+        self._append_info_ui(f"[封装] 媒体信息解析完成: {os.path.basename(path)}")
 
     def merge_update_track_list(self):
         for w in self.merge_track_frame.winfo_children():
@@ -4208,372 +4136,369 @@ class FFmpegBatchGUI:
 
     def merge_edit_video_track(self, track_idx):
         track = self.merge_tracks[track_idx]
-        win = tk.Toplevel(self.root)
-        win.title(f"视频轨道设置 - {track.codec}")
-        center_window(win, 700, 300)  # 适当增加高度以容纳新页面
-        win.transient(self.root)
-        win.grab_set()
-        notebook = ttk.Notebook(win)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-    
-        # ----- 页面1：编码器与质量 -----
-        page_enc = ttk.Frame(notebook)
-        notebook.add(page_enc, text="编码器与质量")
-        enc_frame = VideoEncoderFrame(page_enc)
-        enc_frame.pack(fill=tk.X, padx=5, pady=5)
-        enc_frame.set_settings(track.enc_settings)
-    
-        # ----- 页面2：视频滤镜 -----
-        page_filt = ttk.Frame(notebook)
-        notebook.add(page_filt, text="视频滤镜")
-        filt_frame = VideoFilterFrame(page_filt, app=self)
-        filt_frame.current_file = track.file_path
-        filt_frame.pack(fill=tk.X, padx=5, pady=5)
-        filt_frame.set_settings(track.enc_settings)
-    
-        # ----- 页面3：截取片段 -----
-        page_trim = ttk.Frame(notebook)
-        notebook.add(page_trim, text="截取片段")
-        trim_frame = TrimFrame(page_trim)
-        trim_frame.pack(fill=tk.X, padx=5, pady=5)
-        trim_frame.set_settings(track.enc_settings)
-    
-        # ========== 页面4：循环水印与绿幕抠像（始终存在，不受画中画影响） ==========
-        page_loop = ttk.Frame(notebook)
-        notebook.add(page_loop, text="循环/绿幕控制")
-    
-        # 左右并排的主容器
-        main_row = ttk.Frame(page_loop)
-        main_row.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-    
-        # ========== 左侧：循环控制 ==========
-        left_frame = ttk.LabelFrame(main_row, text="循环播放", padding="5")
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0,5))
-    
-        loop_enabled_var = tk.BooleanVar(value=track.enc_settings.get("loop_enabled", False))
-        ttk.Checkbutton(left_frame, text="启用循环播放", variable=loop_enabled_var).pack(anchor=tk.W, pady=(0,5))
-    
-        ttk.Label(left_frame, text="循环模式:").pack(anchor=tk.W, pady=(5,0))
-        loop_mode_var = tk.StringVar(value=track.enc_settings.get("loop_mode", "infinite"))
-        ttk.Radiobutton(left_frame, text="无限循环", variable=loop_mode_var, value="infinite").pack(anchor=tk.W, padx=10)
-    
-        count_frame = ttk.Frame(left_frame)
-        count_frame.pack(anchor=tk.W, padx=10, pady=2)
-        ttk.Radiobutton(count_frame, text="指定次数", variable=loop_mode_var, value="count").pack(side=tk.LEFT)
-        loop_count_var = tk.IntVar(value=track.enc_settings.get("loop_count", 3))
-        count_spin = ttk.Spinbox(count_frame, from_=1, to=100, width=5, textvariable=loop_count_var, state="readonly")
-        count_spin.pack(side=tk.LEFT, padx=5)
-    
-        # ========== 右侧：绿幕抠像 ==========
-        right_frame = ttk.LabelFrame(main_row, text="绿幕抠像 (色度键)", padding="5")
-        right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5,0))
-    
-        chroma_enabled_var = tk.BooleanVar(value=track.enc_settings.get("chroma_enabled", False))
-        ttk.Checkbutton(right_frame, text="启用绿幕抠像", variable=chroma_enabled_var).pack(anchor=tk.W)
-    
-        # 颜色选择
-        color_row = ttk.Frame(right_frame)
-        color_row.pack(fill=tk.X, pady=2)
-        ttk.Label(color_row, text="抠除颜色:").pack(side=tk.LEFT)
-        chroma_color_var = tk.StringVar(value=track.enc_settings.get("chroma_color", "green"))
-        color_combo = ttk.Combobox(color_row, textvariable=chroma_color_var,
-                                   values=["green", "blue", "black", "white"], state="readonly", width=10)
-        color_combo.pack(side=tk.LEFT, padx=5)
-    
-        # 相似度滑块
-        sim_frame = ttk.Frame(right_frame)
-        sim_frame.pack(fill=tk.X, pady=2)
-        sim_label = ttk.Label(sim_frame, text="相似度 (0~1，越小越严格):")
-        sim_label.pack(side=tk.LEFT)
-        init_sim = track.enc_settings.get("chroma_similarity", 0.3)
-        if init_sim <= 0:
-            init_sim = 0.3
-        chroma_similarity_var = tk.DoubleVar(value=init_sim)
-        sim_slider = ttk.Scale(sim_frame, from_=0.0, to=1.0, variable=chroma_similarity_var,
-                               orient=tk.HORIZONTAL, length=150)
-        sim_slider.pack(side=tk.LEFT, padx=5)
-        sim_value_label = ttk.Label(sim_frame, text=f"{chroma_similarity_var.get():.4f}")
-        sim_value_label.pack(side=tk.LEFT)
-        sim_slider.configure(command=lambda v: sim_value_label.config(text=f"{float(v):.4f}"))
-    
-        # 混合度滑块
-        blend_frame = ttk.Frame(right_frame)
-        blend_frame.pack(fill=tk.X, pady=2)
-        ttk.Label(blend_frame, text="混合度/平滑 (0~1):").pack(side=tk.LEFT)
-        chroma_blend_var = tk.DoubleVar(value=track.enc_settings.get("chroma_blend", 0.1))
-        blend_slider = ttk.Scale(blend_frame, from_=0.0, to=1.0, variable=chroma_blend_var,
-                                 orient=tk.HORIZONTAL, length=150)
-        blend_slider.pack(side=tk.LEFT, padx=5)
-        blend_label = ttk.Label(blend_frame, text=f"{chroma_blend_var.get():.2f}")
-        blend_label.pack(side=tk.LEFT)
-        blend_slider.configure(command=lambda v: blend_label.config(text=f"{float(v):.2f}"))
-    
-        # ========== 页面5：叠加/偏移（仅在画中画启用时显示控件，否则显示提示） ==========
-        page_overlay = ttk.Frame(notebook)
-        notebook.add(page_overlay, text="叠加/偏移")
-    
-        if self.pip_enabled.get():
-            # 画中画模式：显示叠加/偏移设置
-            enabled_video_tracks = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
-            is_main = (enabled_video_tracks and enabled_video_tracks[0] == track)
-    
-            if is_main:
-                # 主视频：画布偏移
-                pad_frame = ttk.LabelFrame(page_overlay, text="主视频画布偏移", padding="5")
-                pad_frame.pack(fill=tk.X, pady=5)
-    
-                pad_enabled_var = tk.BooleanVar(value=getattr(track, 'pad_enabled', False))
-                ttk.Checkbutton(pad_frame, text="启用画布偏移", variable=pad_enabled_var).pack(anchor=tk.W)
-    
-                w_frame = ttk.Frame(pad_frame)
-                w_frame.pack(fill=tk.X, pady=2)
-                ttk.Label(w_frame, text="画布宽度:").pack(side=tk.LEFT)
-                pad_w_var = tk.StringVar(value=getattr(track, 'pad_width', ''))
-                pad_w_entry = ttk.Entry(w_frame, textvariable=pad_w_var, width=10)
-                pad_w_entry.pack(side=tk.LEFT, padx=5)
-    
-                def fetch_size():
+        with self.SafeToplevel(self.root) as win:
+            win.title(f"视频轨道设置 - {track.codec}")
+            center_window(win, 700, 300)
+            win.transient(self.root)
+            notebook = ttk.Notebook(win)
+            notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+            # 页面1：编码器与质量
+            page_enc = ttk.Frame(notebook)
+            notebook.add(page_enc, text="编码器与质量")
+            enc_frame = VideoEncoderFrame(page_enc)
+            enc_frame.pack(fill=tk.X, padx=5, pady=5)
+            enc_frame.set_settings(track.enc_settings)
+            # 页面2：视频滤镜
+            page_filt = ttk.Frame(notebook)
+            notebook.add(page_filt, text="视频滤镜")
+            filt_frame = VideoFilterFrame(page_filt, app=self)
+            filt_frame.current_file = track.file_path
+            filt_frame.pack(fill=tk.X, padx=5, pady=5)
+            filt_frame.set_settings(track.enc_settings)
+            # 页面3：截取片段
+            page_trim = ttk.Frame(notebook)
+            notebook.add(page_trim, text="截取片段")
+            trim_frame = TrimFrame(page_trim)
+            trim_frame.pack(fill=tk.X, padx=5, pady=5)
+            trim_frame.set_settings(track.enc_settings)
+            # 页面4：循环/绿幕控制
+            page_loop = ttk.Frame(notebook)
+            notebook.add(page_loop, text="循环/绿幕控制")
+            main_row = ttk.Frame(page_loop)
+            main_row.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+            left_frame = ttk.LabelFrame(main_row, text="循环播放", padding="5")
+            left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0,5))
+            loop_enabled_var = tk.BooleanVar(value=track.enc_settings.get("loop_enabled", False))
+            ttk.Checkbutton(left_frame, text="启用循环播放", variable=loop_enabled_var).pack(anchor=tk.W, pady=(0,5))
+            ttk.Label(left_frame, text="循环模式:").pack(anchor=tk.W, pady=(5,0))
+            loop_mode_var = tk.StringVar(value=track.enc_settings.get("loop_mode", "infinite"))
+            ttk.Radiobutton(left_frame, text="无限循环", variable=loop_mode_var, value="infinite").pack(anchor=tk.W, padx=10)
+            count_frame = ttk.Frame(left_frame)
+            count_frame.pack(anchor=tk.W, padx=10, pady=2)
+            ttk.Radiobutton(count_frame, text="指定次数", variable=loop_mode_var, value="count").pack(side=tk.LEFT)
+            loop_count_var = tk.IntVar(value=track.enc_settings.get("loop_count", 3))
+            count_spin = ttk.Spinbox(count_frame, from_=1, to=100, width=5, textvariable=loop_count_var, state="readonly")
+            count_spin.pack(side=tk.LEFT, padx=5)
+            right_frame = ttk.LabelFrame(main_row, text="绿幕抠像 (色度键)", padding="5")
+            right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5,0))
+            chroma_enabled_var = tk.BooleanVar(value=track.enc_settings.get("chroma_enabled", False))
+            ttk.Checkbutton(right_frame, text="启用绿幕抠像", variable=chroma_enabled_var).pack(anchor=tk.W)
+            # 颜色选择
+            color_row = ttk.Frame(right_frame)
+            color_row.pack(fill=tk.X, pady=2)
+            ttk.Label(color_row, text="抠除颜色:").pack(side=tk.LEFT)
+            chroma_color_var = tk.StringVar(value=track.enc_settings.get("chroma_color", "green"))
+            color_combo = ttk.Combobox(color_row, textvariable=chroma_color_var,
+                                       values=["green", "blue", "black", "white"], state="readonly", width=10)
+            color_combo.pack(side=tk.LEFT, padx=5)
+            color_swatch = tk.Label(color_row, width=4, height=1, relief=tk.SUNKEN, bg=chroma_color_var.get())
+            color_swatch.pack(side=tk.LEFT, padx=5)
+            def update_swatch(*args):
+                color_swatch.config(bg=chroma_color_var.get())
+            chroma_color_var.trace_add("write", update_swatch)
+            # 吸管取色功能（Windows 专用）
+            def pick_color_with_eyedropper():
+                import ctypes
+                import ctypes.wintypes
+            
+                def get_pixel_color(x, y):
+                    hdc = ctypes.windll.user32.GetDC(0)
+                    pixel = ctypes.windll.gdi32.GetPixel(hdc, x, y)
+                    ctypes.windll.user32.ReleaseDC(0, hdc)
+                    r = pixel & 0xFF
+                    g = (pixel >> 8) & 0xFF
+                    b = (pixel >> 16) & 0xFF
+                    return f"#{r:02x}{g:02x}{b:02x}"
+            
+                # 创建半透明全屏遮罩
+                mask = tk.Toplevel(win)
+                mask.attributes('-fullscreen', True)
+                mask.attributes('-alpha', 0.3)
+                mask.configure(bg='black', cursor='crosshair')
+                mask.attributes('-topmost', True)
+            
+                tip = tk.Label(mask, text="点击屏幕任意位置取色 (ESC 取消)", 
+                               font=("Microsoft YaHei", 16, "bold"),
+                               fg="white", bg="black", padx=20, pady=10)
+                tip.pack(expand=True)
+            
+                def on_click(event):
+                    mask.withdraw()
+                    mask.update_idletasks()
+                    hex_color = get_pixel_color(event.x_root, event.y_root)
+                    mask.destroy()
+                    chroma_color_var.set(hex_color)
+            
+                def on_escape(event):
+                    mask.destroy()
+            
+                mask.bind("<Button-1>", on_click)
+                mask.bind("<Escape>", on_escape)
+                win.wait_window(mask)
+            
+            ttk.Button(color_row, text="🔍吸取颜色", command=pick_color_with_eyedropper).pack(side=tk.LEFT, padx=5)
+            
+            # 标准色盘
+            def pick_standard_color():
+                from tkinter import colorchooser
+                color_code = colorchooser.askcolor(title="选择抠像颜色", parent=win, initialcolor=chroma_color_var.get())[1]
+                if color_code:
+                    chroma_color_var.set(color_code)
+            ttk.Button(color_row, text="标准色盘", command=pick_standard_color).pack(side=tk.LEFT, padx=5)
+        
+            # 相似度滑块
+
+            sim_frame = ttk.Frame(right_frame)
+            sim_frame.pack(fill=tk.X, pady=2)
+            sim_label = ttk.Label(sim_frame, text="相似度 (0~1，越小越严格):")
+            sim_label.pack(side=tk.LEFT)
+            init_sim = track.enc_settings.get("chroma_similarity", 0.3)
+            if init_sim <= 0:
+                init_sim = 0.3
+            chroma_similarity_var = tk.DoubleVar(value=init_sim)
+            sim_slider = ttk.Scale(sim_frame, from_=0.0, to=1.0, variable=chroma_similarity_var,
+                                   orient=tk.HORIZONTAL, length=150)
+            sim_slider.pack(side=tk.LEFT, padx=5)
+            sim_value_label = ttk.Label(sim_frame, text=f"{chroma_similarity_var.get():.4f}")
+            sim_value_label.pack(side=tk.LEFT)
+            sim_slider.configure(command=lambda v: sim_value_label.config(text=f"{float(v):.4f}"))
+            blend_frame = ttk.Frame(right_frame)
+            blend_frame.pack(fill=tk.X, pady=2)
+            ttk.Label(blend_frame, text="混合度/平滑 (0~1):").pack(side=tk.LEFT)
+            chroma_blend_var = tk.DoubleVar(value=track.enc_settings.get("chroma_blend", 0.1))
+            blend_slider = ttk.Scale(blend_frame, from_=0.0, to=1.0, variable=chroma_blend_var,
+                                     orient=tk.HORIZONTAL, length=150)
+            blend_slider.pack(side=tk.LEFT, padx=5)
+            blend_label = ttk.Label(blend_frame, text=f"{chroma_blend_var.get():.2f}")
+            blend_label.pack(side=tk.LEFT)
+            blend_slider.configure(command=lambda v: blend_label.config(text=f"{float(v):.2f}"))
+            # 页面5：叠加/偏移
+            page_overlay = ttk.Frame(notebook)
+            notebook.add(page_overlay, text="叠加/偏移")
+            if self.pip_enabled.get():
+                enabled_video_tracks = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
+                is_main = (enabled_video_tracks and enabled_video_tracks[0] == track)
+                if is_main:
+                    pad_frame = ttk.LabelFrame(page_overlay, text="主视频画布偏移", padding="5")
+                    pad_frame.pack(fill=tk.X, pady=5)
+                    pad_enabled_var = tk.BooleanVar(value=getattr(track, 'pad_enabled', False))
+                    ttk.Checkbutton(pad_frame, text="启用画布偏移", variable=pad_enabled_var).pack(anchor=tk.W)
+                    w_frame = ttk.Frame(pad_frame)
+                    w_frame.pack(fill=tk.X, pady=2)
+                    ttk.Label(w_frame, text="画布宽度:").pack(side=tk.LEFT)
+                    pad_w_var = tk.StringVar(value=getattr(track, 'pad_width', ''))
+                    pad_w_entry = ttk.Entry(w_frame, textvariable=pad_w_var, width=10)
+                    pad_w_entry.pack(side=tk.LEFT, padx=5)
+                    def fetch_size():
                     # 获取主视频最终渲染尺寸（考虑裁剪和缩放）
-                    crop_enabled = filt_frame.crop_enabled.get()
-                    crop_w_str = filt_frame.crop_width.get().strip()
-                    crop_h_str = filt_frame.crop_height.get().strip()
-                    scale_enabled = filt_frame.scale_enabled.get()
-                    scale_method = filt_frame.scale_method.get()
-                    scale_w_str = filt_frame.scale_width.get().strip()
-                    scale_h_str = filt_frame.scale_height.get().strip()
-                    dim = get_video_rotated_dimensions(self.ffprobe_cmd, track.file_path, track.enc_settings)
-                    if not dim:
-                        self._append_info_ui("获取主视频原始尺寸失败")
-                        return
-                    w, h = dim
-                    if crop_enabled and crop_w_str and crop_h_str:
-                        def eval_crop(expr):
-                            expr2 = expr.replace('iw', str(w)).replace('ih', str(h))
-                            result = safe_eval_expr(expr2, {})
-                            return result if result is not None else None
-                        cw = eval_crop(crop_w_str)
-                        ch = eval_crop(crop_h_str)
-                        if cw and ch and cw > 0 and ch > 0:
-                            w, h = cw, ch
-                    if scale_enabled:
-                        try:
-                            if scale_method == "width" and scale_w_str:
-                                target_w = int(scale_w_str)
-                                target_h = int(round(target_w * h / w))
-                                w, h = target_w, target_h
-                            elif scale_method == "height" and scale_h_str:
-                                target_h = int(scale_h_str)
-                                target_w = int(round(target_h * w / h))
-                                w, h = target_w, target_h
-                            elif scale_method == "exact" and scale_w_str and scale_h_str:
-                                w, h = int(scale_w_str), int(scale_h_str)
-                        except:
-                            pass
-                    pad_w_var.set(str(w))
-                    pad_h_var.set(str(h))
-                    self._append_info_ui(f"最终渲染尺寸: {w}x{h}")
-    
-                ttk.Button(w_frame, text="获取主视频尺寸", command=fetch_size).pack(side=tk.LEFT, padx=5)
-    
-                h_frame = ttk.Frame(pad_frame)
-                h_frame.pack(fill=tk.X, pady=2)
-                ttk.Label(h_frame, text="画布高度:").pack(side=tk.LEFT)
-                pad_h_var = tk.StringVar(value=getattr(track, 'pad_height', ''))
-                ttk.Entry(h_frame, textvariable=pad_h_var, width=10).pack(side=tk.LEFT, padx=5)
-    
-                ox_frame = ttk.Frame(pad_frame)
-                ox_frame.pack(fill=tk.X, pady=2)
-                ttk.Label(ox_frame, text="偏移 X:").pack(side=tk.LEFT)
-                off_x_var = tk.StringVar(value=getattr(track, 'offset_x', '0'))
-                off_x_entry = ttk.Entry(ox_frame, textvariable=off_x_var, width=10)
-                off_x_entry.pack(side=tk.LEFT, padx=5)
-    
-                def open_pad_editor():
-                    if not pad_enabled_var.get():
-                        messagebox.showinfo("提示", "请先勾选「启用画布偏移」再使用可视化编辑功能。")
-                        return
-                    self.open_visual_pad_editor(track_idx, pad_w_var, pad_h_var, off_x_var, off_y_var, live_filt_frame=filt_frame)
-    
-                ttk.Button(ox_frame, text="🎨 可视化编辑画布偏移", command=open_pad_editor).pack(side=tk.LEFT, padx=5)
-    
-                oy_frame = ttk.Frame(pad_frame)
-                oy_frame.pack(fill=tk.X, pady=2)
-                ttk.Label(oy_frame, text="偏移 Y:").pack(side=tk.LEFT)
-                off_y_var = tk.StringVar(value=getattr(track, 'offset_y', '0'))
-                ttk.Entry(oy_frame, textvariable=off_y_var, width=10).pack(side=tk.LEFT, padx=5)
-    
-                tip_label = ttk.Label(pad_frame, text="⚠ 预览模式下无法体现主视频偏移效果，请转码后查看 ⚠ 可用编辑框简易查看",
-                                      foreground="red", font=("", 12, "bold"))
-                tip_label.pack(fill=tk.X, pady=(10, 0))
-    
+                        crop_enabled = filt_frame.crop_enabled.get()
+                        crop_w_str = filt_frame.crop_width.get().strip()
+                        crop_h_str = filt_frame.crop_height.get().strip()
+                        scale_enabled = filt_frame.scale_enabled.get()
+                        scale_method = filt_frame.scale_method.get()
+                        scale_w_str = filt_frame.scale_width.get().strip()
+                        scale_h_str = filt_frame.scale_height.get().strip()
+                        dim = get_video_rotated_dimensions(self.ffprobe_cmd, track.file_path, track.enc_settings)
+                        if not dim:
+                            self._append_info_ui("获取主视频原始尺寸失败")
+                            return
+                        w, h = dim
+                        if crop_enabled and crop_w_str and crop_h_str:
+                            def eval_crop(expr):
+                                expr2 = expr.replace('iw', str(w)).replace('ih', str(h))
+                                result = safe_eval_expr(expr2, {})
+                                return result if result is not None else None
+                            cw = eval_crop(crop_w_str)
+                            ch = eval_crop(crop_h_str)
+                            if cw and ch and cw > 0 and ch > 0:
+                                w, h = cw, ch
+                        if scale_enabled:
+                            try:
+                                if scale_method == "width" and scale_w_str:
+                                    target_w = int(scale_w_str)
+                                    target_h = int(round(target_w * h / w))
+                                    w, h = target_w, target_h
+                                elif scale_method == "height" and scale_h_str:
+                                    target_h = int(scale_h_str)
+                                    target_w = int(round(target_h * w / h))
+                                    w, h = target_w, target_h
+                                elif scale_method == "exact" and scale_w_str and scale_h_str:
+                                    w, h = int(scale_w_str), int(scale_h_str)
+                            except:
+                                pass
+                        pad_w_var.set(str(w))
+                        pad_h_var.set(str(h))
+                        self._append_info_ui(f"最终渲染尺寸: {w}x{h}")
+                    ttk.Button(w_frame, text="获取主视频尺寸", command=fetch_size).pack(side=tk.LEFT, padx=5)
+                    h_frame = ttk.Frame(pad_frame)
+                    h_frame.pack(fill=tk.X, pady=2)
+                    ttk.Label(h_frame, text="画布高度:").pack(side=tk.LEFT)
+                    pad_h_var = tk.StringVar(value=getattr(track, 'pad_height', ''))
+                    ttk.Entry(h_frame, textvariable=pad_h_var, width=10).pack(side=tk.LEFT, padx=5)
+                    ox_frame = ttk.Frame(pad_frame)
+                    ox_frame.pack(fill=tk.X, pady=2)
+                    ttk.Label(ox_frame, text="偏移 X:").pack(side=tk.LEFT)
+                    off_x_var = tk.StringVar(value=getattr(track, 'offset_x', '0'))
+                    off_x_entry = ttk.Entry(ox_frame, textvariable=off_x_var, width=10)
+                    off_x_entry.pack(side=tk.LEFT, padx=5)
+                    def open_pad_editor():
+                        if not pad_enabled_var.get():
+                            messagebox.showinfo("提示", "请先勾选「启用画布偏移」再使用可视化编辑功能。")
+                            return
+                        self.open_visual_pad_editor(track_idx, pad_w_var, pad_h_var, off_x_var, off_y_var, live_filt_frame=filt_frame)
+                    ttk.Button(ox_frame, text="🎨 可视化编辑画布偏移", command=open_pad_editor).pack(side=tk.LEFT, padx=5)
+                    oy_frame = ttk.Frame(pad_frame)
+                    oy_frame.pack(fill=tk.X, pady=2)
+                    ttk.Label(oy_frame, text="偏移 Y:").pack(side=tk.LEFT)
+                    off_y_var = tk.StringVar(value=getattr(track, 'offset_y', '0'))
+                    ttk.Entry(oy_frame, textvariable=off_y_var, width=10).pack(side=tk.LEFT, padx=5)
+                    tip_label = ttk.Label(pad_frame, text="⚠ 预览模式下无法体现主视频偏移效果，请转码后查看 ⚠ 可用编辑框简易查看",
+                                          foreground="red", font=("", 12, "bold"))
+                    tip_label.pack(fill=tk.X, pady=(10, 0))
+                else:
+                    ov_frame = ttk.LabelFrame(page_overlay, text="画中画叠加位置", padding="5")
+                    ov_frame.pack(fill=tk.X, pady=5)
+                    ov_enabled_var = tk.BooleanVar(value=getattr(track, 'overlay_enabled', True))
+                    ttk.Checkbutton(ov_frame, text="启用叠加", variable=ov_enabled_var).pack(anchor=tk.W)
+                    ttk.Label(ov_frame, text="X 位置 (支持表达式，如 W-w-10):").pack(anchor=tk.W)
+                    ov_x_var = tk.StringVar(value=getattr(track, 'overlay_x', 'W-w-10'))
+                    x_entry = ttk.Entry(ov_frame, textvariable=ov_x_var, width=30)
+                    x_entry.pack(fill=tk.X, pady=2)
+                    ttk.Label(ov_frame, text="Y 位置 (支持表达式):").pack(anchor=tk.W)
+                    ov_y_var = tk.StringVar(value=getattr(track, 'overlay_y', 'H-h-10'))
+                    y_entry = ttk.Entry(ov_frame, textvariable=ov_y_var, width=30)
+                    y_entry.pack(fill=tk.X, pady=2)
+                    preset_frame = ttk.LabelFrame(ov_frame, text="快速预设", padding="3")
+                    preset_frame.pack(fill=tk.X, pady=5)
+                    positions = {
+                        "左上角": ("10", "10"),
+                        "右上角": ("W-w-10", "10"),
+                        "左下角": ("10", "H-h-10"),
+                        "右下角": ("W-w-10", "H-h-10"),
+                        "居中": ("(W-w)/2", "(H-h)/2")
+                    }
+                    def set_position(x_val, y_val):
+                        ov_x_var.set(x_val)
+                        ov_y_var.set(y_val)
+                        self.merge_update_command_preview()
+                    for text, (x_val, y_val) in positions.items():
+                        btn = ttk.Button(preset_frame, text=text,
+                                         command=lambda x=x_val, y=y_val: set_position(x, y))
+                        btn.pack(side=tk.LEFT, padx=2, pady=2)
+                    vis_btn = ttk.Button(preset_frame, text="🎨 可视化编辑坐标",
+                                         command=lambda: self.open_visual_overlay_editor(track_idx, ov_x_var, ov_y_var, filt_frame))
+                    vis_btn.pack(side=tk.LEFT, padx=5, pady=2)
             else:
-                # 从视频：叠加位置
-                ov_frame = ttk.LabelFrame(page_overlay, text="画中画叠加位置", padding="5")
-                ov_frame.pack(fill=tk.X, pady=5)
-    
-                ov_enabled_var = tk.BooleanVar(value=getattr(track, 'overlay_enabled', True))
-                ttk.Checkbutton(ov_frame, text="启用叠加", variable=ov_enabled_var).pack(anchor=tk.W)
-    
-                ttk.Label(ov_frame, text="X 位置 (支持表达式，如 W-w-10):").pack(anchor=tk.W)
-                ov_x_var = tk.StringVar(value=getattr(track, 'overlay_x', 'W-w-10'))
-                x_entry = ttk.Entry(ov_frame, textvariable=ov_x_var, width=30)
-                x_entry.pack(fill=tk.X, pady=2)
-    
-                ttk.Label(ov_frame, text="Y 位置 (支持表达式):").pack(anchor=tk.W)
-                ov_y_var = tk.StringVar(value=getattr(track, 'overlay_y', 'H-h-10'))
-                y_entry = ttk.Entry(ov_frame, textvariable=ov_y_var, width=30)
-                y_entry.pack(fill=tk.X, pady=2)
-    
-                # 快速预设
-                preset_frame = ttk.LabelFrame(ov_frame, text="快速预设", padding="3")
-                preset_frame.pack(fill=tk.X, pady=5)
-                positions = {
-                    "左上角": ("10", "10"),
-                    "右上角": ("W-w-10", "10"),
-                    "左下角": ("10", "H-h-10"),
-                    "右下角": ("W-w-10", "H-h-10"),
-                    "居中": ("(W-w)/2", "(H-h)/2")
-                }
-                def set_position(x_val, y_val):
-                    ov_x_var.set(x_val)
-                    ov_y_var.set(y_val)
-                    self.merge_update_command_preview()
-                for text, (x_val, y_val) in positions.items():
-                    btn = ttk.Button(preset_frame, text=text,
-                                     command=lambda x=x_val, y=y_val: set_position(x, y))
-                    btn.pack(side=tk.LEFT, padx=2, pady=2)
-    
-                # 可视化编辑按钮
-                vis_btn = ttk.Button(preset_frame, text="🎨 可视化编辑坐标",
-                                     command=lambda: self.open_visual_overlay_editor(track_idx, ov_x_var, ov_y_var, filt_frame))
-                vis_btn.pack(side=tk.LEFT, padx=5, pady=2)
-    
-        else:
-            # 未启用画中画：显示灰色提示
-            msg = "当前未启用画中画模式。\n如需调整叠加/偏移参数，请先在主界面勾选“启用画中画”。\n注意给视频流选择重新编码，不能使用copy了。"
-            label = tk.Label(page_overlay, text=msg, justify="center", fg="gray",
-                             font=("Microsoft YaHei", 14, "bold"))
-            label.pack(expand=True, pady=50)
-    
+                msg = "当前未启用画中画模式。\n如需调整叠加/偏移参数，请先在主界面勾选“启用画中画”。\n注意给视频流选择重新编码，不能使用copy了。"
+                label = tk.Label(page_overlay, text=msg, justify="center", fg="gray",
+                                 font=("Microsoft YaHei", 14, "bold"))
+                label.pack(expand=True, pady=50)
         # ========== 保存按钮 ==========
-        def save():
-            try:
+            def save():
+                try:
                 # 收集编码、滤镜、截取设置
-                new_settings = {}
-                new_settings.update(enc_frame.get_settings())
-                new_settings.update(filt_frame.get_settings())
-                new_settings.update(trim_frame.get_settings())
-                track.enc_settings = new_settings
-    
+                    new_settings = {}
+                    new_settings.update(enc_frame.get_settings())
+                    new_settings.update(filt_frame.get_settings())
+                    new_settings.update(trim_frame.get_settings())
+                    track.enc_settings = new_settings
                 # 循环和绿幕设置（始终存在）
-                track.enc_settings["loop_enabled"] = loop_enabled_var.get()
-                track.enc_settings["loop_mode"] = loop_mode_var.get()
-                track.enc_settings["loop_count"] = loop_count_var.get()
-                track.enc_settings["chroma_enabled"] = chroma_enabled_var.get()
-                track.enc_settings["chroma_color"] = chroma_color_var.get()
-                similarity = chroma_similarity_var.get()
-                if similarity < 1e-5:
-                    similarity = 1e-5
-                track.enc_settings["chroma_similarity"] = similarity
-                track.enc_settings["chroma_blend"] = chroma_blend_var.get()
-    
+                    track.enc_settings["loop_enabled"] = loop_enabled_var.get()
+                    track.enc_settings["loop_mode"] = loop_mode_var.get()
+                    track.enc_settings["loop_count"] = loop_count_var.get()
+                    track.enc_settings["chroma_enabled"] = chroma_enabled_var.get()
+                    track.enc_settings["chroma_color"] = chroma_color_var.get()
+                    similarity = chroma_similarity_var.get()
+                    if similarity < 1e-5:
+                        similarity = 1e-5
+                    track.enc_settings["chroma_similarity"] = similarity
+                    track.enc_settings["chroma_blend"] = chroma_blend_var.get()
                 # 画中画相关设置（仅在启用画中画时保存）
-                if self.pip_enabled.get():
-                    enabled_video_tracks = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
-                    is_main = (enabled_video_tracks and enabled_video_tracks[0] == track)
-                    if is_main:
+                    if self.pip_enabled.get():
+                        enabled_video_tracks = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
+                        is_main = (enabled_video_tracks and enabled_video_tracks[0] == track)
+                        if is_main:
                         # 主视频
-                        track.pad_enabled = pad_enabled_var.get()
-                        track.pad_width = pad_w_var.get().strip()
-                        track.pad_height = pad_h_var.get().strip()
-                        track.offset_x = off_x_var.get().strip()
-                        track.offset_y = off_y_var.get().strip()
-                    else:
+                            track.pad_enabled = pad_enabled_var.get()
+                            track.pad_width = pad_w_var.get().strip()
+                            track.pad_height = pad_h_var.get().strip()
+                            track.offset_x = off_x_var.get().strip()
+                            track.offset_y = off_y_var.get().strip()
+                        else:
                         # 从视频
-                        track.overlay_enabled = ov_enabled_var.get()
-                        track.overlay_x = ov_x_var.get().strip()
-                        track.overlay_y = ov_y_var.get().strip()
-    
+                            track.overlay_enabled = ov_enabled_var.get()
+                            track.overlay_x = ov_x_var.get().strip()
+                            track.overlay_y = ov_y_var.get().strip()
                 # 刷新界面并关闭窗口
-                self.merge_update_track_list()
-                self.merge_update_command_preview()
-                win.destroy()
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                messagebox.showerror("保存错误", f"保存设置时发生错误：\n{e}\n请检查参数是否有效。")
-    
-        ttk.Button(win, text="保存", command=save).pack(pady=10)
+                    self.merge_update_track_list()
+                    self.merge_update_command_preview()
+                    win.destroy()
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    messagebox.showerror("保存错误", f"保存设置时发生错误：\n{e}\n请检查参数是否有效。")
+            ttk.Button(win, text="保存", command=save).pack(pady=10)
+            win.wait_window()
 
     def merge_edit_audio_track(self, track_idx):
         track = self.merge_tracks[track_idx]
-        win = tk.Toplevel(self.root)
-        win.title(f"音频轨道编码设置 - {track.codec}")
-        center_window(win, 400, 200)
-        win.transient(self.root)
-        win.grab_set()
-        ttk.Label(win, text="编码器:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        encoder_var = tk.StringVar(value=track.enc_settings.get("encoder", "copy"))
-        ttk.Combobox(win, textvariable=encoder_var, values=ALL_AUDIO_ENCODERS, state="readonly", width=15).grid(row=0, column=1, sticky="w", padx=5, pady=5)
-        ttk.Label(win, text="比特率:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
-        bitrate_var = tk.StringVar(value=track.enc_settings.get("bitrate", "128k"))
-        ttk.Entry(win, textvariable=bitrate_var, width=10).grid(row=1, column=1, sticky="w", padx=5, pady=5)
-        ttk.Label(win, text="采样率:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
-        samplerate_var = tk.StringVar(value=track.enc_settings.get("samplerate", "44100"))
-        ttk.Entry(win, textvariable=samplerate_var, width=10).grid(row=2, column=1, sticky="w", padx=5, pady=5)
-        def save():
-            track.enc_settings = {"encoder": encoder_var.get(), "bitrate": bitrate_var.get(), "samplerate": samplerate_var.get()}
-            self.merge_update_track_list()
-            self.merge_update_command_preview()
-            win.destroy()
-        ttk.Button(win, text="保存", command=save).grid(row=3, column=0, columnspan=2, pady=10)
+        with self.SafeToplevel(self.root) as win:
+            win.title(f"音频轨道编码设置 - {track.codec}")
+            center_window(win, 400, 200)
+            win.transient(self.root)
+            ttk.Label(win, text="编码器:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+            encoder_var = tk.StringVar(value=track.enc_settings.get("encoder", "copy"))
+            ttk.Combobox(win, textvariable=encoder_var, values=ALL_AUDIO_ENCODERS, state="readonly", width=15).grid(row=0, column=1, sticky="w", padx=5, pady=5)
+            ttk.Label(win, text="比特率:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+            bitrate_var = tk.StringVar(value=track.enc_settings.get("bitrate", "128k"))
+            ttk.Entry(win, textvariable=bitrate_var, width=10).grid(row=1, column=1, sticky="w", padx=5, pady=5)
+            ttk.Label(win, text="采样率:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+            samplerate_var = tk.StringVar(value=track.enc_settings.get("samplerate", "44100"))
+            ttk.Entry(win, textvariable=samplerate_var, width=10).grid(row=2, column=1, sticky="w", padx=5, pady=5)
+            def save():
+                track.enc_settings = {"encoder": encoder_var.get(), "bitrate": bitrate_var.get(), "samplerate": samplerate_var.get()}
+                self.merge_update_track_list()
+                self.merge_update_command_preview()
+                win.destroy()
+            ttk.Button(win, text="保存", command=save).grid(row=3, column=0, columnspan=2, pady=10)
+            win.wait_window()
 
     def merge_edit_subtitle_track(self, track_idx):
         track = self.merge_tracks[track_idx]
-        win = tk.Toplevel(self.root)
-        win.title(f"字幕轨道设置 - {track.codec}")
-        center_window(win, 450, 270)
-        win.transient(self.root)
-        win.grab_set()
-    
-        # 第一行：编码器（带 ToolTip）
-        ttk.Label(win, text="编码器:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        encoder_var = tk.StringVar(value=track.enc_settings.get("encoder", "copy"))
-        combo = ttk.Combobox(win, textvariable=encoder_var, values=["copy", "mov_text", "srt"], state="readonly")
-        combo.grid(row=0, column=1, padx=5, pady=5, sticky="w")
-        # 将提示信息附加到“编码器:”标签上
-        ToolTip(win.grid_slaves(row=0, column=0)[0], 
-                "对于 ASS/SSA 字幕，推荐使用 MKV 容器并选择「copy」流，\n"
-                "MP4 容器支持不佳（会丢失样式），MP4 必须用 mov_text",
-                wraplength=300)
-    
-        # 第二行：语言
-        ttk.Label(win, text="语言代码:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
-        lang_var = tk.StringVar(value=getattr(track, 'language', ''))
-        lang_combo = ttk.Combobox(win, textvariable=lang_var,
-                                  values=["", "chi", "eng", "jpn", "kor", "fre", "ger", "rus", "spa", "ita"],
-                                  state="normal", width=10)
-        lang_combo.grid(row=1, column=1, padx=5, pady=5, sticky="w")
-        ttk.Label(win, text="常见: chi(中文), eng(英语), jpn(日语)", foreground="gray").grid(row=2, column=1, sticky="w", padx=5)
-    
-        # 第三行：轨道标题
-        ttk.Label(win, text="轨道标题:").grid(row=3, column=0, sticky="w", padx=5, pady=5)
-        title_var = tk.StringVar(value=getattr(track, 'title', ''))
-        title_entry = ttk.Entry(win, textvariable=title_var, width=30)
-        title_entry.grid(row=3, column=1, padx=5, pady=5, sticky="w")
-    
-        def save():
-            # 保存编码器、语言、标题
-            track.enc_settings["encoder"] = encoder_var.get()
-            track.language = lang_var.get().strip()
-            track.title = title_var.get().strip()
-            track.enc_settings["language"] = track.language
-            track.enc_settings["title"] = track.title
-            self.merge_update_track_list()
-            self.merge_update_command_preview()
-            win.destroy()
-    
-        ttk.Button(win, text="保存", command=save).grid(row=4, column=0, columnspan=2, pady=10)
+        with self.SafeToplevel(self.root) as win:
+            win.title(f"字幕轨道设置 - {track.codec}")
+            center_window(win, 450, 270)
+            win.transient(self.root)
+            ttk.Label(win, text="编码器:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+            encoder_var = tk.StringVar(value=track.enc_settings.get("encoder", "copy"))
+            combo = ttk.Combobox(win, textvariable=encoder_var, values=["copy", "mov_text", "srt"], state="readonly")
+            combo.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+            ToolTip(win.grid_slaves(row=0, column=0)[0], 
+                    "对于 ASS/SSA 字幕，推荐使用 MKV 容器并选择「copy」流，\n"
+                    "MP4 容器支持不佳（会丢失样式），MP4 必须用 mov_text",
+                    wraplength=300)
+            ttk.Label(win, text="语言代码:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+            lang_var = tk.StringVar(value=getattr(track, 'language', ''))
+            lang_combo = ttk.Combobox(win, textvariable=lang_var,
+                                      values=["", "chi", "eng", "jpn", "kor", "fre", "ger", "rus", "spa", "ita"],
+                                      state="normal", width=10)
+            lang_combo.grid(row=1, column=1, padx=5, pady=5, sticky="w")
+            ttk.Label(win, text="常见: chi(中文), eng(英语), jpn(日语)", foreground="gray").grid(row=2, column=1, sticky="w", padx=5)
+            ttk.Label(win, text="轨道标题:").grid(row=3, column=0, sticky="w", padx=5, pady=5)
+            title_var = tk.StringVar(value=getattr(track, 'title', ''))
+            title_entry = ttk.Entry(win, textvariable=title_var, width=30)
+            title_entry.grid(row=3, column=1, padx=5, pady=5, sticky="w")
+            def save():
+                track.enc_settings["encoder"] = encoder_var.get()
+                track.language = lang_var.get().strip()
+                track.title = title_var.get().strip()
+                track.enc_settings["language"] = track.language
+                track.enc_settings["title"] = track.title
+                self.merge_update_track_list()
+                self.merge_update_command_preview()
+                win.destroy()
+            ttk.Button(win, text="保存", command=save).grid(row=4, column=0, columnspan=2, pady=10)
+            win.wait_window()
 
     def merge_set_track_enabled(self, idx, enabled):
         self.merge_tracks[idx].enabled = enabled
@@ -4682,7 +4607,6 @@ class FFmpegBatchGUI:
         for t in self.merge_tracks:
             if t.enabled and t.file_path not in source_files:
                 source_files.add(t.file_path)
-
         try:
             proc = subprocess.Popen(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, encoding='utf-8', errors='replace',
@@ -4694,7 +4618,6 @@ class FFmpegBatchGUI:
                 self._append_info_ui("[封装] ✅ 处理完成")
                 if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
                     if self.merge_delete_source.get():
-                        # 将确认对话框调度到主线程
                         self.root.after(0, lambda: self._confirm_delete_sources(source_files, output_file))
                     else:
                         self._append_info_ui("[封装] 未勾选删除源文件，保留原文件")
@@ -4708,7 +4631,6 @@ class FFmpegBatchGUI:
             self.root.after(0, lambda: self.merge_btn.config(state="normal"))
 
     def _confirm_delete_sources(self, source_files, output_file):
-        """在主线程中确认删除源文件（线程安全）"""
         if not messagebox.askyesno("确认删除", f"是否确定删除 {len(source_files)} 个源文件？\n此操作不可恢复！"):
             self._append_info_ui("[封装] 取消删除源文件")
             return
@@ -4801,23 +4723,24 @@ class FFmpegBatchGUI:
             info_text = "请选择操作：\n\n• [All] 按钮：仅添加音频（不改变主视频）\n• 点击下方视频按钮：设为主视频，其余添加音频"
             tk.Label(dialog, text=info_text, justify=tk.LEFT).pack(pady=10, padx=10)
             def all_action():
-                if not has_main and video_files:
-                    main = video_files[0]
-                    self.root.after(0, lambda: self.merge_video.set(main))
-                    self.root.after(0, lambda: self.append_info(f"[封装] 自动设置主视频: {os.path.basename(main)}"))
-                    for f in video_files[1:]:
-                        self.root.after(0, lambda f=f: self.merge_add_external("audio", f))
-                        self.root.after(0, lambda f=f: self.merge_add_external("subtitle", f))
-                else:
-                    for f in video_files:
-                        self.root.after(0, lambda f=f: self.merge_add_external("audio", f))
-                        self.root.after(0, lambda f=f: self.merge_add_external("subtitle", f))
-                for f in other_files:
-                    self.root.after(0, lambda f=f: self.merge_handle_dropped_file(f))
-                dialog.destroy()
-                self.root.after(200, self.merge_update_track_list)
-                self.root.after(200, self.merge_auto_recommend_container)
-                self.root.after(200, self.merge_update_command_preview)
+                def do_all():
+                    if not has_main and video_files:
+                        main = video_files[0]
+                        self.merge_video.set(main)
+                        self.append_info(f"[封装] 自动设置主视频: {os.path.basename(main)}")
+                        start_idx = 1
+                    else:
+                        start_idx = 0
+                    for f in video_files[start_idx:]:
+                        self.merge_add_external("audio", f)
+                        self.merge_add_external("subtitle", f)
+                    for f in other_files:
+                        self.merge_handle_dropped_file(f)
+                    self.merge_update_track_list()
+                    self.merge_auto_recommend_container()
+                    self.merge_update_command_preview()
+                    dialog.destroy()
+                self.root.after(0, do_all)
             btn_all = tk.Button(dialog, text="[All] 仅音频", command=all_action,
                                 bg="#4CAF50", fg="white", width=22, wraplength=300)
             btn_all.pack(pady=5, padx=10)
@@ -4833,19 +4756,21 @@ class FFmpegBatchGUI:
             canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
             canvas.configure(yscrollcommand=scrollbar.set)
             def select_main_video(idx):
-                main = video_files[idx]
-                self.root.after(0, lambda: self.merge_video.set(main))
-                self.root.after(0, lambda: self.append_info(f"[封装] 设置主视频为: {os.path.basename(main)}"))
-                for i, f in enumerate(video_files):
-                    if i != idx:
-                        self.root.after(0, lambda f=f: self.merge_add_external("audio", f))
-                        self.root.after(0, lambda f=f: self.merge_add_external("subtitle", f))
-                for f in other_files:
-                    self.root.after(0, lambda f=f: self.merge_handle_dropped_file(f))
-                dialog.destroy()
-                self.root.after(200, self.merge_update_track_list)
-                self.root.after(200, self.merge_auto_recommend_container)
-                self.root.after(200, self.merge_update_command_preview)
+                def do_select():
+                    main = video_files[idx]
+                    self.merge_video.set(main)
+                    self.append_info(f"[封装] 设置主视频为: {os.path.basename(main)}")
+                    for i, f in enumerate(video_files):
+                        if i != idx:
+                            self.merge_add_external("audio", f)
+                            self.merge_add_external("subtitle", f)
+                    for f in other_files:
+                        self.merge_handle_dropped_file(f)
+                    self.merge_update_track_list()
+                    self.merge_auto_recommend_container()
+                    self.merge_update_command_preview()
+                    dialog.destroy()
+                self.root.after(0, do_select)
             for i, vf in enumerate(video_files):
                 btn = tk.Button(scrollable_frame, text=f"{i+1}. {os.path.basename(vf)}",
                                 wraplength=550, anchor="w", justify=tk.LEFT,
@@ -4857,6 +4782,182 @@ class FFmpegBatchGUI:
             dialog.wait_window()
         threading.Thread(target=run_in_thread, daemon=True).start()
 
+    # ---------- 播放器设置标签页 ----------
+    def create_player_settings_tab(self, parent):
+        frame = ttk.Frame(parent, padding="10")
+        frame.pack(fill=tk.BOTH, expand=True)
+        self.mpv_check = ttk.Checkbutton(frame, text="启用 mpv 作为预览播放器（推荐，支持进度条等）",
+                                         variable=self.use_mpv,
+                                         command=self.on_player_changed)
+        self.mpv_check.pack(anchor=tk.W, pady=5)
+        path_frame = ttk.Frame(frame)
+        path_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(path_frame, text="mpv 可执行文件路径:").pack(side=tk.LEFT, padx=(0,5))
+        self.mpv_path_entry = ttk.Entry(path_frame, textvariable=self.mpv_path, width=40)
+        self.mpv_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(path_frame, text="浏览", command=self.browse_mpv).pack(side=tk.LEFT, padx=5)
+        status_frame = ttk.LabelFrame(frame, text="状态检测", padding="5")
+        status_frame.pack(fill=tk.X, pady=(15, 5))
+        self.status_text = tk.Text(status_frame, height=20, width=80, wrap=tk.WORD,
+                                   bg="#f8f8f8", relief=tk.FLAT)
+        self.status_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.status_text.config(state=tk.DISABLED)
+        btn_frame = ttk.Frame(status_frame)
+        btn_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Button(btn_frame, text="在文件管理器中打开预设文件夹",
+                   command=self.open_preset_folder).pack(side=tk.LEFT, padx=5)
+        tip = ttk.Label(frame, text="提示：mpv 支持进度条、拖拽等交互，且兼容 FFmpeg 大部分滤镜。\n"
+                                     "请确保已安装 mpv 并正确设置路径（例如 C:\\mpv\\mpv.exe 或直接输入 mpv）。\n"
+                                     "未启用时使用 ffplay 预览。",
+                        foreground="gray", wraplength=500, justify=tk.LEFT)
+        tip.pack(anchor=tk.W, pady=(10,0))
+        self.update_mpv_path_state()
+        self.use_mpv.trace_add("write", lambda *a: self.update_player_status())
+        self.mpv_path.trace_add("write", lambda *a: self.update_player_status())
+        self.update_player_status()
+
+    def open_preset_folder(self):
+        folder = os.path.dirname(self.preset_file_path)
+        if not os.path.exists(folder):
+            folder = get_script_dir()
+        try:
+            if sys.platform == "win32":
+                os.startfile(folder)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", folder])
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except Exception as e:
+            self._append_info_ui(f"打开文件夹失败: {e}")
+
+    def update_player_status(self):
+        if not hasattr(self, 'status_text'):
+            return
+        self.status_text.config(state=tk.NORMAL)
+        self.status_text.delete(1.0, tk.END)
+        preset_path = self.preset_file_path
+        if os.path.exists(preset_path):
+            preset_status = "✓ 文件存在"
+        else:
+            preset_status = "✗ 文件不存在（将自动创建）"
+        local_preset = os.path.join(get_script_dir(), "ffmpeg_presets.json")
+        if preset_path == local_preset:
+            source = "脚本目录（便携模式）"
+        else:
+            source = "用户目录（%USERPROFILE%\\.FFLiteGUI）"
+        self.status_text.insert(tk.END, f"预设配置文件: {preset_path}\n")
+        self.status_text.insert(tk.END, f"配置来源: {source}  | 状态: {preset_status}\n\n")
+        if self.use_mpv.get():
+            mpv_path = self.mpv_path.get().strip()
+            self.status_text.insert(tk.END, "mpv 预览: 已启用\n")
+            if mpv_path:
+                if os.path.exists(mpv_path) and os.access(mpv_path, os.X_OK):
+                    self.status_text.insert(tk.END, f"  mpv 路径: {mpv_path}  →  ✓ 有效\n")
+                else:
+                    self.status_text.insert(tk.END, f"  mpv 路径: {mpv_path}  →  ✗ 无效（文件不存在或不可执行）\n")
+                    self.status_text.insert(tk.END, "  请检查路径是否正确，或重新安装 mpv。\n")
+            else:
+                self.status_text.insert(tk.END, "  mpv 路径未设置，预览将失败。\n")
+        else:
+            self.status_text.insert(tk.END, "预览播放器: ffplay（未启用 mpv）\n")
+            if self.ffplay_cmd and os.path.exists(self.ffplay_cmd):
+                self.status_text.insert(tk.END, f"  ffplay 路径: {self.ffplay_cmd}  →  ✓ 可用\n")
+            else:
+                self.status_text.insert(tk.END, f"  ffplay 未找到，请将 ffplay.exe 放在脚本目录或添加到 PATH。\n")
+        self.status_text.insert(tk.END, "\n--- FFmpeg 全家桶检测 ---\n")
+        tools = ['ffmpeg', 'ffplay', 'ffprobe']
+        script_dir = get_script_dir()
+        self.status_text.insert(tk.END, f"当前目录 ({script_dir}):\n")
+        for tool in tools:
+            if sys.platform == "win32":
+                exe_name = tool + ".exe"
+            else:
+                exe_name = tool
+            local_path = os.path.join(script_dir, exe_name)
+            exists = os.path.isfile(local_path) and os.access(local_path, os.X_OK)
+            status = "✓ 存在" if exists else "✗ 不存在"
+            self.status_text.insert(tk.END, f"  {exe_name}: {status}\n")
+        self.status_text.insert(tk.END, "环境变量 PATH:\n")
+        import shutil
+        for tool in tools:
+            path_in_path = shutil.which(tool)
+            if path_in_path:
+                self.status_text.insert(tk.END, f"  {tool}: ✓ 找到 → {path_in_path}\n")
+            else:
+                self.status_text.insert(tk.END, f"  {tool}: ✗ 未找到\n")
+        self.status_text.insert(tk.END, "（提示：FFmpeg 全家桶用于编码、解码、预览等核心功能，建议确保 ffmpeg、ffplay、ffprobe 三者均可访问）\n")
+        self.status_text.config(state=tk.DISABLED)
+
+    def on_player_changed(self):
+        self.update_mpv_path_state()
+        self.save_player_settings()
+        self.update_player_status()
+
+    def update_mpv_path_state(self):
+        state = tk.NORMAL if self.use_mpv.get() else tk.DISABLED
+        self.mpv_path_entry.config(state=state)
+
+    def browse_mpv(self):
+        path = filedialog.askopenfilename(title="选择 mpv 可执行文件", filetypes=[("可执行文件", "*.exe"), ("所有文件", "*.*")])
+        if path:
+            self.mpv_path.set(normalize_path(path))
+            self.save_player_settings()
+            self.update_player_status()
+
+    # ---------- 基本界面输入方法 ----------
+    def select_input(self):
+        path = filedialog.askopenfilename(title="选择视频文件")
+        if path:
+            path = normalize_path(path)
+            self.input_file.set(path)
+            if not self.output_dir.get():
+                self.output_dir.set(os.path.dirname(path))
+            self.update_command_preview()
+
+    def select_output_dir(self):
+        dirpath = filedialog.askdirectory()
+        if dirpath:
+            dirpath = normalize_path(dirpath)
+            self.output_dir.set(dirpath)
+            self.update_command_preview()
+
+    def append_info(self, text):
+        self.info_text.insert(tk.END, text + "\n")
+        self.info_text.see(tk.END)
+
+    def append_detail(self, text):
+        self.detail_text.insert(tk.END, text)
+        self.detail_text.see(tk.END)
+
+    def save_log(self, text_widget):
+        file_path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("文本文件", "*.txt")])
+        if file_path:
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(text_widget.get(1.0, tk.END))
+                self._append_info_ui(f"日志已保存到 {file_path}")
+            except Exception as e:
+                messagebox.showerror("保存失败", str(e))
+
+    def check_ffmpeg_dependencies(self):
+        return self.ffmpeg_cmd, self.ffplay_cmd, self.ffprobe_cmd
+
+    def show_quick_warning(self):
+        missing = []
+        if not self.ffmpeg_cmd: missing.append("ffmpeg")
+        if not self.ffplay_cmd: missing.append("ffplay")
+        if not self.ffprobe_cmd: missing.append("ffprobe")
+        if missing:
+            missing_str = "、".join(missing)
+            self._append_info_ui("⚠️ 必要组件缺失: " + missing_str)
+            self._append_info_ui("请确保 FFmpeg 已正确安装。快捷方法：")
+            self._append_info_ui("  ① 将 ffmpeg.exe、ffplay.exe、ffprobe.exe 放在本脚本同一目录下（推荐，绿色便携）")
+            self._append_info_ui("  ② 或者将它们所在文件夹的路径添加到系统 Path 环境变量中")
+            self._append_info_ui("推荐下载 FFmpeg 的 **shared** 版本（体积小，节约空间）：")
+            self._append_info_ui("下载地址: https://github.com/BtbN/FFmpeg-Builds/releases")
+            self._append_info_ui("选择文件名中包含 'shared' 的版本，例如: ffmpeg-master-latest-win64-gpl-shared.zip")
+            self._append_info_ui("解压后，将 bin 文件夹内的三个 exe 文件复制到本脚本目录，或添加 bin 路径到 Path。")
+            self._append_info_ui("提示：您可以在此日志框中直接选中上面的链接文字，右键复制。")
     # -------------------- 界面创建 --------------------
     def create_widgets(self):
         main_frame = ttk.Frame(self.root)
@@ -5003,44 +5104,27 @@ class FFmpegBatchGUI:
         tasks_frame = ttk.Frame(transcode_vpane)
         tasks_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0,0))
 
-        # ----- 可水平滚动的按钮行（Grid 布局修复版）-----
-        
-        # 1. 修改 tasks_frame 的布局方式为 grid
-        # 假设 tasks_frame 已经在前面定义过： tasks_frame = ttk.Frame(transcode_vpane)
-        # 这里我们需要配置它的行权重
-        tasks_frame.rowconfigure(0, weight=0)  # 第0行（按钮区）：固定高度，不随窗口拉伸
-        tasks_frame.rowconfigure(1, weight=1)  # 第1行（列表区）：权重为1，占满剩余垂直空间
+        # ----- 可水平滚动的按钮行（Grid 布局）-----
+        tasks_frame.rowconfigure(0, weight=0)
+        tasks_frame.rowconfigure(1, weight=1)
         tasks_frame.columnconfigure(0, weight=1)
         
-        # --- 按钮区域容器 (放在第0行) ---
         btn_container = ttk.Frame(tasks_frame)
-        btn_container.grid(row=0, column=0, sticky="ew", pady=0) # sticky="ew" 保证横向填满
-        
+        btn_container.grid(row=0, column=0, sticky="ew", pady=0)
         canvas = tk.Canvas(btn_container, highlightthickness=0, height=1)
         canvas.pack(side=tk.TOP, fill=tk.X, expand=True)
         h_scroll = ttk.Scrollbar(btn_container, orient=tk.HORIZONTAL, command=canvas.xview)
-        h_scroll.pack(side=tk.BOTTOM, fill=tk.X, pady=(4,0))  #滚动条
-        
-        # 绑定滚动事件
+        h_scroll.pack(side=tk.BOTTOM, fill=tk.X, pady=(4,0))
         canvas.configure(xscrollcommand=h_scroll.set)
-        
-        # 创建内部放置按钮的 Frame
         button_frame = ttk.Frame(canvas)
         canvas.create_window((0, 0), window=button_frame, anchor="nw")
-        
-        # 动态调整 Canvas 高度的函数
         def _on_frame_configure(event):
-            # 更新滚动区域
             canvas.configure(scrollregion=canvas.bbox("all"))
-            # 【关键】：根据内容实际高度调整 Canvas 高度
-            # 增加一点缓冲(比如+2)防止出现不必要的垂直滚动条
             new_height = button_frame.winfo_reqheight()
             if canvas.cget("height") != new_height:
-                 canvas.configure(height=new_height)
-        
+                canvas.configure(height=new_height)
         button_frame.bind("<Configure>", _on_frame_configure)
         
-        # --- 放入按钮 (保持原样) ---
         btn_start = tk.Button(button_frame, text="开始队列", command=self.start_queue,
                               bg="#4CAF50", fg="black", width=12, relief=tk.RAISED)
         btn_start.pack(side=tk.LEFT, padx=5)
@@ -5063,15 +5147,11 @@ class FFmpegBatchGUI:
                           ("导出为脚本", self.export_script), ("预览选中任务", self.preview_selected_task)]:
             ttk.Button(button_frame, text=text, command=cmd).pack(side=tk.LEFT, padx=5)
         
-        
-        # --- 列表区域容器 (放在第1行) ---
         tree_frame = ttk.Frame(tasks_frame)
-        # 【关键】：sticky="nsew" 确保列表框在 grid 单元格内上下左右都填满
         tree_frame.grid(row=1, column=0, sticky="nsew", pady=5)
         tree_frame.rowconfigure(0, weight=1)
         tree_frame.columnconfigure(0, weight=1)
         
-        # 列表框内部的 pack 布局保持不变
         v_scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
         v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         h_scrollbar = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL)
@@ -5081,7 +5161,6 @@ class FFmpegBatchGUI:
         self.task_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=12,
                                       yscrollcommand=v_scrollbar.set,
                                       xscrollcommand=h_scrollbar.set)
-
         self.task_tree.tag_configure('odd', background='#e8e8e8')
         self.task_tree.tag_configure('even', background='#ffffff')
         v_scrollbar.config(command=self.task_tree.yview)
@@ -5149,159 +5228,6 @@ class FFmpegBatchGUI:
         self.output_container.trace_add("write", lambda *a: self.update_command_preview())
         self.audio_frame.only_audio.trace_add("write", lambda *a: self.toggle_only_audio_mode())
 
-
-
-    # ---------- 播放器设置标签页 ----------
-    def create_player_settings_tab(self, parent):
-        frame = ttk.Frame(parent, padding="10")
-        frame.pack(fill=tk.BOTH, expand=True)
-    
-        self.mpv_check = ttk.Checkbutton(frame, text="启用 mpv 作为预览播放器（推荐，支持进度条等）",
-                                         variable=self.use_mpv,
-                                         command=self.on_player_changed)
-        self.mpv_check.pack(anchor=tk.W, pady=5)
-    
-        path_frame = ttk.Frame(frame)
-        path_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(path_frame, text="mpv 可执行文件路径:").pack(side=tk.LEFT, padx=(0,5))
-        self.mpv_path_entry = ttk.Entry(path_frame, textvariable=self.mpv_path, width=40)
-        self.mpv_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        ttk.Button(path_frame, text="浏览", command=self.browse_mpv).pack(side=tk.LEFT, padx=5)
-    
-        status_frame = ttk.LabelFrame(frame, text="状态检测", padding="5")
-        status_frame.pack(fill=tk.X, pady=(15, 5))
-    
-        self.status_text = tk.Text(status_frame, height=20, width=80, wrap=tk.WORD,
-                                   bg="#f8f8f8", relief=tk.FLAT)
-        self.status_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.status_text.config(state=tk.DISABLED)
-    
-        btn_frame = ttk.Frame(status_frame)
-        btn_frame.pack(fill=tk.X, pady=(0, 5))
-        ttk.Button(btn_frame, text="在文件管理器中打开预设文件夹",
-                   command=self.open_preset_folder).pack(side=tk.LEFT, padx=5)
-    
-        tip = ttk.Label(frame, text="提示：mpv 支持进度条、拖拽等交互，且兼容 FFmpeg 大部分滤镜。\n"
-                                     "请确保已安装 mpv 并正确设置路径（例如 C:\\mpv\\mpv.exe 或直接输入 mpv）。\n"
-                                     "未启用时使用 ffplay 预览。",
-                        foreground="gray", wraplength=500, justify=tk.LEFT)
-        tip.pack(anchor=tk.W, pady=(10,0))
-    
-        self.update_mpv_path_state()
-        self.use_mpv.trace_add("write", lambda *a: self.update_player_status())
-        self.mpv_path.trace_add("write", lambda *a: self.update_player_status())
-        self.update_player_status()
-
-    def open_preset_folder(self):
-        folder = os.path.dirname(self.preset_file_path)
-        if not os.path.exists(folder):
-            folder = get_script_dir()
-        try:
-            if sys.platform == "win32":
-                os.startfile(folder)
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", folder])
-            else:
-                subprocess.Popen(["xdg-open", folder])
-        except Exception as e:
-            self._append_info_ui(f"打开文件夹失败: {e}")
-
-    def update_player_status(self):
-        if not hasattr(self, 'status_text'):
-            return
-        self.status_text.config(state=tk.NORMAL)
-        self.status_text.delete(1.0, tk.END)
-    
-        preset_path = self.preset_file_path
-        if os.path.exists(preset_path):
-            preset_status = "✓ 文件存在"
-        else:
-            preset_status = "✗ 文件不存在（将自动创建）"
-        local_preset = os.path.join(get_script_dir(), "ffmpeg_presets.json")
-        if preset_path == local_preset:
-            source = "脚本目录（便携模式）"
-        else:
-            source = "用户目录（%USERPROFILE%\\.FFLiteGUI）"
-    
-        self.status_text.insert(tk.END, f"预设配置文件: {preset_path}\n")
-        self.status_text.insert(tk.END, f"配置来源: {source}  | 状态: {preset_status}\n\n")
-    
-        if self.use_mpv.get():
-            mpv_path = self.mpv_path.get().strip()
-            self.status_text.insert(tk.END, "mpv 预览: 已启用\n")
-            if mpv_path:
-                if os.path.exists(mpv_path) and os.access(mpv_path, os.X_OK):
-                    self.status_text.insert(tk.END, f"  mpv 路径: {mpv_path}  →  ✓ 有效\n")
-                else:
-                    self.status_text.insert(tk.END, f"  mpv 路径: {mpv_path}  →  ✗ 无效（文件不存在或不可执行）\n")
-                    self.status_text.insert(tk.END, "  请检查路径是否正确，或重新安装 mpv。\n")
-            else:
-                self.status_text.insert(tk.END, "  mpv 路径未设置，预览将失败。\n")
-        else:
-            self.status_text.insert(tk.END, "预览播放器: ffplay（未启用 mpv）\n")
-            if self.ffplay_cmd and os.path.exists(self.ffplay_cmd):
-                self.status_text.insert(tk.END, f"  ffplay 路径: {self.ffplay_cmd}  →  ✓ 可用\n")
-            else:
-                self.status_text.insert(tk.END, f"  ffplay 未找到，请将 ffplay.exe 放在脚本目录或添加到 PATH。\n")
-    
-        self.status_text.insert(tk.END, "\n--- FFmpeg 全家桶检测 ---\n")
-        tools = ['ffmpeg', 'ffplay', 'ffprobe']
-        script_dir = get_script_dir()
-    
-        self.status_text.insert(tk.END, f"当前目录 ({script_dir}):\n")
-        for tool in tools:
-            if sys.platform == "win32":
-                exe_name = tool + ".exe"
-            else:
-                exe_name = tool
-            local_path = os.path.join(script_dir, exe_name)
-            exists = os.path.isfile(local_path) and os.access(local_path, os.X_OK)
-            status = "✓ 存在" if exists else "✗ 不存在"
-            self.status_text.insert(tk.END, f"  {exe_name}: {status}\n")
-    
-        self.status_text.insert(tk.END, "环境变量 PATH:\n")
-        import shutil
-        for tool in tools:
-            path_in_path = shutil.which(tool)
-            if path_in_path:
-                self.status_text.insert(tk.END, f"  {tool}: ✓ 找到 → {path_in_path}\n")
-            else:
-                self.status_text.insert(tk.END, f"  {tool}: ✗ 未找到\n")
-        self.status_text.insert(tk.END, "（提示：FFmpeg 全家桶用于编码、解码、预览等核心功能，建议确保 ffmpeg、ffplay、ffprobe 三者均可访问）\n")
-    
-        self.status_text.config(state=tk.DISABLED)
-
-    def on_player_changed(self):
-        self.update_mpv_path_state()
-        self.save_player_settings()
-        self.update_player_status()
-
-    def update_mpv_path_state(self):
-        state = tk.NORMAL if self.use_mpv.get() else tk.DISABLED
-        self.mpv_path_entry.config(state=state)
-
-    def browse_mpv(self):
-        path = filedialog.askopenfilename(title="选择 mpv 可执行文件", filetypes=[("可执行文件", "*.exe"), ("所有文件", "*.*")])
-        if path:
-            self.mpv_path.set(normalize_path(path))
-            self.save_player_settings()
-            self.update_player_status()
-
-    def select_input(self):
-        path = filedialog.askopenfilename(title="选择视频文件")
-        if path:
-            path = normalize_path(path)
-            self.input_file.set(path)
-            if not self.output_dir.get():
-                self.output_dir.set(os.path.dirname(path))
-            self.update_command_preview()
-
-    def select_output_dir(self):
-        dirpath = filedialog.askdirectory()
-        if dirpath:
-            dirpath = normalize_path(dirpath)
-            self.output_dir.set(dirpath)
-            self.update_command_preview()
 
 # ================== 主入口 ==================
 if __name__ == "__main__":
