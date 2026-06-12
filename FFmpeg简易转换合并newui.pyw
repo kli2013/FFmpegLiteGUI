@@ -3268,14 +3268,12 @@ class FFmpegBatchGUI:
         self.merge_auto_recommend_container()
         self.merge_update_command_preview()
         self._append_info_ui(f"[封装] 已添加画中画视频或图片水印: {os.path.basename(path)}")
-
     def browse_chapter_file(self):
         path = filedialog.askopenfilename(title="选择章节文件", filetypes=[("FFmetadata", "*.txt *.chapters")])
         if path:
             self.chapter_file.set(normalize_path(path))
             if path:
                 self.copy_chapters.set(False)
-
     def merge_copy_command(self):
         cmd_str = self.merge_cmd_preview.get(1.0, tk.END).strip()
         if cmd_str:
@@ -3284,7 +3282,6 @@ class FFmpegBatchGUI:
             self._append_info_ui("[封装] 命令已复制到剪贴板")
         else:
             self._append_info_ui("[封装] 无命令可复制")
-
     def merge_build_cmd_list(self) -> List[str]:
         if not self.ffmpeg_cmd:
             self._append_info_ui("❌ 未找到 ffmpeg，无法生成合并命令。")
@@ -3300,9 +3297,10 @@ class FFmpegBatchGUI:
             if t.file_path not in input_files:
                 input_files.append(t.file_path)
     
-        def normalize_win_path(p):
+        # ========== 统一的路径标准化函数 ==========
+        def _norm_path(p):
             if sys.platform != "win32":
-                return p
+                return normalize_path(p)
             try:
                 import ctypes
                 GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW
@@ -3310,19 +3308,37 @@ class FFmpegBatchGUI:
                 GetShortPathNameW.restype = ctypes.c_uint
                 buf_len = GetShortPathNameW(p, None, 0)
                 if buf_len == 0:
-                    return p
+                    return normalize_path(p)
                 buf = ctypes.create_unicode_buffer(buf_len)
                 GetShortPathNameW(p, buf, buf_len)
                 return buf.value
             except Exception:
-                return p
+                return normalize_path(p)
     
-        input_files_norm = [normalize_win_path(f) for f in input_files]
-        output_norm = normalize_win_path(output)
+        # --- 收集循环参数（键使用标准化路径）---
+        input_loop_opts = {}
+        for track in enabled_tracks:
+            if track.type == "video" and track.enc_settings.get("loop_enabled", False):
+                norm_key = _norm_path(track.file_path)
+                mode = track.enc_settings.get("loop_mode", "infinite")
+                if mode == "infinite":
+                    loop_arg = ("-stream_loop", "-1")
+                else:
+                    count = track.enc_settings.get("loop_count", 3)
+                    loop_arg = ("-stream_loop", str(count))
+                input_loop_opts[norm_key] = loop_arg
     
+        # --- 收集输入文件列表（去重，使用相同标准化）---
+        input_files = []
+        for t in enabled_tracks:
+            if t.file_path not in input_files:
+                input_files.append(t.file_path)
+        input_files_norm = [_norm_path(f) for f in input_files]
+    
+        output_norm = _norm_path(output)
         cmd_list = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
     
-        # 处理 trim
+        # --- 收集截取参数（键使用标准化路径）---
         file_trim = {}
         for track in enabled_tracks:
             if track.type == "video":
@@ -3331,9 +3347,13 @@ class FFmpegBatchGUI:
                     start = track.enc_settings.get("trim_start", "").strip()
                     end = track.enc_settings.get("trim_end", "").strip()
                     if start or end:
-                        file_trim[track.file_path] = (start, end)
+                        norm_key = _norm_path(track.file_path)
+                        file_trim[norm_key] = (start, end)
     
+        # --- 添加输入文件及对应的循环/截取参数 ---
         for f in input_files_norm:
+            if f in input_loop_opts:
+                cmd_list.extend(input_loop_opts[f])
             if f in file_trim:
                 start, end = file_trim[f]
                 if start:
@@ -3350,10 +3370,11 @@ class FFmpegBatchGUI:
             self._append_info_ui("[封装] 没有启用的视频轨道")
             return []
     
+        # ================= 画中画模式 =================
         if self.pip_enabled.get():
             main_video = video_tracks[0]
             sub_videos = video_tracks[1:]
-            main_idx = input_files_norm.index(normalize_win_path(main_video.file_path))
+            main_idx = input_files_norm.index(_norm_path(main_video.file_path))
     
             user_filters = build_video_filter_chain(main_video.enc_settings, include_subtitle=False, include_speed=False)
             main_filters = user_filters if user_filters != "null" else None
@@ -3366,6 +3387,7 @@ class FFmpegBatchGUI:
                 filter_parts.append(f"[{main_idx}:v]null[v_main_proc]")
                 current_v = "v_main_proc"
     
+            # 主视频画布偏移
             if getattr(main_video, 'pad_enabled', False) and main_video.pad_width and main_video.pad_height:
                 pw = main_video.pad_width.strip()
                 ph = main_video.pad_height.strip()
@@ -3375,19 +3397,38 @@ class FFmpegBatchGUI:
                 filter_parts.append(f"[canvas][{current_v}]overlay={ox}:{oy}:shortest=1[v_main_pad]")
                 current_v = "v_main_pad"
     
+            # 处理从视频（画中画）
             for i, sv in enumerate(sub_videos):
-                sv_idx = input_files_norm.index(normalize_win_path(sv.file_path))
+                sv_idx = input_files_norm.index(_norm_path(sv.file_path))
+                # 基础滤镜（缩放、裁剪等）
                 sv_filters = build_video_filter_chain(sv.enc_settings, include_subtitle=False, include_speed=False)
                 if sv_filters and sv_filters != "null":
-                    filter_parts.append(f"[{sv_idx}:v]{sv_filters}[v_sub_{i}]")
+                    filter_parts.append(f"[{sv_idx}:v]{sv_filters}[v_temp_{i}]")
+                    current_label = f"v_temp_{i}"
+                else:
+                    filter_parts.append(f"[{sv_idx}:v]null[v_temp_{i}]")
+                    current_label = f"v_temp_{i}"
+    
+                # 绿幕抠像（色度键）
+                if sv.enc_settings.get("chroma_enabled", False):
+                    color = sv.enc_settings.get("chroma_color", "green")
+                    if color.startswith("#"):
+                        color = "0x" + color[1:].upper()
+                    similarity = sv.enc_settings.get("chroma_similarity", 0.3)
+                    if similarity <= 0:
+                        similarity = 0.00001
+                    blend = sv.enc_settings.get("chroma_blend", 0.1)
+                    filter_parts.append(f"[{current_label}]chromakey={color}:{similarity}:{blend}[v_sub_{i}]")
                     sub_src = f"v_sub_{i}"
                 else:
-                    filter_parts.append(f"[{sv_idx}:v]null[v_sub_{i}]")
+                    filter_parts.append(f"[{current_label}]null[v_sub_{i}]")
                     sub_src = f"v_sub_{i}"
+    
+                # 叠加（如果启用）
                 if getattr(sv, 'overlay_enabled', True):
                     x = sv.overlay_x.strip() if sv.overlay_x else "0"
                     y = sv.overlay_y.strip() if sv.overlay_y else "0"
-                    filter_parts.append(f"[{current_v}][{sub_src}]overlay={x}:{y}[v_out_{i}]")
+                    filter_parts.append(f"[{current_v}][{sub_src}]overlay={x}:{y}:shortest=1[v_out_{i}]")
                     current_v = f"v_out_{i}"
                 else:
                     filter_parts.append(f"[{current_v}]null[{current_v}]")
@@ -3396,6 +3437,7 @@ class FFmpegBatchGUI:
             cmd_list.extend(["-filter_complex", complex_filter])
             cmd_list.extend(["-map", f"[{current_v}]"])
     
+            # 主视频编码参数
             v_settings = main_video.enc_settings
             vcodec = v_settings.get("encoder", "libx265")
             rc = v_settings.get("rate_control_type", "crf")
@@ -3415,9 +3457,10 @@ class FFmpegBatchGUI:
             if v_settings.get("pix_fmt_enabled", True):
                 cmd_list.extend(["-pix_fmt", v_settings.get("pix_fmt", "yuv420p")])
     
+            # 音频轨道映射
             audio_map_count = 0
             for audio in audio_tracks:
-                a_idx = input_files_norm.index(normalize_win_path(audio.file_path))
+                a_idx = input_files_norm.index(_norm_path(audio.file_path))
                 enc = audio.enc_settings.get("encoder", "copy")
                 cmd_list.extend(["-map", f"{a_idx}:a:0"])
                 if enc == "copy":
@@ -3436,10 +3479,11 @@ class FFmpegBatchGUI:
             else:
                 cmd_list.extend(["-disposition:a:0", "default"])
     
+            # 字幕轨道映射
             sub_map_count = 0
             first_sub_default = False
             for sub in subtitle_tracks:
-                s_idx = input_files_norm.index(normalize_win_path(sub.file_path))
+                s_idx = input_files_norm.index(_norm_path(sub.file_path))
                 enc = sub.enc_settings.get("encoder", "copy")
                 container = self.merge_container.get().lower()
                 if container == "mp4":
@@ -3452,24 +3496,23 @@ class FFmpegBatchGUI:
                         enc = "mov_text"
                         self._append_info_ui(f"[封装] 字幕编码 {enc} 不兼容 MP4，自动转换为 mov_text")
                 cmd_list.extend(["-map", f"{s_idx}:s:0", f"-c:s:{sub_map_count}", enc])
-                
-                # ---------- 新增：语言和标题 ----------
+    
                 lang = sub.enc_settings.get("language", "")
                 title = sub.enc_settings.get("title", "")
                 if lang:
                     cmd_list.extend([f"-metadata:s:s:{sub_map_count}", f"language={lang}"])
                 if title:
                     cmd_list.extend([f"-metadata:s:s:{sub_map_count}", f"title={title}"])
-                # ---------------------------------
-            
+    
                 if not first_sub_default:
                     cmd_list.extend([f"-disposition:s:{sub_map_count}", "default"])
                     first_sub_default = True
                 sub_map_count += 1
     
+        # ================= 非画中画模式 =================
         else:
             video_track = video_tracks[0]
-            v_idx = input_files_norm.index(normalize_win_path(video_track.file_path))
+            v_idx = input_files_norm.index(_norm_path(video_track.file_path))
             cmd_list.extend(["-map", f"{v_idx}:v:0"])
     
             v_settings = video_track.enc_settings
@@ -3505,9 +3548,10 @@ class FFmpegBatchGUI:
                 if v_settings.get("pix_fmt_enabled", True):
                     cmd_list.extend(["-pix_fmt", v_settings.get("pix_fmt", "yuv420p")])
     
+            # 音频轨道映射
             audio_map_count = 0
             for audio in audio_tracks:
-                a_idx = input_files_norm.index(normalize_win_path(audio.file_path))
+                a_idx = input_files_norm.index(_norm_path(audio.file_path))
                 enc = audio.enc_settings.get("encoder", "copy")
                 cmd_list.extend(["-map", f"{a_idx}:a:0"])
                 if enc == "copy":
@@ -3526,10 +3570,11 @@ class FFmpegBatchGUI:
             else:
                 cmd_list.extend(["-disposition:a:0", "default"])
     
+            # 字幕轨道映射
             sub_map_count = 0
             first_sub_default = False
             for sub in subtitle_tracks:
-                s_idx = input_files_norm.index(normalize_win_path(sub.file_path))
+                s_idx = input_files_norm.index(_norm_path(sub.file_path))
                 enc = sub.enc_settings.get("encoder", "copy")
                 container = self.merge_container.get().lower()
                 if container == "mp4":
@@ -3542,30 +3587,30 @@ class FFmpegBatchGUI:
                         enc = "mov_text"
                         self._append_info_ui(f"[封装] 字幕编码 {enc} 不兼容 MP4，自动转换为 mov_text")
                 cmd_list.extend(["-map", f"{s_idx}:s:0", f"-c:s:{sub_map_count}", enc])
-                
-                # ---------- 新增：语言和标题 ----------
+    
                 lang = sub.enc_settings.get("language", "")
                 title = sub.enc_settings.get("title", "")
                 if lang:
                     cmd_list.extend([f"-metadata:s:s:{sub_map_count}", f"language={lang}"])
                 if title:
                     cmd_list.extend([f"-metadata:s:s:{sub_map_count}", f"title={title}"])
-                # ---------------------------------
-            
+    
                 if not first_sub_default:
                     cmd_list.extend([f"-disposition:s:{sub_map_count}", "default"])
                     first_sub_default = True
                 sub_map_count += 1
     
+        # 章节处理
         if self.copy_chapters.get() and input_files_norm:
             cmd_list.extend(["-map_chapters", "0"])
         chapter_file = self.chapter_file.get().strip()
         if chapter_file and os.path.exists(chapter_file):
-            chapter_file_norm = normalize_win_path(chapter_file)
+            chapter_file_norm = _norm_path(chapter_file)
             cmd_list.insert(1, "-i")
             cmd_list.insert(2, chapter_file_norm)
             cmd_list.extend(["-map_chapters", "1"])
     
+        # 输出容器优化
         container = self.merge_container.get().lower()
         if container in ("mp4", "mov"):
             cmd_list.extend(["-movflags", "+faststart"])
@@ -3944,7 +3989,166 @@ class FFmpegBatchGUI:
                 vis_btn = ttk.Button(preset_frame, text="🎨 可视化编辑坐标",
                                      command=lambda: self.open_visual_overlay_editor(track_idx, ov_x_var, ov_y_var, filt_frame))
                 vis_btn.pack(side=tk.LEFT, padx=5, pady=2)
+
     
+            # ================= 新增：循环水印控制页面 =================
+            page_loop = ttk.Frame(notebook)
+            notebook.add(page_loop, text="循环水印控制")
+    
+            # 左右并排的主容器
+            main_row = ttk.Frame(page_loop)
+            main_row.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+    
+            # ========== 左侧：循环控制 ==========
+            left_frame = ttk.LabelFrame(main_row, text="循环播放", padding="5")
+            left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+    
+            loop_enabled_var = tk.BooleanVar(value=track.enc_settings.get("loop_enabled", False))
+            ttk.Checkbutton(left_frame, text="启用循环播放", variable=loop_enabled_var).pack(anchor=tk.W, pady=(0,5))
+    
+            # 循环模式选项垂直排列
+            ttk.Label(left_frame, text="循环模式:").pack(anchor=tk.W, pady=(5,0))
+            loop_mode_var = tk.StringVar(value=track.enc_settings.get("loop_mode", "infinite"))
+            ttk.Radiobutton(left_frame, text="无限循环", variable=loop_mode_var, value="infinite").pack(anchor=tk.W, padx=10)
+            
+            count_frame = ttk.Frame(left_frame)
+            count_frame.pack(anchor=tk.W, padx=10, pady=2)
+            ttk.Radiobutton(count_frame, text="指定次数", variable=loop_mode_var, value="count").pack(side=tk.LEFT)
+            loop_count_var = tk.IntVar(value=track.enc_settings.get("loop_count", 3))
+            count_spin = ttk.Spinbox(count_frame, from_=1, to=100, width=5, textvariable=loop_count_var, state="readonly")
+            count_spin.pack(side=tk.LEFT, padx=5)
+    
+            # ========== 右侧：绿幕抠像 ==========
+            right_frame = ttk.LabelFrame(main_row, text="绿幕抠像 (色度键)", padding="5")
+            right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
+    
+            chroma_enabled_var = tk.BooleanVar(value=track.enc_settings.get("chroma_enabled", False))
+    
+            def toggle_chroma():
+                state = tk.NORMAL if chroma_enabled_var.get() else tk.DISABLED
+                for w in (color_combo, sim_slider, blend_slider):
+                    w.config(state=state)
+    
+            ttk.Checkbutton(right_frame, text="启用绿幕抠像", variable=chroma_enabled_var,
+                            command=toggle_chroma).pack(anchor=tk.W)
+    
+            # 颜色选择
+            # 颜色选择（带吸管按钮）
+            color_row = ttk.Frame(right_frame)
+            color_row.pack(fill=tk.X, pady=2)
+            ttk.Label(color_row, text="抠除颜色:").pack(side=tk.LEFT)
+            chroma_color_var = tk.StringVar(value=track.enc_settings.get("chroma_color", "green"))
+            color_combo = ttk.Combobox(color_row, textvariable=chroma_color_var,
+                                       values=["green", "blue", "black", "white"], state="readonly", width=10)
+            color_combo.pack(side=tk.LEFT, padx=5)
+
+            # 色块：显示当前颜色的小矩形
+            color_swatch = tk.Label(color_row, width=4, height=1, relief=tk.SUNKEN, bg=chroma_color_var.get())
+            color_swatch.pack(side=tk.LEFT, padx=5)
+    
+            # 更新色块的函数
+            def update_swatch(*args):
+                color_swatch.config(bg=chroma_color_var.get())
+            chroma_color_var.trace_add("write", update_swatch)
+
+            # 自定义颜色选择窗口（带吸管）
+            def pick_color_with_eyedropper():
+                import ctypes
+                import ctypes.wintypes
+
+                # 获取屏幕某点的原始颜色 (Windows API)
+                def get_pixel_color(x, y):
+                    hdc = ctypes.windll.user32.GetDC(0)
+                    pixel = ctypes.windll.gdi32.GetPixel(hdc, x, y)
+                    ctypes.windll.user32.ReleaseDC(0, hdc)
+                    r = pixel & 0xFF
+                    g = (pixel >> 8) & 0xFF
+                    b = (pixel >> 16) & 0xFF
+                    return f"#{r:02x}{g:02x}{b:02x}"
+
+                # 创建半透明全屏遮罩
+                mask = tk.Toplevel(win)
+                mask.attributes('-fullscreen', True)
+                mask.attributes('-alpha', 0.3)          # 半透明，可以看到背后画面
+                mask.configure(bg='black', cursor='crosshair')
+                mask.attributes('-topmost', True)
+
+                # 提示标签
+                tip = tk.Label(mask, text="点击屏幕任意位置取色 (ESC 取消)", 
+                               font=("Microsoft YaHei", 16, "bold"),
+                               fg="white", bg="black", padx=20, pady=10)
+                tip.pack(expand=True)
+
+                def on_click(event):
+                    # 先隐藏遮罩，以便获取底层真实颜色
+                    mask.withdraw()
+                    mask.update_idletasks()   # 确保窗口立即隐藏
+                    # 获取鼠标位置的颜色（此时遮罩已隐藏，读取的是原始屏幕）
+                    hex_color = get_pixel_color(event.x_root, event.y_root)
+                    mask.destroy()            # 关闭遮罩
+                    chroma_color_var.set(hex_color)
+
+                def on_escape(event):
+                    mask.destroy()
+
+                mask.bind("<Button-1>", on_click)
+                mask.bind("<Escape>", on_escape)
+
+                # 等待遮罩窗口关闭
+                win.wait_window(mask)
+    
+            ttk.Button(color_row, text="🔍吸取颜色", command=pick_color_with_eyedropper).pack(side=tk.LEFT, padx=5)
+
+            # 标准色盘按钮（原来的色盘选择）
+            def pick_standard_color():
+                from tkinter import colorchooser
+                color_code = colorchooser.askcolor(title="选择抠像颜色", parent=win, initialcolor=chroma_color_var.get())[1]
+                if color_code:
+                    chroma_color_var.set(color_code)
+    
+            ttk.Button(color_row, text="标准色盘", command=pick_standard_color).pack(side=tk.LEFT, padx=5)
+
+
+            # 相似度滑块
+            sim_frame = ttk.Frame(right_frame)
+            sim_frame.pack(fill=tk.X, pady=2)
+            sim_label = ttk.Label(sim_frame, text="相似度 (0~1，越小越严格):")
+            sim_label.pack(side=tk.LEFT)
+            # 添加ToolTip
+            ToolTip(sim_label,
+                    "【绿幕/蓝幕】推荐 0.3 左右，可适当调整。\n"
+                    "【黑色背景】即使相似度设为极小值(0.0001)也很难完美抠除，\n"
+                    "因为黑色区域通常包含阴影、渐变，会导致边缘残留或误抠。\n"
+                    "【建议】纯色背景抠图最好使用带透明通道的 PNG 图片，\n"
+                    "或者先用图像处理软件将背景彻底擦除。",
+                    wraplength=400)
+            init_sim = track.enc_settings.get("chroma_similarity", 0.3)
+            if init_sim <= 0:
+                init_sim = 0.3
+            chroma_similarity_var = tk.DoubleVar(value=init_sim)
+            sim_slider = ttk.Scale(sim_frame, from_=0.0, to=1.0, variable=chroma_similarity_var,
+                                   orient=tk.HORIZONTAL, length=150)
+            sim_slider.pack(side=tk.LEFT, padx=5)
+            sim_value_label = ttk.Label(sim_frame, text=f"{chroma_similarity_var.get():.4f}")
+            sim_value_label.pack(side=tk.LEFT)
+            sim_slider.configure(command=lambda v: sim_value_label.config(text=f"{float(v):.4f}"))
+    
+            # 混合度滑块
+            blend_frame = ttk.Frame(right_frame)
+            blend_frame.pack(fill=tk.X, pady=2)
+            ttk.Label(blend_frame, text="混合度/平滑 (0~1):").pack(side=tk.LEFT)
+            chroma_blend_var = tk.DoubleVar(value=track.enc_settings.get("chroma_blend", 0.1))
+            blend_slider = ttk.Scale(blend_frame, from_=0.0, to=1.0, variable=chroma_blend_var,
+                                     orient=tk.HORIZONTAL, length=150)
+            blend_slider.pack(side=tk.LEFT, padx=5)
+            blend_label = ttk.Label(blend_frame, text=f"{chroma_blend_var.get():.2f}")
+            blend_label.pack(side=tk.LEFT)
+            blend_slider.configure(command=lambda v: blend_label.config(text=f"{float(v):.2f}"))
+    
+            # 初始化控件状态
+            toggle_chroma()
+
+
         def save():
             new_settings = {}
             new_settings.update(enc_frame.get_settings())
@@ -3962,6 +4166,19 @@ class FFmpegBatchGUI:
                     track.overlay_enabled = ov_enabled_var.get()
                     track.overlay_x = ov_x_var.get().strip()
                     track.overlay_y = ov_y_var.get().strip()
+
+            # 保存循环和绿幕设置
+            track.enc_settings["loop_enabled"] = loop_enabled_var.get()
+            track.enc_settings["loop_mode"] = loop_mode_var.get()
+            track.enc_settings["loop_count"] = loop_count_var.get()
+            track.enc_settings["chroma_enabled"] = chroma_enabled_var.get()
+            track.enc_settings["chroma_color"] = chroma_color_var.get()
+            similarity = chroma_similarity_var.get()
+            if similarity < 1e-5:   # 避免值为0导致chromakey出错
+                similarity = 1e-5
+            track.enc_settings["chroma_similarity"] = similarity
+            track.enc_settings["chroma_blend"] = chroma_blend_var.get()
+
             self.merge_update_track_list()
             self.merge_update_command_preview()
             win.destroy()
