@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+#微调 色度键默认的绿/蓝色
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 import subprocess
@@ -4187,9 +4189,9 @@ class FFmpegBatchGUI:
             color_row = ttk.Frame(right_frame)
             color_row.pack(fill=tk.X, pady=2)
             ttk.Label(color_row, text="抠除颜色:").pack(side=tk.LEFT)
-            chroma_color_var = tk.StringVar(value=track.enc_settings.get("chroma_color", "green"))
+            chroma_color_var = tk.StringVar(value=track.enc_settings.get("chroma_color", "#3fff08"))
             color_combo = ttk.Combobox(color_row, textvariable=chroma_color_var,
-                                       values=["green", "blue", "black", "white"], state="readonly", width=10)
+                                       values=["#3fff08", "#00CFFD", "black", "white"], state="readonly", width=10)
             color_combo.pack(side=tk.LEFT, padx=5)
             color_swatch = tk.Label(color_row, width=4, height=1, relief=tk.SUNKEN, bg=chroma_color_var.get())
             color_swatch.pack(side=tk.LEFT, padx=5)
@@ -4200,7 +4202,6 @@ class FFmpegBatchGUI:
             def pick_color_with_eyedropper():
                 import ctypes
                 import ctypes.wintypes
-            
                 def get_pixel_color(x, y):
                     hdc = ctypes.windll.user32.GetDC(0)
                     pixel = ctypes.windll.gdi32.GetPixel(hdc, x, y)
@@ -4209,35 +4210,28 @@ class FFmpegBatchGUI:
                     g = (pixel >> 8) & 0xFF
                     b = (pixel >> 16) & 0xFF
                     return f"#{r:02x}{g:02x}{b:02x}"
-            
                 # 创建半透明全屏遮罩
                 mask = tk.Toplevel(win)
                 mask.attributes('-fullscreen', True)
                 mask.attributes('-alpha', 0.3)
                 mask.configure(bg='black', cursor='crosshair')
                 mask.attributes('-topmost', True)
-            
                 tip = tk.Label(mask, text="点击屏幕任意位置取色 (ESC 取消)", 
                                font=("Microsoft YaHei", 16, "bold"),
                                fg="white", bg="black", padx=20, pady=10)
                 tip.pack(expand=True)
-            
                 def on_click(event):
                     mask.withdraw()
                     mask.update_idletasks()
                     hex_color = get_pixel_color(event.x_root, event.y_root)
                     mask.destroy()
                     chroma_color_var.set(hex_color)
-            
                 def on_escape(event):
                     mask.destroy()
-            
                 mask.bind("<Button-1>", on_click)
                 mask.bind("<Escape>", on_escape)
                 win.wait_window(mask)
-            
             ttk.Button(color_row, text="🔍吸取颜色", command=pick_color_with_eyedropper).pack(side=tk.LEFT, padx=5)
-            
             # 标准色盘
             def pick_standard_color():
                 from tkinter import colorchooser
@@ -4245,13 +4239,22 @@ class FFmpegBatchGUI:
                 if color_code:
                     chroma_color_var.set(color_code)
             ttk.Button(color_row, text="标准色盘", command=pick_standard_color).pack(side=tk.LEFT, padx=5)
-        
-            # 相似度滑块
 
+
+            # 相似度滑块
             sim_frame = ttk.Frame(right_frame)
             sim_frame.pack(fill=tk.X, pady=2)
-            sim_label = ttk.Label(sim_frame, text="相似度 (0~1，越小越严格):")
+            sim_label = ttk.Label(sim_frame, text="相似度 (0~1):")
             sim_label.pack(side=tk.LEFT)
+            # 添加ToolTip
+            ToolTip(sim_label,
+                    "【绿幕/蓝幕】推荐 0.3 左右，可适当调整。\n"
+                    "如果觉得转换后的对象发虚透明，降低相似度重试。\n\n"
+                    "【黑色背景】即使相似度设为极小值(0.0001)也很难完美抠除，\n"
+                    "因为黑色区域通常包含阴影、渐变，会导致边缘残留或误抠。\n"
+                    "【建议】纯色背景抠图最好使用带透明通道的 PNG 图片，\n\n"
+                    "或者先用图像处理软件将背景彻底擦除。",
+                    wraplength=400)
             init_sim = track.enc_settings.get("chroma_similarity", 0.3)
             if init_sim <= 0:
                 init_sim = 0.3
@@ -4259,19 +4262,51 @@ class FFmpegBatchGUI:
             sim_slider = ttk.Scale(sim_frame, from_=0.0, to=1.0, variable=chroma_similarity_var,
                                    orient=tk.HORIZONTAL, length=150)
             sim_slider.pack(side=tk.LEFT, padx=5)
-            sim_value_label = ttk.Label(sim_frame, text=f"{chroma_similarity_var.get():.4f}")
-            sim_value_label.pack(side=tk.LEFT)
-            sim_slider.configure(command=lambda v: sim_value_label.config(text=f"{float(v):.4f}"))
+            # 可编辑输入框
+            sim_entry_var = tk.StringVar(value=f"{init_sim:.4f}")
+            sim_entry = ttk.Entry(sim_frame, textvariable=sim_entry_var, width=8)
+            sim_entry.pack(side=tk.LEFT, padx=5)
+            # 双向同步：滑块 -> 输入框
+            def sim_slider_changed(val):
+                sim_entry_var.set(f"{float(val):.4f}")
+            sim_slider.configure(command=sim_slider_changed)
+            # 输入框 -> 滑块（带验证）
+            def sim_entry_changed(*args):
+                try:
+                    val = float(sim_entry_var.get())
+                    if 0.0 <= val <= 1.0:
+                        chroma_similarity_var.set(val)
+                    else:
+                        raise ValueError
+                except ValueError:
+                    # 恢复滑块值
+                    sim_entry_var.set(f"{chroma_similarity_var.get():.4f}")
+            sim_entry_var.trace_add("write", sim_entry_changed)
+            # 混合度控制行（滑块 + 可编辑输入框）
             blend_frame = ttk.Frame(right_frame)
             blend_frame.pack(fill=tk.X, pady=2)
             ttk.Label(blend_frame, text="混合度/平滑 (0~1):").pack(side=tk.LEFT)
-            chroma_blend_var = tk.DoubleVar(value=track.enc_settings.get("chroma_blend", 0.1))
+            init_blend = track.enc_settings.get("chroma_blend", 0.1)
+            chroma_blend_var = tk.DoubleVar(value=init_blend)
             blend_slider = ttk.Scale(blend_frame, from_=0.0, to=1.0, variable=chroma_blend_var,
                                      orient=tk.HORIZONTAL, length=150)
             blend_slider.pack(side=tk.LEFT, padx=5)
-            blend_label = ttk.Label(blend_frame, text=f"{chroma_blend_var.get():.2f}")
-            blend_label.pack(side=tk.LEFT)
-            blend_slider.configure(command=lambda v: blend_label.config(text=f"{float(v):.2f}"))
+            blend_entry_var = tk.StringVar(value=f"{init_blend:.2f}")
+            blend_entry = ttk.Entry(blend_frame, textvariable=blend_entry_var, width=8)
+            blend_entry.pack(side=tk.LEFT, padx=5)
+            def blend_slider_changed(val):
+                blend_entry_var.set(f"{float(val):.2f}")
+            blend_slider.configure(command=blend_slider_changed)
+            def blend_entry_changed(*args):
+                try:
+                    val = float(blend_entry_var.get())
+                    if 0.0 <= val <= 1.0:
+                        chroma_blend_var.set(val)
+                    else:
+                        raise ValueError
+                except ValueError:
+                    blend_entry_var.set(f"{chroma_blend_var.get():.2f}")
+            blend_entry_var.trace_add("write", blend_entry_changed)
             # 页面5：叠加/偏移
             page_overlay = ttk.Frame(notebook)
             notebook.add(page_overlay, text="叠加/偏移")
@@ -4439,7 +4474,6 @@ class FFmpegBatchGUI:
                     messagebox.showerror("保存错误", f"保存设置时发生错误：\n{e}\n请检查参数是否有效。")
             ttk.Button(win, text="保存", command=save).pack(pady=10)
             win.wait_window()
-
     def merge_edit_audio_track(self, track_idx):
         track = self.merge_tracks[track_idx]
         with self.SafeToplevel(self.root) as win:
