@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-
-#一直以来都只考虑到了合并页面的水印(画中画),某一天忽然想到转换页面才是水印(批量)的主要应用方向,所以尽可能的给转换页集成上水印功能,
-#然后把大部分通用功能都抽成公共函数复用了,不过水印、主、从、裁剪这4个的可视化编辑框想合并暂时失败了, 有了一个水印、主、从这3个编辑框复用的版本,但是效果没达到预期(以前100%的详细效果,现在只有85%),代码量也没减少多少,所以暂时放弃
-#下一步想改进的点是,水印自适应大小,比如是在1080p上测试和设置的水印大小和位置模板,要对2k4k的自动适应调整大小和位置,不然就会显得太小
-
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 import subprocess
@@ -2229,7 +2224,23 @@ class AdvancedFrame(ttk.LabelFrame):
                 self._auto_detect_watermark_duration()
                 self._trigger_update()
         ttk.Button(wm_frame, text="浏览", command=browse_wm).pack(side=tk.LEFT, padx=2)
-        
+
+        self.adaptive_var = tk.BooleanVar(value=False)
+        chk_adaptive = ttk.Checkbutton(
+            wm_frame,
+            text="自适应",
+            variable=self.adaptive_var
+        )
+        chk_adaptive.pack(side=tk.LEFT, padx=5)
+        ToolTip(
+            chk_adaptive,
+            "勾选后，水印的大小和位置会根据当前模板里*水印和载入视频*的比例为基准。\n\n"
+	    "自动在新添加视频命令里缩放大小和调整边距。\n\n"
+            "取消勾选则保持原始像素值，不进行任何缩放。",
+            wraplength=600
+        )
+
+
         # 水印设置按钮（移到同一行）
         self.watermark_btn = ttk.Button(wm_frame, text="水印叠加设置 (图片/视频)", command=self.open_watermark_editor)
         self.watermark_btn.pack(side=tk.LEFT, padx=5)
@@ -2241,8 +2252,11 @@ class AdvancedFrame(ttk.LabelFrame):
         
         # 绑定路径变化更新
         self.wm_path_var.trace_add("write", lambda *a: self._on_wm_path_changed())
-        
-        # 注意：原 btn_frame 已被移除，所有控件都在 wm_frame 中
+
+    # 在 create_widgets 末尾加入：
+        def update_adaptive(*args):
+            self.app.watermark_settings["adaptive"] = self.adaptive_var.get()
+        self.adaptive_var.trace_add("write", update_adaptive)
 
     def _on_wm_path_changed(self):
         path = self.wm_path_var.get().strip()
@@ -2307,9 +2321,15 @@ class AdvancedFrame(ttk.LabelFrame):
         new_settings["enabled"] = True
         self.app.watermark_settings.update(new_settings)
         self.wm_path_var.set(self.app.watermark_settings.get("file_path", ""))
+
+        # 保留旧的 adaptive 设置，防止编辑器覆盖
+        old_adaptive = self.app.watermark_settings.get("adaptive", True)
+        new_settings["adaptive"] = old_adaptive
+        self.app.watermark_settings.update(new_settings)
         self._auto_detect_watermark_duration()
         self._trigger_update()
         self.app.update_command_preview()
+
 
     def get_settings(self):
         return {
@@ -2322,6 +2342,7 @@ class AdvancedFrame(ttk.LabelFrame):
         self.hwaccel_enabled.set(settings.get("hwaccel_enabled", False))
         self.hwaccel_decoder.set(settings.get("hwaccel_decoder", "无"))
         self.custom_args.set(settings.get("custom_args", ""))
+        self.adaptive_var.set(settings.get("adaptive", True))
         self._on_hw_toggle()
 
 
@@ -2552,6 +2573,7 @@ class FFmpegBatchGUI:
             "offset_y": "0",
             "alpha_enabled": False,
             "alpha_value": 1.0,
+            "adaptive": False,
         }
         # ---------------------------------
 
@@ -2681,6 +2703,68 @@ class FFmpegBatchGUI:
             cmd_list.extend(["-af", ",".join(audio_filters)])
     
         return cmd_list
+
+    def _adapt_sub_settings(self, sub_settings, current_w, current_h):
+        """
+        根据当前视频尺寸，从基准尺寸缩放位置和大小。
+        返回新的设置字典（含 base_width/height 和缩放后的像素值）。
+        基准尺寸从 sub_settings 中读取，若不存在则用当前尺寸初始化。
+        """
+        if not sub_settings:
+            return {}
+        import copy
+        new_settings = copy.deepcopy(sub_settings)
+    
+        # 获取基准尺寸
+        base_w = new_settings.get("base_width")
+        base_h = new_settings.get("base_height")
+        if base_w is None or base_h is None:
+            # 首次设置，用当前尺寸作为基准
+            base_w = current_w
+            base_h = current_h
+            new_settings["base_width"] = base_w
+            new_settings["base_height"] = base_h
+            # 基准就是当前尺寸，缩放比例为1，所以无需改变数值
+            # 但为了统一，仍然保留原有数值（可能都是数字）
+            return new_settings
+    
+        # 计算缩放比例
+        scale_w = current_w / base_w
+        scale_h = current_h / base_h
+    
+        # 处理位置坐标（必须是纯数字）
+        for field in ['overlay_x', 'overlay_y']:
+            val = new_settings.get(field, '').strip()
+            if val:
+                try:
+                    num = float(val)
+                    if field == 'overlay_x':
+                        new_val = int(round(num * scale_w))
+                    else:
+                        new_val = int(round(num * scale_h))
+                    new_settings[field] = str(new_val)
+                except ValueError:
+                    # 非纯数字（如表达式）保持不变，但建议只使用数字
+                    pass
+    
+        # 处理缩放尺寸（scale_width / scale_height）
+        for field in ['scale_width', 'scale_height']:
+            val = new_settings.get(field, '').strip()
+            if val:
+                try:
+                    num = float(val)
+                    if field == 'scale_width':
+                        new_val = int(round(num * scale_w))
+                    else:
+                        new_val = int(round(num * scale_h))
+                    new_settings[field] = str(new_val)
+                except ValueError:
+                    # 非纯数字（如 "iw/2"）保持不变，建议用户使用数字
+                    pass
+    
+        return new_settings
+
+
 
     def _build_overlay_filter_complex(self, main_idx: int, main_settings: dict,
                                        sub_infos: List[Tuple[int, str, dict]],
@@ -2987,16 +3071,27 @@ class FFmpegBatchGUI:
 
 
     def _generate_command_with_watermark(self, input_path: str, output_path: str, settings: dict, wm_settings: dict) -> List[str]:
+        main_w, main_h = get_video_dimensions(self.ffprobe_cmd, input_path)
+        if main_w is not None and main_h is not None:
+            if wm_settings.get("adaptive", True):   # ← 新增判断
+                adapted_wm = self._adapt_sub_settings(wm_settings, main_w, main_h)
+            else:
+                adapted_wm = wm_settings.copy()      # 不自动缩放，但复制一份避免污染原数据
+        else:
+            adapted_wm = copy.deepcopy(wm_settings)
+
+    
+        # ---- 2. 开始构建命令 ----
         cmd_list = [self.ffmpeg_cmd, "-y"]
     
-        wm_file = wm_settings.get("file_path", "").strip()
+        wm_file = adapted_wm.get("file_path", "").strip()
         ext = os.path.splitext(wm_file)[1].lower()
         is_image = ext in ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
-        wm_duration = wm_settings.get("duration", None)
-        loop_mode = wm_settings.get("loop_mode", "infinite")
-        loop_count = wm_settings.get("loop_count", 3)
+        wm_duration = adapted_wm.get("duration", None)
+        loop_mode = adapted_wm.get("loop_mode", "infinite")
+        loop_count = adapted_wm.get("loop_count", 3)
     
-        loop_enabled = wm_settings.get("loop_enabled", False)
+        loop_enabled = adapted_wm.get("loop_enabled", False)
         use_infinite_loop = loop_enabled and (not is_image) and loop_mode == "infinite"
     
         if use_infinite_loop:
@@ -3008,51 +3103,42 @@ class FFmpegBatchGUI:
             cmd_list.append("+genpts")
     
         self._add_trim_params(cmd_list, settings)
-    
         self._add_hwaccel_params(cmd_list, settings)
     
         cmd_list.extend(["-i", input_path])
-
-        # ---- 区分图片和视频 ----
+    
+        # ---- 3. 添加水印输入（图片或视频） ----
         if not is_image:
             self._add_infinite_loop_params(cmd_list, wm_file)
             cmd_list.extend(["-i", wm_file])
         else:
-            # 图片：设置循环和帧率
             fps = settings.get("frame_rate_custom", "30") if settings.get("frame_rate_type") == "custom" else "30"
             self._add_infinite_loop_params(cmd_list, wm_file, framerate=fps)
             cmd_list.extend(["-i", wm_file])
     
         if use_infinite_loop:
             cmd_list.append("-shortest")
-
-        # ---- 使用通用函数构建滤镜 ----
-        # 主视频设置中若有字幕，在调用时传入 include_subtitle_main=True
-        sub_infos = [(1, wm_file, wm_settings)]  # 水印作为子视频，输入索引为1
+    
+        # ---- 4. 构建叠加滤镜（使用自适应后的设置） ----
+        sub_infos = [(1, wm_file, adapted_wm)]  # 水印作为子视频，输入索引为1
         complex_filter, final_v_label = self._build_overlay_filter_complex(
             0, settings, sub_infos, include_subtitle_main=True
         )
         cmd_list.extend(["-filter_complex", complex_filter])
         cmd_list.extend(["-map", final_v_label])
-
-
-
-        # 视频编码参数（使用公共函数）
-        cmd_list = self._build_video_encoding_params(cmd_list, settings)
     
-        # 添加 -vsync cfr
+        # ---- 5. 视频编码参数 ----
+        cmd_list = self._build_video_encoding_params(cmd_list, settings)
         cmd_list.extend(["-vsync", "cfr"])
     
-        # 音频处理（使用公共函数）
+        # ---- 6. 音频处理 ----
         if settings.get("audio_enabled", True):
-            # 映射主视频的第一个音频流（通常索引为 0）
             cmd_list.extend(["-map", "0:a:0"])
-            # 调用公共函数添加编码参数（比特率、采样率、滤镜等）
             cmd_list = self._build_audio_encoding_params(cmd_list, settings)
         else:
             cmd_list.append("-an")
     
-        # 自定义参数
+        # ---- 7. 自定义参数与容器优化 ----
         custom = settings.get("custom_args", "").strip()
         if custom:
             try:
@@ -3066,6 +3152,7 @@ class FFmpegBatchGUI:
     
         cmd_list.append(output_path)
         return cmd_list
+
 
     # ---------- 修改 get_current_settings 包含水印 ----------
     def get_current_settings(self):
@@ -3082,6 +3169,13 @@ class FFmpegBatchGUI:
         settings["pip_enabled"] = self.pip_enabled.get()
         # 添加水印设置（深拷贝）
         settings["watermark"] = copy.deepcopy(self.watermark_settings)
+        # 记录当前输入文件的尺寸作为水印基准
+        input_file = self.input_file.get().strip()
+        if input_file and os.path.exists(input_file):
+            w, h = get_video_dimensions(self.ffprobe_cmd, input_file)
+            if w is not None and h is not None:
+                settings["watermark"]["base_width"] = w
+                settings["watermark"]["base_height"] = h
         return settings
 
     # ---------- 修改 load_settings_into_ui 恢复水印 ----------
@@ -3521,12 +3615,36 @@ class FFmpegBatchGUI:
             canvas.bind("<ButtonRelease-1>", on_release)
     
             def apply():
-                x_var.set(str(int(cur_x)))
-                y_var.set(str(int(cur_y)))
-                vis_win.destroy()
-                # 关闭后恢复父窗口焦点
-                parent.lift()
-                parent.focus_force()
+                try:
+                    # 获取矩形在画布上的像素坐标
+                    coords = canvas.coords(rect_id)
+                    if not coords or len(coords) < 4:
+                        # 如果矩形不存在，使用居中位置
+                        final_x = (canvas_w - wm_w) // 2
+                        final_y = (canvas_h - wm_h) // 2
+                    else:
+                        # 像素坐标转真实坐标
+                        real_x = coords[0] / scale
+                        real_y = coords[1] / scale
+                        final_x = int(round(real_x))
+                        final_y = int(round(real_y))
+            
+                    # 回填到界面变量
+                    x_var.set(str(final_x))
+                    y_var.set(str(final_y))
+            
+                    # 保存基准（仅在首次设置）
+                    if "base_width" not in self.watermark_settings:
+                        self.watermark_settings["base_width"] = canvas_w
+                        self.watermark_settings["base_height"] = canvas_h
+                except Exception as e:
+                    self._append_info_ui(f"[可视化] 应用坐标时出错: {e}")
+                finally:
+                    # 确保窗口关闭
+                    if vis_win and vis_win.winfo_exists():
+                        vis_win.destroy()
+                    parent.lift()
+                    parent.focus_force()
     
             def cancel():
                 vis_win.destroy()
@@ -4008,10 +4126,10 @@ class FFmpegBatchGUI:
 
     # ---------- 任务管理 ----------
     def is_duplicate_task(self, input_path, output_path):
-        norm_in = normalize_path(input_path)
+        """检查输出路径是否已被已有任务占用（无论输入是否相同）"""
         norm_out = normalize_path(output_path)
         for task in self.tasks:
-            if normalize_path(task.input) == norm_in and normalize_path(task.output) == norm_out:
+            if normalize_path(task.output) == norm_out:
                 return True
         return False
 
@@ -4029,8 +4147,26 @@ class FFmpegBatchGUI:
             messagebox.showerror("错误", err_msg)
             return False
         
+        # ---- 新增：自定义名称重复时自动编号 ----
+        custom_name = settings.get("custom_output_name", "").strip()
+        if custom_name:
+            base, ext = os.path.splitext(output_path)
+            counter = 1
+            while self.is_duplicate_task(input_path, output_path) and counter <= 100:
+                new_output = f"{base}_{counter}{ext}"
+                if not self.is_duplicate_task(input_path, new_output):
+                    output_path = new_output
+                    break
+                counter += 1
+            if counter > 100:
+                self._append_info_ui(f"警告：尝试生成唯一输出路径超过100次，保留原路径: {output_path}")
+        # 最终重复检查（若仍重复则放弃添加）
         if self.is_duplicate_task(input_path, output_path):
-            messagebox.showwarning("重复任务", f"任务已存在:\n输入: {input_path}\n输出: {output_path}")
+            messagebox.showwarning("重复任务",
+                                   f"任务已存在且无法自动生成唯一输出名:\n"
+                                   f"输入: {input_path}\n"
+                                   f"输出: {output_path}\n"
+                                   "请检查自定义名称或手动修改。")
             return False
         
         try:
@@ -4492,6 +4628,8 @@ class FFmpegBatchGUI:
             win.wait_window()
 
     def _on_task_watermark_saved(self, task, new_wm):
+        old_adaptive = task.settings.get("watermark", {}).get("adaptive", True)
+        new_wm["adaptive"] = old_adaptive
         task.settings["watermark"] = new_wm
         self.update_task_list()
         self._append_info_ui("任务水印已更新")
@@ -4854,6 +4992,7 @@ class FFmpegBatchGUI:
             return []
         
         # ---- 画中画模式（使用 filter_complex） ----
+
         if self.pip_enabled.get():
             main_video = video_tracks[0]
             sub_videos = video_tracks[1:]
@@ -4864,7 +5003,9 @@ class FFmpegBatchGUI:
             for sv in sub_videos:
                 sv_idx = input_files_norm.index(normalize_path(sv.file_path))
                 sub_infos.append((sv_idx, sv.file_path, sv.enc_settings))
-    
+
+
+
             # 构建 filter_complex（主视频字幕由主设置决定，可在调用时指定）
             # 这里主视频设置的字幕可能来自外部，但 merge 中未直接支持字幕，故我们设为 False
             complex_filter, final_v_label = self._build_overlay_filter_complex(
