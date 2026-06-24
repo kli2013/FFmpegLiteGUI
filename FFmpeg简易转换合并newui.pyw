@@ -2172,10 +2172,16 @@ class OverlayPositionFrame(ttk.LabelFrame):
 
 # ================== 高级选项组件 ==================
 class AdvancedFrame(ttk.LabelFrame):
-    def __init__(self, parent, update_callback=None, app=None, **kwargs):
+    def __init__(self, parent, update_callback=None, app=None, show_adaptive=True, watermark_dict=None, **kwargs):
         super().__init__(parent, text="高级选项 (硬件解码/自定义参数)", padding="5", **kwargs)
         self.update_callback = update_callback
         self.app = app
+        self.show_adaptive = show_adaptive
+        # 设置水印字典：若传入则使用，否则使用 app 的全局设置
+        if watermark_dict is not None:
+            self.watermark_dict = watermark_dict
+        else:
+            self.watermark_dict = self.app.watermark_settings
         self.create_widgets()
 
     def create_widgets(self):
@@ -2206,12 +2212,13 @@ class AdvancedFrame(ttk.LabelFrame):
         self.custom_args.trace_add("write", lambda *a: self._trigger_update())
 
         # ---- 水印文件选择与设置 ----
+        # ---- 水印文件选择与设置 ----
         wm_frame = ttk.Frame(self)
         wm_frame.pack(fill=tk.X, pady=2)
         
-        ttk.Label(wm_frame, text="水印文件:").pack(side=tk.LEFT, padx=(0,5))
+        ttk.Label(wm_frame, text="水印文件 (图片/视频):").pack(side=tk.LEFT, padx=(0,5))
         
-        self.wm_path_var = tk.StringVar(value=self.app.watermark_settings.get("file_path", ""))
+        self.wm_path_var = tk.StringVar(value=self.watermark_dict.get("file_path", ""))
         wm_entry = ttk.Entry(wm_frame, textvariable=self.wm_path_var, width=40)
         wm_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         
@@ -2219,30 +2226,39 @@ class AdvancedFrame(ttk.LabelFrame):
             path = filedialog.askopenfilename(title="选择水印文件", filetypes=[("媒体", "*.png *.jpg *.jpeg *.bmp *.gif *.webp *.mp4 *.mkv *.avi *.mov")])
             if path:
                 self.wm_path_var.set(normalize_path(path))
-                self.app.watermark_settings["file_path"] = normalize_path(path)
-                self.app.watermark_settings["enabled"] = True
+                self.watermark_dict["file_path"] = normalize_path(path)
+                self.watermark_dict["enabled"] = True
                 self._auto_detect_watermark_duration()
-                self._trigger_update()
-        ttk.Button(wm_frame, text="浏览", command=browse_wm).pack(side=tk.LEFT, padx=2)
+                if self.update_callback:
+                    self.update_callback()
 
-        self.adaptive_var = tk.BooleanVar(value=False)
-        chk_adaptive = ttk.Checkbutton(
-            wm_frame,
-            text="自适应",
-            variable=self.adaptive_var
-        )
+        ttk.Button(wm_frame, text="浏览", command=browse_wm, width=6).pack(side=tk.LEFT, padx=2)
+
+        def clear_wm():
+            self.wm_path_var.set("")
+        ttk.Button(wm_frame, text="清除", command=self.clear_wm, width=6).pack(side=tk.LEFT, padx=2)
+        
+
+        self.adaptive_var = tk.BooleanVar(value=self.watermark_dict.get("adaptive", False))
+        chk_adaptive = ttk.Checkbutton(wm_frame, text="自适应", variable=self.adaptive_var)
         chk_adaptive.pack(side=tk.LEFT, padx=5)
         ToolTip(
             chk_adaptive,
             "勾选后，水印的大小和位置会根据当前模板里*水印和载入视频*的比例为基准。\n\n"
 	    "自动在新添加视频命令里缩放大小和调整边距。\n\n"
-            "取消勾选则保持原始像素值，不进行任何缩放。",
+            "取消勾选则保持原始像素值，不进行任何缩放。\n\n"
+            "**单个任务编辑框里勾选取消是更改当前任务(主界面要有基准)**",
             wraplength=600
         )
-
-
-        # 水印设置按钮（移到同一行）
-        self.watermark_btn = ttk.Button(wm_frame, text="水印叠加设置 (图片/视频)", command=self.open_watermark_editor)
+            
+        def update_adaptive(*args):
+            self.watermark_dict["adaptive"] = self.adaptive_var.get()
+            if self.update_callback:
+                self.update_callback()
+        self.adaptive_var.trace_add("write", update_adaptive)
+        
+        # ---- 水印设置按钮 ----
+        self.watermark_btn = ttk.Button(wm_frame, text="水印叠加设置", command=self.open_watermark_editor)
         self.watermark_btn.pack(side=tk.LEFT, padx=5)
         ToolTip(self.watermark_btn, "打开独立窗口配置水印（支持缩放、裁剪、绿幕、位置调整等）。\n注意：水印会应用在主视频之上，且会忽略水印自身的音频。")
         
@@ -2253,35 +2269,35 @@ class AdvancedFrame(ttk.LabelFrame):
         # 绑定路径变化更新
         self.wm_path_var.trace_add("write", lambda *a: self._on_wm_path_changed())
 
-    # 在 create_widgets 末尾加入：
-        def update_adaptive(*args):
-            self.app.watermark_settings["adaptive"] = self.adaptive_var.get()
-        self.adaptive_var.trace_add("write", update_adaptive)
 
-    def _on_wm_path_changed(self):
-        path = self.wm_path_var.get().strip()
-        self.app.watermark_settings["file_path"] = path
-        if path:   # 如果有路径则启用
-            self.app.watermark_settings["enabled"] = True
-        else:
-            self.app.watermark_settings["enabled"] = False
+    def clear_wm(self):
+        self.wm_path_var.set("")
+        self.watermark_dict["file_path"] = ""
+        self.watermark_dict["enabled"] = False
         self._auto_detect_watermark_duration()
-        self._trigger_update()
+        if self.update_callback:
+            self.update_callback()
 
+
+    def _on_wm_path_changed(self, *args):
+        path = self.wm_path_var.get().strip()
+        self.watermark_dict["file_path"] = path
+        self.watermark_dict["enabled"] = bool(path)
+        self._auto_detect_watermark_duration()
+        if self.update_callback:
+            self.update_callback()
+    
     def _auto_detect_watermark_duration(self):
         path = self.wm_path_var.get().strip()
         if not path or not os.path.exists(path):
-            self.app.watermark_settings["duration"] = None
+            self.watermark_dict["duration"] = None
             return
         ext = os.path.splitext(path)[1].lower()
         if ext in ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp'):
-            self.app.watermark_settings["duration"] = None
+            self.watermark_dict["duration"] = None
             return
-        duration = self.app._get_media_duration(path)   # 改为调用 app 的方法
-        if duration is not None:
-            self.app.watermark_settings["duration"] = duration
-        else:
-            self.app.watermark_settings["duration"] = None
+        duration = self.app._get_media_duration(path)
+        self.watermark_dict["duration"] = duration if duration is not None else None
 
 
 
@@ -2298,15 +2314,13 @@ class AdvancedFrame(ttk.LabelFrame):
     def open_watermark_editor(self):
         if self.app is None:
             return
-        # 确保 watermak_settings 中有 file_path
-        file_path = self.app.watermark_settings.get("file_path", "")
+        file_path = self.watermark_dict.get("file_path", "")
         if not file_path or not os.path.exists(file_path):
             messagebox.showwarning("提示", "请先选择一个有效的水印文件")
             return
-        # 调用通用编辑器，水印模式
         self.app.edit_video_settings(
             title="水印参数编辑",
-            initial_settings=self.app.watermark_settings.copy(),  # 传递副本，避免直接修改
+            initial_settings=self.watermark_dict.copy(),
             on_save=lambda new: self._on_watermark_saved(new),
             file_path=file_path,
             is_watermark=True,
@@ -2317,18 +2331,11 @@ class AdvancedFrame(ttk.LabelFrame):
         )
     
     def _on_watermark_saved(self, new_settings):
-        # 确保 enabled 为 True
-        new_settings["enabled"] = True
-        self.app.watermark_settings.update(new_settings)
-        self.wm_path_var.set(self.app.watermark_settings.get("file_path", ""))
-
-        # 保留旧的 adaptive 设置，防止编辑器覆盖
-        old_adaptive = self.app.watermark_settings.get("adaptive", True)
-        new_settings["adaptive"] = old_adaptive
-        self.app.watermark_settings.update(new_settings)
+        self.watermark_dict.update(new_settings)
+        self.wm_path_var.set(self.watermark_dict.get("file_path", ""))
         self._auto_detect_watermark_duration()
-        self._trigger_update()
-        self.app.update_command_preview()
+        if self.update_callback:
+            self.update_callback()
 
 
     def get_settings(self):
@@ -2342,7 +2349,8 @@ class AdvancedFrame(ttk.LabelFrame):
         self.hwaccel_enabled.set(settings.get("hwaccel_enabled", False))
         self.hwaccel_decoder.set(settings.get("hwaccel_decoder", "无"))
         self.custom_args.set(settings.get("custom_args", ""))
-        self.adaptive_var.set(settings.get("adaptive", True))
+        if hasattr(self, 'adaptive_var'):
+            self.adaptive_var.set(self.watermark_dict.get("adaptive", False))
         self._on_hw_toggle()
 
 
@@ -2940,11 +2948,70 @@ class FFmpegBatchGUI:
         if not file_path or not os.path.exists(file_path):
             self._append_info_ui(f"文件不存在: {file_path}")
             return
+    
+        # ----- 1. 构建基础视频滤镜链（不含 scale） -----
+        # 使用 build_video_filter_chain，不包括 speed（变速由音频单独处理）
+        base_vf = build_video_filter_chain(settings, include_subtitle=True, include_speed=False)
+        filter_parts = []
+        if base_vf and base_vf != "null":
+            filter_parts.append(base_vf)
+    
+        # ----- 2. 添加水印虚拟框（如果启用） -----
+        # ----- 2. 添加水印虚拟框（如果启用） -----
+        wm_settings = settings.get("watermark", {})
+        if wm_settings.get("enabled", False) and wm_settings.get("file_path", "").strip():
+            wm_file = wm_settings.get("file_path", "").strip()
+            
+            # 获取主视频尺寸（用于自适应）
+            main_w, main_h = get_video_dimensions(self.ffprobe_cmd, file_path)
+            if main_w is None or main_h is None:
+                self._append_info_ui("[预览] 无法获取视频尺寸，跳过水印虚拟框")
+            else:
+                # ---- 新增：判断是否启用自适应，如果启用则缩放设置 ----
+                if wm_settings.get("adaptive", False):
+                    # 使用 _adapt_sub_settings 根据当前主视频尺寸缩放
+                    adapted_wm = self._adapt_sub_settings(wm_settings, main_w, main_h)
+                else:
+                    adapted_wm = wm_settings  # 或 copy，但后面只读
+                
+                # 获取水印文件的原始尺寸（考虑旋转）
+                orig_w, orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, wm_file, adapted_wm)
+                if orig_w is None or orig_h is None:
+                    self._append_info_ui("[预览] 无法获取水印文件尺寸，使用默认 320x240")
+                    orig_w, orig_h = 320, 240
         
-        # 构建视频滤镜链（预览时强制缩放到 960 高度）
-        filter_chain = build_preview_filter_chain(settings)
+                # 计算水印渲染尺寸（使用自适应后的设置）
+                wm_w, wm_h = compute_rendered_size(orig_w, orig_h, adapted_wm)
+                if wm_w <= 0 or wm_h <= 0:
+                    self._append_info_ui("[预览] 水印渲染尺寸无效，使用原始尺寸")
+                    wm_w, wm_h = orig_w, orig_h
         
-        # 处理音频变速额外参数
+                # 计算 X/Y 位置（使用自适应后的设置，支持表达式）
+                ctx = {"W": main_w, "H": main_h, "w": wm_w, "h": wm_h}
+                x_expr = adapted_wm.get("overlay_x", "W-w-10")
+                y_expr = adapted_wm.get("overlay_y", "H-h-10")
+                x_val = safe_eval_expr(x_expr, ctx)
+                y_val = safe_eval_expr(y_expr, ctx)
+                if x_val is None:
+                    x_val = main_w - wm_w - 10
+                if y_val is None:
+                    y_val = main_h - wm_h - 10
+                # 限制范围
+                x_val = max(0, min(x_val, main_w - wm_w))
+                y_val = max(0, min(y_val, main_h - wm_h))
+        
+                # 构建 drawbox 滤镜
+                drawbox = f"drawbox=x={x_val}:y={y_val}:w={wm_w}:h={wm_h}:color=red@0.3:t=3"
+                filter_parts.append(drawbox)
+                self._append_info_ui(f"[预览] 水印虚拟框: 位置({x_val}, {y_val}) 尺寸{wm_w}x{wm_h}")
+    
+        # ----- 3. 最后添加 scale 到预览高度（确保所有滤镜在缩放前执行） -----
+        filter_parts.append("scale=-2:960")
+    
+        # 合并滤镜链
+        filter_chain = ",".join(filter_parts) if filter_parts else "null"
+    
+        # ----- 4. 处理音频变速额外参数 -----
         extra_args = []
         if settings.get("speed_enabled", False):
             try:
@@ -2958,8 +3025,8 @@ class FFmpegBatchGUI:
                             extra_args.extend(["-af", atempo])
             except ValueError:
                 pass
-        
-        # 调用播放器预览
+    
+        # ----- 5. 调用播放器预览 -----
         self.preview_with_player(file_path, filter_chain, volume=10, extra_args=extra_args)
 
     # ---------- 输出路径生成与命令构建 ----------
@@ -3073,7 +3140,7 @@ class FFmpegBatchGUI:
     def _generate_command_with_watermark(self, input_path: str, output_path: str, settings: dict, wm_settings: dict) -> List[str]:
         main_w, main_h = get_video_dimensions(self.ffprobe_cmd, input_path)
         if main_w is not None and main_h is not None:
-            if wm_settings.get("adaptive", True):   # ← 新增判断
+            if wm_settings.get("adaptive", False):   # ← 新增判断
                 adapted_wm = self._adapt_sub_settings(wm_settings, main_w, main_h)
             else:
                 adapted_wm = wm_settings.copy()      # 不自动缩放，但复制一份避免污染原数据
@@ -3168,7 +3235,10 @@ class FFmpegBatchGUI:
         settings["output_container"] = self.output_container.get()
         settings["pip_enabled"] = self.pip_enabled.get()
         # 添加水印设置（深拷贝）
-        settings["watermark"] = copy.deepcopy(self.watermark_settings)
+        wm = copy.deepcopy(self.watermark_settings)
+        if "adaptive" not in wm:
+            wm["adaptive"] = False
+        settings["watermark"] = wm
         # 记录当前输入文件的尺寸作为水印基准
         input_file = self.input_file.get().strip()
         if input_file and os.path.exists(input_file):
@@ -4438,7 +4508,7 @@ class FFmpegBatchGUI:
     
         with self.SafeToplevel(self.root) as win:
             win.title(f"编辑任务 - {os.path.basename(task.input)}")
-            center_window(win, 800, 460)
+
             
             notebook = ttk.Notebook(win)
             notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -4494,45 +4564,20 @@ class FFmpegBatchGUI:
             # 高级选项页面
             page_adv = ttk.Frame(notebook)
             notebook.add(page_adv, text="高级选项")
-            adv_frame = AdvancedFrame(page_adv, update_callback=None, app=self)
-            adv_frame.pack(fill=tk.X, padx=5, pady=5)
-            adv_frame.set_settings(task.settings)
-
-            # 隐藏 AdvancedFrame 自带的水印按钮（它只应出现在主界面）
-            if hasattr(adv_frame, 'watermark_btn'):
-                adv_frame.watermark_btn.pack_forget()   # 移除该按钮
-
-            # 水印编辑按钮（在高级选项旁边）
-            def open_task_watermark():
-                task_watermark = task.settings.get("watermark", {})
-                if not task_watermark.get("file_path"):
-                    messagebox.showwarning("提示", "请先在任务设置中输入水印文件路径")
-                    return
-                self.edit_video_settings(
-                    title="编辑任务水印",
-                    initial_settings=task_watermark,
-                    on_save=lambda new: self._on_task_watermark_saved(task, new),
-                    file_path=task_watermark.get("file_path"),
-                    is_watermark=True,
-                    parent=win
-                )
-            wm_btn = ttk.Button(page_adv, text="编辑当前任务水印设置", command=open_task_watermark)
-            wm_btn.pack(pady=5)
-
-
-            # 命令预览区
+            
+            # ---- 先定义命令预览区和 update_preview 函数 ----
             preview_frame = ttk.LabelFrame(win, text="新命令预览", padding="5")
             preview_frame.pack(fill=tk.X, pady=10, padx=5)
             preview_text = scrolledtext.ScrolledText(preview_frame, height=10, wrap=tk.WORD)
             preview_text.pack(fill=tk.BOTH, expand=True)
-    
+            
             def update_preview(*args):
                 new_settings = {}
                 new_settings.update(enc_frame.get_settings())
                 new_settings.update(filt_frame.get_settings())
                 new_settings.update(audio_frame.get_settings())
                 new_settings.update(trim_frame.get_settings())
-                new_settings.update(adv_frame.get_settings())
+                new_settings.update(adv_frame.get_settings())  # 这里 adv_frame 将在后面创建，但函数定义时不会执行，所以没问题
                 new_settings["output_dir"] = out_dir_var.get()
                 new_settings["output_suffix"] = suffix_var.get()
                 new_settings["custom_output_name"] = custom_var.get()
@@ -4547,6 +4592,58 @@ class FFmpegBatchGUI:
                     new_cmd_str = f"参数错误: {e}"
                 preview_text.delete(1.0, tk.END)
                 preview_text.insert(tk.END, new_cmd_str)
+            
+            # ---- 现在创建 AdvancedFrame，并传入 update_callback ----
+            watermark_dict = task.settings.get("watermark", {})   # 防止 KeyError
+            adv_frame = AdvancedFrame(
+                page_adv,
+                update_callback=update_preview,   # 此时 update_preview 已定义
+                app=self,
+                show_adaptive=True,
+                watermark_dict=watermark_dict
+            )
+            task.settings["watermark"] = adv_frame.watermark_dict
+            adv_frame.pack(fill=tk.X, padx=5, pady=5)
+            adv_frame.set_settings(task.settings)
+            
+            # 隐藏 AdvancedFrame 自带的水印按钮（它只应出现在主界面）
+            if hasattr(adv_frame, 'watermark_btn'):
+                adv_frame.watermark_btn.pack_forget()
+            
+            # 水印编辑按钮（在高级选项旁边）
+            def open_task_watermark():
+                task_watermark = task.settings.get("watermark", {})
+                if not task_watermark.get("file_path"):
+                    messagebox.showwarning("提示", "请先在任务设置中输入水印文件路径")
+                    return
+                def on_save(new_wm):
+                    # 更新 adv_frame 的字典（原地更新）
+                    adv_frame.watermark_dict.update(new_wm)
+                    # 同步界面控件
+                    adv_frame.wm_path_var.set(adv_frame.watermark_dict.get("file_path", ""))
+                    if hasattr(adv_frame, 'adaptive_var'):
+                        adv_frame.adaptive_var.set(adv_frame.watermark_dict.get("adaptive", False))
+                    # 刷新预览
+                    update_preview()
+                    # 任务设置已自动更新（因为引用同一个字典）
+                    self.update_task_list()
+                    self._append_info_ui("任务水印已更新")
+                self.edit_video_settings(
+                    title="编辑任务水印",
+                    initial_settings=task_watermark,
+                    on_save=on_save,
+                    file_path=task_watermark.get("file_path"),
+                    is_watermark=True,
+                    parent=win
+                )
+            wm_btn = ttk.Button(page_adv, text="编辑当前任务水印设置", command=open_task_watermark)
+            wm_btn.pack(pady=5)
+
+            # 在 edit_task 方法末尾，所有控件创建完成后，调用 center_window 之前添加：
+            win.update_idletasks()   # 强制刷新布局
+            center_window(win, 800, 460)   # 此时窗口内容已就绪
+
+
     
             # 绑定各种事件
             enc_frame.vcodec.trace_add("write", update_preview)
@@ -4606,7 +4703,8 @@ class FFmpegBatchGUI:
                 new_settings["output_suffix"] = suffix_var.get()
                 new_settings["custom_output_name"] = custom_var.get()
                 new_settings["output_container"] = container_var.get()
-                new_settings["watermark"] = task.settings.get("watermark", self.watermark_settings.copy())
+
+                new_settings["watermark"] = adv_frame.watermark_dict.copy()  # 或直接引用
                 new_output = self.generate_output_path(task.input, new_settings)
                 try:
                     new_cmd_list = self.generate_ffmpeg_command(task.input, new_output, new_settings)
@@ -5099,22 +5197,17 @@ class FFmpegBatchGUI:
             self.merge_update_track_list()
             self.merge_update_output_preview()
             return
-    
-        self._append_info_ui(f"[封装] 正在解析媒体信息: {os.path.basename(path)} ...")
-        def load_info():
-            info = ffprobe_json(self.ffprobe_cmd, path)
-            self.root.after(0, lambda: self._on_merge_video_info_loaded(path, info))
-        threading.Thread(target=load_info, daemon=True).start()
-    
-    def _on_merge_video_info_loaded(self, path, info):
+        ext = os.path.splitext(path)[1].lower().lstrip('.')
+        self.original_container = ext if ext in ['mp4', 'mkv', 'mov', 'avi', 'webm'] else 'mp4'
+        info = ffprobe_json(self.ffprobe_cmd, path)
         if not info:
-            self._append_info_ui(f"[封装] 无法解析媒体信息: {path}，可能 ffprobe 失败")
+            self.root.after(0, lambda: self.append_info(f"[封装] 无法解析媒体信息: {path}，可能 ffprobe 失败"))
             self.merge_tracks = []
             self.merge_update_track_list()
             return
         streams = info.get("streams", [])
         if not streams:
-            self._append_info_ui(f"[封装] {path} 中没有发现任何流")
+            self.root.after(0, lambda: self.append_info(f"[封装] {path} 中没有发现任何流"))
             return
         self.merge_tracks = []
         for s in streams:
@@ -5124,11 +5217,10 @@ class FFmpegBatchGUI:
             track = Track(s["index"], st, s.get("codec_name", "unknown"), path, True)
             self.merge_tracks.append(track)
         if not self.merge_tracks:
-            self._append_info_ui(f"[封装] {path} 中未找到视频/音频/字幕轨道")
+            self.root.after(0, lambda: self.append_info(f"[封装] {path} 中未找到视频/音频/字幕轨道"))
         self.merge_update_track_list()
         self.merge_auto_recommend_container()
         self.merge_update_output_preview()
-        self._append_info_ui(f"[封装] 媒体信息解析完成: {os.path.basename(path)}")
 
     def merge_update_track_list(self):
         for w in self.merge_track_frame.winfo_children():
@@ -5764,7 +5856,7 @@ class FFmpegBatchGUI:
             root_tk = self.root
             dialog = tk.Toplevel(root_tk)
             dialog.title("批量处理选项")
-            height = min(350 + len(video_files) * 25, 600)
+            height = min(350 + len(video_files) * 25, 600) + 20
             center_window(dialog, 600, height)
             dialog.transient(root_tk)
             dialog.grab_set()
@@ -5776,7 +5868,7 @@ class FFmpegBatchGUI:
                     if not has_main and video_files:
                         main = video_files[0]
                         self.merge_video.set(main)
-                        self.app._append_info_ui(f"[封装] 自动设置主视频: {os.path.basename(main)}")
+                        self._append_info_ui(f"[封装] 自动设置主视频: {os.path.basename(main)}")
                         start_idx = 1
                     else:
                         start_idx = 0
@@ -5808,7 +5900,7 @@ class FFmpegBatchGUI:
                 def do_select():
                     main = video_files[idx]
                     self.merge_video.set(main)
-                    self.app._append_info_ui(f"[封装] 设置主视频为: {os.path.basename(main)}")
+                    self._append_info_ui(f"[封装] 设置主视频为: {os.path.basename(main)}")
                     for i, f in enumerate(video_files):
                         if i != idx:
                             self.merge_add_external("audio", f)
