@@ -2212,7 +2212,6 @@ class AdvancedFrame(ttk.LabelFrame):
         self.custom_args.trace_add("write", lambda *a: self._trigger_update())
 
         # ---- 水印文件选择与设置 ----
-        # ---- 水印文件选择与设置 ----
         wm_frame = ttk.Frame(self)
         wm_frame.pack(fill=tk.X, pady=2)
         
@@ -2956,7 +2955,6 @@ class FFmpegBatchGUI:
         if base_vf and base_vf != "null":
             filter_parts.append(base_vf)
     
-        # ----- 2. 添加水印虚拟框（如果启用） -----
         # ----- 2. 添加水印虚拟框（如果启用） -----
         wm_settings = settings.get("watermark", {})
         if wm_settings.get("enabled", False) and wm_settings.get("file_path", "").strip():
@@ -5201,13 +5199,13 @@ class FFmpegBatchGUI:
         self.original_container = ext if ext in ['mp4', 'mkv', 'mov', 'avi', 'webm'] else 'mp4'
         info = ffprobe_json(self.ffprobe_cmd, path)
         if not info:
-            self.root.after(0, lambda: self.append_info(f"[封装] 无法解析媒体信息: {path}，可能 ffprobe 失败"))
+            self._append_info_ui(f"[封装] 无法解析媒体信息: {path}，可能 ffprobe 失败")
             self.merge_tracks = []
             self.merge_update_track_list()
             return
         streams = info.get("streams", [])
         if not streams:
-            self.root.after(0, lambda: self.append_info(f"[封装] {path} 中没有发现任何流"))
+            self._append_info_ui(f"[封装] {path} 中没有发现任何流")
             return
         self.merge_tracks = []
         for s in streams:
@@ -5217,7 +5215,7 @@ class FFmpegBatchGUI:
             track = Track(s["index"], st, s.get("codec_name", "unknown"), path, True)
             self.merge_tracks.append(track)
         if not self.merge_tracks:
-            self.root.after(0, lambda: self.append_info(f"[封装] {path} 中未找到视频/音频/字幕轨道"))
+            self._append_info_ui(f"[封装] {path} 中未找到视频/音频/字幕轨道")
         self.merge_update_track_list()
         self.merge_auto_recommend_container()
         self.merge_update_output_preview()
