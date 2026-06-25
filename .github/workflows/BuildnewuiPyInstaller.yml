@@ -1,4 +1,4 @@
-name: PyInstaller Build NewUI and Upload to Release
+name: Build NewUI PyInstaller and Upload to Release
 
 on:
   workflow_dispatch:
