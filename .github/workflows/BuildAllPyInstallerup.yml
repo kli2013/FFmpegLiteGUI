@@ -52,11 +52,12 @@ jobs:
 
       - name: 获取版本号（每个任务独立获取，仅用于产物命名）
         id: version
+        shell: pwsh
         run: |
           if ("${{ github.event.inputs.version }}" -ne "") {
             $VER = "${{ github.event.inputs.version }}"
           } else {
-            # 自动生成：使用 run_number 或 git describe
+            # 自动生成：使用 git describe 或 run_number
             $VER = git describe --tags --always --dirty 2>$null
             if (-not $VER) { $VER = "continuous-${{ github.run_number }}" }
           }
@@ -64,6 +65,7 @@ jobs:
           echo "版本号: $VER"
 
       - name: 构建（文件夹或单文件）
+        shell: pwsh
         run: |
           if ("${{ matrix.mode }}" -eq "folder") {
             $modeFlag = "-D"
@@ -92,39 +94,42 @@ jobs:
 
       - name: 整理产物（压缩文件夹、收集 exe）
         run: |
-          mkdir upload_files
+          mkdir -p upload_files
           # 遍历所有下载的 artifact 目录
           for dir in all_artifacts/*/; do
-            # 获取 artifact 名称（目录名）
             artifact_name=$(basename "$dir")
-            echo "处理 artifact: $artifact_name"
+            echo "正在处理 artifact: $artifact_name"
             
-            # 该 artifact 内应该是 dist/ 下的内容（可能是一个文件夹或一个 .exe）
-            # 实际路径为 all_artifacts/$artifact_name/dist/*
+            # 兼容直接是文件还是在 dist 目录下的情况
             content_path="$dir/dist"
             if [ ! -d "$content_path" ]; then
-              echo "警告: $content_path 不存在，跳过"
-              continue
+              echo "警告: $content_path 不存在，尝试直接使用 $dir"
+              content_path="$dir"
             fi
             
             # 进入 content_path 查看内部
             cd "$content_path"
             for item in *; do
               if [ -d "$item" ]; then
-                # 文件夹模式：打包成 zip
-                zip -r "../../../upload_files/${item}.zip" "$item"
+                echo "发现文件夹: $item，正在压缩..."
+                zip -r "../../upload_files/${item}.zip" "$item"
               elif [ -f "$item" ] && [[ "$item" == *.exe ]]; then
-                # 单文件 .exe：直接复制
-                cp "$item" "../../../upload_files/"
+                echo "发现 exe: $item，正在复制..."
+                cp "$item" "../../upload_files/"
               else
-                echo "忽略非 exe 文件: $item"
+                echo "忽略其他文件: $item"
               fi
             done
             cd - > /dev/null
           done
           
-          echo "准备上传的文件列表:"
+          echo "===== 准备上传的文件列表 ====="
           ls -l upload_files/
+          # 如果列表为空，让这一步报错，方便排查
+          if [ -z "$(ls -A upload_files)" ]; then
+            echo "::error::upload_files 目录为空，没有可上传的文件！"
+            exit 1
+          fi
 
       - name: 确定 Release 版本号
         id: release_version
@@ -133,7 +138,6 @@ jobs:
             VERSION="${{ github.event.inputs.version }}"
           else
             # 从任意一个构建产物的名称中提取版本号
-            # 找到第一个目录，取出 _ 之后的部分
             first_dir=$(ls all_artifacts | head -1)
             VERSION="${first_dir##*_}"
           fi
@@ -151,7 +155,9 @@ jobs:
             - **newui** 采用全新界面
             - **oldui** 为兼容旧版界面
             - 包含文件夹版（便携）和单文件版
-          files: upload_files/*
+          files: |
+            upload_files/*.exe
+            upload_files/*.zip
           draft: false
           prerelease: false
         env:
