@@ -1206,7 +1206,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             return None, None
     
     def open_crop_editor(self):
-        """可视化裁剪窗口 - 使用纯 Python 最近邻缩放"""
+        """可视化裁剪窗口 - 拖拽绘制矩形（使用纯Python最近邻缩放）"""
         input_file = getattr(self, 'current_file', None)
         if not input_file or not os.path.exists(input_file):
             input_file = self.app.input_file.get().strip()
@@ -1226,6 +1226,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             os.unlink(ppm_path)
             return
     
+        # 屏幕可用区域
         screen_w = self.app.root.winfo_screenwidth()
         screen_h = self.app.root.winfo_screenheight()
         max_w = int(screen_w * 0.9)
@@ -1243,6 +1244,7 @@ class VideoFilterFrame(ttk.LabelFrame):
         if disp_h < 1: disp_h = 1
         self.app._append_info_ui(f"[裁剪] 原始尺寸: {orig_w}x{orig_h}, 缩放比例: {scale:.3f}, 显示尺寸: {disp_w}x{disp_h}")
     
+        # 窗口总尺寸
         total_w = disp_w + RIGHT_PANEL_WIDTH + 30
         total_h = disp_h + EXTRA_HEIGHT
         total_w = min(total_w, max_w)
@@ -1250,13 +1252,13 @@ class VideoFilterFrame(ttk.LabelFrame):
         if total_w < 400:
             total_w = 400
     
-        # ---- 使用纯 Python 最近邻缩放 ----
+        # ---- 使用纯Python最近邻缩放 ----
         fd_out, scaled_temp_path = tempfile.mkstemp(suffix='.ppm', prefix='ffgui_scaled_')
         os.close(fd_out)
     
         try:
             resize_ppm_nearest(ppm_path, scaled_temp_path, disp_w, disp_h)
-            self.app._append_info_ui("[裁剪] 缩放成功")
+            self.app._append_info_ui("[裁剪] 最近邻缩放成功")
         except Exception as e:
             self.app._append_info_ui(f"[裁剪] 缩放失败: {e}")
             os.unlink(ppm_path)
@@ -1276,16 +1278,16 @@ class VideoFilterFrame(ttk.LabelFrame):
             messagebox.showerror("错误", f"无法加载缩放后的图像: {e}")
             return
     
-        os.unlink(ppm_path)  # 删除原始 PPM
+        os.unlink(ppm_path)  # 删除原始PPM
     
-        # 缩放因子
+        # 缩放因子（显示坐标 -> 原始坐标）
         scale_x = orig_w / disp_w
         scale_y = orig_h / disp_h
         img_w, img_h = disp_w, disp_h
     
         # ---------- 创建窗口 ----------
         with self.app.SafeToplevel(self.app.root) as win:
-            win.title(f"可视化裁剪 - 显示尺寸 {disp_w}x{disp_h} (原始 {orig_w}x{orig_h})")
+            win.title(f"可视化裁剪 - 拖拽绘制矩形 (显示 {disp_w}x{disp_h}, 原始 {orig_w}x{orig_h})")
             win.transient(self.app.root)
             center_window(win, total_w, total_h)
     
@@ -1327,11 +1329,13 @@ class VideoFilterFrame(ttk.LabelFrame):
             def original_to_display(ox, oy):
                 return ox / scale_x, oy / scale_y
     
-            points = []
-            temp_rect_id = None
-            start_point = None
-            rect_id = None
-            info_var = tk.StringVar(value="👉 点击图像上的第一个点，标记矩形起始位置")
+            # ---- 状态变量 ----
+            points = []                 # 存储两个原始坐标点 [(x1,y1), (x2,y2)]
+            rect_id = None              # 最终矩形ID
+            drag_start_display = None   # 拖拽起始显示坐标 (dx, dy)
+            drag_rect_id = None         # 拖拽过程中临时矩形ID
+    
+            info_var = tk.StringVar(value="👉 在图像上按住左键拖拽以绘制裁剪矩形")
     
             info_label = tk.Label(right_frame, textvariable=info_var, wraplength=RIGHT_PANEL_WIDTH-20,
                                   justify=tk.LEFT, bg="#FFFFCC", relief=tk.SUNKEN, padx=5, pady=5)
@@ -1345,81 +1349,95 @@ class VideoFilterFrame(ttk.LabelFrame):
                     y = min(y1, y2)
                     w = abs(x2 - x1)
                     h = abs(y2 - y1)
-                    info_var.set(f"✅ 矩形已确定\n起始点: ({x1}, {y1})\n结束点: ({x2}, {y2})\n"
-                                 f"左上: ({x}, {y})  宽: {w}  高: {h}\n"
+                    info_var.set(f"✅ 矩形已确定\n左上: ({x}, {y})  宽: {w}  高: {h}\n"
                                  f"裁剪参数: crop={w}:{h}:{x}:{y}\n"
-                                 "👉 可以继续点击其他位置重置矩形")
-                elif len(points) == 1:
-                    x1, y1 = points[0]
-                    info_var.set(f"📍 已标记第一个点: ({x1}, {y1})\n👉 移动鼠标查看虚线矩形，点击第二个点确定")
+                                 "👉 可继续拖拽新矩形覆盖")
                 else:
-                    info_var.set("👉 点击图像上的第一个点，标记矩形起始位置")
+                    info_var.set("👉 在图像上按住左键拖拽以绘制裁剪矩形")
     
-            def draw_temp_rect(event):
-                nonlocal temp_rect_id
-                if start_point is None:
-                    if temp_rect_id:
-                        canvas.delete(temp_rect_id)
-                        temp_rect_id = None
-                    return
-                cur_dx, cur_dy = canvas_to_display(event.x, event.y)
-                start_dx, start_dy = original_to_display(start_point[0], start_point[1])
-                if temp_rect_id:
-                    canvas.delete(temp_rect_id)
-                temp_rect_id = canvas.create_rectangle(start_dx, start_dy, cur_dx, cur_dy,
-                                                       outline='yellow', width=2, dash=(4, 2), tags="temp_rect")
-    
-            def on_canvas_click(event):
-                nonlocal points, rect_id, start_point, temp_rect_id
+            # ---- 拖拽事件 ----
+            def on_drag_start(event):
+                nonlocal drag_start_display, drag_rect_id
                 dx, dy = canvas_to_display(event.x, event.y)
-                ox, oy = display_to_original(dx, dy)
+                drag_start_display = (dx, dy)
+                # 删除已有的临时矩形
+                if drag_rect_id:
+                    canvas.delete(drag_rect_id)
+                    drag_rect_id = None
+                # 删除最终矩形（新拖拽时清除旧的）
                 if rect_id:
                     canvas.delete(rect_id)
-                    rect_id = None
-                if temp_rect_id:
-                    canvas.delete(temp_rect_id)
-                    temp_rect_id = None
+                    # 不清除points，但后续会覆盖
     
-                if len(points) == 0:
-                    points = [(ox, oy)]
-                    start_point = (ox, oy)
+            def on_drag_motion(event):
+                nonlocal drag_start_display, drag_rect_id
+                if drag_start_display is None:
+                    return
+                cur_dx, cur_dy = canvas_to_display(event.x, event.y)
+                if drag_rect_id:
+                    canvas.delete(drag_rect_id)
+                sx, sy = drag_start_display
+                drag_rect_id = canvas.create_rectangle(sx, sy, cur_dx, cur_dy,
+                                                       outline='yellow', width=2, dash=(4, 2))
+    
+            def on_drag_end(event):
+                nonlocal drag_start_display, drag_rect_id, points, rect_id
+                if drag_start_display is None:
+                    return
+                # 获取结束显示坐标
+                ex, ey = canvas_to_display(event.x, event.y)
+                sx, sy = drag_start_display
+                # 转换为原始坐标
+                ox1, oy1 = display_to_original(sx, sy)
+                ox2, oy2 = display_to_original(ex, ey)
+                # 检查矩形是否有效（宽高均大于0）
+                if abs(ox2 - ox1) > 0 and abs(oy2 - oy1) > 0:
+                    # 保存两点（顺序不重要）
+                    points = [(ox1, oy1), (ox2, oy2)]
+                    # 绘制最终矩形（红色）
+                    if rect_id:
+                        canvas.delete(rect_id)
+                    # 使用原始坐标转显示坐标绘制（保持一致性）
+                    dx1, dy1 = original_to_display(ox1, oy1)
+                    dx2, dy2 = original_to_display(ox2, oy2)
+                    rect_id = canvas.create_rectangle(dx1, dy1, dx2, dy2,
+                                                      outline='red', width=2)
                     update_info()
-                    canvas.bind("<Motion>", draw_temp_rect)
-                elif len(points) == 1:
-                    points.append((ox, oy))
-                    start_point = None
-                    canvas.unbind("<Motion>")
-                    x1, y1 = points[0]
-                    x2, y2 = points[1]
-                    dx1, dy1 = original_to_display(x1, y1)
-                    dx2, dy2 = original_to_display(x2, y2)
-                    rect_id = canvas.create_rectangle(dx1, dy1, dx2, dy2, outline='red', width=2)
-                    update_info()
-                    # 无需 canvas.see
                 else:
-                    points = [(ox, oy)]
-                    start_point = (ox, oy)
+                    # 无效矩形，清除所有
+                    if rect_id:
+                        canvas.delete(rect_id)
+                        rect_id = None
+                    points = []
                     update_info()
-                    canvas.bind("<Motion>", draw_temp_rect)
+                # 清除临时矩形
+                if drag_rect_id:
+                    canvas.delete(drag_rect_id)
+                    drag_rect_id = None
+                drag_start_display = None
     
-            canvas.bind("<Button-1>", on_canvas_click)
+            # 绑定事件
+            canvas.bind("<ButtonPress-1>", on_drag_start)
+            canvas.bind("<B1-Motion>", on_drag_motion)
+            canvas.bind("<ButtonRelease-1>", on_drag_end)
     
+            # ---- 清除矩形 ----
             def clear_rect():
-                nonlocal points, rect_id, start_point, temp_rect_id
+                nonlocal points, rect_id, drag_start_display, drag_rect_id
                 points = []
                 if rect_id:
                     canvas.delete(rect_id)
                     rect_id = None
-                if temp_rect_id:
-                    canvas.delete(temp_rect_id)
-                    temp_rect_id = None
-                start_point = None
-                canvas.unbind("<Motion>")
+                if drag_rect_id:
+                    canvas.delete(drag_rect_id)
+                    drag_rect_id = None
+                drag_start_display = None
                 update_info()
     
+            # ---- 应用裁剪 ----
             def apply_crop():
                 if len(points) != 2:
-                    messagebox.showwarning("提示", "请先在图像上点击两个点来确定裁剪矩形")
+                    messagebox.showwarning("提示", "请先拖拽绘制一个裁剪矩形")
                     return
                 x1, y1 = points[0]
                 x2, y2 = points[1]
@@ -1430,6 +1448,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                 if w <= 0 or h <= 0:
                     messagebox.showerror("错误", "矩形尺寸无效")
                     return
+                # 保证偶数（与原逻辑一致）
                 if w % 2:
                     if x + w + 1 <= orig_w:
                         w += 1
@@ -1455,6 +1474,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                 self.app._append_info_ui(f"[裁剪] 应用 crop={int(w)}:{int(h)}:{int(x)}:{int(y)}")
                 win.destroy()
     
+            # ---- 自动检测（保留原有功能） ----
             def auto_detect():
                 self.crop_detect_frames.set(frames_var.get())
                 self.crop_detect_round.set(round_var.get())
@@ -1470,22 +1490,19 @@ class VideoFilterFrame(ttk.LabelFrame):
                         h = int(self.crop_height.get())
                         x = int(self.crop_left.get())
                         y = int(self.crop_top.get())
-                        nonlocal points, rect_id, start_point, temp_rect_id
+                        nonlocal points, rect_id
                         if rect_id:
                             canvas.delete(rect_id)
-                        if temp_rect_id:
-                            canvas.delete(temp_rect_id)
-                        canvas.unbind("<Motion>")
                         points = [(x, y), (x+w, y+h)]
-                        start_point = None
                         dx1, dy1 = original_to_display(x, y)
                         dx2, dy2 = original_to_display(x+w, y+h)
-                        rect_id = canvas.create_rectangle(dx1, dy1, dx2, dy2, outline='red', width=2)
+                        rect_id = canvas.create_rectangle(dx1, dy1, dx2, dy2,
+                                                          outline='red', width=2)
                         update_info()
-                        # 无需 canvas.see
                     except:
                         pass
     
+            # ---- 按钮布局 ----
             btn_frame = ttk.Frame(right_frame)
             btn_frame.pack(fill=tk.X, pady=5)
     
@@ -1514,10 +1531,10 @@ class VideoFilterFrame(ttk.LabelFrame):
             ttk.Button(btn_frame, text="保存并应用裁剪", command=apply_crop).pack(fill=tk.X, pady=2)
             ttk.Button(btn_frame, text="取消", command=win.destroy).pack(fill=tk.X, pady=2)
     
-            tip = "点击第一个点，移动鼠标查看虚线辅助，点击第二个点确定矩形"
+            tip = "按住左键拖拽绘制矩形，松开确定。黄色虚线为辅助，红色为最终选区。"
             ttk.Label(right_frame, text=tip, foreground="gray", wraplength=RIGHT_PANEL_WIDTH-20).pack(pady=10)
     
-            # 若已有裁剪参数，自动加载矩形
+            # ---- 若已有裁剪参数，自动加载矩形 ----
             if self.crop_enabled.get():
                 try:
                     w = int(self.crop_width.get())
@@ -1527,7 +1544,8 @@ class VideoFilterFrame(ttk.LabelFrame):
                     points = [(x, y), (x+w, y+h)]
                     dx1, dy1 = original_to_display(x, y)
                     dx2, dy2 = original_to_display(x+w, y+h)
-                    rect_id = canvas.create_rectangle(dx1, dy1, dx2, dy2, outline='red', width=2)
+                    rect_id = canvas.create_rectangle(dx1, dy1, dx2, dy2,
+                                                      outline='red', width=2)
                     update_info()
                 except:
                     pass
