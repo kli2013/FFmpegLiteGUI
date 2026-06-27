@@ -17,6 +17,8 @@ from typing import List, Tuple, Optional, Dict, Any, Callable
 import shlex
 import tempfile
 
+
+
 # --- 依赖检测 ---
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
@@ -56,10 +58,20 @@ def get_script_dir() -> str:
         return os.path.dirname(os.path.abspath(__file__))
 
 def find_executable(name: str) -> Optional[str]:
-    """查找可执行文件：优先脚本目录，再搜索 PATH"""
-    local_path = os.path.join(get_script_dir(), name)
+    """查找可执行文件：优先脚本目录，再检查打包后的 _internal 目录，最后搜索 PATH"""
+    script_dir = get_script_dir()
+    # 1. 脚本目录（开发环境或 one-dir 顶层）
+    local_path = os.path.join(script_dir, name)
     if os.path.isfile(local_path) and os.access(local_path, os.X_OK):
         return local_path
+
+    # 2. 打包后 one-dir 模式的 _internal 目录
+    if getattr(sys, 'frozen', False):
+        internal_path = os.path.join(script_dir, '_internal', name)
+        if os.path.isfile(internal_path) and os.access(internal_path, os.X_OK):
+            return internal_path
+
+    # 3. 系统 PATH 环境变量
     return shutil.which(name)
 
 def get_dpi_scaling(root: tk.Tk) -> float:
@@ -142,6 +154,99 @@ def is_valid_timestamp(ts: str) -> bool:
 
 
 
+# 纯python 缩放函数 ,用于可视化裁剪
+def resize_ppm_nearest(input_path, output_path, new_width, new_height):
+    """
+    使用最近邻插值缩放 PPM 图像（P6 格式，最大颜色值 255）。
+    - input_path: 输入 PPM 文件路径
+    - output_path: 输出 PPM 文件路径
+    - new_width, new_height: 目标尺寸
+    """
+    with open(input_path, 'rb') as f:
+        # 读取头部
+        header = []
+        data_start = 0
+        for line in iter(f.readline, b''):
+            header.append(line)
+            line = line.strip()
+            if line.startswith(b'#'):
+                continue
+            if header and header[-1].strip() == b'':
+                # 空行可以忽略
+                continue
+            if line.startswith(b'P'):
+                # 格式行
+                magic = line
+                if magic not in (b'P6', b'P3'):
+                    raise ValueError("仅支持 P6 或 P3 格式，当前为 " + magic.decode())
+                continue
+            # 解析宽高和最大值
+            parts = line.split()
+            if len(parts) == 2:
+                # 可能是宽高
+                try:
+                    width = int(parts[0])
+                    height = int(parts[1])
+                    continue
+                except:
+                    pass
+            if len(parts) == 1:
+                # 可能是最大值
+                try:
+                    max_val = int(parts[0])
+                    # 找到数据开始位置
+                    data_start = f.tell()
+                    break
+                except:
+                    pass
+        else:
+            raise ValueError("无法解析 PPM 头部")
+
+        # 读取像素数据（二进制）
+        f.seek(data_start)
+        raw_data = f.read()
+
+        # 如果为 P3 格式（ASCII），需额外解析，这里简化，假设为 P6 二进制
+        # 如果实际为 P3，则需按空格拆分，这里暂不支持，但 FFmpeg 默认输出 P6
+        pixel_count = width * height
+        expected_bytes = pixel_count * 3
+        if len(raw_data) != expected_bytes:
+            # 可能头部解析有误，尝试从当前位置读取全部
+            # 但简单起见，我们重置到数据开始处重新读取
+            f.seek(data_start)
+            raw_data = f.read()
+            if len(raw_data) != expected_bytes:
+                raise ValueError(f"数据长度不匹配：期望 {expected_bytes}，实际 {len(raw_data)}")
+
+        # 转换为字节数组（便于索引）
+        pixels = bytearray(raw_data)
+
+    # 最近邻缩放
+    scale_x = width / new_width
+    scale_y = height / new_height
+
+    new_pixels = bytearray(new_width * new_height * 3)
+
+    for y in range(new_height):
+        src_y = int(y * scale_y)
+        src_y = min(src_y, height - 1)
+        src_row_start = src_y * width * 3
+        dst_row_start = y * new_width * 3
+        for x in range(new_width):
+            src_x = int(x * scale_x)
+            src_x = min(src_x, width - 1)
+            src_idx = src_row_start + src_x * 3
+            dst_idx = dst_row_start + x * 3
+            # 复制 RGB
+            new_pixels[dst_idx:dst_idx+3] = pixels[src_idx:src_idx+3]
+
+    # 写入新的 PPM 文件 (P6 格式)
+    with open(output_path, 'wb') as f:
+        f.write(b'P6\n')
+        f.write(f'{new_width} {new_height}\n'.encode())
+        f.write(b'255\n')
+        f.write(new_pixels)
+
 
 # ================== 预设管理 ==================
 class PresetManager:
@@ -152,16 +257,36 @@ class PresetManager:
         self._ensure_default_preset()
 
     def _ensure_default_preset(self):
-        """若预设文件不存在且存在捆绑默认配置，则复制"""
         if os.path.exists(self.preset_path):
             return
-        bundled = os.path.join(get_script_dir(), "ffmpeg_presets.json")
-        if os.path.exists(bundled):
-            try:
-                shutil.copy2(bundled, self.preset_path)
-                print(f"首次运行，已从内部释放默认配置到：{self.preset_path}")
-            except Exception as e:
-                print(f"释放配置文件失败: {e}")
+    
+        # 可能的捆绑路径列表
+        possible_paths = []
+        script_dir = get_script_dir()
+    
+        # 1. 脚本目录（开发环境或 one-dir 顶层）
+        possible_paths.append(os.path.join(script_dir, "ffmpeg_presets.json"))
+    
+        # 2. 打包后 one-dir 模式的 _internal 目录
+        if getattr(sys, 'frozen', False):
+            possible_paths.append(os.path.join(script_dir, '_internal', "ffmpeg_presets.json"))
+    
+        # 3. onefile 模式下的 _MEIPASS 临时目录（若存在）
+        if getattr(sys, 'frozen', False):
+            meipass = getattr(sys, '_MEIPASS', None)
+            if meipass:
+                possible_paths.append(os.path.join(meipass, "ffmpeg_presets.json"))
+    
+        for bundled in possible_paths:
+            if os.path.exists(bundled):
+                try:
+                    shutil.copy2(bundled, self.preset_path)
+                    print(f"首次运行，已从内部释放默认配置到：{self.preset_path}")
+                    return
+                except Exception as e:
+                    print(f"释放配置文件失败: {e}")
+                    # 继续尝试下一个路径（但通常复制失败后不再尝试其他）
+                    break
 
     def load_all(self) -> Dict[str, Any]:
         """加载所有预设，返回字典 {预设名: 设置字典}，不含播放器设置"""
@@ -1081,7 +1206,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             return None, None
     
     def open_crop_editor(self):
-        """可视化裁剪窗口：点击第一个点，移动鼠标显示虚线框，点击第二个点确定矩形"""
+        """可视化裁剪窗口 - 使用纯 Python 最近邻缩放"""
         input_file = getattr(self, 'current_file', None)
         if not input_file or not os.path.exists(input_file):
             input_file = self.app.input_file.get().strip()
@@ -1096,45 +1221,81 @@ class VideoFilterFrame(ttk.LabelFrame):
     
         fd, ppm_path = tempfile.mkstemp(suffix='.ppm', prefix='ffgui_crop_')
         os.close(fd)
-        w_orig, h_orig = self.extract_video_frame_ppm(input_file, ppm_path, frame_sec=0.0)
-        if w_orig is None or h_orig is None:
+        orig_w, orig_h = self.extract_video_frame_ppm(input_file, ppm_path, frame_sec=0.0)
+        if orig_w is None or orig_h is None:
             os.unlink(ppm_path)
             return
-    
-        try:
-            img = tk.PhotoImage(file=ppm_path)
-        except Exception as e:
-            messagebox.showerror("错误", f"无法加载图像帧: {e}")
-            os.unlink(ppm_path)
-            return
-        os.unlink(ppm_path)
     
         screen_w = self.app.root.winfo_screenwidth()
         screen_h = self.app.root.winfo_screenheight()
         max_w = int(screen_w * 0.9)
         max_h = int(screen_h * 0.9)
-    
         RIGHT_PANEL_WIDTH = 280
         EXTRA_HEIGHT = 120
-        img_w, img_h = img.width(), img.height()
+        avail_w = max_w - RIGHT_PANEL_WIDTH - 30
+        avail_h = max_h - EXTRA_HEIGHT
     
-        need_scroll = (img_w > max_w - RIGHT_PANEL_WIDTH - 30) or (img_h > max_h - EXTRA_HEIGHT)
+        # 计算缩放比例，使图像完整可见且不放大
+        scale = min(1.0, avail_w / orig_w, avail_h / orig_h)
+        disp_w = int(orig_w * scale)
+        disp_h = int(orig_h * scale)
+        if disp_w < 1: disp_w = 1
+        if disp_h < 1: disp_h = 1
+        self.app._append_info_ui(f"[裁剪] 原始尺寸: {orig_w}x{orig_h}, 缩放比例: {scale:.3f}, 显示尺寸: {disp_w}x{disp_h}")
     
-        if not need_scroll:
-            total_w = img_w + RIGHT_PANEL_WIDTH + 30
-            total_h = img_h + EXTRA_HEIGHT
-            total_w = min(total_w, max_w)
-            total_h = min(total_h, max_h)
-
-        else:
-            total_w = max_w
-            total_h = max_h
-
+        total_w = disp_w + RIGHT_PANEL_WIDTH + 30
+        total_h = disp_h + EXTRA_HEIGHT
+        total_w = min(total_w, max_w)
+        total_h = min(total_h, max_h)
+        if total_w < 400:
+            total_w = 400
     
+        # ---- 使用纯 Python 最近邻缩放 ----
+        fd_out, scaled_temp_path = tempfile.mkstemp(suffix='.ppm', prefix='ffgui_scaled_')
+        os.close(fd_out)
+    
+        try:
+            resize_ppm_nearest(ppm_path, scaled_temp_path, disp_w, disp_h)
+            self.app._append_info_ui("[裁剪] 缩放成功")
+        except Exception as e:
+            self.app._append_info_ui(f"[裁剪] 缩放失败: {e}")
+            os.unlink(ppm_path)
+            if os.path.exists(scaled_temp_path):
+                os.unlink(scaled_temp_path)
+            messagebox.showerror("错误", f"图像缩放失败: {e}")
+            return
+    
+        # 加载缩放后的图像
+        try:
+            img = tk.PhotoImage(file=scaled_temp_path)
+        except Exception as e:
+            self.app._append_info_ui(f"[裁剪] 加载缩放后的图像失败: {e}")
+            os.unlink(ppm_path)
+            if os.path.exists(scaled_temp_path):
+                os.unlink(scaled_temp_path)
+            messagebox.showerror("错误", f"无法加载缩放后的图像: {e}")
+            return
+    
+        os.unlink(ppm_path)  # 删除原始 PPM
+    
+        # 缩放因子
+        scale_x = orig_w / disp_w
+        scale_y = orig_h / disp_h
+        img_w, img_h = disp_w, disp_h
+    
+        # ---------- 创建窗口 ----------
         with self.app.SafeToplevel(self.app.root) as win:
-            win.title("可视化裁剪 - 点击两点确定矩形（移动鼠标有虚线辅助）")
+            win.title(f"可视化裁剪 - 显示尺寸 {disp_w}x{disp_h} (原始 {orig_w}x{orig_h})")
             win.transient(self.app.root)
             center_window(win, total_w, total_h)
+    
+            def cleanup_scaled_file(event=None):
+                if scaled_temp_path and os.path.exists(scaled_temp_path):
+                    try:
+                        os.unlink(scaled_temp_path)
+                    except:
+                        pass
+            win.bind("<Destroy>", cleanup_scaled_file)
     
             main_pane = ttk.Frame(win)
             main_pane.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -1146,23 +1307,25 @@ class VideoFilterFrame(ttk.LabelFrame):
             canvas_frame = ttk.Frame(main_pane)
             canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     
-            h_scroll = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL)
-            v_scroll = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL)
-            canvas = tk.Canvas(canvas_frame, bg='gray',
-                               xscrollcommand=h_scroll.set,
-                               yscrollcommand=v_scroll.set)
-            h_scroll.config(command=canvas.xview)
-            v_scroll.config(command=canvas.yview)
-    
-            canvas.grid(row=0, column=0, sticky="nsew")
-            v_scroll.grid(row=0, column=1, sticky="ns")
-            h_scroll.grid(row=1, column=0, sticky="ew")
-            canvas_frame.grid_rowconfigure(0, weight=1)
-            canvas_frame.grid_columnconfigure(0, weight=1)
+            canvas = tk.Canvas(canvas_frame, bg='gray', width=img_w, height=img_h,
+                               highlightthickness=0)
+            canvas.pack(fill=tk.BOTH, expand=True)
     
             canvas.config(scrollregion=(0, 0, img_w, img_h))
             canvas.create_image(0, 0, anchor=tk.NW, image=img, tags="bg_img")
             canvas.image = img
+    
+            # ---- 坐标转换 ----
+            def canvas_to_display(cx, cy):
+                x = canvas.canvasx(cx)
+                y = canvas.canvasy(cy)
+                return max(0, min(x, img_w)), max(0, min(y, img_h))
+    
+            def display_to_original(dx, dy):
+                return int(dx * scale_x), int(dy * scale_y)
+    
+            def original_to_display(ox, oy):
+                return ox / scale_x, oy / scale_y
     
             points = []
             temp_rect_id = None
@@ -1174,11 +1337,6 @@ class VideoFilterFrame(ttk.LabelFrame):
                                   justify=tk.LEFT, bg="#FFFFCC", relief=tk.SUNKEN, padx=5, pady=5)
             info_label.pack(pady=5, fill=tk.X)
     
-            def canvas_to_image(cx, cy):
-                x = canvas.canvasx(cx)
-                y = canvas.canvasy(cy)
-                return max(0, min(x, img_w)), max(0, min(y, img_h))
-    
             def update_info():
                 if len(points) == 2:
                     x1, y1 = points[0]
@@ -1187,13 +1345,13 @@ class VideoFilterFrame(ttk.LabelFrame):
                     y = min(y1, y2)
                     w = abs(x2 - x1)
                     h = abs(y2 - y1)
-                    info_var.set(f"✅ 矩形已确定\n起始点: ({int(x1)}, {int(y1)})\n结束点: ({int(x2)}, {int(y2)})\n"
-                                 f"左上: ({int(x)}, {int(y)})  宽: {int(w)}  高: {int(h)}\n"
-                                 f"裁剪参数: crop={int(w)}:{int(h)}:{int(x)}:{int(y)}\n"
+                    info_var.set(f"✅ 矩形已确定\n起始点: ({x1}, {y1})\n结束点: ({x2}, {y2})\n"
+                                 f"左上: ({x}, {y})  宽: {w}  高: {h}\n"
+                                 f"裁剪参数: crop={w}:{h}:{x}:{y}\n"
                                  "👉 可以继续点击其他位置重置矩形")
                 elif len(points) == 1:
                     x1, y1 = points[0]
-                    info_var.set(f"📍 已标记第一个点: ({int(x1)}, {int(y1)})\n👉 移动鼠标查看虚线矩形，点击第二个点确定")
+                    info_var.set(f"📍 已标记第一个点: ({x1}, {y1})\n👉 移动鼠标查看虚线矩形，点击第二个点确定")
                 else:
                     info_var.set("👉 点击图像上的第一个点，标记矩形起始位置")
     
@@ -1204,40 +1362,43 @@ class VideoFilterFrame(ttk.LabelFrame):
                         canvas.delete(temp_rect_id)
                         temp_rect_id = None
                     return
-                cur_x, cur_y = canvas_to_image(event.x, event.y)
+                cur_dx, cur_dy = canvas_to_display(event.x, event.y)
+                start_dx, start_dy = original_to_display(start_point[0], start_point[1])
                 if temp_rect_id:
                     canvas.delete(temp_rect_id)
-                temp_rect_id = canvas.create_rectangle(start_point[0], start_point[1], cur_x, cur_y,
+                temp_rect_id = canvas.create_rectangle(start_dx, start_dy, cur_dx, cur_dy,
                                                        outline='yellow', width=2, dash=(4, 2), tags="temp_rect")
     
             def on_canvas_click(event):
                 nonlocal points, rect_id, start_point, temp_rect_id
-                x_img, y_img = canvas_to_image(event.x, event.y)
+                dx, dy = canvas_to_display(event.x, event.y)
+                ox, oy = display_to_original(dx, dy)
                 if rect_id:
                     canvas.delete(rect_id)
                     rect_id = None
                 if temp_rect_id:
                     canvas.delete(temp_rect_id)
                     temp_rect_id = None
+    
                 if len(points) == 0:
-                    points = [(x_img, y_img)]
-                    start_point = (x_img, y_img)
+                    points = [(ox, oy)]
+                    start_point = (ox, oy)
                     update_info()
                     canvas.bind("<Motion>", draw_temp_rect)
                 elif len(points) == 1:
-                    points.append((x_img, y_img))
+                    points.append((ox, oy))
                     start_point = None
                     canvas.unbind("<Motion>")
                     x1, y1 = points[0]
                     x2, y2 = points[1]
-                    rect_id = canvas.create_rectangle(x1, y1, x2, y2, outline='red', width=2)
+                    dx1, dy1 = original_to_display(x1, y1)
+                    dx2, dy2 = original_to_display(x2, y2)
+                    rect_id = canvas.create_rectangle(dx1, dy1, dx2, dy2, outline='red', width=2)
                     update_info()
-                    cx = (x1 + x2) // 2
-                    cy = (y1 + y2) // 2
-                    canvas.see(cx, cy)
+                    # 无需 canvas.see
                 else:
-                    points = [(x_img, y_img)]
-                    start_point = (x_img, y_img)
+                    points = [(ox, oy)]
+                    start_point = (ox, oy)
                     update_info()
                     canvas.bind("<Motion>", draw_temp_rect)
     
@@ -1270,19 +1431,19 @@ class VideoFilterFrame(ttk.LabelFrame):
                     messagebox.showerror("错误", "矩形尺寸无效")
                     return
                 if w % 2:
-                    if x + w + 1 <= img_w:
+                    if x + w + 1 <= orig_w:
                         w += 1
                     else:
                         w -= 1
                 if h % 2:
-                    if y + h + 1 <= img_h:
+                    if y + h + 1 <= orig_h:
                         h += 1
                     else:
                         h -= 1
-                if x + w > img_w:
-                    w = img_w - x
-                if y + h > img_h:
-                    h = img_h - y
+                if x + w > orig_w:
+                    w = orig_w - x
+                if y + h > orig_h:
+                    h = orig_h - y
                 if w <= 0 or h <= 0:
                     messagebox.showerror("错误", "修正后矩形无效")
                     return
@@ -1317,9 +1478,11 @@ class VideoFilterFrame(ttk.LabelFrame):
                         canvas.unbind("<Motion>")
                         points = [(x, y), (x+w, y+h)]
                         start_point = None
-                        rect_id = canvas.create_rectangle(x, y, x+w, y+h, outline='red', width=2)
+                        dx1, dy1 = original_to_display(x, y)
+                        dx2, dy2 = original_to_display(x+w, y+h)
+                        rect_id = canvas.create_rectangle(dx1, dy1, dx2, dy2, outline='red', width=2)
                         update_info()
-                        canvas.see(x + w//2, y + h//2)
+                        # 无需 canvas.see
                     except:
                         pass
     
@@ -1351,12 +1514,10 @@ class VideoFilterFrame(ttk.LabelFrame):
             ttk.Button(btn_frame, text="保存并应用裁剪", command=apply_crop).pack(fill=tk.X, pady=2)
             ttk.Button(btn_frame, text="取消", command=win.destroy).pack(fill=tk.X, pady=2)
     
-            if need_scroll:
-                tip = "图像较大，请使用滚动条查看。点击第一个点，移动鼠标有虚线辅助，点击第二个点确定矩形"
-            else:
-                tip = "点击第一个点，移动鼠标查看虚线辅助，点击第二个点确定矩形"
+            tip = "点击第一个点，移动鼠标查看虚线辅助，点击第二个点确定矩形"
             ttk.Label(right_frame, text=tip, foreground="gray", wraplength=RIGHT_PANEL_WIDTH-20).pack(pady=10)
     
+            # 若已有裁剪参数，自动加载矩形
             if self.crop_enabled.get():
                 try:
                     w = int(self.crop_width.get())
@@ -1364,9 +1525,10 @@ class VideoFilterFrame(ttk.LabelFrame):
                     x = int(self.crop_left.get())
                     y = int(self.crop_top.get())
                     points = [(x, y), (x+w, y+h)]
-                    rect_id = canvas.create_rectangle(x, y, x+w, y+h, outline='red', width=2)
+                    dx1, dy1 = original_to_display(x, y)
+                    dx2, dy2 = original_to_display(x+w, y+h)
+                    rect_id = canvas.create_rectangle(dx1, dy1, dx2, dy2, outline='red', width=2)
                     update_info()
-                    canvas.see(x + w//2, y + h//2)
                 except:
                     pass
     
@@ -4506,7 +4668,7 @@ class FFmpegBatchGUI:
     
         with self.SafeToplevel(self.root) as win:
             win.title(f"编辑任务 - {os.path.basename(task.input)}")
-
+            center_window(win, 800, 460)
             
             notebook = ttk.Notebook(win)
             notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -4637,9 +4799,6 @@ class FFmpegBatchGUI:
             wm_btn = ttk.Button(page_adv, text="编辑当前任务水印设置", command=open_task_watermark)
             wm_btn.pack(pady=5)
 
-            # 在 edit_task 方法末尾，所有控件创建完成后，调用 center_window 之前添加：
-            win.update_idletasks()   # 强制刷新布局
-            center_window(win, 800, 460)   # 此时窗口内容已就绪
 
 
     
@@ -6008,14 +6167,23 @@ class FFmpegBatchGUI:
         script_dir = get_script_dir()
         self.status_text.insert(tk.END, f"当前目录 ({script_dir}):\n")
         for tool in tools:
-            if sys.platform == "win32":
-                exe_name = tool + ".exe"
-            else:
-                exe_name = tool
+            exe_name = tool + ".exe" if sys.platform == "win32" else tool
             local_path = os.path.join(script_dir, exe_name)
             exists = os.path.isfile(local_path) and os.access(local_path, os.X_OK)
             status = "✓ 存在" if exists else "✗ 不存在"
             self.status_text.insert(tk.END, f"  {exe_name}: {status}\n")
+        
+        # ---- 新增 _internal 目录检测 ----
+        if getattr(sys, 'frozen', False):
+            internal_dir = os.path.join(script_dir, '_internal')
+            if os.path.isdir(internal_dir):
+                self.status_text.insert(tk.END, f"\n_internal 目录 ({internal_dir}):\n")
+                for tool in tools:
+                    exe_name = tool + ".exe" if sys.platform == "win32" else tool
+                    internal_path = os.path.join(internal_dir, exe_name)
+                    exists = os.path.isfile(internal_path) and os.access(internal_path, os.X_OK)
+                    status = "✓ 存在" if exists else "✗ 不存在"
+                    self.status_text.insert(tk.END, f"  {exe_name}: {status}\n")
         self.status_text.insert(tk.END, "环境变量 PATH:\n")
         import shutil
         for tool in tools:
