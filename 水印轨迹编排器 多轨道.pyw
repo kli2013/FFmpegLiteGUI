@@ -26,6 +26,8 @@ class TrackFrame(ttk.LabelFrame):
         self.index = index
         self.trajectory = []
         self.original_pre_filters = None
+        self.static_x = None
+        self.static_y = None
 
         # 轨迹按钮
         btn_frame = ttk.Frame(self)
@@ -70,10 +72,10 @@ class TrackFrame(ttk.LabelFrame):
         self.scale_h_entry.pack(side="left", padx=2)
         self.scale_h_entry.bind("<FocusOut>", self.on_scale_entry_change)
 
-        # ===== 独立时间控制（周期、延迟、显示时长） =====
+        # 独立时间控制（周期、延迟、显示时长）
         time_frame = ttk.Frame(self)
         time_frame.pack(fill="x", padx=5, pady=2, anchor="w")
-        ttk.Label(time_frame, text="轨迹运动周期(秒):").pack(side="left")
+        ttk.Label(time_frame, text="周期(秒):").pack(side="left")
         self.cycle_entry = ttk.Entry(time_frame, width=6)
         self.cycle_entry.pack(side="left", padx=2)
         self.cycle_entry.insert(0, "")
@@ -83,11 +85,10 @@ class TrackFrame(ttk.LabelFrame):
         self.delay_entry.pack(side="left", padx=2)
         self.delay_entry.insert(0, "0")
 
-        # 新增显示时长输入框
         ttk.Label(time_frame, text="显示时长(秒):").pack(side="left", padx=(10, 2))
         self.duration_entry = ttk.Entry(time_frame, width=6)
         self.duration_entry.pack(side="left", padx=2)
-        self.duration_entry.insert(0, "")  # 留空表示无限
+        self.duration_entry.insert(0, "")
 
         # 额外滤镜显示
         filter_frame = ttk.Frame(self)
@@ -152,6 +153,12 @@ class TrackFrame(ttk.LabelFrame):
             self.scale_h_entry.insert(0, "-2")
             if not self.use_scale_var.get():
                 self.scale_h_entry.config(state="disabled")
+
+    # ---------- 静态坐标 ----------
+    def set_static_position(self, x, y):
+        self.static_x = x
+        self.static_y = y
+
     # ---------- 额外滤镜 ----------
     def set_original_filters(self, filters_str):
         self.original_pre_filters = filters_str
@@ -185,14 +192,20 @@ class TrackFrame(ttk.LabelFrame):
     def update_traj_display(self):
         self.traj_text.config(state="normal")
         self.traj_text.delete("1.0", tk.END)
-        self.traj_text.insert(tk.END, " -> ".join(self.trajectory) if self.trajectory else "(空)")
+        if self.trajectory:
+            self.traj_text.insert(tk.END, " -> ".join(self.trajectory))
+        else:
+            if self.static_x is not None and self.static_y is not None:
+                self.traj_text.insert(tk.END, f"(静态位置: x={self.static_x}, y={self.static_y})")
+            else:
+                self.traj_text.insert(tk.END, "(空)")
         self.traj_text.config(state="disabled")
 
 
 class MultiTrackWatermarkGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("FFmpeg 多轨道水印轨迹编排器 v15.3")
+        self.root.title("FFmpeg 多轨道水印轨迹编排器 v15.5")
 
         win_width, win_height = 1100, 850
         screen_width = self.root.winfo_screenwidth()
@@ -392,6 +405,7 @@ class MultiTrackWatermarkGUI:
             messagebox.showerror("错误", "命令中至少需要包含 2 个 -i 输入文件")
             return
 
+        # 提取每个子视频的滤镜串
         raw_filters_map = {}
         if filter_complex:
             pattern = r'\[(\d+):v\]([^\[]+?)(?=\s*\[|$)'
@@ -399,17 +413,47 @@ class MultiTrackWatermarkGUI:
             for idx, filters in matches:
                 raw_filters_map[int(idx)] = filters.strip(',')
 
+        # 提取透明度
         alpha_pattern = re.compile(r'\[v_sub_(\d+)\]colorchannelmixer=aa=([0-9.]+)')
         alpha_map = {}
         if filter_complex:
             for m in alpha_pattern.finditer(filter_complex):
                 alpha_map[int(m.group(1))] = float(m.group(2))
 
+        # ===== 增强的静态坐标提取 =====
+        static_coords = []
+        if filter_complex:
+            # 1) 尝试匹配带引号的 x='...' y='...'
+            pattern1 = r"overlay=x='([^']*)':y='([^']*)'"
+            matches1 = re.findall(pattern1, filter_complex)
+            if matches1:
+                static_coords = [(x.strip(), y.strip()) for x, y in matches1]
+            else:
+                # 2) 尝试匹配 x=...:y=...（无引号）
+                pattern2 = r"overlay=x=([^:]*):y=([^:]*)(?=[:]|$)"
+                matches2 = re.findall(pattern2, filter_complex)
+                if matches2:
+                    static_coords = [(x.strip(), y.strip()) for x, y in matches2]
+                else:
+                    # 3) 尝试匹配 overlay=参数:参数 这种无前缀形式
+                    # 使用正则 overlay=([^:]+):([^:]+) 并过滤掉 enable/shortest
+                    overlay_pattern = re.compile(r'overlay=([^:]+):([^:]+)')
+                    for m in overlay_pattern.finditer(filter_complex):
+                        x = m.group(1).strip()
+                        y = m.group(2).strip()
+                        # 如果 x 或 y 是 enable、shortest 等，则跳过
+                        if x.lower() in ('enable', 'shortest') or y.lower() in ('enable', 'shortest'):
+                            continue
+                        static_coords.append((x, y))
+                    # 如果还没有匹配，可能 overlay 只有一个参数（比如只有 x 或只有 y），忽略
+
+        # 创建轨道
         for idx, file_path in enumerate(inputs[1:], start=1):
             file_name = file_path.split("/")[-1].split("\\")[-1]
             track = TrackFrame(self.scrollable_frame, idx, file_name)
             track.pack(fill="x", padx=5, pady=5)
 
+            # 原始滤镜提取
             raw_filters = raw_filters_map.get(idx, "")
             scale_w = scale_h = None
             clean_filters = []
@@ -433,11 +477,18 @@ class MultiTrackWatermarkGUI:
 
             track.set_original_filters(clean_str)
 
+            # 透明度
             if (idx-1) in alpha_map:
                 track.set_alpha(alpha_map[idx-1])
 
+            # 缩放
             if scale_w is not None and scale_h is not None:
                 track.set_scale(scale_w, scale_h)
+
+            # ===== 静态坐标：按顺序对应 =====
+            if idx-1 < len(static_coords):
+                x, y = static_coords[idx-1]
+                track.set_static_position(x, y)
 
             self.tracks.append(track)
 
@@ -496,9 +547,9 @@ class MultiTrackWatermarkGUI:
             messagebox.showwarning("提示", "请先粘贴命令！")
             return
 
-        valid_tracks = [t for t in self.tracks if len(t.trajectory) >= 1]
+        valid_tracks = [t for t in self.tracks if len(t.trajectory) >= 1 or (t.static_x is not None and t.static_y is not None)]
         if not valid_tracks:
-            messagebox.showwarning("提示", "至少需要一个包含轨迹的轨道！")
+            messagebox.showwarning("提示", "至少需要一个包含轨迹或静态位置的轨道！")
             return
 
         try:
@@ -565,7 +616,9 @@ class MultiTrackWatermarkGUI:
         output_counter = 0
 
         for track in self.tracks:
-            if len(track.trajectory) < 1:
+            has_trajectory = len(track.trajectory) >= 1
+            has_static = (track.static_x is not None and track.static_y is not None)
+            if not has_trajectory and not has_static:
                 continue
 
             # 读取时间参数
@@ -588,7 +641,6 @@ class MultiTrackWatermarkGUI:
                     messagebox.showerror("错误", f"轨道 {track['text']} 的显示时长必须是数字！")
                     return
 
-            # 计算该轨道的有效周期（用于 enable 表达式）
             if cycle and cycle.strip():
                 try:
                     effective_duration = float(cycle.strip())
@@ -598,8 +650,13 @@ class MultiTrackWatermarkGUI:
                 effective_duration = global_duration
 
             idx = track.index
-            x_expr = self.build_axis_expr(track.trajectory, global_duration, 0, loop, mode, cycle, delay_val)
-            y_expr = self.build_axis_expr(track.trajectory, global_duration, 1, loop, mode, cycle, delay_val)
+
+            if has_trajectory:
+                x_expr = self.build_axis_expr(track.trajectory, global_duration, 0, loop, mode, cycle, delay_val)
+                y_expr = self.build_axis_expr(track.trajectory, global_duration, 1, loop, mode, cycle, delay_val)
+            else:
+                x_expr = track.static_x
+                y_expr = track.static_y
 
             sub_stream = f"[{idx}:v]"
             sub_temp_label = f"v_sub_{idx}"
@@ -629,32 +686,20 @@ class MultiTrackWatermarkGUI:
             format_pipeline = f"[{sub_temp_label}]format=rgba[{sub_temp_label}_rgba]"
 
             # ===== 构建 enable 表达式 =====
-            # 基础：延迟下界
             if delay_val > 0:
                 enable_parts = [f"gte(t,{delay_val})"]
             else:
                 enable_parts = ["1"]
 
-            # 若循环关闭且选择“立即消失”，则在周期结束时消失
-            if not loop and end_behavior == "立即消失":
+            if not loop and end_behavior == "立即消失" and has_trajectory:
                 end_time = delay_val + effective_duration
                 enable_parts = [f"between(t,{delay_val},{end_time})"]
-            # 否则，如果设置了显示时长，则添加寿命上界
             elif display_val is not None:
                 life_end = delay_val + display_val
-                if loop or end_behavior == "停留在结束点":
-                    # 保留延迟下界，加上寿命上界
+                if loop or end_behavior == "停留在结束点" or not has_trajectory:
                     enable_parts = [f"between(t,{delay_val},{life_end})"]
-                # 对于“立即消失”且 loop=False，上面已处理，这里不重复
 
-            # 组合 enable 表达式
-            if len(enable_parts) == 1:
-                enable_expr = enable_parts[0]
-            else:
-                # 多个条件用 and 连接（通常只会有两个）
-                enable_expr = " && ".join(enable_parts)
-
-            # 对于循环开启且无显示时长，且延迟为0，保持 "1"
+            enable_expr = " && ".join(enable_parts) if len(enable_parts) > 1 else enable_parts[0]
             if enable_expr == "1" and loop and display_val is None and delay_val == 0:
                 enable_expr = "1"
 
