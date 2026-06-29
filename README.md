@@ -43,3 +43,5 @@
     独立了个轨迹编排程序,尝试集成进子视频的编辑框,但是感觉不好用,每个子轨道单独点开编辑太慢了,   
     复制主程序原始的命令(带子视频/图片),用这个外挂的程序全显示出来快,点一点就一次全生成了 
 
+<img width="1072" height="701" alt="Img20260630030325987" src="https://github.com/user-attachments/assets/5fe57733-8739-40f3-983c-c8917a558772" />
+<img width="480" height="270" alt="3" src="https://github.com/user-attachments/assets/4065c11e-4904-4094-87b1-25fe3ad9faa5" />
