@@ -54,7 +54,7 @@ class TrackFrame(ttk.LabelFrame):
         self.alpha_label.pack(side="left", padx=2)
         self.alpha_scale.config(command=self.update_alpha_label)
 
-        # ===== 缩放控件（含智能补全） =====
+        # 缩放控件
         scale_frame = ttk.Frame(self)
         scale_frame.pack(fill="x", padx=5, pady=2, anchor="w")
         self.use_scale_var = tk.BooleanVar(value=False)
@@ -65,23 +65,29 @@ class TrackFrame(ttk.LabelFrame):
         self.scale_w_entry = ttk.Entry(scale_frame, width=6, state="disabled")
         self.scale_w_entry.pack(side="left", padx=2)
         self.scale_w_entry.bind("<FocusOut>", self.on_scale_entry_change)
-
         ttk.Label(scale_frame, text="H:").pack(side="left")
         self.scale_h_entry = ttk.Entry(scale_frame, width=6, state="disabled")
         self.scale_h_entry.pack(side="left", padx=2)
         self.scale_h_entry.bind("<FocusOut>", self.on_scale_entry_change)
 
-        # 独立时间控制
+        # ===== 独立时间控制（周期、延迟、显示时长） =====
         time_frame = ttk.Frame(self)
         time_frame.pack(fill="x", padx=5, pady=2, anchor="w")
-        ttk.Label(time_frame, text="周期(秒):").pack(side="left")
+        ttk.Label(time_frame, text="轨迹运动周期(秒):").pack(side="left")
         self.cycle_entry = ttk.Entry(time_frame, width=6)
         self.cycle_entry.pack(side="left", padx=2)
         self.cycle_entry.insert(0, "")
+
         ttk.Label(time_frame, text="延迟(秒):").pack(side="left", padx=(10, 2))
         self.delay_entry = ttk.Entry(time_frame, width=6)
         self.delay_entry.pack(side="left", padx=2)
         self.delay_entry.insert(0, "0")
+
+        # 新增显示时长输入框
+        ttk.Label(time_frame, text="显示时长(秒):").pack(side="left", padx=(10, 2))
+        self.duration_entry = ttk.Entry(time_frame, width=6)
+        self.duration_entry.pack(side="left", padx=2)
+        self.duration_entry.insert(0, "")  # 留空表示无限
 
         # 额外滤镜显示
         filter_frame = ttk.Frame(self)
@@ -128,13 +134,10 @@ class TrackFrame(ttk.LabelFrame):
         """智能补全 -2：当其中一个为空时，自动设为 -2"""
         if not self.use_scale_var.get():
             return
-        
         w_val = self.scale_w_entry.get().strip()
         h_val = self.scale_h_entry.get().strip()
-        
         if not w_val and not h_val:
             return
-        
         # W 空，H 有值 => W = -2
         if not w_val and h_val:
             self.scale_w_entry.config(state="normal")
@@ -142,7 +145,6 @@ class TrackFrame(ttk.LabelFrame):
             self.scale_w_entry.insert(0, "-2")
             if not self.use_scale_var.get():
                 self.scale_w_entry.config(state="disabled")
-        
         # H 空，W 有值 => H = -2
         elif w_val and not h_val:
             self.scale_h_entry.config(state="normal")
@@ -150,7 +152,6 @@ class TrackFrame(ttk.LabelFrame):
             self.scale_h_entry.insert(0, "-2")
             if not self.use_scale_var.get():
                 self.scale_h_entry.config(state="disabled")
-
     # ---------- 额外滤镜 ----------
     def set_original_filters(self, filters_str):
         self.original_pre_filters = filters_str
@@ -209,7 +210,7 @@ class MultiTrackWatermarkGUI:
         left_panel = ttk.Frame(paned, width=400)
         paned.add(left_panel, weight=1)
 
-        ttk.Label(left_panel, text="FFmpeg 水印编排器 v14.9", font=("Microsoft YaHei", 16, "bold")).pack(pady=10, anchor="w", padx=5)
+        ttk.Label(left_panel, text="FFmpeg 水印编排器", font=("Microsoft YaHei", 16, "bold")).pack(pady=10, anchor="w", padx=5)
 
         ttk.Label(left_panel, text="粘贴原始 FFmpeg 命令:").pack(anchor="w", padx=5)
         self.input_cmd = tk.Text(left_panel, height=5, font=("Microsoft YaHei", 9), wrap="word")
@@ -235,7 +236,6 @@ class MultiTrackWatermarkGUI:
                                             values=["跳跃循环", "往复循环"], state="readonly", width=10)
         self.loop_mode_combo.pack(side="left", padx=5)
 
-        # 不循环行为
         self.end_behavior_var = tk.StringVar(value="停留在结束点")
         self.end_behavior_combo = ttk.Combobox(global_time_frame, textvariable=self.end_behavior_var,
                                                 values=["停留在结束点", "立即消失"],
@@ -282,6 +282,7 @@ class MultiTrackWatermarkGUI:
         canvas = event.widget
         canvas.itemconfig(self.canvas_window, width=canvas.winfo_width())
 
+    # ---------- 短路径转换 ----------
     def get_short_path(self, path):
         try:
             buffer = ctypes.create_unicode_buffer(260)
@@ -292,6 +293,7 @@ class MultiTrackWatermarkGUI:
             pass
         return path
 
+    # ---------- 获取主视频时长 ----------
     def get_main_duration(self):
         original_cmd = self.input_cmd.get("1.0", tk.END).strip()
         if not original_cmd:
@@ -350,6 +352,7 @@ class MultiTrackWatermarkGUI:
         except Exception as e:
             messagebox.showerror("获取失败", f"发生异常：{str(e)}")
 
+    # ---------- 解析命令生成轨道 ----------
     def parse_and_generate_tracks(self):
         for t in self.tracks:
             t.destroy()
@@ -440,6 +443,7 @@ class MultiTrackWatermarkGUI:
 
         messagebox.showinfo("解析成功", f"成功识别到 {len(inputs)-1} 个子视频轨道！")
 
+    # ---------- 构建单轴运动表达式 ----------
     def build_axis_expr(self, trajectory, global_duration, axis_idx,
                         loop=True, mode="跳跃循环",
                         track_cycle=None, track_delay=0.0):
@@ -485,6 +489,7 @@ class MultiTrackWatermarkGUI:
 
         return expr
 
+    # ---------- 生成最终命令 ----------
     def generate_command(self):
         original_cmd = self.input_cmd.get("1.0", tk.END).strip()
         if not original_cmd:
@@ -502,6 +507,7 @@ class MultiTrackWatermarkGUI:
             messagebox.showerror("错误", "全局循环时长必须是数字！")
             return
 
+        # 解析原始命令提取输入
         try:
             args = shlex.split(original_cmd, posix=False)
         except:
@@ -552,6 +558,7 @@ class MultiTrackWatermarkGUI:
         mode = self.loop_mode_var.get() if loop else "跳跃循环"
         end_behavior = self.end_behavior_var.get() if not loop else "停留在结束点"
 
+        # ========== 构建 filter_complex ==========
         filter_chain = []
         filter_chain.append("[0:v]format=yuv420p[v_main]")
         current_base = "[v_main]"
@@ -561,6 +568,7 @@ class MultiTrackWatermarkGUI:
             if len(track.trajectory) < 1:
                 continue
 
+            # 读取时间参数
             cycle = track.cycle_entry.get().strip() or None
             delay = track.delay_entry.get().strip()
             if delay and not delay.replace('.', '').isdigit():
@@ -568,6 +576,19 @@ class MultiTrackWatermarkGUI:
                 return
             delay_val = float(delay) if delay else 0.0
 
+            display = track.duration_entry.get().strip()
+            display_val = None
+            if display:
+                try:
+                    display_val = float(display)
+                    if display_val <= 0:
+                        messagebox.showerror("错误", f"轨道 {track['text']} 的显示时长必须大于0！")
+                        return
+                except ValueError:
+                    messagebox.showerror("错误", f"轨道 {track['text']} 的显示时长必须是数字！")
+                    return
+
+            # 计算该轨道的有效周期（用于 enable 表达式）
             if cycle and cycle.strip():
                 try:
                     effective_duration = float(cycle.strip())
@@ -607,15 +628,35 @@ class MultiTrackWatermarkGUI:
 
             format_pipeline = f"[{sub_temp_label}]format=rgba[{sub_temp_label}_rgba]"
 
-            # enable 表达式
-            if loop:
-                enable_expr = f"gte(t,{delay_val})" if delay_val > 0 else "1"
+            # ===== 构建 enable 表达式 =====
+            # 基础：延迟下界
+            if delay_val > 0:
+                enable_parts = [f"gte(t,{delay_val})"]
             else:
-                if end_behavior == "立即消失":
-                    end_time = delay_val + effective_duration
-                    enable_expr = f"between(t,{delay_val},{end_time})"
-                else:
-                    enable_expr = f"gte(t,{delay_val})" if delay_val > 0 else "1"
+                enable_parts = ["1"]
+
+            # 若循环关闭且选择“立即消失”，则在周期结束时消失
+            if not loop and end_behavior == "立即消失":
+                end_time = delay_val + effective_duration
+                enable_parts = [f"between(t,{delay_val},{end_time})"]
+            # 否则，如果设置了显示时长，则添加寿命上界
+            elif display_val is not None:
+                life_end = delay_val + display_val
+                if loop or end_behavior == "停留在结束点":
+                    # 保留延迟下界，加上寿命上界
+                    enable_parts = [f"between(t,{delay_val},{life_end})"]
+                # 对于“立即消失”且 loop=False，上面已处理，这里不重复
+
+            # 组合 enable 表达式
+            if len(enable_parts) == 1:
+                enable_expr = enable_parts[0]
+            else:
+                # 多个条件用 and 连接（通常只会有两个）
+                enable_expr = " && ".join(enable_parts)
+
+            # 对于循环开启且无显示时长，且延迟为0，保持 "1"
+            if enable_expr == "1" and loop and display_val is None and delay_val == 0:
+                enable_expr = "1"
 
             if track.use_alpha_var.get():
                 alpha = f"{track.alpha_var.get():.2f}"
@@ -638,6 +679,7 @@ class MultiTrackWatermarkGUI:
         final_output_label = f"[v_out_{output_counter-1}]"
         map_cmd = f'-map {final_output_label} -map 0:a? -c:v libx264 -c:a copy -shortest'
 
+        # 输出路径
         first_path = input_entries[0][1]
         base_dir = os.path.dirname(first_path)
         base_name = os.path.splitext(os.path.basename(first_path))[0]
@@ -645,6 +687,7 @@ class MultiTrackWatermarkGUI:
         output_file = output_file.replace('\\', '/')
         output_file = self.get_short_path(output_file)
 
+        # ========== 使用列表构建命令 ==========
         cmd_parts = []
         cmd_parts.append(ffmpeg_exe.replace('\\', '/'))
         cmd_parts.extend(['-y', '-fflags', '+genpts'])
