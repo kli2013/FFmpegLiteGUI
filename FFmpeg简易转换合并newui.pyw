@@ -1227,7 +1227,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             return None, None
     
     def open_crop_editor(self):
-        """可视化裁剪窗口 - 拖拽绘制矩形"""
+        """可视化裁剪窗口 - 拖拽绘制矩形，支持时间跳转重新取帧"""
         input_file = getattr(self, 'current_file', None)
         if not input_file or not os.path.exists(input_file):
             input_file = self.app.input_file.get().strip()
@@ -1240,34 +1240,36 @@ class VideoFilterFrame(ttk.LabelFrame):
             messagebox.showerror("错误", "未找到 ffmpeg，无法提取视频帧")
             return
     
+        # ---------- 1. 提取当前帧（默认为 0 秒） ----------
+        current_time = 0.0
         fd, ppm_path = tempfile.mkstemp(suffix='.ppm', prefix='ffgui_crop_')
         os.close(fd)
-        orig_w, orig_h = self.extract_video_frame_ppm(input_file, ppm_path, frame_sec=0.0)
+        orig_w, orig_h = self.extract_video_frame_ppm(input_file, ppm_path, frame_sec=current_time)
         if orig_w is None or orig_h is None:
             os.unlink(ppm_path)
             return
     
-        # 屏幕可用区域
+        # ---------- 2. 计算显示尺寸 ----------
         screen_w = self.app.root.winfo_screenwidth()
         screen_h = self.app.root.winfo_screenheight()
         max_w = int(screen_w * 0.9)
         max_h = int(screen_h * 0.9)
         RIGHT_PANEL_WIDTH = 280
         EXTRA_HEIGHT = 10
-        PADDING = 10  # 图片外边距
-        WINDOW_MARGIN = 20 #右边菜单控件和图片区的间隔
+        PADDING = 10
+        WINDOW_MARGIN = 20
         avail_w = max_w - RIGHT_PANEL_WIDTH - WINDOW_MARGIN - PADDING * 2
         avail_h = max_h - EXTRA_HEIGHT - PADDING * 2
     
-        # 计算缩放比例
         scale = min(1.0, avail_w / orig_w, avail_h / orig_h)
         disp_w = int(orig_w * scale)
         disp_h = int(orig_h * scale)
-        if disp_w < 1: disp_w = 1
-        if disp_h < 1: disp_h = 1
+        if disp_w < 1:
+            disp_w = 1
+        if disp_h < 1:
+            disp_h = 1
         self.app._append_info_ui(f"[裁剪] 原始尺寸: {orig_w}x{orig_h}, 缩放比例: {scale:.3f}, 显示尺寸: {disp_w}x{disp_h}")
     
-        # 画布尺寸（含边距）
         canvas_w = disp_w + PADDING * 2
         canvas_h = disp_h + PADDING * 2
         total_w = canvas_w + RIGHT_PANEL_WIDTH + WINDOW_MARGIN
@@ -1277,13 +1279,13 @@ class VideoFilterFrame(ttk.LabelFrame):
         if total_w < 400:
             total_w = 400
     
-        # ---- 使用纯Python最近邻缩放 ----
+        # 缩放图像（纯 Python 最近邻）
         fd_out, scaled_temp_path = tempfile.mkstemp(suffix='.ppm', prefix='ffgui_scaled_')
         os.close(fd_out)
     
         try:
             resize_ppm_nearest(ppm_path, scaled_temp_path, disp_w, disp_h)
-            self.app._append_info_ui("[裁剪] 最近邻缩放成功")
+            self.app._append_info_ui("[裁剪] 缩放成功")
         except Exception as e:
             self.app._append_info_ui(f"[裁剪] 缩放失败: {e}")
             os.unlink(ppm_path)
@@ -1292,7 +1294,6 @@ class VideoFilterFrame(ttk.LabelFrame):
             messagebox.showerror("错误", f"图像缩放失败: {e}")
             return
     
-        # 加载缩放后的图像
         try:
             img = tk.PhotoImage(file=scaled_temp_path)
         except Exception as e:
@@ -1303,14 +1304,14 @@ class VideoFilterFrame(ttk.LabelFrame):
             messagebox.showerror("错误", f"无法加载缩放后的图像: {e}")
             return
     
+        # 删除原始 ppm（缩放后的暂存文件在窗口关闭时清理）
         os.unlink(ppm_path)
     
-        # 缩放因子
         scale_x = orig_w / disp_w
         scale_y = orig_h / disp_h
         img_w, img_h = disp_w, disp_h
     
-        # ---------- 创建窗口 ----------
+        # ---------- 3. 创建窗口 ----------
         with self.app.SafeToplevel(self.app.root) as win:
             win.title(f"可视化裁剪 - 拖拽绘制矩形 (显示 {disp_w}x{disp_h}, 原始 {orig_w}x{orig_h})")
             win.transient(self.app.root)
@@ -1342,18 +1343,16 @@ class VideoFilterFrame(ttk.LabelFrame):
             canvas.create_image(PADDING, PADDING, anchor=tk.NW, image=img, tags="bg_img")
             canvas.image = img
     
-            # ---- 坐标转换（含边距映射） ----
+            # ---------- 4. 坐标转换函数 ----------
             def canvas_to_display(cx, cy):
                 x = canvas.canvasx(cx)
                 y = canvas.canvasy(cy)
-                # 映射到图像区域（0 ~ img_w, 0 ~ img_h）
                 if x < PADDING:
                     x = 0
                 elif x > PADDING + img_w:
                     x = img_w
                 else:
                     x = x - PADDING
-    
                 if y < PADDING:
                     y = 0
                 elif y > PADDING + img_h:
@@ -1368,7 +1367,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             def original_to_display(ox, oy):
                 return ox / scale_x, oy / scale_y
     
-            # ---- 状态变量 ----
+            # ---------- 5. 状态变量 ----------
             points = []
             rect_id = None
             drag_start_display = None
@@ -1393,7 +1392,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                 else:
                     info_var.set("👉 在图像上按住左键拖拽（可从边缘外开始）以绘制裁剪矩形")
     
-            # ---- 拖拽事件 ----
+            # ---------- 6. 拖拽事件 ----------
             def on_drag_start(event):
                 nonlocal drag_start_display, drag_rect_id
                 dx, dy = canvas_to_display(event.x, event.y)
@@ -1412,7 +1411,6 @@ class VideoFilterFrame(ttk.LabelFrame):
                 if drag_rect_id:
                     canvas.delete(drag_rect_id)
                 sx, sy = drag_start_display
-                # 加上边距偏移
                 drag_rect_id = canvas.create_rectangle(
                     sx + PADDING, sy + PADDING,
                     cur_dx + PADDING, cur_dy + PADDING,
@@ -1431,7 +1429,6 @@ class VideoFilterFrame(ttk.LabelFrame):
                     points = [(ox1, oy1), (ox2, oy2)]
                     if rect_id:
                         canvas.delete(rect_id)
-                    # 加边距偏移
                     dx1, dy1 = original_to_display(ox1, oy1)
                     dx2, dy2 = original_to_display(ox2, oy2)
                     rect_id = canvas.create_rectangle(
@@ -1455,7 +1452,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             canvas.bind("<B1-Motion>", on_drag_motion)
             canvas.bind("<ButtonRelease-1>", on_drag_end)
     
-            # ---- 清除矩形 ----
+            # ---------- 7. 清除矩形 ----------
             def clear_rect():
                 nonlocal points, rect_id, drag_start_display, drag_rect_id
                 points = []
@@ -1468,7 +1465,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                 drag_start_display = None
                 update_info()
     
-            # ---- 应用裁剪 ----
+            # ---------- 8. 应用裁剪 ----------
             def apply_crop():
                 if len(points) != 2:
                     messagebox.showwarning("提示", "请先拖拽绘制一个裁剪矩形")
@@ -1508,7 +1505,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                 self.app._append_info_ui(f"[裁剪] 应用 crop={int(w)}:{int(h)}:{int(x)}:{int(y)}")
                 win.destroy()
     
-            # ---- 自动检测 ----
+            # ---------- 9. 自动检测黑边 ----------
             def auto_detect():
                 self.crop_detect_frames.set(frames_var.get())
                 self.crop_detect_round.set(round_var.get())
@@ -1539,7 +1536,143 @@ class VideoFilterFrame(ttk.LabelFrame):
                     except:
                         pass
     
-            # ---- 按钮布局 ----
+            # ---------- 10. 新增：时间跳转和重新获取画面 ----------
+            time_var = tk.StringVar(value="0.0")
+            time_entry = ttk.Entry(right_frame, textvariable=time_var, width=12)
+            time_entry.pack(pady=(10,2), fill=tk.X)
+    
+            # 解析时间字符串的辅助函数
+            def parse_time_str(s):
+                s = s.strip()
+                if not s:
+                    return None
+                # 尝试直接解析为浮点数
+                try:
+                    return float(s)
+                except ValueError:
+                    pass
+                # 尝试解析 HH:MM:SS[.mmm] 或 MM:SS[.mmm]
+                import re
+                m = re.match(r'^(?:(\d+):)?(\d{1,2}):(\d{1,2}(?:\.\d{1,3})?)$', s)
+                if m:
+                    h = int(m.group(1)) if m.group(1) else 0
+                    m_ = int(m.group(2))
+                    sec = float(m.group(3))
+                    return h * 3600 + m_ * 60 + sec
+                return None
+    
+            def on_refresh_click():
+                """点击重新获取画面按钮"""
+                nonlocal current_time, img, scaled_temp_path, orig_w, orig_h, scale, img_w, img_h
+                # 解析时间
+                time_str = time_var.get().strip()
+                if not time_str:
+                    messagebox.showwarning("提示", "请输入时间")
+                    return
+                sec = parse_time_str(time_str)
+                if sec is None:
+                    messagebox.showerror("错误", f"无效的时间格式: {time_str}\n支持格式: 秒数 (如 10.5) 或 HH:MM:SS[.mmm]")
+                    return
+                # 检查是否超出视频总时长（可选）
+                total_duration = self.app._get_media_duration(input_file)
+                if total_duration is not None and sec > total_duration:
+                    messagebox.showwarning("警告", f"输入时间 {sec:.2f}s 超过视频总时长 {total_duration:.2f}s，将跳转到末尾")
+                    sec = total_duration
+                current_time = sec
+    
+                # 禁用按钮，显示状态
+                refresh_btn.config(state=tk.DISABLED, text="提取中...")
+                info_var.set("⏳ 正在提取画面，请稍候...")
+                win.update_idletasks()
+    
+                def extract_thread():
+                    """在后台线程中提取帧并更新 UI"""
+                    nonlocal ppm_path, scaled_temp_path, img
+                    # 生成新的临时 ppm 路径
+                    fd_new, new_ppm = tempfile.mkstemp(suffix='.ppm', prefix='ffgui_crop_')
+                    os.close(fd_new)
+                    try:
+                        # 提取新帧
+                        new_w, new_h = self.extract_video_frame_ppm(input_file, new_ppm, frame_sec=sec)
+                        if new_w is None or new_h is None:
+                            # 提取失败
+                            self.app.root.after(0, lambda: on_extract_failed("提取帧失败，请检查文件是否支持"))
+                            return
+                        # 缩放新图像
+                        fd_out_new, new_scaled = tempfile.mkstemp(suffix='.ppm', prefix='ffgui_scaled_')
+                        os.close(fd_out_new)
+                        try:
+                            resize_ppm_nearest(new_ppm, new_scaled, disp_w, disp_h)
+                        except Exception as e:
+                            os.unlink(new_scaled)
+                            self.app.root.after(0, lambda: on_extract_failed(f"缩放图像失败: {e}"))
+                            return
+                        # 在 UI 线程更新画布
+                        self.app.root.after(0, lambda: on_extract_success(new_scaled, new_w, new_h))
+                    except Exception as e:
+                        self.app.root.after(0, lambda: on_extract_failed(f"提取异常: {e}"))
+                    finally:
+                        if os.path.exists(new_ppm):
+                            os.unlink(new_ppm)
+    
+                def on_extract_success(new_scaled_path, new_orig_w, new_orig_h):
+                    """提取成功后的 UI 更新（主线程）"""
+                    nonlocal img, scaled_temp_path, orig_w, orig_h, img_w, img_h, scale_x, scale_y, points, rect_id, drag_start_display, drag_rect_id
+                    # 加载新图像
+                    try:
+                        new_img = tk.PhotoImage(file=new_scaled_path)
+                    except Exception as e:
+                        on_extract_failed(f"加载缩放后的图像失败: {e}")
+                        return
+                    # 删除旧的缩放文件并替换
+                    if os.path.exists(scaled_temp_path):
+                        try:
+                            os.unlink(scaled_temp_path)
+                        except:
+                            pass
+                    scaled_temp_path = new_scaled_path
+                    # 更新图像
+                    canvas.delete("bg_img")
+                    canvas.create_image(PADDING, PADDING, anchor=tk.NW, image=new_img, tags="bg_img")
+                    canvas.image = new_img  # 保持引用
+                    img = new_img
+                    # 更新原始尺寸和缩放系数
+                    orig_w, orig_h = new_orig_w, new_orig_h
+                    scale_x = orig_w / disp_w
+                    scale_y = orig_h / disp_h
+                    img_w, img_h = disp_w, disp_h
+                    # 清除所有矩形和拖拽状态
+                    if rect_id:
+                        canvas.delete(rect_id)
+                        rect_id = None
+                    if drag_rect_id:
+                        canvas.delete(drag_rect_id)
+                        drag_rect_id = None
+                    points = []
+                    drag_start_display = None
+                    update_info()
+                    info_var.set(f"✅ 已更新画面 (时间: {current_time:.2f}s) 请重新拖拽裁剪")
+                    self.app._append_info_ui(f"[裁剪] 跳转到 {current_time:.2f}s，提取帧尺寸 {orig_w}x{orig_h}")
+                    # 恢复按钮
+                    refresh_btn.config(state=tk.NORMAL, text="重新获取画面")
+    
+                def on_extract_failed(err_msg):
+                    """提取失败时的处理"""
+                    info_var.set(f"❌ {err_msg}")
+                    self.app._append_info_ui(f"[裁剪] 提取失败: {err_msg}")
+                    refresh_btn.config(state=tk.NORMAL, text="重新获取画面")
+    
+                # 启动后台线程
+                import threading
+                threading.Thread(target=extract_thread, daemon=True).start()
+    
+            refresh_btn = ttk.Button(right_frame, text="重新获取画面", command=on_refresh_click)
+            refresh_btn.pack(pady=2, fill=tk.X)
+    
+            # 时间格式提示
+            ttk.Label(right_frame, text="支持格式: 秒数 (如 10.5) 或 HH:MM:SS[.mmm]", foreground="gray", wraplength=RIGHT_PANEL_WIDTH-20).pack(pady=(2,10))
+    
+            # ---------- 11. 其他按钮 ----------
             btn_frame = ttk.Frame(right_frame)
             btn_frame.pack(fill=tk.X, pady=5)
     
@@ -1571,7 +1704,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             tip = "按住左键拖拽绘制矩形（可从边缘外开始），松开确定。黄色虚线为辅助，红色为最终选区。"
             ttk.Label(right_frame, text=tip, foreground="gray", wraplength=RIGHT_PANEL_WIDTH-20).pack(pady=10)
     
-            # ---- 若已有裁剪参数，自动加载矩形 ----
+            # ---------- 12. 若已有裁剪参数，自动加载矩形 ----------
             if self.crop_enabled.get():
                 try:
                     w = int(self.crop_width.get())
@@ -2924,8 +3057,8 @@ class FFmpegBatchGUI:
         end_sec = time_to_seconds(end) if end else None
     
         if start_sec is not None:
-            cmd_list.extend(["-ss", str(start_sec)])
-            # 计算输出时长
+            # 保留 3 位小数（毫秒精度）
+            cmd_list.extend(["-ss", f"{start_sec:.3f}"])
             duration = None
             total_duration = self._get_media_duration(input_path)
             if end_sec is not None:
@@ -2934,7 +3067,7 @@ class FFmpegBatchGUI:
                 duration = total_duration - start_sec
     
             if duration is not None and duration > 0:
-                cmd_list.extend(["-t", str(duration)])
+                cmd_list.extend(["-t", f"{duration:.3f}"])
             else:
                 self._append_info_ui("无法计算精准截取时长，将不添加 -t，输出可能不准确。")
     
