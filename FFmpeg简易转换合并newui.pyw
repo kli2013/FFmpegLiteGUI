@@ -1029,6 +1029,8 @@ class VideoFilterFrame(ttk.LabelFrame):
         super().__init__(parent, text="视频滤镜 (缩放/裁剪/旋转/变速/反交错/像素格式)", padding="5", **kwargs)
         self.app = app
         self.current_file = None
+        self.current_track = None
+        self.override_settings = None
         self.create_widgets()
 
     def create_widgets(self):
@@ -1225,9 +1227,21 @@ class VideoFilterFrame(ttk.LabelFrame):
         except Exception as e:
             self.app._append_info_ui(f"[裁剪辅助] 提取视频帧失败: {e}")
             return None, None
-    
+
+
+    def set_track(self, track):
+        """设置当前编辑的轨道，用于获取截取设置"""
+        self.current_track = track
+        if track:
+            self.current_file = track.file_path
+
+    def set_override_settings(self, settings):
+        """设置外部传入的设置字典，用于读取截取起始时间"""
+        self.override_settings = settings
+
+
     def open_crop_editor(self):
-        """可视化裁剪窗口 - 拖拽绘制矩形，支持时间跳转重新取帧"""
+        """可视化裁剪窗口 - 拖拽绘制矩形，支持时间跳转重新取帧，初始时间自动从主界面的截取起始时间获取"""
         input_file = getattr(self, 'current_file', None)
         if not input_file or not os.path.exists(input_file):
             input_file = self.app.input_file.get().strip()
@@ -1240,8 +1254,40 @@ class VideoFilterFrame(ttk.LabelFrame):
             messagebox.showerror("错误", "未找到 ffmpeg，无法提取视频帧")
             return
     
-        # ---------- 提取当前帧（默认为 0 秒） ----------
-        current_time = 0.0
+        # ----- 从当前轨道或主界面获取截取起始时间 未启用则为0秒 -----
+        initial_time = 0.0
+        # 优先使用 override_settings
+        if self.override_settings is not None:
+            if self.override_settings.get("trim_enabled", False):
+                start_str = self.override_settings.get("trim_start", "").strip()
+                if start_str:
+                    sec = time_to_seconds(start_str)
+                    if sec is not None and sec >= 0:
+                        initial_time = sec
+                        self.app._append_info_ui(f"[裁剪] 自动使用外部设置的截取起始时间: {sec:.2f}s")
+        elif self.current_track is not None:
+            # 轨道设置
+            enc = self.current_track.enc_settings
+            if enc.get("trim_enabled", False):
+                start_str = enc.get("trim_start", "").strip()
+                if start_str:
+                    sec = time_to_seconds(start_str)
+                    if sec is not None and sec >= 0:
+                        initial_time = sec
+                        self.app._append_info_ui(f"[裁剪] 自动使用轨道截取起始时间: {sec:.2f}s")
+        else:
+            # 主界面
+            if self.app.trim_frame.trim_enabled.get():
+                start_str = self.app.trim_frame.trim_start.get().strip()
+                if start_str:
+                    sec = time_to_seconds(start_str)
+                    if sec is not None and sec >= 0:
+                        initial_time = sec
+                        self.app._append_info_ui(f"[裁剪] 自动使用主界面截取起始时间: {sec:.2f}s")
+    
+        current_time = initial_time
+    
+        # 提取初始帧
         fd, ppm_path = tempfile.mkstemp(suffix='.ppm', prefix='ffgui_crop_')
         os.close(fd)
         orig_w, orig_h = self.extract_video_frame_ppm(input_file, ppm_path, frame_sec=current_time)
@@ -1308,6 +1354,7 @@ class VideoFilterFrame(ttk.LabelFrame):
         # 删除原始 ppm（缩放后的暂存文件在窗口关闭时清理）
         os.unlink(ppm_path)
     
+        # 坐标转换因子（需要被后续更新）
         scale_x = orig_w / disp_w
         scale_y = orig_h / disp_h
         img_w, img_h = disp_w, disp_h
@@ -1538,34 +1585,16 @@ class VideoFilterFrame(ttk.LabelFrame):
                         pass
     
             # ---------- 时间跳转和重新获取画面 ----------
-            time_var = tk.StringVar(value="0.0")
+            time_var = tk.StringVar(value=str(initial_time))
             time_entry = ttk.Entry(right_frame, textvariable=time_var, width=12)
             time_entry.pack(pady=(10,2), fill=tk.X)
     
-            # 解析时间字符串的辅助函数
             def parse_time_str(s):
-                s = s.strip()
-                if not s:
-                    return None
-                # 尝试直接解析为浮点数
-                try:
-                    return float(s)
-                except ValueError:
-                    pass
-                # 尝试解析 HH:MM:SS[.mmm] 或 MM:SS[.mmm]
-                import re
-                m = re.match(r'^(?:(\d+):)?(\d{1,2}):(\d{1,2}(?:\.\d{1,3})?)$', s)
-                if m:
-                    h = int(m.group(1)) if m.group(1) else 0
-                    m_ = int(m.group(2))
-                    sec = float(m.group(3))
-                    return h * 3600 + m_ * 60 + sec
-                return None
+                return time_to_seconds(s)
     
             def on_refresh_click():
-                """点击重新获取画面按钮"""
-                nonlocal current_time, img, scaled_temp_path, orig_w, orig_h, scale, img_w, img_h
-                # 解析时间
+
+                nonlocal current_time, img, scaled_temp_path, orig_w, orig_h, scale_x, scale_y, img_w, img_h
                 time_str = time_var.get().strip()
                 if not time_str:
                     messagebox.showwarning("提示", "请输入时间")
@@ -1574,32 +1603,25 @@ class VideoFilterFrame(ttk.LabelFrame):
                 if sec is None:
                     messagebox.showerror("错误", f"无效的时间格式: {time_str}\n支持格式: 秒数 (如 10.5) 或 HH:MM:SS[.mmm]")
                     return
-                # 检查是否超出视频总时长（可选）
                 total_duration = self.app._get_media_duration(input_file)
                 if total_duration is not None and sec > total_duration:
                     messagebox.showwarning("警告", f"输入时间 {sec:.2f}s 超过视频总时长 {total_duration:.2f}s，将跳转到末尾")
                     sec = total_duration
                 current_time = sec
     
-                # 禁用按钮，显示状态
                 refresh_btn.config(state=tk.DISABLED, text="提取中...")
                 info_var.set("⏳ 正在提取画面，请稍候...")
                 win.update_idletasks()
     
                 def extract_thread():
-                    """在后台线程中提取帧并更新 UI"""
                     nonlocal ppm_path, scaled_temp_path, img
-                    # 生成新的临时 ppm 路径
                     fd_new, new_ppm = tempfile.mkstemp(suffix='.ppm', prefix='ffgui_crop_')
                     os.close(fd_new)
                     try:
-                        # 提取新帧
                         new_w, new_h = self.extract_video_frame_ppm(input_file, new_ppm, frame_sec=sec)
                         if new_w is None or new_h is None:
-                            # 提取失败
                             self.app.root.after(0, lambda: on_extract_failed("提取帧失败，请检查文件是否支持"))
                             return
-                        # 缩放新图像
                         fd_out_new, new_scaled = tempfile.mkstemp(suffix='.ppm', prefix='ffgui_scaled_')
                         os.close(fd_out_new)
                         try:
@@ -1608,7 +1630,6 @@ class VideoFilterFrame(ttk.LabelFrame):
                             os.unlink(new_scaled)
                             self.app.root.after(0, lambda: on_extract_failed(f"缩放图像失败: {e}"))
                             return
-                        # 在 UI 线程更新画布
                         self.app.root.after(0, lambda: on_extract_success(new_scaled, new_w, new_h))
                     except Exception as e:
                         self.app.root.after(0, lambda: on_extract_failed(f"提取异常: {e}"))
@@ -1617,32 +1638,28 @@ class VideoFilterFrame(ttk.LabelFrame):
                             os.unlink(new_ppm)
     
                 def on_extract_success(new_scaled_path, new_orig_w, new_orig_h):
-                    """提取成功后的 UI 更新（主线程）"""
-                    nonlocal img, scaled_temp_path, orig_w, orig_h, img_w, img_h, scale_x, scale_y, points, rect_id, drag_start_display, drag_rect_id
-                    # 加载新图像
+
+                    nonlocal img, scaled_temp_path, orig_w, orig_h, img_w, img_h, scale_x, scale_y
+                    nonlocal points, rect_id, drag_start_display, drag_rect_id
                     try:
                         new_img = tk.PhotoImage(file=new_scaled_path)
                     except Exception as e:
                         on_extract_failed(f"加载缩放后的图像失败: {e}")
                         return
-                    # 删除旧的缩放文件并替换
                     if os.path.exists(scaled_temp_path):
                         try:
                             os.unlink(scaled_temp_path)
                         except:
                             pass
                     scaled_temp_path = new_scaled_path
-                    # 更新图像
                     canvas.delete("bg_img")
                     canvas.create_image(PADDING, PADDING, anchor=tk.NW, image=new_img, tags="bg_img")
-                    canvas.image = new_img  # 保持引用
+                    canvas.image = new_img
                     img = new_img
-                    # 更新原始尺寸和缩放系数
                     orig_w, orig_h = new_orig_w, new_orig_h
                     scale_x = orig_w / disp_w
                     scale_y = orig_h / disp_h
                     img_w, img_h = disp_w, disp_h
-                    # 清除所有矩形和拖拽状态
                     if rect_id:
                         canvas.delete(rect_id)
                         rect_id = None
@@ -1654,23 +1671,18 @@ class VideoFilterFrame(ttk.LabelFrame):
                     update_info()
                     info_var.set(f"✅ 已更新画面 (时间: {current_time:.2f}s) 请重新拖拽裁剪")
                     self.app._append_info_ui(f"[裁剪] 跳转到 {current_time:.2f}s，提取帧尺寸 {orig_w}x{orig_h}")
-                    # 恢复按钮
                     refresh_btn.config(state=tk.NORMAL, text="重新获取画面")
     
                 def on_extract_failed(err_msg):
-                    """提取失败时的处理"""
                     info_var.set(f"❌ {err_msg}")
                     self.app._append_info_ui(f"[裁剪] 提取失败: {err_msg}")
                     refresh_btn.config(state=tk.NORMAL, text="重新获取画面")
     
-                # 启动后台线程
-                import threading
                 threading.Thread(target=extract_thread, daemon=True).start()
     
             refresh_btn = ttk.Button(right_frame, text="重新获取画面", command=on_refresh_click)
             refresh_btn.pack(pady=2, fill=tk.X)
     
-            # 时间格式提示
             ttk.Label(right_frame, text="支持格式: 秒数 (如 10.5) 或 HH:MM:SS[.mmm]", foreground="gray", wraplength=RIGHT_PANEL_WIDTH-20).pack(pady=(2,10))
     
             # ---------- 其他按钮 ----------
@@ -2714,7 +2726,8 @@ class AdvancedFrame(ttk.LabelFrame):
             track_idx=None,
             pip_enabled_var=None,
             overlay_mode='sub',
-            parent=self
+            parent=self,
+            track_obj=None
         )
     
     def _on_watermark_saved(self, new_settings):
@@ -5079,7 +5092,8 @@ class FFmpegBatchGUI:
                     on_save=on_save,
                     file_path=task_watermark.get("file_path"),
                     is_watermark=True,
-                    parent=win
+                    parent=win,
+                    track_obj=None
                 )
             wm_btn = ttk.Button(page_adv, text="编辑当前任务水印设置", command=open_task_watermark)
             wm_btn.pack(pady=5)
@@ -5861,7 +5875,8 @@ class FFmpegBatchGUI:
 
     def edit_video_settings(self, title, initial_settings, on_save, file_path=None,
                             is_watermark=False, track_idx=None, pip_enabled_var=None,
-                            overlay_mode='sub', parent=None, show_loop_chroma=True):
+                            overlay_mode='sub', parent=None, show_loop_chroma=True,
+                            track_obj=None):
         if parent is None:
             parent = self.root
         with self.SafeToplevel(parent) as win:
@@ -5882,6 +5897,13 @@ class FFmpegBatchGUI:
             filt_frame = VideoFilterFrame(page_filt, app=self)
             if file_path:
                 filt_frame.current_file = file_path
+            # 设置轨道或覆盖设置
+            if track_obj is not None:
+                filt_frame.set_track(track_obj)
+            else:
+                # 如果传入的设置中包含 trim 相关键，则认为独立设置
+                if "trim_enabled" in initial_settings or "trim_start" in initial_settings:
+                    filt_frame.set_override_settings(initial_settings)
             filt_frame.pack(fill=tk.X, padx=5, pady=5)
             filt_frame.set_settings(initial_settings)
 
@@ -6016,7 +6038,8 @@ class FFmpegBatchGUI:
             pip_enabled_var=self.pip_enabled,
             overlay_mode=overlay_mode,
             parent=self.root,
-            show_loop_chroma=show_loop
+            show_loop_chroma=show_loop,
+            track_obj=track   # 传递轨道对象
         )
     
     
