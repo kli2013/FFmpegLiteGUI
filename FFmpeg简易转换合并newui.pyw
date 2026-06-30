@@ -349,6 +349,24 @@ class PresetManager:
         with open(self.preset_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
 
+def time_to_seconds(timestr: str) -> Optional[float]:
+    """将 HH:MM:SS[.mmm] 或 MM:SS[.mmm] 或纯数字转换为秒数"""
+    if not timestr:
+        return None
+    timestr = timestr.strip()
+    parts = timestr.split(':')
+    try:
+        if len(parts) == 3:
+            h, m, s = parts
+            return int(h) * 3600 + int(m) * 60 + float(s)
+        elif len(parts) == 2:
+            m, s = parts
+            return int(m) * 60 + float(s)
+        else:
+            return float(timestr)
+    except ValueError:
+        return None
+
 # ================== 滤镜链构建 ==================
 def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = True, include_speed: bool = True) -> str:
     """
@@ -357,6 +375,9 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
     include_speed: 是否包含变速滤镜
     """
     filters = []
+    
+
+    
     # 裁剪
     if settings.get("crop_enabled", False):
         w = settings.get("crop_width", "").strip()
@@ -1817,10 +1838,20 @@ class TrimFrame(ttk.LabelFrame):
                                           command=self.on_trim_toggle)
         self.trim_check.pack(anchor=tk.W, pady=(0,10))
         ToolTip(self.trim_check, 
-                "对从视频（水印/画中画子视频）启用截取可能导致输出文件所有画面在截取结束时定格，请谨慎使用。\n"
-                "而且FFmpeg粗略的截取也不能精确到帧，不截取最好。\n"
-                "建议对子视频先预处理，或避免同时使用截取和循环。",
-                wraplength=400)
+                "默认是 -ss 在 -i 之前的快速模式，快速无损截取请把音频视频都改为Copy\n\n"
+                "截取功能限制说明：\n\n"
+                "对主视频截取（当前主界面输入的视频）：\n"
+                "   若同时启用了「水印」或「画中画（子视频）」，截取可能失效。\n"
+                "   常见问题：输出时长仍为原视频长度、画面从开头播放、或截取结束时画面定格。\n\n"
+                "对子视频（水印/画中画素材）截取：\n"
+                "   若在子视频的设置中启用截取，可能导致输出视频根据子视频的短时间提前结束，\n"
+                "   或出现画面闪烁、黑屏等异常。\n\n"
+                "推荐处理方式：\n"
+                "  ① 先单独对主视频进行截取转码（在「视频转码」标签页中操作），生成截取后的主视频；\n"
+                "  ② 再以截取后的视频作为主视频，在「封装/合并」标签页中添加水印或画中画；\n"
+                "  ③ 子视频如需截取，也建议先预处理后再导入。\n\n"
+                "当前功能仅适用于单视频截取，无水印/画中画时效果最佳。",
+                wraplength=500)
 
         time_frame = ttk.Frame(self)
         time_frame.pack(fill=tk.X, pady=2)
@@ -1836,10 +1867,32 @@ class TrimFrame(ttk.LabelFrame):
         self.trim_end_entry = ttk.Entry(time_frame2, textvariable=self.trim_end, width=12)
         self.trim_end_entry.pack(side=tk.LEFT, padx=5)
     
+        # ----- 新增：精准到帧复选框 -----
+        precise_frame = ttk.Frame(self)
+        precise_frame.pack(fill=tk.X, pady=5)
+        self.precise_trim = tk.BooleanVar(value=False)
+        self.precise_check = ttk.Checkbutton(
+            precise_frame, 
+            text="精准到帧（需重新编码，速度慢）", 
+            variable=self.precise_trim,
+            command=self.on_precise_toggle
+        )
+        self.precise_check.pack(side=tk.LEFT, padx=5)
+        ToolTip(self.precise_check,
+                "勾选后，截取将精确到帧（-ss 放在 -i 之后），但必须重新编码视频。\n"
+                "若编码器为「copy」将自动改为 libx264 并提示。\n"
+                "取消勾选则为快速截取（基于关键帧），可能不精确但速度快。",
+                wraplength=400)
+        # 新增结束
+
         info_label = ttk.Label(self, text="示例: 01:23:45 或 01:23:45.500 (留空表示到文件末尾)", foreground="gray")
         info_label.pack(anchor=tk.W, pady=(5,0))
 
         self.on_trim_toggle()
+
+    def on_precise_toggle(self):
+        # 精准模式不需要禁用任何控件，仅用于界面反馈（可留空）
+        pass
 
     def on_trim_toggle(self):
         state = tk.NORMAL if self.trim_enabled.get() else tk.DISABLED
@@ -1850,13 +1903,15 @@ class TrimFrame(ttk.LabelFrame):
         return {
             "trim_enabled": self.trim_enabled.get(),
             "trim_start": self.trim_start.get(),
-            "trim_end": self.trim_end.get()
+            "trim_end": self.trim_end.get(),
+            "precise_trim": self.precise_trim.get()   # 新增
         }
 
     def set_settings(self, settings):
         self.trim_enabled.set(settings.get("trim_enabled", False))
         self.trim_start.set(settings.get("trim_start", "0"))
         self.trim_end.set(settings.get("trim_end", ""))
+        self.precise_trim.set(settings.get("precise_trim", False))   # 新增
         self.on_trim_toggle()
 
 # ================== 公共组件：循环与绿幕 ==================
@@ -1881,7 +1936,7 @@ class LoopChromaFrame(ttk.LabelFrame):
         chk.grid(row=0, column=0, sticky="w", pady=(0,5))
         ToolTip(chk, 
                 "勾选后可设置显示次数或仅显示一次。\n"
-                "注意：图片文件时长通常为 0.04 秒，若选择“一次”会导致瞬间消失，\n"
+                "注意：图片文件时长就1帧，若选择“一次”会导致瞬间消失，\n"
                 "您可复制生成的命令，手动修改 enable 表达式中的时间值以达到预期效果。",
                 wraplength=400)
 
@@ -2844,6 +2899,49 @@ class FFmpegBatchGUI:
                 cmd_list.extend(["-to", end])
 
 
+    def _enforce_reencode_for_precise_trim(self, settings: dict, only_audio: bool = False):
+        """精准模式下强制重新编码"""
+        if settings.get("precise_trim", False) and not only_audio:
+            if settings.get("encoder") == "copy":
+                settings["encoder"] = "libx265"
+                self._append_info_ui("精准截取模式下，编码器不能为 copy，已自动改为 libx265。")
+
+    def _apply_precise_trim(self, cmd_list: List[str], settings: dict, input_path: str) -> List[str]:
+        """
+        在精准截取模式下，向命令列表添加 -ss 和 -t 参数（放在 -i 之后）。
+        :param cmd_list: 当前命令列表（会被修改）
+        :param settings: 设置字典
+        :param input_path: 输入文件路径（用于获取总时长）
+        :return: 修改后的命令列表（便于链式调用）
+        """
+        precise_trim = settings.get("precise_trim", False)
+        if not precise_trim:
+            return cmd_list
+    
+        start = settings.get("trim_start", "").strip()
+        end = settings.get("trim_end", "").strip()
+        start_sec = time_to_seconds(start) if start else None
+        end_sec = time_to_seconds(end) if end else None
+    
+        if start_sec is not None:
+            cmd_list.extend(["-ss", str(start_sec)])
+            # 计算输出时长
+            duration = None
+            total_duration = self._get_media_duration(input_path)
+            if end_sec is not None:
+                duration = end_sec - start_sec
+            elif total_duration is not None:
+                duration = total_duration - start_sec
+    
+            if duration is not None and duration > 0:
+                cmd_list.extend(["-t", str(duration)])
+            else:
+                self._append_info_ui("无法计算精准截取时长，将不添加 -t，输出可能不准确。")
+    
+        return cmd_list
+
+
+
     def _get_media_duration(self, file_path):
         """获取媒体文件时长（秒），失败返回 None"""
         if not self.ffprobe_cmd:
@@ -3268,6 +3366,10 @@ class FFmpegBatchGUI:
         input_path = normalize_path(input_path)
         output_path = normalize_path(output_path)
         only_audio = settings.get("only_audio", False)
+        precise_trim = settings.get("precise_trim", False)
+    
+        # 精准模式下强制重新编码
+        self._enforce_reencode_for_precise_trim(settings, only_audio)
     
         # ---------- 检查水印 ----------
         wm_settings = settings.get("watermark", {})
@@ -3280,14 +3382,18 @@ class FFmpegBatchGUI:
         # ---------- 普通模式（无复杂水印） ----------
         cmd_list = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
     
-        self._add_trim_params(cmd_list, settings)
+        # 只有非精准模式才在命令行添加 -ss/-to（快速模式）
+        if not precise_trim:
+            self._add_trim_params(cmd_list, settings)
     
-
         if not only_audio:
             self._add_hwaccel_params(cmd_list, settings)
     
         cmd_list.extend(["-i", input_path])
     
+        # ----- 精准模式：在 -i 后添加 -ss 和 -t -----
+        self._apply_precise_trim(cmd_list, settings, input_path)
+
         if only_audio:
             cmd_list.append("-vn")
         else:
@@ -3337,15 +3443,14 @@ class FFmpegBatchGUI:
     def _generate_command_with_watermark(self, input_path: str, output_path: str, settings: dict, wm_settings: dict) -> List[str]:
         main_w, main_h = get_video_dimensions(self.ffprobe_cmd, input_path)
         if main_w is not None and main_h is not None:
-            if wm_settings.get("adaptive", False):   # ← 新增判断
+            if wm_settings.get("adaptive", False):
                 adapted_wm = self._adapt_sub_settings(wm_settings, main_w, main_h)
             else:
-                adapted_wm = wm_settings.copy()      # 不自动缩放，但复制一份避免污染原数据
+                adapted_wm = wm_settings.copy()
         else:
             adapted_wm = copy.deepcopy(wm_settings)
 
-    
-        # ---- 2. 开始构建命令 ----
+        # ---- 开始构建命令 ----
         cmd_list = [self.ffmpeg_cmd, "-y"]
     
         wm_file = adapted_wm.get("file_path", "").strip()
@@ -3365,13 +3470,22 @@ class FFmpegBatchGUI:
         else:
             cmd_list.append("-fflags")
             cmd_list.append("+genpts")
-    
-        self._add_trim_params(cmd_list, settings)
+
+        precise_trim = settings.get("precise_trim", False)
+        self._enforce_reencode_for_precise_trim(settings, only_audio=False)
+
+        # 只有非精准模式才在命令行添加 -ss/-to（快速模式）
+        if not precise_trim:
+            self._add_trim_params(cmd_list, settings)
+
         self._add_hwaccel_params(cmd_list, settings)
     
         cmd_list.extend(["-i", input_path])
     
-        # ---- 3. 添加水印输入（图片或视频） ----
+        # ----- 精准模式：在 -i 后添加 -ss 和 -t（针对主视频） -----
+        self._apply_precise_trim(cmd_list, settings, input_path)
+
+        # ---- 添加水印输入（图片或视频） ----
         if not is_image:
             self._add_infinite_loop_params(cmd_list, wm_file)
             cmd_list.extend(["-i", wm_file])
@@ -3383,26 +3497,26 @@ class FFmpegBatchGUI:
         if use_infinite_loop:
             cmd_list.append("-shortest")
     
-        # ---- 4. 构建叠加滤镜（使用自适应后的设置） ----
-        sub_infos = [(1, wm_file, adapted_wm)]  # 水印作为子视频，输入索引为1
+        # ---- 构建叠加滤镜（使用自适应后的设置） ----
+        sub_infos = [(1, wm_file, adapted_wm)]
         complex_filter, final_v_label = self._build_overlay_filter_complex(
             0, settings, sub_infos, include_subtitle_main=True
         )
         cmd_list.extend(["-filter_complex", complex_filter])
         cmd_list.extend(["-map", final_v_label])
     
-        # ---- 5. 视频编码参数 ----
+        # ---- 视频编码参数 ----
         cmd_list = self._build_video_encoding_params(cmd_list, settings)
         cmd_list.extend(["-vsync", "cfr"])
     
-        # ---- 6. 音频处理 ----
+        # ---- 音频处理 ----
         if settings.get("audio_enabled", True):
             cmd_list.extend(["-map", "0:a:0"])
             cmd_list = self._build_audio_encoding_params(cmd_list, settings)
         else:
             cmd_list.append("-an")
     
-        # ---- 7. 自定义参数与容器优化 ----
+        # ---- 自定义参数与容器优化 ----
         custom = settings.get("custom_args", "").strip()
         if custom:
             try:
@@ -5245,34 +5359,56 @@ class FFmpegBatchGUI:
         video_tracks = [t for t in enabled_tracks if t.type == "video"]
         sub_video_files = {normalize_path(t.file_path) for t in video_tracks[1:]}  # 从视频文件集合
         img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
-
         
-        # ---- 处理截取参数（从 enc_settings 读取） ----
-        file_trim = {}
+        # ---- 处理截取参数（从 enc_settings 读取，包含 precise） ----
+        file_trim_info = {}   # key: file_path, value: (start, end, precise)
         for track in enabled_tracks:
             if track.type == "video":
                 trim_enabled = track.enc_settings.get("trim_enabled", False)
                 if trim_enabled:
                     start = track.enc_settings.get("trim_start", "").strip()
                     end = track.enc_settings.get("trim_end", "").strip()
+                    precise = track.enc_settings.get("precise_trim", False)
                     if start or end:
                         norm_key = normalize_path(track.file_path)
-                        file_trim[norm_key] = (start, end)
+                        file_trim_info[norm_key] = (start, end, precise)
+        
+        # ---- 检查精准截取与编码器冲突（强制重编码） ----
+        for track in video_tracks:
+            if track.file_path in file_trim_info:
+                _, _, precise = file_trim_info[normalize_path(track.file_path)]
+                if precise and track.enc_settings.get("encoder") == "copy":
+                    track.enc_settings["encoder"] = "libx265"
+                    self._append_info_ui(f"精准截取模式下，视频 {os.path.basename(track.file_path)} 编码器不能为 copy，已改为 libx265。")
         
         # ---- 构建基础命令 ----
         cmd_list = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
         
         # ---- 添加输入文件（带循环和截取参数） ----
         for f in input_files_norm:
+            # 循环参数（子视频）
             if f in sub_video_files:
                 self._add_infinite_loop_params(cmd_list, f, framerate="30")
-            if f in file_trim:
-                start, end = file_trim[f]
-                if start:
+            # 快速模式截取参数：放在 -i 前
+            if f in file_trim_info:
+                start, end, precise = file_trim_info[f]
+                if start and not precise:
                     cmd_list.extend(["-ss", start])
-                if end:
-                    cmd_list.extend(["-to", end])
+                    if end:
+                        cmd_list.extend(["-to", end])
+            # 添加输入
             cmd_list.extend(["-i", f])
+            # 精准模式：在 -i 后添加 -ss 和 -t（使用公共函数）
+            if f in file_trim_info:
+                start, end, precise = file_trim_info[f]
+                if precise and start:
+                    # 构造临时 settings 字典，仅包含精准截取所需字段
+                    temp_settings = {
+                        "precise_trim": True,
+                        "trim_start": start,
+                        "trim_end": end
+                    }
+                    self._apply_precise_trim(cmd_list, temp_settings, f)
         
         # ---- 分离轨道 ----
         video_tracks = [t for t in enabled_tracks if t.type == "video"]
@@ -5284,7 +5420,6 @@ class FFmpegBatchGUI:
             return []
         
         # ---- 画中画模式（使用 filter_complex） ----
-
         if self.pip_enabled.get():
             main_video = video_tracks[0]
             sub_videos = video_tracks[1:]
@@ -5296,10 +5431,7 @@ class FFmpegBatchGUI:
                 sv_idx = input_files_norm.index(normalize_path(sv.file_path))
                 sub_infos.append((sv_idx, sv.file_path, sv.enc_settings))
 
-
-
-            # 构建 filter_complex（主视频字幕由主设置决定，可在调用时指定）
-            # 这里主视频设置的字幕可能来自外部，但 merge 中未直接支持字幕，故我们设为 False
+            # 构建 filter_complex
             complex_filter, final_v_label = self._build_overlay_filter_complex(
                 main_idx, main_video.enc_settings, sub_infos, include_subtitle_main=False
             )
@@ -5339,7 +5471,6 @@ class FFmpegBatchGUI:
             if vcodec == "copy":
                 cmd_list.extend(["-c:v", "copy"])
             else:
-                # 使用公共函数
                 cmd_list = self._build_video_encoding_params(cmd_list, v_settings)
             
             # 音频轨道
@@ -6574,6 +6705,7 @@ class FFmpegBatchGUI:
         self.trim_frame.trim_enabled.trace_add("write", lambda *a: self.update_command_preview())
         self.trim_frame.trim_start.trace_add("write", lambda *a: self.update_command_preview())
         self.trim_frame.trim_end.trace_add("write", lambda *a: self.update_command_preview())
+        self.trim_frame.precise_trim.trace_add("write", lambda *a: self.update_command_preview())
         self.adv_frame.hwaccel_enabled.trace_add("write", lambda *a: self.update_command_preview())
         self.adv_frame.hwaccel_decoder.trace_add("write", lambda *a: self.update_command_preview())
         self.adv_frame.custom_args.trace_add("write", lambda *a: self.update_command_preview())
