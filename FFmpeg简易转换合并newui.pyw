@@ -1031,6 +1031,7 @@ class VideoFilterFrame(ttk.LabelFrame):
         self.current_file = None
         self.current_track = None
         self.override_settings = None
+        self.get_trim_settings_callback = None
         self.create_widgets()
 
     def create_widgets(self):
@@ -1239,6 +1240,9 @@ class VideoFilterFrame(ttk.LabelFrame):
         """设置外部传入的设置字典，用于读取截取起始时间"""
         self.override_settings = settings
 
+    def set_get_trim_settings_callback(self, callback):
+        """设置一个回调函数，用于获取当前的截取设置（由编辑窗口提供）"""
+        self.get_trim_settings_callback = callback
 
     def open_crop_editor(self):
         """可视化裁剪窗口 - 拖拽绘制矩形，支持时间跳转重新取帧，初始时间自动从主界面的截取起始时间获取"""
@@ -1254,19 +1258,35 @@ class VideoFilterFrame(ttk.LabelFrame):
             messagebox.showerror("错误", "未找到 ffmpeg，无法提取视频帧")
             return
     
+
         # ----- 从当前轨道或主界面获取截取起始时间 未启用则为0秒 -----
         initial_time = 0.0
-        # 优先使用 override_settings
-        if self.override_settings is not None:
+        
+        # 1. 优先使用回调（实时获取当前编辑窗口的截取设置）
+        if hasattr(self, 'get_trim_settings_callback') and self.get_trim_settings_callback is not None:
+            trim_settings = self.get_trim_settings_callback()
+            if trim_settings.get("trim_enabled", False):
+                start_str = trim_settings.get("trim_start", "").strip()
+                if start_str:
+                    sec = time_to_seconds(start_str)
+                    if sec is not None and sec >= 0:
+                        initial_time = sec
+                        self.app._append_info_ui(f"[裁剪] 使用当前编辑窗口的截取起始时间: {sec:.2f}s")
+            # 注意：一旦有回调，无论是否启用截取，都不再检查其他来源
+            # 因此不再继续往下
+        
+        # 2. 其次使用 override_settings（静态外部设置）
+        elif self.override_settings is not None:
             if self.override_settings.get("trim_enabled", False):
                 start_str = self.override_settings.get("trim_start", "").strip()
                 if start_str:
                     sec = time_to_seconds(start_str)
                     if sec is not None and sec >= 0:
                         initial_time = sec
-                        self.app._append_info_ui(f"[裁剪] 自动使用外部设置的截取起始时间: {sec:.2f}s")
+                        self.app._append_info_ui(f"[裁剪] 使用外部设置的截取起始时间: {sec:.2f}s")
+        
+        # 3. 再次使用轨道设置
         elif self.current_track is not None:
-            # 轨道设置
             enc = self.current_track.enc_settings
             if enc.get("trim_enabled", False):
                 start_str = enc.get("trim_start", "").strip()
@@ -1274,16 +1294,17 @@ class VideoFilterFrame(ttk.LabelFrame):
                     sec = time_to_seconds(start_str)
                     if sec is not None and sec >= 0:
                         initial_time = sec
-                        self.app._append_info_ui(f"[裁剪] 自动使用轨道截取起始时间: {sec:.2f}s")
+                        self.app._append_info_ui(f"[裁剪] 使用轨道截取起始时间: {sec:.2f}s")
+        
+        # 4. 最后使用主界面
         else:
-            # 主界面
             if self.app.trim_frame.trim_enabled.get():
                 start_str = self.app.trim_frame.trim_start.get().strip()
                 if start_str:
                     sec = time_to_seconds(start_str)
                     if sec is not None and sec >= 0:
                         initial_time = sec
-                        self.app._append_info_ui(f"[裁剪] 自动使用主界面截取起始时间: {sec:.2f}s")
+                        self.app._append_info_ui(f"[裁剪] 使用主界面截取起始时间: {sec:.2f}s")
     
         current_time = initial_time
     
@@ -5000,6 +5021,7 @@ class FFmpegBatchGUI:
             notebook.add(page_filt, text="视频滤镜")
             filt_frame = VideoFilterFrame(page_filt, app=self)
             filt_frame.current_file = task.input
+            filt_frame.set_override_settings(task.settings)
             filt_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
             filt_frame.set_settings(task.settings)
     
@@ -5018,6 +5040,8 @@ class FFmpegBatchGUI:
             trim_frame = TrimFrame(page_trim)
             trim_frame.pack(fill=tk.X, padx=5, pady=5)
             trim_frame.set_settings(task.settings)
+            
+            filt_frame.set_get_trim_settings_callback(lambda: trim_frame.get_settings())
     
             # 高级选项页面
             page_adv = ttk.Frame(notebook)
@@ -5904,6 +5928,8 @@ class FFmpegBatchGUI:
                 # 如果传入的设置中包含 trim 相关键，则认为独立设置
                 if "trim_enabled" in initial_settings or "trim_start" in initial_settings:
                     filt_frame.set_override_settings(initial_settings)
+
+
             filt_frame.pack(fill=tk.X, padx=5, pady=5)
             filt_frame.set_settings(initial_settings)
 
@@ -5913,6 +5939,9 @@ class FFmpegBatchGUI:
             trim_frame = TrimFrame(page_trim)
             trim_frame.pack(fill=tk.X, padx=5, pady=5)
             trim_frame.set_settings(initial_settings)
+
+            # 设置回调（此时 trim_frame 已存在）
+            filt_frame.set_get_trim_settings_callback(lambda: trim_frame.get_settings())
 
             # ---- 页面4：循环/绿幕控制（仅在需要时显示） ----
             loop_chroma_frame = None  # 占位，确保变量始终存在
