@@ -1240,7 +1240,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             messagebox.showerror("错误", "未找到 ffmpeg，无法提取视频帧")
             return
     
-        # ---------- 1. 提取当前帧（默认为 0 秒） ----------
+        # ---------- 提取当前帧（默认为 0 秒） ----------
         current_time = 0.0
         fd, ppm_path = tempfile.mkstemp(suffix='.ppm', prefix='ffgui_crop_')
         os.close(fd)
@@ -1249,15 +1249,15 @@ class VideoFilterFrame(ttk.LabelFrame):
             os.unlink(ppm_path)
             return
     
-        # ---------- 2. 计算显示尺寸 ----------
+        # 屏幕可用区域
         screen_w = self.app.root.winfo_screenwidth()
         screen_h = self.app.root.winfo_screenheight()
         max_w = int(screen_w * 0.9)
         max_h = int(screen_h * 0.9)
         RIGHT_PANEL_WIDTH = 280
         EXTRA_HEIGHT = 10
-        PADDING = 10
-        WINDOW_MARGIN = 20
+        PADDING = 10           # 图片外边距
+        WINDOW_MARGIN = 20     # 右边菜单控件和图片区的间隔
         avail_w = max_w - RIGHT_PANEL_WIDTH - WINDOW_MARGIN - PADDING * 2
         avail_h = max_h - EXTRA_HEIGHT - PADDING * 2
     
@@ -1279,7 +1279,7 @@ class VideoFilterFrame(ttk.LabelFrame):
         if total_w < 400:
             total_w = 400
     
-        # 缩放图像（纯 Python 最近邻）
+        # 缩放图像（纯 Python 函数）
         fd_out, scaled_temp_path = tempfile.mkstemp(suffix='.ppm', prefix='ffgui_scaled_')
         os.close(fd_out)
     
@@ -1294,6 +1294,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             messagebox.showerror("错误", f"图像缩放失败: {e}")
             return
     
+        # 加载缩放后的图像
         try:
             img = tk.PhotoImage(file=scaled_temp_path)
         except Exception as e:
@@ -1311,7 +1312,7 @@ class VideoFilterFrame(ttk.LabelFrame):
         scale_y = orig_h / disp_h
         img_w, img_h = disp_w, disp_h
     
-        # ---------- 3. 创建窗口 ----------
+        # ---------- 创建窗口 ----------
         with self.app.SafeToplevel(self.app.root) as win:
             win.title(f"可视化裁剪 - 拖拽绘制矩形 (显示 {disp_w}x{disp_h}, 原始 {orig_w}x{orig_h})")
             win.transient(self.app.root)
@@ -1343,7 +1344,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             canvas.create_image(PADDING, PADDING, anchor=tk.NW, image=img, tags="bg_img")
             canvas.image = img
     
-            # ---------- 4. 坐标转换函数 ----------
+            # ---- 坐标转换（含边距映射） ----
             def canvas_to_display(cx, cy):
                 x = canvas.canvasx(cx)
                 y = canvas.canvasy(cy)
@@ -1367,7 +1368,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             def original_to_display(ox, oy):
                 return ox / scale_x, oy / scale_y
     
-            # ---------- 5. 状态变量 ----------
+            # ---------- 状态变量 ----------
             points = []
             rect_id = None
             drag_start_display = None
@@ -1392,7 +1393,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                 else:
                     info_var.set("👉 在图像上按住左键拖拽（可从边缘外开始）以绘制裁剪矩形")
     
-            # ---------- 6. 拖拽事件 ----------
+            # ---------- 拖拽事件 ----------
             def on_drag_start(event):
                 nonlocal drag_start_display, drag_rect_id
                 dx, dy = canvas_to_display(event.x, event.y)
@@ -1452,7 +1453,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             canvas.bind("<B1-Motion>", on_drag_motion)
             canvas.bind("<ButtonRelease-1>", on_drag_end)
     
-            # ---------- 7. 清除矩形 ----------
+            # ---------- 清除矩形 ----------
             def clear_rect():
                 nonlocal points, rect_id, drag_start_display, drag_rect_id
                 points = []
@@ -1465,7 +1466,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                 drag_start_display = None
                 update_info()
     
-            # ---------- 8. 应用裁剪 ----------
+            # ---------- 应用裁剪 ----------
             def apply_crop():
                 if len(points) != 2:
                     messagebox.showwarning("提示", "请先拖拽绘制一个裁剪矩形")
@@ -1505,7 +1506,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                 self.app._append_info_ui(f"[裁剪] 应用 crop={int(w)}:{int(h)}:{int(x)}:{int(y)}")
                 win.destroy()
     
-            # ---------- 9. 自动检测黑边 ----------
+            # ---------- 自动检测黑边 ----------
             def auto_detect():
                 self.crop_detect_frames.set(frames_var.get())
                 self.crop_detect_round.set(round_var.get())
@@ -1536,7 +1537,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                     except:
                         pass
     
-            # ---------- 10. 新增：时间跳转和重新获取画面 ----------
+            # ---------- 时间跳转和重新获取画面 ----------
             time_var = tk.StringVar(value="0.0")
             time_entry = ttk.Entry(right_frame, textvariable=time_var, width=12)
             time_entry.pack(pady=(10,2), fill=tk.X)
@@ -1672,7 +1673,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             # 时间格式提示
             ttk.Label(right_frame, text="支持格式: 秒数 (如 10.5) 或 HH:MM:SS[.mmm]", foreground="gray", wraplength=RIGHT_PANEL_WIDTH-20).pack(pady=(2,10))
     
-            # ---------- 11. 其他按钮 ----------
+            # ---------- 其他按钮 ----------
             btn_frame = ttk.Frame(right_frame)
             btn_frame.pack(fill=tk.X, pady=5)
     
@@ -1704,7 +1705,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             tip = "按住左键拖拽绘制矩形（可从边缘外开始），松开确定。黄色虚线为辅助，红色为最终选区。"
             ttk.Label(right_frame, text=tip, foreground="gray", wraplength=RIGHT_PANEL_WIDTH-20).pack(pady=10)
     
-            # ---------- 12. 若已有裁剪参数，自动加载矩形 ----------
+            # ---------- 若已有裁剪参数，自动加载矩形 ----------
             if self.crop_enabled.get():
                 try:
                     w = int(self.crop_width.get())
