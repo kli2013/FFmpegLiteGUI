@@ -376,7 +376,23 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
     """
     filters = []
     
-
+    # ----- 精准截取（trim + setpts）-----
+    # 当 precise_trim=True 且启用截取时，使用 trim 滤镜精确裁剪并重置时间戳
+    if settings.get("precise_trim", False) and settings.get("trim_enabled", False):
+        start = settings.get("trim_start", "").strip()
+        end = settings.get("trim_end", "").strip()
+        start_sec = time_to_seconds(start) if start else None
+        end_sec = time_to_seconds(end) if end else None
+        if start_sec is not None or end_sec is not None:
+            trim_parts = []
+            if start_sec is not None:
+                trim_parts.append(f"start={start_sec}")
+            if end_sec is not None:
+                trim_parts.append(f"end={end_sec}")
+            if trim_parts:
+                filters.append(f"trim={':'.join(trim_parts)}")
+                filters.append("setpts=PTS-STARTPTS")
+    # -----------------------------------------
     
     # 裁剪
     if settings.get("crop_enabled", False):
@@ -1245,7 +1261,7 @@ class VideoFilterFrame(ttk.LabelFrame):
         self.get_trim_settings_callback = callback
 
     def open_crop_editor(self):
-        """可视化裁剪窗口 - 拖拽绘制矩形，支持时间跳转重新取帧，初始时间自动从主界面的截取起始时间获取"""
+        """可视化裁剪窗口 - 拖拽绘制矩形，支持时间跳转重新取帧，初始时间自动从主界面或者当前编辑窗口的截取起始时间获取"""
         input_file = getattr(self, 'current_file', None)
         if not input_file or not os.path.exists(input_file):
             input_file = self.app.input_file.get().strip()
@@ -2005,7 +2021,7 @@ class TrimFrame(ttk.LabelFrame):
                                           command=self.on_trim_toggle)
         self.trim_check.pack(anchor=tk.W, pady=(0,10))
         ToolTip(self.trim_check, 
-                "默认是 -ss 在 -i 之前的快速模式，快速无损截取请把音频视频都改为Copy\n\n"
+                "默认是 -ss 在 -i 之前的快速模式，快速无损截取请把音频视频都改为Copy，注意取消一下像素格式滤镜\n\n"
                 "截取功能限制说明：\n\n"
                 "对主视频截取（当前主界面输入的视频）：\n"
                 "   若同时启用了「水印」或「画中画（子视频）」，截取可能失效。\n"
@@ -2854,7 +2870,15 @@ class Track:
                     "alpha_value": 1.0,
                 }
             elif typ == "audio":
-                self.enc_settings = {"encoder": "copy", "bitrate": "128k", "samplerate": "44100"}
+                self.enc_settings = {
+                    "encoder": "copy",
+                    "bitrate": "128k",
+                    "samplerate": "44100",
+                    "trim_enabled": False,
+                    "trim_start": "",
+                    "trim_end": "",
+                    "precise_trim": False
+                }
             else:  # subtitle
                 self.enc_settings = {"encoder": "copy"}
         else:
@@ -3074,6 +3098,34 @@ class FFmpegBatchGUI:
                 settings["encoder"] = "libx265"
                 self._append_info_ui("精准截取模式下，编码器不能为 copy，已自动改为 libx265。")
 
+    def _calculate_trim_duration(self, settings: dict, input_path: str) -> Tuple[Optional[float], Optional[float]]:
+        """
+        根据设置计算精准截取的起始时间（start_sec）和输出时长（duration）。
+        :param settings: 设置字典（需包含 trim_start, trim_end, precise_trim）
+        :param input_path: 输入文件路径（用于获取总时长）
+        :return: (start_sec, duration)，若无法计算则对应为 None
+        """
+        if not settings.get("precise_trim", False):
+            return None, None
+    
+        start = settings.get("trim_start", "").strip()
+        end = settings.get("trim_end", "").strip()
+        start_sec = time_to_seconds(start) if start else None
+        end_sec = time_to_seconds(end) if end else None
+    
+        if start_sec is None:
+            return None, None
+    
+        duration = None
+        total_duration = self._get_media_duration(input_path)
+        if end_sec is not None:
+            duration = end_sec - start_sec
+        elif total_duration is not None:
+            duration = total_duration - start_sec
+    
+        return start_sec, duration
+
+
     def _apply_precise_trim(self, cmd_list: List[str], settings: dict, input_path: str) -> List[str]:
         """
         在精准截取模式下，向命令列表添加 -ss 和 -t 参数（放在 -i 之后）。
@@ -3176,6 +3228,55 @@ class FFmpegBatchGUI:
     
         return cmd_list
 
+    def _apply_audio_trim_and_encode(self, cmd_list: List[str], settings: dict,
+                                      input_path: str, start_sec: float, duration: float,
+                                      map_audio: bool = False) -> List[str]:
+        """
+        为音频流应用精准截取（atrim + asetpts）并设置编码参数。
+        :param cmd_list: 命令列表
+        :param settings: 设置字典（包含音频编码器、比特率、采样率等）
+        :param input_path: 音频来源文件路径（用于获取总时长，但这里我们已经传入了 duration，所以不需要）
+        :param start_sec: 起始时间（秒）
+        :param duration: 截取时长（秒）
+        :param map_audio: 是否添加 -map 0:a:0（水印模式需要）
+        :return: 修改后的 cmd_list
+        """
+        if map_audio:
+            cmd_list.extend(["-map", "0:a:0"])
+    
+        # 强制重新编码
+        acodec = settings.get("audio_codec", "aac")
+        if acodec == "copy":
+            acodec = "aac"
+            self._append_info_ui("音频截取启用，编码器已从 copy 改为 aac")
+    
+        # 构建音频滤镜
+        af_filters = []
+        if start_sec is not None and duration > 0:
+            af_filters.append(f"atrim=start={start_sec:.3f}:duration={duration:.3f}")
+            af_filters.append("asetpts=PTS-STARTPTS")
+    
+        # 合并其他音频滤镜（音量、变速等）
+        speed_factor = float(settings.get("speed_factor", "1.0"))
+        if settings.get("speed_enabled", False) and speed_factor != 1.0:
+            atempo = build_atempo_chain(speed_factor)
+            if atempo:
+                af_filters.append(atempo)
+        volume = settings.get("volume", 1.0)
+        if settings.get("volume_enabled", False) and volume != 1.0:
+            af_filters.append(f"volume={volume:.2f}")
+    
+        if af_filters:
+            cmd_list.extend(["-af", ",".join(af_filters)])
+    
+        # 编码参数
+        cmd_list.extend(["-c:a", acodec])
+        cmd_list.extend(["-b:a", settings.get("audio_bitrate", "128k")])
+        cmd_list.extend(["-ar", settings.get("audio_samplerate", "44100")])
+    
+        return cmd_list
+
+
     def _adapt_sub_settings(self, sub_settings, current_w, current_h):
         """
         根据当前视频尺寸，从基准尺寸缩放位置和大小。
@@ -3240,13 +3341,15 @@ class FFmpegBatchGUI:
 
     def _build_overlay_filter_complex(self, main_idx: int, main_settings: dict,
                                        sub_infos: List[Tuple[int, str, dict]],
-                                       include_subtitle_main: bool = False) -> Tuple[str, str]:
+                                       include_subtitle_main: bool = False,
+                                       disable_shortest: bool = False) -> Tuple[str, str]:
         """
         构建主视频 + 多个子视频（画中画/水印）的 filter_complex 字符串。
         :param main_idx: 主视频输入索引
         :param main_settings: 主视频设置
         :param sub_infos: 子视频信息 [(索引, 文件路径, 设置)]
         :param include_subtitle_main: 是否在主视频滤镜中包含字幕
+        :param disable_shortest: 是否禁用 overlay 的 shortest=1（精准截取时使用）
         :return: (filter_complex, 最终视频标签)
         """
         filter_parts = []
@@ -3309,7 +3412,11 @@ class FFmpegBatchGUI:
                 y = sub_settings.get('overlay_y', '0').strip() or '0'
                 duration = self._get_media_duration(sub_file)
                 enable_expr = self._calc_enable_expr(sub_settings, duration)
-                overlay_filter = f"overlay={x}:{y}:enable='{enable_expr}':shortest=1"
+                # 构建 overlay，根据 disable_shortest 决定是否添加 shortest=1
+                if disable_shortest:
+                    overlay_filter = f"overlay={x}:{y}:enable='{enable_expr}'"
+                else:
+                    overlay_filter = f"overlay={x}:{y}:enable='{enable_expr}':shortest=1"
                 filter_parts.append(f"[{current_v}][{current_sub}]{overlay_filter}[v_out_{i}]")
                 current_v = f"v_out_{i}"
             else:
@@ -3492,6 +3599,9 @@ class FFmpegBatchGUI:
         # ----- 5. 调用播放器预览 -----
         self.preview_with_player(file_path, filter_chain, volume=10, extra_args=extra_args)
 
+
+
+
     # ---------- 输出路径生成与命令构建 ----------
     def generate_output_path(self, input_path, settings):
         dir_path = settings.get("output_dir") or os.path.dirname(input_path)
@@ -3524,6 +3634,7 @@ class FFmpegBatchGUI:
             out_name = f"{name}{suffix}.{container}"
         return os.path.join(dir_path, out_name).replace('\\', '/')
 
+
     def generate_ffmpeg_command(self, input_path: str, output_path: str, settings: dict) -> List[str]:
         if not self.ffmpeg_cmd:
             raise ValueError("未找到 ffmpeg 可执行文件。")
@@ -3536,7 +3647,7 @@ class FFmpegBatchGUI:
         only_audio = settings.get("only_audio", False)
         precise_trim = settings.get("precise_trim", False)
     
-        # 精准模式下强制重新编码
+        # 精准模式下强制重新编码（视频）
         self._enforce_reencode_for_precise_trim(settings, only_audio)
     
         # ---------- 检查水印 ----------
@@ -3550,7 +3661,7 @@ class FFmpegBatchGUI:
         # ---------- 普通模式（无复杂水印） ----------
         cmd_list = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
     
-        # 只有非精准模式才在命令行添加 -ss/-to（快速模式）
+        # 快速模式（非精准）才在命令行添加 -ss/-to
         if not precise_trim:
             self._add_trim_params(cmd_list, settings)
     
@@ -3559,20 +3670,24 @@ class FFmpegBatchGUI:
     
         cmd_list.extend(["-i", input_path])
     
-        # ----- 精准模式：在 -i 后添加 -ss 和 -t -----
-        self._apply_precise_trim(cmd_list, settings, input_path)
+        # ----- 精准模式：不添加命令行 -ss/-t，而是通过滤镜处理 计算截取时长-----
+        start_sec, duration_for_audio = self._calculate_trim_duration(settings, input_path)
 
+    
         if only_audio:
             cmd_list.append("-vn")
         else:
+            # 视频滤镜（已包含 trim 和 setpts）
             vf = build_video_filter_chain(settings, include_subtitle=True, include_speed=True)
             if vf != "null":
                 cmd_list.extend(["-vf", vf])
-            # 视频编码参数（使用公共函数）
             cmd_list = self._build_video_encoding_params(cmd_list, settings)
     
-        # 音频处理（使用公共函数）
-        cmd_list = self._build_audio_encoding_params(cmd_list, settings)
+        # 音频处理（若精准模式且音频需要截取）
+        if precise_trim and duration_for_audio is not None and duration_for_audio > 0:
+            self._apply_audio_trim_and_encode(cmd_list, settings, input_path, start_sec, duration_for_audio, map_audio=False)
+        else:
+            cmd_list = self._build_audio_encoding_params(cmd_list, settings)
     
         custom = settings.get("custom_args", "").strip()
         if custom:
@@ -3642,33 +3757,42 @@ class FFmpegBatchGUI:
         precise_trim = settings.get("precise_trim", False)
         self._enforce_reencode_for_precise_trim(settings, only_audio=False)
 
-        # 只有非精准模式才在命令行添加 -ss/-to（快速模式）
+        # 快速模式（非精准）才在命令行添加 -ss/-to
         if not precise_trim:
             self._add_trim_params(cmd_list, settings)
 
         self._add_hwaccel_params(cmd_list, settings)
     
+        # 主视频输入
         cmd_list.extend(["-i", input_path])
     
-        # ----- 精准模式：在 -i 后添加 -ss 和 -t（针对主视频） -----
-        self._apply_precise_trim(cmd_list, settings, input_path)
+        # ----- 精准模式：计算截取时长 -----
+        start_sec, duration_for_sub = self._calculate_trim_duration(settings, input_path)
 
         # ---- 添加水印输入（图片或视频） ----
         if not is_image:
             self._add_infinite_loop_params(cmd_list, wm_file)
             cmd_list.extend(["-i", wm_file])
+            # 精准模式下，为子视频添加 -t 限制时长
+            if precise_trim and duration_for_sub is not None and duration_for_sub > 0:
+                cmd_list.extend(["-t", f"{duration_for_sub:.3f}"])
         else:
             fps = settings.get("frame_rate_custom", "30") if settings.get("frame_rate_type") == "custom" else "30"
             self._add_infinite_loop_params(cmd_list, wm_file, framerate=fps)
             cmd_list.extend(["-i", wm_file])
+
+            # 给图片也加 -t
+            if precise_trim and duration_for_sub is not None and duration_for_sub > 0:
+                cmd_list.extend(["-t", f"{duration_for_sub:.3f}"])
     
         if use_infinite_loop:
             cmd_list.append("-shortest")
     
-        # ---- 构建叠加滤镜（使用自适应后的设置） ----
+        # ---- 构建叠加滤镜 ----
         sub_infos = [(1, wm_file, adapted_wm)]
+
         complex_filter, final_v_label = self._build_overlay_filter_complex(
-            0, settings, sub_infos, include_subtitle_main=True
+            0, settings, sub_infos, include_subtitle_main=True, disable_shortest=precise_trim
         )
         cmd_list.extend(["-filter_complex", complex_filter])
         cmd_list.extend(["-map", final_v_label])
@@ -3677,10 +3801,13 @@ class FFmpegBatchGUI:
         cmd_list = self._build_video_encoding_params(cmd_list, settings)
         cmd_list.extend(["-vsync", "cfr"])
     
-        # ---- 音频处理 ----
+        # ---- 音频处理（主视频音频） ----
         if settings.get("audio_enabled", True):
-            cmd_list.extend(["-map", "0:a:0"])
-            cmd_list = self._build_audio_encoding_params(cmd_list, settings)
+            if precise_trim and duration_for_sub is not None and duration_for_sub > 0:
+                self._apply_audio_trim_and_encode(cmd_list, settings, input_path, start_sec, duration_for_sub, map_audio=True)
+            else:
+                cmd_list.extend(["-map", "0:a:0"])
+                cmd_list = self._build_audio_encoding_params(cmd_list, settings)
         else:
             cmd_list.append("-an")
     
@@ -5446,14 +5573,46 @@ class FFmpegBatchGUI:
 
     def _map_audio_tracks(self, cmd_list: List[str], input_files_norm: List[str], audio_tracks: List[Track]) -> int:
         """
-        添加音频轨道的 -map 和编码参数。
+        添加音频轨道的 -map、编码参数，并支持独立截取（trim）。
         返回音频轨道数量（用于设置默认音频）。
         """
         audio_map_count = 0
         for audio in audio_tracks:
             a_idx = input_files_norm.index(normalize_path(audio.file_path))
-            enc = audio.enc_settings.get("encoder", "copy")
             cmd_list.extend(["-map", f"{a_idx}:a:0"])
+    
+            # ----- 检查是否启用截取 -----
+            if audio.enc_settings.get("trim_enabled", False):
+                start = audio.enc_settings.get("trim_start", "").strip()
+                end = audio.enc_settings.get("trim_end", "").strip()
+                start_sec = time_to_seconds(start) if start else None
+                end_sec = time_to_seconds(end) if end else None
+                if start_sec is not None:
+                    total_duration = self._get_media_duration(audio.file_path)
+                    if end_sec is not None:
+                        duration = end_sec - start_sec
+                    elif total_duration is not None:
+                        duration = total_duration - start_sec
+                    else:
+                        duration = None
+    
+                    if duration is not None and duration > 0:
+                        # 强制重编码（不能 copy）
+                        enc = audio.enc_settings.get("encoder", "aac")
+                        if enc == "copy":
+                            enc = "aac"
+                            self._append_info_ui(f"音频截取启用，轨道 {audio_map_count+1} 编码器已从 copy 改为 {enc}")
+                        # 音频滤镜
+                        af_filter = f"atrim=start={start_sec:.3f}:duration={duration:.3f},asetpts=PTS-STARTPTS"
+                        cmd_list.extend(["-af", af_filter])
+                        cmd_list.extend([f"-c:a:{audio_map_count}", enc])
+                        cmd_list.extend([f"-b:a:{audio_map_count}", audio.enc_settings.get("bitrate", "128k")])
+                        cmd_list.extend([f"-ar:a:{audio_map_count}", audio.enc_settings.get("samplerate", "44100")])
+                        audio_map_count += 1
+                        continue  # 已处理，跳过后续 copy 分支
+    
+            # ----- 普通音频（无截取） -----
+            enc = audio.enc_settings.get("encoder", "copy")
             if enc == "copy":
                 cmd_list.extend([f"-c:a:{audio_map_count}", "copy"])
             else:
@@ -5465,6 +5624,7 @@ class FFmpegBatchGUI:
                     f"-ar:a:{audio_map_count}", samplerate
                 ])
             audio_map_count += 1
+    
         return audio_map_count
 
     def _map_subtitle_tracks(self, cmd_list: List[str], input_files_norm: List[str],
@@ -6091,24 +6251,76 @@ class FFmpegBatchGUI:
     def merge_edit_audio_track(self, track_idx):
         track = self.merge_tracks[track_idx]
         with self.SafeToplevel(self.root) as win:
-            win.title(f"音频轨道编码设置 - {track.codec}")
-            center_window(win, 400, 200)
+            win.title(f"音频轨道设置 - {track.codec}")
+            center_window(win, 500, 400)
             win.transient(self.root)
-            ttk.Label(win, text="编码器:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+    
+            # 主框架
+            main_frame = ttk.Frame(win, padding="10")
+            main_frame.pack(fill=tk.BOTH, expand=True)
+    
+            # ---- 编码设置 ----
+            enc_frame = ttk.LabelFrame(main_frame, text="编码参数", padding="5")
+            enc_frame.pack(fill=tk.X, pady=5)
+    
+            ttk.Label(enc_frame, text="编码器:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
             encoder_var = tk.StringVar(value=track.enc_settings.get("encoder", "copy"))
-            ttk.Combobox(win, textvariable=encoder_var, values=ALL_AUDIO_ENCODERS, state="readonly", width=15).grid(row=0, column=1, sticky="w", padx=5, pady=5)
-            ttk.Label(win, text="比特率:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+            ttk.Combobox(enc_frame, textvariable=encoder_var, values=ALL_AUDIO_ENCODERS, state="readonly", width=15).grid(row=0, column=1, sticky="w", padx=5, pady=5)
+    
+            ttk.Label(enc_frame, text="比特率:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
             bitrate_var = tk.StringVar(value=track.enc_settings.get("bitrate", "128k"))
-            ttk.Entry(win, textvariable=bitrate_var, width=10).grid(row=1, column=1, sticky="w", padx=5, pady=5)
-            ttk.Label(win, text="采样率:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+            ttk.Entry(enc_frame, textvariable=bitrate_var, width=10).grid(row=1, column=1, sticky="w", padx=5, pady=5)
+    
+            ttk.Label(enc_frame, text="采样率:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
             samplerate_var = tk.StringVar(value=track.enc_settings.get("samplerate", "44100"))
-            ttk.Entry(win, textvariable=samplerate_var, width=10).grid(row=2, column=1, sticky="w", padx=5, pady=5)
+            ttk.Entry(enc_frame, textvariable=samplerate_var, width=10).grid(row=2, column=1, sticky="w", padx=5, pady=5)
+    
+            # ---- 截取设置 ----
+            trim_frame = ttk.LabelFrame(main_frame, text="音频截取（精确到毫秒）", padding="5")
+            trim_frame.pack(fill=tk.X, pady=5)
+    
+            trim_enabled_var = tk.BooleanVar(value=track.enc_settings.get("trim_enabled", False))
+            ttk.Checkbutton(trim_frame, text="启用截取", variable=trim_enabled_var).grid(row=0, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+    
+            ttk.Label(trim_frame, text="开始时间 (HH:MM:SS[.mmm]):").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+            trim_start_var = tk.StringVar(value=track.enc_settings.get("trim_start", ""))
+            ttk.Entry(trim_frame, textvariable=trim_start_var, width=15).grid(row=1, column=1, sticky="w", padx=5, pady=5)
+            ttk.Label(trim_frame, text="结束时间 (留空到末尾)").grid(row=1, column=2, sticky="w", padx=5, pady=5)
+    
+            ttk.Label(trim_frame, text="结束时间 (HH:MM:SS[.mmm]):").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+            trim_end_var = tk.StringVar(value=track.enc_settings.get("trim_end", ""))
+            ttk.Entry(trim_frame, textvariable=trim_end_var, width=15).grid(row=2, column=1, sticky="w", padx=5, pady=5)
+    
+            # 精准模式（保留，但音频 atrim 本身就是精确的）
+            precise_trim_var = tk.BooleanVar(value=track.enc_settings.get("precise_trim", False))
+            ttk.Checkbutton(trim_frame, text="精准模式（精确到帧）", variable=precise_trim_var).grid(row=3, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+    
+            # 提示
+            ttk.Label(trim_frame, text="注意：启用截取后，编码器将自动改为非 copy 格式（如 aac）", foreground="gray").grid(row=4, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+    
+            # ---- 保存按钮 ----
             def save():
-                track.enc_settings = {"encoder": encoder_var.get(), "bitrate": bitrate_var.get(), "samplerate": samplerate_var.get()}
+                # 检查截取启用时，编码器是否非 copy
+                enc = encoder_var.get()
+                if trim_enabled_var.get() and enc == "copy":
+                    enc = "aac"
+                    self._append_info_ui("音频截取启用，编码器已从 copy 改为 aac")
+    
+                track.enc_settings = {
+                    "encoder": enc,
+                    "bitrate": bitrate_var.get(),
+                    "samplerate": samplerate_var.get(),
+                    "trim_enabled": trim_enabled_var.get(),
+                    "trim_start": trim_start_var.get().strip(),
+                    "trim_end": trim_end_var.get().strip(),
+                    "precise_trim": precise_trim_var.get()
+                }
                 self.merge_update_track_list()
                 self.merge_update_command_preview()
                 win.destroy()
-            ttk.Button(win, text="保存", command=save).grid(row=3, column=0, columnspan=2, pady=10)
+    
+            ttk.Button(main_frame, text="保存", command=save).pack(pady=10)
+    
             win.wait_window()
 
     def merge_edit_subtitle_track(self, track_idx):
