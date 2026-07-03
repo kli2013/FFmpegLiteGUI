@@ -349,6 +349,8 @@ class PresetManager:
         with open(self.preset_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
 
+
+
 def time_to_seconds(timestr: str) -> Optional[float]:
     """将 HH:MM:SS[.mmm] 或 MM:SS[.mmm] 或纯数字转换为秒数"""
     if not timestr:
@@ -5006,6 +5008,7 @@ class FFmpegBatchGUI:
         if retcode == 0:
             task.status = "完成"
             self._append_info_ui(f"✅ 任务完成: {os.path.basename(task.input)}")
+            self._log_command_to_file(cmd_str)
         else:
             task.status = "失败"
             task.error_msg = f"返回码 {retcode}"
@@ -5041,6 +5044,16 @@ class FFmpegBatchGUI:
     def _append_info_ui(self, text: str):
         self.root.after(0, lambda: self.append_info(text))
 
+    def _log_command_to_file(self, cmd_str: str):
+        """将成功执行的命令记录到脚本目录下的 editlog.txt"""
+        try:
+            log_path = os.path.join(get_script_dir(), "editlog.txt")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"{cmd_str}\n")
+        except Exception as e:
+            self._append_info_ui(f"无法写入命令日志: {e}")
+
+
     def transcode_single(self):
         input_file = self.input_file.get()
         if not input_file or not os.path.exists(input_file):
@@ -5065,6 +5078,7 @@ class FFmpegBatchGUI:
         retcode, _ = run_ffmpeg_command(cmd_list, on_output_line=on_line)
         if retcode == 0:
             self._append_info_ui(f"✅ 当前选择转码完成: {os.path.basename(input_name)}")
+            self._log_command_to_file(cmd_str)
         else:
             self._append_info_ui(f"当前选择转码失败，返回码 {retcode}")
 
@@ -6476,6 +6490,8 @@ class FFmpegBatchGUI:
             ret = proc.wait()
             if ret == 0:
                 self._append_info_ui("[封装] ✅ 处理完成")
+                cmd_str = format_cmd_for_display(cmd_list)
+                self._log_command_to_file(cmd_str)
                 if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
                     if self.merge_delete_source.get():
                         self.root.after(0, lambda: self._confirm_delete_sources(source_files, output_file))
