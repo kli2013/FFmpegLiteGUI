@@ -2957,6 +2957,10 @@ class FFmpegBatchGUI:
         self.output_suffix = tk.StringVar(value="")
         self.custom_output_name = tk.StringVar(value="")
         self.output_container = tk.StringVar(value="mp4")
+        
+        self.log_enabled_var = tk.BooleanVar(value=True)
+        default_log_path = os.path.join(get_script_dir(), "editlog.txt")
+        self.log_path_var = tk.StringVar(value=default_log_path)
 
         self.tasks = []
         self.is_processing = False
@@ -3459,11 +3463,16 @@ class FFmpegBatchGUI:
         settings = self.preset_manager.load_player_settings()
         self.use_mpv.set(settings.get("use_mpv", False))
         self.mpv_path.set(settings.get("mpv_path", "mpv"))
+        # 读取日志设置，缺失时使用默认值
+        self.log_enabled_var.set(settings.get("log_enabled", True))
+        self.log_path_var.set(settings.get("log_path", os.path.join(get_script_dir(), "editlog.txt")))
 
     def save_player_settings(self):
         self.preset_manager.save_player_settings({
             "use_mpv": self.use_mpv.get(),
-            "mpv_path": self.mpv_path.get()
+            "mpv_path": self.mpv_path.get(),
+            "log_enabled": self.log_enabled_var.get(),
+            "log_path": self.log_path_var.get()
         })
 
     def preview_with_player(self, input_path, filters=None, audio_only=False, volume=10, extra_args=None):
@@ -5045,9 +5054,13 @@ class FFmpegBatchGUI:
         self.root.after(0, lambda: self.append_info(text))
 
     def _log_command_to_file(self, cmd_str: str):
-        """将成功执行的命令记录到脚本目录下的 editlog.txt"""
+        """将成功执行的命令记录到日志文件（受开关控制）"""
+        if not self.log_enabled_var.get():
+            return
+        log_path = self.log_path_var.get().strip()
+        if not log_path:
+            return
         try:
-            log_path = os.path.join(get_script_dir(), "editlog.txt")
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"{cmd_str}\n")
         except Exception as e:
@@ -6676,6 +6689,17 @@ class FFmpegBatchGUI:
         self.mpv_path_entry = ttk.Entry(path_frame, textvariable=self.mpv_path, width=40)
         self.mpv_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         ttk.Button(path_frame, text="浏览", command=self.browse_mpv).pack(side=tk.LEFT, padx=5)
+
+        # ---- 日志记录控制 ----
+        log_frame = ttk.Frame(frame)
+        log_frame.pack(fill=tk.X, pady=5)
+        chk_log = ttk.Checkbutton(log_frame, text="记录成功命令到日志", variable=self.log_enabled_var)
+        chk_log.pack(side=tk.LEFT)
+        log_entry = ttk.Entry(log_frame, textvariable=self.log_path_var, width=30)
+        log_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(log_frame, text="浏览", command=self.browse_log_file).pack(side=tk.LEFT, padx=5)
+
+
         status_frame = ttk.LabelFrame(frame, text="状态检测", padding="5")
         status_frame.pack(fill=tk.X, pady=(15, 5))
         self.status_text = tk.Text(status_frame, height=20, width=80, wrap=tk.WORD,
@@ -6709,6 +6733,17 @@ class FFmpegBatchGUI:
                 subprocess.Popen(["xdg-open", folder])
         except Exception as e:
             self._append_info_ui(f"打开文件夹失败: {e}")
+
+
+    def browse_log_file(self):
+        path = filedialog.asksaveasfilename(
+            title="选择日志文件",
+            defaultextension=".txt",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")]
+        )
+        if path:
+            self.log_path_var.set(normalize_path(path))
+            self.save_player_settings()
 
     def update_player_status(self):
         if not hasattr(self, 'status_text'):
