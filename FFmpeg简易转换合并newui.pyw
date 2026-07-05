@@ -681,7 +681,7 @@ ALL_VIDEO_ENCODERS = [
     "h264_amf", "hevc_amf", "av1_amf",
     "h264_vaapi", "hevc_vaapi",
     "h264_videotoolbox", "hevc_videotoolbox",
-    "prores_ks", "prores_aw", "dnxhdenc", "ffv1", "libopenjpeg", "gif", "copy"
+    "prores_ks", "prores_aw", "dnxhdenc", "ffv1", "libopenjpeg", "gif", "libwebp", "copy"
 ]
 
 ALL_AUDIO_ENCODERS = ["aac", "libmp3lame", "opus", "ac3", "eac3",
@@ -2763,7 +2763,7 @@ class AdvancedFrame(ttk.LabelFrame):
         label = ttk.Label(custom_frame, text="自定义FFmpeg参数 (例如: -tune grain -profile:v high):")
         label.pack(anchor=tk.W)
         ToolTip(label, 
-                "可直接添加全局选项（如 -tune grain、-profile:v high），它们会追加到命令末尾。\n"
+                "可直接添加全局选项（如 -tune grain、-profile:v high），它们会追加到命令末尾。\n\n"
                 "对于滤镜（-vf / -filter_complex），如果界面已设置滤镜，自定义参数中的 -vf 会覆盖界面生成的滤镜链。\n"
                 "如需保留界面滤镜，请在自定义参数中复制完整的 -vf 链（从预览区复制）并扩展。\n"
                 "同样，-af、-map 等也会覆盖。新手建议仅添加全局选项。",
@@ -3317,7 +3317,11 @@ class FFmpegBatchGUI:
     
         if settings.get("frame_rate_type") == "custom" and settings.get("frame_rate_custom"):
             cmd_list.extend(["-r", settings['frame_rate_custom']])
-    
+
+        # 为 WebP 动图默认添加无限循环
+        if vcodec == "libwebp":
+            cmd_list.extend(["-loop", "0"])
+
         return cmd_list
     
     def _build_audio_encoding_params(self, cmd_list: List[str], settings: dict) -> List[str]:
@@ -3774,11 +3778,19 @@ class FFmpegBatchGUI:
             if ext.lower() != ".gif":
                 out_name = base + ".gif"
 
+        # WebP 强制扩展名
+        if settings.get("encoder") == "libwebp":
+            base, ext = os.path.splitext(out_name)
+            if ext.lower() != ".webp":
+                out_name = base + ".webp"
+
         return os.path.join(dir_path, out_name).replace('\\', '/')
 
     def _generate_gif_command(self, input_path, output_path, settings):
         cmd_list = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
-        self._add_trim_params(cmd_list, settings)
+
+        if not settings.get("precise_trim", False):
+            self._add_trim_params(cmd_list, settings)
         self._add_hwaccel_params(cmd_list, settings)
         cmd_list.extend(["-i", input_path])
     
@@ -5350,7 +5362,7 @@ class FFmpegBatchGUI:
             ttk.Label(page_io, text="自定义完整名称:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
             ttk.Entry(page_io, textvariable=custom_var, width=60).grid(row=2, column=1, padx=5)
             ttk.Label(page_io, text="输出容器:").grid(row=3, column=0, sticky="w", padx=5, pady=5)
-            ttk.Combobox(page_io, textvariable=container_var, values=["mp4","mkv","mov","avi","webm","gif"], state="readonly", width=8).grid(row=3, column=1, sticky="w", padx=5)
+            ttk.Combobox(page_io, textvariable=container_var, values=["mp4","mkv","mov","avi","webm","gif","webp"], state="readonly", width=8).grid(row=3, column=1, sticky="w", padx=5)
     
             # 视频编码页面
             page_enc = ttk.Frame(notebook)
@@ -7095,6 +7107,7 @@ class FFmpegBatchGUI:
         right_panel.config(width=420)
         main_frame.columnconfigure(0, weight=1)
         main_frame.columnconfigure(1, weight=0)
+        main_frame.rowconfigure(0, weight=1)
 
         info_frame = ttk.LabelFrame(right_panel, text="关键信息", padding="5")
         info_frame.pack(fill=tk.BOTH, expand=True, pady=(0,5))
@@ -7148,7 +7161,7 @@ class FFmpegBatchGUI:
         ttk.Entry(suffix_frame, textvariable=self.custom_output_name, width=30).pack(side=tk.LEFT, padx=5)
         ttk.Label(suffix_frame, text="输出容器:").pack(side=tk.LEFT, padx=(20,0))
         container_combo = ttk.Combobox(suffix_frame, textvariable=self.output_container,
-                                       values=["mp4", "mkv", "mov", "avi", "webm"], state="readonly", width=6)
+                                       values=["mp4", "mkv", "mov", "avi", "webm","gif","webp"], state="readonly", width=6)
         container_combo.pack(side=tk.LEFT, padx=5)
 
         preset_frame = ttk.LabelFrame(settings_frame, text="参数预设", padding="5")
