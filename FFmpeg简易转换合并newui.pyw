@@ -882,8 +882,9 @@ def get_encoder_strategy(encoder: str) -> EncoderStrategy:
 
 # ================== 视频编码与质量组件 ==================
 class VideoEncoderFrame(ttk.LabelFrame):
-    def __init__(self, parent, **kwargs):
+    def __init__(self, parent, refresh_callback=None, **kwargs):
         super().__init__(parent, text="视频编码与质量", padding="5", **kwargs)
+        self.refresh_callback = refresh_callback  # 保存刷新函数
         self.create_widgets()
         self.setup_bindings()
 
@@ -924,9 +925,107 @@ class VideoEncoderFrame(ttk.LabelFrame):
 
         self.update_dynamic_controls()
 
+        # GIF 选项按钮（初始隐藏）
+        self.gif_btn_frame = ttk.Frame(self)
+        self.gif_btn_frame.grid(row=4, column=0, columnspan=3, sticky="we", pady=5, padx=5)
+        self.gif_btn_frame.grid_remove()  # 默认隐藏
+        
+        self.gif_options_btn = ttk.Button(self.gif_btn_frame, text="GIF 输出选项...", command=self.open_gif_options)
+        self.gif_options_btn.pack(side=tk.LEFT)
+        
+        # GIF 参数变量（存储实际值）
+        self.gif_loop = tk.IntVar(value=0)
+        self.gif_dither = tk.StringVar(value="bayer")
+        self.gif_bayer_scale = tk.IntVar(value=2)
+        self.gif_max_colors = tk.IntVar(value=256)
+
+
+
+
     def setup_bindings(self):
         self.vcodec.trace_add("write", self.auto_set_rate_control_by_codec)
         self.rate_control_type.trace_add("write", self.on_rate_control_change)
+        self.vcodec.trace_add("write", self._on_gif_codec_toggle)
+
+
+    def _on_gif_codec_toggle(self, *args):
+        if self.vcodec.get() == "gif":
+            self.gif_btn_frame.grid()
+        else:
+            self.gif_btn_frame.grid_remove()
+
+    def open_gif_options(self):
+        win = tk.Toplevel(self)
+        win.title("GIF 输出选项")
+        win.transient(self)
+        win.grab_set()
+        win.withdraw()
+        width, height = 380, 230  # 高度缩小（去掉一行）
+        center_window(win, width, height)
+    
+        main = ttk.Frame(win, padding="10")
+        main.pack(fill=tk.BOTH, expand=True)
+    
+        # 循环次数
+        row1 = ttk.Frame(main)
+        row1.pack(fill=tk.X, pady=5)
+        ttk.Label(row1, text="循环次数 (0=无限):").pack(side=tk.LEFT)
+        loop_var = tk.IntVar(value=self.gif_loop.get())
+        ttk.Spinbox(row1, from_=0, to=1000, width=6, textvariable=loop_var).pack(side=tk.LEFT, padx=5)
+    
+        # 抖动算法 + bayer_scale
+        row2 = ttk.Frame(main)
+        row2.pack(fill=tk.X, pady=5)
+        ttk.Label(row2, text="抖动算法:").pack(side=tk.LEFT)
+        dither_var = tk.StringVar(value=self.gif_dither.get())
+        dither_combo = ttk.Combobox(row2, textvariable=dither_var,
+                                    values=["none", "bayer", "floyd_steinberg", "sierra2_4a"],
+                                    state="readonly", width=15)
+        dither_combo.pack(side=tk.LEFT, padx=5)
+    
+        bayer_frame = ttk.Frame(row2)
+        bayer_frame.pack(side=tk.LEFT, padx=5)
+        ttk.Label(bayer_frame, text="Bayer Scale:").pack(side=tk.LEFT)
+        bayer_scale_var = tk.IntVar(value=self.gif_bayer_scale.get())
+        bayer_spin = ttk.Spinbox(bayer_frame, from_=0, to=5, width=4, textvariable=bayer_scale_var)
+        bayer_spin.pack(side=tk.LEFT, padx=2)
+    
+        def on_dither_change(*args):
+            if dither_var.get() == "bayer":
+                bayer_frame.pack(side=tk.LEFT, padx=5)
+            else:
+                bayer_frame.pack_forget()
+        dither_var.trace_add("write", on_dither_change)
+        on_dither_change()
+    
+        # 调色板大小
+        row3 = ttk.Frame(main)
+        row3.pack(fill=tk.X, pady=5)
+        ttk.Label(row3, text="调色板大小 (max_colors):").pack(side=tk.LEFT)
+        max_colors_var = tk.IntVar(value=self.gif_max_colors.get())
+        ttk.Spinbox(row3, from_=2, to=256, width=6, textvariable=max_colors_var).pack(side=tk.LEFT, padx=5)
+    
+        # 提示信息
+        info_label = ttk.Label(main, text="提示：GIF 速度和大小由「视频滤镜」中的帧率控制。", foreground="gray")
+        info_label.pack(pady=5)
+    
+        # 按钮
+        btn_frame = ttk.Frame(main)
+        btn_frame.pack(fill=tk.X, pady=10)
+        def save():
+            self.gif_loop.set(loop_var.get())
+            self.gif_dither.set(dither_var.get())
+            self.gif_bayer_scale.set(bayer_scale_var.get())
+            self.gif_max_colors.set(max_colors_var.get())
+            if self.refresh_callback:
+                self.refresh_callback()
+            win.destroy()
+        def cancel():
+            win.destroy()
+        ttk.Button(btn_frame, text="保存", command=save).pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text="取消", command=cancel).pack(side=tk.LEFT, padx=10)
+        win.wait_window()
+
 
     def update_dynamic_controls(self):
         for widget in self.dynamic_frame.winfo_children():
@@ -1021,7 +1120,12 @@ class VideoEncoderFrame(ttk.LabelFrame):
             "crf_value": self.crf_value.get(),
             "cq_value": self.cq_value.get(),
             "global_quality": self.global_quality.get(),
-            "bitrate_video": self.bitrate_video.get()
+            "bitrate_video": self.bitrate_video.get(),
+            # GIF 参数
+            "gif_loop": self.gif_loop.get(),
+            "gif_dither": self.gif_dither.get(),
+            "gif_bayer_scale": self.gif_bayer_scale.get(),
+            "gif_max_colors": self.gif_max_colors.get(),
         }
 
     def set_settings(self, settings):
@@ -1032,7 +1136,18 @@ class VideoEncoderFrame(ttk.LabelFrame):
         self.cq_value.set(settings.get("cq_value", 35))
         self.global_quality.set(settings.get("global_quality", 26))
         self.bitrate_video.set(settings.get("bitrate_video", "1900k"))
-
+        # ----- 新增 GIF 参数恢复 -----
+        if "gif_loop" in settings:
+            self.gif_loop.set(settings["gif_loop"])
+        if "gif_dither" in settings:
+            self.gif_dither.set(settings["gif_dither"])
+        if "gif_bayer_scale" in settings:
+            self.gif_bayer_scale.set(settings["gif_bayer_scale"])
+        if "gif_max_colors" in settings:
+            self.gif_max_colors.set(settings["gif_max_colors"])
+        
+        # 更新 GIF 按钮显示状态（如果编码器是 gif 则显示，否则隐藏）
+        self._on_gif_codec_toggle()
 
 # ================== 视频滤镜组件 ==================
 class VideoFilterFrame(ttk.LabelFrame):
@@ -1073,7 +1188,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             line1,
             textvariable=self.frame_rate_custom,
             width=9,
-            values=["30", "29.970030", "23.976024", "24", "25", "48", "59.940060", "60", "50"]
+            values=["30", "29.970030", "23.976024", "24", "25", "48", "59.940060", "60", "50", "10", "12"]
         )
         self.fps_combo.pack(side=tk.LEFT, padx=(0, 2))
         ttk.Label(line1, text="fps").pack(side=tk.LEFT, padx=(0, 10))
@@ -2644,7 +2759,15 @@ class AdvancedFrame(ttk.LabelFrame):
         # 自定义参数
         custom_frame = ttk.Frame(self)
         custom_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(custom_frame, text="自定义FFmpeg参数 (例如: -tune grain -profile:v high):").pack(anchor=tk.W)
+
+        label = ttk.Label(custom_frame, text="自定义FFmpeg参数 (例如: -tune grain -profile:v high):")
+        label.pack(anchor=tk.W)
+        ToolTip(label, 
+                "可直接添加全局选项（如 -tune grain、-profile:v high），它们会追加到命令末尾。\n"
+                "对于滤镜（-vf / -filter_complex），如果界面已设置滤镜，自定义参数中的 -vf 会覆盖界面生成的滤镜链。\n"
+                "如需保留界面滤镜，请在自定义参数中复制完整的 -vf 链（从预览区复制）并扩展。\n"
+                "同样，-af、-map 等也会覆盖。新手建议仅添加全局选项。",
+                wraplength=500)
         self.custom_args = tk.StringVar(value="")
         self.custom_entry = ttk.Entry(custom_frame, textvariable=self.custom_args, width=50)
         self.custom_entry.pack(fill=tk.X, pady=2)
@@ -3643,7 +3766,69 @@ class FFmpegBatchGUI:
             if not suffix and in_dir == out_dir:
                 suffix = "_new"
             out_name = f"{name}{suffix}.{container}"
+
+        # GIF 强制扩展名
+        if settings.get("encoder") == "gif":
+            # 确保文件名以 .gif 结尾
+            base, ext = os.path.splitext(out_name)
+            if ext.lower() != ".gif":
+                out_name = base + ".gif"
+
         return os.path.join(dir_path, out_name).replace('\\', '/')
+
+    def _generate_gif_command(self, input_path, output_path, settings):
+        cmd_list = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
+        self._add_trim_params(cmd_list, settings)
+        self._add_hwaccel_params(cmd_list, settings)
+        cmd_list.extend(["-i", input_path])
+    
+        # 读取帧率设置
+        fps_type = settings.get("frame_rate_type", "keep")
+        fps_value = settings.get("frame_rate_custom", "30")
+        if fps_type == "custom":
+            # 添加输出帧率（放在 -i 之后，滤镜之前）
+            cmd_list.extend(["-r", str(fps_value)])
+    
+        # 构建预处理滤镜（不含 format 和 subtitle）
+        vf = build_video_filter_chain(settings, include_subtitle=False, include_speed=True)
+        if vf and vf != "null":
+            filters = [f.strip() for f in vf.split(",") if f.strip() and not f.startswith("format=")]
+            pre_vf = ",".join(filters) if filters else ""
+        else:
+            pre_vf = ""
+    
+        # 读取 GIF 参数
+        loop = settings.get("gif_loop", 0)
+        dither = settings.get("gif_dither", "bayer")
+        bayer_scale = settings.get("gif_bayer_scale", 2)
+        max_colors = settings.get("gif_max_colors", 256)
+    
+        # 构建 dither 选项
+        if dither == "none":
+            dither_opt = "none"
+        elif dither == "bayer":
+            dither_opt = f"bayer:bayer_scale={bayer_scale}"
+        else:
+            dither_opt = dither
+    
+        # 构建 filter_complex
+        if pre_vf:
+            complex_filter = f"[0:v]{pre_vf}[v];[v]split[v1][v2];[v1]palettegen=max_colors={max_colors}[palette];[v2][palette]paletteuse=dither={dither_opt}[out]"
+        else:
+            complex_filter = f"[0:v]split[v1][v2];[v1]palettegen=max_colors={max_colors}[palette];[v2][palette]paletteuse=dither={dither_opt}[out]"
+    
+        cmd_list.extend(["-filter_complex", complex_filter])
+        cmd_list.extend(["-map", "[out]"])
+        cmd_list.extend(["-c:v", "gif"])
+    
+
+        # 循环始终添加
+        if loop != 0:
+            cmd_list.extend(["-loop", str(loop)])
+    
+        cmd_list.append("-an")  # 忽略音频
+        cmd_list.append(output_path)
+        return cmd_list
 
 
     def generate_ffmpeg_command(self, input_path: str, output_path: str, settings: dict) -> List[str]:
@@ -3668,7 +3853,11 @@ class FFmpegBatchGUI:
     
         if wm_file and not only_audio:
             return self._generate_command_with_watermark(input_path, output_path, settings, wm_settings)
-    
+
+        # 检查是否 GIF 编码（且非仅音频）
+        if settings.get("encoder") == "gif" and not only_audio:
+            return self._generate_gif_command(input_path, output_path, settings)
+
         # ---------- 普通模式（无复杂水印） ----------
         cmd_list = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
     
@@ -5161,7 +5350,7 @@ class FFmpegBatchGUI:
             ttk.Label(page_io, text="自定义完整名称:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
             ttk.Entry(page_io, textvariable=custom_var, width=60).grid(row=2, column=1, padx=5)
             ttk.Label(page_io, text="输出容器:").grid(row=3, column=0, sticky="w", padx=5, pady=5)
-            ttk.Combobox(page_io, textvariable=container_var, values=["mp4","mkv","mov","avi","webm"], state="readonly", width=8).grid(row=3, column=1, sticky="w", padx=5)
+            ttk.Combobox(page_io, textvariable=container_var, values=["mp4","mkv","mov","avi","webm","gif"], state="readonly", width=8).grid(row=3, column=1, sticky="w", padx=5)
     
             # 视频编码页面
             page_enc = ttk.Frame(notebook)
@@ -6984,7 +7173,7 @@ class FFmpegBatchGUI:
 
         video_enc_page = ttk.Frame(param_notebook)
         param_notebook.add(video_enc_page, text="视频编码")
-        self.video_encoder = VideoEncoderFrame(video_enc_page)
+        self.video_encoder = VideoEncoderFrame(video_enc_page, refresh_callback=self.update_command_preview)
         self.video_encoder.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         filter_page = ttk.Frame(param_notebook)
