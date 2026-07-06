@@ -3889,17 +3889,28 @@ class FFmpegBatchGUI:
         if only_audio:
             cmd_list.append("-vn")
         else:
-            # 视频滤镜（已包含 trim 和 setpts）
-            vf = build_video_filter_chain(settings, include_subtitle=True, include_speed=True)
-            if vf != "null":
-                cmd_list.extend(["-vf", vf])
-            cmd_list = self._build_video_encoding_params(cmd_list, settings)
+            vcodec = settings.get("encoder", "libx265")
+            precise_trim = settings.get("precise_trim", False)
+            if vcodec == "copy" and not precise_trim:
+                # 纯流复制，忽略所有视频处理
+                self._append_info_ui("编码器为 copy，已忽略所有视频滤镜、帧率、像素格式等设置。")
+                cmd_list.extend(["-c:v", "copy"])
+            else:
+                # 构建视频滤镜（包含字幕、变速等）
+                vf = build_video_filter_chain(settings, include_subtitle=True, include_speed=True)
+                if vf != "null":
+                    cmd_list.extend(["-vf", vf])
+                cmd_list = self._build_video_encoding_params(cmd_list, settings)
     
-        # 音频处理（若精准模式且音频需要截取）
-        if precise_trim and duration_for_audio is not None and duration_for_audio > 0:
-            self._apply_audio_trim_and_encode(cmd_list, settings, input_path, start_sec, duration_for_audio, map_audio=False)
+
+        # 音频处理（精准模式下也需尊重 audio_enabled）
+        if settings.get("audio_enabled", True):
+            if precise_trim and duration_for_audio is not None and duration_for_audio > 0:
+                self._apply_audio_trim_and_encode(cmd_list, settings, input_path, start_sec, duration_for_audio, map_audio=False)
+            else:
+                cmd_list = self._build_audio_encoding_params(cmd_list, settings)
         else:
-            cmd_list = self._build_audio_encoding_params(cmd_list, settings)
+            cmd_list.append("-an")
     
         custom = settings.get("custom_args", "").strip()
         if custom:
@@ -3937,6 +3948,11 @@ class FFmpegBatchGUI:
 
     def _generate_command_with_watermark(self, input_path: str, output_path: str, settings: dict, wm_settings: dict) -> List[str]:
         main_w, main_h = get_video_dimensions(self.ffprobe_cmd, input_path)
+
+        vcodec = settings.get("encoder", "libx265")
+        if vcodec == "copy":
+            settings["encoder"] = "libx265"
+            self._append_info_ui("水印模式必须重新编码，已将编码器自动改为 libx265。")
         if main_w is not None and main_h is not None:
             if wm_settings.get("adaptive", False):
                 adapted_wm = self._adapt_sub_settings(wm_settings, main_w, main_h)
