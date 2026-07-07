@@ -3967,7 +3967,7 @@ class FFmpegBatchGUI:
 
     def _generate_command_with_watermark(self, input_path: str, output_path: str, settings: dict, wm_settings: dict) -> List[str]:
         main_w, main_h = get_video_dimensions(self.ffprobe_cmd, input_path)
-
+    
         vcodec = settings.get("encoder", "libx265")
         if vcodec == "copy":
             settings["encoder"] = "libx265"
@@ -3979,7 +3979,7 @@ class FFmpegBatchGUI:
                 adapted_wm = wm_settings.copy()
         else:
             adapted_wm = copy.deepcopy(wm_settings)
-
+    
         # ---- 开始构建命令 ----
         cmd_list = [self.ffmpeg_cmd, "-y"]
     
@@ -4000,14 +4000,14 @@ class FFmpegBatchGUI:
         else:
             cmd_list.append("-fflags")
             cmd_list.append("+genpts")
-
+    
         precise_trim = settings.get("precise_trim", False)
         self._enforce_reencode_for_precise_trim(settings, only_audio=False)
-
+    
         # 快速模式（非精准）才在命令行添加 -ss/-to
         if not precise_trim:
             self._add_trim_params(cmd_list, settings)
-
+    
         self._add_hwaccel_params(cmd_list, settings)
     
         # 主视频输入
@@ -4015,31 +4015,57 @@ class FFmpegBatchGUI:
     
         # ----- 精准模式：计算截取时长 -----
         start_sec, duration_for_sub = self._calculate_trim_duration(settings, input_path)
-
+    
+        # 计算主视频截取时长（用于自动限制水印时长）
+        main_duration = None
+        # 只有主视频启用了截取功能，才计算截取时长
+        if settings.get("trim_enabled", False):
+            if precise_trim:
+                main_duration = duration_for_sub if duration_for_sub is not None else None
+            else:
+                start = settings.get("trim_start", "").strip()
+                end = settings.get("trim_end", "").strip()
+                start_sec_calc = time_to_seconds(start) if start else 0.0
+                end_sec_calc = time_to_seconds(end) if end else None
+                if end_sec_calc is not None:
+                    main_duration = end_sec_calc - start_sec_calc
+                else:
+                    total_dur = self._get_media_duration(input_path)
+                    if total_dur is not None:
+                        main_duration = total_dur - start_sec_calc
+    
+        # 水印普通截取（非精准）
+        wm_trim_enabled = adapted_wm.get("trim_enabled", False)
+        wm_precise = adapted_wm.get("precise_trim", False)
+        if wm_trim_enabled and not wm_precise:
+            start = adapted_wm.get("trim_start", "").strip()
+            end = adapted_wm.get("trim_end", "").strip()
+            if start:
+                cmd_list.extend(["-ss", start])
+            if end:
+                cmd_list.extend(["-to", end])
+    
         # ---- 添加水印输入（图片或视频） ----
         if not is_image:
             self._add_infinite_loop_params(cmd_list, wm_file)
+            # 如果水印没有显式截取且主时长已知，自动添加 -t 限制水印时长
+            if not wm_trim_enabled and main_duration is not None and main_duration > 0:
+                cmd_list.extend(["-t", f"{main_duration:.3f}"])
             cmd_list.extend(["-i", wm_file])
-            # 精准模式下，为子视频添加 -t 限制时长
-            if precise_trim and duration_for_sub is not None and duration_for_sub > 0:
-                cmd_list.extend(["-t", f"{duration_for_sub:.3f}"])
         else:
             fps = settings.get("frame_rate_custom", "30") if settings.get("frame_rate_type") == "custom" else "30"
             self._add_infinite_loop_params(cmd_list, wm_file, framerate=fps)
+            if not wm_trim_enabled and main_duration is not None and main_duration > 0:
+                cmd_list.extend(["-t", f"{main_duration:.3f}"])
             cmd_list.extend(["-i", wm_file])
-
-            # 给图片也加 -t
-            if precise_trim and duration_for_sub is not None and duration_for_sub > 0:
-                cmd_list.extend(["-t", f"{duration_for_sub:.3f}"])
     
         if use_infinite_loop:
             cmd_list.append("-shortest")
     
-        # ---- 构建叠加滤镜 ----
+        # ---- 构建叠加滤镜（强制 disable_shortest=True，不再使用 shortest=1） ----
         sub_infos = [(1, wm_file, adapted_wm)]
-
         complex_filter, final_v_label = self._build_overlay_filter_complex(
-            0, settings, sub_infos, include_subtitle_main=True, disable_shortest=precise_trim
+            0, settings, sub_infos, include_subtitle_main=True, disable_shortest=True
         )
         cmd_list.extend(["-filter_complex", complex_filter])
         cmd_list.extend(["-map", final_v_label])
@@ -4072,6 +4098,7 @@ class FFmpegBatchGUI:
     
         cmd_list.append(output_path)
         return cmd_list
+
 
 
     # ---------- 修改 get_current_settings 包含水印 ----------
