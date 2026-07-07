@@ -1083,8 +1083,10 @@ class VideoEncoderFrame(ttk.LabelFrame):
             self.preset.set("p4")
 
     def auto_set_codec_by_rate_control(self):
-        rc = self.rate_control_type.get()
         current = self.vcodec.get()
+        if current == "copy":
+            return  # 不要自动改变 copy
+        rc = self.rate_control_type.get()
         if rc == "crf":
             if current not in ("libx264", "libx265", "libvpx-vp9", "libsvtav1", "mpeg4", "libxvid"):
                 self.vcodec.set("libx265")
@@ -2787,17 +2789,11 @@ class AdvancedFrame(ttk.LabelFrame):
             path = filedialog.askopenfilename(title="选择水印文件", filetypes=[("媒体", "*.png *.jpg *.jpeg *.bmp *.gif *.webp *.mp4 *.mkv *.avi *.mov")])
             if path:
                 self.wm_path_var.set(normalize_path(path))
-                self.watermark_dict["file_path"] = normalize_path(path)
-                self.watermark_dict["enabled"] = True
-                self._auto_detect_watermark_duration()
-                if self.update_callback:
-                    self.update_callback()
-
         ttk.Button(wm_frame, text="浏览", command=browse_wm, width=6).pack(side=tk.LEFT, padx=2)
 
         def clear_wm():
             self.wm_path_var.set("")
-        ttk.Button(wm_frame, text="清除", command=self.clear_wm, width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Button(wm_frame, text="清除", command=clear_wm, width=6).pack(side=tk.LEFT, padx=2)
         
 
         self.adaptive_var = tk.BooleanVar(value=self.watermark_dict.get("adaptive", False))
@@ -2831,13 +2827,8 @@ class AdvancedFrame(ttk.LabelFrame):
         self.wm_path_var.trace_add("write", lambda *a: self._on_wm_path_changed())
 
 
-    def clear_wm(self):
-        self.wm_path_var.set("")
-        self.watermark_dict["file_path"] = ""
-        self.watermark_dict["enabled"] = False
-        self._auto_detect_watermark_duration()
-        if self.update_callback:
-            self.update_callback()
+
+
 
 
     def _on_wm_path_changed(self, *args):
@@ -3108,6 +3099,11 @@ class FFmpegBatchGUI:
 
         self.use_mpv = tk.BooleanVar(value=False)
         self.mpv_path = tk.StringVar(value="mpv")
+        
+        self.overwrite_policy = tk.StringVar(value='ask')    # 可选值: 'ask', 'rename', 'overwrite'
+        self._loading_preset = False      # 加载预设标志
+        self._updating_preview = False    # 防重入锁标志
+
 
         # ---------- 水印设置 ----------
         self.watermark_settings = {
@@ -3593,13 +3589,15 @@ class FFmpegBatchGUI:
         # 读取日志设置，缺失时使用默认值
         self.log_enabled_var.set(settings.get("log_enabled", True))
         self.log_path_var.set(settings.get("log_path", os.path.join(get_script_dir(), "editlog.txt")))
+        self.overwrite_policy.set(settings.get("overwrite_policy", "ask"))
 
     def save_player_settings(self):
         self.preset_manager.save_player_settings({
             "use_mpv": self.use_mpv.get(),
             "mpv_path": self.mpv_path.get(),
             "log_enabled": self.log_enabled_var.get(),
-            "log_path": self.log_path_var.get()
+            "log_path": self.log_path_var.get(),
+            "overwrite_policy": self.overwrite_policy.get()
         })
 
     def preview_with_player(self, input_path, filters=None, audio_only=False, volume=10, extra_args=None):
@@ -3787,30 +3785,40 @@ class FFmpegBatchGUI:
         return os.path.join(dir_path, out_name).replace('\\', '/')
 
     def _generate_gif_command(self, input_path, output_path, settings):
+        """
+        生成 GIF 编码的 FFmpeg 命令（使用 filter_complex）。
+        帧率控制改用 fps 滤镜，而非 -r 选项。
+        """
         cmd_list = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
-
+    
+        # 快速截取（非精准）在命令行添加 -ss/-to
         if not settings.get("precise_trim", False):
             self._add_trim_params(cmd_list, settings)
+    
+        # 硬件解码（一般不用于 GIF，但保留）
         self._add_hwaccel_params(cmd_list, settings)
+    
+        # 输入文件
         cmd_list.extend(["-i", input_path])
     
-        # 读取帧率设置
+        # ---- 读取帧率设置 ----
         fps_type = settings.get("frame_rate_type", "keep")
         fps_value = settings.get("frame_rate_custom", "30")
-        if fps_type == "custom":
-            # 添加输出帧率（放在 -i 之后，滤镜之前）
-            cmd_list.extend(["-r", str(fps_value)])
+        fps_filter = f"fps={fps_value}" if fps_type == "custom" else ""
     
         # 构建预处理滤镜（不含 format 和 subtitle）
         vf = build_video_filter_chain(settings, include_subtitle=False, include_speed=True)
         if vf and vf != "null":
             filters = [f.strip() for f in vf.split(",") if f.strip() and not f.startswith("format=")]
+            # 将 fps 滤镜加入列表（放在最前面，减少处理帧数）
+            if fps_filter:
+                filters.insert(0, fps_filter)
             pre_vf = ",".join(filters) if filters else ""
         else:
-            pre_vf = ""
+            pre_vf = fps_filter  # 只有帧率滤镜
     
-        # 读取 GIF 参数
-        loop = settings.get("gif_loop", 0)
+        # ---- 读取 GIF 参数 ----
+        loop = settings.get("gif_loop", 0)          # 0=无限循环
         dither = settings.get("gif_dither", "bayer")
         bayer_scale = settings.get("gif_bayer_scale", 2)
         max_colors = settings.get("gif_max_colors", 256)
@@ -3823,25 +3831,36 @@ class FFmpegBatchGUI:
         else:
             dither_opt = dither
     
-        # 构建 filter_complex
+        # ---- 构建 filter_complex ----
         if pre_vf:
-            complex_filter = f"[0:v]{pre_vf}[v];[v]split[v1][v2];[v1]palettegen=max_colors={max_colors}[palette];[v2][palette]paletteuse=dither={dither_opt}[out]"
+            complex_filter = (
+                f"[0:v]{pre_vf}[v];"
+                f"[v]split[v1][v2];"
+                f"[v1]palettegen=max_colors={max_colors}[palette];"
+                f"[v2][palette]paletteuse=dither={dither_opt}[out]"
+            )
         else:
-            complex_filter = f"[0:v]split[v1][v2];[v1]palettegen=max_colors={max_colors}[palette];[v2][palette]paletteuse=dither={dither_opt}[out]"
+            complex_filter = (
+                f"[0:v]split[v1][v2];"
+                f"[v1]palettegen=max_colors={max_colors}[palette];"
+                f"[v2][palette]paletteuse=dither={dither_opt}[out]"
+            )
     
         cmd_list.extend(["-filter_complex", complex_filter])
         cmd_list.extend(["-map", "[out]"])
         cmd_list.extend(["-c:v", "gif"])
     
-
-        # 循环始终添加
+        # 循环设置（如果 loop != 0，则添加 -loop，否则默认无限循环）
         if loop != 0:
             cmd_list.extend(["-loop", str(loop)])
     
-        cmd_list.append("-an")  # 忽略音频
+        # 忽略音频
+        cmd_list.append("-an")
+    
+        # 输出文件
         cmd_list.append(output_path)
+    
         return cmd_list
-
 
     def generate_ffmpeg_command(self, input_path: str, output_path: str, settings: dict) -> List[str]:
         if not self.ffmpeg_cmd:
@@ -4084,23 +4103,28 @@ class FFmpegBatchGUI:
 
     # ---------- 修改 load_settings_into_ui 恢复水印 ----------
     def load_settings_into_ui(self, settings):
-        self.output_dir.set(settings.get("output_dir", ""))
-        self.output_suffix.set(settings.get("output_suffix", ""))
-        self.custom_output_name.set(settings.get("custom_output_name", ""))
-        self.output_container.set(settings.get("output_container", "mp4"))
-        self.video_encoder.set_settings(settings)
-        self.video_filter.set_settings(settings)
-        self.audio_frame.set_settings(settings)
-        self.trim_frame.set_settings(settings)
-        self.adv_frame.set_settings(settings)
-        self.pip_enabled.set(settings.get("pip_enabled", False))
-        # 恢复水印设置
-        if "watermark" in settings:
-            self.watermark_settings = copy.deepcopy(settings["watermark"])
-        else:
-            # 保持默认值（已在 __init__ 中定义）
-            pass
-        self.toggle_only_audio_mode()
+        self._loading_preset = True
+        try:
+            self.output_dir.set(settings.get("output_dir", ""))
+            self.output_suffix.set(settings.get("output_suffix", ""))
+            self.custom_output_name.set(settings.get("custom_output_name", ""))
+            self.output_container.set(settings.get("output_container", "mp4"))
+            self.video_encoder.set_settings(settings)
+            self.video_filter.set_settings(settings)
+            self.audio_frame.set_settings(settings)
+            self.trim_frame.set_settings(settings)
+            self.adv_frame.set_settings(settings)
+            self.pip_enabled.set(settings.get("pip_enabled", False))
+            # 恢复水印设置
+            if "watermark" in settings:
+                self.watermark_settings = copy.deepcopy(settings["watermark"])
+            else:
+                # 保持默认值（已在 __init__ 中定义）
+                pass
+            self.toggle_only_audio_mode()
+        finally:
+            self._loading_preset = False
+            self.update_command_preview()  # 最后统一刷新一次
 
     # ---------- 可视化编辑器公共辅助方法（用于合并模块）----------
     def _get_enabled_video_tracks(self):
@@ -5014,19 +5038,71 @@ class FFmpegBatchGUI:
             self._set_recursive_state(child, state)
 
     def update_command_preview(self, *args):
-        input_file = self.input_file.get()
+        if getattr(self, '_loading_preset', False):
+            return
+        # ---- 防重入锁 ----
+        if hasattr(self, '_updating_preview') and self._updating_preview:
+            return
+        self._updating_preview = True
         try:
-            if not input_file:
-                cmd_list = self.generate_ffmpeg_command("{input}", "{output}", self.get_current_settings())
+            # 原有代码
+            input_file = self.input_file.get()
+            try:
+                if not input_file:
+                    cmd_list = self.generate_ffmpeg_command("{input}", "{output}", self.get_current_settings())
+                else:
+                    settings = self.get_current_settings()
+                    output_path = self.generate_output_path(input_file, settings)
+                    cmd_list = self.generate_ffmpeg_command(input_file, output_path, settings)
+                cmd_str = format_cmd_for_display(cmd_list)
+            except Exception as e:
+                cmd_str = f"生成命令时出错: {e}"
+            self.cmd_preview.delete(1.0, tk.END)
+            self.cmd_preview.insert(tk.END, cmd_str)
+        finally:
+            self._updating_preview = False
+
+
+    # ---------- 同名文件处理 ----------
+    def _unique_path(self, path: str) -> str:
+        """生成不冲突的唯一路径（自动加序号）"""
+        dirname = os.path.dirname(path)
+        basename, ext = os.path.splitext(os.path.basename(path))
+        counter = 1
+        new_path = path
+        # 检查文件系统存在或任务列表中已占用
+        while os.path.exists(new_path) or any(t.output == new_path for t in self.tasks):
+            new_path = os.path.join(dirname, f"{basename} ({counter}){ext}")
+            counter += 1
+        return new_path
+
+    def _resolve_path_conflict(self, output_path: str):
+        """
+        根据当前策略处理同名文件冲突，返回最终路径。
+        若策略为 'ask' 且用户取消覆盖，则自动重命名。
+        永远不会返回 None。
+        """
+        if not output_path:
+            return output_path
+        policy = self.overwrite_policy.get()
+        
+        def conflict(path):
+            return os.path.exists(path) or any(t.output == path for t in self.tasks)
+        
+        if policy == 'overwrite':
+            return output_path
+        
+        if policy == 'rename':
+            return self._unique_path(output_path)
+        
+        # policy == 'ask'
+        if conflict(output_path):
+            if messagebox.askyesno("文件已存在", f"输出文件已存在:\n{output_path}\n\n是否覆盖？"):
+                return output_path
             else:
-                settings = self.get_current_settings()
-                output_path = self.generate_output_path(input_file, settings)
-                cmd_list = self.generate_ffmpeg_command(input_file, output_path, settings)
-            cmd_str = format_cmd_for_display(cmd_list)
-        except Exception as e:
-            cmd_str = f"生成命令时出错: {e}"
-        self.cmd_preview.delete(1.0, tk.END)
-        self.cmd_preview.insert(tk.END, cmd_str)
+                return self._unique_path(output_path)
+        return output_path
+
 
     # ---------- 任务管理 ----------
     def is_duplicate_task(self, input_path, output_path):
@@ -5036,6 +5112,7 @@ class FFmpegBatchGUI:
             if normalize_path(task.output) == norm_out:
                 return True
         return False
+
 
     def add_task(self, input_path, settings=None):
         if settings is None:
@@ -5050,29 +5127,13 @@ class FFmpegBatchGUI:
             self._append_info_ui(traceback.format_exc())
             messagebox.showerror("错误", err_msg)
             return False
-        
-        # ---- 新增：自定义名称重复时自动编号 ----
-        custom_name = settings.get("custom_output_name", "").strip()
-        if custom_name:
-            base, ext = os.path.splitext(output_path)
-            counter = 1
-            while self.is_duplicate_task(input_path, output_path) and counter <= 100:
-                new_output = f"{base}_{counter}{ext}"
-                if not self.is_duplicate_task(input_path, new_output):
-                    output_path = new_output
-                    break
-                counter += 1
-            if counter > 100:
-                self._append_info_ui(f"警告：尝试生成唯一输出路径超过100次，保留原路径: {output_path}")
-        # 最终重复检查（若仍重复则放弃添加）
-        if self.is_duplicate_task(input_path, output_path):
-            messagebox.showwarning("重复任务",
-                                   f"任务已存在且无法自动生成唯一输出名:\n"
-                                   f"输入: {input_path}\n"
-                                   f"输出: {output_path}\n"
-                                   "请检查自定义名称或手动修改。")
+    
+        # ---- 统一处理所有冲突（文件系统 + 任务列表） ----
+        output_path = self._resolve_path_conflict(output_path)
+        if output_path is None:   # 实际上不会返回 None，但保留防御
+            self._append_info_ui("添加任务已取消")
             return False
-        
+    
         try:
             cmd_list = self.generate_ffmpeg_command(input_path, output_path, settings)
             self._append_info_ui(f"命令生成成功，参数个数: {len(cmd_list)}")
@@ -5083,7 +5144,7 @@ class FFmpegBatchGUI:
             self._append_info_ui(traceback.format_exc())
             messagebox.showerror("命令生成错误", err_msg)
             return False
-        
+    
         task = Task(input_path, output_path, settings, cmd_list)
         self.tasks.append(task)
         self.update_task_list()
@@ -5223,7 +5284,7 @@ class FFmpegBatchGUI:
         task.status = "转码中"
         self._update_task_list_ui()
         self._append_info_ui(f"\n========== 开始转码: {os.path.basename(task.input)} ==========")
-        cmd_str = ' '.join(task.cmd)
+        cmd_str = format_cmd_for_display(task.cmd)
         self._append_info_ui(f">>> {cmd_str}")
         self.ensure_output_dir(task.output)
 
@@ -5291,6 +5352,8 @@ class FFmpegBatchGUI:
             return
         settings = self.get_current_settings()
         output_file = self.generate_output_path(input_file, settings)
+        # ---- 新增：处理冲突 ----
+        output_file = self._resolve_path_conflict(output_file)
         self.ensure_output_dir(output_file)
         try:
             cmd_list = self.generate_ffmpeg_command(input_file, output_file, settings)
@@ -5301,7 +5364,7 @@ class FFmpegBatchGUI:
 
     def _run_single_transcode(self, cmd_list, input_name):
         self._append_info_ui(f"\n========== 当前选择转码: {os.path.basename(input_name)} ==========")
-        cmd_str = ' '.join(cmd_list)
+        cmd_str = format_cmd_for_display(cmd_list)
         self._append_info_ui(f">>> {cmd_str}")
         def on_line(line):
             self.safe_append_detail(line)
@@ -6695,6 +6758,15 @@ class FFmpegBatchGUI:
             return
         if not self._check_pip_video_encoders():
             return
+
+        # ---- 新增：处理输出路径冲突 ----
+        output = self.merge_output.get().strip()
+        resolved = self._resolve_path_conflict(output)
+        if resolved != output:
+            self.merge_output.set(resolved)  # 更新界面变量
+            self._append_info_ui(f"[封装] 输出路径已自动调整为: {resolved}")
+        # --------------------------------
+
         self.merge_btn.config(state="disabled")
         threading.Thread(target=self.merge_do_merge, daemon=True).start()
 
@@ -6915,6 +6987,30 @@ class FFmpegBatchGUI:
         log_entry = ttk.Entry(log_frame, textvariable=self.log_path_var, width=30)
         log_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         ttk.Button(log_frame, text="浏览", command=self.browse_log_file).pack(side=tk.LEFT, padx=5)
+
+
+        # ---- 新增：同名文件处理策略 ----
+        policy_frame = ttk.LabelFrame(frame, text="全局同名文件处理策略", padding="5")
+        policy_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(policy_frame, text="当输出文件已存在时:").pack(side=tk.LEFT)
+        policy_combo = ttk.Combobox(
+            policy_frame,
+            textvariable=self.overwrite_policy,
+            values=["ask", "rename", "overwrite"],
+            state="readonly",
+            width=12
+        )
+        policy_combo.pack(side=tk.LEFT, padx=5)
+        # 添加解释
+        desc = ttk.Label(
+            policy_frame,
+            text="询问/自动重命名/直接覆盖",
+            foreground="gray"
+        )
+        desc.pack(side=tk.LEFT, padx=5)
+        # 绑定事件，保存设置
+        self.overwrite_policy.trace_add("write", lambda *a: self.save_player_settings())
 
 
         status_frame = ttk.LabelFrame(frame, text="状态检测", padding="5")
