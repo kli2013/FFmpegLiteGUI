@@ -4018,7 +4018,7 @@ class FFmpegBatchGUI:
     
         # 计算主视频截取时长（用于自动限制水印时长）
         main_duration = None
-        # 只有主视频启用了截取功能，才计算截取时长
+        # 如果主视频启用了截取，使用截取时长
         if settings.get("trim_enabled", False):
             if precise_trim:
                 main_duration = duration_for_sub if duration_for_sub is not None else None
@@ -4033,6 +4033,11 @@ class FFmpegBatchGUI:
                     total_dur = self._get_media_duration(input_path)
                     if total_dur is not None:
                         main_duration = total_dur - start_sec_calc
+        else:
+            # 主视频无截取：使用主视频总时长
+            total_dur = self._get_media_duration(input_path)
+            if total_dur is not None:
+                main_duration = total_dur
     
         # 水印普通截取（非精准）
         wm_trim_enabled = adapted_wm.get("trim_enabled", False)
@@ -7376,7 +7381,7 @@ class FFmpegBatchGUI:
 
         preview_frame = ttk.LabelFrame(settings_frame, text="当前命令模板", padding="5")
         preview_frame.pack(fill=tk.X, pady=0)
-        self.cmd_preview = scrolledtext.ScrolledText(preview_frame, height=3, wrap=tk.WORD, font=("Microsoft YaHei",9))
+        self.cmd_preview = scrolledtext.ScrolledText(preview_frame, height=4, wrap=tk.WORD, font=("Microsoft YaHei",9))
         self.cmd_preview.pack(fill=tk.BOTH, expand=True)
         self.cmd_preview.insert(tk.END, "请选择输入文件，或调整参数...")
 
