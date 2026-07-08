@@ -45,3 +45,8 @@
 
 <img width="1072" height="701" alt="Img20260630030325987" src="https://github.com/user-attachments/assets/5fe57733-8739-40f3-983c-c8917a558772" />
 <img width="480" height="270" alt="3" src="https://github.com/user-attachments/assets/4065c11e-4904-4094-87b1-25fe3ad9faa5" />
+
+20260707   水印问题好像都解决了  
+    截取和循环的冲突问题,换了个思路  
+    子视频/水印截取时从全局循环改为单独循环,测试了10多种情况,几乎覆盖完了所有场景,感觉没问题了,  
+    唯一不完美的是截取后的片段循环时,首尾交接有点跳帧,暂时不知道原因  
