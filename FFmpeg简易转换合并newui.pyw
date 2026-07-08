@@ -3458,17 +3458,11 @@ class FFmpegBatchGUI:
 
     def _build_overlay_filter_complex(self, main_idx: int, main_settings: dict,
                                        sub_infos: List[Tuple[int, str, dict]],
-                                       include_subtitle_main: bool = False,
-                                       disable_shortest: bool = False) -> Tuple[str, str]:
+                                       include_subtitle_main: bool = False) -> Tuple[str, str]:
         """
         构建主视频 + 多个子视频（画中画/水印）的 filter_complex 字符串。
-        
-        :param main_idx: 主视频输入索引
-        :param main_settings: 主视频设置字典
-        :param sub_infos: 子视频信息列表，每个元素为 (输入索引, 文件路径, 设置字典)
-        :param include_subtitle_main: 是否在主视频滤镜链中包含字幕烧录
-        :param disable_shortest: 若为 True，则 overlay 滤镜不加 shortest=1（适用于精准截取时避免主视频被提前截断）
-        :return: (filter_complex 字符串, 最终视频标签，如 "[v_out_0]")
+        注意：此函数不会在 overlay 中添加 shortest=1，避免子视频流结束导致输出提前截断。
+        输出结束由全局 -shortest 控制。
         """
         filter_parts = []
         # 主视频滤镜
@@ -3489,11 +3483,12 @@ class FFmpegBatchGUI:
                 ox = main_settings.get('offset_x', '0').strip() or '0'
                 oy = main_settings.get('offset_y', '0').strip() or '0'
                 filter_parts.append(f"color=c=black:s={pw}x{ph}[canvas]")
-                filter_parts.append(f"[canvas][{current_v}]overlay={ox}:{oy}:shortest=1[v_main_pad]")
+                filter_parts.append(f"[canvas][{current_v}]overlay={ox}:{oy}[v_main_pad]")
                 current_v = "v_main_pad"
     
+        # 处理每个子视频
         for i, (sub_idx, sub_file, sub_settings) in enumerate(sub_infos):
-            # 判断是否使用 loop 滤镜：截取且不是 once 模式
+            # 判断是否使用 loop 滤镜：只要截取了且循环模式不是 once，就使用 loop
             use_loop = sub_settings.get("trim_enabled", False)
             if use_loop:
                 if sub_settings.get("loop_enabled", False) and sub_settings.get("loop_mode") == "once":
@@ -3535,21 +3530,13 @@ class FFmpegBatchGUI:
     
             # 构建子视频滤镜串
             if use_loop:
-                loop_enabled = sub_settings.get("loop_enabled", False)
-                loop_mode = sub_settings.get("loop_mode", "infinite")
-                if not loop_enabled or loop_mode == "infinite":
-                    loop_param = "-1"
-                else:  # count
-                    loop_count = sub_settings.get("loop_count", 3)
-                    extra = max(0, loop_count - 1)
-                    loop_param = str(extra) if extra > 0 else "0"
-    
-                # 构建滤镜链
-                vf_parts = []
-                trim_filter = f"trim=start={start_sec}:end={end_sec}" if end_sec is not None else f"trim=start={start_sec}"
-                vf_parts.append(trim_filter)
-                vf_parts.append("setpts=PTS-STARTPTS")
-                vf_parts.append(f"loop=loop={loop_param}:size={size}:start=0")
+                # 始终无限循环（loop=-1），显示时间由 enable 控制
+                loop_param = "-1"
+                vf_parts = [
+                    f"trim=start={start_sec}:end={end_sec}",
+                    "setpts=PTS-STARTPTS",
+                    f"loop=loop={loop_param}:size={size}:start=0"
+                ]
                 if base_vf:
                     vf_parts.append(base_vf)
                 vf_parts.append("format=rgba")
@@ -3587,16 +3574,13 @@ class FFmpegBatchGUI:
                 filter_parts.append(f"[{current_sub}]colorchannelmixer=aa={alpha_val:.2f}[v_alpha_{i}]")
                 current_sub = f"v_alpha_{i}"
     
-            # 叠加
+            # 叠加（不添加 shortest=1）
             if sub_settings.get('overlay_enabled', True):
                 x = sub_settings.get('overlay_x', '0').strip() or '0'
                 y = sub_settings.get('overlay_y', '0').strip() or '0'
                 duration = self._get_media_duration(sub_file)
                 enable_expr = self._calc_enable_expr(sub_settings, duration)
-                if disable_shortest:
-                    overlay_filter = f"overlay={x}:{y}:enable='{enable_expr}'"
-                else:
-                    overlay_filter = f"overlay={x}:{y}:enable='{enable_expr}':shortest=1"
+                overlay_filter = f"overlay={x}:{y}:enable='{enable_expr}'"
                 filter_parts.append(f"[{current_v}][{current_sub}]{overlay_filter}[v_out_{i}]")
                 current_v = f"v_out_{i}"
             else:
@@ -4114,7 +4098,7 @@ class FFmpegBatchGUI:
                 cmd_list.extend(["-to", end])
     
         # ---- 判断是否在滤镜中使用 loop ----
-        use_loop_in_filter = wm_trim_enabled and (not (loop_enabled and loop_mode == "once"))
+        use_loop_in_filter = wm_trim_enabled  # 只要截取了，就用 loop 滤镜
     
         # ---- 计算水印单次有效时长（用于循环总时长判断） ----
         wm_single_duration = None
@@ -4139,35 +4123,7 @@ class FFmpegBatchGUI:
                 # 图片没有时长，视为无限
                 wm_single_duration = None
     
-        # ---- 判断是否需要添加 -shortest ----
-        need_shortest = False
-        if is_image:
-            # 图片水印无限循环，总时长无限，肯定需要 -shortest
-            need_shortest = True
-        else:
-            # 判断循环模式
-            if not loop_enabled or loop_mode == "infinite":
-                # 无限循环
-                need_shortest = True
-            elif loop_mode == "once":
-                # 只显示一次，总时长 = wm_single_duration，如果小于主视频则不需要 -shortest
-                if wm_single_duration is not None and main_duration is not None:
-                    if wm_single_duration > main_duration:
-                        need_shortest = True
-                    else:
-                        need_shortest = False
-                else:
-                    # 无法确定，为安全添加 -shortest
-                    need_shortest = True
-            else:  # count
-                if wm_single_duration is not None and main_duration is not None:
-                    total_duration = wm_single_duration * loop_count
-                    if total_duration > main_duration:
-                        need_shortest = True
-                    else:
-                        need_shortest = False
-                else:
-                    need_shortest = True
+
     
         # ---- 添加水印输入（及循环参数） ----
         if not is_image:
@@ -4187,7 +4143,7 @@ class FFmpegBatchGUI:
         # ---- 构建叠加滤镜 ----
         sub_infos = [(1, wm_file, adapted_wm)]
         complex_filter, final_v_label = self._build_overlay_filter_complex(
-            0, settings, sub_infos, include_subtitle_main=True, disable_shortest=True
+            0, settings, sub_infos, include_subtitle_main=True
         )
         cmd_list.extend(["-filter_complex", complex_filter])
         cmd_list.extend(["-map", final_v_label])
@@ -4219,8 +4175,7 @@ class FFmpegBatchGUI:
             cmd_list.extend(["-movflags", "+faststart"])
     
         # ---- 根据判断添加 -shortest ----
-        if need_shortest:
-            cmd_list.append("-shortest")
+        cmd_list.append("-shortest")
     
         cmd_list.append(output_path)
         return cmd_list
@@ -6143,66 +6098,11 @@ class FFmpegBatchGUI:
         input_files_norm = [normalize_path(f) for f in input_files]
         output_norm = normalize_path(output)
         
-        # ---- 获取所有文件的时长（用于 enable 计算） ----
+        # ---- 获取所有文件的时长（用于 enable 计算，但此处未使用，仅保留） ----
         file_durations = {}
         for f in input_files_norm:
             if f not in file_durations:
                 file_durations[f] = self._get_media_duration(f)
-        
-        # ---- 准备循环参数（仅对子视频添加循环） ----
-        video_tracks = [t for t in enabled_tracks if t.type == "video"]
-        sub_video_files = {normalize_path(t.file_path) for t in video_tracks[1:]}  # 从视频文件集合
-        img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
-        
-        # ---- 处理截取参数（从 enc_settings 读取，包含 precise） ----
-        file_trim_info = {}   # key: file_path, value: (start, end, precise)
-        for track in enabled_tracks:
-            if track.type == "video":
-                trim_enabled = track.enc_settings.get("trim_enabled", False)
-                if trim_enabled:
-                    start = track.enc_settings.get("trim_start", "").strip()
-                    end = track.enc_settings.get("trim_end", "").strip()
-                    precise = track.enc_settings.get("precise_trim", False)
-                    if start or end:
-                        norm_key = normalize_path(track.file_path)
-                        file_trim_info[norm_key] = (start, end, precise)
-        
-        # ---- 检查精准截取与编码器冲突（强制重编码） ----
-        for track in video_tracks:
-            if track.file_path in file_trim_info:
-                _, _, precise = file_trim_info[normalize_path(track.file_path)]
-                if precise and track.enc_settings.get("encoder") == "copy":
-                    track.enc_settings["encoder"] = "libx265"
-                    self._append_info_ui(f"精准截取模式下，视频 {os.path.basename(track.file_path)} 编码器不能为 copy，已改为 libx265。")
-        
-        # ---- 构建基础命令 ----
-        cmd_list = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
-        
-        # ---- 添加输入文件（带循环和截取参数） ----
-        for f in input_files_norm:
-            # 循环参数（子视频）
-            if f in sub_video_files:
-                self._add_infinite_loop_params(cmd_list, f, framerate="30")
-            # 快速模式截取参数：放在 -i 前
-            if f in file_trim_info:
-                start, end, precise = file_trim_info[f]
-                if start and not precise:
-                    cmd_list.extend(["-ss", start])
-                    if end:
-                        cmd_list.extend(["-to", end])
-            # 添加输入
-            cmd_list.extend(["-i", f])
-            # 精准模式：在 -i 后添加 -ss 和 -t（使用公共函数）
-            if f in file_trim_info:
-                start, end, precise = file_trim_info[f]
-                if precise and start:
-                    # 构造临时 settings 字典，仅包含精准截取所需字段
-                    temp_settings = {
-                        "precise_trim": True,
-                        "trim_start": start,
-                        "trim_end": end
-                    }
-                    self._apply_precise_trim(cmd_list, temp_settings, f)
         
         # ---- 分离轨道 ----
         video_tracks = [t for t in enabled_tracks if t.type == "video"]
@@ -6213,29 +6113,67 @@ class FFmpegBatchGUI:
             self._append_info_ui("[封装] 没有启用的视频轨道")
             return []
         
+        main_video = video_tracks[0]
+        sub_videos = video_tracks[1:] if self.pip_enabled.get() else []
+        
+        # ---- 构建基础命令 ----
+        cmd_list = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
+        
+        # ---- 添加输入文件（带截取和循环参数） ----
+        for f in input_files_norm:
+            is_main = (f == normalize_path(main_video.file_path))
+            is_sub = any(f == normalize_path(sv.file_path) for sv in sub_videos)
+            
+            # 快速模式截取参数
+            if is_main and main_video.enc_settings.get("trim_enabled", False) and not main_video.enc_settings.get("precise_trim", False):
+                start = main_video.enc_settings.get("trim_start", "").strip()
+                end = main_video.enc_settings.get("trim_end", "").strip()
+                if start:
+                    cmd_list.extend(["-ss", start])
+                if end:
+                    cmd_list.extend(["-to", end])
+            elif is_sub:
+                sv = next(sv for sv in sub_videos if normalize_path(sv.file_path) == f)
+                sv_settings = sv.enc_settings
+                if sv_settings.get("trim_enabled", False) and not sv_settings.get("precise_trim", False):
+                    start = sv_settings.get("trim_start", "").strip()
+                    end = sv_settings.get("trim_end", "").strip()
+                    if start:
+                        cmd_list.extend(["-ss", start])
+                    if end:
+                        cmd_list.extend(["-to", end])
+            
+            # 循环参数（仅对子视频，且未截取时添加 -stream_loop -1）
+            if is_sub:
+                sv = next(sv for sv in sub_videos if normalize_path(sv.file_path) == f)
+                sv_settings = sv.enc_settings
+                # 如果子视频启用了截取，则不加 -stream_loop（由 loop 滤镜处理）
+                if not sv_settings.get("trim_enabled", False):
+                    # 未截取，添加无限循环（由 -shortest 控制结束）
+                    cmd_list.extend(["-stream_loop", "-1"])
+            # 主视频不添加循环
+            
+            # 添加输入
+            cmd_list.extend(["-i", f])
+        
         # ---- 画中画模式（使用 filter_complex） ----
         if self.pip_enabled.get():
-            main_video = video_tracks[0]
-            sub_videos = video_tracks[1:]
             main_idx = input_files_norm.index(normalize_path(main_video.file_path))
-    
-            # 准备子视频信息列表
+            
             sub_infos = []
             for sv in sub_videos:
                 sv_idx = input_files_norm.index(normalize_path(sv.file_path))
                 sub_infos.append((sv_idx, sv.file_path, sv.enc_settings))
-
-            # 构建 filter_complex
+            
             complex_filter, final_v_label = self._build_overlay_filter_complex(
                 main_idx, main_video.enc_settings, sub_infos, include_subtitle_main=False
             )
             cmd_list.extend(["-filter_complex", complex_filter])
             cmd_list.extend(["-map", final_v_label])
-    
-            # 视频编码参数（使用主视频设置）
+            
             v_settings = main_video.enc_settings
             cmd_list = self._build_video_encoding_params(cmd_list, v_settings)
-    
+            
             # 音频轨道
             audio_map_count = self._map_audio_tracks(cmd_list, input_files_norm, audio_tracks)
             if audio_map_count == 0:
@@ -6243,10 +6181,9 @@ class FFmpegBatchGUI:
             else:
                 cmd_list.extend(["-disposition:a:0", "default"])
             
-            # 字幕轨道
             container = self.merge_container.get().lower()
             self._map_subtitle_tracks(cmd_list, input_files_norm, subtitle_tracks, container)
-
+        
         else:
             # ---- 非画中画模式（普通封装） ----
             video_track = video_tracks[0]
@@ -6267,16 +6204,18 @@ class FFmpegBatchGUI:
             else:
                 cmd_list = self._build_video_encoding_params(cmd_list, v_settings)
             
-            # 音频轨道
             audio_map_count = self._map_audio_tracks(cmd_list, input_files_norm, audio_tracks)
             if audio_map_count == 0:
                 cmd_list.append("-an")
             else:
                 cmd_list.extend(["-disposition:a:0", "default"])
             
-            # 字幕轨道
             container = self.merge_container.get().lower()
             self._map_subtitle_tracks(cmd_list, input_files_norm, subtitle_tracks, container)
+        
+        # ---- 添加 -shortest（画中画模式下存在子视频时） ----
+        if self.pip_enabled.get() and sub_videos:
+            cmd_list.append("-shortest")
         
         # ---- 章节处理 ----
         if self.copy_chapters.get() and input_files_norm:
@@ -6288,7 +6227,6 @@ class FFmpegBatchGUI:
             cmd_list.insert(2, chapter_file_norm)
             cmd_list.extend(["-map_chapters", "1"])
         
-        # ---- 容器优化 ----
         container = self.merge_container.get().lower()
         if container in ("mp4", "mov"):
             cmd_list.extend(["-movflags", "+faststart"])
