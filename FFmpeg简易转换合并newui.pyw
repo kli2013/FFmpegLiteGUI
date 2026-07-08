@@ -370,17 +370,19 @@ def time_to_seconds(timestr: str) -> Optional[float]:
         return None
 
 # ================== 滤镜链构建 ==================
-def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = True, include_speed: bool = True) -> str:
+def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = True, include_speed: bool = True,
+                              include_trim: bool = True, include_format: bool = True) -> str:
     """
     从设置字典构建视频滤镜链。
     include_subtitle: 是否包含字幕滤镜
     include_speed: 是否包含变速滤镜
+    include_trim: 是否包含精准截取（trim+setpts）滤镜
+    include_format: 是否包含像素格式转换（format）滤镜
     """
     filters = []
     
     # ----- 精准截取（trim + setpts）-----
-    # 当 precise_trim=True 且启用截取时，使用 trim 滤镜精确裁剪并重置时间戳
-    if settings.get("precise_trim", False) and settings.get("trim_enabled", False):
+    if include_trim and settings.get("precise_trim", False) and settings.get("trim_enabled", False):
         start = settings.get("trim_start", "").strip()
         end = settings.get("trim_end", "").strip()
         start_sec = time_to_seconds(start) if start else None
@@ -432,8 +434,8 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
     deint = settings.get("deinterlace_filter", "none")
     if deint != "none":
         filters.append(deint)
-    # 像素格式
-    if settings.get("pix_fmt_enabled", True):
+    # 像素格式（受 include_format 控制）
+    if include_format and settings.get("pix_fmt_enabled", True):
         filters.append(f"format={settings.get('pix_fmt', 'yuv420p')}")
     # 变速（视频）
     if include_speed and settings.get("speed_enabled", False):
@@ -2140,20 +2142,21 @@ class TrimFrame(ttk.LabelFrame):
                                           command=self.on_trim_toggle)
         self.trim_check.pack(anchor=tk.W, pady=(0,10))
         ToolTip(self.trim_check, 
-                "默认是 -ss 在 -i 之前的快速模式，快速无损截取请把音频视频都改为Copy，注意取消一下像素格式滤镜\n\n"
-                "截取功能限制说明：\n\n"
-                "对主视频截取（当前主界面输入的视频）：\n"
-                "   若同时启用了「水印」或「画中画（子视频）」，截取可能失效。\n"
-                "   常见问题：输出时长仍为原视频长度、画面从开头播放、或截取结束时画面定格。\n\n"
-                "对子视频（水印/画中画素材）截取：\n"
-                "   若在子视频的设置中启用截取，可能导致输出视频根据子视频的短时间提前结束，\n"
-                "   或出现画面闪烁、黑屏等异常。\n\n"
-                "推荐处理方式：\n"
-                "  ① 先单独对主视频进行截取转码（在「视频转码」标签页中操作），生成截取后的主视频；\n"
-                "  ② 再以截取后的视频作为主视频，在「封装/合并」标签页中添加水印或画中画；\n"
-                "  ③ 子视频如需截取，也建议先预处理后再导入。\n\n"
-                "当前功能仅适用于单视频截取，无水印/画中画时效果最佳。",
-                wraplength=500)
+                "默认是 -ss 在 -i 之前的快速模式，快速无损截取请把音频视频都改为Copy\n\n"
+                "截取功能在普通转码模式下（无水印/画中画）表现稳定，支持快速截取（基于关键帧）和精准截取（基于解码帧）两种方式。\n\n"
+                "当同时启用了「水印」或「画中画（子视频）」时：\n"
+                "  主视频截取：\n"
+                "    · 推荐使用「精准截取」模式（勾选“精准到帧”），可确保水印时长精确匹配主视频截取时长。\n"
+                "    · 快速模式下因基于关键帧，结束时间可能有几帧偏差（通常可忽略）。\n\n"
+                "  子视频（水印/画中画）截取：\n"
+                "    · 子视频启用截取后，截取的片段会循环播放（使用 loop 滤镜），直到主视频结束。\n"
+                "    · 若循环次数有限且总时长小于主视频，水印会在播放完后消失，主视频继续播放。\n"
+                "    · 若循环为无限或总时长超过主视频，会自动添加 -shortest 参数，确保输出在主视频结束时停止。\n\n"
+                "关于 -shortest 参数：\n"
+                "  该参数仅在必要时（水印总时长 ≥ 主视频时长）添加，避免主视频被意外截断。\n"
+                "  旧版曾无条件使用 -shortest，现已优化，仅在需要时启用。\n\n"
+                "若您不希望水印循环或需要更精细控制，建议先在「视频转码」标签页单独处理好子视频，再导入作为水印/画中画素材。",
+                wraplength=700)
 
         time_frame = ttk.Frame(self)
         time_frame.pack(fill=tk.X, pady=2)
@@ -2182,7 +2185,7 @@ class TrimFrame(ttk.LabelFrame):
         self.precise_check.pack(side=tk.LEFT, padx=5)
         ToolTip(self.precise_check,
                 "勾选后，截取将精确到帧（-ss 放在 -i 之后），但必须重新编码视频。\n"
-                "若编码器为「copy」将自动改为 libx264 并提示。\n"
+                "若编码器为「copy」将自动改为 libx265 并提示。\n"
                 "取消勾选则为快速截取（基于关键帧），可能不精确但速度快。",
                 wraplength=400)
         # 新增结束
@@ -3179,6 +3182,8 @@ class FFmpegBatchGUI:
         self.show_quick_warning()
 
 
+
+
     def _add_hwaccel_params(self, cmd_list: List[str], settings: dict):
         """添加硬件解码相关参数（若启用）"""
         if not settings.get("hwaccel_enabled", False):
@@ -3251,41 +3256,24 @@ class FFmpegBatchGUI:
         return start_sec, duration
 
 
-    def _apply_precise_trim(self, cmd_list: List[str], settings: dict, input_path: str) -> List[str]:
-        """
-        在精准截取模式下，向命令列表添加 -ss 和 -t 参数（放在 -i 之后）。
-        :param cmd_list: 当前命令列表（会被修改）
-        :param settings: 设置字典
-        :param input_path: 输入文件路径（用于获取总时长）
-        :return: 修改后的命令列表（便于链式调用）
-        """
-        precise_trim = settings.get("precise_trim", False)
-        if not precise_trim:
-            return cmd_list
-    
-        start = settings.get("trim_start", "").strip()
-        end = settings.get("trim_end", "").strip()
-        start_sec = time_to_seconds(start) if start else None
-        end_sec = time_to_seconds(end) if end else None
-    
-        if start_sec is not None:
-            # 保留 3 位小数（毫秒精度）
-            cmd_list.extend(["-ss", f"{start_sec:.3f}"])
-            duration = None
-            total_duration = self._get_media_duration(input_path)
-            if end_sec is not None:
-                duration = end_sec - start_sec
-            elif total_duration is not None:
-                duration = total_duration - start_sec
-    
-            if duration is not None and duration > 0:
-                cmd_list.extend(["-t", f"{duration:.3f}"])
-            else:
-                self._append_info_ui("无法计算精准截取时长，将不添加 -t，输出可能不准确。")
-    
-        return cmd_list
 
 
+
+    def _get_video_framerate(self, file_path: str) -> Optional[float]:
+        """获取视频文件的平均帧率（fps），失败返回 None"""
+        if not self.ffprobe_cmd or not os.path.exists(file_path):
+            return None
+        cmd = [self.ffprobe_cmd, "-v", "error", "-select_streams", "v:0",
+               "-show_entries", "stream=avg_frame_rate", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
+        try:
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, creationflags=flags)
+            if result.returncode == 0 and result.stdout.strip():
+                num, den = result.stdout.strip().split('/')
+                return float(num) / float(den) if float(den) != 0 else None
+        except:
+            pass
+        return None
 
     def _get_media_duration(self, file_path):
         """获取媒体文件时长（秒），失败返回 None"""
@@ -3474,15 +3462,16 @@ class FFmpegBatchGUI:
                                        disable_shortest: bool = False) -> Tuple[str, str]:
         """
         构建主视频 + 多个子视频（画中画/水印）的 filter_complex 字符串。
+        
         :param main_idx: 主视频输入索引
-        :param main_settings: 主视频设置
-        :param sub_infos: 子视频信息 [(索引, 文件路径, 设置)]
-        :param include_subtitle_main: 是否在主视频滤镜中包含字幕
-        :param disable_shortest: 是否禁用 overlay 的 shortest=1（精准截取时使用）
-        :return: (filter_complex, 最终视频标签)
+        :param main_settings: 主视频设置字典
+        :param sub_infos: 子视频信息列表，每个元素为 (输入索引, 文件路径, 设置字典)
+        :param include_subtitle_main: 是否在主视频滤镜链中包含字幕烧录
+        :param disable_shortest: 若为 True，则 overlay 滤镜不加 shortest=1（适用于精准截取时避免主视频被提前截断）
+        :return: (filter_complex 字符串, 最终视频标签，如 "[v_out_0]")
         """
         filter_parts = []
-        # 主视频滤镜（包含字幕、变速等）
+        # 主视频滤镜
         main_vf = build_video_filter_chain(main_settings, include_subtitle=include_subtitle_main, include_speed=True)
         if main_vf and main_vf != "null":
             filter_parts.append(f"[{main_idx}:v]{main_vf}[v_main_proc]")
@@ -3503,15 +3492,78 @@ class FFmpegBatchGUI:
                 filter_parts.append(f"[canvas][{current_v}]overlay={ox}:{oy}:shortest=1[v_main_pad]")
                 current_v = "v_main_pad"
     
-        # 处理每个子视频
         for i, (sub_idx, sub_file, sub_settings) in enumerate(sub_infos):
-            sub_vf = build_video_filter_chain(sub_settings, include_subtitle=False, include_speed=False)
-            if sub_vf and sub_vf != "null":
-                filter_parts.append(f"[{sub_idx}:v]{sub_vf},format=rgba[v_temp_{i}]")
+            # 判断是否使用 loop 滤镜：截取且不是 once 模式
+            use_loop = sub_settings.get("trim_enabled", False)
+            if use_loop:
+                if sub_settings.get("loop_enabled", False) and sub_settings.get("loop_mode") == "once":
+                    use_loop = False
+    
+            # 获取基础滤镜（不含 trim 和 format）
+            base_vf = build_video_filter_chain(
+                sub_settings,
+                include_subtitle=False,
+                include_speed=False,
+                include_trim=False,
+                include_format=False
+            )
+            if base_vf == "null":
+                base_vf = ""
+    
+            if use_loop:
+                # 获取帧率
+                fps = self._get_video_framerate(sub_file)
+                if fps is None:
+                    use_loop = False
+                else:
+                    start_str = sub_settings.get("trim_start", "0").strip()
+                    end_str = sub_settings.get("trim_end", "").strip()
+                    start_sec = time_to_seconds(start_str) if start_str else 0.0
+                    end_sec = time_to_seconds(end_str) if end_str else None
+                    if end_sec is not None and end_sec > start_sec:
+                        duration = end_sec - start_sec
+                    else:
+                        raw_duration = self._get_media_duration(sub_file)
+                        if raw_duration is not None:
+                            duration = raw_duration - start_sec
+                        else:
+                            use_loop = False
+                    if use_loop:
+                        size = int(round(duration * fps))
+                        if size <= 0:
+                            use_loop = False
+    
+            # 构建子视频滤镜串
+            if use_loop:
+                loop_enabled = sub_settings.get("loop_enabled", False)
+                loop_mode = sub_settings.get("loop_mode", "infinite")
+                if not loop_enabled or loop_mode == "infinite":
+                    loop_param = "-1"
+                else:  # count
+                    loop_count = sub_settings.get("loop_count", 3)
+                    extra = max(0, loop_count - 1)
+                    loop_param = str(extra) if extra > 0 else "0"
+    
+                # 构建滤镜链
+                vf_parts = []
+                trim_filter = f"trim=start={start_sec}:end={end_sec}" if end_sec is not None else f"trim=start={start_sec}"
+                vf_parts.append(trim_filter)
+                vf_parts.append("setpts=PTS-STARTPTS")
+                vf_parts.append(f"loop=loop={loop_param}:size={size}:start=0")
+                if base_vf:
+                    vf_parts.append(base_vf)
+                vf_parts.append("format=rgba")
+                sub_vf = ",".join(vf_parts)
+                filter_parts.append(f"[{sub_idx}:v]{sub_vf}[v_temp_{i}]")
                 current_sub = f"v_temp_{i}"
             else:
-                filter_parts.append(f"[{sub_idx}:v]format=rgba[v_temp_{i}]")
-                current_sub = f"v_temp_{i}"
+                sub_vf = build_video_filter_chain(sub_settings, include_subtitle=False, include_speed=False)
+                if sub_vf and sub_vf != "null":
+                    filter_parts.append(f"[{sub_idx}:v]{sub_vf},format=rgba[v_temp_{i}]")
+                    current_sub = f"v_temp_{i}"
+                else:
+                    filter_parts.append(f"[{sub_idx}:v]format=rgba[v_temp_{i}]")
+                    current_sub = f"v_temp_{i}"
     
             # 绿幕
             if sub_settings.get("chroma_enabled", False):
@@ -3541,7 +3593,6 @@ class FFmpegBatchGUI:
                 y = sub_settings.get('overlay_y', '0').strip() or '0'
                 duration = self._get_media_duration(sub_file)
                 enable_expr = self._calc_enable_expr(sub_settings, duration)
-                # 构建 overlay，根据 disable_shortest 决定是否添加 shortest=1
                 if disable_shortest:
                     overlay_filter = f"overlay={x}:{y}:enable='{enable_expr}'"
                 else:
@@ -3554,12 +3605,39 @@ class FFmpegBatchGUI:
         complex_filter = ";".join(filter_parts)
         return complex_filter, f"[{current_v}]"
 
+    def _get_effective_duration(self, settings: dict, raw_duration: Optional[float]) -> Optional[float]:
+        """
+        计算子视频的有效时长（考虑截取设置）。
+        返回值为秒数，若无法计算或无效则返回 None。
+        """
+        if not settings.get("trim_enabled", False) or raw_duration is None or raw_duration <= 0:
+            return raw_duration
+    
+        start_str = settings.get("trim_start", "").strip()
+        end_str = settings.get("trim_end", "").strip()
+        start_sec = time_to_seconds(start_str) if start_str else 0.0
+        end_sec = time_to_seconds(end_str) if end_str else None
+    
+        if end_sec is not None and end_sec > start_sec:
+            effective = end_sec - start_sec
+        else:
+            # 无结束或结束无效，截取到末尾
+            effective = raw_duration - start_sec
+    
+        if effective <= 0:
+            return None
+        return effective
 
     def _calc_enable_expr(self, enc_settings: dict, duration: Optional[float]) -> str:
-        """根据循环设置和视频时长计算 enable 表达式"""
         loop_enabled = enc_settings.get("loop_enabled", False)
         if not loop_enabled:
             return "1"
+    
+        # 使用公共方法获取有效时长
+        effective_duration = self._get_effective_duration(enc_settings, duration)
+        if effective_duration is None:
+            # 无法计算有效时长时，降级为原始总时长或无限
+            effective_duration = duration
     
         loop_mode = enc_settings.get("loop_mode", "infinite")
         loop_count = enc_settings.get("loop_count", 3)
@@ -3567,14 +3645,14 @@ class FFmpegBatchGUI:
         if loop_mode == "infinite":
             return "1"
         elif loop_mode == "once":
-            if duration is not None and duration > 0:
-                return f"lte(t,{duration})"
+            if effective_duration is not None and effective_duration > 0:
+                return f"lte(t,{effective_duration})"
             else:
                 self._append_info_ui("[循环] 无法获取视频时长，将一直显示")
                 return "1"
         else:  # count
-            if duration is not None and duration > 0:
-                total = duration * max(1, loop_count)
+            if effective_duration is not None and effective_duration > 0:
+                total = effective_duration * max(1, loop_count)
                 return f"lte(t,{total})"
             else:
                 self._append_info_ui("[循环] 无法获取视频时长，将按次数显示但无法精确")
@@ -3981,25 +4059,14 @@ class FFmpegBatchGUI:
             adapted_wm = copy.deepcopy(wm_settings)
     
         # ---- 开始构建命令 ----
-        cmd_list = [self.ffmpeg_cmd, "-y"]
+        cmd_list = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
     
         wm_file = adapted_wm.get("file_path", "").strip()
         ext = os.path.splitext(wm_file)[1].lower()
         is_image = ext in ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
-        wm_duration = adapted_wm.get("duration", None)
         loop_mode = adapted_wm.get("loop_mode", "infinite")
         loop_count = adapted_wm.get("loop_count", 3)
-    
         loop_enabled = adapted_wm.get("loop_enabled", False)
-        use_infinite_loop = loop_enabled and (not is_image) and loop_mode == "infinite"
-    
-        if use_infinite_loop:
-            cmd_list.append("-copyts")
-            cmd_list.append("-fflags")
-            cmd_list.append("+genpts")
-        else:
-            cmd_list.append("-fflags")
-            cmd_list.append("+genpts")
     
         precise_trim = settings.get("precise_trim", False)
         self._enforce_reencode_for_precise_trim(settings, only_audio=False)
@@ -4013,12 +4080,9 @@ class FFmpegBatchGUI:
         # 主视频输入
         cmd_list.extend(["-i", input_path])
     
-        # ----- 精准模式：计算截取时长 -----
+        # ----- 计算主视频有效时长（截取或总时长） -----
         start_sec, duration_for_sub = self._calculate_trim_duration(settings, input_path)
-    
-        # 计算主视频截取时长（用于自动限制水印时长）
         main_duration = None
-        # 如果主视频启用了截取，使用截取时长
         if settings.get("trim_enabled", False):
             if precise_trim:
                 main_duration = duration_for_sub if duration_for_sub is not None else None
@@ -4034,12 +4098,11 @@ class FFmpegBatchGUI:
                     if total_dur is not None:
                         main_duration = total_dur - start_sec_calc
         else:
-            # 主视频无截取：使用主视频总时长
             total_dur = self._get_media_duration(input_path)
             if total_dur is not None:
                 main_duration = total_dur
     
-        # 水印普通截取（非精准）
+        # ---- 水印普通截取（非精准） ----
         wm_trim_enabled = adapted_wm.get("trim_enabled", False)
         wm_precise = adapted_wm.get("precise_trim", False)
         if wm_trim_enabled and not wm_precise:
@@ -4050,24 +4113,78 @@ class FFmpegBatchGUI:
             if end:
                 cmd_list.extend(["-to", end])
     
-        # ---- 添加水印输入（图片或视频） ----
-        if not is_image:
-            self._add_infinite_loop_params(cmd_list, wm_file)
-            # 如果水印没有显式截取且主时长已知，自动添加 -t 限制水印时长
-            if not wm_trim_enabled and main_duration is not None and main_duration > 0:
-                cmd_list.extend(["-t", f"{main_duration:.3f}"])
-            cmd_list.extend(["-i", wm_file])
+        # ---- 判断是否在滤镜中使用 loop ----
+        use_loop_in_filter = wm_trim_enabled and (not (loop_enabled and loop_mode == "once"))
+    
+        # ---- 计算水印单次有效时长（用于循环总时长判断） ----
+        wm_single_duration = None
+        if wm_trim_enabled:
+            # 计算截取时长
+            start = adapted_wm.get("trim_start", "0").strip()
+            end = adapted_wm.get("trim_end", "").strip()
+            start_sec_calc = time_to_seconds(start) if start else 0.0
+            end_sec_calc = time_to_seconds(end) if end else None
+            if end_sec_calc is not None and end_sec_calc > start_sec_calc:
+                wm_single_duration = end_sec_calc - start_sec_calc
+            else:
+                # 只有开始没有结束，用总时长 - 开始
+                raw_duration = self._get_media_duration(wm_file)
+                if raw_duration is not None:
+                    wm_single_duration = raw_duration - start_sec_calc
         else:
+            # 无截取，使用原始总时长（视频）
+            if not is_image:
+                wm_single_duration = self._get_media_duration(wm_file)
+            else:
+                # 图片没有时长，视为无限
+                wm_single_duration = None
+    
+        # ---- 判断是否需要添加 -shortest ----
+        need_shortest = False
+        if is_image:
+            # 图片水印无限循环，总时长无限，肯定需要 -shortest
+            need_shortest = True
+        else:
+            # 判断循环模式
+            if not loop_enabled or loop_mode == "infinite":
+                # 无限循环
+                need_shortest = True
+            elif loop_mode == "once":
+                # 只显示一次，总时长 = wm_single_duration，如果小于主视频则不需要 -shortest
+                if wm_single_duration is not None and main_duration is not None:
+                    if wm_single_duration > main_duration:
+                        need_shortest = True
+                    else:
+                        need_shortest = False
+                else:
+                    # 无法确定，为安全添加 -shortest
+                    need_shortest = True
+            else:  # count
+                if wm_single_duration is not None and main_duration is not None:
+                    total_duration = wm_single_duration * loop_count
+                    if total_duration > main_duration:
+                        need_shortest = True
+                    else:
+                        need_shortest = False
+                else:
+                    need_shortest = True
+    
+        # ---- 添加水印输入（及循环参数） ----
+        if not is_image:
+            if use_loop_in_filter:
+                # 循环由滤镜中的 loop 处理，不添加 -stream_loop
+                cmd_list.extend(["-i", wm_file])
+            else:
+                # 使用 -stream_loop -1
+                cmd_list.extend(["-stream_loop", "-1"])
+                cmd_list.extend(["-i", wm_file])
+        else:
+            # 图片水印
             fps = settings.get("frame_rate_custom", "30") if settings.get("frame_rate_type") == "custom" else "30"
-            self._add_infinite_loop_params(cmd_list, wm_file, framerate=fps)
-            if not wm_trim_enabled and main_duration is not None and main_duration > 0:
-                cmd_list.extend(["-t", f"{main_duration:.3f}"])
+            cmd_list.extend(["-loop", "1", "-framerate", fps])
             cmd_list.extend(["-i", wm_file])
     
-        if use_infinite_loop:
-            cmd_list.append("-shortest")
-    
-        # ---- 构建叠加滤镜（强制 disable_shortest=True，不再使用 shortest=1） ----
+        # ---- 构建叠加滤镜 ----
         sub_infos = [(1, wm_file, adapted_wm)]
         complex_filter, final_v_label = self._build_overlay_filter_complex(
             0, settings, sub_infos, include_subtitle_main=True, disable_shortest=True
@@ -4079,7 +4196,7 @@ class FFmpegBatchGUI:
         cmd_list = self._build_video_encoding_params(cmd_list, settings)
         cmd_list.extend(["-vsync", "cfr"])
     
-        # ---- 音频处理（主视频音频） ----
+        # ---- 音频处理 ----
         if settings.get("audio_enabled", True):
             if precise_trim and duration_for_sub is not None and duration_for_sub > 0:
                 self._apply_audio_trim_and_encode(cmd_list, settings, input_path, start_sec, duration_for_sub, map_audio=True)
@@ -4100,6 +4217,10 @@ class FFmpegBatchGUI:
         container = settings.get("output_container", "mp4").lower()
         if container in ("mp4", "mov"):
             cmd_list.extend(["-movflags", "+faststart"])
+    
+        # ---- 根据判断添加 -shortest ----
+        if need_shortest:
+            cmd_list.append("-shortest")
     
         cmd_list.append(output_path)
         return cmd_list
@@ -5481,6 +5602,8 @@ class FFmpegBatchGUI:
             enc_frame = VideoEncoderFrame(page_enc)
             enc_frame.pack(fill=tk.X, padx=5, pady=5)
             enc_frame.set_settings(task.settings)
+            
+            filt_frame.set_get_trim_settings_callback(lambda: trim_frame.get_settings())
     
             # 视频滤镜页面
             page_filt = ttk.Frame(notebook)
@@ -6451,12 +6574,32 @@ class FFmpegBatchGUI:
                 loop_chroma_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
                 loop_chroma_frame.set_settings(initial_settings)
                 if file_path and os.path.exists(file_path):
-                    duration = self._get_media_duration(file_path)
+                    raw_duration = self._get_media_duration(file_path)
+                    effective_duration = self._get_effective_duration(initial_settings, raw_duration)
                     if hasattr(loop_chroma_frame, 'set_duration_info'):
-                        loop_chroma_frame.set_duration_info(duration)
+                        loop_chroma_frame.set_duration_info(effective_duration)
                 else:
                     if hasattr(loop_chroma_frame, 'set_duration_info'):
                         loop_chroma_frame.set_duration_info(None)
+
+            def update_duration_on_trim_change(*args):
+                if loop_chroma_frame is None:
+                    return
+                # 获取当前截取设置（直接从 trim_frame 读取）
+                settings_snapshot = trim_frame.get_settings()
+                if file_path and os.path.exists(file_path):
+                    raw_duration = self._get_media_duration(file_path)
+                    effective_duration = self._get_effective_duration(settings_snapshot, raw_duration)
+                    if hasattr(loop_chroma_frame, 'set_duration_info'):
+                        loop_chroma_frame.set_duration_info(effective_duration)
+                else:
+                    if hasattr(loop_chroma_frame, 'set_duration_info'):
+                        loop_chroma_frame.set_duration_info(None)
+            
+            # 绑定 trace
+            trim_frame.trim_enabled.trace_add('write', update_duration_on_trim_change)
+            trim_frame.trim_start.trace_add('write', update_duration_on_trim_change)
+            trim_frame.trim_end.trace_add('write', update_duration_on_trim_change)
 
             # ---- 页面5：叠加/偏移 ----
             page_overlay = ttk.Frame(notebook)
