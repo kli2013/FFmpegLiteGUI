@@ -6047,21 +6047,21 @@ class FFmpegBatchGUI:
         sub_videos = video_tracks[1:] if self.pip_enabled.get() else []
         main_video_path = normalize_path(main_video.file_path)
         
-        # ---- 计算主视频有效时长（用于 -t） ----
+        # ---- 计算主视频有效时长（使用容器时长 _get_media_duration） ----
         main_duration = None
         main_settings = main_video.enc_settings
+        raw_duration = self._get_media_duration(main_video.file_path)  # 直接使用文件总时长
         if main_settings.get("trim_enabled", False):
             start = main_settings.get("trim_start", "0").strip()
             end = main_settings.get("trim_end", "").strip()
             start_sec = time_to_seconds(start) if start else 0.0
             end_sec = time_to_seconds(end) if end else None
-            raw_duration = self._get_media_duration(main_video.file_path)
             if end_sec is not None and end_sec > start_sec:
                 main_duration = end_sec - start_sec
             elif raw_duration is not None:
                 main_duration = raw_duration - start_sec
         else:
-            main_duration = self._get_media_duration(main_video.file_path)
+            main_duration = raw_duration
         
         # ---- 检查是否启用了子视频的音频 ----
         has_sub_audio = False
@@ -6079,6 +6079,7 @@ class FFmpegBatchGUI:
             is_main = (f == main_video_path)
             is_sub = any(f == normalize_path(sv.file_path) for sv in sub_videos)
             
+            # 主视频普通截取（保留）
             if is_main and main_video.enc_settings.get("trim_enabled", False) and not main_video.enc_settings.get("precise_trim", False):
                 start = main_video.enc_settings.get("trim_start", "").strip()
                 end = main_video.enc_settings.get("trim_end", "").strip()
@@ -6086,17 +6087,10 @@ class FFmpegBatchGUI:
                     cmd_list.extend(["-ss", start])
                 if end:
                     cmd_list.extend(["-to", end])
-#             elif is_sub:
-#                 sv = next(sv for sv in sub_videos if normalize_path(sv.file_path) == f)
-#                 sv_settings = sv.enc_settings
-#                 if sv_settings.get("trim_enabled", False) and not sv_settings.get("precise_trim", False):
-#                     start = sv_settings.get("trim_start", "").strip()
-#                     end = sv_settings.get("trim_end", "").strip()
-#                     if start:
-#                         cmd_list.extend(["-ss", start])
-#                     if end:
-#                         cmd_list.extend(["-to", end])
             
+            # 子视频普通截取已禁用，不再添加 -ss/-to
+            
+            # 循环参数（仅对子视频，且未截取时添加 -stream_loop -1）
             if is_sub:
                 sv = next(sv for sv in sub_videos if normalize_path(sv.file_path) == f)
                 sv_settings = sv.enc_settings
@@ -6122,65 +6116,6 @@ class FFmpegBatchGUI:
             
             v_settings = main_video.enc_settings
             cmd_list = self._build_video_encoding_params(cmd_list, v_settings)
-            
-            # ---- 音频处理（画中画模式） ----
-            audio_map_count = 0
-            # 如果有子视频音频，则包含所有音频轨道；否则仅包含主视频音频
-            if has_sub_audio:
-                audio_tracks_to_map = audio_tracks
-            else:
-                audio_tracks_to_map = [t for t in audio_tracks if normalize_path(t.file_path) == main_video_path]
-            
-            for audio in audio_tracks_to_map:
-                a_idx = input_files_norm.index(normalize_path(audio.file_path))
-                a_type_idx = audio._type_index
-                cmd_list.extend(["-map", f"{a_idx}:a:{a_type_idx}"])
-                
-                if audio.enc_settings.get("trim_enabled", False):
-                    start = audio.enc_settings.get("trim_start", "").strip()
-                    end = audio.enc_settings.get("trim_end", "").strip()
-                    if not start:
-                        start = "0"
-                    start_sec = time_to_seconds(start) if start else None
-                    end_sec = time_to_seconds(end) if end else None
-                    if start_sec is not None:
-                        total_duration = self._get_media_duration(audio.file_path)
-                        if end_sec is not None:
-                            duration = end_sec - start_sec
-                        elif total_duration is not None:
-                            duration = total_duration - start_sec
-                        else:
-                            duration = None
-                        if duration is not None and duration > 0:
-                            enc = audio.enc_settings.get("encoder", "aac")
-                            if enc == "copy":
-                                enc = "aac"
-                                self._append_info_ui(f"音频截取启用，轨道 {audio_map_count+1} 编码器已从 copy 改为 {enc}")
-                            af_filter = f"atrim=start={start_sec:.3f}:duration={duration:.3f},asetpts=PTS-STARTPTS"
-                            cmd_list.extend(["-af", af_filter])
-                            cmd_list.extend([f"-c:a:{audio_map_count}", enc])
-                            cmd_list.extend([f"-b:a:{audio_map_count}", audio.enc_settings.get("bitrate", "128k")])
-                            cmd_list.extend([f"-ar:a:{audio_map_count}", audio.enc_settings.get("samplerate", "44100")])
-                            audio_map_count += 1
-                            continue
-                
-                enc = audio.enc_settings.get("encoder", "copy")
-                if enc == "copy":
-                    cmd_list.extend([f"-c:a:{audio_map_count}", "copy"])
-                else:
-                    bitrate = audio.enc_settings.get("bitrate", "128k")
-                    samplerate = audio.enc_settings.get("samplerate", "44100")
-                    cmd_list.extend([
-                        f"-c:a:{audio_map_count}", enc,
-                        f"-b:a:{audio_map_count}", bitrate,
-                        f"-ar:a:{audio_map_count}", samplerate
-                    ])
-                audio_map_count += 1
-            
-            if audio_map_count == 0:
-                cmd_list.append("-an")
-            else:
-                cmd_list.extend(["-disposition:a:0", "default"])
         
         else:
             # ---- 非画中画模式（普通封装） ----
@@ -6203,61 +6138,61 @@ class FFmpegBatchGUI:
                 cmd_list.extend(["-c:v", "copy"])
             else:
                 cmd_list = self._build_video_encoding_params(cmd_list, v_settings)
-            
-            # 音频（普通封装：包含所有音频轨道）
-            audio_map_count = 0
-            for audio in audio_tracks:
-                a_idx = input_files_norm.index(normalize_path(audio.file_path))
-                a_type_idx = audio._type_index
-                cmd_list.extend(["-map", f"{a_idx}:a:{a_type_idx}"])
-                
-                if audio.enc_settings.get("trim_enabled", False):
-                    start = audio.enc_settings.get("trim_start", "").strip()
-                    end = audio.enc_settings.get("trim_end", "").strip()
-                    if not start:
-                        start = "0"
-                    start_sec = time_to_seconds(start) if start else None
-                    end_sec = time_to_seconds(end) if end else None
-                    if start_sec is not None:
-                        total_duration = self._get_media_duration(audio.file_path)
-                        if end_sec is not None:
-                            duration = end_sec - start_sec
-                        elif total_duration is not None:
-                            duration = total_duration - start_sec
-                        else:
-                            duration = None
-                        if duration is not None and duration > 0:
-                            enc = audio.enc_settings.get("encoder", "aac")
-                            if enc == "copy":
-                                enc = "aac"
-                                self._append_info_ui(f"音频截取启用，轨道 {audio_map_count+1} 编码器已从 copy 改为 {enc}")
-                            af_filter = f"atrim=start={start_sec:.3f}:duration={duration:.3f},asetpts=PTS-STARTPTS"
-                            cmd_list.extend(["-af", af_filter])
-                            cmd_list.extend([f"-c:a:{audio_map_count}", enc])
-                            cmd_list.extend([f"-b:a:{audio_map_count}", audio.enc_settings.get("bitrate", "128k")])
-                            cmd_list.extend([f"-ar:a:{audio_map_count}", audio.enc_settings.get("samplerate", "44100")])
-                            audio_map_count += 1
-                            continue
-                
-                enc = audio.enc_settings.get("encoder", "copy")
-                if enc == "copy":
-                    cmd_list.extend([f"-c:a:{audio_map_count}", "copy"])
-                else:
-                    bitrate = audio.enc_settings.get("bitrate", "128k")
-                    samplerate = audio.enc_settings.get("samplerate", "44100")
-                    cmd_list.extend([
-                        f"-c:a:{audio_map_count}", enc,
-                        f"-b:a:{audio_map_count}", bitrate,
-                        f"-ar:a:{audio_map_count}", samplerate
-                    ])
-                audio_map_count += 1
-            
-            if audio_map_count == 0:
-                cmd_list.append("-an")
-            else:
-                cmd_list.extend(["-disposition:a:0", "default"])
         
-        # ---- 字幕（所有模式均包含） ----
+        # ---- 音频轨道（使用类型序号） ----
+        audio_map_count = 0
+        for audio in audio_tracks:
+            a_idx = input_files_norm.index(normalize_path(audio.file_path))
+            a_type_idx = audio._type_index
+            cmd_list.extend(["-map", f"{a_idx}:a:{a_type_idx}"])
+            
+            if audio.enc_settings.get("trim_enabled", False):
+                start = audio.enc_settings.get("trim_start", "").strip()
+                end = audio.enc_settings.get("trim_end", "").strip()
+                if not start:
+                    start = "0"
+                start_sec = time_to_seconds(start) if start else None
+                end_sec = time_to_seconds(end) if end else None
+                if start_sec is not None:
+                    total_duration = self._get_media_duration(audio.file_path)
+                    if end_sec is not None:
+                        duration = end_sec - start_sec
+                    elif total_duration is not None:
+                        duration = total_duration - start_sec
+                    else:
+                        duration = None
+                    if duration is not None and duration > 0:
+                        enc = audio.enc_settings.get("encoder", "aac")
+                        if enc == "copy":
+                            enc = "aac"
+                            self._append_info_ui(f"音频截取启用，轨道 {audio_map_count+1} 编码器已从 copy 改为 {enc}")
+                        af_filter = f"atrim=start={start_sec:.3f}:duration={duration:.3f},asetpts=PTS-STARTPTS"
+                        cmd_list.extend(["-af", af_filter])
+                        cmd_list.extend([f"-c:a:{audio_map_count}", enc])
+                        cmd_list.extend([f"-b:a:{audio_map_count}", audio.enc_settings.get("bitrate", "128k")])
+                        cmd_list.extend([f"-ar:a:{audio_map_count}", audio.enc_settings.get("samplerate", "44100")])
+                        audio_map_count += 1
+                        continue
+            
+            enc = audio.enc_settings.get("encoder", "copy")
+            if enc == "copy":
+                cmd_list.extend([f"-c:a:{audio_map_count}", "copy"])
+            else:
+                bitrate = audio.enc_settings.get("bitrate", "128k")
+                samplerate = audio.enc_settings.get("samplerate", "44100")
+                cmd_list.extend([
+                    f"-c:a:{audio_map_count}", enc,
+                    f"-b:a:{audio_map_count}", bitrate,
+                    f"-ar:a:{audio_map_count}", samplerate
+                ])
+            audio_map_count += 1
+        
+        if audio_map_count == 0:
+            cmd_list.append("-an")
+        else:
+            cmd_list.extend(["-disposition:a:0", "default"])
+        
+        # ---- 字幕轨道（使用类型序号） ----
         container = self.merge_container.get().lower()
         sub_map_count = 0
         first_sub_default = False
@@ -6289,18 +6224,18 @@ class FFmpegBatchGUI:
         # ---- 输出时长控制 ----
         if self.pip_enabled.get() and sub_videos:
             if has_sub_audio:
-                # 使用 -t 控制时长
+                # 使用 -t 控制时长（基于文件总时长，确保有值）
                 if main_duration is not None and main_duration > 0:
                     cmd_list.extend(["-t", f"{main_duration:.3f}"])
                     self._append_info_ui(f"[封装] 检测到子视频音频，使用 -t {main_duration:.3f}s 控制输出时长。")
                 else:
-                    # 后备：使用一个较大的值，确保输出由主视频实际时长决定
-                    cmd_list.extend(["-t", "3600"])
-                    self._append_info_ui("[封装] 警告：无法获取主视频时长，使用 -t 3600s 作为后备。")
+                    # 极端情况：无法获取任何时长，回退到 -shortest
+                    cmd_list.append("-shortest")
+                    self._append_info_ui("[封装] 警告：无法获取主视频时长，改用 -shortest。")
             else:
                 cmd_list.append("-shortest")
         
-        # ---- 章节 ----
+        # ---- 章节处理 ----
         if self.copy_chapters.get() and input_files_norm:
             cmd_list.extend(["-map_chapters", "0"])
         chapter_file = self.chapter_file.get().strip()
@@ -6310,6 +6245,7 @@ class FFmpegBatchGUI:
             cmd_list.insert(2, chapter_file_norm)
             cmd_list.extend(["-map_chapters", "1"])
         
+        # ---- 容器优化 ----
         container = self.merge_container.get().lower()
         if container in ("mp4", "mov"):
             cmd_list.extend(["-movflags", "+faststart"])
