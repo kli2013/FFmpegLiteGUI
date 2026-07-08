@@ -4086,13 +4086,13 @@ class FFmpegBatchGUI:
         # ---- 水印普通截取（非精准） ----
         wm_trim_enabled = adapted_wm.get("trim_enabled", False)
         wm_precise = adapted_wm.get("precise_trim", False)
-        if wm_trim_enabled and not wm_precise:
-            start = adapted_wm.get("trim_start", "").strip()
-            end = adapted_wm.get("trim_end", "").strip()
-            if start:
-                cmd_list.extend(["-ss", start])
-            if end:
-                cmd_list.extend(["-to", end])
+#         if wm_trim_enabled and not wm_precise:
+#             start = adapted_wm.get("trim_start", "").strip()
+#             end = adapted_wm.get("trim_end", "").strip()
+#             if start:
+#                 cmd_list.extend(["-ss", start])
+#             if end:
+#                 cmd_list.extend(["-to", end])
     
         # ---- 判断是否在滤镜中使用 loop ----
         use_loop_in_filter = wm_trim_enabled  # 只要截取了，就用 loop 滤镜
