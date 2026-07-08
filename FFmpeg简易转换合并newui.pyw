@@ -5985,97 +5985,6 @@ class FFmpegBatchGUI:
             self._append_info_ui("[封装] 无命令可复制")
 
 
-    def _map_audio_tracks(self, cmd_list: List[str], input_files_norm: List[str], audio_tracks: List[Track]) -> int:
-        """
-        添加音频轨道的 -map、编码参数，并支持独立截取（trim）。
-        返回音频轨道数量（用于设置默认音频）。
-        """
-        audio_map_count = 0
-        for audio in audio_tracks:
-            a_idx = input_files_norm.index(normalize_path(audio.file_path))
-            cmd_list.extend(["-map", f"{a_idx}:a:0"])
-    
-            # ----- 检查是否启用截取 -----
-            if audio.enc_settings.get("trim_enabled", False):
-                start = audio.enc_settings.get("trim_start", "").strip()
-                end = audio.enc_settings.get("trim_end", "").strip()
-                start_sec = time_to_seconds(start) if start else None
-                end_sec = time_to_seconds(end) if end else None
-                if start_sec is not None:
-                    total_duration = self._get_media_duration(audio.file_path)
-                    if end_sec is not None:
-                        duration = end_sec - start_sec
-                    elif total_duration is not None:
-                        duration = total_duration - start_sec
-                    else:
-                        duration = None
-    
-                    if duration is not None and duration > 0:
-                        # 强制重编码（不能 copy）
-                        enc = audio.enc_settings.get("encoder", "aac")
-                        if enc == "copy":
-                            enc = "aac"
-                            self._append_info_ui(f"音频截取启用，轨道 {audio_map_count+1} 编码器已从 copy 改为 {enc}")
-                        # 音频滤镜
-                        af_filter = f"atrim=start={start_sec:.3f}:duration={duration:.3f},asetpts=PTS-STARTPTS"
-                        cmd_list.extend(["-af", af_filter])
-                        cmd_list.extend([f"-c:a:{audio_map_count}", enc])
-                        cmd_list.extend([f"-b:a:{audio_map_count}", audio.enc_settings.get("bitrate", "128k")])
-                        cmd_list.extend([f"-ar:a:{audio_map_count}", audio.enc_settings.get("samplerate", "44100")])
-                        audio_map_count += 1
-                        continue  # 已处理，跳过后续 copy 分支
-    
-            # ----- 普通音频（无截取） -----
-            enc = audio.enc_settings.get("encoder", "copy")
-            if enc == "copy":
-                cmd_list.extend([f"-c:a:{audio_map_count}", "copy"])
-            else:
-                bitrate = audio.enc_settings.get("bitrate", "128k")
-                samplerate = audio.enc_settings.get("samplerate", "44100")
-                cmd_list.extend([
-                    f"-c:a:{audio_map_count}", enc,
-                    f"-b:a:{audio_map_count}", bitrate,
-                    f"-ar:a:{audio_map_count}", samplerate
-                ])
-            audio_map_count += 1
-    
-        return audio_map_count
-
-    def _map_subtitle_tracks(self, cmd_list: List[str], input_files_norm: List[str],
-                             subtitle_tracks: List[Track], container: str) -> int:
-        """
-        添加字幕轨道的 -map、编码参数、元数据和默认设置。
-        返回字幕轨道数量（用于设置默认字幕，但这里在内部处理默认设置）。
-        注意：此方法会直接修改 cmd_list，并设置默认字幕（第一个）。
-        """
-        sub_map_count = 0
-        first_sub_default = False
-        for sub in subtitle_tracks:
-            s_idx = input_files_norm.index(normalize_path(sub.file_path))
-            enc = sub.enc_settings.get("encoder", "copy")
-            if container == "mp4":
-                if enc == "copy":
-                    orig_codec = sub.codec.lower()
-                    if orig_codec not in ("mov_text", "mp4s"):
-                        enc = "mov_text"
-                        self._append_info_ui(f"[封装] 字幕格式 {orig_codec} 不兼容 MP4，自动转换为 mov_text")
-                elif enc not in ("mov_text", "mp4s"):
-                    enc = "mov_text"
-                    self._append_info_ui(f"[封装] 字幕编码 {enc} 不兼容 MP4，自动转换为 mov_text")
-            cmd_list.extend(["-map", f"{s_idx}:s:0", f"-c:s:{sub_map_count}", enc])
-            lang = sub.enc_settings.get("language", "")
-            title = sub.enc_settings.get("title", "")
-            if lang:
-                cmd_list.extend([f"-metadata:s:s:{sub_map_count}", f"language={lang}"])
-            if title:
-                cmd_list.extend([f"-metadata:s:s:{sub_map_count}", f"title={title}"])
-            if not first_sub_default:
-                cmd_list.extend([f"-disposition:s:{sub_map_count}", "default"])
-                first_sub_default = True
-            sub_map_count += 1
-        return sub_map_count
-
-
     def merge_build_cmd_list(self) -> List[str]:
         if not self.ffmpeg_cmd:
             self._append_info_ui("未找到 ffmpeg，无法生成合并命令。")
@@ -6095,7 +6004,7 @@ class FFmpegBatchGUI:
         input_files_norm = [normalize_path(f) for f in input_files]
         output_norm = normalize_path(output)
         
-        # ---- 构建文件流信息映射（用于多流支持） ----
+        # ---- 构建文件流信息映射 ----
         file_stream_map = {}
         for f in input_files_norm:
             info = ffprobe_json(self.ffprobe_cmd, f)
@@ -6110,10 +6019,8 @@ class FFmpegBatchGUI:
                     'subtitle': subtitle_indices,
                 }
             else:
-                # 如果无法解析，假设每个文件只有一个视频、一个音频、一个字幕
                 file_stream_map[f] = {'video': [0], 'audio': [0], 'subtitle': [0]}
         
-        # ---- 辅助函数：获取轨道在文件中的类型序号 ----
         def get_type_index(track):
             typ = track.type
             file_path = normalize_path(track.file_path)
@@ -6121,16 +6028,13 @@ class FFmpegBatchGUI:
                 return 0
             indices = file_stream_map[file_path].get(typ, [])
             try:
-                return indices.index(track.index)  # track.index 是全局索引
+                return indices.index(track.index)
             except ValueError:
-                # 如果找不到，可能因为 track.index 为 -1 或无效，默认返回0
                 return 0
         
-        # ---- 计算每个轨道的类型序号并存储（用于后续） ----
         for track in enabled_tracks:
             track._type_index = get_type_index(track)
         
-        # ---- 分离轨道 ----
         video_tracks = [t for t in enabled_tracks if t.type == "video"]
         audio_tracks = [t for t in enabled_tracks if t.type == "audio"]
         subtitle_tracks = [t for t in enabled_tracks if t.type == "subtitle"]
@@ -6141,16 +6045,17 @@ class FFmpegBatchGUI:
         
         main_video = video_tracks[0]
         sub_videos = video_tracks[1:] if self.pip_enabled.get() else []
+        main_video_path = normalize_path(main_video.file_path)
         
         # ---- 构建基础命令 ----
         cmd_list = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
         
-        # ---- 添加输入文件（带截取和循环参数） ----
+        # ---- 添加输入文件 ----
         for f in input_files_norm:
-            is_main = (f == normalize_path(main_video.file_path))
+            is_main = (f == main_video_path)
             is_sub = any(f == normalize_path(sv.file_path) for sv in sub_videos)
             
-            # 快速模式截取参数
+            # 主视频普通截取（保留）
             if is_main and main_video.enc_settings.get("trim_enabled", False) and not main_video.enc_settings.get("precise_trim", False):
                 start = main_video.enc_settings.get("trim_start", "").strip()
                 end = main_video.enc_settings.get("trim_end", "").strip()
@@ -6158,29 +6063,24 @@ class FFmpegBatchGUI:
                     cmd_list.extend(["-ss", start])
                 if end:
                     cmd_list.extend(["-to", end])
-#             elif is_sub:
-#                 sv = next(sv for sv in sub_videos if normalize_path(sv.file_path) == f)
-#                 sv_settings = sv.enc_settings
-#                 if sv_settings.get("trim_enabled", False) and not sv_settings.get("precise_trim", False):
-#                     start = sv_settings.get("trim_start", "").strip()
-#                     end = sv_settings.get("trim_end", "").strip()
-#                     if start:
-#                         cmd_list.extend(["-ss", start])
-#                     if end:
-#                         cmd_list.extend(["-to", end])
+            
+            # 子视频普通截取已禁用（不再添加 -ss/-to）
+            # 子视频截取完全由滤镜中的 trim 处理
             
             # 循环参数（仅对子视频，且未截取时添加 -stream_loop -1）
             if is_sub:
                 sv = next(sv for sv in sub_videos if normalize_path(sv.file_path) == f)
                 sv_settings = sv.enc_settings
                 if not sv_settings.get("trim_enabled", False):
+                    # 未截取，添加无限循环
                     cmd_list.extend(["-stream_loop", "-1"])
+                # 注意：如果子视频截取，不添加 -stream_loop，循环由滤镜中的 loop 处理
             
             cmd_list.extend(["-i", f])
         
-        # ---- 画中画模式（使用 filter_complex） ----
+        # ---- 画中画模式 ----
         if self.pip_enabled.get():
-            main_idx = input_files_norm.index(normalize_path(main_video.file_path))
+            main_idx = input_files_norm.index(main_video_path)
             
             sub_infos = []
             for sv in sub_videos:
@@ -6193,7 +6093,6 @@ class FFmpegBatchGUI:
             cmd_list.extend(["-filter_complex", complex_filter])
             cmd_list.extend(["-map", final_v_label])
             
-            # 视频编码参数（使用主视频设置）
             v_settings = main_video.enc_settings
             cmd_list = self._build_video_encoding_params(cmd_list, v_settings)
         
@@ -6201,7 +6100,6 @@ class FFmpegBatchGUI:
             # ---- 非画中画模式（普通封装） ----
             video_track = video_tracks[0]
             v_idx = input_files_norm.index(normalize_path(video_track.file_path))
-            # 使用类型序号（视频流序号）进行映射
             v_type_idx = video_track._type_index
             cmd_list.extend(["-map", f"{v_idx}:v:{v_type_idx}"])
             
@@ -6220,17 +6118,19 @@ class FFmpegBatchGUI:
             else:
                 cmd_list = self._build_video_encoding_params(cmd_list, v_settings)
         
-        # ---- 音频轨道（使用类型序号） ----
+        # ---- 音频轨道（使用类型序号，截取统一使用 atrim 滤镜） ----
         audio_map_count = 0
         for audio in audio_tracks:
             a_idx = input_files_norm.index(normalize_path(audio.file_path))
             a_type_idx = audio._type_index
             cmd_list.extend(["-map", f"{a_idx}:a:{a_type_idx}"])
             
-            # 检查是否启用截取
+            # 音频截取（无论普通还是精准，都使用 atrim 滤镜）
             if audio.enc_settings.get("trim_enabled", False):
                 start = audio.enc_settings.get("trim_start", "").strip()
                 end = audio.enc_settings.get("trim_end", "").strip()
+                if not start:
+                    start = "0"
                 start_sec = time_to_seconds(start) if start else None
                 end_sec = time_to_seconds(end) if end else None
                 if start_sec is not None:
@@ -6252,7 +6152,7 @@ class FFmpegBatchGUI:
                         cmd_list.extend([f"-b:a:{audio_map_count}", audio.enc_settings.get("bitrate", "128k")])
                         cmd_list.extend([f"-ar:a:{audio_map_count}", audio.enc_settings.get("samplerate", "44100")])
                         audio_map_count += 1
-                        continue  # 已处理，跳过后续 copy 分支
+                        continue
             
             # 普通音频（无截取）
             enc = audio.enc_settings.get("encoder", "copy")
@@ -6302,7 +6202,7 @@ class FFmpegBatchGUI:
                 first_sub_default = True
             sub_map_count += 1
         
-        # ---- 添加 -shortest（画中画模式下存在子视频时） ----
+        # ---- 输出时长控制（画中画模式下使用 -shortest） ----
         if self.pip_enabled.get() and sub_videos:
             cmd_list.append("-shortest")
         
