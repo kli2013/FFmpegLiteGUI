@@ -5555,8 +5555,6 @@ class FFmpegBatchGUI:
             enc_frame.pack(fill=tk.X, padx=5, pady=5)
             enc_frame.set_settings(task.settings)
             
-            filt_frame.set_get_trim_settings_callback(lambda: trim_frame.get_settings())
-    
             # 视频滤镜页面
             page_filt = ttk.Frame(notebook)
             notebook.add(page_filt, text="视频滤镜")
@@ -5565,7 +5563,10 @@ class FFmpegBatchGUI:
             filt_frame.set_override_settings(task.settings)
             filt_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
             filt_frame.set_settings(task.settings)
-    
+
+
+            filt_frame.set_get_trim_settings_callback(lambda: trim_frame.get_settings())
+
             # 音频页面
             page_audio = ttk.Frame(notebook)
             notebook.add(page_audio, text="音频")
@@ -5992,6 +5993,11 @@ class FFmpegBatchGUI:
         output = self.merge_output.get().strip()
         if not output:
             return []
+
+        # ---- 解析冲突（但不更新界面） ----
+        output = self._resolve_path_conflict(output)
+        output_norm = normalize_path(output)
+
         enabled_tracks = [t for t in self.merge_tracks if t.enabled]
         if not enabled_tracks:
             return []
@@ -6719,17 +6725,23 @@ class FFmpegBatchGUI:
             trim_frame.pack(fill=tk.X, pady=5)
     
             trim_enabled_var = tk.BooleanVar(value=track.enc_settings.get("trim_enabled", False))
-            ttk.Checkbutton(trim_frame, text="启用截取", variable=trim_enabled_var).grid(row=0, column=0, columnspan=3, sticky="w", padx=5, pady=5)
-    
+            chk = ttk.Checkbutton(trim_frame, text="启用截取", variable=trim_enabled_var)
+            chk.grid(row=0, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+            ToolTip(chk, 
+                    "注意：若截取时长短于主视频，输出将以音频为准提前结束，导致主视频内容丢失。\n"
+                    "建议截取时长 ≥ 主视频时长，或保持不截取。",
+                    wraplength=500)
             ttk.Label(trim_frame, text="开始时间 (HH:MM:SS[.mmm]):").grid(row=1, column=0, sticky="w", padx=5, pady=5)
-            trim_start_var = tk.StringVar(value=track.enc_settings.get("trim_start", ""))
+
+            trim_start_var = tk.StringVar(value=track.enc_settings.get("trim_start", "0"))
             ttk.Entry(trim_frame, textvariable=trim_start_var, width=15).grid(row=1, column=1, sticky="w", padx=5, pady=5)
-            ttk.Label(trim_frame, text="结束时间 (留空到末尾)").grid(row=1, column=2, sticky="w", padx=5, pady=5)
+
     
             ttk.Label(trim_frame, text="结束时间 (HH:MM:SS[.mmm]):").grid(row=2, column=0, sticky="w", padx=5, pady=5)
             trim_end_var = tk.StringVar(value=track.enc_settings.get("trim_end", ""))
             ttk.Entry(trim_frame, textvariable=trim_end_var, width=15).grid(row=2, column=1, sticky="w", padx=5, pady=5)
-    
+            ttk.Label(trim_frame, text="结束时间 (留空到末尾)").grid(row=2, column=2, sticky="w", padx=5, pady=5)
+
             # 精准模式（保留，但音频 atrim 本身就是精确的）
             precise_trim_var = tk.BooleanVar(value=track.enc_settings.get("precise_trim", False))
             ttk.Checkbutton(trim_frame, text="精准模式（精确到帧）", variable=precise_trim_var).grid(row=3, column=0, columnspan=3, sticky="w", padx=5, pady=5)
@@ -6891,13 +6903,13 @@ class FFmpegBatchGUI:
         if not self._check_pip_video_encoders():
             return
 
-        # ---- 新增：处理输出路径冲突 ----
-        output = self.merge_output.get().strip()
-        resolved = self._resolve_path_conflict(output)
-        if resolved != output:
-            self.merge_output.set(resolved)  # 更新界面变量
-            self._append_info_ui(f"[封装] 输出路径已自动调整为: {resolved}")
-        # --------------------------------
+#         # ---- 新增：处理输出路径冲突 ----
+#         output = self.merge_output.get().strip()
+#         resolved = self._resolve_path_conflict(output)
+#         if resolved != output:
+#             self.merge_output.set(resolved)  # 更新界面变量
+#             self._append_info_ui(f"[封装] 输出路径已自动调整为: {resolved}")
+#         # --------------------------------
 
         self.merge_btn.config(state="disabled")
         threading.Thread(target=self.merge_do_merge, daemon=True).start()
