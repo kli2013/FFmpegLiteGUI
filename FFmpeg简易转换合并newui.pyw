@@ -6141,7 +6141,7 @@ class FFmpegBatchGUI:
             is_main = (f == main_video_path)
             is_sub = any(f == normalize_path(sv.file_path) for sv in sub_videos)
             
-            # 主视频普通截取（保留）
+            # 主视频普通截取
             if is_main and main_video.enc_settings.get("trim_enabled", False) and not main_video.enc_settings.get("precise_trim", False):
                 start = main_video.enc_settings.get("trim_start", "").strip()
                 end = main_video.enc_settings.get("trim_end", "").strip()
