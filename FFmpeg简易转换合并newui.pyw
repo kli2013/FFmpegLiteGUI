@@ -1169,6 +1169,7 @@ class VideoFilterFrame(ttk.LabelFrame):
         self.current_track = None
         self.override_settings = None
         self.get_trim_settings_callback = None
+        self._visual_crop_start_time = None
         self.create_widgets()
 
     def create_widgets(self):
@@ -1713,6 +1714,17 @@ class VideoFilterFrame(ttk.LabelFrame):
     
             # ---------- 自动检测黑边 ----------
             def auto_detect():
+                # ---- 获取当前时间输入框的值 ----
+                time_str = time_var.get().strip()
+                if time_str:
+                    sec = parse_time_str(time_str)
+                    if sec is not None:
+                        self._visual_crop_start_time = sec
+                    else:
+                        self._visual_crop_start_time = 0.0
+                else:
+                    self._visual_crop_start_time = 0.0
+            
                 self.crop_detect_frames.set(frames_var.get())
                 self.crop_detect_round.set(round_var.get())
                 old = self.current_file
@@ -1915,9 +1927,48 @@ class VideoFilterFrame(ttk.LabelFrame):
         except ValueError:
             messagebox.showerror("错误", "分析帧数和 round 必须为整数")
             return
-        # 强制 skip=0 确保从第一帧开始分析
-        skip = 0
     
+        # ---- 获取截取起始时间 ----
+        start_sec = 0.0
+        # 优先使用可视化裁剪窗口传入的时间
+        if hasattr(self, '_visual_crop_start_time') and self._visual_crop_start_time is not None:
+            start_sec = self._visual_crop_start_time
+            # 用完即清理，避免影响其他调用
+            self._visual_crop_start_time = None
+        else:
+            # 原有的优先级逻辑（回调 -> 覆盖设置 -> 轨道 -> 主界面）
+            if self.get_trim_settings_callback is not None:
+                trim_settings = self.get_trim_settings_callback()
+                if trim_settings.get("trim_enabled", False):
+                    start_str = trim_settings.get("trim_start", "").strip()
+                    if start_str:
+                        sec = time_to_seconds(start_str)
+                        if sec is not None:
+                            start_sec = sec
+            elif self.override_settings is not None:
+                if self.override_settings.get("trim_enabled", False):
+                    start_str = self.override_settings.get("trim_start", "").strip()
+                    if start_str:
+                        sec = time_to_seconds(start_str)
+                        if sec is not None:
+                            start_sec = sec
+            elif self.current_track is not None:
+                enc = self.current_track.enc_settings
+                if enc.get("trim_enabled", False):
+                    start_str = enc.get("trim_start", "").strip()
+                    if start_str:
+                        sec = time_to_seconds(start_str)
+                        if sec is not None:
+                            start_sec = sec
+            else:
+                if self.app.trim_frame.trim_enabled.get():
+                    start_str = self.app.trim_frame.trim_start.get().strip()
+                    if start_str:
+                        sec = time_to_seconds(start_str)
+                        if sec is not None:
+                            start_sec = sec
+    
+        # 禁用按钮防止重复点击
         for child in self.winfo_children():
             if isinstance(child, ttk.Button) and "自动检测黑边" in child.cget("text"):
                 child.config(state=tk.DISABLED)
@@ -1925,12 +1976,17 @@ class VideoFilterFrame(ttk.LabelFrame):
     
         def detect():
             try:
-                cmd = [
-                    ffmpeg, "-i", input_file,
+                cmd = [ffmpeg, "-i", input_file]
+                # 如果起始时间 > 0，添加 -ss 快速跳转
+                if start_sec > 0:
+                    cmd.insert(1, "-ss")
+                    cmd.insert(2, f"{start_sec:.3f}")
+                # 添加 cropdetect 参数
+                cmd.extend([
                     "-vframes", str(frames),
-                    "-vf", f"cropdetect=limit=0.1:round={round_val}:skip={skip}",
+                    "-vf", f"cropdetect=limit=0.1:round={round_val}:skip=0",  # skip=0 因为已用 -ss 跳转
                     "-f", "null", "-"
-                ]
+                ])
                 proc = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True, encoding='utf-8', errors='replace',
@@ -3983,7 +4039,7 @@ class FFmpegBatchGUI:
 
         # 音频处理（精准模式下也需尊重 audio_enabled）
         if settings.get("audio_enabled", True):
-            if precise_trim and duration_for_audio is not None and duration_for_audio > 0:
+            if precise_trim and settings.get("trim_enabled", False) and duration_for_audio is not None and duration_for_audio > 0:
                 self._apply_audio_trim_and_encode(cmd_list, settings, input_path, start_sec, duration_for_audio, map_audio=False)
             else:
                 cmd_list = self._build_audio_encoding_params(cmd_list, settings)
@@ -4151,7 +4207,7 @@ class FFmpegBatchGUI:
     
         # ---- 音频处理 ----
         if settings.get("audio_enabled", True):
-            if precise_trim and duration_for_sub is not None and duration_for_sub > 0:
+            if precise_trim and settings.get("trim_enabled", False) and duration_for_sub is not None and duration_for_sub > 0:
                 self._apply_audio_trim_and_encode(cmd_list, settings, input_path, start_sec, duration_for_sub, map_audio=True)
             else:
                 cmd_list.extend(["-map", "0:a:0"])
