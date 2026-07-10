@@ -281,10 +281,10 @@ class PresetManager:
             if os.path.exists(bundled):
                 try:
                     shutil.copy2(bundled, self.preset_path)
-              #      print(f"首次运行，已从内部释放默认配置到：{self.preset_path}")
+                    print(f"首次运行，已从内部释放默认配置到：{self.preset_path}")
                     return
                 except Exception as e:
-             #       print(f"释放配置文件失败: {e}")
+                    print(f"释放配置文件失败: {e}")
                     # 继续尝试下一个路径（但通常复制失败后不再尝试其他）
                     break
 
@@ -703,7 +703,7 @@ def launch_player(file_path: str, filters: str = "", audio_only: bool = False, v
     try:
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
     except Exception as e:
-     #   print(f"预览失败: {e}")
+        print(f"预览失败: {e}")
 
 # ================== FFmpeg 编码器选项 ==================
 ALL_VIDEO_ENCODERS = [
@@ -3091,7 +3091,6 @@ class AdvancedFrame(ttk.LabelFrame):
                 "• 如果添加了 -vf / -filter_complex / -af / -map 等，会覆盖界面生成的对应设置（滤镜、音频滤镜、流映射）。\n"
                 "  如需保留界面生成的滤镜链，请在自定义参数中复制完整的 -vf 链（可从预览区复制）并扩展。\n\n"
                 "• 界面上已单独提供的参数（如 tune、profile、level、maxrate、bufsize）请勿重复添加，以免冲突。\n"
-                "  这些参数在界面中设置后会自动生效，无需再写入自定义参数。\n\n"
                 "• 新手建议：仅添加界面未提供的高级选项（如 -x264-params、-bsf 等），避免覆盖关键设置。",
                 wraplength=500)
         self.custom_args = tk.StringVar(value="")
@@ -4320,7 +4319,7 @@ class FFmpegBatchGUI:
                 vf = build_video_filter_chain(settings, include_subtitle=True, include_speed=True, enhance_settings=enhance_settings)
                 if vf != "null":
                     cmd_list.extend(["-vf", vf])
-                else:
+
                 cmd_list = self._build_video_encoding_params(cmd_list, settings)
     
 
@@ -5944,7 +5943,7 @@ class FFmpegBatchGUI:
             watermark_dict = task.settings.get("watermark", {})   # 防止 KeyError
             adv_frame = AdvancedFrame(
                 page_adv,
-                update_callback=None,   # 此时 update_preview 已定义
+                update_callback=None,
                 app=self,
                 show_adaptive=True,
                 watermark_dict=watermark_dict
