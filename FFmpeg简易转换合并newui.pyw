@@ -832,6 +832,27 @@ class SoftwareEncoderStrategy(EncoderStrategy):
         rc = settings["rate_control_type"]
         preset = settings.get("preset", "medium")
         cmd_list.extend(["-c:v", vcodec, "-preset", preset])
+        
+        # 高级参数
+        tune = settings.get("tune", "").strip()
+        if tune and tune != "无":
+            cmd_list.extend(["-tune", tune])
+        
+        profile = settings.get("profile", "").strip()
+        if profile and profile != "无":
+            cmd_list.extend(["-profile:v", profile])
+        
+        level = settings.get("level", "").strip()
+        if level and level != "无":
+            cmd_list.extend(["-level:v", level])
+
+        maxrate = settings.get("maxrate", "").strip()
+        if maxrate:
+            cmd_list.extend(["-maxrate", maxrate + "k"])
+        bufsize = settings.get("bufsize", "").strip()
+        if bufsize:
+            cmd_list.extend(["-bufsize", bufsize + "k"])
+        
         if rc == "crf":
             cmd_list.extend(["-crf", str(settings['crf_value'])])
         elif rc == "bitrate":
@@ -887,6 +908,7 @@ class VideoEncoderFrame(ttk.LabelFrame):
     def __init__(self, parent, refresh_callback=None, **kwargs):
         super().__init__(parent, text="视频编码与质量", padding="5", **kwargs)
         self.refresh_callback = refresh_callback  # 保存刷新函数
+        self._suppress_update = False
         self.create_widgets()
         self.setup_bindings()
 
@@ -918,7 +940,7 @@ class VideoEncoderFrame(ttk.LabelFrame):
                             value=val).pack(side=tk.LEFT, padx=2)
 
         self.dynamic_frame = ttk.Frame(self)
-        self.dynamic_frame.grid(row=3, column=0, columnspan=3, sticky="we", pady=5, padx=5)
+        self.dynamic_frame.grid(row=3, column=0, columnspan=3, sticky="we", pady=0, padx=5)
 
         self.crf_value = tk.IntVar(value=28)
         self.cq_value = tk.IntVar(value=35)
@@ -934,27 +956,76 @@ class VideoEncoderFrame(ttk.LabelFrame):
         
         self.gif_options_btn = ttk.Button(self.gif_btn_frame, text="GIF 输出选项...", command=self.open_gif_options)
         self.gif_options_btn.pack(side=tk.LEFT)
+
+        # 高级选项面板（新建）
+        self.advanced_frame = ttk.Frame(self)
+        self.advanced_frame.grid(row=4, column=0, columnspan=3, sticky="we", pady=5, padx=5)
+        # 默认隐藏
+        self.advanced_frame.grid_remove()
+
+        # 在 advanced_frame 中添加控件
+        row1 = ttk.Frame(self.advanced_frame)
+        row1.pack(fill=tk.X, pady=2)
         
+        ttk.Label(row1, text="tune:").pack(side=tk.LEFT)
+        self.tune_var = tk.StringVar(value="无")   # 默认“无”
+        tune_combo = ttk.Combobox(row1, textvariable=self.tune_var,
+                                  values=["无", "film","animation","grain","stillimage","psnr","ssim","fastdecode","zerolatency"],
+                                  state="readonly", width=10)
+        tune_combo.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(row1, text="profile:").pack(side=tk.LEFT, padx=(10,0))
+        self.profile_var = tk.StringVar(value="无")
+        profile_combo = ttk.Combobox(row1, textvariable=self.profile_var,
+                                     values=["无", "baseline","main","high","high10","high422","high444"],
+                                     state="readonly", width=8)
+        profile_combo.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(row1, text="level:").pack(side=tk.LEFT, padx=(10,0))
+        self.level_var = tk.StringVar(value="无")
+        level_combo = ttk.Combobox(row1, textvariable=self.level_var,
+                                   values=["无", "1.0","1b","1.1","1.2","1.3","2.0","2.1","2.2",
+                                           "3.0","3.1","3.2","4.0","4.1","4.2",
+                                           "5.0","5.1","5.2","6.0","6.1","6.2"],
+                                   state="readonly", width=6)
+        level_combo.pack(side=tk.LEFT, padx=5)
+        
+        # 第二行：maxrate, bufsize
+        row2 = ttk.Frame(self.advanced_frame)
+        row2.pack(fill=tk.X, pady=2)
+        ttk.Label(row2, text="最大比特率 (kbps):").pack(side=tk.LEFT)
+        self.maxrate_var = tk.StringVar(value="")
+        maxrate_entry = ttk.Entry(row2, textvariable=self.maxrate_var, width=8)
+        maxrate_entry.pack(side=tk.LEFT, padx=5)
+        ttk.Label(row2, text="缓冲区大小 (kbps):").pack(side=tk.LEFT, padx=(10,0))
+        self.bufsize_var = tk.StringVar(value="")
+        bufsize_entry = ttk.Entry(row2, textvariable=self.bufsize_var, width=8)
+        bufsize_entry.pack(side=tk.LEFT, padx=5)
+
         # GIF 参数变量（存储实际值）
         self.gif_loop = tk.IntVar(value=0)
         self.gif_dither = tk.StringVar(value="bayer")
         self.gif_bayer_scale = tk.IntVar(value=2)
         self.gif_max_colors = tk.IntVar(value=256)
+        
+        self._on_gif_codec_toggle()
 
 
 
+
+    def _on_gif_codec_toggle(self, *args):
+        if self.vcodec.get() == "gif":
+            self.gif_btn_frame.grid()
+            self.advanced_frame.grid_remove()
+        else:
+            self.gif_btn_frame.grid_remove()
+            self.advanced_frame.grid()
 
     def setup_bindings(self):
         self.vcodec.trace_add("write", self.auto_set_rate_control_by_codec)
         self.rate_control_type.trace_add("write", self.on_rate_control_change)
         self.vcodec.trace_add("write", self._on_gif_codec_toggle)
 
-
-    def _on_gif_codec_toggle(self, *args):
-        if self.vcodec.get() == "gif":
-            self.gif_btn_frame.grid()
-        else:
-            self.gif_btn_frame.grid_remove()
 
     def open_gif_options(self):
         win = tk.Toplevel(self)
@@ -1063,7 +1134,7 @@ class VideoEncoderFrame(ttk.LabelFrame):
         elif rc == "bitrate":
             frame = ttk.Frame(self.dynamic_frame)
             frame.pack(fill=tk.X, expand=True)
-            ttk.Label(frame, text="固定比特率 (单位 kbps，例如 1900k 或 1900):").pack(side=tk.LEFT)
+            ttk.Label(frame, text="固定比特率:").pack(side=tk.LEFT)
             self.bitrate_entry = ttk.Entry(frame, textvariable=self.bitrate_video, width=12)
             self.bitrate_entry.pack(side=tk.LEFT, padx=5)
             self.bitrate_entry.bind("<FocusOut>", self.fix_bitrate_value)
@@ -1076,6 +1147,8 @@ class VideoEncoderFrame(ttk.LabelFrame):
             self.bitrate_video.set(val + "k")
 
     def on_rate_control_change(self, *args):
+        if getattr(self, '_suppress_update', False):
+            return  # 加载预设时跳过所有副作用
         self.update_dynamic_controls()
         self.auto_set_codec_by_rate_control()
         rc = self.rate_control_type.get()
@@ -1130,28 +1203,55 @@ class VideoEncoderFrame(ttk.LabelFrame):
             "gif_dither": self.gif_dither.get(),
             "gif_bayer_scale": self.gif_bayer_scale.get(),
             "gif_max_colors": self.gif_max_colors.get(),
+
+            "tune": self.tune_var.get(),
+            "profile": self.profile_var.get(),
+            "level": self.level_var.get(),
+            "maxrate": self.maxrate_var.get(),
+            "bufsize": self.bufsize_var.get(),
         }
 
     def set_settings(self, settings):
-        self.vcodec.set(settings.get("encoder", "libx265"))
-        self.preset.set(settings.get("preset", "p4"))
-        self.rate_control_type.set(settings.get("rate_control_type", "crf"))
-        self.crf_value.set(settings.get("crf_value", 26))
-        self.cq_value.set(settings.get("cq_value", 35))
-        self.global_quality.set(settings.get("global_quality", 26))
-        self.bitrate_video.set(settings.get("bitrate_video", "1900k"))
-        # ----- 新增 GIF 参数恢复 -----
-        if "gif_loop" in settings:
-            self.gif_loop.set(settings["gif_loop"])
-        if "gif_dither" in settings:
-            self.gif_dither.set(settings["gif_dither"])
-        if "gif_bayer_scale" in settings:
-            self.gif_bayer_scale.set(settings["gif_bayer_scale"])
-        if "gif_max_colors" in settings:
-            self.gif_max_colors.set(settings["gif_max_colors"])
-        
-        # 更新 GIF 按钮显示状态（如果编码器是 gif 则显示，否则隐藏）
-        self._on_gif_codec_toggle()
+        self._suppress_update = True
+        try:
+            # 处理 preset（兼容旧预设）
+            preset_val = settings.get("preset")
+            if preset_val is None or preset_val == "":
+                rc = settings.get("rate_control_type", "crf")
+                if rc == "cq":
+                    preset_val = "p4"
+                elif rc == "global_quality":
+                    preset_val = "medium"
+                else:
+                    preset_val = "medium"
+            self.preset.set(preset_val)
+            
+            self.vcodec.set(settings.get("encoder", "libx265"))
+            self.rate_control_type.set(settings.get("rate_control_type", "crf"))
+            self.crf_value.set(settings.get("crf_value", 26))
+            self.cq_value.set(settings.get("cq_value", 35))
+            self.global_quality.set(settings.get("global_quality", 26))
+            self.bitrate_video.set(settings.get("bitrate_video", "1900k"))
+            # GIF 参数...
+            if "gif_loop" in settings:
+                self.gif_loop.set(settings["gif_loop"])
+            if "gif_dither" in settings:
+                self.gif_dither.set(settings["gif_dither"])
+            if "gif_bayer_scale" in settings:
+                self.gif_bayer_scale.set(settings["gif_bayer_scale"])
+            if "gif_max_colors" in settings:
+                self.gif_max_colors.set(settings["gif_max_colors"])
+            self._on_gif_codec_toggle()
+
+
+            self.tune_var.set(settings.get("tune", "无") or "无")
+            self.profile_var.set(settings.get("profile", "无") or "无")
+            self.level_var.set(settings.get("level", "无") or "无")
+            self.maxrate_var.set(settings.get("maxrate", ""))
+            self.bufsize_var.set(settings.get("bufsize", ""))
+        finally:
+            self._suppress_update = False
+            self.update_dynamic_controls()
 
 # ================== 视频滤镜组件 ==================
 class VideoFilterFrame(ttk.LabelFrame):
@@ -1261,7 +1361,7 @@ class VideoFilterFrame(ttk.LabelFrame):
         ttk.Label(crop_frame, text="上:").pack(side=tk.LEFT)
         ttk.Entry(crop_frame, textvariable=self.crop_top, width=6).pack(side=tk.LEFT)
 
-#         # 自动检测黑边按钮
+        # 自动检测黑边按钮
         auto_crop_btn = ttk.Button(crop_frame, text="自动去黑边",
                                    command=self.auto_detect_crop, width=9)
         auto_crop_btn.pack(side=tk.LEFT, padx=(10,0))
@@ -2821,10 +2921,12 @@ class AdvancedFrame(ttk.LabelFrame):
         label = ttk.Label(custom_frame, text="自定义FFmpeg参数 (例如: -tune grain -profile:v high):")
         label.pack(anchor=tk.W)
         ToolTip(label, 
-                "可直接添加全局选项（如 -tune grain、-profile:v high），它们会追加到命令末尾。\n\n"
-                "对于滤镜（-vf / -filter_complex），如果界面已设置滤镜，自定义参数中的 -vf 会覆盖界面生成的滤镜链。\n"
-                "如需保留界面滤镜，请在自定义参数中复制完整的 -vf 链（从预览区复制）并扩展。\n"
-                "同样，-af、-map 等也会覆盖。新手建议仅添加全局选项。",
+                "可直接添加 FFmpeg 命令行参数，它们会追加到命令末尾。\n\n"
+                "【注意】\n"
+                "• 如果添加了 -vf / -filter_complex / -af / -map 等，会覆盖界面生成的对应设置（滤镜、音频滤镜、流映射）。\n"
+                "  如需保留界面生成的滤镜链，请在自定义参数中复制完整的 -vf 链（可从预览区复制）并扩展。\n\n"
+                "• 界面上已单独提供的参数（如 tune、profile、level、maxrate、bufsize）请勿重复添加，以免冲突。\n"
+                "• 新手建议：仅添加界面未提供的高级选项（如 -x264-params、-bsf 等），避免覆盖关键设置。",
                 wraplength=500)
         self.custom_args = tk.StringVar(value="")
         self.custom_entry = ttk.Entry(custom_frame, textvariable=self.custom_args, width=50)
@@ -2881,8 +2983,6 @@ class AdvancedFrame(ttk.LabelFrame):
         
         # 绑定路径变化更新
         self.wm_path_var.trace_add("write", lambda *a: self._on_wm_path_changed())
-
-
 
 
 
@@ -5767,7 +5867,13 @@ class FFmpegBatchGUI:
             suffix_var.trace_add("write", update_preview)
             custom_var.trace_add("write", update_preview)
             container_var.trace_add("write", update_preview)
-    
+
+            enc_frame.tune_var.trace_add("write", update_preview)
+            enc_frame.profile_var.trace_add("write", update_preview)
+            enc_frame.level_var.trace_add("write", update_preview)
+            enc_frame.maxrate_var.trace_add("write", update_preview)
+            enc_frame.bufsize_var.trace_add("write", update_preview)
+
             update_preview()
     
             def save_changes():
@@ -6141,7 +6247,7 @@ class FFmpegBatchGUI:
             is_main = (f == main_video_path)
             is_sub = any(f == normalize_path(sv.file_path) for sv in sub_videos)
             
-            # 主视频普通截取
+            # 主视频普通截取（保留）
             if is_main and main_video.enc_settings.get("trim_enabled", False) and not main_video.enc_settings.get("precise_trim", False):
                 start = main_video.enc_settings.get("trim_start", "").strip()
                 end = main_video.enc_settings.get("trim_end", "").strip()
@@ -7680,6 +7786,11 @@ class FFmpegBatchGUI:
         self.output_container.trace_add("write", lambda *a: self.update_command_preview())
         self.audio_frame.only_audio.trace_add("write", lambda *a: self.toggle_only_audio_mode())
 
+        self.video_encoder.tune_var.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_encoder.profile_var.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_encoder.level_var.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_encoder.maxrate_var.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_encoder.bufsize_var.trace_add("write", lambda *a: self.update_command_preview())
 
 # ================== 主入口 ==================
 if __name__ == "__main__":
