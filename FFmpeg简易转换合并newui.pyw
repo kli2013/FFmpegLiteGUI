@@ -281,10 +281,10 @@ class PresetManager:
             if os.path.exists(bundled):
                 try:
                     shutil.copy2(bundled, self.preset_path)
-                    print(f"首次运行，已从内部释放默认配置到：{self.preset_path}")
+              #      print(f"首次运行，已从内部释放默认配置到：{self.preset_path}")
                     return
                 except Exception as e:
-                    print(f"释放配置文件失败: {e}")
+             #       print(f"释放配置文件失败: {e}")
                     # 继续尝试下一个路径（但通常复制失败后不再尝试其他）
                     break
 
@@ -371,7 +371,7 @@ def time_to_seconds(timestr: str) -> Optional[float]:
 
 # ================== 滤镜链构建 ==================
 def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = True, include_speed: bool = True,
-                              include_trim: bool = True, include_format: bool = True) -> str:
+                              include_trim: bool = True, include_format: bool = True, enhance_settings=None) -> str:
     """
     从设置字典构建视频滤镜链。
     include_subtitle: 是否包含字幕滤镜
@@ -397,7 +397,36 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
                 filters.append(f"trim={':'.join(trim_parts)}")
                 filters.append("setpts=PTS-STARTPTS")
     # -----------------------------------------
-    
+
+    if enhance_settings:
+        # 降噪
+        if enhance_settings.get("denoise_enabled", False):
+            spatial = enhance_settings.get("denoise_spatial", 4.0)
+            temporal = enhance_settings.get("denoise_temporal", 3.0)
+            # hqdn3d 参数：空间亮度, 空间色度, 时间亮度, 时间色度
+            # 简化：空间色度 = 空间亮度*0.75，时间色度 = 时间亮度*0.75
+            filters.append(f"hqdn3d={spatial:.1f}:{spatial*0.75:.1f}:{temporal:.1f}:{temporal*0.75:.1f}")
+        # 锐化
+        if enhance_settings.get("sharpen_enabled", False):
+            strength = enhance_settings.get("sharpen_strength", 1.0)
+            # unsharp 参数：luma_msize_x:luma_msize_y:luma_amount:chroma_msize_x:chroma_msize_y:chroma_amount
+            # 简化：使用 5x5 矩阵，色度锐化减半
+            filters.append(f"unsharp=5:5:{strength:.2f}:5:5:{strength*0.5:.2f}")
+        # IVTC
+        if enhance_settings.get("ivtc_enabled", False):
+            filters.append("ivtc=1")   # 自动检测
+        # 去块
+        if enhance_settings.get("deblock_enabled", False):
+            strength = enhance_settings.get("deblock_strength", 4)
+            filters.append(f"deblock=filter=weak:block={strength}")
+        # 色彩空间转换
+        if enhance_settings.get("colorspace_enabled", False):
+            matrix = enhance_settings.get("colorspace_matrix", "bt709:bt2020")
+            # 格式: colorspace=in:out 或其他，但标准是 colorspace=all=1:transfer=...:matrix=...
+            # 简化：使用 colormatrix 滤镜（更简单，但仅支持部分转换）
+            filters.append(f"colormatrix={matrix}")
+
+
     # 裁剪
     if settings.get("crop_enabled", False):
         w = settings.get("crop_width", "").strip()
@@ -457,7 +486,8 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
 
 def build_preview_filter_chain(settings: Dict[str, Any], target_height: int = 960) -> str:
     """生成预览用的滤镜链，强制缩放到指定高度"""
-    vf = build_video_filter_chain(settings, include_subtitle=True, include_speed=True)
+    enhance_settings = settings.get("enhance", {})
+    vf = build_video_filter_chain(settings, include_subtitle=True, include_speed=True, enhance_settings=enhance_settings)
     if vf != "null":
         return f"{vf},scale=-2:{target_height}"
     else:
@@ -673,7 +703,7 @@ def launch_player(file_path: str, filters: str = "", audio_only: bool = False, v
     try:
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
     except Exception as e:
-        print(f"预览失败: {e}")
+     #   print(f"预览失败: {e}")
 
 # ================== FFmpeg 编码器选项 ==================
 ALL_VIDEO_ENCODERS = [
@@ -1262,15 +1292,29 @@ class VideoFilterFrame(ttk.LabelFrame):
         "gbrp", "gbrp10le", "gray", "gray10le", "ya8", "yuva420p"
     ]
 
-    def __init__(self, parent, app, **kwargs):
+    def __init__(self, parent, app, preview_callback=None, **kwargs):
         super().__init__(parent, text="视频滤镜 (缩放/裁剪/旋转/变速/反交错/像素格式)", padding="5", **kwargs)
         self.app = app
         self.current_file = None
         self.current_track = None
         self.override_settings = None
         self.get_trim_settings_callback = None
+        self.preview_callback = preview_callback
         self._visual_crop_start_time = None
         self.create_widgets()
+
+        self.enhance_settings = {
+            "denoise_enabled": False,
+            "denoise_spatial": 4.0,
+            "denoise_temporal": 3.0,
+            "sharpen_enabled": False,
+            "sharpen_strength": 1.0,
+            "ivtc_enabled": False,
+            "deblock_enabled": False,
+            "deblock_strength": 4,
+            "colorspace_enabled": False,
+            "colorspace_matrix": "bt709:bt2020",
+        }
 
     def create_widgets(self):
         main_pane = ttk.Frame(self)
@@ -1401,12 +1445,21 @@ class VideoFilterFrame(ttk.LabelFrame):
         self.rotate = tk.StringVar(value="none")
         for text, val in [("无", "none"), ("90°顺时针", "90"), ("180°", "180"), ("90°逆时针", "270")]:
             ttk.Radiobutton(rot_frame, text=text, variable=self.rotate, value=val).pack(side=tk.LEFT, padx=2)
-    
+
+
+
         self.vflip = tk.BooleanVar(value=False)
         self.hflip = tk.BooleanVar(value=False)
         ttk.Checkbutton(rot_frame, text="上下翻转", variable=self.vflip).pack(side=tk.LEFT, padx=(40,0))
         ttk.Checkbutton(rot_frame, text="左右翻转", variable=self.hflip).pack(side=tk.LEFT, padx=5)
-    
+
+
+        self.enhance_btn = ttk.Button(rot_frame, text="高级增强...", 
+                                      command=self.open_enhance_window, width=10)
+        self.enhance_btn.pack(side=tk.LEFT, padx=(20,0))
+
+
+
         hybrid_frame = ttk.Frame(left_frame)
         hybrid_frame.pack(fill=tk.X, pady=2)
         self.speed_enabled = tk.BooleanVar(value=False)
@@ -1481,6 +1534,118 @@ class VideoFilterFrame(ttk.LabelFrame):
     def set_get_trim_settings_callback(self, callback):
         """设置一个回调函数，用于获取当前的截取设置（由编辑窗口提供）"""
         self.get_trim_settings_callback = callback
+
+    def get_enhance_settings(self):
+     #   print(f"[get_enhance_settings] 返回 = {self.enhance_settings}")
+        return self.enhance_settings.copy()
+    
+    def set_enhance_settings(self, settings):
+        self.enhance_settings.update(settings)
+        # 如果当前有打开增强窗口，可以更新控件，但为了简单，仅更新存储
+
+
+    def open_enhance_window(self):
+        win = tk.Toplevel(self)
+        win.title("高级增强滤镜")
+        win.transient(self)
+        win.grab_set()
+        center_window(win, 500, 550)
+    
+        main = ttk.Frame(win, padding="10")
+        main.pack(fill=tk.BOTH, expand=True)
+    
+        # ----- 降噪（hqdn3d）-----
+        denoise_frame = ttk.LabelFrame(main, text="降噪 (hqdn3d)", padding="5")
+        denoise_frame.pack(fill=tk.X, pady=5)
+    
+        self.denoise_enabled = tk.BooleanVar(value=self.enhance_settings.get("denoise_enabled", False))
+        ttk.Checkbutton(denoise_frame, text="启用降噪", variable=self.denoise_enabled).pack(anchor=tk.W)
+    
+        row1 = ttk.Frame(denoise_frame); row1.pack(fill=tk.X, pady=2)
+        ttk.Label(row1, text="空间强度 (0~10):").pack(side=tk.LEFT)
+        self.denoise_spatial = tk.DoubleVar(value=self.enhance_settings.get("denoise_spatial", 4.0))
+        ttk.Scale(row1, from_=0, to=10, variable=self.denoise_spatial, orient=tk.HORIZONTAL, length=150).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row1, textvariable=self.denoise_spatial, width=4).pack(side=tk.LEFT)
+    
+        row2 = ttk.Frame(denoise_frame); row2.pack(fill=tk.X, pady=2)
+        ttk.Label(row2, text="时间强度 (0~10):").pack(side=tk.LEFT)
+        self.denoise_temporal = tk.DoubleVar(value=self.enhance_settings.get("denoise_temporal", 3.0))
+        ttk.Scale(row2, from_=0, to=10, variable=self.denoise_temporal, orient=tk.HORIZONTAL, length=150).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row2, textvariable=self.denoise_temporal, width=4).pack(side=tk.LEFT)
+    
+        # ----- 锐化（unsharp）-----
+        sharpen_frame = ttk.LabelFrame(main, text="锐化 (unsharp)", padding="5")
+        sharpen_frame.pack(fill=tk.X, pady=5)
+    
+        self.sharpen_enabled = tk.BooleanVar(value=self.enhance_settings.get("sharpen_enabled", False))
+        ttk.Checkbutton(sharpen_frame, text="启用锐化", variable=self.sharpen_enabled).pack(anchor=tk.W)
+    
+        row3 = ttk.Frame(sharpen_frame); row3.pack(fill=tk.X, pady=2)
+        ttk.Label(row3, text="锐化强度 (0~5):").pack(side=tk.LEFT)
+        self.sharpen_strength = tk.DoubleVar(value=self.enhance_settings.get("sharpen_strength", 1.0))
+        ttk.Scale(row3, from_=0, to=5, variable=self.sharpen_strength, orient=tk.HORIZONTAL, length=150).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row3, textvariable=self.sharpen_strength, width=4).pack(side=tk.LEFT)
+    
+        # ----- IVTC（反胶卷过带）-----
+        ivtc_frame = ttk.LabelFrame(main, text="反胶卷过带 (IVTC)", padding="5")
+        ivtc_frame.pack(fill=tk.X, pady=5)
+        self.ivtc_enabled = tk.BooleanVar(value=self.enhance_settings.get("ivtc_enabled", False))
+        ttk.Checkbutton(ivtc_frame, text="启用 IVTC (适用于 60i -> 24p)", variable=self.ivtc_enabled).pack(anchor=tk.W)
+    
+        # ----- 去块滤波（deblock）-----
+        deblock_frame = ttk.LabelFrame(main, text="去块滤波 (deblock)", padding="5")
+        deblock_frame.pack(fill=tk.X, pady=5)
+        self.deblock_enabled = tk.BooleanVar(value=self.enhance_settings.get("deblock_enabled", False))
+        ttk.Checkbutton(deblock_frame, text="启用去块", variable=self.deblock_enabled).pack(anchor=tk.W)
+    
+        row4 = ttk.Frame(deblock_frame); row4.pack(fill=tk.X, pady=2)
+        ttk.Label(row4, text="强度 (1~8):").pack(side=tk.LEFT)
+        self.deblock_strength = tk.IntVar(value=self.enhance_settings.get("deblock_strength", 4))
+        ttk.Scale(row4, from_=1, to=8, variable=self.deblock_strength, orient=tk.HORIZONTAL, length=150).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row4, textvariable=self.deblock_strength, width=4).pack(side=tk.LEFT)
+    
+        # ----- 色彩空间转换-----
+        colorspace_frame = ttk.LabelFrame(main, text="色彩空间转换", padding="5")
+        colorspace_frame.pack(fill=tk.X, pady=5)
+        self.colorspace_enabled = tk.BooleanVar(value=self.enhance_settings.get("colorspace_enabled", False))
+        ttk.Checkbutton(colorspace_frame, text="启用转换", variable=self.colorspace_enabled).pack(anchor=tk.W)
+    
+        row5 = ttk.Frame(colorspace_frame); row5.pack(fill=tk.X, pady=2)
+        ttk.Label(row5, text="目标色彩矩阵:").pack(side=tk.LEFT)
+        self.colorspace_matrix = tk.StringVar(value=self.enhance_settings.get("colorspace_matrix", "bt709:bt2020"))
+        ttk.Combobox(row5, textvariable=self.colorspace_matrix, 
+                     values=["bt709:bt2020", "bt2020:bt709", "bt601:bt709", "bt709:bt601"], 
+                     state="readonly", width=15).pack(side=tk.LEFT, padx=5)
+    
+        # ----- 按钮-----
+        btn_frame = ttk.Frame(main)
+        btn_frame.pack(fill=tk.X, pady=10)
+    
+        def save_and_close():
+            self.enhance_settings.update({
+                "denoise_enabled": self.denoise_enabled.get(),
+                "denoise_spatial": self.denoise_spatial.get(),
+                "denoise_temporal": self.denoise_temporal.get(),
+                "sharpen_enabled": self.sharpen_enabled.get(),
+                "sharpen_strength": self.sharpen_strength.get(),
+                "ivtc_enabled": self.ivtc_enabled.get(),
+                "deblock_enabled": self.deblock_enabled.get(),
+                "deblock_strength": self.deblock_strength.get(),
+                "colorspace_enabled": self.colorspace_enabled.get(),
+                "colorspace_matrix": self.colorspace_matrix.get(),
+            })
+            if self.app:
+                self.app.update_command_preview()
+            # 刷新编辑窗口预览（如果存在回调）
+            if hasattr(self, '_preview_callback') and self._preview_callback:
+                self._preview_callback()
+            win.destroy()
+    
+        ttk.Button(btn_frame, text="保存并关闭", command=save_and_close).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=win.destroy).pack(side=tk.LEFT, padx=5)
+
+
+
 
     def open_crop_editor(self):
         """可视化裁剪窗口 - 拖拽绘制矩形，支持时间跳转重新取帧，初始时间自动从主界面或者当前编辑窗口的截取起始时间获取"""
@@ -2926,6 +3091,7 @@ class AdvancedFrame(ttk.LabelFrame):
                 "• 如果添加了 -vf / -filter_complex / -af / -map 等，会覆盖界面生成的对应设置（滤镜、音频滤镜、流映射）。\n"
                 "  如需保留界面生成的滤镜链，请在自定义参数中复制完整的 -vf 链（可从预览区复制）并扩展。\n\n"
                 "• 界面上已单独提供的参数（如 tune、profile、level、maxrate、bufsize）请勿重复添加，以免冲突。\n"
+                "  这些参数在界面中设置后会自动生效，无需再写入自定义参数。\n\n"
                 "• 新手建议：仅添加界面未提供的高级选项（如 -x264-params、-bsf 等），避免覆盖关键设置。",
                 wraplength=500)
         self.custom_args = tk.StringVar(value="")
@@ -3140,6 +3306,18 @@ class Track:
                     "chroma_blend": 0.1,
                     "alpha_enabled": False,
                     "alpha_value": 1.0,
+                    "enhance": {
+                        "denoise_enabled": False,
+                        "denoise_spatial": 4.0,
+                        "denoise_temporal": 3.0,
+                        "sharpen_enabled": False,
+                        "sharpen_strength": 1.0,
+                        "ivtc_enabled": False,
+                        "deblock_enabled": False,
+                        "deblock_strength": 4,
+                        "colorspace_enabled": False,
+                        "colorspace_matrix": "bt709:bt2020",
+                    }
                 }
             elif typ == "audio":
                 self.enc_settings = {
@@ -3611,7 +3789,8 @@ class FFmpegBatchGUI:
 
     def _build_overlay_filter_complex(self, main_idx: int, main_settings: dict,
                                        sub_infos: List[Tuple[int, str, dict]],
-                                       include_subtitle_main: bool = False) -> Tuple[str, str]:
+                                       include_subtitle_main: bool = False,
+                                       enhance_settings: Optional[dict] = None) -> Tuple[str, str]:
         """
         构建主视频 + 多个子视频（画中画/水印）的 filter_complex 字符串。
         注意：此函数不会在 overlay 中添加 shortest=1，避免子视频流结束导致输出提前截断。
@@ -3619,7 +3798,7 @@ class FFmpegBatchGUI:
         """
         filter_parts = []
         # 主视频滤镜
-        main_vf = build_video_filter_chain(main_settings, include_subtitle=include_subtitle_main, include_speed=True)
+        main_vf = build_video_filter_chain(main_settings, include_subtitle=include_subtitle_main,include_speed=True, enhance_settings=enhance_settings)
         if main_vf and main_vf != "null":
             filter_parts.append(f"[{main_idx}:v]{main_vf}[v_main_proc]")
             current_v = "v_main_proc"
@@ -3647,13 +3826,18 @@ class FFmpegBatchGUI:
                 if sub_settings.get("loop_enabled", False) and sub_settings.get("loop_mode") == "once":
                     use_loop = False
     
+
+            # 获取子视频的增强设置
+            sub_enhance = sub_settings.get("enhance", {})
+        
             # 获取基础滤镜（不含 trim 和 format）
             base_vf = build_video_filter_chain(
                 sub_settings,
                 include_subtitle=False,
                 include_speed=False,
                 include_trim=False,
-                include_format=False
+                include_format=False,
+                enhance_settings=sub_enhance
             )
             if base_vf == "null":
                 base_vf = ""
@@ -3697,13 +3881,13 @@ class FFmpegBatchGUI:
                 filter_parts.append(f"[{sub_idx}:v]{sub_vf}[v_temp_{i}]")
                 current_sub = f"v_temp_{i}"
             else:
-                sub_vf = build_video_filter_chain(sub_settings, include_subtitle=False, include_speed=False)
-                if sub_vf and sub_vf != "null":
-                    filter_parts.append(f"[{sub_idx}:v]{sub_vf},format=rgba[v_temp_{i}]")
-                    current_sub = f"v_temp_{i}"
+                # 直接使用 base_vf（已含增强），然后加 format=rgba
+                if base_vf:
+                    sub_vf = f"{base_vf},format=rgba"
                 else:
-                    filter_parts.append(f"[{sub_idx}:v]format=rgba[v_temp_{i}]")
-                    current_sub = f"v_temp_{i}"
+                    sub_vf = "format=rgba"
+                filter_parts.append(f"[{sub_idx}:v]{sub_vf}[v_temp_{i}]")
+                current_sub = f"v_temp_{i}"
     
             # 绿幕
             if sub_settings.get("chroma_enabled", False):
@@ -3873,7 +4057,8 @@ class FFmpegBatchGUI:
     
         # ----- 1. 构建基础视频滤镜链（不含 scale） -----
         # 使用 build_video_filter_chain，不包括 speed（变速由音频单独处理）
-        base_vf = build_video_filter_chain(settings, include_subtitle=True, include_speed=False)
+        enhance_settings = settings.get("enhance", {})
+        base_vf = build_video_filter_chain(settings, include_subtitle=True, include_speed=False, enhance_settings=enhance_settings)
         filter_parts = []
         if base_vf and base_vf != "null":
             filter_parts.append(base_vf)
@@ -4131,9 +4316,11 @@ class FFmpegBatchGUI:
                 cmd_list.extend(["-c:v", "copy"])
             else:
                 # 构建视频滤镜（包含字幕、变速等）
-                vf = build_video_filter_chain(settings, include_subtitle=True, include_speed=True)
+                enhance_settings = settings.get("enhance", {})
+                vf = build_video_filter_chain(settings, include_subtitle=True, include_speed=True, enhance_settings=enhance_settings)
                 if vf != "null":
                     cmd_list.extend(["-vf", vf])
+                else:
                 cmd_list = self._build_video_encoding_params(cmd_list, settings)
     
 
@@ -4295,8 +4482,10 @@ class FFmpegBatchGUI:
     
         # ---- 构建叠加滤镜 ----
         sub_infos = [(1, wm_file, adapted_wm)]
+        enhance_settings = settings.get("enhance", {})
         complex_filter, final_v_label = self._build_overlay_filter_complex(
-            0, settings, sub_infos, include_subtitle_main=True
+            0, settings, sub_infos, include_subtitle_main=True,
+            enhance_settings=enhance_settings
         )
         cmd_list.extend(["-filter_complex", complex_filter])
         cmd_list.extend(["-map", final_v_label])
@@ -4360,6 +4549,7 @@ class FFmpegBatchGUI:
             if w is not None and h is not None:
                 settings["watermark"]["base_width"] = w
                 settings["watermark"]["base_height"] = h
+        settings["enhance"] = self.video_filter.get_enhance_settings()
         return settings
 
     # ---------- 修改 load_settings_into_ui 恢复水印 ----------
@@ -4383,6 +4573,8 @@ class FFmpegBatchGUI:
                 # 保持默认值（已在 __init__ 中定义）
                 pass
             self.toggle_only_audio_mode()
+            if "enhance" in settings:
+                self.video_filter.set_enhance_settings(settings["enhance"])
         finally:
             self._loading_preset = False
             self.update_command_preview()  # 最后统一刷新一次
@@ -5719,7 +5911,8 @@ class FFmpegBatchGUI:
             filt_frame.set_override_settings(task.settings)
             filt_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
             filt_frame.set_settings(task.settings)
-
+            if "enhance" in task.settings:
+                filt_frame.set_enhance_settings(task.settings["enhance"])
 
             filt_frame.set_get_trim_settings_callback(lambda: trim_frame.get_settings())
 
@@ -5745,39 +5938,13 @@ class FFmpegBatchGUI:
             page_adv = ttk.Frame(notebook)
             notebook.add(page_adv, text="高级选项")
             
-            # ---- 先定义命令预览区和 update_preview 函数 ----
-            preview_frame = ttk.LabelFrame(win, text="新命令预览", padding="5")
-            preview_frame.pack(fill=tk.X, pady=10, padx=5)
-            preview_text = scrolledtext.ScrolledText(preview_frame, height=10, wrap=tk.WORD)
-            preview_text.pack(fill=tk.BOTH, expand=True)
-            
-            def update_preview(*args):
-                new_settings = {}
-                new_settings.update(enc_frame.get_settings())
-                new_settings.update(filt_frame.get_settings())
-                new_settings.update(audio_frame.get_settings())
-                new_settings.update(trim_frame.get_settings())
-                new_settings.update(adv_frame.get_settings())  # 这里 adv_frame 将在后面创建，但函数定义时不会执行，所以没问题
-                new_settings["output_dir"] = out_dir_var.get()
-                new_settings["output_suffix"] = suffix_var.get()
-                new_settings["custom_output_name"] = custom_var.get()
-                new_settings["output_container"] = container_var.get()
-                # 保留水印设置
-                new_settings["watermark"] = task.settings.get("watermark", self.watermark_settings.copy())
-                new_out = self.generate_output_path(task.input, new_settings)
-                try:
-                    new_cmd_list = self.generate_ffmpeg_command(task.input, new_out, new_settings)
-                    new_cmd_str = format_cmd_for_display(new_cmd_list)
-                except ValueError as e:
-                    new_cmd_str = f"参数错误: {e}"
-                preview_text.delete(1.0, tk.END)
-                preview_text.insert(tk.END, new_cmd_str)
+
             
             # ---- 现在创建 AdvancedFrame，并传入 update_callback ----
             watermark_dict = task.settings.get("watermark", {})   # 防止 KeyError
             adv_frame = AdvancedFrame(
                 page_adv,
-                update_callback=update_preview,   # 此时 update_preview 已定义
+                update_callback=None,   # 此时 update_preview 已定义
                 app=self,
                 show_adaptive=True,
                 watermark_dict=watermark_dict
@@ -5820,7 +5987,38 @@ class FFmpegBatchGUI:
             wm_btn = ttk.Button(page_adv, text="编辑当前任务水印设置", command=open_task_watermark)
             wm_btn.pack(pady=5)
 
+            # ---- 先定义命令预览区和 update_preview 函数 ----
+            preview_frame = ttk.LabelFrame(win, text="新命令预览", padding="5")
+            preview_frame.pack(fill=tk.X, pady=10, padx=5)
+            preview_text = scrolledtext.ScrolledText(preview_frame, height=10, wrap=tk.WORD)
+            preview_text.pack(fill=tk.BOTH, expand=True)
+            
+            def update_preview(*args):
+                new_settings = {}
+                new_settings.update(enc_frame.get_settings())
+                new_settings.update(filt_frame.get_settings())
+                new_settings.update(audio_frame.get_settings())
+                new_settings.update(trim_frame.get_settings())
+                new_settings.update(adv_frame.get_settings())  # 这里 adv_frame 将在后面创建，但函数定义时不会执行，所以没问题
+                new_settings["output_dir"] = out_dir_var.get()
+                new_settings["output_suffix"] = suffix_var.get()
+                new_settings["custom_output_name"] = custom_var.get()
+                new_settings["output_container"] = container_var.get()
+                # 保留水印设置
+                new_settings["watermark"] = task.settings.get("watermark", self.watermark_settings.copy())
+                new_out = self.generate_output_path(task.input, new_settings)
+                new_settings["enhance"] = filt_frame.get_enhance_settings()
+              #  print(f"[edit_task update_preview] 获取到 enhance = {new_settings['enhance']}")
+                try:
+                    new_cmd_list = self.generate_ffmpeg_command(task.input, new_out, new_settings)
+                    new_cmd_str = format_cmd_for_display(new_cmd_list)
+                except ValueError as e:
+                    new_cmd_str = f"参数错误: {e}"
+                preview_text.delete(1.0, tk.END)
+                preview_text.insert(tk.END, new_cmd_str)
 
+            filt_frame._preview_callback = update_preview   
+            adv_frame.update_callback = update_preview
 
     
             # 绑定各种事件
@@ -5890,6 +6088,8 @@ class FFmpegBatchGUI:
 
                 new_settings["watermark"] = adv_frame.watermark_dict.copy()  # 或直接引用
                 new_output = self.generate_output_path(task.input, new_settings)
+                new_settings["enhance"] = filt_frame.get_enhance_settings()
+
                 try:
                     new_cmd_list = self.generate_ffmpeg_command(task.input, new_output, new_settings)
                 except ValueError as e:
@@ -6276,8 +6476,11 @@ class FFmpegBatchGUI:
                 sv_idx = input_files_norm.index(normalize_path(sv.file_path))
                 sub_infos.append((sv_idx, sv.file_path, sv.enc_settings))
             
+            enhance_settings = main_video.enc_settings.get("enhance", {})
             complex_filter, final_v_label = self._build_overlay_filter_complex(
-                main_idx, main_video.enc_settings, sub_infos, include_subtitle_main=False
+                main_idx, main_video.enc_settings, sub_infos,
+                include_subtitle_main=False,
+                enhance_settings=enhance_settings
             )
             cmd_list.extend(["-filter_complex", complex_filter])
             cmd_list.extend(["-map", final_v_label])
@@ -6294,7 +6497,7 @@ class FFmpegBatchGUI:
             
             v_settings = video_track.enc_settings
             vcodec = v_settings.get("encoder", "copy")
-            video_filters = build_video_filter_chain(v_settings, include_subtitle=False, include_speed=False)
+            video_filters = build_video_filter_chain(v_settings, include_subtitle=False, include_speed=False, enhance_settings=v_settings.get("enhance", {}))
             has_filters = video_filters and video_filters != "null"
             if has_filters and vcodec == "copy":
                 self._append_info_ui("[封装] 警告：主视频启用了滤镜，但编码器设为「copy」。自动将编码器改为 libx265 以应用滤镜。")
@@ -6680,6 +6883,9 @@ class FFmpegBatchGUI:
             filt_frame.pack(fill=tk.X, padx=5, pady=5)
             filt_frame.set_settings(initial_settings)
 
+            if "enhance" in initial_settings:
+                filt_frame.set_enhance_settings(initial_settings["enhance"])
+
             # ---- 页面3：截取片段 ----
             page_trim = ttk.Frame(notebook)
             notebook.add(page_trim, text="截取片段")
@@ -6799,6 +7005,7 @@ class FFmpegBatchGUI:
                         new_settings["enabled"] = True
                         new_settings["file_path"] = initial_settings.get("file_path", "")
                         new_settings["duration"] = initial_settings.get("duration", None)
+                    new_settings["enhance"] = filt_frame.get_enhance_settings()
                     on_save(new_settings)
                 except Exception as e:
                     import traceback
@@ -6823,10 +7030,25 @@ class FFmpegBatchGUI:
         overlay_mode = 'main' if is_main else 'sub'
         # 主视频不显示循环/绿幕
         show_loop = not is_main
-    
+
+        initial_settings = track.enc_settings.copy()
+        if "enhance" not in initial_settings:
+            initial_settings["enhance"] = {
+                "denoise_enabled": False,
+                "denoise_spatial": 4.0,
+                "denoise_temporal": 3.0,
+                "sharpen_enabled": False,
+                "sharpen_strength": 1.0,
+                "ivtc_enabled": False,
+                "deblock_enabled": False,
+                "deblock_strength": 4,
+                "colorspace_enabled": False,
+                "colorspace_matrix": "bt709:bt2020",
+            }
+
         self.edit_video_settings(
             title=f"视频轨道设置 - {track.codec}",
-            initial_settings=track.enc_settings,
+            initial_settings=initial_settings,
             on_save=lambda new: self._update_track_enc(track_idx, new),
             file_path=track.file_path,
             is_watermark=False,
@@ -6840,9 +7062,12 @@ class FFmpegBatchGUI:
     
     
     def _update_track_enc(self, idx, new_settings):
-        self.merge_tracks[idx].enc_settings = new_settings
+        track = self.merge_tracks[idx]  # 先获取 track 对象
+        track.enc_settings = new_settings
+        if "enhance" in new_settings:
+            track.enc_settings["enhance"] = new_settings["enhance"]
         # 同步属性（兼容旧代码）
-        track = self.merge_tracks[idx]
+
         track.overlay_enabled = new_settings.get("overlay_enabled", False)
         track.overlay_x = new_settings.get("overlay_x", "W-w-10")
         track.overlay_y = new_settings.get("overlay_y", "H-h-10")
