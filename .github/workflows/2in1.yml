@@ -15,8 +15,10 @@ jobs:
   build-and-release:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      # 1. 升级 checkout 到 v6 以支持 Node 24
+      - uses: actions/checkout@v6
 
+      # 2. setup-python 目前官方最新为 v5，保持原样（若后续有 v6 再行升级）
       - name: 设置 Python
         uses: actions/setup-python@v5
         with:
@@ -82,8 +84,9 @@ jobs:
           Compress-Archive -Path "$env:MAIN_EXE_DIR\*" -DestinationPath "upload_files\$mainDirName.zip" -Force
           Write-Host "打包完成: upload_files\$mainDirName.zip"
 
+      # 3. 升级 release action 到 v3 以支持 Node 24
       - name: 创建 Release 并上传附件
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.VERSION }}
           name: "Release ${{ env.VERSION }}"
