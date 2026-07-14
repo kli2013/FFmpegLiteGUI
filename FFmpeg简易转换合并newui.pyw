@@ -152,7 +152,17 @@ def is_valid_timestamp(ts: str) -> bool:
         return False
     return False
 
-
+def seconds_to_time(sec):
+    """秒数转 HH:MM:SS.ms"""
+    if sec is None:
+        return ""
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = sec % 60
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:06.3f}"
+    else:
+        return f"{m:02d}:{s:06.3f}"
 
 # 纯python 缩放函数 ,用于可视化裁剪
 def resize_ppm_nearest(input_path, output_path, new_width, new_height):
@@ -378,6 +388,11 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
     include_speed: 是否包含变速滤镜
     include_trim: 是否包含精准截取（trim+setpts）滤镜
     include_format: 是否包含像素格式转换（format）滤镜
+    enhance_settings:高级一点的滤镜
+    顺序优化：
+    1. 精准截取		2. 裁剪		3. 缩放		4. IVTC（反胶卷过带）	5. 反交错
+    6. 去块滤波		7. 降噪		8. 锐化		9. 旋转/翻转		10. 色彩空间转换
+    11. 像素格式	12. 变速	13. 字幕烧录
     """
     filters = []
     
@@ -396,38 +411,8 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
             if trim_parts:
                 filters.append(f"trim={':'.join(trim_parts)}")
                 filters.append("setpts=PTS-STARTPTS")
-    # -----------------------------------------
-
-    if enhance_settings:
-        # 降噪
-        if enhance_settings.get("denoise_enabled", False):
-            spatial = enhance_settings.get("denoise_spatial", 4.0)
-            temporal = enhance_settings.get("denoise_temporal", 3.0)
-            # hqdn3d 参数：空间亮度, 空间色度, 时间亮度, 时间色度
-            # 简化：空间色度 = 空间亮度*0.75，时间色度 = 时间亮度*0.75
-            filters.append(f"hqdn3d={spatial:.1f}:{spatial*0.75:.1f}:{temporal:.1f}:{temporal*0.75:.1f}")
-        # 锐化
-        if enhance_settings.get("sharpen_enabled", False):
-            strength = enhance_settings.get("sharpen_strength", 1.0)
-            # unsharp 参数：luma_msize_x:luma_msize_y:luma_amount:chroma_msize_x:chroma_msize_y:chroma_amount
-            # 简化：使用 5x5 矩阵，色度锐化减半
-            filters.append(f"unsharp=5:5:{strength:.2f}:5:5:{strength*0.5:.2f}")
-        # IVTC
-        if enhance_settings.get("ivtc_enabled", False):
-            filters.append("ivtc=1")   # 自动检测
-        # 去块
-        if enhance_settings.get("deblock_enabled", False):
-            strength = enhance_settings.get("deblock_strength", 4)
-            filters.append(f"deblock=filter=weak:block={strength}")
-        # 色彩空间转换
-        if enhance_settings.get("colorspace_enabled", False):
-            matrix = enhance_settings.get("colorspace_matrix", "bt709:bt2020")
-            # 格式: colorspace=in:out 或其他，但标准是 colorspace=all=1:transfer=...:matrix=...
-            # 简化：使用 colormatrix 滤镜（更简单，但仅支持部分转换）
-            filters.append(f"colormatrix={matrix}")
-
-
-    # 裁剪
+    
+    # ----- 裁剪 -----
     if settings.get("crop_enabled", False):
         w = settings.get("crop_width", "").strip()
         h = settings.get("crop_height", "").strip()
@@ -435,7 +420,8 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
         top = settings.get("crop_top", "0").strip()
         if w and h:
             filters.append(f"crop={w}:{h}:{left}:{top}")
-    # 缩放
+    
+    # ----- 缩放 -----
     if settings.get("scale_enabled", False):
         method = settings.get("scale_method", "width")
         w = settings.get("scale_width", "").strip()
@@ -446,7 +432,37 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
             filters.append(f"scale=-2:{h}")
         elif method == "exact" and w and h:
             filters.append(f"scale={w}:{h}")
-    # 旋转
+    
+    # ----- IVTC（反胶卷过带）----- 
+    ivtc_enabled = enhance_settings and enhance_settings.get("ivtc_enabled", False)
+    if ivtc_enabled:
+        filters.append("ivtc=1")
+    
+    # ----- 反交错（仅当 IVTC 未启用时执行） -----
+    if not ivtc_enabled:  # 添加条件
+        deint = settings.get("deinterlace_filter", "none")
+        if deint != "none":
+            filters.append(deint)
+    
+    # ----- 去块滤波 -----
+    if enhance_settings and enhance_settings.get("deblock_enabled", False):
+        strength = enhance_settings.get("deblock_strength", 4)
+        filters.append(f"deblock=filter=weak:block={strength}")
+    
+    # ----- 降噪 -----
+    if enhance_settings and enhance_settings.get("denoise_enabled", False):
+        spatial = enhance_settings.get("denoise_spatial", 4.0)
+        temporal = enhance_settings.get("denoise_temporal", 3.0)
+        # hqdn3d 参数：空间亮度, 空间色度, 时间亮度, 时间色度
+        filters.append(f"hqdn3d={spatial:.1f}:{spatial*0.75:.1f}:{temporal:.1f}:{temporal*0.75:.1f}")
+    
+    # ----- 锐化 -----
+    if enhance_settings and enhance_settings.get("sharpen_enabled", False):
+        strength = enhance_settings.get("sharpen_strength", 1.0)
+        # unsharp 参数：luma_msize_x:luma_msize_y:luma_amount:chroma_msize_x:chroma_msize_y:chroma_amount
+        filters.append(f"unsharp=5:5:{strength:.2f}:5:5:{strength*0.5:.2f}")
+    
+    # ----- 旋转/翻转 -----
     rot = settings.get("rotate", "none")
     if rot == "90":
         filters.append("transpose=1")
@@ -454,19 +470,21 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
         filters.append("transpose=2,transpose=2")
     elif rot == "270":
         filters.append("transpose=2")
-    # 翻转
     if settings.get("vflip", False):
         filters.append("vflip")
     if settings.get("hflip", False):
         filters.append("hflip")
-    # 反交错
-    deint = settings.get("deinterlace_filter", "none")
-    if deint != "none":
-        filters.append(deint)
-    # 像素格式（受 include_format 控制）
+    
+    # ----- 色彩空间转换 -----
+    if enhance_settings and enhance_settings.get("colorspace_enabled", False):
+        matrix = enhance_settings.get("colorspace_matrix", "bt709:bt2020")
+        filters.append(f"colormatrix={matrix}")
+    
+    # ----- 像素格式 -----
     if include_format and settings.get("pix_fmt_enabled", True):
         filters.append(f"format={settings.get('pix_fmt', 'yuv420p')}")
-    # 变速（视频）
+    
+    # ----- 变速 -----
     if include_speed and settings.get("speed_enabled", False):
         try:
             factor = float(settings.get("speed_factor", "1.0"))
@@ -474,7 +492,8 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
                 filters.append(f"setpts={1.0/factor}*PTS")
         except ValueError:
             pass
-    # 字幕烧录
+    
+    # ----- 字幕烧录 -----
     if include_subtitle and settings.get("subtitle_enabled", False):
         sub_path = settings.get("subtitle_path", "").strip()
         if sub_path:
@@ -482,6 +501,7 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
             sub_path = sub_path.replace(':', '\\:')
             sub_path = sub_path.replace("'", "\\'")
             filters.append(f"subtitles='{sub_path}'")
+    
     return ",".join(filters) if filters else "null"
 
 def build_preview_filter_chain(settings: Dict[str, Any], target_height: int = 960) -> str:
@@ -833,7 +853,7 @@ class ParamValidator:
         rc = settings.get("rate_control_type")
         encoder = settings.get("encoder")
         if rc == "crf":
-            ok, msg = ParamValidator.validate_crf(settings.get("crf_value", 28), encoder)
+            ok, msg = ParamValidator.validate_crf(settings.get("crf_value", 25), encoder)
             if not ok: errors.append(msg)
         elif rc == "cq":
             ok, msg = ParamValidator.validate_cq(settings.get("cq_value", 35))
@@ -972,7 +992,7 @@ class VideoEncoderFrame(ttk.LabelFrame):
         self.dynamic_frame = ttk.Frame(self)
         self.dynamic_frame.grid(row=3, column=0, columnspan=3, sticky="we", pady=0, padx=5)
 
-        self.crf_value = tk.IntVar(value=28)
+        self.crf_value = tk.IntVar(value=25)
         self.cq_value = tk.IntVar(value=35)
         self.global_quality = tk.IntVar(value=28)
         self.bitrate_video = tk.StringVar(value="1900k")
@@ -1410,12 +1430,12 @@ class VideoFilterFrame(ttk.LabelFrame):
                                    command=self.auto_detect_crop, width=9)
         auto_crop_btn.pack(side=tk.LEFT, padx=(10,0))
         ToolTip(auto_crop_btn,
-                "自动分析当前输入文件，推荐裁剪参数（去除四周黑边）。\n"
+                "自动分析当前输入文件，获取裁剪参数（去除四周黑边）。\n"
                 "参数说明：\n"
                 "• 分析帧数：检测多少帧画面（默认10帧）。帧数越多越准确，但耗时稍长；\n"
                 "• round：裁剪宽/高对齐数值（默认2，保证偶数）。设为16可满足旧编码器兼容性；\n"
                 "• 检测从第1帧开始（skip=0）。若第一帧为黑屏，请手动增加分析帧数或跳过片头。\n"
-                "提示：以上两个参数的详细调整请点击右侧的「可视化裁剪」按钮，在打开的窗口中进行设置。\n"
+                "可根据截取起始时间或者可视化窗口内自定义时间获取需要片段的黑边参数。\n"
                 "检测仅需约0.5秒，可快速尝试调整参数。",
                 wraplength=400)
 
@@ -1436,7 +1456,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                 "打开可视化裁剪窗口：\n"
                 "• 显示视频首帧画面，可用鼠标拖拽绘制矩形选区\n"
                 "• 选区参数会回填到「启用裁剪」的各项输入框中\n"
-                "• 下方仍保留「自动检测黑边」功能，可辅助定位",
+                "• 仍保留「自动检测黑边」功能，可辅助定位",
                 wraplength=400)
 
         rot_frame = ttk.Frame(left_frame)
@@ -1454,7 +1474,7 @@ class VideoFilterFrame(ttk.LabelFrame):
         ttk.Checkbutton(rot_frame, text="左右翻转", variable=self.hflip).pack(side=tk.LEFT, padx=5)
 
 
-        self.enhance_btn = ttk.Button(rot_frame, text="高级增强...", 
+        self.enhance_btn = ttk.Button(rot_frame, text="高级增强", 
                                       command=self.open_enhance_window, width=10)
         self.enhance_btn.pack(side=tk.LEFT, padx=(20,0))
 
@@ -2502,8 +2522,8 @@ class TrimFrame(ttk.LabelFrame):
         )
         self.precise_check.pack(side=tk.LEFT, padx=5)
         ToolTip(self.precise_check,
-                "勾选后，截取将精确到帧（-ss 放在 -i 之后），但必须重新编码视频。\n"
-                "若编码器为「copy」将自动改为 libx265 并提示。\n"
+                "勾选后，截取将精确到帧，但必须重新编码视频。\n"
+                "若编码器为「copy」将自动提示。\n"
                 "取消勾选则为快速截取（基于关键帧），可能不精确但速度快。",
                 wraplength=400)
         # 新增结束
@@ -3437,6 +3457,8 @@ class FFmpegBatchGUI:
         self._loading_preset = False      # 加载预设标志
         self._updating_preview = False    # 防重入锁标志
 
+        self.segment_enabled = tk.BooleanVar(value=False)
+        self.segments = []
 
         # ---------- 水印设置 ----------
         self.watermark_settings = {
@@ -3448,7 +3470,7 @@ class FFmpegBatchGUI:
             "encoder": "libx264",
             "preset": "medium",
             "rate_control_type": "crf",
-            "crf_value": 23,
+            "crf_value": 25,
             "cq_value": 28,
             "global_quality": 23,
             "bitrate_video": "2000k",
@@ -3784,7 +3806,150 @@ class FFmpegBatchGUI:
     
         return new_settings
 
-
+    def _generate_segment_concat_command(self, input_path: str, output_path: str, settings: dict) -> List[str]:
+        """
+        生成分段拼接的 FFmpeg 命令，使用 filter_complex。
+        settings 包含编码、音频、全局滤镜等设置。
+        """
+        segments = settings.get("segments", [])
+        if not segments:
+            raise ValueError("片段列表为空")
+    
+        input_path = normalize_path(input_path)
+        output_path = normalize_path(output_path)
+    
+        cmd = [self.ffmpeg_cmd, "-y", "-i", input_path]
+    
+        # ----- 构建 filter_complex -----
+        n = len(segments)
+        v_filters = []
+        a_filters = []
+        disable_audio = not settings.get("audio_enabled", True)  # 注意：audio_enabled 默认 True
+    
+        for i, seg in enumerate(segments):
+            start = time_to_seconds(seg["start"])
+            end = time_to_seconds(seg["end"])
+            if start is None or end is None:
+                raise ValueError(f"片段 {i+1} 时间无效: start={seg['start']}, end={seg['end']}")
+            if start >= end:
+                raise ValueError(f"片段 {i+1} 开始时间必须小于结束时间")
+    
+            flip = seg.get("flip", "无")
+            flip_filter = ""
+            if flip == "水平翻转":
+                flip_filter = ",hflip"
+            elif flip == "垂直翻转":
+                flip_filter = ",vflip"
+            elif flip == "水平+垂直":
+                flip_filter = ",hflip,vflip"
+    
+            v_filters.append(f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS{flip_filter}[v{i}]")
+            if not disable_audio:
+                a_filters.append(f"[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a{i}]")
+    
+        # 视频 concat
+        v_concat = f"[{']['.join(f'v{i}' for i in range(n))}]concat=n={n}:v=1:a=0[vout]"
+        # 合并所有滤镜
+        filter_parts = v_filters + [v_concat]
+        if not disable_audio:
+            filter_parts.extend(a_filters)
+            a_concat = f"[{']['.join(f'a{i}' for i in range(n))}]concat=n={n}:v=0:a=1[aout]"
+            filter_parts.append(a_concat)
+        all_filters = ";".join(filter_parts)
+    
+        # ----- 全局滤镜（缩放、裁剪、旋转、帧率、像素格式）-----
+        global_filters = []
+        # 缩放
+        if settings.get("scale_enabled", False):
+            method = settings.get("scale_method", "width")
+            w = settings.get("scale_width", "").strip()
+            h = settings.get("scale_height", "").strip()
+            if method == "width" and w:
+                global_filters.append(f"scale={w}:-2")
+            elif method == "height" and h:
+                global_filters.append(f"scale=-2:{h}")
+            elif method == "exact" and w and h:
+                global_filters.append(f"scale={w}:{h}")
+        # 裁剪
+        if settings.get("crop_enabled", False):
+            cw = settings.get("crop_width", "").strip()
+            ch = settings.get("crop_height", "").strip()
+            cx = settings.get("crop_left", "0").strip()
+            cy = settings.get("crop_top", "0").strip()
+            if cw and ch:
+                global_filters.append(f"crop={cw}:{ch}:{cx}:{cy}")
+        # 旋转
+        rotate = settings.get("rotate", "none")
+        if rotate == "90":
+            global_filters.append("transpose=1")
+        elif rotate == "180":
+            global_filters.append("transpose=2,transpose=2")
+        elif rotate == "270":
+            global_filters.append("transpose=2")
+        # 翻转（全局翻转，如果用户在主界面勾选，但片段内已经独立翻转，这里可以叠加，但一般不需要）
+        if settings.get("vflip", False):
+            global_filters.append("vflip")
+        if settings.get("hflip", False):
+            global_filters.append("hflip")
+        # 帧率
+        if settings.get("frame_rate_type") == "custom":
+            fps = settings.get("frame_rate_custom", "").strip()
+            if fps:
+                global_filters.append(f"fps={fps}")
+        # 像素格式
+        if settings.get("pix_fmt_enabled", True):
+            pix = settings.get("pix_fmt", "yuv420p")
+            if pix:
+                global_filters.append(f"format={pix}")
+    
+        if global_filters:
+            global_filter_str = ",".join(global_filters)
+            all_filters += f";[vout]{global_filter_str}[final_v]"
+            map_v = "[final_v]"
+        else:
+            map_v = "[vout]"
+    
+        cmd.extend(["-filter_complex", all_filters])
+    
+        # 映射
+        if disable_audio:
+            cmd.extend(["-map", map_v])
+        else:
+            cmd.extend(["-map", map_v, "-map", "[aout]"])
+    
+        # ----- 视频编码参数 -----
+        vcodec = settings.get("encoder", "libx265")
+        if vcodec == "copy":
+            # 拼接必须重新编码，强制改为 libx265
+            self._append_info_ui("分段拼接模式不支持 copy，自动改为 libx265")
+            vcodec = "libx265"
+            settings["encoder"] = vcodec
+    
+        strategy = get_encoder_strategy(vcodec)
+        cmd = strategy.build_params(cmd, settings)
+    
+        # ----- 音频编码参数（如果启用）-----
+        if not disable_audio:
+            acodec = settings.get("audio_codec", "aac")
+            abitrate = settings.get("audio_bitrate", "128k")
+            arate = settings.get("audio_samplerate", "44100")
+            cmd.extend(["-c:a", acodec, "-b:a", abitrate, "-ar", arate])
+    
+        # ----- 自定义参数 -----
+        custom = settings.get("custom_args", "").strip()
+        if custom:
+            try:
+                cmd.extend(shlex.split(custom))
+            except ValueError:
+                self._append_info_ui(f"警告：自定义参数格式错误，已忽略：{custom}")
+    
+        # ----- 容器优化 -----
+        container = settings.get("output_container", "mp4").lower()
+        if container in ("mp4", "mov"):
+            cmd.extend(["-movflags", "+faststart"])
+    
+        cmd.append(output_path)
+        return cmd
 
     def _build_overlay_filter_complex(self, main_idx: int, main_settings: dict,
                                        sub_infos: List[Tuple[int, str, dict]],
@@ -4262,6 +4427,8 @@ class FFmpegBatchGUI:
         return cmd_list
 
     def generate_ffmpeg_command(self, input_path: str, output_path: str, settings: dict) -> List[str]:
+        if settings.get("segment_enabled", False) and settings.get("segments", []):
+            return self._generate_segment_concat_command(input_path, output_path, settings)
         if not self.ffmpeg_cmd:
             raise ValueError("未找到 ffmpeg 可执行文件。")
         errors = ParamValidator.validate_settings(settings)
@@ -4275,7 +4442,14 @@ class FFmpegBatchGUI:
     
         # 精准模式下强制重新编码（视频）
         self._enforce_reencode_for_precise_trim(settings, only_audio)
-    
+
+        # ---------- 新增：IVTC 与反交错冲突检测 ----------
+        enhance_settings = settings.get("enhance", {})
+        if enhance_settings.get("ivtc_enabled", False) and settings.get("deinterlace_filter", "none") != "none":
+            self._append_info_ui("已启用 IVTC，反交错滤镜将被忽略（IVTC 本身包含反交错功能）。")
+        # ------------------------------------------------
+
+
         # ---------- 检查水印 ----------
         wm_settings = settings.get("watermark", {})
         wm_enabled = wm_settings.get("enabled", False) and wm_settings.get("file_path", "").strip()
@@ -5489,6 +5663,19 @@ class FFmpegBatchGUI:
         for child in widget.winfo_children():
             self._set_recursive_state(child, state)
 
+
+    def open_segment_editor(self):
+        if not self.segment_enabled.get():
+            messagebox.showinfo("提示", "请先勾选「启用分段拼接模式」再打开设置窗口。")
+            return
+        import copy
+        initial_segments = copy.deepcopy(self.segments)
+        editor = SegmentEditor(self.root, initial_segments, self)
+        self.root.wait_window(editor.window)
+        if editor.result is not None:
+            self.segments = editor.result
+            self.update_command_preview()
+
     def update_command_preview(self, *args):
         if getattr(self, '_loading_preset', False):
             return
@@ -5569,6 +5756,8 @@ class FFmpegBatchGUI:
     def add_task(self, input_path, settings=None):
         if settings is None:
             settings = self.get_current_settings()
+        settings["segment_enabled"] = self.segment_enabled.get()
+        settings["segments"] = copy.deepcopy(self.segments)
         try:
             output_path = self.generate_output_path(input_path, settings)
             self._append_info_ui(f"生成输出路径: {output_path}")
@@ -5932,14 +6121,62 @@ class FFmpegBatchGUI:
             trim_frame.set_settings(task.settings)
             
             filt_frame.set_get_trim_settings_callback(lambda: trim_frame.get_settings())
-    
+
+
+            # ----- 分段拼接页面 -----
+            page_segment = ttk.Frame(notebook)
+            notebook.add(page_segment, text="分段拼接")
+            
+            # 从任务设置中读取
+            seg_enabled = task.settings.get("segment_enabled", False)
+            segments = copy.deepcopy(task.settings.get("segments", []))
+            
+            # 局部变量（用于编辑）
+            seg_enabled_var = tk.BooleanVar(value=seg_enabled)
+            seg_enabled_var.trace_add("write", lambda *args: update_preview())
+            seg_list = segments  # 直接引用，修改后保存到 task
+            
+            seg_control_frame = ttk.Frame(page_segment)
+            seg_control_frame.pack(fill=tk.X, pady=10)
+            
+            ttk.Checkbutton(seg_control_frame, text="启用分段拼接模式 (将忽略『截取片段』设置)",
+                            variable=seg_enabled_var).pack(side=tk.LEFT, padx=5)
+            
+            def open_task_segment_editor():
+                if not seg_enabled_var.get():
+                    messagebox.showinfo("提示", "请先勾选「启用分段拼接模式」再打开设置窗口。")
+                    return
+                # 打开编辑器，传入 seg_list 和 seg_enabled_var 的引用
+                editor = SegmentEditor(win, seg_list, self)  # 注意：这里的 self 是主程序
+                self.root.wait_window(editor.window)
+                if editor.result is not None:
+                    seg_list.clear()
+                    seg_list.extend(editor.result)
+                    # 更新预览
+                    update_preview()
+            
+            ttk.Button(seg_control_frame, text="打开分段设置...",
+                       command=open_task_segment_editor).pack(side=tk.LEFT, padx=10)
+            
+
+            ttk.Label(
+                page_segment,
+                text="勾选启用后，视频将按片段列表裁剪并拼接，所有片段使用相同的全局编码/滤镜设置。\n"
+                     "   建议使用（mpv、PotPlayer）等播放器打开视频，定位到需要的起始/结束帧，将时间（格式如 01:23.456）填入左侧输入框。\n\n"
+                     "   典型用途：简单混剪、去中间广告、提取精华片段等。",
+                foreground="grey",
+                wraplength=800,
+                justify=tk.LEFT
+            ).pack(anchor=tk.W, padx=10, pady=(5,0))
+
+
             # 高级选项页面
             page_adv = ttk.Frame(notebook)
             notebook.add(page_adv, text="高级选项")
             
 
             
-            # ---- 现在创建 AdvancedFrame，并传入 update_callback ----
+            # ---- AdvancedFrame，并传入 update_callback ----
             watermark_dict = task.settings.get("watermark", {})   # 防止 KeyError
             adv_frame = AdvancedFrame(
                 page_adv,
@@ -5986,7 +6223,7 @@ class FFmpegBatchGUI:
             wm_btn = ttk.Button(page_adv, text="编辑当前任务水印设置", command=open_task_watermark)
             wm_btn.pack(pady=5)
 
-            # ---- 先定义命令预览区和 update_preview 函数 ----
+            # ---- 命令预览区和 update_preview 函数 ----
             preview_frame = ttk.LabelFrame(win, text="新命令预览", padding="5")
             preview_frame.pack(fill=tk.X, pady=10, padx=5)
             preview_text = scrolledtext.ScrolledText(preview_frame, height=10, wrap=tk.WORD)
@@ -6007,6 +6244,9 @@ class FFmpegBatchGUI:
                 new_settings["watermark"] = task.settings.get("watermark", self.watermark_settings.copy())
                 new_out = self.generate_output_path(task.input, new_settings)
                 new_settings["enhance"] = filt_frame.get_enhance_settings()
+
+                new_settings["segment_enabled"] = seg_enabled_var.get()
+                new_settings["segments"] = copy.deepcopy(seg_list)
               #  print(f"[edit_task update_preview] 获取到 enhance = {new_settings['enhance']}")
                 try:
                     new_cmd_list = self.generate_ffmpeg_command(task.input, new_out, new_settings)
@@ -6089,6 +6329,9 @@ class FFmpegBatchGUI:
                 new_output = self.generate_output_path(task.input, new_settings)
                 new_settings["enhance"] = filt_frame.get_enhance_settings()
 
+
+                new_settings["segment_enabled"] = seg_enabled_var.get()
+                new_settings["segments"] = copy.deepcopy(seg_list)
                 try:
                     new_cmd_list = self.generate_ffmpeg_command(task.input, new_output, new_settings)
                 except ValueError as e:
@@ -7735,6 +7978,10 @@ class FFmpegBatchGUI:
         else:
             self._append_info_ui("[封装] 无命令可复制")
 
+
+
+
+
     # -------------------- 界面创建 --------------------
     def create_widgets(self):
         main_frame = ttk.Frame(self.root)
@@ -7845,6 +8092,40 @@ class FFmpegBatchGUI:
         param_notebook.add(trim_page, text="截取片段")
         self.trim_frame = TrimFrame(trim_page)
         self.trim_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        # 在 create_widgets 中，adv_page 之后添加：
+        segment_tab = ttk.Frame(param_notebook)
+        param_notebook.add(segment_tab, text="分段拼接")
+        
+        seg_control_frame = ttk.Frame(segment_tab)
+        seg_control_frame.pack(fill=tk.X, pady=10)
+        
+        ttk.Checkbutton(seg_control_frame, text="启用分段拼接模式 (将忽略『截取片段』设置)",
+                        variable=self.segment_enabled).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(seg_control_frame, text="打开分段设置...",
+                   command=self.open_segment_editor).pack(side=tk.LEFT, padx=10)
+        
+        # 灰色说明（包含功能描述和时间码获取提示）
+        ttk.Label(
+            segment_tab,
+            text="勾选启用后，视频将按片段列表裁剪并拼接，所有片段使用相同的全局编码/滤镜设置。\n"
+                 "   建议使用（mpv、PotPlayer）等播放器打开视频，定位到需要的起始/结束帧，将时间（格式如 01:23.456）填入左侧输入框。ffplay 简易预览功能看不到时间。\n\n"
+                 "   典型用途：简单混剪、去中间广告、提取精华片段等。",
+            foreground="grey",
+            wraplength=1100,
+            justify=tk.LEFT
+        ).pack(anchor=tk.W, padx=10, pady=(5,0))
+        
+        # 红色警告（关于任务队列的提示）
+        ttk.Label(
+            segment_tab,
+            text="建议：该功能主要用于单个文件的片段重组，不推荐作为模板批量添加到「任务队列」中，（多个片段时间不通用）。",
+            foreground="red",
+            wraplength=900,
+            justify=tk.LEFT
+        ).pack(anchor=tk.W, padx=10, pady=(0,5))
+
 
         adv_page = ttk.Frame(param_notebook)
         param_notebook.add(adv_page, text="高级选项")
@@ -8015,6 +8296,414 @@ class FFmpegBatchGUI:
         self.video_encoder.level_var.trace_add("write", lambda *a: self.update_command_preview())
         self.video_encoder.maxrate_var.trace_add("write", lambda *a: self.update_command_preview())
         self.video_encoder.bufsize_var.trace_add("write", lambda *a: self.update_command_preview())
+
+        self.segment_enabled.trace_add("write", lambda *a: self.update_command_preview())
+
+
+class EditSegmentDialog(simpledialog.Dialog):
+    """用于编辑片段的起始时间、结束时间和翻转"""
+    def __init__(self, parent, title, start, end, flip):
+        self.start = start
+        self.end = end
+        self.flip = flip
+        super().__init__(parent, title=title)
+
+    def body(self, master):
+        ttk.Label(master, text="开始时间:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.start_entry = ttk.Entry(master, width=15)
+        self.start_entry.grid(row=0, column=1, padx=5, pady=5)
+        self.start_entry.insert(0, self.start)
+
+        ttk.Label(master, text="结束时间:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        self.end_entry = ttk.Entry(master, width=15)
+        self.end_entry.grid(row=1, column=1, padx=5, pady=5)
+        self.end_entry.insert(0, self.end)
+
+        ttk.Label(master, text="翻转:").grid(row=2, column=0, padx=5, pady=5, sticky="w")
+        self.flip_var = tk.StringVar(value=self.flip)
+        self.flip_combo = ttk.Combobox(master, textvariable=self.flip_var,
+                                       values=["无", "水平翻转", "垂直翻转", "水平+垂直"],
+                                       state="readonly", width=12)
+        self.flip_combo.grid(row=2, column=1, padx=5, pady=5)
+
+        return self.start_entry
+
+    def apply(self):
+        self.start = self.start_entry.get().strip()
+        self.end = self.end_entry.get().strip()
+        self.flip = self.flip_var.get()
+
+class SegmentEditor:
+    def __init__(self, parent, segments, app):
+        self.parent = parent
+        self.app = app  # 主程序引用，用于获取时长等信息
+        self.segments = copy.deepcopy(segments)  # 深拷贝，独立修改
+        self.result = None  # 返回结果
+
+        # 创建窗口
+        self.window = tk.Toplevel(parent)
+        self.window.title("分段拼接设置")
+        self.window.transient(parent)
+        self.window.grab_set()
+        # 窗口大小
+        self.window.geometry("900x600")
+        center_window(self.window, 900, 600)  # 复用已有的center_window函数
+
+        self.create_widgets()
+        self.refresh_tree()
+
+        # 绑定关闭事件
+        self.window.protocol("WM_DELETE_WINDOW", self.on_cancel)
+
+    def create_widgets(self):
+        main = ttk.Frame(self.window, padding="10")
+        main.pack(fill=tk.BOTH, expand=True)
+
+        # 左右 PanedWindow
+        paned = ttk.PanedWindow(main, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True)
+
+        # ---- 左栏：片段列表 ----
+        left_frame = ttk.Frame(paned)
+        paned.add(left_frame, weight=3)
+
+
+        # 添加工具栏
+        tool_frame = ttk.Frame(left_frame)
+        tool_frame.pack(fill=tk.X, pady=2)
+
+        ttk.Label(tool_frame, text="开始:").pack(side=tk.LEFT)
+        self.start_entry = ttk.Entry(tool_frame, width=12)
+        self.start_entry.pack(side=tk.LEFT, padx=2)
+        self.start_entry.insert(0, "0")
+
+        ttk.Label(tool_frame, text="结束:").pack(side=tk.LEFT, padx=(10,0))
+        self.end_entry = ttk.Entry(tool_frame, width=12)
+        self.end_entry.pack(side=tk.LEFT, padx=2)
+
+        flip_label = ttk.Label(tool_frame, text="翻转:")
+        flip_label.pack(side=tk.LEFT, padx=(10,0))
+        ToolTip(flip_label, 
+                "此翻转仅作用于当前选中的片段内部（水平/垂直翻转）\n"
+                "不影响主界面「视频滤镜」中的全局旋转/翻转设置。",
+                wraplength=400)
+        self.flip_var = tk.StringVar(value="无")
+        self.flip_combo = ttk.Combobox(tool_frame, textvariable=self.flip_var,
+                                       values=["无", "水平翻转", "垂直翻转", "水平+垂直"],
+                                       state="readonly", width=12)
+        self.flip_combo.pack(side=tk.LEFT, padx=2)
+
+        ttk.Button(tool_frame, text="添加片段", command=self.add_segment).pack(side=tk.LEFT, padx=5)
+
+        # 表格
+        tree_frame = ttk.Frame(left_frame)
+        tree_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        columns = ("序号", "开始", "结束", "时长", "翻转")
+        self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=8)
+        for col in columns:
+            self.tree.heading(col, text=col)
+            self.tree.column(col, width=100, minwidth=60)
+        self.tree.column("序号", width=50)
+        self.tree.column("翻转", width=100)
+
+        vbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vbar.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 操作按钮
+        op_frame = ttk.Frame(left_frame)
+        op_frame.pack(fill=tk.X, pady=2)
+        ttk.Button(op_frame, text="删除选中", command=self.delete_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Button(op_frame, text="上移", command=self.move_up).pack(side=tk.LEFT, padx=2)
+        ttk.Button(op_frame, text="下移", command=self.move_down).pack(side=tk.LEFT, padx=2)
+        ttk.Button(op_frame, text="清空所有", command=self.clear_all).pack(side=tk.LEFT, padx=2)
+
+        # ---- 右栏：外部命令输入 ----
+        right_frame = ttk.Frame(paned)
+        paned.add(right_frame, weight=1)
+
+        cmd_frame = ttk.LabelFrame(right_frame, text="输入外部命令或时间 - 提示", padding="5")
+        cmd_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # 添加 ToolTip
+        ToolTip(cmd_frame, 
+                "在此粘贴 FFmpeg 裁剪命令（每行一条），程序会自动提取其中的 -ss 和 -t/-to 时间参数。\n"
+                "点击「解析并导入所有片段」即可将提取的时间段添加到左侧列表。\n"
+                "提示：此为高级功能，普通用户可直接在左侧手动添加片段。",
+                wraplength=400)
+
+        self.cmd_input = scrolledtext.ScrolledText(cmd_frame, height=15, wrap=tk.NONE,
+                                                   font=("Consolas", 9))
+        self.cmd_input.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        cmd_btn_frame = ttk.Frame(cmd_frame)
+        cmd_btn_frame.pack(fill=tk.X, pady=2)
+        ttk.Button(cmd_btn_frame, text="解析并导入所有片段", command=self.import_from_commands).pack(side=tk.LEFT, padx=2)
+        ttk.Button(cmd_btn_frame, text="清空输入", command=lambda: self.cmd_input.delete(1.0, tk.END)).pack(side=tk.LEFT, padx=2)
+
+        # ---- 底部按钮 ----
+        btn_frame = ttk.Frame(main)
+        btn_frame.pack(fill=tk.X, pady=10)
+        ttk.Button(btn_frame, text="确定", command=self.on_ok).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=self.on_cancel).pack(side=tk.RIGHT, padx=5)
+
+        # 设置左右分栏的初始比例（左侧列表占 75%，右侧命令输入占 25%）
+        def set_initial_pane_size():
+            total_width = self.window.winfo_width()
+            if total_width > 100:
+                sash_pos = int(total_width * 0.75)   # 左侧占 75%
+                paned.sashpos(0, sash_pos)
+        
+        # 窗口显示后再设置
+        self.window.after(100, set_initial_pane_size)
+
+        # 绑定双击编辑
+        self.tree.bind("<Double-1>", self.on_tree_double_click)
+
+    # ---------- 片段管理方法 ----------
+    def add_segment_with_time(self, start_sec, end_sec, flip="无"):
+        if start_sec is None or end_sec is None:
+    #        self.app._append_info_ui("[分段] 时间无效，无法添加")
+            return False
+        if start_sec >= end_sec:
+    #        self.app._append_info_ui(f"[分段] 开始 {start_sec} >= 结束 {end_sec}，跳过")
+            return False
+        start_str = seconds_to_time(start_sec)
+        end_str = seconds_to_time(end_sec)
+        # 时长检测（仅警告）
+        if self.app and self.app.input_file.get():
+            dur = self.app._get_media_duration(self.app.input_file.get())
+            if dur is not None and end_sec > dur:
+                self.app._append_info_ui(f"[分段] 片段超出总时长: {start_str}->{end_str}，已跳过")
+                return False
+
+        self.segments.append({
+            "start": start_str,
+            "end": end_str,
+            "flip": flip
+        })
+        self.refresh_tree()
+ #       self.app._append_info_ui(f"[分段] 从命令导入片段: {start_str} -> {end_str} (翻转: {flip})")
+        return True
+
+    def add_segment(self):
+        # 获取输入
+        start = self.start_entry.get().strip()
+        end = self.end_entry.get().strip()
+        
+        # ---- 调试日志 ----
+ #       self.app._append_info_ui(f"[分段] 用户点击添加: start='{start}', end='{end}'")
+        
+        if not start:
+            messagebox.showwarning("提示", "请填写开始时间")
+            return
+    
+        # 如果未填写结束时间，尝试自动补全（但推荐强制手动填写）
+        if not end:
+            # 尝试从输入文件获取总时长
+            if self.app and self.app.input_file.get():
+                dur = self.app._get_media_duration(self.app.input_file.get())
+                if dur is not None:
+                    end = seconds_to_time(dur)
+  #                  self.app._append_info_ui(f"[分段] 结束时间自动设为总时长: {end}")
+                else:
+                    messagebox.showerror("错误", "无法获取视频总时长，请手动填写结束时间")
+                    return
+            else:
+                messagebox.showerror("错误", "未指定输入文件，无法自动获取结束时间，请手动填写")
+                return
+    
+        # 解析时间
+        start_sec = time_to_seconds(start)
+        end_sec = time_to_seconds(end)
+        if start_sec is None or end_sec is None:
+            messagebox.showerror("错误", "时间格式无效，请使用 HH:MM:SS.ms 或秒数")
+            return
+        if start_sec >= end_sec:
+            messagebox.showerror("错误", "开始时间必须小于结束时间")
+            return
+    
+        # 检查总时长（仅警告）
+        if self.app and self.app.input_file.get():
+            dur = self.app._get_media_duration(self.app.input_file.get())
+            if dur is not None and end_sec > dur:
+                self.app._append_info_ui(f"[分段] 片段超出总时长: {start_str}->{end_str}，已跳过")
+                return
+    
+        # ---- 获取翻转值（直接从控件读取） ----
+        flip_value = self.flip_combo.get()
+#        self.app._append_info_ui(f"[分段] 当前翻转值: {flip_value}")
+    
+        # 添加到列表
+        self.segments.append({
+            "start": start,
+            "end": end,
+            "flip": flip_value
+        })
+        self.refresh_tree()
+ #       self.app._append_info_ui(f"[分段] 已添加片段: {start} -> {end} (翻转: {flip_value})")
+
+    def delete_selected(self):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        idx = int(selected[0])
+        del self.segments[idx]
+        self.refresh_tree()
+
+    def move_up(self):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        idx = int(selected[0])
+        if idx == 0:
+            return
+        self.segments[idx], self.segments[idx-1] = self.segments[idx-1], self.segments[idx]
+        self.refresh_tree()
+        self.tree.selection_set(str(idx-1))
+
+    def move_down(self):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        idx = int(selected[0])
+        if idx == len(self.segments)-1:
+            return
+        self.segments[idx], self.segments[idx+1] = self.segments[idx+1], self.segments[idx]
+        self.refresh_tree()
+        self.tree.selection_set(str(idx+1))
+
+    def clear_all(self):
+        if self.segments and messagebox.askyesno("确认", "确定清空所有片段吗？"):
+            self.segments.clear()
+            self.refresh_tree()
+
+    def refresh_tree(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for i, seg in enumerate(self.segments):
+            start = seg["start"]
+            end = seg["end"]
+            dur = time_to_seconds(end) - time_to_seconds(start)
+            dur_str = seconds_to_time(dur) if dur is not None else "?"
+            self.tree.insert("", tk.END, iid=str(i), values=(i+1, start, end, dur_str, seg["flip"]))
+
+    # ---------- 双击编辑 ----------
+    def on_tree_double_click(self, event):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        idx = int(selected[0])
+        seg = self.segments[idx]
+
+        dialog = EditSegmentDialog(self.window, "编辑片段",
+                                   start=seg["start"], end=seg["end"], flip=seg["flip"])
+        if dialog.start is not None and dialog.end is not None:
+            start_sec = time_to_seconds(dialog.start)
+            end_sec = time_to_seconds(dialog.end)
+            if start_sec is None or end_sec is None:
+                messagebox.showerror("错误", "时间格式无效")
+                return
+            if start_sec >= end_sec:
+                messagebox.showerror("错误", "开始时间必须小于结束时间")
+                return
+            if self.app and self.app.input_file.get():
+                dur = self.app._get_media_duration(self.app.input_file.get())
+                if dur is not None and end_sec > dur:
+                    self.app._append_info_ui(f"[分段] 片段超出总时长: {start_str}->{end_str}，已跳过")
+                    return
+            seg["start"] = dialog.start
+            seg["end"] = dialog.end
+      #      self.app._append_info_ui(f"[编辑] 修改前翻转: {seg['flip']}, 修改后: {dialog.flip}")
+            seg["flip"] = dialog.flip
+      #      self.app._append_info_ui(f"[编辑] 实际存储: {seg['flip']}")
+            self.refresh_tree()
+
+    # ---------- 外部命令导入 ----------
+    def import_from_commands(self):
+        text = self.cmd_input.get(1.0, tk.END).strip()
+        if not text:
+            messagebox.showinfo("提示", "请先在右侧粘贴 FFmpeg 命令")
+            return
+
+        lines = text.splitlines()
+        parsed_count = 0
+        skipped_count = 0
+        errors = []
+
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+
+            # 提取 -ss 时间
+            ss_match = re.search(r'-ss\s+([\d.]+)', line, re.IGNORECASE)
+            if not ss_match:
+                skipped_count += 1
+                errors.append(f"未找到 -ss: {line[:80]}...")
+                continue
+
+            start_sec = float(ss_match.group(1))
+
+            # 提取 -t 或 -to
+            t_match = re.search(r'-t\s+([\d.]+)', line, re.IGNORECASE)
+            to_match = re.search(r'-to\s+([\d.]+)', line, re.IGNORECASE)
+
+            if t_match:
+                duration_sec = float(t_match.group(1))
+                end_sec = start_sec + duration_sec
+            elif to_match:
+                end_sec = float(to_match.group(1))
+            else:
+                skipped_count += 1
+                errors.append(f"未找到 -t 或 -to: {line[:80]}...")
+                continue
+
+
+
+            # 添加片段（翻转默认为“无”）
+
+            start_str = seconds_to_time(start_sec)
+            end_str = seconds_to_time(end_sec)
+            
+            # 检查是否已存在相同时间段（精确到毫秒）
+            if any(seg["start"] == start_str and seg["end"] == end_str for seg in self.segments):
+                skipped_count += 1
+                errors.append(f"重复片段: {start_str}->{end_str}，已跳过")
+                continue
+            
+            # 添加片段（翻转默认为“无”）
+            try:
+                if self.add_segment_with_time(start_sec, end_sec, flip="无"):
+                    parsed_count += 1
+                else:
+                    skipped_count += 1
+                    errors.append(f"无效时间: start={start_sec}, end={end_sec}")
+            except Exception as e:
+                skipped_count += 1
+                errors.append(f"添加片段异常: {e}")
+                self.app._append_info_ui(f"[分段] 导入异常: {e}")
+
+        msg = f"成功导入 {parsed_count} 个片段"
+        if skipped_count > 0:
+            msg += f"，{skipped_count} 行被跳过"
+            if errors:
+                messagebox.showwarning("导入警告", msg + "\n\n错误详情（前10条）：\n" + "\n".join(errors[:10]))
+            else:
+                messagebox.showinfo("导入完成", msg)
+        else:
+            messagebox.showinfo("导入完成", msg)
+
+    # ---------- 确定/取消 ----------
+    def on_ok(self):
+        self.result = self.segments
+        self.window.destroy()
+
+    def on_cancel(self):
+        self.result = None
+        self.window.destroy()
 
 # ================== 主入口 ==================
 if __name__ == "__main__":
