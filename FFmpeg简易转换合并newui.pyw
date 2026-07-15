@@ -4697,7 +4697,7 @@ class FFmpegBatchGUI:
 
 
 
-    # ---------- 修改 get_current_settings 包含水印 ----------
+
     def get_current_settings(self):
         settings = {}
         settings.update(self.video_encoder.get_settings())
@@ -4710,22 +4710,22 @@ class FFmpegBatchGUI:
         settings["custom_output_name"] = self.custom_output_name.get()
         settings["output_container"] = self.output_container.get()
         settings["pip_enabled"] = self.pip_enabled.get()
-        # 添加水印设置（深拷贝）
-        wm = copy.deepcopy(self.watermark_settings)
-        if "adaptive" not in wm:
-            wm["adaptive"] = False
-        settings["watermark"] = wm
-        # 记录当前输入文件的尺寸作为水印基准
-        input_file = self.input_file.get().strip()
-        if input_file and os.path.exists(input_file):
-            w, h = get_video_dimensions(self.ffprobe_cmd, input_file)
-            if w is not None and h is not None:
-                settings["watermark"]["base_width"] = w
-                settings["watermark"]["base_height"] = h
+#         # 添加水印设置（深拷贝）
+#         wm = copy.deepcopy(self.watermark_settings)
+#         if "adaptive" not in wm:
+#             wm["adaptive"] = False
+#         settings["watermark"] = wm
+#         # 记录当前输入文件的尺寸作为水印基准
+#         input_file = self.input_file.get().strip()
+#         if input_file and os.path.exists(input_file):
+#             w, h = get_video_dimensions(self.ffprobe_cmd, input_file)
+#             if w is not None and h is not None:
+#                 settings["watermark"]["base_width"] = w
+#                 settings["watermark"]["base_height"] = h
         settings["enhance"] = self.video_filter.get_enhance_settings()
         return settings
 
-    # ---------- 修改 load_settings_into_ui 恢复水印 ----------
+
     def load_settings_into_ui(self, settings):
         self._loading_preset = True
         try:
@@ -4739,12 +4739,12 @@ class FFmpegBatchGUI:
             self.trim_frame.set_settings(settings)
             self.adv_frame.set_settings(settings)
             self.pip_enabled.set(settings.get("pip_enabled", False))
-            # 恢复水印设置
-            if "watermark" in settings:
-                self.watermark_settings = copy.deepcopy(settings["watermark"])
-            else:
-                # 保持默认值（已在 __init__ 中定义）
-                pass
+#             # 恢复水印设置
+#             if "watermark" in settings:
+#                 self.watermark_settings = copy.deepcopy(settings["watermark"])
+#             else:
+#                 # 保持默认值（已在 __init__ 中定义）
+#                 pass
             self.toggle_only_audio_mode()
             if "enhance" in settings:
                 self.video_filter.set_enhance_settings(settings["enhance"])
@@ -6161,7 +6161,7 @@ class FFmpegBatchGUI:
 
             ttk.Label(
                 page_segment,
-                text="勾选启用后，视频将按片段列表裁剪并拼接，所有片段使用相同的全局编码/滤镜设置。\n"
+                text="勾选启用后，视频将按片段列表裁剪并拼接，所有片段使用相同的全局编码/滤镜设置。\n\n"
                      "   建议使用（mpv、PotPlayer）等播放器打开视频，定位到需要的起始/结束帧，将时间（格式如 01:23.456）填入左侧输入框。\n\n"
                      "   典型用途：简单混剪、去中间广告、提取精华片段等。",
                 foreground="grey",
@@ -8109,7 +8109,7 @@ class FFmpegBatchGUI:
         # 灰色说明（包含功能描述和时间码获取提示）
         ttk.Label(
             segment_tab,
-            text="勾选启用后，视频将按片段列表裁剪并拼接，所有片段使用相同的全局编码/滤镜设置。\n"
+            text="勾选启用后，视频将按片段列表裁剪并拼接，所有片段使用相同的全局编码/滤镜设置。\n\n"
                  "   建议使用（mpv、PotPlayer）等播放器打开视频，定位到需要的起始/结束帧，将时间（格式如 01:23.456）填入左侧输入框。ffplay 简易预览功能看不到时间。\n\n"
                  "   典型用途：简单混剪、去中间广告、提取精华片段等。",
             foreground="grey",
