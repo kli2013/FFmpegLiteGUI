@@ -3079,7 +3079,27 @@ class AdvancedFrame(ttk.LabelFrame):
             self.watermark_dict = watermark_dict
         else:
             self.watermark_dict = self.app.watermark_settings
+
+
+        self.wm_preset_var = tk.StringVar()
+        self.wm_templates = {}  # 缓存所有水印模板
+        # 获取主预设目录（与主预设 ffmpeg_presets.json 同目录）
+        if self.app and hasattr(self.app, 'preset_file_path'):
+            preset_dir = os.path.dirname(self.app.preset_file_path)
+        else:
+            # 极罕见情况：回退到用户目录
+            preset_dir = os.path.join(os.path.expanduser("~"), ".FFLiteGUI")
+        
+        # 确保目录存在
+        os.makedirs(preset_dir, exist_ok=True)
+        
+        self.wm_preset_file = os.path.join(preset_dir, "watermark_templates.json")
+        self._load_wm_templates()  # 加载现有模板
+
+
         self.create_widgets()
+
+
 
     def create_widgets(self):
         # 硬件解码
@@ -3103,7 +3123,7 @@ class AdvancedFrame(ttk.LabelFrame):
         custom_frame = ttk.Frame(self)
         custom_frame.pack(fill=tk.X, pady=5)
 
-        label = ttk.Label(custom_frame, text="自定义FFmpeg参数 (例如: -tune grain -profile:v high):")
+        label = ttk.Label(custom_frame, text="自定义FFmpeg参数 (追加到命令末尾，会覆盖界面生成的对应设置):")
         label.pack(anchor=tk.W)
         ToolTip(label, 
                 "可直接添加 FFmpeg 命令行参数，它们会追加到命令末尾。\n\n"
@@ -3169,6 +3189,27 @@ class AdvancedFrame(ttk.LabelFrame):
         # 绑定路径变化更新
         self.wm_path_var.trace_add("write", lambda *a: self._on_wm_path_changed())
 
+        # ---- 水印预设管理 ----
+        preset_row = ttk.Frame(self)
+        preset_row.pack(fill=tk.X, pady=2)
+        
+        ttk.Label(preset_row, text="水印预设:").pack(side=tk.LEFT, padx=(0,5))
+        self.wm_preset_combo = ttk.Combobox(
+            preset_row,
+            textvariable=self.wm_preset_var,
+            state="readonly",
+            width=20
+        )
+        self.wm_preset_combo.pack(side=tk.LEFT, padx=2)
+        # 绑定选择事件
+        self.wm_preset_combo.bind("<<ComboboxSelected>>", lambda e: self.load_wm_preset())
+        
+        ttk.Button(preset_row, text="保存模板", command=self.save_wm_preset).pack(side=tk.LEFT, padx=2)
+        ttk.Button(preset_row, text="删除模板", command=self.delete_wm_preset).pack(side=tk.LEFT, padx=2)
+        ttk.Button(preset_row, text="加载模板", command=self.load_wm_preset).pack(side=tk.LEFT, padx=2)
+        
+        # 刷新下拉列表
+        self._refresh_wm_preset_list()
 
 
 
@@ -3230,6 +3271,115 @@ class AdvancedFrame(ttk.LabelFrame):
         self._auto_detect_watermark_duration()
         if self.update_callback:
             self.update_callback()
+
+
+    def _get_wm_templates_path(self):
+        return self.wm_preset_file
+    
+    def _load_wm_templates(self):
+        """从 JSON 文件加载所有水印模板"""
+        if os.path.exists(self.wm_preset_file):
+            try:
+                with open(self.wm_preset_file, 'r', encoding='utf-8') as f:
+                    self.wm_templates = json.load(f)
+                if not isinstance(self.wm_templates, dict):
+                    self.wm_templates = {}
+            except:
+                self.wm_templates = {}
+        else:
+            self.wm_templates = {}
+    
+    def _save_wm_templates(self):
+        """将模板字典保存到 JSON 文件"""
+        try:
+            with open(self.wm_preset_file, 'w', encoding='utf-8') as f:
+                json.dump(self.wm_templates, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            messagebox.showerror("保存失败", f"无法保存水印模板: {e}")
+    
+    def _refresh_wm_preset_list(self):
+        """刷新下拉框列表"""
+        self._load_wm_templates()
+        names = list(self.wm_templates.keys())
+        self.wm_preset_combo['values'] = names
+        if names:
+            self.wm_preset_var.set(names[0])  # 默认选中第一个
+        else:
+            self.wm_preset_var.set("")
+
+    def save_wm_preset(self):
+        """保存当前水印设置为一个新模板"""
+        # 获取当前水印设置（深拷贝，避免引用问题）
+        current = copy.deepcopy(self.watermark_dict)
+        # 移除 file_path，避免路径失效
+        current.pop("file_path", None)
+        # 移除可能存在的基准尺寸，因为模板不应该绑定特定视频尺寸
+        current.pop("base_width", None)
+        current.pop("base_height", None)
+        
+        # 弹出对话框输入模板名称
+        name = simpledialog.askstring("保存水印模板", "请输入模板名称:", parent=self)
+        if not name:
+            return
+        
+        # 如果已存在同名，询问是否覆盖
+        if name in self.wm_templates:
+            if not messagebox.askyesno("覆盖确认", f'模板 "{name}" 已存在，是否覆盖？'):
+                return
+        
+        # 保存
+        self.wm_templates[name] = current
+        self._save_wm_templates()
+        self._refresh_wm_preset_list()
+        self.app._append_info_ui(f"✅ 水印模板 '{name}' 已保存")
+        messagebox.showinfo("成功", f'水印模板 "{name}" 已保存')
+    
+    def load_wm_preset(self):
+        """加载选中的模板到当前水印设置"""
+        name = self.wm_preset_var.get()
+        if not name:
+            messagebox.showinfo("提示", "请先选择一个水印模板")
+            return
+        
+        if name not in self.wm_templates:
+            messagebox.showerror("错误", f'模板 "{name}" 不存在')
+            return
+        
+        template = self.wm_templates[name]
+        # 更新当前水印设置（保留 file_path，避免覆盖已有文件路径）
+        # 但也要注意：如果模板中不包含 file_path，则保留当前文件路径
+        # 如果模板中包含 file_path，则使用模板的（但我们已经移除了，所以这里不会覆盖）
+        for key, value in template.items():
+            self.watermark_dict[key] = value
+        # 同步界面控件
+        self.wm_path_var.set(self.watermark_dict.get("file_path", ""))
+        if hasattr(self, 'adaptive_var'):
+            self.adaptive_var.set(self.watermark_dict.get("adaptive", False))
+        # 如果有其他界面控件需要同步，例如缩放、裁剪、绿幕等，需要进一步更新
+        # 但因为我们当前的水印设置界面只有文件路径、自适应、以及叠加设置按钮（打开独立编辑器）
+        # 所以只需更新路径和自适应，其他参数在编辑器中打开时会加载
+        # 为了完整，我们可以触发更新回调
+        if self.update_callback:
+            self.update_callback()
+        self.app._append_info_ui(f"✅ 已加载水印模板 '{name}'")
+        messagebox.showinfo("成功", f'水印模板 "{name}" 已加载')
+    
+    def delete_wm_preset(self):
+        """删除选中的模板"""
+        name = self.wm_preset_var.get()
+        if not name:
+            messagebox.showinfo("提示", "请先选择一个水印模板")
+            return
+        if not messagebox.askyesno("确认删除", f'确定要删除水印模板 "{name}" 吗？'):
+            return
+        if name in self.wm_templates:
+            del self.wm_templates[name]
+            self._save_wm_templates()
+            self._refresh_wm_preset_list()
+            self.app._append_info_ui(f"🗑️ 已删除水印模板 '{name}'")
+            messagebox.showinfo("成功", f'水印模板 "{name}" 已删除')
+        else:
+            messagebox.showerror("错误", f'模板 "{name}" 不存在')
 
 
     def get_settings(self):
@@ -4710,18 +4860,18 @@ class FFmpegBatchGUI:
         settings["custom_output_name"] = self.custom_output_name.get()
         settings["output_container"] = self.output_container.get()
         settings["pip_enabled"] = self.pip_enabled.get()
-#         # 添加水印设置（深拷贝）
-#         wm = copy.deepcopy(self.watermark_settings)
-#         if "adaptive" not in wm:
-#             wm["adaptive"] = False
-#         settings["watermark"] = wm
-#         # 记录当前输入文件的尺寸作为水印基准
-#         input_file = self.input_file.get().strip()
-#         if input_file and os.path.exists(input_file):
-#             w, h = get_video_dimensions(self.ffprobe_cmd, input_file)
-#             if w is not None and h is not None:
-#                 settings["watermark"]["base_width"] = w
-#                 settings["watermark"]["base_height"] = h
+        # 添加水印设置（深拷贝）
+        wm = copy.deepcopy(self.watermark_settings)
+        if "adaptive" not in wm:
+            wm["adaptive"] = False
+        settings["watermark"] = wm
+        # 记录当前输入文件的尺寸作为水印基准
+        input_file = self.input_file.get().strip()
+        if input_file and os.path.exists(input_file):
+            w, h = get_video_dimensions(self.ffprobe_cmd, input_file)
+            if w is not None and h is not None:
+                settings["watermark"]["base_width"] = w
+                settings["watermark"]["base_height"] = h
         settings["enhance"] = self.video_filter.get_enhance_settings()
         return settings
 
@@ -5534,6 +5684,12 @@ class FFmpegBatchGUI:
         if not preset_name: 
             return
         preset_settings = self.get_current_settings()
+
+        # ---- 移除水印设置（不保存到预设文件） ----
+        preset_settings.pop("watermark", None)
+        # ---- 移除分段拼接数据（如果您也不希望保存） ----
+        preset_settings.pop("segment_enabled", None)
+        preset_settings.pop("segments", None)
         self.preset_manager.save_preset(preset_name, preset_settings)
         self.load_preset_list()
         messagebox.showinfo("成功", f"预设“{preset_name}”已保存到:\n{self.preset_file_path}")
@@ -6188,12 +6344,10 @@ class FFmpegBatchGUI:
             task.settings["watermark"] = adv_frame.watermark_dict
             adv_frame.pack(fill=tk.X, padx=5, pady=5)
             adv_frame.set_settings(task.settings)
-            
-            # 隐藏 AdvancedFrame 自带的水印按钮（它只应出现在主界面）
-            if hasattr(adv_frame, 'watermark_btn'):
-                adv_frame.watermark_btn.pack_forget()
-            
-            # 水印编辑按钮（在高级选项旁边）
+
+
+
+            # 水印编辑按钮新命令
             def open_task_watermark():
                 task_watermark = task.settings.get("watermark", {})
                 if not task_watermark.get("file_path"):
@@ -6220,8 +6374,10 @@ class FFmpegBatchGUI:
                     parent=win,
                     track_obj=None
                 )
-            wm_btn = ttk.Button(page_adv, text="编辑当前任务水印设置", command=open_task_watermark)
-            wm_btn.pack(pady=5)
+            # 替换 水印按钮的命令
+            if hasattr(adv_frame, 'watermark_btn'):
+                adv_frame.watermark_btn.config(command=open_task_watermark)
+            
 
             # ---- 命令预览区和 update_preview 函数 ----
             preview_frame = ttk.LabelFrame(win, text="新命令预览", padding="5")
@@ -6349,6 +6505,8 @@ class FFmpegBatchGUI:
             btn_frame.pack(pady=10)
             ttk.Button(btn_frame, text="保存修改", command=save_changes).pack(side=tk.LEFT, padx=5)
             ttk.Button(btn_frame, text="取消", command=win.destroy).pack(side=tk.LEFT, padx=5)
+
+
             win.wait_window()
 
     def _on_task_watermark_saved(self, task, new_wm):
