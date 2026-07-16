@@ -4860,6 +4860,8 @@ class FFmpegBatchGUI:
         settings["custom_output_name"] = self.custom_output_name.get()
         settings["output_container"] = self.output_container.get()
         settings["pip_enabled"] = self.pip_enabled.get()
+        settings["segment_enabled"] = self.segment_enabled.get()
+        settings["segments"] = copy.deepcopy(self.segments)
         # 添加水印设置（深拷贝）
         wm = copy.deepcopy(self.watermark_settings)
         if "adaptive" not in wm:
