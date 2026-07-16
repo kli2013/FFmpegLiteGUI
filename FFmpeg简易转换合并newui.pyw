@@ -5692,6 +5692,11 @@ class FFmpegBatchGUI:
         # ---- 移除分段拼接数据（如果您也不希望保存） ----
         preset_settings.pop("segment_enabled", None)
         preset_settings.pop("segments", None)
+        # ---- 移除普通截取参数 ----
+        preset_settings.pop("trim_enabled", None)
+        preset_settings.pop("trim_start", None)
+        preset_settings.pop("trim_end", None)
+        preset_settings.pop("precise_trim", None)
         self.preset_manager.save_preset(preset_name, preset_settings)
         self.load_preset_list()
         messagebox.showinfo("成功", f"预设“{preset_name}”已保存到:\n{self.preset_file_path}")
