@@ -7157,7 +7157,7 @@ class FFmpegBatchGUI:
 
 
 
-    def _build_concat_cmd(self, enabled_tracks, output_norm):
+    def _build_concat_cmd(self, enabled_tracks, output_norm, preview=False):
         """
         生成串行合并（Concat）命令。
         支持两种模式：
@@ -7181,43 +7181,46 @@ class FFmpegBatchGUI:
         cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
 
         if use_copy_mode:
-            return self._build_concat_copy_mode(cmd, video_tracks, audio_tracks, output_norm)
+            return self._build_concat_copy_mode(cmd, video_tracks, audio_tracks, output_norm, preview=preview)
         else:
             return self._build_concat_reencode_mode(cmd, video_tracks, audio_tracks, main_video, output_norm)
 
 
-    def _build_concat_copy_mode(self, cmd, video_tracks, audio_tracks, output_norm):
+    def _build_concat_copy_mode(self, cmd, video_tracks, audio_tracks, output_norm, preview=False):
         """流复制模式 - 使用 concat demuxer（最高性能）"""
         import tempfile
-
-        # 创建临时 concat 文件列表
-        fd, list_path = tempfile.mkstemp(suffix='.txt', prefix='concat_', text=True)
-        try:
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                for track in video_tracks:
-                    safe_path = normalize_path(track.file_path).replace("'", "'\\''")
-                    f.write(f"file '{safe_path}'\n")
-        except Exception as e:
-            self._append_info_ui(f"[串联] 生成文件列表失败: {e}")
-            os.close(fd) if 'fd' in locals() else None
-            return []
-
-        # 保存临时文件路径，方便后续清理
-        if not hasattr(self, '_temp_concat_lists'):
-            self._temp_concat_lists = []
-        self._temp_concat_lists.append(list_path)
-
+    
+        if preview:
+            # 预览模式：使用占位符，不创建实际文件
+            list_path = "concat_random.txt"
+            self._append_info_ui("[串联] 流复制模式预览命令，txt使用占位符文件名，开始合并时随机生成")
+        else:
+            # 实际执行：创建临时文件
+            fd, list_path = tempfile.mkstemp(suffix='.txt', prefix='concat_', text=True)
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    for track in video_tracks:
+                        safe_path = normalize_path(track.file_path).replace("'", "'\\''")
+                        f.write(f"file '{safe_path}'\n")
+            except Exception as e:
+                self._append_info_ui(f"[串联] 生成文件列表失败: {e}")
+                os.close(fd) if 'fd' in locals() else None
+                return []
+            # 存储真实路径以便后续清理
+            if not hasattr(self, '_temp_concat_lists'):
+                self._temp_concat_lists = []
+            self._temp_concat_lists.append(list_path)
+    
         cmd.extend(["-f", "concat", "-safe", "0", "-i", list_path])
         cmd.extend(["-c:v", "copy"])
-
         if audio_tracks:
             cmd.extend(["-c:a", "copy"])
         else:
             cmd.append("-an")
-
+    
         self._add_container_optimization(cmd)
         cmd.append(output_norm)
-
+    
         self._append_info_ui("[串联] 使用流复制模式（concat demuxer）")
         return cmd
 
@@ -7287,7 +7290,7 @@ class FFmpegBatchGUI:
         self._append_info_ui(f"[串联] 使用 filter_complex 重新编码模式（{n} 个片段）")
         return cmd
     
-    def merge_build_cmd_list(self, output_override=None) -> List[str]:
+    def merge_build_cmd_list(self, output_override=None, preview=False) -> List[str]:
         if not self.ffmpeg_cmd:
             self._append_info_ui("未找到 ffmpeg，无法生成合并命令。")
             return []
@@ -7308,7 +7311,7 @@ class FFmpegBatchGUI:
         if self.pip_enabled.get():
             return self._build_pip_cmd(enabled_tracks, output_norm)
         elif self.concat_enabled.get():
-            return self._build_concat_cmd(enabled_tracks, output_norm)
+            return self._build_concat_cmd(enabled_tracks, output_norm, preview=preview)
         else:
             return self._build_normal_cmd(enabled_tracks, output_norm)
     
@@ -7321,7 +7324,7 @@ class FFmpegBatchGUI:
 
 
     def merge_update_command_preview(self, output_override=None):
-        cmd_list = self.merge_build_cmd_list(output_override=output_override)
+        cmd_list = self.merge_build_cmd_list(output_override=output_override, preview=True)
         if not cmd_list:
             self.merge_cmd_preview.delete(1.0, tk.END)
             self.merge_cmd_preview.insert(tk.END, "参数不完整，无法生成命令")
@@ -7585,6 +7588,23 @@ class FFmpegBatchGUI:
 
             if "enhance" in initial_settings:
                 filt_frame.set_enhance_settings(initial_settings["enhance"])
+
+            def on_encoder_changed(*args):
+                if enc_frame.vcodec.get() == "copy":
+                    # 直接禁用所有滤镜（无需新增方法）
+                    filt_frame.scale_enabled.set(False)
+                    filt_frame.crop_enabled.set(False)
+                    filt_frame.rotate.set("none")
+                    filt_frame.vflip.set(False)
+                    filt_frame.hflip.set(False)
+                    filt_frame.speed_enabled.set(False)
+                    filt_frame.deinterlace_filter.set("none")
+                    filt_frame.pix_fmt_enabled.set(False)
+                    filt_frame.subtitle_enabled.set(False)
+                    # 如果还需要禁用增强，可以调用 filt_frame.set_enhance_settings({})，但建议保留用户自定义
+                    self._append_info_ui("[设置] 编码器切换为 copy，已自动取消大部分视频滤镜")
+            
+            enc_frame.vcodec.trace_add("write", on_encoder_changed)
 
             # ---- 页面3：截取片段 ----
             page_trim = ttk.Frame(notebook)
@@ -7990,14 +8010,12 @@ class FFmpegBatchGUI:
         if not self._check_pip_video_encoders():
             return
     
-        # ---- 处理冲突（不修改界面） ----
         output = self.merge_output.get().strip()
         final_output = self._resolve_path_conflict(output, show_dialog=True)
-        # 更新命令预览区显示最终路径（但不修改 self.merge_output）
-        self.merge_update_command_preview(output_override=final_output)
+        self.merge_update_command_preview(output_override=final_output)  # 这个调用可能仍是预览模式，可保留或删除
     
-        # 生成命令（传入最终路径）
-        cmd_list = self.merge_build_cmd_list(output_override=final_output)
+        # 生成实际执行的命令（preview=False）
+        cmd_list = self.merge_build_cmd_list(output_override=final_output, preview=False)
         if not cmd_list:
             self._append_info_ui("[封装] 无法生成命令，请检查设置")
             return
