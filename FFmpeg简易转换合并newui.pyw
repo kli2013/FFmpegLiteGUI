@@ -3563,6 +3563,7 @@ class FFmpegBatchGUI:
         self.overwrite_policy = tk.StringVar(value='ask')    # 可选值: 'ask', 'rename', 'overwrite'
         self._loading_preset = False      # 加载预设标志
         self._updating_preview = False    # 防重入锁标志
+        self._batch_update = False        # 批量更新模式标志，用于抑制多次预览刷新
 
         self.segment_enabled = tk.BooleanVar(value=False)
         self.segments = []
@@ -6568,9 +6569,11 @@ class FFmpegBatchGUI:
                 "  - 像素格式（如 yuv420p）、采样纵横比（SAR）、时间基（timebase）\n"
                 "• 若参数不一致，可能出现：\n"
                 "  - 拼接处播放速度异常（过快/过慢）\n"
-                "  - 音画不同步\n"
-                "  - 画面花屏或卡顿\n"
-                "  - 部分播放器无法正常播放\n"
+                "  - 音画不同步、画面花屏或卡顿、部分播放器无法正常播放\n"
+                "• 适合流复制模式的常见情况：\n"
+                "  - 同一设备或软件连续录制的分段文件（如 GoPro、行车记录仪）\n"
+                "  - 同一来源压制、参数相同的剧集或系列视频\n"
+                "  - 同一个视频文件的循环拼接（如片头/背景）\n"
                 "• 建议：若不确定文件参数是否一致，或者串接后不满意，请使用【重新编码模式】。\n\n"
                 "【重新编码模式（编码器 ≠ copy）】\n"
                 "• 系统会对所有视频进行重新编码，强制统一参数，拼接后播放流畅。\n"
@@ -6735,9 +6738,15 @@ class FFmpegBatchGUI:
             for s_audio in audio_streams:
                 audio_track = Track(s_audio["index"], "audio", s_audio.get("codec_name", "unknown"), path, True)
                 self.merge_tracks.append(audio_track)
-        self.merge_update_track_list()
-        self.merge_auto_recommend_container()
-        self.merge_update_command_preview()
+        self._batch_update = True
+        try:
+            self.merge_update_track_list()
+            self.merge_auto_recommend_container()
+            self.merge_update_output_preview()
+        finally:
+            self._batch_update = False
+            self.merge_update_command_preview()  # 统一刷新一次
+ #       self._append_info_ui(f"[封装] 已添加画中画视频或图片水印: {os.path.basename(path)}")
 
     def merge_add_external_video(self):
         if self.concat_enabled.get():
@@ -6774,9 +6783,15 @@ class FFmpegBatchGUI:
             for s_audio in audio_streams:
                 audio_track = Track(s_audio["index"], "audio", s_audio.get("codec_name", "unknown"), path, True)
                 self.merge_tracks.append(audio_track)
-        self.merge_update_track_list()
-        self.merge_auto_recommend_container()
-        self.merge_update_command_preview()
+        self._batch_update = True
+        try:
+            self.merge_update_track_list()
+            self.merge_auto_recommend_container()
+            self.merge_update_output_preview()
+        finally:
+            self._batch_update = False
+            self.merge_update_command_preview()  # 统一刷新一次
+ #       self._append_info_ui(f"[封装] 已添加画中画视频或图片水印: {os.path.basename(path)}")
 
 
     def browse_chapter_file(self):
@@ -7025,62 +7040,58 @@ class FFmpegBatchGUI:
 
 
     def _build_normal_cmd(self, enabled_tracks, output_norm):
-        """普通封装模式"""
+        """普通封装模式：支持视频滤镜、多音频/字幕、音频截取等。"""
         cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
-
+    
         input_files, file_index = self._prepare_tracks_and_inputs(enabled_tracks)
-
+    
         # 识别主视频
         video_tracks = [t for t in enabled_tracks if t.type == "video"]
         if not video_tracks:
             self._append_info_ui("[封装] 没有启用的视频轨道")
             return []
         main_video = video_tracks[0]
-
-        # 添加输入文件 + 前置选项
+    
+        # 添加输入文件 + 前置选项（-ss/-to）
         cmd = self._add_input_options(cmd, input_files, main_video)
-
+    
         # ---- 视频处理 ----
         v_idx = file_index[main_video.file_path]
         cmd.extend(["-map", f"{v_idx}:v:{main_video._type_index}"])
-
+    
         v_settings = main_video.enc_settings
         vcodec = v_settings.get("encoder", "copy")
-
-        video_filters = build_video_filter_chain(
-            v_settings,
-            include_subtitle=False,
-            include_speed=False,
-            enhance_settings=v_settings.get("enhance", {})
-        )
-        has_filters = video_filters and video_filters != "null"
-
-        if has_filters and vcodec == "copy":
-            self._append_info_ui("[封装] 警告：主视频启用了滤镜，但编码器设为「copy」。自动改为 libx265。")
-            vcodec = "libx265"
-            v_settings["encoder"] = "libx265"
-
-        if has_filters:
-            cmd.extend(["-vf", video_filters])
-
+    
+        # copy 时直接跳过滤镜，不强制改编码器
         if vcodec == "copy":
+            self._append_info_ui("[封装] 编码器为 copy，已忽略所有视频滤镜。")
             cmd.extend(["-c:v", "copy"])
         else:
+            # 构建视频滤镜
+            video_filters = build_video_filter_chain(
+                v_settings,
+                include_subtitle=False,
+                include_speed=False,
+                enhance_settings=v_settings.get("enhance", {})
+            )
+            if video_filters and video_filters != "null":
+                cmd.extend(["-vf", video_filters])
+    
+            # 应用编码参数
             strategy = get_encoder_strategy(vcodec)
             cmd = strategy.build_params(cmd, v_settings)
-
-        # ---- 音频处理 ----
+    
+        # ---- 音频处理（支持截取） ----
         audio_tracks = [t for t in enabled_tracks if t.type == "audio"]
         audio_map_count = 0
         for audio in audio_tracks:
             a_idx = file_index[audio.file_path]
             cmd.extend(["-map", f"{a_idx}:a:{audio._type_index}"])
-
+    
             if self._handle_audio_trim(cmd, audio, audio_map_count):
                 audio_map_count += 1
                 continue
-
-            # 正常音频编码
+    
             enc = audio.enc_settings.get("encoder", "copy")
             if enc == "copy":
                 cmd.extend([f"-c:a:{audio_map_count}", "copy"])
@@ -7093,16 +7104,16 @@ class FFmpegBatchGUI:
                     f"-ar:a:{audio_map_count}", samplerate
                 ])
             audio_map_count += 1
-
+    
         if audio_map_count == 0:
             cmd.append("-an")
         else:
             cmd.extend(["-disposition:a:0", "default"])
-
-        # ---- 字幕、章节、容器优化等后续处理 ----
+    
+        # ---- 字幕、章节、容器优化 ----
         self._add_subtitles_and_chapters(cmd, enabled_tracks, file_index, input_files)
         self._add_container_optimization(cmd)
-
+    
         cmd.append(output_norm)
         return cmd
 
@@ -7193,7 +7204,7 @@ class FFmpegBatchGUI:
         if preview:
             # 预览模式：使用占位符，不创建实际文件
             list_path = "concat_random.txt"
-            self._append_info_ui("[串联] 流复制模式预览命令，txt使用占位符文件名，开始合并时随机生成")
+            self._append_info_ui("[串联-流] 预览命令，txt列表使用占位名，开始合并时随机生成")
         else:
             # 实际执行：创建临时文件
             fd, list_path = tempfile.mkstemp(suffix='.txt', prefix='concat_', text=True)
@@ -7203,7 +7214,7 @@ class FFmpegBatchGUI:
                         safe_path = normalize_path(track.file_path).replace("'", "'\\''")
                         f.write(f"file '{safe_path}'\n")
             except Exception as e:
-                self._append_info_ui(f"[串联] 生成文件列表失败: {e}")
+                self._append_info_ui(f"[串联-流] 生成文件列表失败: {e}")
                 os.close(fd) if 'fd' in locals() else None
                 return []
             # 存储真实路径以便后续清理
@@ -7221,7 +7232,7 @@ class FFmpegBatchGUI:
         self._add_container_optimization(cmd)
         cmd.append(output_norm)
     
-        self._append_info_ui("[串联] 使用流复制模式（concat demuxer）")
+        self._append_info_ui("[串联-流] 使用流复制模式（concat demuxer）")
         return cmd
 
 
@@ -7263,7 +7274,7 @@ class FFmpegBatchGUI:
         v_settings = main_video.enc_settings.copy()  # 避免修改原字典
         vcodec = v_settings.get("encoder", "libx265")
         if vcodec == "copy":
-            self._append_info_ui("[串联] 重新编码模式下视频编码器自动改为 libx265")
+            self._append_info_ui("[串联-编] 重新编码模式下视频编码器自动改为 libx265")
             vcodec = "libx265"
             v_settings["encoder"] = "libx265"
 
@@ -7276,7 +7287,7 @@ class FFmpegBatchGUI:
             enc = a_settings.get("encoder", "aac")
             if enc == "copy":
                 enc = "aac"
-                self._append_info_ui("[串联] 重新编码模式下音频自动从 copy 改为 aac")
+                self._append_info_ui("[串联-编] 重新编码模式下音频自动从 copy 改为 aac")
 
             cmd.extend([
                 "-c:a", enc,
@@ -7287,7 +7298,7 @@ class FFmpegBatchGUI:
         self._add_container_optimization(cmd)
         cmd.append(output_norm)
 
-        self._append_info_ui(f"[串联] 使用 filter_complex 重新编码模式（{n} 个片段）")
+        self._append_info_ui(f"[串联-编] 使用 filter_complex 重新编码模式（{n} 个片段）")
         return cmd
     
     def merge_build_cmd_list(self, output_override=None, preview=False) -> List[str]:
@@ -7324,6 +7335,8 @@ class FFmpegBatchGUI:
 
 
     def merge_update_command_preview(self, output_override=None):
+        if self._batch_update:
+            return
         cmd_list = self.merge_build_cmd_list(output_override=output_override, preview=True)
         if not cmd_list:
             self.merge_cmd_preview.delete(1.0, tk.END)
@@ -7343,30 +7356,37 @@ class FFmpegBatchGUI:
             self.merge_update_track_list()
             self.merge_update_output_preview()
             return
-        ext = os.path.splitext(path)[1].lower().lstrip('.')
-        self.original_container = ext if ext in ['mp4', 'mkv', 'mov', 'avi', 'webm'] else 'mp4'
-        info = ffprobe_json(self.ffprobe_cmd, path)
-        if not info:
-            self._append_info_ui(f"[封装] 无法解析媒体信息: {path}，可能 ffprobe 失败")
+    
+        self._batch_update = True
+        try:
+            ext = os.path.splitext(path)[1].lower().lstrip('.')
+            self.original_container = ext if ext in ['mp4', 'mkv', 'mov', 'avi', 'webm'] else 'mp4'
+            info = ffprobe_json(self.ffprobe_cmd, path)
+            if not info:
+                self._append_info_ui(f"[封装] 无法解析媒体信息: {path}，可能 ffprobe 失败")
+                self.merge_tracks = []
+                self.merge_update_track_list()
+                self.merge_update_output_preview()
+                return
+            streams = info.get("streams", [])
+            if not streams:
+                self._append_info_ui(f"[封装] {path} 中没有发现任何流")
+                return
             self.merge_tracks = []
+            for s in streams:
+                st = s.get("codec_type")
+                if st not in ("video","audio","subtitle"):
+                    continue
+                track = Track(s["index"], st, s.get("codec_name", "unknown"), path, True)
+                self.merge_tracks.append(track)
+            if not self.merge_tracks:
+                self._append_info_ui(f"[封装] {path} 中未找到视频/音频/字幕轨道")
             self.merge_update_track_list()
-            return
-        streams = info.get("streams", [])
-        if not streams:
-            self._append_info_ui(f"[封装] {path} 中没有发现任何流")
-            return
-        self.merge_tracks = []
-        for s in streams:
-            st = s.get("codec_type")
-            if st not in ("video","audio","subtitle"):
-                continue
-            track = Track(s["index"], st, s.get("codec_name", "unknown"), path, True)
-            self.merge_tracks.append(track)
-        if not self.merge_tracks:
-            self._append_info_ui(f"[封装] {path} 中未找到视频/音频/字幕轨道")
-        self.merge_update_track_list()
-        self.merge_auto_recommend_container()
-        self.merge_update_output_preview()
+            self.merge_auto_recommend_container()
+            self.merge_update_output_preview()
+        finally:
+            self._batch_update = False
+            self.merge_update_command_preview()  # 最终统一刷新一次
 
     def merge_update_track_list(self):
         for w in self.merge_track_frame.winfo_children():
@@ -7589,22 +7609,6 @@ class FFmpegBatchGUI:
             if "enhance" in initial_settings:
                 filt_frame.set_enhance_settings(initial_settings["enhance"])
 
-            def on_encoder_changed(*args):
-                if enc_frame.vcodec.get() == "copy":
-                    # 直接禁用所有滤镜（无需新增方法）
-                    filt_frame.scale_enabled.set(False)
-                    filt_frame.crop_enabled.set(False)
-                    filt_frame.rotate.set("none")
-                    filt_frame.vflip.set(False)
-                    filt_frame.hflip.set(False)
-                    filt_frame.speed_enabled.set(False)
-                    filt_frame.deinterlace_filter.set("none")
-                    filt_frame.pix_fmt_enabled.set(False)
-                    filt_frame.subtitle_enabled.set(False)
-                    # 如果还需要禁用增强，可以调用 filt_frame.set_enhance_settings({})，但建议保留用户自定义
-                    self._append_info_ui("[设置] 编码器切换为 copy，已自动取消大部分视频滤镜")
-            
-            enc_frame.vcodec.trace_add("write", on_encoder_changed)
 
             # ---- 页面3：截取片段 ----
             page_trim = ttk.Frame(notebook)
@@ -7937,7 +7941,7 @@ class FFmpegBatchGUI:
         if self.merge_container.get() != rec:
             self.merge_container.set(rec)
             self._append_info_ui(f"[封装] 自动推荐容器: {rec.upper()}")
-            self.merge_update_output_preview()
+   #         self.merge_update_output_preview()
 
     def merge_add_external(self, ftype, path=None):
         if not self.merge_video.get():
