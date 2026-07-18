@@ -6675,28 +6675,21 @@ class FFmpegBatchGUI:
         self.merge_update_command_preview()
         self.merge_update_track_list()
 
-    def _add_pip_video(self):
-        path = filedialog.askopenfilename(
-            title="选择视频或图片文件（画中画）",
-            filetypes = [
-                ("媒体文件", "*.mp4 *.mkv *.avi *.mov *.flv *.webm *.png *.jpg *.jpeg *.bmp *.gif *.webp"),
-                ("视频文件", "*.mp4 *.mkv *.avi *.mov *.flv *.webm"),
-                ("图片文件", "*.png *.jpg *.jpeg *.bmp *.gif *.webp")
-            ]
-        )
-        if not path:
-            return
+    def _add_pip_video_forced(self, path, add_audio=True):
+        """
+        强制添加视频作为画中画（不弹出询问对话框）。
+        - add_audio: 是否同时添加该文件的所有音频流
+        """
         info = ffprobe_json(self.ffprobe_cmd, path)
         if not info:
             self._append_info_ui(f"[封装] 无法解析文件: {path}")
             return
     
-        # ---- 检测是否为图片 ----
+        # 检测是否为图片
         img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
         is_image = os.path.splitext(path)[1].lower() in img_exts
     
         if is_image:
-            # 图片水印：直接创建轨道，编码为 image2
             track = Track(0, "video", "image2", path, True)
             track.enc_settings["scale_enabled"] = True
             track.enc_settings["scale_width"] = "320"
@@ -6708,20 +6701,17 @@ class FFmpegBatchGUI:
             track.overlay_enabled = True
             self.merge_tracks.append(track)
             self._append_info_ui(f"[封装] 已添加图片水印: {os.path.basename(path)}")
-            # 图片没有音频，直接更新列表
-            self.merge_update_track_list()
-            self.merge_auto_recommend_container()
-            self.merge_update_command_preview()
             return
     
-        # ---- 视频处理逻辑 ----
+        # 视频处理
         video_streams = [s for s in info["streams"] if s.get("codec_type") == "video"]
         if not video_streams:
             self._append_info_ui("[封装] 所选文件不包含视频流")
             return
+    
+        # 添加视频轨道
         s = video_streams[0]
         track = Track(s["index"], "video", s.get("codec_name", "unknown"), path, True)
-        # 设置画中画相关属性
         track.enc_settings["scale_enabled"] = True
         track.enc_settings["scale_width"] = "320"
         track.enc_settings["scale_height"] = ""
@@ -6732,21 +6722,143 @@ class FFmpegBatchGUI:
         track.overlay_enabled = True
         self.merge_tracks.append(track)
         self._append_info_ui(f"[封装] 已添加画中画视频: {os.path.basename(path)}")
-        # 询问是否添加音频流（可选）
-        audio_streams = [s for s in info["streams"] if s.get("codec_type") == "audio"]
-        if audio_streams and messagebox.askyesno("添加音频", f"是否同时将文件中的音频流添加为独立音轨？\n{os.path.basename(path)}"):
+    
+        # 添加音频（如果 add_audio 为 True）
+        if add_audio:
+            audio_streams = [s for s in info["streams"] if s.get("codec_type") == "audio"]
             for s_audio in audio_streams:
                 audio_track = Track(s_audio["index"], "audio", s_audio.get("codec_name", "unknown"), path, True)
                 self.merge_tracks.append(audio_track)
-        self._batch_update = True
-        try:
-            self.merge_update_track_list()
-            self.merge_auto_recommend_container()
-            self.merge_update_output_preview()
-        finally:
-            self._batch_update = False
-            self.merge_update_command_preview()  # 统一刷新一次
- #       self._append_info_ui(f"[封装] 已添加画中画视频或图片水印: {os.path.basename(path)}")
+                self._append_info_ui(f"[封装] 已添加音频流: {s_audio.get('codec_name', 'unknown')}")
+    
+    
+    def _add_concat_video_forced(self, path):
+        """
+        强制添加视频作为串联片段（不弹出询问对话框，自动添加所有音频和字幕流）
+        """
+        info = ffprobe_json(self.ffprobe_cmd, path)
+        if not info:
+            self._append_info_ui(f"[封装] 无法解析文件: {path}")
+            return
+    
+        # 添加所有视频流（通常只有一个）
+        video_streams = [s for s in info["streams"] if s.get("codec_type") == "video"]
+        for s in video_streams:
+            track = Track(s["index"], "video", s.get("codec_name", "unknown"), path, True)
+            # 串联模式不需要 overlay 属性
+            self.merge_tracks.append(track)
+            self._append_info_ui(f"[封装] 已添加串联视频流: {os.path.basename(path)}")
+    
+        # 添加所有音频流
+        audio_streams = [s for s in info["streams"] if s.get("codec_type") == "audio"]
+        for s_audio in audio_streams:
+            audio_track = Track(s_audio["index"], "audio", s_audio.get("codec_name", "unknown"), path, True)
+            self.merge_tracks.append(audio_track)
+            self._append_info_ui(f"[封装] 已添加音频流: {s_audio.get('codec_name', 'unknown')}")
+    
+        # 添加所有字幕流
+        subtitle_streams = [s for s in info["streams"] if s.get("codec_type") == "subtitle"]
+        for s_sub in subtitle_streams:
+            sub_track = Track(s_sub["index"], "subtitle", s_sub.get("codec_name", "unknown"), path, True)
+            self.merge_tracks.append(sub_track)
+            self._append_info_ui(f"[封装] 已添加字幕流: {s_sub.get('codec_name', 'unknown')}")
+    
+    
+    def _handle_drop_pip_mode(self, files):
+        """
+        画中画模式下的拖拽处理（支持单个或多个文件）
+        - 视频：询问是否添加音频（批量时一次询问）
+        - 图片：直接添加为图片水印
+        - 音频：直接添加为独立音轨
+        """
+        if not files:
+            return
+    
+        # 分离文件类型
+        video_files = []
+        audio_files = []
+        image_files = []
+        other_files = []
+        video_exts = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.ts', '.webm')
+        img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
+        audio_exts = ('.mp3', '.aac', '.m4a', '.wav', '.flac', '.ogg', '.opus', '.ac3', '.dts')
+    
+        for f in files:
+            ext = os.path.splitext(f)[1].lower()
+            if ext in video_exts:
+                video_files.append(f)
+            elif ext in img_exts:
+                image_files.append(f)
+            elif ext in audio_exts:
+                audio_files.append(f)
+            else:
+                other_files.append(f)
+    
+        # 处理图片（直接添加）
+        for img in image_files:
+            self._add_pip_video_forced(img, add_audio=False)  # 图片无音频
+    
+        # 处理音频（直接添加为外部音轨）
+        for audio in audio_files:
+            self.merge_add_external("audio", audio)
+    
+        # 处理视频（询问是否添加音频）
+        if video_files:
+            # 批量时只询问一次
+            if len(video_files) > 1:
+                add_audio = messagebox.askyesno(
+                    "添加音频",
+                    f"是否同时添加这 {len(video_files)} 个视频文件的音频流？\n选“是”将添加所有音频流，选“否”仅添加视频作为水印。"
+                )
+            else:
+                add_audio = messagebox.askyesno(
+                    "添加音频",
+                    f"是否同时添加文件「{os.path.basename(video_files[0])}」的音频流？\n选“是”将添加音频，选“否”仅添加视频作为水印。"
+                )
+    
+            for video in video_files:
+                self._add_pip_video_forced(video, add_audio=add_audio)
+    
+        # 其他文件提示
+        if other_files:
+            self._append_info_ui(f"[拖拽] 忽略不支持的文件类型: {', '.join(os.path.basename(f) for f in other_files)}")
+    
+        # 最后统一更新界面
+        self.merge_update_track_list()
+        self.merge_auto_recommend_container()
+        self.merge_update_output_preview()
+    
+    def _handle_drop_concat_mode(self, files):
+        """
+        串行合并模式下的拖拽处理（不询问，直接添加所有视频/音频/字幕）
+        - 视频：添加所有视频流、音频流、字幕流
+        - 音频：直接添加为独立音轨（虽然串行合并主要用视频自带的音频，但用户可以手动调整）
+        - 字幕：直接添加为独立字幕轨
+        """
+        if not files:
+            return
+    
+        video_exts = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.ts', '.webm')
+        audio_exts = ('.mp3', '.aac', '.m4a', '.wav', '.flac', '.ogg', '.opus', '.ac3', '.dts')
+        subtitle_exts = ('.srt', '.ass', '.ssa', '.vtt', '.idx', '.sup')
+    
+        for f in files:
+            ext = os.path.splitext(f)[1].lower()
+            if ext in video_exts:
+                self._add_concat_video_forced(f)  # 自动添加所有流
+            elif ext in audio_exts:
+                self.merge_add_external("audio", f)
+            elif ext in subtitle_exts:
+                self.merge_add_external("subtitle", f)
+            else:
+                self._append_info_ui(f"[拖拽] 忽略不支持的文件: {os.path.basename(f)}")
+    
+        self.merge_update_track_list()
+        self.merge_auto_recommend_container()
+        self.merge_update_output_preview()
+
+
+
 
     def merge_add_external_video(self):
         if self.concat_enabled.get():
@@ -6757,32 +6869,41 @@ class FFmpegBatchGUI:
             messagebox.showinfo("提示", "请先勾选「串行合并」或「启用画中画」")
 
 
-    def _add_concat_video(self):
+    def _add_pip_video(self):
         path = filedialog.askopenfilename(
-            title="选择视频文件（串联）",
-            filetypes=[("媒体文件", "*.mp4 *.mkv *.avi *.mov *.flv *.webm")]
+            title="选择视频或图片文件（画中画）",
+            filetypes=[
+                ("媒体文件", "*.mp4 *.mkv *.avi *.mov *.flv *.webm *.png *.jpg *.jpeg *.bmp *.gif *.webp"),
+                ("视频文件", "*.mp4 *.mkv *.avi *.mov *.flv *.webm"),
+                ("图片文件", "*.png *.jpg *.jpeg *.bmp *.gif *.webp")
+            ]
         )
         if not path:
             return
+    
         info = ffprobe_json(self.ffprobe_cmd, path)
         if not info:
             self._append_info_ui(f"[封装] 无法解析文件: {path}")
             return
-        video_streams = [s for s in info["streams"] if s.get("codec_type") == "video"]
-        if not video_streams:
-            self._append_info_ui("[封装] 所选文件不包含视频流")
-            return
-        s = video_streams[0]
-        # 创建轨道，不设置 overlay 属性（默认 False）
-        track = Track(s["index"], "video", s.get("codec_name", "unknown"), path, True)
-        self.merge_tracks.append(track)
-        self._append_info_ui(f"[封装] 已添加串联视频: {os.path.basename(path)}")
-        # 询问是否添加音频流（可选）
-        audio_streams = [s for s in info["streams"] if s.get("codec_type") == "audio"]
-        if audio_streams and messagebox.askyesno("添加音频", f"是否同时将文件中的音频流添加为独立音轨？\n{os.path.basename(path)}"):
-            for s_audio in audio_streams:
-                audio_track = Track(s_audio["index"], "audio", s_audio.get("codec_name", "unknown"), path, True)
-                self.merge_tracks.append(audio_track)
+    
+        # 检测是否为图片
+        img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
+        is_image = os.path.splitext(path)[1].lower() in img_exts
+    
+        if is_image:
+            # 图片直接添加（无音频）
+            self._add_pip_video_forced(path, add_audio=False)
+            self._append_info_ui(f"[封装] 已添加图片水印: {os.path.basename(path)}")
+        else:
+            # 视频：询问是否添加音频
+            add_audio = messagebox.askyesno(
+                "添加音频",
+                f"是否同时添加文件「{os.path.basename(path)}」的音频流？\n选“是”将添加音频，选“否”仅添加视频作为水印。"
+            )
+            self._add_pip_video_forced(path, add_audio=add_audio)
+            self._append_info_ui(f"[封装] 已添加画中画视频: {os.path.basename(path)}")
+    
+        # 统一更新界面
         self._batch_update = True
         try:
             self.merge_update_track_list()
@@ -6790,8 +6911,36 @@ class FFmpegBatchGUI:
             self.merge_update_output_preview()
         finally:
             self._batch_update = False
-            self.merge_update_command_preview()  # 统一刷新一次
- #       self._append_info_ui(f"[封装] 已添加画中画视频或图片水印: {os.path.basename(path)}")
+            self.merge_update_command_preview()
+    
+    def _add_concat_video(self):
+        path = filedialog.askopenfilename(
+            title="选择视频文件（串联）",
+            filetypes=[("媒体文件", "*.mp4 *.mkv *.avi *.mov *.flv *.webm")]
+        )
+        if not path:
+            return
+    
+        info = ffprobe_json(self.ffprobe_cmd, path)
+        if not info:
+            self._append_info_ui(f"[封装] 无法解析文件: {path}")
+            return
+    
+        # 串联模式：直接添加所有流（不询问）
+        self._add_concat_video_forced(path)
+        self._append_info_ui(f"[封装] 已添加串联视频: {os.path.basename(path)}")
+    
+        # 统一更新界面
+        self._batch_update = True
+        try:
+            self.merge_update_track_list()
+            self.merge_auto_recommend_container()
+            self.merge_update_output_preview()
+        finally:
+            self._batch_update = False
+            self.merge_update_command_preview()
+
+
 
 
     def browse_chapter_file(self):
@@ -8121,19 +8270,21 @@ class FFmpegBatchGUI:
         self._append_info_ui(f"拖拽了 {len(files)} 个文件")
         current_tab = self.notebook.index(self.notebook.select())
         if current_tab == 0:
+            # 转码标签页
             for file in files:
                 if os.path.exists(file):
                     self.add_task(file)
                 else:
                     self._append_info_ui(f"文件不存在: {file}")
         else:
-            # 合并模块的处理保持不变
-            if len(files) >= 2:
-                self.merge_handle_batch_dropped(files)
+            # 根据模式调用不同的处理函数
+            if self.pip_enabled.get():
+                self._handle_drop_pip_mode(files)
+            elif self.concat_enabled.get():
+                self._handle_drop_concat_mode(files)
             else:
-                for file in files:
-                    if os.path.exists(file):
-                        self.merge_handle_dropped_file(file)
+                # 普通模式，调用原有的批量处理
+                self.merge_handle_batch_dropped(files)
 
     def merge_handle_dropped_file(self, path):
         def process():
