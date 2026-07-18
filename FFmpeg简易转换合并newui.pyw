@@ -8283,8 +8283,13 @@ class FFmpegBatchGUI:
             elif self.concat_enabled.get():
                 self._handle_drop_concat_mode(files)
             else:
-                # 普通模式，调用原有的批量处理
-                self.merge_handle_batch_dropped(files)
+                #普通模式
+                if len(files) >= 2:
+                    self.merge_handle_batch_dropped(files)
+                else:
+                    for file in files:
+                        if os.path.exists(file):
+                            self.merge_handle_dropped_file(file)
 
     def merge_handle_dropped_file(self, path):
         def process():
