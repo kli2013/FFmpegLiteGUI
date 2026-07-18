@@ -3174,6 +3174,9 @@ class AdvancedFrame(ttk.LabelFrame):
         path = self.wm_path_var.get().strip()
         self.watermark_dict["file_path"] = path
         self.watermark_dict["enabled"] = bool(path)
+        if not path:
+            # 水印被清除，重置提示标志
+            self.app._watermark_precise_hint_shown = False
         self._auto_detect_watermark_duration()
         if self.update_callback:
             self.update_callback()
@@ -3564,6 +3567,9 @@ class FFmpegBatchGUI:
         self._loading_preset = False      # 加载预设标志
         self._updating_preview = False    # 防重入锁标志
         self._batch_update = False        # 批量更新模式标志，用于抑制多次预览刷新
+        self._trim_precise_hint_shown = False
+        self._watermark_precise_hint_shown = False
+
 
         self.segment_enabled = tk.BooleanVar(value=False)
         self.segments = []
@@ -4674,13 +4680,11 @@ class FFmpegBatchGUI:
         loop_count = adapted_wm.get("loop_count", 3)
         loop_enabled = adapted_wm.get("loop_enabled", False)
     
-        precise_trim = settings.get("precise_trim", False)
+        # ---------- 强制精准截取（水印模式） ----------
+        settings["precise_trim"] = True
         self._enforce_reencode_for_precise_trim(settings, only_audio=False)
     
-        # 快速模式（非精准）才在命令行添加 -ss/-to
-        if not precise_trim:
-            self._add_trim_params(cmd_list, settings)
-    
+
         self._add_hwaccel_params(cmd_list, settings)
     
         # 主视频输入
@@ -4690,7 +4694,7 @@ class FFmpegBatchGUI:
         start_sec, duration_for_sub = self._calculate_trim_duration(settings, input_path)
         main_duration = None
         if settings.get("trim_enabled", False):
-            if precise_trim:
+            if settings.get("precise_trim", False):  # 强制为 True
                 main_duration = duration_for_sub if duration_for_sub is not None else None
             else:
                 start = settings.get("trim_start", "").strip()
@@ -4709,15 +4713,10 @@ class FFmpegBatchGUI:
                 main_duration = total_dur
     
         # ---- 水印普通截取（非精准） ----
+        # 注：水印自身的截取由 wm_trim_enabled 控制，不影响主视频
         wm_trim_enabled = adapted_wm.get("trim_enabled", False)
         wm_precise = adapted_wm.get("precise_trim", False)
-#         if wm_trim_enabled and not wm_precise:
-#             start = adapted_wm.get("trim_start", "").strip()
-#             end = adapted_wm.get("trim_end", "").strip()
-#             if start:
-#                 cmd_list.extend(["-ss", start])
-#             if end:
-#                 cmd_list.extend(["-to", end])
+
     
         # ---- 判断是否在滤镜中使用 loop ----
         use_loop_in_filter = wm_trim_enabled  # 只要截取了，就用 loop 滤镜
@@ -4744,8 +4743,6 @@ class FFmpegBatchGUI:
             else:
                 # 图片没有时长，视为无限
                 wm_single_duration = None
-    
-
     
         # ---- 添加水印输入（及循环参数） ----
         if not is_image:
@@ -4778,7 +4775,7 @@ class FFmpegBatchGUI:
     
         # ---- 音频处理 ----
         if settings.get("audio_enabled", True):
-            if precise_trim and settings.get("trim_enabled", False) and duration_for_sub is not None and duration_for_sub > 0:
+            if settings.get("precise_trim", False) and settings.get("trim_enabled", False) and duration_for_sub is not None and duration_for_sub > 0:
                 self._apply_audio_trim_and_encode(cmd_list, settings, input_path, start_sec, duration_for_sub, map_audio=True)
             else:
                 cmd_list.extend(["-map", "0:a:0"])
@@ -4798,8 +4795,22 @@ class FFmpegBatchGUI:
         if container in ("mp4", "mov"):
             cmd_list.extend(["-movflags", "+faststart"])
     
-        # ---- 根据判断添加 -shortest ----
-        cmd_list.append("-shortest")
+        # ---- 时长控制：有音频时用 -shortest，无音频时用 -t ----
+        # 检查主视频是否包含音频流（可复用已有的 ffprobe 信息）
+        has_audio_stream = False
+        if input_path and os.path.exists(input_path):
+            info = ffprobe_json(self.ffprobe_cmd, input_path)
+            if info and any(s.get("codec_type") == "audio" for s in info.get("streams", [])):
+                has_audio_stream = True
+    
+        if settings.get("audio_enabled", True) and has_audio_stream:
+            cmd_list.append("-shortest")
+        else:
+            if main_duration and main_duration > 0:
+                cmd_list.extend(["-t", f"{main_duration:.3f}"])
+            else:
+                cmd_list.append("-shortest")
+                self._append_info_ui("[水印] 警告：无法计算主视频时长，使用 -shortest 控制输出。")
     
         cmd_list.append(output_path)
         return cmd_list
@@ -5820,6 +5831,20 @@ class FFmpegBatchGUI:
                 cmd_str = f"生成命令时出错: {e}"
             self.cmd_preview.delete(1.0, tk.END)
             self.cmd_preview.insert(tk.END, cmd_str)
+            # ---- 同步界面精准截取状态（水印或画中画强制） ----
+            try:
+                watermark_enabled = self.watermark_settings.get("enabled", False)
+                if (watermark_enabled or self.pip_enabled.get()) and self.trim_frame.trim_enabled.get():
+                    if not self.trim_frame.precise_trim.get():
+                        self.trim_frame.precise_trim.set(True)
+                    self.trim_frame.precise_check.config(state='disabled')
+                    if not self._watermark_precise_hint_shown:
+                        self._append_info_ui("[水印/画中画] 已自动启用精准截取（确保叠加对齐）。")
+                        self._watermark_precise_hint_shown = True
+                else:
+                    self.trim_frame.precise_check.config(state='normal')
+            except Exception as e:
+                pass
         finally:
             self._updating_preview = False
 
@@ -6666,12 +6691,17 @@ class FFmpegBatchGUI:
     def _on_pip_toggle(self, *args):
         if self.pip_enabled.get() and self.concat_enabled.get():
             self.concat_enabled.set(False)
+        # 当画中画被禁用时（切回普通模式），重置水印提示
+        if not self.pip_enabled.get():
+            self._trim_precise_hint_shown = False
         self.merge_update_command_preview()
         self.merge_update_track_list()
 
     def _on_concat_toggle(self, *args):
         if self.concat_enabled.get() and self.pip_enabled.get():
             self.pip_enabled.set(False)
+        if not self.concat_enabled.get():
+            self._trim_precise_hint_shown = False
         self.merge_update_command_preview()
         self.merge_update_track_list()
 
@@ -7155,36 +7185,55 @@ class FFmpegBatchGUI:
 
 
     def _add_pip_duration_control(self, cmd, main_video, enabled_tracks):
-        """PIP 时长控制"""
-        # 主视频有效时长
-        raw_duration = self._get_media_duration(main_video.file_path)
-        main_duration = None
-        if main_video.enc_settings.get("trim_enabled", False):
-            start = main_video.enc_settings.get("trim_start", "0").strip()
-            end = main_video.enc_settings.get("trim_end", "").strip()
-            start_sec = time_to_seconds(start) if start else 0.0
-            end_sec = time_to_seconds(end) if end else None
-            if end_sec and end_sec > start_sec:
-                main_duration = end_sec - start_sec
-            elif raw_duration:
-                main_duration = raw_duration - start_sec
-        else:
-            main_duration = raw_duration
-
-        main_video_path = normalize_path(main_video.file_path)
-        has_sub_audio = any(
-            normalize_path(t.file_path) != main_video_path 
-            for t in enabled_tracks if t.type == "audio"
-        )
-
+        """PIP 时长控制：根据主音频和子视频音频存在情况选择 -shortest 或 -t"""
         sub_videos = [t for t in enabled_tracks if t.type == "video"][1:]
-
-        if sub_videos:
-            if has_sub_audio and main_duration and main_duration > 0:
-                cmd.extend(["-t", f"{main_duration:.3f}"])
-                self._append_info_ui(f"[封装] 检测到子视频音频，使用 -t {main_duration:.3f}s 控制输出时长。")
+        if not sub_videos:
+            return  # 没有子视频，无需时长控制
+    
+        # 判断主视频是否包含音频
+        main_video_path = normalize_path(main_video.file_path)
+        has_main_audio = any(
+            normalize_path(t.file_path) == main_video_path and t.type == "audio"
+            for t in enabled_tracks
+        )
+    
+        # 判断子视频是否包含音频（任何子视频有音频即认为有子音频）
+        sub_paths = [normalize_path(sv.file_path) for sv in sub_videos]
+        has_sub_audio = any(
+            normalize_path(t.file_path) in sub_paths and t.type == "audio"
+            for t in enabled_tracks
+        )
+    
+        if has_main_audio and not has_sub_audio:
+            # 只有主视频有音频，子视频无音频 → -shortest 精确
+            cmd.append("-shortest")
+            self._append_info_ui("[封装] 只有主音频，使用 -shortest 控制输出时长。")
+        else:
+            # 其他情况：有子音频或无主音频 → 优先 -t 避免无限输出
+            raw_duration = self._get_media_duration(main_video.file_path)
+            main_duration = None
+            if main_video.enc_settings.get("trim_enabled", False):
+                start = main_video.enc_settings.get("trim_start", "0").strip()
+                end = main_video.enc_settings.get("trim_end", "").strip()
+                start_sec = time_to_seconds(start) if start else 0.0
+                end_sec = time_to_seconds(end) if end else None
+                if end_sec and end_sec > start_sec:
+                    main_duration = end_sec - start_sec
+                elif raw_duration:
+                    main_duration = raw_duration - start_sec
             else:
+                main_duration = raw_duration
+    
+            if main_duration and main_duration > 0:
+                cmd.extend(["-t", f"{main_duration:.3f}"])
+                if has_sub_audio:
+                    self._append_info_ui(f"[封装] 检测到子视频音频，使用 -t {main_duration:.3f}s 控制输出时长。")
+                else:
+                    self._append_info_ui(f"[封装] 主视频无音频，使用 -t {main_duration:.3f}s 控制输出时长。")
+            else:
+                # 无法计算时长，回退 -shortest
                 cmd.append("-shortest")
+                self._append_info_ui("[封装] 无法计算主视频时长，使用 -shortest 控制输出。")
 
 
 
@@ -7279,6 +7328,10 @@ class FFmpegBatchGUI:
             return []
         main_video = video_tracks[0]
         sub_videos = video_tracks[1:]
+
+        # 画中画模式下强制使用精准截取（由滤镜处理）
+        main_video.enc_settings["precise_trim"] = True
+
 
         # 添加输入文件 + 前置选项（包含子视频循环）
         cmd = self._add_input_options(cmd, input_files, main_video, sub_videos)
@@ -7765,6 +7818,17 @@ class FFmpegBatchGUI:
             trim_frame = TrimFrame(page_trim)
             trim_frame.pack(fill=tk.X, padx=5, pady=5)
             trim_frame.set_settings(initial_settings)
+
+            # 水印或画中画模式下，强制启用精准截取
+            if is_watermark or (pip_enabled_var is not None and pip_enabled_var.get()):
+                trim_frame.precise_trim.set(True)
+                trim_frame.precise_check.config(state='disabled')
+                if not self._trim_precise_hint_shown:
+                    self._append_info_ui("[设置] 水印/画中画模式下已自动启用精准截取。")
+                    self._trim_precise_hint_shown = True
+            else:
+                trim_frame.precise_check.config(state='normal')
+               # trim_frame.precise_trim.set(False)
 
             # 设置回调（此时 trim_frame 已存在）
             filt_frame.set_get_trim_settings_callback(lambda: trim_frame.get_settings())
