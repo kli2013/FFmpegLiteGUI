@@ -1683,7 +1683,7 @@ class VideoFilterFrame(ttk.LabelFrame):
         current_time = initial_time
     
         # ----- 获取原始视频尺寸（用于计算显示比例） -----
-        orig_w, orig_h = get_video_dimensions(self.app.ffprobe_cmd, input_file)
+        orig_w, orig_h = self.app._get_video_dimensions_cached(input_file)
         if orig_w is None or orig_h is None:
             # 降级：使用固定默认值
             orig_w, orig_h = 1920, 1080
@@ -2430,15 +2430,27 @@ class AudioFrame(ttk.LabelFrame):
 
 # ================== 截取片段组件 ==================
 class TrimFrame(ttk.LabelFrame):
-    def __init__(self, parent, **kwargs):
+    def __init__(self, parent, show_combo_seek=True, update_callback=None, **kwargs):
+        kwargs.pop('update_callback', None)
         super().__init__(parent, text="截取片段", padding="5", **kwargs)
+        self.show_combo_seek = show_combo_seek
+        self.update_callback = update_callback
+        self.combo_check = None
+        self._setting = False
         self.create_widgets()
 
     def create_widgets(self):
         self.trim_enabled = tk.BooleanVar(value=False)
-        self.trim_check = ttk.Checkbutton(self, text="启用截取片段", variable=self.trim_enabled,
+        top_line = ttk.Frame(self)
+        top_line.pack(fill=tk.X, pady=(0,5))
+        
+        self.trim_check = ttk.Checkbutton(top_line, text="启用截取片段", variable=self.trim_enabled,
                                           command=self.on_trim_toggle)
-        self.trim_check.pack(anchor=tk.W, pady=(0,10))
+        self.trim_check.pack(side=tk.LEFT, padx=5)
+        
+        info_label = ttk.Label(top_line, text="示例: 01:23:45 或 01:23:45.500 (留空表示到文件末尾)", 
+                               foreground="gray")
+        info_label.pack(side=tk.LEFT, padx=5)
         ToolTip(self.trim_check, 
                 "默认是 -ss 在 -i 之前的快速模式，快速无损截取请把音频视频都改为Copy\n\n"
                 "截取功能在普通转码模式下（无水印/画中画）表现稳定，支持快速截取（基于关键帧）和精准截取（基于解码帧）两种方式。\n\n"
@@ -2467,7 +2479,7 @@ class TrimFrame(ttk.LabelFrame):
         self.trim_end_entry = ttk.Entry(time_frame2, textvariable=self.trim_end, width=12)
         self.trim_end_entry.pack(side=tk.LEFT, padx=5)
     
-        # ----- 新增：精准到帧复选框 -----
+        # 精准到帧
         precise_frame = ttk.Frame(self)
         precise_frame.pack(fill=tk.X, pady=5)
         self.precise_trim = tk.BooleanVar(value=False)
@@ -2483,15 +2495,93 @@ class TrimFrame(ttk.LabelFrame):
                 "若编码器为「copy」将自动提示。\n"
                 "取消勾选则为快速截取（基于关键帧），可能不精确但速度快。",
                 wraplength=400)
-        # 新增结束
 
-        info_label = ttk.Label(self, text="示例: 01:23:45 或 01:23:45.500 (留空表示到文件末尾)", foreground="gray")
-        info_label.pack(anchor=tk.W, pady=(5,0))
+        # ---------- 组合跳转控件（根据 show_combo_seek 决定是否显示） ----------
+        if self.show_combo_seek:
+            combo_frame = ttk.Frame(self)
+            combo_frame.pack(fill=tk.X, pady=2)
+            
+            self.combo_seek = tk.BooleanVar(value=False)
+            self.combo_threshold = tk.IntVar(value=30)
+
+            self.combo_seek.trace_add('write', self._on_combo_changed)
+            self.combo_threshold.trace_add('write', self._on_combo_changed)
+
+            self.combo_check = ttk.Checkbutton(
+                combo_frame, 
+                text="组合跳转（加速长视频精确截取）", 
+                variable=self.combo_seek,
+                command=self._on_combo_toggle
+            )
+            self.combo_check.pack(side=tk.LEFT, padx=5)
+            
+            ttk.Label(combo_frame, text="后置微调阈值(秒):").pack(side=tk.LEFT, padx=(10,0))
+            spin = ttk.Spinbox(combo_frame, from_=1, to=120, width=5, 
+                               textvariable=self.combo_threshold)
+            spin.pack(side=tk.LEFT, padx=2)
+            
+            ToolTip(self.combo_check,
+                "⚡ 组合跳转模式（仅推荐用于单个纯净视频转码）\n\n"
+                "原理：先快速跳到目标时间点之前的关键帧（输入跳转），\n"
+                "      再精确解码到目标帧（输出跳转），兼顾速度与精度。\n\n"
+                "阈值含义：\n"
+                "  例如：起始时间 3600s，阈值 30s → 前置跳 3570s，后置微调 30s\n\n"
+                "适用场景：\n"
+                "  ✅ 单个视频文件，无叠加、无水印、无画中画\n"
+                "  ✅ 需要从长视频中间位置开始截取（如从1小时处开始）\n"
+                "  ✅ 编码器非 copy（必须重新编码）\n\n"
+                "何时启用：\n"
+                "  📌 当视频总时长 > 2分钟 且 截取起始时间 > 30秒 时，推荐开启此模式；\n"
+                "  📌 若视频较短（<5分钟）或起始时间非常靠前（<10秒），提升不明显，\n\n"
+                "不适用场景：\n"
+                "  ❌ 启用「水印」或「画中画」（自动禁用）\n"
+                "     原因：前后双 -ss 的后置 -ss 无法区分是针对主视频还是从视频，\n"
+                "           容易误作用于其他输入，导致截取错位。\n"
+                "  ❌ 启用「精准到帧」模式（互斥，勾选后自动取消）\n"
+                "  ❌ 仅提取音频（only_audio）\n\n"
+                "性能提升参考（2小时电影，从1小时处截取）：\n"
+                "  • 软件解码：省去约15~30分钟的解码时间\n"
+                "  • 硬件解码（cuda/qsv）：省去约5~10分钟\n"
+                "  • 精准的trim模式需要慢慢把前面的全解码在丢弃，所以慢\n\n"
+                "阈值建议：默认30秒足以覆盖绝大多数关键帧间隔（1~10秒），\n"
+                "         无需调大，调大反而增加解码耗时。\n"
+                "若起始时间小于阈值，则自动跳过前置跳转，仅执行后置微调。",
+                wraplength=500)
+        else:
+            # 不显示组合跳转时，创建内部变量但强制为 False
+            self.combo_seek = tk.BooleanVar(value=False)
+            self.combo_threshold = tk.IntVar(value=30)
+            self.combo_check = None
+
+
 
         self.on_trim_toggle()
 
+
+    def _on_combo_changed(self, *args):
+        """组合跳转相关控件变化时，触发外部刷新"""
+        if not self._setting and self.update_callback:
+            self.update_callback()
+
+    # ---------- 新增：组合跳转切换回调 ----------
+    def _on_combo_toggle(self):
+        if self.combo_seek.get():
+            # 启用组合跳转时，禁用精准模式（互斥）
+            self.precise_trim.set(False)
+            self.precise_check.config(state='disabled')
+        else:
+            self.precise_check.config(state='normal')
+        if not self._setting and self.update_callback:
+            self.update_callback()
+
+    # ---------- 修改：精准模式切换回调（增加互斥） ----------
     def on_precise_toggle(self):
-        # 精准模式不需要禁用任何控件，仅用于界面反馈（可留空）
+        if self.precise_trim.get() and self.show_combo_seek and self.combo_seek.get():
+            # 如果精准模式被启用，但组合跳转已启用，则禁用组合跳转
+            self.combo_seek.set(False)
+            if self.combo_check:
+                self.combo_check.config(state='normal')
+        # 原有逻辑（如有）保留
         pass
 
     def on_trim_toggle(self):
@@ -2499,20 +2589,40 @@ class TrimFrame(ttk.LabelFrame):
         self.trim_start_entry.config(state=state)
         self.trim_end_entry.config(state=state)
 
+    # ---------- 修改：get_settings 增加组合跳转字段 ----------
     def get_settings(self):
-        return {
+        res = {
             "trim_enabled": self.trim_enabled.get(),
             "trim_start": self.trim_start.get(),
             "trim_end": self.trim_end.get(),
-            "precise_trim": self.precise_trim.get()   # 新增
+            "precise_trim": self.precise_trim.get(),
         }
+        if self.show_combo_seek:
+            res["combo_seek"] = self.combo_seek.get()
+            res["combo_threshold"] = self.combo_threshold.get()
+        else:
+            # 在不显示的场景下强制为 False
+            res["combo_seek"] = False
+            res["combo_threshold"] = 30
+        return res
 
+    # ---------- 修改：set_settings 增加组合跳转字段 ----------
     def set_settings(self, settings):
-        self.trim_enabled.set(settings.get("trim_enabled", False))
-        self.trim_start.set(settings.get("trim_start", "0"))
-        self.trim_end.set(settings.get("trim_end", ""))
-        self.precise_trim.set(settings.get("precise_trim", False))   # 新增
-        self.on_trim_toggle()
+        self._setting = True
+        try:
+            self.trim_enabled.set(settings.get("trim_enabled", False))
+            self.trim_start.set(settings.get("trim_start", "0"))
+            self.trim_end.set(settings.get("trim_end", ""))
+            self.precise_trim.set(settings.get("precise_trim", False))
+            if self.show_combo_seek:
+                self.combo_seek.set(settings.get("combo_seek", False))
+                self.combo_threshold.set(settings.get("combo_threshold", 30))
+                self._on_combo_toggle()
+            else:
+                self.combo_seek.set(False)
+            self.on_trim_toggle()
+        finally:
+            self._setting = False
 
 # ================== 公共组件：循环与绿幕 ==================
 class LoopChromaFrame(ttk.LabelFrame):
@@ -2931,7 +3041,7 @@ class OverlayPositionFrame(ttk.LabelFrame):
                 if not main_file or not os.path.exists(main_file):
                     messagebox.showerror("错误", "未找到主视频文件，请先设置主视频")
                     return
-                w, h = get_video_dimensions(self.app.ffprobe_cmd, main_file)
+                w, h = self.app._get_video_dimensions_cached(main_file)
                 if w is not None and h is not None:
                     self.pad_width.set(str(w))
                     self.pad_height.set(str(h))
@@ -3569,7 +3679,11 @@ class FFmpegBatchGUI:
         self._batch_update = False        # 批量更新模式标志，用于抑制多次预览刷新
         self._trim_precise_hint_shown = False
         self._watermark_precise_hint_shown = False
+        self._preview_after_id = None   # after 回调 ID
+        self._preview_pending = False   # 是否有待处理的刷新
 
+        self._duration_cache = {}
+        self._dimension_cache = {}
 
         self.segment_enabled = tk.BooleanVar(value=False)
         self.segments = []
@@ -3701,24 +3815,20 @@ class FFmpegBatchGUI:
         :param input_path: 输入文件路径（用于获取总时长）
         :return: (start_sec, duration)，若无法计算则对应为 None
         """
-        if not settings.get("precise_trim", False):
+        if not settings.get("trim_enabled", False):
             return None, None
-    
         start = settings.get("trim_start", "").strip()
         end = settings.get("trim_end", "").strip()
-        start_sec = time_to_seconds(start) if start else None
+        start_sec = time_to_seconds(start) if start else 0.0
         end_sec = time_to_seconds(end) if end else None
-    
         if start_sec is None:
             return None, None
-    
         duration = None
         total_duration = self._get_media_duration(input_path)
         if end_sec is not None:
             duration = end_sec - start_sec
         elif total_duration is not None:
             duration = total_duration - start_sec
-    
         return start_sec, duration
 
 
@@ -3742,7 +3852,19 @@ class FFmpegBatchGUI:
         return None
 
     def _get_media_duration(self, file_path):
-        """获取媒体文件时长（秒），失败返回 None"""
+        """获取媒体文件时长（秒），带缓存，失败返回 None"""
+        if not file_path or not os.path.exists(file_path):
+            return None
+        # 获取文件修改时间作为缓存键的一部分
+        try:
+            mtime = os.path.getmtime(file_path)
+        except OSError:
+            mtime = None
+        cache_key = (file_path, mtime)
+        if cache_key in self._duration_cache:
+            return self._duration_cache[cache_key]
+        
+        # 原有 ffprobe 调用
         if not self.ffprobe_cmd:
             return None
         cmd = [self.ffprobe_cmd, "-v", "error", "-show_entries", "format=duration",
@@ -3751,10 +3873,31 @@ class FFmpegBatchGUI:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=5,
                                     creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
             if result.returncode == 0 and result.stdout.strip():
-                return float(result.stdout.strip())
+                duration = float(result.stdout.strip())
+                self._duration_cache[cache_key] = duration
+                return duration
         except:
             pass
         return None
+    
+    
+    def _get_video_dimensions_cached(self, file_path):
+        """获取视频原始宽高（不考虑旋转），带缓存"""
+        if not file_path or not os.path.exists(file_path):
+            return None, None
+        try:
+            mtime = os.path.getmtime(file_path)
+        except OSError:
+            mtime = None
+        cache_key = (file_path, mtime)
+        if cache_key in self._dimension_cache:
+            return self._dimension_cache[cache_key]
+        
+        w, h = get_video_dimensions(self.ffprobe_cmd, file_path)
+        if w is not None and h is not None:
+            self._dimension_cache[cache_key] = (w, h)
+        return w, h
+
 
     def _build_video_encoding_params(self, cmd_list: List[str], settings: dict) -> List[str]:
         vcodec = settings.get("encoder", "libx265")
@@ -4347,7 +4490,7 @@ class FFmpegBatchGUI:
             wm_file = wm_settings.get("file_path", "").strip()
             
             # 获取主视频尺寸（用于自适应）
-            main_w, main_h = get_video_dimensions(self.ffprobe_cmd, file_path)
+            main_w, main_h = self._get_video_dimensions_cached(file_path)
             if main_w is None or main_h is None:
                 self._append_info_ui("[预览] 无法获取视频尺寸，跳过水印虚拟框")
             else:
@@ -4555,66 +4698,110 @@ class FFmpegBatchGUI:
         only_audio = settings.get("only_audio", False)
         precise_trim = settings.get("precise_trim", False)
     
+        # ----- 组合跳转设置（仅用于普通视频转码，水印/GIF 单独处理） -----
+        combo_seek = False
+        combo_threshold = 30
+        if not only_audio and not settings.get("watermark", {}).get("enabled", False) and settings.get("encoder") != "gif":
+            combo_seek = settings.get("combo_seek", False)
+            combo_threshold = settings.get("combo_threshold", 30)
+            # 互斥：组合跳转时强制禁用精准模式
+            if combo_seek:
+                precise_trim = False
+                settings["precise_trim"] = False
+    
         # 精准模式下强制重新编码（视频）
         self._enforce_reencode_for_precise_trim(settings, only_audio)
-
+    
         # ---------- 新增：IVTC 与反交错冲突检测 ----------
         enhance_settings = settings.get("enhance", {})
         if enhance_settings.get("ivtc_enabled", False) and settings.get("deinterlace_filter", "none") != "none":
             self._append_info_ui("已启用 IVTC，反交错滤镜将被忽略（IVTC 本身包含反交错功能）。")
         # ------------------------------------------------
-
-
+    
         # ---------- 检查水印 ----------
         wm_settings = settings.get("watermark", {})
         wm_enabled = wm_settings.get("enabled", False) and wm_settings.get("file_path", "").strip()
         wm_file = wm_settings.get("file_path", "").strip() if wm_enabled else None
     
         if wm_file and not only_audio:
+            # 水印模式强制禁用组合跳转
+            settings["combo_seek"] = False
             return self._generate_command_with_watermark(input_path, output_path, settings, wm_settings)
-
+    
         # 检查是否 GIF 编码（且非仅音频）
         if settings.get("encoder") == "gif" and not only_audio:
             return self._generate_gif_command(input_path, output_path, settings)
-
+    
         # ---------- 普通模式（无复杂水印） ----------
         cmd_list = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
     
-        # 快速模式（非精准）才在命令行添加 -ss/-to
-        if not precise_trim:
-            self._add_trim_params(cmd_list, settings)
+        # ----- 计算截取时长（仅在精准模式或组合跳转时需要） -----
+        start_sec = None
+        duration_for_audio = None
+        if precise_trim or combo_seek:
+            start_sec, duration_for_audio = self._calculate_trim_duration(settings, input_path)
     
-        if not only_audio:
-            self._add_hwaccel_params(cmd_list, settings)
+        used_combo = False
     
-        cmd_list.extend(["-i", input_path])
+        # ---------- 组合跳转分支 ----------
+        if combo_seek and settings.get("trim_enabled", False) and start_sec is not None and start_sec > 0:
+            threshold = combo_threshold
+            pre_seek = max(0, start_sec - threshold)
+            post_seek = start_sec - pre_seek  # 即 min(start_sec, threshold)
+            # 前置跳转
+            cmd_list.extend(["-ss", f"{pre_seek:.3f}"])
+            # 硬件解码（放在 -i 之前）
+            if not only_audio:
+                self._add_hwaccel_params(cmd_list, settings)
+            # 输入文件
+            cmd_list.extend(["-i", input_path])
+            # 后置微调
+            cmd_list.extend(["-ss", f"{post_seek:.3f}"])
+            # 输出时长
+            if duration_for_audio is not None and duration_for_audio > 0:
+                cmd_list.extend(["-t", f"{duration_for_audio:.3f}"])
+            used_combo = True
+        else:
+            # ---------- 非组合跳转（正常模式） ----------
+            # 快速模式（非精准）才在命令行添加 -ss/-to
+            if not precise_trim:
+                self._add_trim_params(cmd_list, settings)
     
-        # ----- 精准模式：不添加命令行 -ss/-t，而是通过滤镜处理 计算截取时长-----
-        start_sec, duration_for_audio = self._calculate_trim_duration(settings, input_path)
-
+            if not only_audio:
+                self._add_hwaccel_params(cmd_list, settings)
     
+            cmd_list.extend(["-i", input_path])
+    
+        # ----- 视频处理 -----
         if only_audio:
             cmd_list.append("-vn")
         else:
             vcodec = settings.get("encoder", "libx265")
-            precise_trim = settings.get("precise_trim", False)
-            if vcodec == "copy" and not precise_trim:
+            if vcodec == "copy" and not precise_trim and not used_combo:
                 # 纯流复制，忽略所有视频处理
                 self._append_info_ui("编码器为 copy，已忽略所有视频滤镜、帧率、像素格式等设置。")
                 cmd_list.extend(["-c:v", "copy"])
             else:
-                # 构建视频滤镜（包含字幕、变速等）
+                # 构建视频滤镜（包含字幕、变速等），组合跳转时跳过 trim
                 enhance_settings = settings.get("enhance", {})
-                vf = build_video_filter_chain(settings, include_subtitle=True, include_speed=True, enhance_settings=enhance_settings)
+                vf = build_video_filter_chain(
+                    settings,
+                    include_subtitle=True,
+                    include_speed=True,
+                    include_trim=(not used_combo),   # 组合跳转时不加 trim
+                    enhance_settings=enhance_settings
+                )
                 if vf != "null":
                     cmd_list.extend(["-vf", vf])
-
+    
                 cmd_list = self._build_video_encoding_params(cmd_list, settings)
     
-
-        # 音频处理（精准模式下也需尊重 audio_enabled）
+        # ----- 音频处理 -----
         if settings.get("audio_enabled", True):
-            if precise_trim and settings.get("trim_enabled", False) and duration_for_audio is not None and duration_for_audio > 0:
+            if used_combo:
+                # 组合跳转已用 -ss 截取整个流，音频直接编码（不使用 atrim）
+                cmd_list = self._build_audio_encoding_params(cmd_list, settings)
+            elif precise_trim and settings.get("trim_enabled", False) and duration_for_audio is not None and duration_for_audio > 0:
                 self._apply_audio_trim_and_encode(cmd_list, settings, input_path, start_sec, duration_for_audio, map_audio=False)
             else:
                 cmd_list = self._build_audio_encoding_params(cmd_list, settings)
@@ -4636,6 +4823,8 @@ class FFmpegBatchGUI:
         cmd_list.append(output_path)
         return cmd_list
 
+
+
     def _add_infinite_loop_params(self, cmd_list: List[str], file_path: str, is_sub_video: bool = True, framerate: str = "30"):
         """
         为输入文件添加无限循环参数（用于子视频/水印）。
@@ -4656,8 +4845,9 @@ class FFmpegBatchGUI:
 
 
     def _generate_command_with_watermark(self, input_path: str, output_path: str, settings: dict, wm_settings: dict) -> List[str]:
-        main_w, main_h = get_video_dimensions(self.ffprobe_cmd, input_path)
-    
+        main_w, main_h = self._get_video_dimensions_cached(input_path)
+        # 强制禁用组合跳转
+        settings["combo_seek"] = False
         vcodec = settings.get("encoder", "libx265")
         if vcodec == "copy":
             settings["encoder"] = "libx265"
@@ -4840,7 +5030,7 @@ class FFmpegBatchGUI:
         # 记录当前输入文件的尺寸作为水印基准
         input_file = self.input_file.get().strip()
         if input_file and os.path.exists(input_file):
-            w, h = get_video_dimensions(self.ffprobe_cmd, input_file)
+            w, h = self._get_video_dimensions_cached(input_file)
             if w is not None and h is not None:
                 settings["watermark"]["base_width"] = w
                 settings["watermark"]["base_height"] = h
@@ -4885,7 +5075,7 @@ class FFmpegBatchGUI:
                 return int(main_track.pad_width), int(main_track.pad_height)
             except:
                 pass
-        w, h = get_video_dimensions(self.ffprobe_cmd, main_track.file_path)
+        w, h = self._get_video_dimensions_cached(main_track.file_path)
         if w is None or h is None:
             w, h = 1280, 720
         return w, h
@@ -5809,15 +5999,38 @@ class FFmpegBatchGUI:
             self.segments = editor.result
             self.update_command_preview()
 
+
     def update_command_preview(self, *args):
+        """防抖版刷新命令预览"""
+        if self._preview_after_id:
+            self.root.after_cancel(self._preview_after_id)
+            self._preview_after_id = None
+        self._preview_after_id = self.root.after(50, self._do_update_command_preview)
+
+    def _do_update_command_preview(self):
+        """实际执行命令刷新的函数（原 update_command_preview 的所有代码）"""
+        self._preview_after_id = None
+        # 以下为原有的全部代码，请原样复制粘贴
         if getattr(self, '_loading_preset', False):
             return
-        # ---- 防重入锁 ----
         if hasattr(self, '_updating_preview') and self._updating_preview:
             return
         self._updating_preview = True
         try:
-            # 原有代码
+            # ---- 水印/画中画禁用组合跳转 ----
+            watermark_enabled = self.watermark_settings.get("enabled", False)
+            pip_enabled = self.pip_enabled.get()
+            if watermark_enabled or pip_enabled:
+                if self.trim_frame.show_combo_seek and self.trim_frame.combo_seek.get():
+                    self.trim_frame.combo_seek.set(False)
+                    self._append_info_ui("[提示] 水印/画中画模式下已自动禁用组合跳转。")
+                    if self.trim_frame.combo_check:
+                        self.trim_frame.combo_check.config(state='disabled')
+            else:
+                if self.trim_frame.show_combo_seek and self.trim_frame.combo_check:
+                    self.trim_frame.combo_check.config(state='normal')
+            # -------------------------------------------------
+
             input_file = self.input_file.get()
             try:
                 if not input_file:
@@ -5831,7 +6044,7 @@ class FFmpegBatchGUI:
                 cmd_str = f"生成命令时出错: {e}"
             self.cmd_preview.delete(1.0, tk.END)
             self.cmd_preview.insert(tk.END, cmd_str)
-            # ---- 同步界面精准截取状态（水印或画中画强制） ----
+            # ---- 同步精准截取 ----
             try:
                 watermark_enabled = self.watermark_settings.get("enabled", False)
                 if (watermark_enabled or self.pip_enabled.get()) and self.trim_frame.trim_enabled.get():
@@ -6407,6 +6620,7 @@ class FFmpegBatchGUI:
 
             filt_frame._preview_callback = update_preview   
             adv_frame.update_callback = update_preview
+            trim_frame.update_callback = update_preview
 
     
             # 绑定各种事件
@@ -7318,6 +7532,10 @@ class FFmpegBatchGUI:
 
     def _build_pip_cmd(self, enabled_tracks, output_norm):
         """画中画模式"""
+        # 强制禁用组合跳转
+        for track in enabled_tracks:
+            if track.type == "video":
+                track.enc_settings["combo_seek"] = False
         cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
 
         input_files, file_index = self._prepare_tracks_and_inputs(enabled_tracks)
@@ -7695,11 +7913,7 @@ class FFmpegBatchGUI:
             self.merge_auto_recommend_container()
             self.merge_update_command_preview()
 
-#     def get_video_dimensions(self, file_path):
-#         return get_video_dimensions(self.ffprobe_cmd, file_path)
 
-#     def get_video_rotated_dimensions(self, file_path, enc_settings):
-#         return get_video_rotated_dimensions(self.ffprobe_cmd, file_path, enc_settings)
 
     def evaluate_expression(self, expr, main_w, main_h, box_w, box_h):
         return safe_eval_expr(expr, {"W": main_w, "H": main_h, "w": box_w, "h": box_h})
@@ -7815,7 +8029,7 @@ class FFmpegBatchGUI:
             # ---- 页面3：截取片段 ----
             page_trim = ttk.Frame(notebook)
             notebook.add(page_trim, text="截取片段")
-            trim_frame = TrimFrame(page_trim)
+            trim_frame = TrimFrame(page_trim, show_combo_seek=False)
             trim_frame.pack(fill=tk.X, padx=5, pady=5)
             trim_frame.set_settings(initial_settings)
 
@@ -8808,7 +9022,7 @@ class FFmpegBatchGUI:
 
         trim_page = ttk.Frame(param_notebook)
         param_notebook.add(trim_page, text="截取片段")
-        self.trim_frame = TrimFrame(trim_page)
+        self.trim_frame = TrimFrame(trim_page, update_callback=self.update_command_preview)
         self.trim_frame.pack(fill=tk.X, padx=5, pady=5)
 
         # 在 create_widgets 中，adv_page 之后添加：
