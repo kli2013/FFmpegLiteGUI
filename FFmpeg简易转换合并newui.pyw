@@ -4712,11 +4712,11 @@ class FFmpegBatchGUI:
         # 精准模式下强制重新编码（视频）
         self._enforce_reencode_for_precise_trim(settings, only_audio)
     
-        # ---------- 新增：IVTC 与反交错冲突检测 ----------
+        # ---------- IVTC 与反交错冲突检测 ----------
         enhance_settings = settings.get("enhance", {})
         if enhance_settings.get("ivtc_enabled", False) and settings.get("deinterlace_filter", "none") != "none":
             self._append_info_ui("已启用 IVTC，反交错滤镜将被忽略（IVTC 本身包含反交错功能）。")
-        # ------------------------------------------------
+
     
         # ---------- 检查水印 ----------
         wm_settings = settings.get("watermark", {})
@@ -6824,6 +6824,38 @@ class FFmpegBatchGUI:
         ttk.Button(btn_frame, text="添加外部视频（画中画/串行）", 
             command=self.merge_add_external_video).pack(side=tk.LEFT, padx=2)
 
+        # ----- 手动时长控制 -----
+        # 变量定义
+        self.merge_manual_duration_enabled = tk.BooleanVar(value=False)
+        self.merge_manual_duration = tk.StringVar(value="")
+        # UI 控件
+        ttk.Separator(btn_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=(20,5))
+        chk_manual = ttk.Checkbutton(btn_frame, text="手动时长", 
+                                     variable=self.merge_manual_duration_enabled,
+                                     command=lambda: self.merge_update_command_preview())
+        chk_manual.pack(side=tk.LEFT, padx=2)
+
+        ToolTip(chk_manual,
+            "勾选后，将使用您输入的时长作为输出总时长（手动 -t）。\n\n"
+            "适用于需要精确控制输出长度（如去除片尾多余黑色淡出）的场景。\n\n"
+            "「视频转码」页面可使用自定义参数 -t 实现同功能。",
+            wraplength=400
+        )
+
+
+        self.merge_manual_duration_entry = ttk.Entry(btn_frame, 
+                                                     textvariable=self.merge_manual_duration,
+                                                     width=8)
+        self.merge_manual_duration_entry.pack(side=tk.LEFT, padx=2)
+        ttk.Label(btn_frame, text="秒 (覆盖自动时长)").pack(side=tk.LEFT, padx=(0,5))
+
+
+
+        # 绑定输入变化刷新预览
+        self.merge_manual_duration.trace_add('write', lambda *a: self.merge_update_command_preview())
+
+
+
         chapter_frame = ttk.LabelFrame(parent, text="章节处理", padding="3")
         chapter_frame.pack(fill=tk.X, pady=5)
         chapter_row = ttk.Frame(chapter_frame)
@@ -7400,6 +7432,13 @@ class FFmpegBatchGUI:
 
     def _add_pip_duration_control(self, cmd, main_video, enabled_tracks):
         """PIP 时长控制：根据主音频和子视频音频存在情况选择 -shortest 或 -t"""
+        # 如果启用了手动时长，则跳过内部时长控制
+        if self.merge_manual_duration_enabled.get():
+            dur_str = self.merge_manual_duration.get().strip()
+            if dur_str and time_to_seconds(dur_str) is not None:
+                # 可选：打印一次提示（但每次刷新会重复，可改为只在第一次或使用标志）
+                self._append_info_ui("[封装] 手动时长已启用，将使用用户指定的时长。")
+                return
         sub_videos = [t for t in enabled_tracks if t.type == "video"][1:]
         if not sub_videos:
             return  # 没有子视频，无需时长控制
@@ -7739,12 +7778,44 @@ class FFmpegBatchGUI:
             self._append_info_ui("[封装] 没有启用的轨道")
             return []
     
+        # 根据模式生成命令
         if self.pip_enabled.get():
-            return self._build_pip_cmd(enabled_tracks, output_norm)
+            cmd_list = self._build_pip_cmd(enabled_tracks, output_norm)
         elif self.concat_enabled.get():
-            return self._build_concat_cmd(enabled_tracks, output_norm, preview=preview)
+            cmd_list = self._build_concat_cmd(enabled_tracks, output_norm, preview=preview)
         else:
-            return self._build_normal_cmd(enabled_tracks, output_norm)
+            cmd_list = self._build_normal_cmd(enabled_tracks, output_norm)
+    
+        # ------ 手动时长覆盖（最高优先级） ------
+        if self.merge_manual_duration_enabled.get():
+            dur_str = self.merge_manual_duration.get().strip()
+            if dur_str:
+                dur_sec = time_to_seconds(dur_str)
+                if dur_sec is not None and dur_sec > 0:
+                    # 移除已有的 -t 和 -shortest 及其参数
+                    new_cmd = []
+                    skip_next = False
+                    for i, arg in enumerate(cmd_list):
+                        if skip_next:
+                            skip_next = False
+                            continue
+                        if arg in ('-t', '-shortest'):
+                            if arg == '-t':
+                                # 如果下一个参数不是选项（即 -t 的值），跳过
+                                if i+1 < len(cmd_list) and not cmd_list[i+1].startswith('-'):
+                                    skip_next = True
+                            continue
+                        new_cmd.append(arg)
+                    # 在输出文件之前插入 -t（输出文件是最后一个元素）
+                    if new_cmd and new_cmd[-1] != '-t':
+                        output = new_cmd.pop()
+                        new_cmd.extend(['-t', f'{dur_sec:.3f}'])
+                        new_cmd.append(output)
+                    cmd_list = new_cmd
+                else:
+                    self._append_info_ui("警告：手动时长格式无效，已忽略")
+    
+        return cmd_list
     
     
     
