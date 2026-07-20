@@ -3570,7 +3570,9 @@ class Track:
                     "trim_enabled": False,
                     "trim_start": "",
                     "trim_end": "",
-                    "precise_trim": False
+                    "precise_trim": False,
+                    "mix_enabled": False,
+                    "volume": 1.0,
                 }
             else:  # subtitle
                 self.enc_settings = {"encoder": "copy"}
@@ -7602,12 +7604,14 @@ class FFmpegBatchGUI:
 
 
     def _build_normal_cmd(self, enabled_tracks, output_norm):
-        """普通封装模式：支持视频滤镜、多音频/字幕、音频截取等。"""
+        """
+        普通封装模式：支持视频滤镜、多音频/字幕、音频截取、音频混合（amix）与音量调整。
+        """
         cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
     
         input_files, file_index = self._prepare_tracks_and_inputs(enabled_tracks)
     
-        # 识别主视频
+        # 识别主视频（第一个启用的视频轨道）
         video_tracks = [t for t in enabled_tracks if t.type == "video"]
         if not video_tracks:
             self._append_info_ui("[封装] 没有启用的视频轨道")
@@ -7624,7 +7628,6 @@ class FFmpegBatchGUI:
         v_settings = main_video.enc_settings
         vcodec = v_settings.get("encoder", "copy")
     
-        # copy 时直接跳过滤镜，不强制改编码器
         if vcodec == "copy":
             self._append_info_ui("[封装] 编码器为 copy，已忽略所有视频滤镜。")
             cmd.extend(["-c:v", "copy"])
@@ -7638,42 +7641,149 @@ class FFmpegBatchGUI:
             )
             if video_filters and video_filters != "null":
                 cmd.extend(["-vf", video_filters])
-    
             # 应用编码参数
             strategy = get_encoder_strategy(vcodec)
             cmd = strategy.build_params(cmd, v_settings)
     
-        # ---- 音频处理（支持截取） ----
+        # ---- 音频处理（支持截取、混合、音量调整） ----
         audio_tracks = [t for t in enabled_tracks if t.type == "audio"]
-        audio_map_count = 0
-        for audio in audio_tracks:
-            a_idx = file_index[audio.file_path]
-            cmd.extend(["-map", f"{a_idx}:a:{audio._type_index}"])
+        # 分离勾选混合和未勾选的流
+        mix_tracks = [t for t in audio_tracks if t.enc_settings.get("mix_enabled", False)]
+        non_mix_tracks = [t for t in audio_tracks if not t.enc_settings.get("mix_enabled", False)]
     
-            if self._handle_audio_trim(cmd, audio, audio_map_count):
+        if len(mix_tracks) == 0:
+            # ----- 无混合：保持原有行为（多音轨映射） -----
+            audio_map_count = 0
+            for audio in audio_tracks:
+                a_idx = file_index[audio.file_path]
+                cmd.extend(["-map", f"{a_idx}:a:{audio._type_index}"])
+                # 处理音频截取（使用 _handle_audio_trim）
+                if self._handle_audio_trim(cmd, audio, audio_map_count):
+                    audio_map_count += 1
+                    continue
+                # 普通编码
+                enc = audio.enc_settings.get("encoder", "copy")
+                if enc == "copy":
+                    cmd.extend([f"-c:a:{audio_map_count}", "copy"])
+                else:
+                    bitrate = audio.enc_settings.get("bitrate", "128k")
+                    samplerate = audio.enc_settings.get("samplerate", "44100")
+                    cmd.extend([
+                        f"-c:a:{audio_map_count}", enc,
+                        f"-b:a:{audio_map_count}", bitrate,
+                        f"-ar:a:{audio_map_count}", samplerate
+                    ])
                 audio_map_count += 1
-                continue
     
-            enc = audio.enc_settings.get("encoder", "copy")
-            if enc == "copy":
-                cmd.extend([f"-c:a:{audio_map_count}", "copy"])
+            if audio_map_count == 0:
+                cmd.append("-an")
             else:
-                bitrate = audio.enc_settings.get("bitrate", "128k")
-                samplerate = audio.enc_settings.get("samplerate", "44100")
-                cmd.extend([
-                    f"-c:a:{audio_map_count}", enc,
-                    f"-b:a:{audio_map_count}", bitrate,
-                    f"-ar:a:{audio_map_count}", samplerate
-                ])
-            audio_map_count += 1
+                cmd.extend(["-disposition:a:0", "default"])
     
-        if audio_map_count == 0:
-            cmd.append("-an")
         else:
-            cmd.extend(["-disposition:a:0", "default"])
+            # ----- 有混合：使用 amix 混合所有勾选的流 -----
+            # 如果只有一个勾选流，直接输出该流（无需 amix）
+            if len(mix_tracks) == 1:
+                audio = mix_tracks[0]
+                a_idx = file_index[audio.file_path]
+                cmd.extend(["-map", f"{a_idx}:a:{audio._type_index}"])
+                # 构建音频滤镜（截取 + 音量调整）
+                af_parts = []
+                if audio.enc_settings.get("trim_enabled", False):
+                    start = audio.enc_settings.get("trim_start", "").strip()
+                    end = audio.enc_settings.get("trim_end", "").strip()
+                    start_sec = time_to_seconds(start) if start else 0.0
+                    end_sec = time_to_seconds(end) if end else None
+                    total = self._get_media_duration(audio.file_path)
+                    if end_sec is not None:
+                        duration = end_sec - start_sec
+                    elif total is not None:
+                        duration = total - start_sec
+                    else:
+                        duration = None
+                    if duration is not None and duration > 0:
+                        af_parts.append(f"atrim=start={start_sec:.3f}:duration={duration:.3f}")
+                af_parts.append("asetpts=PTS-STARTPTS")
+                vol = audio.enc_settings.get("volume", 1.0)
+                if vol != 1.0:
+                    af_parts.append(f"volume={vol:.2f}")
+                if af_parts:
+                    cmd.extend(["-af", ",".join(af_parts)])
+                # 编码参数
+                enc = audio.enc_settings.get("encoder", "copy")
+                if enc == "copy":
+                    # 如果应用了滤镜，不能使用 copy
+                    if len(af_parts) > 1:  # 有滤镜
+                        enc = "aac"
+                        self._append_info_ui("[封装] 单流混合（音量/截取）强制编码为 aac")
+                    cmd.extend(["-c:a", enc])
+                else:
+                    cmd.extend([
+                        "-c:a", enc,
+                        "-b:a", audio.enc_settings.get("bitrate", "128k"),
+                        "-ar", audio.enc_settings.get("samplerate", "44100")
+                    ])
+                cmd.extend(["-disposition:a:0", "default"])
+                # 未勾选的流被丢弃
+            else:
+                # 多个勾选流 → 使用 amix 混合
+                filter_parts = []
+                inputs = len(mix_tracks)
+                # 构建每个输入流的滤镜链（截取 + 音量调整）
+                for i, audio in enumerate(mix_tracks):
+                    a_idx = file_index[audio.file_path]
+                    af_parts = []
+                    # 截取
+                    if audio.enc_settings.get("trim_enabled", False):
+                        start = audio.enc_settings.get("trim_start", "").strip()
+                        end = audio.enc_settings.get("trim_end", "").strip()
+                        start_sec = time_to_seconds(start) if start else 0.0
+                        end_sec = time_to_seconds(end) if end else None
+                        total = self._get_media_duration(audio.file_path)
+                        if end_sec is not None:
+                            duration = end_sec - start_sec
+                        elif total is not None:
+                            duration = total - start_sec
+                        else:
+                            duration = None
+                        if duration is not None and duration > 0:
+                            af_parts.append(f"atrim=start={start_sec:.3f}:duration={duration:.3f}")
+                    af_parts.append("asetpts=PTS-STARTPTS")
+                    # 音量调整
+                    vol = audio.enc_settings.get("volume", 1.0)
+                    if vol != 1.0:
+                        af_parts.append(f"volume={vol:.2f}")
+                    af_filter = ",".join(af_parts) if af_parts else "null"
+                    if af_filter and af_filter != "null":
+                        filter_parts.append(f"[{a_idx}:a]{af_filter}[a{i}]")
+                        input_label = f"[a{i}]"
+                    else:
+                        filter_parts.append(f"[{a_idx}:a]asetpts=PTS-STARTPTS[a{i}]")
+                        input_label = f"[a{i}]"
     
-        # ---- 字幕、章节、容器优化 ----
+                # 构建 amix 滤镜（权重统一为1.0，因为音量已在之前调整）
+                amix_filter = f"{' '.join(f'[a{i}]' for i in range(inputs))}amix=inputs={inputs}:duration=longest[aout]"
+                filter_parts.append(amix_filter)
+    
+                cmd.extend(["-filter_complex", ";".join(filter_parts)])
+                cmd.extend(["-map", "[aout]"])
+    
+                # 设置音频编码参数（使用第一个勾选轨道的编码设置，或强制 aac）
+                first_mix = mix_tracks[0]
+                enc = first_mix.enc_settings.get("encoder", "aac")
+                if enc == "copy":
+                    enc = "aac"
+                    self._append_info_ui("[封装] 混合模式下编码器不能为 copy，已自动改为 aac")
+                bitrate = first_mix.enc_settings.get("bitrate", "128k")
+                samplerate = first_mix.enc_settings.get("samplerate", "44100")
+                cmd.extend(["-c:a", enc, "-b:a", bitrate, "-ar", samplerate])
+                cmd.extend(["-disposition:a:0", "default"])
+                # 未勾选的流被丢弃，不添加 -map
+    
+        # ---- 字幕 ----
         self._add_subtitles_and_chapters(cmd, enabled_tracks, file_index, input_files)
+    
+        # ---- 容器优化 ----
         self._add_container_optimization(cmd)
     
         cmd.append(output_norm)
@@ -8494,10 +8604,9 @@ class FFmpegBatchGUI:
         track = self.merge_tracks[track_idx]
         with self.SafeToplevel(self.root) as win:
             win.title(f"音频轨道设置 - {track.codec}")
-            center_window(win, 500, 400)
+            center_window(win, 500, 500)
             win.transient(self.root)
     
-            # 主框架
             main_frame = ttk.Frame(win, padding="10")
             main_frame.pack(fill=tk.BOTH, expand=True)
     
@@ -8517,6 +8626,47 @@ class FFmpegBatchGUI:
             samplerate_var = tk.StringVar(value=track.enc_settings.get("samplerate", "44100"))
             ttk.Entry(enc_frame, textvariable=samplerate_var, width=10).grid(row=2, column=1, sticky="w", padx=5, pady=5)
     
+            # ========== 音频混合（仅普通封装模式可用） ==========
+            is_pip = self.pip_enabled.get()
+            is_concat = self.concat_enabled.get()
+            if not is_pip and not is_concat:
+                mix_frame = ttk.LabelFrame(main_frame, text="音频混合 (amix)", padding="5")
+                mix_frame.pack(fill=tk.X, pady=5)
+    
+                self.mix_enabled_var = tk.BooleanVar(value=track.enc_settings.get("mix_enabled", False))
+                mix_cb = ttk.Checkbutton(mix_frame, text="参与混合 (启用后，该流将与其它勾选流合并为单音轨)",
+                                         variable=self.mix_enabled_var)
+                mix_cb.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+                ToolTip(mix_cb,
+                        "勾选后，该音频流将参与混合。\n"
+                        "如果至少一个轨道勾选，则所有勾选的流会通过 amix 滤镜合并为单音轨输出。\n"
+                        "未勾选的流将被丢弃（不输出）。\n"
+                        "若只有一个轨道勾选，则无需混合，直接输出该流。",
+                        wraplength=400)
+    
+                # ---------- 音量调整（替代权重） ----------
+                vol_frame = ttk.Frame(mix_frame)
+                vol_frame.grid(row=1, column=0, columnspan=3, sticky="we", pady=5, padx=5)
+    
+                ttk.Label(vol_frame, text="音量倍数:").pack(side=tk.LEFT)
+                self.volume_var = tk.DoubleVar(value=track.enc_settings.get("volume", 1.0))
+                # 滑块
+                vol_slider = ttk.Scale(vol_frame, from_=0.1, to=3.0, variable=self.volume_var,
+                                       orient=tk.HORIZONTAL, length=150)
+                vol_slider.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+                # 数值显示
+                self.volume_label = ttk.Label(vol_frame, text="1.0", width=5)
+                self.volume_label.pack(side=tk.LEFT)
+                vol_slider.configure(command=lambda v: self.volume_label.config(text=f"{float(v):.2f}"))
+                # 输入框（可选）
+                vol_entry = ttk.Entry(vol_frame, textvariable=self.volume_var, width=6)
+                vol_entry.pack(side=tk.LEFT, padx=5)
+    
+            else:
+                # 其他模式不显示混合控件，但保留变量，避免保存时报错
+                self.mix_enabled_var = tk.BooleanVar(value=track.enc_settings.get("mix_enabled", False))
+                self.volume_var = tk.DoubleVar(value=track.enc_settings.get("volume", 1.0))
+    
             # ---- 截取设置 ----
             trim_frame = ttk.LabelFrame(main_frame, text="音频截取（精确到毫秒）", padding="5")
             trim_frame.pack(fill=tk.X, pady=5)
@@ -8524,35 +8674,35 @@ class FFmpegBatchGUI:
             trim_enabled_var = tk.BooleanVar(value=track.enc_settings.get("trim_enabled", False))
             chk = ttk.Checkbutton(trim_frame, text="启用截取", variable=trim_enabled_var)
             chk.grid(row=0, column=0, columnspan=3, sticky="w", padx=5, pady=5)
-            ToolTip(chk, 
+            ToolTip(chk,
                     "注意：若截取时长短于主视频，输出将以音频为准提前结束，导致主视频内容丢失。\n"
                     "建议截取时长 ≥ 主视频时长，或保持不截取。",
                     wraplength=500)
             ttk.Label(trim_frame, text="开始时间 (HH:MM:SS[.mmm]):").grid(row=1, column=0, sticky="w", padx=5, pady=5)
-
             trim_start_var = tk.StringVar(value=track.enc_settings.get("trim_start", "0"))
             ttk.Entry(trim_frame, textvariable=trim_start_var, width=15).grid(row=1, column=1, sticky="w", padx=5, pady=5)
-
     
             ttk.Label(trim_frame, text="结束时间 (HH:MM:SS[.mmm]):").grid(row=2, column=0, sticky="w", padx=5, pady=5)
             trim_end_var = tk.StringVar(value=track.enc_settings.get("trim_end", ""))
             ttk.Entry(trim_frame, textvariable=trim_end_var, width=15).grid(row=2, column=1, sticky="w", padx=5, pady=5)
             ttk.Label(trim_frame, text="结束时间 (留空到末尾)").grid(row=2, column=2, sticky="w", padx=5, pady=5)
-
-            # 精准模式（保留，但音频 atrim 本身就是精确的）
+    
             precise_trim_var = tk.BooleanVar(value=track.enc_settings.get("precise_trim", False))
             ttk.Checkbutton(trim_frame, text="精准模式（精确到帧）", variable=precise_trim_var).grid(row=3, column=0, columnspan=3, sticky="w", padx=5, pady=5)
     
-            # 提示
             ttk.Label(trim_frame, text="注意：启用截取后，编码器将自动改为非 copy 格式（如 aac）", foreground="gray").grid(row=4, column=0, columnspan=3, sticky="w", padx=5, pady=5)
     
             # ---- 保存按钮 ----
             def save():
-                # 检查截取启用时，编码器是否非 copy
                 enc = encoder_var.get()
                 if trim_enabled_var.get() and enc == "copy":
                     enc = "aac"
                     self._append_info_ui("音频截取启用，编码器已从 copy 改为 aac")
+    
+                # 如果混合启用（仅普通模式），且编码器为 copy，强制改为 aac
+                if not is_pip and not is_concat and self.mix_enabled_var.get() and enc == "copy":
+                    enc = "aac"
+                    self._append_info_ui("音频混合启用，编码器已从 copy 改为 aac")
     
                 track.enc_settings = {
                     "encoder": enc,
@@ -8561,14 +8711,15 @@ class FFmpegBatchGUI:
                     "trim_enabled": trim_enabled_var.get(),
                     "trim_start": trim_start_var.get().strip(),
                     "trim_end": trim_end_var.get().strip(),
-                    "precise_trim": precise_trim_var.get()
+                    "precise_trim": precise_trim_var.get(),
+                    "mix_enabled": self.mix_enabled_var.get(),
+                    "volume": self.volume_var.get(),
                 }
                 self.merge_update_track_list()
                 self.merge_update_command_preview()
                 win.destroy()
     
             ttk.Button(main_frame, text="保存", command=save).pack(pady=10)
-    
             win.wait_window()
 
     def merge_edit_subtitle_track(self, track_idx):
