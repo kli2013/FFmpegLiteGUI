@@ -3546,6 +3546,9 @@ class Track:
                     "chroma_blend": 0.1,
                     "alpha_enabled": False,
                     "alpha_value": 1.0,
+                    "audio_source_type": "self",      # "self" | "silence" | "external"
+                    "external_audio_path": "",
+                    "external_audio_stream": "0:a:0",
                     "enhance": {
                         "denoise_enabled": False,
                         "denoise_spatial": 4.0,
@@ -7804,67 +7807,90 @@ class FFmpegBatchGUI:
 
 
     def _build_concat_reencode_mode(self, cmd, video_tracks, audio_tracks, main_video, output_norm):
-        """重新编码模式 - 使用 filter_complex concat"""
-        # 收集去重视频文件
-        input_files = list(dict.fromkeys(t.file_path for t in video_tracks))  # 保持顺序去重
-
+        """重新编码模式 - 使用 filter_complex concat，支持每个视频独立音频源"""
+        # 收集去重视频文件（视频轨道按顺序）
+        input_files = list(dict.fromkeys(t.file_path for t in video_tracks))
+    
         for f in input_files:
             cmd.extend(["-i", normalize_path(f)])
-
+    
         n = len(input_files)
         filter_parts = []
-
-        # 视频 concat
-        for i in range(n):
+    
+        # 遍历每个视频轨道（按顺序）
+        for i, track in enumerate(video_tracks):
+            # 视频滤镜：setpts
             filter_parts.append(f"[{i}:v]setpts=PTS-STARTPTS[v{i}]")
-        filter_parts.append(
-            f"[{']['.join(f'v{i}' for i in range(n))}]concat=n={n}:v=1:a=0[vout]"
-        )
-
-        # 音频 concat
-        has_audio = bool(audio_tracks)
-        if has_audio:
-            for i in range(n):
+    
+            # ----- 音频源处理 -----
+            audio_source = track.enc_settings.get("audio_source_type", "self")
+            if audio_source == "self":
+                # 使用自身音频流（假设存在）
                 filter_parts.append(f"[{i}:a]asetpts=PTS-STARTPTS[a{i}]")
-            filter_parts.append(
-                f"[{']['.join(f'a{i}' for i in range(n))}]concat=n={n}:v=0:a=1[aout]"
-            )
+            elif audio_source == "silence":
+                # 生成静音流，时长 = 视频片段时长
+                start_str = track.enc_settings.get("trim_start", "").strip()
+                end_str = track.enc_settings.get("trim_end", "").strip()
+                start_sec = time_to_seconds(start_str) if start_str else 0.0
+                end_sec = time_to_seconds(end_str) if end_str else None
+    
+                total_duration = self._get_media_duration(track.file_path)
+                if end_sec is not None:
+                    duration = end_sec - start_sec
+                elif total_duration is not None:
+                    duration = total_duration - start_sec
+                else:
+                    duration = 10.0  # 兜底
+                duration = max(0.1, duration)
+    
+                filter_parts.append(f"anullsrc=r=44100:cl=stereo:duration={duration}[a{i}]")
+            else:
+                # 未知类型，降级为 self
+                self._append_info_ui(f"[串联] 音频源类型 '{audio_source}' 未知，已降级使用视频自身音频")
+                filter_parts.append(f"[{i}:a]asetpts=PTS-STARTPTS[a{i}]")
 
+
+    
+        # ----- 视频 concat -----
+        v_concat = f"[{']['.join(f'v{i}' for i in range(n))}]concat=n={n}:v=1:a=0[vout]"
+        filter_parts.append(v_concat)
+    
+        # ----- 音频 concat -----
+        a_concat = f"[{']['.join(f'a{i}' for i in range(n))}]concat=n={n}:v=0:a=1[aout]"
+        filter_parts.append(a_concat)
+    
         cmd.extend(["-filter_complex", ";".join(filter_parts)])
-        cmd.extend(["-map", "[vout]"])
-        if has_audio:
-            cmd.extend(["-map", "[aout]"])
-        else:
-            cmd.append("-an")
-
-        # 视频编码
-        v_settings = main_video.enc_settings.copy()  # 避免修改原字典
+        cmd.extend(["-map", "[vout]", "-map", "[aout]"])
+    
+        # ----- 视频编码 -----
+        v_settings = main_video.enc_settings.copy()
         vcodec = v_settings.get("encoder", "libx265")
         if vcodec == "copy":
             self._append_info_ui("[串联-编] 重新编码模式下视频编码器自动改为 libx265")
             vcodec = "libx265"
             v_settings["encoder"] = "libx265"
-
+    
         strategy = get_encoder_strategy(vcodec)
         cmd = strategy.build_params(cmd, v_settings)
-
-        # 音频编码
-        if has_audio:
+    
+        # ----- 音频编码 -----
+        if audio_tracks:
             a_settings = audio_tracks[0].enc_settings
             enc = a_settings.get("encoder", "aac")
             if enc == "copy":
                 enc = "aac"
                 self._append_info_ui("[串联-编] 重新编码模式下音频自动从 copy 改为 aac")
-
             cmd.extend([
                 "-c:a", enc,
                 "-b:a", a_settings.get("bitrate", "128k"),
                 "-ar", a_settings.get("samplerate", "44100")
             ])
-
+        else:
+            cmd.extend(["-c:a", "aac", "-b:a", "128k", "-ar", "44100"])
+    
         self._add_container_optimization(cmd)
         cmd.append(output_norm)
-
+    
         self._append_info_ui(f"[串联-编] 使用 filter_complex 重新编码模式（{n} 个片段）")
         return cmd
     
@@ -8168,7 +8194,7 @@ class FFmpegBatchGUI:
     def edit_video_settings(self, title, initial_settings, on_save, file_path=None,
                             is_watermark=False, track_idx=None, pip_enabled_var=None,
                             overlay_mode='sub', parent=None, show_loop_chroma=True,
-                            track_obj=None):
+                            track_obj=None, is_concat_mode=False):
         if parent is None:
             parent = self.root
         with self.SafeToplevel(parent) as win:
@@ -8318,6 +8344,51 @@ class FFmpegBatchGUI:
             overlay_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
             overlay_frame.set_settings(initial_settings)
 
+
+            # ================== 页面6：音频绑定 ==================
+            # 仅在串接模式下显示此页（水印无音频绑定需求）
+            if is_concat_mode and not is_watermark and track_obj is not None and track_obj.type == "video":
+                page_audio_binding = ttk.Frame(notebook)
+                notebook.add(page_audio_binding, text="音频绑定")
+    
+                bind_frame = ttk.Frame(page_audio_binding, padding="10")
+                bind_frame.pack(fill=tk.BOTH, expand=True)
+    
+                ttk.Label(bind_frame, text="音频源类型:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+                audio_source_type_var = tk.StringVar(value=initial_settings.get("audio_source_type", "self"))
+                source_frame = ttk.Frame(bind_frame)
+                source_frame.grid(row=0, column=1, sticky="w", padx=5)
+    
+                rb_self = ttk.Radiobutton(source_frame, text="使用视频自身音频", 
+                                          variable=audio_source_type_var, value="self")
+                rb_silence = ttk.Radiobutton(source_frame, text="生成静音流", 
+                                             variable=audio_source_type_var, value="silence")
+                # 外部音频暂时隐藏，可后续启用
+                # rb_external = ttk.Radiobutton(source_frame, text="从外部文件导入", variable=audio_source_type_var, value="external")
+                rb_self.pack(side=tk.LEFT, padx=5)
+                rb_silence.pack(side=tk.LEFT, padx=5)
+    
+                ttk.Label(
+                    bind_frame,
+                    text="静音流时长自动匹配视频片段时长。\n"
+                         "此功能用于解决串接时因视频缺少音频流导致的音画错位问题。\n"
+                         "注意：此功能会强制重新编码视频（无法使用流复制）。\n"
+                         "如需快速拼接且保留原始编码，可提前用命令生成静音音频文件，\n"
+                         "例如：ffmpeg -f lavfi -i anullsrc=r=44100:cl=stereo -t 10 silence.wav\n"
+                         "然后将该音频流 copy 无损封装到视频中，最后再使用 copy 模式进行串接。",
+                    foreground="gray",
+                    justify=tk.LEFT
+                ).grid(row=1, column=0, columnspan=2, sticky="w", padx=5, pady=10)
+    
+                # 预留外部文件控件（暂时隐藏）
+                # external_frame = ttk.Frame(bind_frame)
+                # external_frame.grid(row=2, column=0, columnspan=2, sticky="we", padx=5, pady=5)
+                # external_frame.grid_remove()
+    
+            # ================== 新增结束 ==================
+
+
+
             # ---- 窗口居中 ----
             center_window(win, 700, 300)
 
@@ -8335,6 +8406,14 @@ class FFmpegBatchGUI:
                         new_settings["enabled"] = True
                         new_settings["file_path"] = initial_settings.get("file_path", "")
                         new_settings["duration"] = initial_settings.get("duration", None)
+                    else:
+                        # 仅在串行模式下收集音频绑定设置
+                        if is_concat_mode and track_obj is not None and track_obj.type == "video":
+                            new_settings["audio_source_type"] = audio_source_type_var.get()
+                            # 以下两项暂不支持，留作未来扩展
+                            # new_settings["external_audio_path"] = ""
+                            # new_settings["external_audio_stream"] = "0:a:0"
+
                     new_settings["enhance"] = filt_frame.get_enhance_settings()
                     on_save(new_settings)
                 except Exception as e:
@@ -8387,7 +8466,8 @@ class FFmpegBatchGUI:
             overlay_mode=overlay_mode,
             parent=self.root,
             show_loop_chroma=show_loop,
-            track_obj=track   # 传递轨道对象
+            track_obj=track,   # 传递轨道对象
+            is_concat_mode=self.concat_enabled.get()
         )
     
     
@@ -8934,6 +9014,67 @@ class FFmpegBatchGUI:
         ).pack(side=tk.LEFT, padx=10)
 
 
+        # ---- 快速命令工具 ----
+        cmd_tool_frame = ttk.LabelFrame(frame, text="快速命令工具", padding="5")
+        cmd_tool_frame.pack(fill=tk.X, pady=5)
+
+        # 顶部：预设下拉 + 输出目录 + 清空
+        top_frame = ttk.Frame(cmd_tool_frame)
+        top_frame.pack(fill=tk.X, pady=2)
+
+        ttk.Label(top_frame, text="预设命令:").pack(side=tk.LEFT)
+        self.cmd_preset_var = tk.StringVar()
+        preset_combo = ttk.Combobox(
+            top_frame,
+            textvariable=self.cmd_preset_var,
+            state="readonly",
+            width=25
+        )
+        preset_combo['values'] = [
+            "生成静音音频 (anullsrc)",
+            "提取关键帧 (关键帧截图)",
+            "查看媒体信息 (ffprobe)",
+            "快速转码测试 (10秒)",
+            "生成测试视频 (彩条)"
+        ]
+        preset_combo.pack(side=tk.LEFT, padx=5)
+        preset_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
+
+
+        ttk.Button(top_frame, text="清空", command=self._clear_cmd_input, width=8).pack(side=tk.LEFT, padx=5)
+
+        # 输出目录（与当前工作目录结合）
+        output_frame = ttk.Frame(top_frame)
+        output_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(15,0))
+        ttk.Label(output_frame, text="输出目录:").pack(side=tk.LEFT)
+        self.cmd_output_path = tk.StringVar(value="")
+        ttk.Entry(output_frame, textvariable=self.cmd_output_path).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(output_frame, text="浏览", command=self._browse_cmd_output).pack(side=tk.LEFT, padx=2)
+
+
+
+        # 命令编辑框（多行）
+        self.cmd_input = scrolledtext.ScrolledText(cmd_tool_frame, height=4, wrap=tk.WORD,
+                                                   font=("Consolas", 9))
+        self.cmd_input.pack(fill=tk.X, pady=5)
+
+        # 底部：运行按钮 + 提示
+        btn_frame = ttk.Frame(cmd_tool_frame)
+        btn_frame.pack(fill=tk.X, pady=2)
+        ttk.Button(btn_frame, text="运行命令", command=self._run_custom_command).pack(side=tk.LEFT, padx=5)
+        ttk.Label(btn_frame, text="（命令在独立线程执行，输出显示在日志区域）",
+                  foreground="gray").pack(side=tk.LEFT, padx=10)
+
+        # 存储命令模板字典（使用占位符 {input} 和 {output_dir}）
+        self.cmd_templates = {
+            "生成静音音频 (anullsrc)": 'ffmpeg -f lavfi -i anullsrc=r=44100:cl=stereo -t 10 "{output_dir}silence.wav"',
+            "提取关键帧 (关键帧截图)": 'ffmpeg -i "{input}" -vf "select=eq(pict_type\\\\,I)" -vsync vfr "{output_dir}thumb_%04d.png"',
+            "查看媒体信息 (ffprobe)": 'ffprobe -v error -show_format -show_streams "{input}"',
+            "快速转码测试 (10秒)": 'ffmpeg -i "{input}" -c:v libx264 -preset ultrafast -t 10 "{output_dir}output_test.mp4"',
+            "生成测试视频 (彩条)": 'ffmpeg -f lavfi -i testsrc=duration=10:size=640x480:rate=30 -c:v libx264 "{output_dir}test.mp4"'
+        }
+
+
         status_frame = ttk.LabelFrame(frame, text="状态检测", padding="5")
         status_frame.pack(fill=tk.X, pady=(15, 5))
         self.status_text = tk.Text(status_frame, height=20, width=80, wrap=tk.WORD,
@@ -8955,6 +9096,85 @@ class FFmpegBatchGUI:
         self.use_mpv.trace_add("write", lambda *a: self.update_player_status())
         self.mpv_path.trace_add("write", lambda *a: self.update_player_status())
         self.update_player_status()
+
+    def _browse_cmd_output(self):
+        path = filedialog.askdirectory(title="选择命令执行目录")
+        if path:
+            self.cmd_output_path.set(normalize_path(path).rstrip('/'))
+    
+    
+    def _on_preset_selected(self, event=None):
+        preset_name = self.cmd_preset_var.get()
+        if preset_name not in self.cmd_templates:
+            return
+    
+        template = self.cmd_templates[preset_name]
+        input_file = self.input_file.get().strip()
+        if not input_file:
+            input_file = "input.mp4"
+    
+        output_dir = self.cmd_output_path.get().strip()
+        if output_dir:
+            # 规范化路径，去除尾部斜杠，添加一个 / 作为分隔符
+            output_dir = normalize_path(output_dir).rstrip('/') + "/"
+        else:
+            output_dir = ""   # 空字符串，文件将生成在当前工作目录
+    
+        cmd = template.replace("{input}", input_file).replace("{output_dir}", output_dir)
+    
+        self.cmd_input.delete(1.0, tk.END)
+        self.cmd_input.insert(tk.END, cmd)
+
+    def _clear_cmd_input(self):
+        """清空命令文本框"""
+        self.cmd_input.delete(1.0, tk.END)
+
+    
+    def _run_custom_command(self):
+        cmd_str = self.cmd_input.get(1.0, tk.END).strip()
+        if not cmd_str:
+            messagebox.showwarning("提示", "请输入要执行的命令")
+            return
+    
+        if not messagebox.askyesno("确认执行", f"将执行以下命令：\n\n{cmd_str}\n\n确定吗？"):
+            return
+    
+        self._append_info_ui(f"\n========== 快速命令开始 ==========")
+        self._append_info_ui(f">>> {cmd_str}")
+    
+        # 获取输出目录，若为空则使用当前目录作为工作目录
+        cwd = self.cmd_output_path.get().strip()
+        if not cwd or not os.path.exists(cwd):
+            cwd = os.getcwd()
+            self._append_info_ui(f"输出目录为空，使用当前目录：{cwd}")
+    
+        def run_thread():
+            try:
+                proc = subprocess.Popen(
+                    cmd_str,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.PIPE,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    shell=True,
+                    cwd=cwd,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                )
+                for line in proc.stdout:
+                    self.safe_append_detail(line)
+                retcode = proc.wait()
+                if retcode == 0:
+                    self._append_info_ui(f"✅ 命令执行成功 (返回码 {retcode})")
+                else:
+                    self._append_info_ui(f"❌ 命令执行失败 (返回码 {retcode})")
+            except Exception as e:
+                self._append_info_ui(f"❌ 命令执行异常: {e}")
+            finally:
+                self._append_info_ui("========== 快速命令结束 ==========\n")
+    
+        threading.Thread(target=run_thread, daemon=True).start()
 
     def open_preset_folder(self):
         folder = os.path.dirname(self.preset_file_path)
