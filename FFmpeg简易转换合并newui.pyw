@@ -3687,6 +3687,8 @@ class FFmpegBatchGUI:
         self._watermark_precise_hint_shown = False
         self._preview_after_id = None   # after 回调 ID
         self._preview_pending = False   # 是否有待处理的刷新
+        
+        self.cmd_output_path = tk.StringVar(value="")
 
         self._duration_cache = {}
         self._dimension_cache = {}
@@ -4479,6 +4481,10 @@ class FFmpegBatchGUI:
         self.log_enabled_var.set(settings.get("log_enabled", True))
         self.log_path_var.set(settings.get("log_path", os.path.join(get_script_dir(), "editlog.txt")))
         self.overwrite_policy.set(settings.get("overwrite_policy", "ask"))
+        cmd_path = settings.get("cmd_output_path", "")
+        if cmd_path:
+            self.cmd_output_path.set(cmd_path)
+
 
     def save_player_settings(self):
         self.preset_manager.save_player_settings({
@@ -4486,7 +4492,8 @@ class FFmpegBatchGUI:
             "mpv_path": self.mpv_path.get(),
             "log_enabled": self.log_enabled_var.get(),
             "log_path": self.log_path_var.get(),
-            "overwrite_policy": self.overwrite_policy.get()
+            "overwrite_policy": self.overwrite_policy.get(),
+            "cmd_output_path": self.cmd_output_path.get()
         })
 
     def preview_with_player(self, input_path, filters=None, audio_only=False, volume=10, extra_args=None):
@@ -9186,7 +9193,10 @@ class FFmpegBatchGUI:
             "提取关键帧 (关键帧截图)",
             "查看媒体信息 (ffprobe)",
             "快速转码测试 (10秒)",
-            "生成测试视频 (彩条)"
+            "生成测试视频 (彩条)",
+            "生成测试视频 (动态)",
+            "生成黑色背景视频",
+            "生成雪花视频"
         ]
         preset_combo.pack(side=tk.LEFT, padx=5)
         preset_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
@@ -9198,8 +9208,8 @@ class FFmpegBatchGUI:
         output_frame = ttk.Frame(top_frame)
         output_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(15,0))
         ttk.Label(output_frame, text="输出目录:").pack(side=tk.LEFT)
-        self.cmd_output_path = tk.StringVar(value="")
-        ttk.Entry(output_frame, textvariable=self.cmd_output_path).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        entry = ttk.Entry(output_frame, textvariable=self.cmd_output_path)
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         ttk.Button(output_frame, text="浏览", command=self._browse_cmd_output).pack(side=tk.LEFT, padx=2)
 
 
@@ -9218,11 +9228,14 @@ class FFmpegBatchGUI:
 
         # 存储命令模板字典（使用占位符 {input} 和 {output_dir}）
         self.cmd_templates = {
-            "生成静音音频 (anullsrc)": 'ffmpeg -f lavfi -i anullsrc=r=44100:cl=stereo -t 10 "{output_dir}silence.wav"',
-            "提取关键帧 (关键帧截图)": 'ffmpeg -i "{input}" -vf "select=eq(pict_type\\\\,I)" -vsync vfr "{output_dir}thumb_%04d.png"',
+            "生成静音音频 (anullsrc)": 'ffmpeg -y -f lavfi -i anullsrc=r=44100:cl=stereo -t 10 "{output_dir}silence.wav"',
+            "提取关键帧 (关键帧截图)": 'ffmpeg -y -i "{input}" -vf "select=eq(pict_type\\\\,I)" -vsync vfr "{output_dir}thumb_%04d.png"',
             "查看媒体信息 (ffprobe)": 'ffprobe -v error -show_format -show_streams "{input}"',
-            "快速转码测试 (10秒)": 'ffmpeg -i "{input}" -c:v libx264 -preset ultrafast -t 10 "{output_dir}output_test.mp4"',
-            "生成测试视频 (彩条)": 'ffmpeg -f lavfi -i testsrc=duration=10:size=640x480:rate=30 -c:v libx264 "{output_dir}test.mp4"'
+            "快速转码测试 (10秒)": 'ffmpeg -y -i "{input}" -c:v libx264 -preset ultrafast -t 10 "{output_dir}output_test.mp4"',
+            "生成测试视频 (彩条)": 'ffmpeg -y -f lavfi -i testsrc=duration=10:size=640x480:rate=30 -c:v libx264 "{output_dir}test.mp4"',
+            "生成测试视频 (动态)": 'ffmpeg -y -f lavfi -i testsrc2=duration=10:size=640x480:rate=30 -c:v libx264 "{output_dir}test2.mp4"',
+            "生成黑色背景视频": 'ffmpeg -y -f lavfi -i color=c=black:s=vga:r=25 -c:v libx264 -t 10 "{output_dir}out_color.mp4"',
+            "生成雪花视频": 'ffmpeg -y -f lavfi -i "nullsrc=s=640x480:r=25,geq=random(1)*255:128:128" -c:v libx264 -t 10 "{output_dir}out_snow.mp4"'
         }
 
 
@@ -9252,6 +9265,7 @@ class FFmpegBatchGUI:
         path = filedialog.askdirectory(title="选择命令执行目录")
         if path:
             self.cmd_output_path.set(normalize_path(path).rstrip('/'))
+            self.save_player_settings()
     
     
     def _on_preset_selected(self, event=None):
@@ -9282,6 +9296,7 @@ class FFmpegBatchGUI:
 
     
     def _run_custom_command(self):
+        """执行命令文本框中的命令，在独立线程中运行，支持全局停止"""
         cmd_str = self.cmd_input.get(1.0, tk.END).strip()
         if not cmd_str:
             messagebox.showwarning("提示", "请输入要执行的命令")
@@ -9290,22 +9305,25 @@ class FFmpegBatchGUI:
         if not messagebox.askyesno("确认执行", f"将执行以下命令：\n\n{cmd_str}\n\n确定吗？"):
             return
     
-        self._append_info_ui(f"\n========== 快速命令开始 ==========")
-        self._append_info_ui(f">>> {cmd_str}")
-    
-        # 获取输出目录，若为空则使用当前目录作为工作目录
+        # 获取输出目录
         cwd = self.cmd_output_path.get().strip()
         if not cwd or not os.path.exists(cwd):
             cwd = os.getcwd()
-            self._append_info_ui(f"输出目录为空，使用当前目录：{cwd}")
+            self.cmd_output_path.set(cwd)
     
+        # 在独立线程中执行，避免阻塞UI
         def run_thread():
+            self._append_info_ui(f"\n========== 快速命令开始 ==========")
+            self._append_info_ui(f">>> {cmd_str}")
+            self._append_info_ui(f"工作目录: {cwd}")
+    
+            proc = None
             try:
                 proc = subprocess.Popen(
                     cmd_str,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    stdin=subprocess.PIPE,
+                    stdin=subprocess.PIPE,          # 启用 stdin 以便发送 q
                     text=True,
                     encoding='utf-8',
                     errors='replace',
@@ -9313,8 +9331,14 @@ class FFmpegBatchGUI:
                     cwd=cwd,
                     creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
                 )
+                # 添加到进程列表（加锁）
+                with self._proc_lock:
+                    self.running_procs.append(proc)
+    
+                # 逐行读取输出
                 for line in proc.stdout:
                     self.safe_append_detail(line)
+    
                 retcode = proc.wait()
                 if retcode == 0:
                     self._append_info_ui(f"✅ 命令执行成功 (返回码 {retcode})")
@@ -9323,8 +9347,13 @@ class FFmpegBatchGUI:
             except Exception as e:
                 self._append_info_ui(f"❌ 命令执行异常: {e}")
             finally:
+                # 从进程列表移除（加锁）
+                with self._proc_lock:
+                    if proc in self.running_procs:
+                        self.running_procs.remove(proc)
                 self._append_info_ui("========== 快速命令结束 ==========\n")
     
+        # 启动线程
         threading.Thread(target=run_thread, daemon=True).start()
 
     def open_preset_folder(self):
