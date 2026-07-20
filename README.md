@@ -21,7 +21,7 @@
 | **音频处理** | 多音轨混合（amix）、音量调整、静音填充、截取。 |
 | **水印叠加** | 图片/视频水印，支持循环、绿幕抠像、自适应尺寸与位置。 |
 | **任务管理** | 多任务并行队列，支持全局停止（发送 q 信号），并可自定义 FFmpeg 命令。 |
-| **预设与工具** | 预设管理（保存/加载）、内置常用命令模板、播放器预览（mpv/ffplay）。 |
+| **预设与工具** | 预设管理（保存/加载）、播放器预览（mpv/ffplay）。 |
 
 
 ---
@@ -34,7 +34,7 @@
 
 契机是 **HandBrake** 又双叒叕换了 **.NET 10**（软件开发框架），我的老 Windows 10 LTSC 2021 装了 .NET 10，运行 HandBrake 依然报错。当时就在想，一个破 FFmpeg 的外壳，需要这么追新吗？
 
-然后在 **52pj** 看到了另外一个 FFmpeg 的 GUI 外壳：[https://www.52pojie.cn/forum.php?mod=viewthread&tid=2099752&highlight=FFmpeg](https://www.52pojie.cn/forum.php?mod=viewthread&tid=2099752&highlight=FFmpeg)，也是用的 .NET 10，我又用不了--------------------------------------不过后来想办法体验了一下，很难用，没他宣传的那么直观简单。
+然后在 **52pj** 看到了另外一个 FFmpeg 的 GUI 外壳：[https://www.52pojie.cn/forum.php?mod=viewthread&tid=2099752&highlight=FFmpeg](https://www.52pojie.cn/forum.php?mod=viewthread&tid=2099752&highlight=FFmpeg)，也是用的 .NET 10，我又用不了--------------------------------------不过后来想办法体验了一下，很难用，没他宣传的那么直观简单。然后还会释放一个驱动,不知道一个 `FFmpeg` 外壳弄个驱动是要干嘛,膈应人,必须用powertool等内核软件才能删除
 
 我一气之下就气了一下，借着这个拼接命令的灵感，找 AI 根据我以前用的一个 bat（里面是我各种 FFmpeg 命令的模板，每次都手动改 goto1234 保存在发送文件运行）写了一个简易 GUI。
 
