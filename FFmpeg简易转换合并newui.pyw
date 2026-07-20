@@ -3197,9 +3197,10 @@ class AdvancedFrame(ttk.LabelFrame):
                 "【注意】\n"
                 "• 如果添加了 -vf / -filter_complex / -af / -map 等，会覆盖界面生成的对应设置（滤镜、音频滤镜、流映射）。\n"
                 "  如需保留界面生成的滤镜链，请在自定义参数中复制完整的 -vf 链（可从预览区复制）并扩展。\n\n"
-                "• 界面上已单独提供的参数（如 tune、profile、level、maxrate、bufsize）请勿重复添加，以免冲突。\n"
+                "• 界面上已单独提供的参数（如 tune、profile、level、maxrate、bufsize）请勿重复添加，以免冲突。\n\n"
+                "• 追加自定义 -t 时间 可作为应急措施，强制限制输出时长，防止因滤镜循环或参数不当导致输出无限延长（主水印模式）。\n\n"
                 "• 新手建议：仅添加界面未提供的高级选项（如 -x264-params、-bsf 等），避免覆盖关键设置。",
-                wraplength=500)
+                wraplength=800)
         self.custom_args = tk.StringVar(value="")
         self.custom_entry = ttk.Entry(custom_frame, textvariable=self.custom_args, width=50)
         self.custom_entry.pack(fill=tk.X, pady=2)
@@ -3685,6 +3686,12 @@ class FFmpegBatchGUI:
         self._duration_cache = {}
         self._dimension_cache = {}
 
+
+
+
+        self._proc_lock = threading.Lock()
+        self.running_procs = []  # 存储当前正在运行的 FFmpeg 进程对象（subprocess.Popen）
+
         self.segment_enabled = tk.BooleanVar(value=False)
         self.segments = []
 
@@ -3761,6 +3768,63 @@ class FFmpegBatchGUI:
 
         self.show_quick_warning()
 
+
+
+    def stop_all_transcodes(self):
+        """停止所有转码进程"""
+        with self._proc_lock:
+            # 清理已结束的
+            self.running_procs = [p for p in self.running_procs if p.poll() is None]
+            
+            if not self.running_procs:
+                self.root.after(0, lambda: messagebox.showinfo("提示", "当前没有正在运行的转码进程"))
+                return
+    
+        if not messagebox.askyesno("确认停止", 
+                                   f"将停止 {len(self.running_procs)} 个正在运行的转码进程，确定吗？"):
+            return
+    
+        with self._proc_lock:
+            procs = list(self.running_procs)   # 安全拷贝
+    
+        # 发送 q
+        for proc in procs:
+            if proc.poll() is None and proc.stdin:
+                try:
+                    proc.stdin.write('q\n')
+                    proc.stdin.flush()
+                    self._append_info_ui(f"[停止] 已向进程 {proc.pid} 发送停止指令")
+                except Exception as e:
+                    self._append_info_ui(f"[停止] 发送 q 到进程 {proc.pid} 失败: {e}")
+    
+        # 3秒后检查并 terminate
+        self.root.after(3000, lambda: self._check_and_terminate(procs))
+    
+    def _check_and_terminate(self, procs):
+        still_alive = [p for p in procs if p.poll() is None]
+        if not still_alive:
+            self._append_info_ui("[停止] 所有进程已正常退出")
+            return
+    
+        for p in still_alive:
+            try:
+                p.terminate()
+                self._append_info_ui(f"[停止] 已 terminate 进程 {p.pid}")
+            except Exception as e:
+                self._append_info_ui(f"[停止] terminate 进程 {p.pid} 失败: {e}")
+    
+        # 最终 kill
+        self.root.after(3000, lambda: self._kill_remaining(still_alive))
+    
+    def _kill_remaining(self, procs):
+        for p in procs:
+            if p.poll() is None:
+                try:
+                    p.kill()
+                    self._append_info_ui(f"[停止] 已 kill 进程 {p.pid}")
+                except Exception as e:
+                    self._append_info_ui(f"[停止] kill 进程 {p.pid} 失败: {e}")
+    
 
 
 
@@ -6290,20 +6354,41 @@ class FFmpegBatchGUI:
         cmd_str = format_cmd_for_display(task.cmd)
         self._append_info_ui(f">>> {cmd_str}")
         self.ensure_output_dir(task.output)
-
-        def on_line(line):
-            self.safe_append_detail(line)
-
-        retcode, output = run_ffmpeg_command(task.cmd, on_output_line=on_line)
-        if retcode == 0:
-            task.status = "完成"
-            self._append_info_ui(f"✅ 任务完成: {os.path.basename(task.input)}")
-            self._log_command_to_file(cmd_str)
-        else:
-            task.status = "失败"
-            task.error_msg = f"返回码 {retcode}"
-            self._append_info_ui(f"任务失败: {os.path.basename(task.input)} (返回码 {retcode})")
-        self._update_task_list_ui()
+    
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                task.cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            )
+            with self._proc_lock:
+                self.running_procs.append(proc)
+    
+            for line in proc.stdout:
+                self.safe_append_detail(line)
+    
+            retcode = proc.wait()
+            if retcode == 0:
+                task.status = "完成"
+                self._append_info_ui(f"✅ 任务完成: {os.path.basename(task.input)}")
+                self._log_command_to_file(cmd_str)
+            else:
+                task.status = "失败"
+                task.error_msg = f"返回码 {retcode}"
+                self._append_info_ui(f"任务失败: {os.path.basename(task.input)} (返回码 {retcode})")
+            self._update_task_list_ui()
+        except Exception as e:
+            self._append_info_ui(f"任务异常: {e}")
+        finally:
+            with self._proc_lock:
+                if proc in self.running_procs:
+                    self.running_procs.remove(proc)
         return task
 
     def _on_task_done(self, future):
@@ -6369,14 +6454,37 @@ class FFmpegBatchGUI:
         self._append_info_ui(f"\n========== 当前选择转码: {os.path.basename(input_name)} ==========")
         cmd_str = format_cmd_for_display(cmd_list)
         self._append_info_ui(f">>> {cmd_str}")
-        def on_line(line):
-            self.safe_append_detail(line)
-        retcode, _ = run_ffmpeg_command(cmd_list, on_output_line=on_line)
-        if retcode == 0:
-            self._append_info_ui(f"✅ 当前选择转码完成: {os.path.basename(input_name)}")
-            self._log_command_to_file(cmd_str)
-        else:
-            self._append_info_ui(f"当前选择转码失败，返回码 {retcode}")
+    
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                cmd_list,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            )
+            with self._proc_lock:
+                self.running_procs.append(proc)
+    
+            for line in proc.stdout:
+                self.safe_append_detail(line)
+    
+            retcode = proc.wait()
+            if retcode == 0:
+                self._append_info_ui(f"✅ 当前选择转码完成: {os.path.basename(input_name)}")
+                self._log_command_to_file(cmd_str)
+            else:
+                self._append_info_ui(f"当前选择转码失败，返回码 {retcode}")
+        except Exception as e:
+            self._append_info_ui(f"转码异常: {e}")
+        finally:
+            with self._proc_lock:
+                if proc in self.running_procs:
+                    self.running_procs.remove(proc)
 
     def ensure_output_dir(self, output_path):
         dirname = os.path.dirname(output_path)
@@ -6837,9 +6945,9 @@ class FFmpegBatchGUI:
 
         ToolTip(chk_manual,
             "勾选后，将使用您输入的时长作为输出总时长（手动 -t）。\n\n"
-            "适用于需要精确控制输出长度（如去除片尾多余黑色淡出）的场景。\n\n"
+            "主要用途：作为应急保险，防止因滤镜循环或参数不当导致输出无限延长（尤其是画中画模式）。\n\n"
             "「视频转码」页面可使用自定义参数 -t 实现同功能。",
-            wraplength=400
+            wraplength=600
         )
 
 
@@ -8531,19 +8639,33 @@ class FFmpegBatchGUI:
             self._append_info_ui("[封装] 命令列表为空，无法执行")
             self.root.after(0, lambda: self.merge_btn.config(state="normal"))
             return
+    
         self._append_info_ui("[封装] 开始合并/转码...")
-        output_file = final_output  # 使用最终路径
+        output_file = final_output
         source_files = set()
         source_files.add(self.merge_video.get().strip())
         for t in self.merge_tracks:
             if t.enabled and t.file_path not in source_files:
                 source_files.add(t.file_path)
+    
+        proc = None
         try:
-            proc = subprocess.Popen(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, encoding='utf-8', errors='replace',
-                                    creationflags=0x08000000 if sys.platform == "win32" else 0)
+            proc = subprocess.Popen(
+                cmd_list,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                creationflags=0x08000000 if sys.platform == "win32" else 0
+            )
+            with self._proc_lock:
+                self.running_procs.append(proc)
+    
             for line in proc.stdout:
                 self.safe_append_detail(line)
+    
             ret = proc.wait()
             if ret == 0:
                 self._append_info_ui("[封装] ✅ 处理完成")
@@ -8561,6 +8683,9 @@ class FFmpegBatchGUI:
         except Exception as e:
             self._append_info_ui(f"[封装] 异常: {e}")
         finally:
+            with self._proc_lock:
+                if proc in self.running_procs:
+                    self.running_procs.remove(proc)
             self.root.after(0, lambda: self.merge_btn.config(state="normal"))
 
     def _confirm_delete_sources(self, source_files, output_file):
@@ -8788,6 +8913,26 @@ class FFmpegBatchGUI:
         # 绑定事件，保存设置
         self.overwrite_policy.trace_add("write", lambda *a: self.save_player_settings())
 
+        # ---- 停止所有转码按钮 ----
+        stop_frame = ttk.Frame(frame)
+        stop_frame.pack(fill=tk.X, pady=5)
+        
+        stop_btn = tk.Button(
+            stop_frame,
+            text="停止所有转码",
+            command=self.stop_all_transcodes,
+            bg="#f44336",
+            fg="white",
+            font=("", 10, "bold")
+        )
+        stop_btn.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(
+            stop_frame,
+            text="（向所有正在运行的 FFmpeg 进程发送停止信号，主要用于紧急停止因水印/画中画循环参数截断失效而无限延伸的转码，无需手动去任务管理器结束进程）",
+            foreground="gray"
+        ).pack(side=tk.LEFT, padx=10)
+
 
         status_frame = ttk.LabelFrame(frame, text="状态检测", padding="5")
         status_frame.pack(fill=tk.X, pady=(15, 5))
@@ -8804,6 +8949,8 @@ class FFmpegBatchGUI:
                                      "未启用时使用 ffplay 预览。",
                         foreground="gray", wraplength=500, justify=tk.LEFT)
         tip.pack(anchor=tk.W, pady=(10,0))
+
+
         self.update_mpv_path_state()
         self.use_mpv.trace_add("write", lambda *a: self.update_player_status())
         self.mpv_path.trace_add("write", lambda *a: self.update_player_status())
@@ -9432,7 +9579,7 @@ class SegmentEditor:
         
         # 添加 ToolTip
         ToolTip(cmd_frame, 
-                "在此粘贴 FFmpeg 裁剪命令（每行一条），程序会自动提取其中的 -ss 和 -t/-to 时间参数。\n"
+                "在此粘贴 FFmpeg 截取命令（每行一条），程序会自动提取其中的 -ss 和 -t/-to 时间参数。\n"
                 "点击「解析并导入所有片段」即可将提取的时间段添加到左侧列表。\n"
                 "提示：此为高级功能，普通用户可直接在左侧手动添加片段。",
                 wraplength=400)
