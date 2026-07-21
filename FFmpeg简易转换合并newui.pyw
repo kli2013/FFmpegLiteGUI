@@ -1293,14 +1293,15 @@ class VideoFilterFrame(ttk.LabelFrame):
         ttk.Checkbutton(scale_frame, text="启用缩放", variable=self.scale_enabled).pack(side=tk.LEFT)
         ttk.Radiobutton(scale_frame, text="宽度(高度自动)", variable=self.scale_method, value="width").pack(side=tk.LEFT, padx=(10,0))
         ttk.Entry(scale_frame, textvariable=self.scale_width, width=6).pack(side=tk.LEFT)
-        ttk.Label(scale_frame, text="px").pack(side=tk.LEFT)
+
         ttk.Radiobutton(scale_frame, text="高度(宽度自动)", variable=self.scale_method, value="height").pack(side=tk.LEFT, padx=10)
         ttk.Entry(scale_frame, textvariable=self.scale_height, width=6).pack(side=tk.LEFT)
-        ttk.Label(scale_frame, text="px").pack(side=tk.LEFT)
+
         ttk.Radiobutton(scale_frame, text="精确宽×高", variable=self.scale_method, value="exact").pack(side=tk.LEFT, padx=10)
         ttk.Entry(scale_frame, textvariable=self.scale_width, width=6).pack(side=tk.LEFT)
         ttk.Label(scale_frame, text="×").pack(side=tk.LEFT)
         ttk.Entry(scale_frame, textvariable=self.scale_height, width=6).pack(side=tk.LEFT)
+        ttk.Button(scale_frame, text="⇄", command=self._swap_width_height, width=3).pack(side=tk.LEFT, padx=2)
     
         crop_frame = ttk.Frame(left_frame)
         crop_frame.pack(fill=tk.X, pady=2)
@@ -1419,6 +1420,13 @@ class VideoFilterFrame(ttk.LabelFrame):
                                           values=self.PIX_FMTS, width=12, state="normal")
         self.pix_fmt_combo.pack(side=tk.LEFT, padx=5)
 
+
+    def _swap_width_height(self):
+        """交换宽度和高度数值"""
+        w = self.scale_width.get().strip()
+        h = self.scale_height.get().strip()
+        self.scale_width.set(h)
+        self.scale_height.set(w)
 
     def extract_video_frame_scaled(self, input_file, output_png_path, frame_sec=0.0,
                                     target_width=None, target_height=None):
@@ -3644,6 +3652,13 @@ class FFmpegBatchGUI:
         self.ffplay_cmd = find_executable("ffplay.exe") or find_executable("ffplay")
         self.ffprobe_cmd = find_executable("ffprobe.exe") or find_executable("ffprobe")
 
+        # 自定义 FFmpeg 目录设置
+        self.ffmpeg_dir_enabled = tk.BooleanVar(value=False)
+        self.ffmpeg_dir_path = tk.StringVar(value="")
+        # 初始化路径（需在 load_player_settings 之前调用）
+        self._update_ffmpeg_paths()
+
+
         # 基本变量
         self.input_file = tk.StringVar()
         self.output_dir = tk.StringVar()
@@ -3652,7 +3667,7 @@ class FFmpegBatchGUI:
         self.output_container = tk.StringVar(value="mp4")
         
         self.log_enabled_var = tk.BooleanVar(value=True)
-        default_log_path = os.path.join(get_script_dir(), "editlog.txt")
+        default_log_path = normalize_path(os.path.join(get_script_dir(), "editlog.txt"))
         self.log_path_var = tk.StringVar(value=default_log_path)
 
         self.tasks = []
@@ -3775,7 +3790,32 @@ class FFmpegBatchGUI:
 
         self.show_quick_warning()
 
-
+    def _update_ffmpeg_paths(self):
+        """根据自定义目录设置更新 ffmpeg/ffprobe/ffplay 路径，并统一斜杠"""
+        if self.ffmpeg_dir_enabled.get() and self.ffmpeg_dir_path.get().strip():
+            base_dir = normalize_path(self.ffmpeg_dir_path.get().strip())
+            ext = ".exe" if sys.platform == "win32" else ""
+            ffmpeg = normalize_path(os.path.join(base_dir, f"ffmpeg{ext}"))
+            ffprobe = normalize_path(os.path.join(base_dir, f"ffprobe{ext}"))
+            ffplay = normalize_path(os.path.join(base_dir, f"ffplay{ext}"))
+            if os.path.exists(ffmpeg):
+                self.ffmpeg_cmd = ffmpeg
+                self.ffprobe_cmd = ffprobe if os.path.exists(ffprobe) else None
+                self.ffplay_cmd = ffplay if os.path.exists(ffplay) else None
+                if not self.ffprobe_cmd:
+                    self._append_info_ui("警告：指定 FFmpeg 目录下未找到 ffprobe，部分功能可能受限")
+                if not self.ffplay_cmd:
+                    self._append_info_ui("警告：指定 FFmpeg 目录下未找到 ffplay，预览功能可能受限")
+                return
+            else:
+                self._append_info_ui("警告：指定 FFmpeg 目录下未找到 ffmpeg，将使用系统 PATH 中的版本")
+        # 回退到系统 PATH，并规范化路径
+        ffmpeg = find_executable("ffmpeg.exe") or find_executable("ffmpeg")
+        ffprobe = find_executable("ffprobe.exe") or find_executable("ffprobe")
+        ffplay = find_executable("ffplay.exe") or find_executable("ffplay")
+        self.ffmpeg_cmd = normalize_path(ffmpeg) if ffmpeg else None
+        self.ffprobe_cmd = normalize_path(ffprobe) if ffprobe else None
+        self.ffplay_cmd = normalize_path(ffplay) if ffplay else None
 
     def stop_all_transcodes(self):
         """停止所有转码进程"""
@@ -4479,12 +4519,19 @@ class FFmpegBatchGUI:
         self.mpv_path.set(settings.get("mpv_path", "mpv"))
         # 读取日志设置，缺失时使用默认值
         self.log_enabled_var.set(settings.get("log_enabled", True))
-        self.log_path_var.set(settings.get("log_path", os.path.join(get_script_dir(), "editlog.txt")))
+        log_path = settings.get("log_path", os.path.join(get_script_dir(), "editlog.txt"))
+        self.log_path_var.set(normalize_path(log_path))
         self.overwrite_policy.set(settings.get("overwrite_policy", "ask"))
         cmd_path = settings.get("cmd_output_path", "")
         if cmd_path:
             self.cmd_output_path.set(cmd_path)
-
+        # 读取 FFmpeg 目录设置
+        ffmpeg_dir_enabled = settings.get("ffmpeg_dir_enabled", False)
+        ffmpeg_dir_path = settings.get("ffmpeg_dir_path", "")
+        self.ffmpeg_dir_enabled.set(ffmpeg_dir_enabled)
+        self.ffmpeg_dir_path.set(ffmpeg_dir_path)
+        # 更新路径
+        self._update_ffmpeg_paths()
 
     def save_player_settings(self):
         self.preset_manager.save_player_settings({
@@ -4493,7 +4540,9 @@ class FFmpegBatchGUI:
             "log_enabled": self.log_enabled_var.get(),
             "log_path": self.log_path_var.get(),
             "overwrite_policy": self.overwrite_policy.get(),
-            "cmd_output_path": self.cmd_output_path.get()
+            "cmd_output_path": self.cmd_output_path.get(),
+            "ffmpeg_dir_enabled": self.ffmpeg_dir_enabled.get(),
+            "ffmpeg_dir_path": self.ffmpeg_dir_path.get()
         })
 
     def preview_with_player(self, input_path, filters=None, audio_only=False, volume=10, extra_args=None):
@@ -9127,8 +9176,35 @@ class FFmpegBatchGUI:
         log_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         ttk.Button(log_frame, text="浏览", command=self.browse_log_file).pack(side=tk.LEFT, padx=5)
 
+        # ---- FFmpeg 版本目录（自定义） ----
+        ffmpeg_row = ttk.Frame(frame)
+        ffmpeg_row.pack(fill=tk.X, pady=5)
 
-        # ---- 新增：同名文件处理策略 ----
+        chk = ttk.Checkbutton(ffmpeg_row, text="启用自定义 FFmpeg 目录", variable=self.ffmpeg_dir_enabled,
+                              command=self._on_ffmpeg_dir_changed)
+        chk.pack(side=tk.LEFT, padx=0)
+
+        # 添加 ToolTip
+        ToolTip(chk,
+            "硬件编码需要 FFmpeg 版本与显卡驱动 API 兼容。\n"
+            "常见对应关系：\n"
+            "• NVIDIA: FFmpeg 6.1 需 NVENC API 12.1；FFmpeg 7.0 需 NVENC SDK 13.0\n"
+            "• AMD: FFmpeg 要求 AMF SDK 版本 ≥ 1.4.23 (较新版本要求可能更高)\n"
+            "• Intel QSV / Apple VideoToolbox 由系统框架决定\n"
+            "若遇到编码器初始化失败（如 API 版本不匹配），\n"
+            "可尝试切换 FFmpeg 版本或更新显卡驱动。",
+            wraplength=700
+        )
+
+        entry = ttk.Entry(ffmpeg_row, textvariable=self.ffmpeg_dir_path, width=40)
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        ttk.Button(ffmpeg_row, text="浏览", command=self._browse_ffmpeg_dir).pack(side=tk.LEFT, padx=2)
+
+        self.ffmpeg_dir_path.trace_add('write', self._on_ffmpeg_dir_changed)
+
+
+        # ---- 同名文件处理策略 ----
         policy_frame = ttk.LabelFrame(frame, text="全局同名文件处理策略", padding="5")
         policy_frame.pack(fill=tk.X, pady=5)
         
@@ -9216,7 +9292,7 @@ class FFmpegBatchGUI:
 
         # 命令编辑框（多行）
         self.cmd_input = scrolledtext.ScrolledText(cmd_tool_frame, height=4, wrap=tk.WORD,
-                                                   font=("Consolas", 9))
+                                                   font=("", 9))
         self.cmd_input.pack(fill=tk.X, pady=5)
 
         # 底部：运行按钮 + 提示
@@ -9260,6 +9336,22 @@ class FFmpegBatchGUI:
         self.use_mpv.trace_add("write", lambda *a: self.update_player_status())
         self.mpv_path.trace_add("write", lambda *a: self.update_player_status())
         self.update_player_status()
+
+
+    def _browse_ffmpeg_dir(self):
+        path = filedialog.askdirectory(title="选择 FFmpeg 所在目录")
+        if path:
+            self.ffmpeg_dir_path.set(normalize_path(path))
+            self.ffmpeg_dir_enabled.set(True)
+            self._on_ffmpeg_dir_changed()
+    
+    def _on_ffmpeg_dir_changed(self):
+        self._update_ffmpeg_paths()
+        self.save_player_settings()
+        # 刷新命令预览（因为 ffmpeg 路径改变了）
+        self.update_command_preview()
+        self.update_player_status()
+
 
     def _browse_cmd_output(self):
         path = filedialog.askdirectory(title="选择命令执行目录")
@@ -9386,20 +9478,24 @@ class FFmpegBatchGUI:
             return
         self.status_text.config(state=tk.NORMAL)
         self.status_text.delete(1.0, tk.END)
-        preset_path = self.preset_file_path
+    
+        # 预设信息
+        preset_path = normalize_path(self.preset_file_path)
         if os.path.exists(preset_path):
             preset_status = "✓ 文件存在"
         else:
             preset_status = "✗ 文件不存在（将自动创建）"
-        local_preset = os.path.join(get_script_dir(), "ffmpeg_presets.json")
+        local_preset = normalize_path(os.path.join(get_script_dir(), "ffmpeg_presets.json"))
         if preset_path == local_preset:
             source = "脚本目录（便携模式）"
         else:
             source = "用户目录（%USERPROFILE%\\.FFLiteGUI）"
         self.status_text.insert(tk.END, f"预设配置文件: {preset_path}\n")
         self.status_text.insert(tk.END, f"配置来源: {source}  | 状态: {preset_status}\n\n")
+    
+        # mpv 预览状态
         if self.use_mpv.get():
-            mpv_path = self.mpv_path.get().strip()
+            mpv_path = normalize_path(self.mpv_path.get().strip())
             self.status_text.insert(tk.END, "mpv 预览: 已启用\n")
             if mpv_path:
                 if os.path.exists(mpv_path) and os.access(mpv_path, os.X_OK):
@@ -9412,40 +9508,71 @@ class FFmpegBatchGUI:
         else:
             self.status_text.insert(tk.END, "预览播放器: ffplay（未启用 mpv）\n")
             if self.ffplay_cmd and os.path.exists(self.ffplay_cmd):
-                self.status_text.insert(tk.END, f"  ffplay 路径: {self.ffplay_cmd}  →  ✓ 可用\n")
+                self.status_text.insert(tk.END, f"  ffplay 路径: {normalize_path(self.ffplay_cmd)}  →  ✓ 可用\n")
             else:
                 self.status_text.insert(tk.END, f"  ffplay 未找到，请将 ffplay.exe 放在脚本目录或添加到 PATH。\n")
-        self.status_text.insert(tk.END, "\n--- FFmpeg 全家桶检测 ---\n")
+    
+        # ---- 当前 FFmpeg 全家桶路径（实际使用） ----
+        self.status_text.insert(tk.END, "\n--- 当前 FFmpeg 全家桶路径（实际使用） ---\n")
+        tools = [('ffmpeg', self.ffmpeg_cmd), ('ffprobe', self.ffprobe_cmd), ('ffplay', self.ffplay_cmd)]
+        for name, path in tools:
+            if path:
+                # 规范化路径显示
+                display_path = normalize_path(path)
+                # 判断来源
+                if self.ffmpeg_dir_enabled.get() and self.ffmpeg_dir_path.get().strip():
+                    base_dir = normalize_path(self.ffmpeg_dir_path.get().strip())
+                    if os.path.dirname(display_path) == base_dir:
+                        source_str = "自定义"
+                    else:
+                        source_str = "系统PATH"
+                else:
+                    source_str = "系统PATH"
+                self.status_text.insert(tk.END, f"  {name}: {display_path}  →  {source_str}\n")
+            else:
+                self.status_text.insert(tk.END, f"  {name}: 未找到\n")
+    
+        # ---- 环境变量 PATH 中的 FFmpeg 全家桶检测（只显示存在的） ----
+        self.status_text.insert(tk.END, "\n--- 环境变量 PATH 中的 FFmpeg 全家桶检测 ---\n")
         tools = ['ffmpeg', 'ffplay', 'ffprobe']
         script_dir = get_script_dir()
-        self.status_text.insert(tk.END, f"当前目录 ({script_dir}):\n")
+        self.status_text.insert(tk.END, f"当前目录 ({normalize_path(script_dir)}):\n")
+        found_any = False
         for tool in tools:
             exe_name = tool + ".exe" if sys.platform == "win32" else tool
             local_path = os.path.join(script_dir, exe_name)
-            exists = os.path.isfile(local_path) and os.access(local_path, os.X_OK)
-            status = "✓ 存在" if exists else "✗ 不存在"
-            self.status_text.insert(tk.END, f"  {exe_name}: {status}\n")
-        
-        # ---- 新增 _internal 目录检测 ----
+            if os.path.isfile(local_path) and os.access(local_path, os.X_OK):
+                self.status_text.insert(tk.END, f"  {exe_name}: ✓ 存在 → {local_path}\n")
+                found_any = True
+        if not found_any:
+            self.status_text.insert(tk.END, "  无\n")
+    
         if getattr(sys, 'frozen', False):
             internal_dir = os.path.join(script_dir, '_internal')
             if os.path.isdir(internal_dir):
                 self.status_text.insert(tk.END, f"\n_internal 目录 ({internal_dir}):\n")
+                found_any = False
                 for tool in tools:
                     exe_name = tool + ".exe" if sys.platform == "win32" else tool
                     internal_path = os.path.join(internal_dir, exe_name)
-                    exists = os.path.isfile(internal_path) and os.access(internal_path, os.X_OK)
-                    status = "✓ 存在" if exists else "✗ 不存在"
-                    self.status_text.insert(tk.END, f"  {exe_name}: {status}\n")
+                    if os.path.isfile(internal_path) and os.access(internal_path, os.X_OK):
+                        self.status_text.insert(tk.END, f"  {exe_name}: ✓ 存在 → {internal_path}\n")
+                        found_any = True
+                if not found_any:
+                    self.status_text.insert(tk.END, "  无\n")
+    
         self.status_text.insert(tk.END, "环境变量 PATH:\n")
         import shutil
+        found_any = False
         for tool in tools:
             path_in_path = shutil.which(tool)
             if path_in_path:
-                self.status_text.insert(tk.END, f"  {tool}: ✓ 找到 → {path_in_path}\n")
-            else:
-                self.status_text.insert(tk.END, f"  {tool}: ✗ 未找到\n")
+                self.status_text.insert(tk.END, f"  {tool}: ✓ 找到 → {normalize_path(path_in_path)}\n")
+                found_any = True
+        if not found_any:
+            self.status_text.insert(tk.END, "  无\n")
         self.status_text.insert(tk.END, "（提示：FFmpeg 全家桶用于编码、解码、预览等核心功能，建议确保 ffmpeg、ffplay、ffprobe 三者均可访问）\n")
+    
         self.status_text.config(state=tk.DISABLED)
 
     def on_player_changed(self):
