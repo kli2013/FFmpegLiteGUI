@@ -2913,48 +2913,19 @@ class LoopChromaFrame(ttk.LabelFrame):
 class OverlayPositionFrame(ttk.LabelFrame):
     """
     叠加位置（子视频）或画布偏移（主视频）设置组件。
-    仅用于封装/合并模块的轨道编辑，不用于水印编辑器。
+    仅用于画中画或水印模式，始终显示控件。
     """
     def __init__(self, master, app, mode='sub', track_idx=None, track_obj=None,
-                 pip_enabled_var=None, filt_frame=None, visual_callback=None, **kwargs):
+                 filt_frame=None, visual_callback=None, **kwargs):
         super().__init__(master, **kwargs)
         self.app = app
         self.mode = mode
         self.track_idx = track_idx
         self.track_obj = track_obj
-        self.pip_enabled_var = pip_enabled_var
         self.filt_frame = filt_frame
-        self.visual_callback = visual_callback   # 新增
+        self.visual_callback = visual_callback
         self._controls = []
-        self._rebuild()
-
-        if self.pip_enabled_var is not None:
-            self.pip_enabled_var.trace_add('write', lambda *a: self._rebuild())
-
-    def _rebuild(self):
-        """清除所有子控件，根据画中画状态重建"""
-        # 检查窗口是否还存在（避免在销毁后调用）
-        if not self.winfo_exists():
-            return
-        for child in self.winfo_children():
-            child.destroy()
-        self._controls.clear()
-        if (self.pip_enabled_var is None) or self.pip_enabled_var.get():
-            self._create_controls()
-        else:
-            self._create_message()
-
-    def _create_message(self):
-        """显示提示信息（画中画未启用）"""
-        msg = (
-            "当前未启用画中画模式。\n"
-            "如需调整叠加/偏移参数，请先在主界面勾选“启用画中画”。\n"
-            "注意：给视频流选择重新编码，不能使用 copy。"
-        )
-        label = ttk.Label(self, text=msg, justify="center", foreground="gray",
-                          font=("Microsoft YaHei", 12, "bold"))
-        label.pack(expand=True, anchor='center', pady=20)
-        self._controls.append(label)
+        self._create_controls()
 
     def _create_controls(self):
         if self.mode == 'sub':
@@ -3002,13 +2973,13 @@ class OverlayPositionFrame(ttk.LabelFrame):
             btn.pack(side=tk.LEFT, padx=2, pady=2)
             self._controls.append(btn)
 
-        # 可视化编辑（传入 filt_frame 以便同步缩放设置）
+        # 可视化编辑
         def open_visual():
             if not self.overlay_enabled.get():
                 messagebox.showinfo("提示", "请先勾选「启用叠加」再使用可视化编辑功能。")
                 return
             if self.visual_callback is not None:
-                self.visual_callback()   # 调用外部传入的回调
+                self.visual_callback()
             elif self.app and self.track_idx is not None:
                 parent_win = self.winfo_toplevel()
                 self.app.open_visual_overlay_editor(
@@ -3025,12 +2996,12 @@ class OverlayPositionFrame(ttk.LabelFrame):
         self._controls.append(btn)
 
     def _create_main_controls(self):
-        """主视频画布偏移控件（与之前相同）"""
+        """主视频画布偏移控件"""
         self.pad_enabled = tk.BooleanVar(value=False)
         cb = ttk.Checkbutton(self, text="启用画布偏移", variable=self.pad_enabled)
         cb.pack(anchor=tk.W, pady=(0,5))
         self._controls.append(cb)
-    
+
         w_frame = ttk.Frame(self)
         w_frame.pack(fill=tk.X, pady=2)
         ttk.Label(w_frame, text="画布宽度:").pack(side=tk.LEFT)
@@ -3038,13 +3009,11 @@ class OverlayPositionFrame(ttk.LabelFrame):
         entry = ttk.Entry(w_frame, textvariable=self.pad_width, width=10)
         entry.pack(side=tk.LEFT, padx=5)
         self._controls.extend([w_frame, entry])
-    
+
         if self.app:
             def fetch_size():
-                # 获取主视频文件路径
                 main_file = self.app.merge_video.get().strip() if self.app.merge_video else ""
                 if not main_file or not os.path.exists(main_file):
-                    # 尝试从主界面输入文件获取
                     main_file = self.app.input_file.get().strip() if self.app.input_file else ""
                 if not main_file or not os.path.exists(main_file):
                     messagebox.showerror("错误", "未找到主视频文件，请先设置主视频")
@@ -3059,7 +3028,7 @@ class OverlayPositionFrame(ttk.LabelFrame):
             btn = ttk.Button(w_frame, text="获取尺寸", command=fetch_size)
             btn.pack(side=tk.LEFT, padx=5)
             self._controls.append(btn)
-    
+
         h_frame = ttk.Frame(self)
         h_frame.pack(fill=tk.X, pady=2)
         ttk.Label(h_frame, text="画布高度:").pack(side=tk.LEFT)
@@ -3075,6 +3044,15 @@ class OverlayPositionFrame(ttk.LabelFrame):
         entry = ttk.Entry(ox_frame, textvariable=self.offset_x, width=10)
         entry.pack(side=tk.LEFT, padx=5)
         self._controls.extend([ox_frame, entry])
+
+        oy_frame = ttk.Frame(self)
+        oy_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(oy_frame, text="偏移 Y:").pack(side=tk.LEFT)
+        self.offset_y = tk.StringVar(value="0")
+        entry = ttk.Entry(oy_frame, textvariable=self.offset_y, width=10)
+        entry.pack(side=tk.LEFT, padx=5)
+        self._controls.extend([oy_frame, entry])
+
 
         def open_pad_editor():
             if not self.pad_enabled.get():
@@ -3093,25 +3071,11 @@ class OverlayPositionFrame(ttk.LabelFrame):
                 )
             else:
                 messagebox.showinfo("提示", "无法启动可视化编辑：缺少轨道索引")
-        btn = ttk.Button(ox_frame, text="🎨 可视化编辑画布偏移", command=open_pad_editor)
-        btn.pack(side=tk.LEFT, padx=5)
+        btn = ttk.Button(self, text="🎨 可视化编辑画布偏移", command=open_pad_editor)
+        btn.pack(side=tk.LEFT,pady=5)
         self._controls.append(btn)
 
-        oy_frame = ttk.Frame(self)
-        oy_frame.pack(fill=tk.X, pady=2)
-        ttk.Label(oy_frame, text="偏移 Y:").pack(side=tk.LEFT)
-        self.offset_y = tk.StringVar(value="0")
-        entry = ttk.Entry(oy_frame, textvariable=self.offset_y, width=10)
-        entry.pack(side=tk.LEFT, padx=5)
-        self._controls.extend([oy_frame, entry])
-
-        tip = ttk.Label(self, text="⚠ 预览模式下无法体现偏移效果，请转码后查看", foreground="red")
-        tip.pack(fill=tk.X, pady=(10,0))
-        self._controls.append(tip)
-
     def get_settings(self):
-        if self.pip_enabled_var is not None and not self.pip_enabled_var.get():
-            return {}
         if self.mode == 'sub':
             return {
                 "overlay_enabled": self.overlay_enabled.get(),
@@ -3128,8 +3092,6 @@ class OverlayPositionFrame(ttk.LabelFrame):
             }
 
     def set_settings(self, settings):
-        if self.pip_enabled_var is not None and not self.pip_enabled_var.get():
-            return
         if self.mode == 'sub':
             self.overlay_enabled.set(settings.get("overlay_enabled", True))
             self.overlay_x.set(settings.get("overlay_x", "W-w-10"))
@@ -6693,7 +6655,7 @@ class FFmpegBatchGUI:
             ttk.Label(
                 page_segment,
                 text="勾选启用后，视频将按片段列表裁剪并拼接，所有片段使用相同的全局编码/滤镜设置。\n\n"
-                     "   建议使用（mpv、PotPlayer）等播放器打开视频，定位到需要的起始/结束帧，将时间（格式如 01:23.456）填入左侧输入框。\n\n"
+                     "   建议使用（mpv、PotPlayer）等播放器打开视频，定位并获取精确到毫秒的时间。\n\n"
                      "   典型用途：简单混剪、去中间广告、提取精华片段等。",
                 foreground="grey",
                 wraplength=800,
@@ -7685,7 +7647,7 @@ class FFmpegBatchGUI:
         vcodec = v_settings.get("encoder", "copy")
     
         if vcodec == "copy":
-            self._append_info_ui("[封装] 编码器为 copy，已忽略所有视频滤镜。")
+ #           self._append_info_ui("[封装] 编码器为 copy，已忽略所有视频滤镜。")
             cmd.extend(["-c:v", "copy"])
         else:
             # 构建视频滤镜
@@ -7835,6 +7797,9 @@ class FFmpegBatchGUI:
                 cmd.extend(["-c:a", enc, "-b:a", bitrate, "-ar", samplerate])
                 cmd.extend(["-disposition:a:0", "default"])
                 # 未勾选的流被丢弃，不添加 -map
+                
+                # amix模式 以最短流结束 通常是主音频
+                cmd.append("-shortest")
     
         # ---- 字幕 ----
         self._add_subtitles_and_chapters(cmd, enabled_tracks, file_index, input_files)
@@ -8454,61 +8419,63 @@ class FFmpegBatchGUI:
             trim_frame.trim_start.trace_add('write', update_duration_on_trim_change)
             trim_frame.trim_end.trace_add('write', update_duration_on_trim_change)
 
-            # ---- 页面5：叠加/偏移 ----
-            page_overlay = ttk.Frame(notebook)
-            notebook.add(page_overlay, text="叠加/偏移")
 
-            if is_watermark:
-                def watermark_visual_callback():
-                    main_file = self.input_file.get().strip()
-                    if not main_file or not os.path.exists(main_file):
-                        messagebox.showwarning("提示", "请先在主界面选择一个输入文件作为画布")
-                        return
-                    main_w, main_h = get_video_rotated_dimensions(self.ffprobe_cmd, main_file, {})
-                    if main_w is None:
-                        main_w, main_h = 1280, 720
-                    wm_file = initial_settings.get("file_path", "")
-                    if not wm_file or not os.path.exists(wm_file):
-                        messagebox.showwarning("提示", "水印文件未设置或不存在")
-                        return
-                    filt_settings = filt_frame.get_settings()
-                    orig_w, orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, wm_file, {})
-                    if orig_w is None:
-                        orig_w, orig_h = 320, 240
-                    rendered = compute_rendered_size(orig_w, orig_h, filt_settings)
-                    if rendered:
-                        wm_w, wm_h = rendered
-                    else:
-                        wm_w, wm_h = 320, 240
-                    self._simple_visual_overlay(main_w, main_h, wm_w, wm_h,
-                                                overlay_frame.overlay_x,
-                                                overlay_frame.overlay_y,
-                                                parent=win)
+            # ---- 页面5：叠加/偏移（仅在画中画或水印模式下显示） ----
+            overlay_frame = None
+            show_overlay = is_watermark or (pip_enabled_var is not None and pip_enabled_var.get())
+            if show_overlay:
+                page_overlay = ttk.Frame(notebook)
+                notebook.add(page_overlay, text="叠加/偏移")
 
-                overlay_frame = OverlayPositionFrame(
-                    page_overlay,
-                    app=self,
-                    mode='sub',
-                    track_idx=None,
-                    track_obj=None,
-                    pip_enabled_var=None,
-                    filt_frame=filt_frame,
-                    visual_callback=watermark_visual_callback
-                )
-            else:
-                overlay_frame = OverlayPositionFrame(
-                    page_overlay,
-                    app=self,
-                    mode=overlay_mode,
-                    track_idx=track_idx,
-                    track_obj=None,
-                    pip_enabled_var=pip_enabled_var,
-                    filt_frame=filt_frame,
-                    visual_callback=None
-                )
-
-            overlay_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-            overlay_frame.set_settings(initial_settings)
+                if is_watermark:
+                    # 水印模式，使用 visual_callback
+                    def watermark_visual_callback():
+                        main_file = self.input_file.get().strip()
+                        if not main_file or not os.path.exists(main_file):
+                            messagebox.showwarning("提示", "请先在主界面选择一个输入文件作为画布")
+                            return
+                        main_w, main_h = get_video_rotated_dimensions(self.ffprobe_cmd, main_file, {})
+                        if main_w is None:
+                            main_w, main_h = 1280, 720
+                        wm_file = initial_settings.get("file_path", "")
+                        if not wm_file or not os.path.exists(wm_file):
+                            messagebox.showwarning("提示", "水印文件未设置或不存在")
+                            return
+                        filt_settings = filt_frame.get_settings()
+                        orig_w, orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, wm_file, {})
+                        if orig_w is None:
+                            orig_w, orig_h = 320, 240
+                        rendered = compute_rendered_size(orig_w, orig_h, filt_settings)
+                        if rendered:
+                            wm_w, wm_h = rendered
+                        else:
+                            wm_w, wm_h = 320, 240
+                        self._simple_visual_overlay(main_w, main_h, wm_w, wm_h,
+                                                    overlay_frame.overlay_x,
+                                                    overlay_frame.overlay_y,
+                                                    parent=win)
+                    overlay_frame = OverlayPositionFrame(
+                        page_overlay,
+                        app=self,
+                        mode='sub',
+                        track_idx=None,
+                        track_obj=None,
+                        filt_frame=filt_frame,
+                        visual_callback=watermark_visual_callback
+                    )
+                else:
+                    # 画中画模式（或主视频偏移）
+                    overlay_frame = OverlayPositionFrame(
+                        page_overlay,
+                        app=self,
+                        mode=overlay_mode,
+                        track_idx=track_idx,
+                        track_obj=None,
+                        filt_frame=filt_frame,
+                        visual_callback=None
+                    )
+                overlay_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+                overlay_frame.set_settings(initial_settings)
 
 
             # ================== 页面6：音频绑定 ==================
@@ -8567,7 +8534,8 @@ class FFmpegBatchGUI:
                     new_settings.update(trim_frame.get_settings())
                     if loop_chroma_frame is not None:
                         new_settings.update(loop_chroma_frame.get_settings())
-                    new_settings.update(overlay_frame.get_settings())
+                    if overlay_frame is not None:
+                        new_settings.update(overlay_frame.get_settings())
                     if is_watermark:
                         new_settings["enabled"] = True
                         new_settings["file_path"] = initial_settings.get("file_path", "")
@@ -9248,6 +9216,7 @@ class FFmpegBatchGUI:
         ).pack(side=tk.LEFT, padx=10)
 
 
+
         # ---- 快速命令工具 ----
         cmd_tool_frame = ttk.LabelFrame(frame, text="快速命令工具", padding="5")
         cmd_tool_frame.pack(fill=tk.X, pady=5)
@@ -9258,22 +9227,42 @@ class FFmpegBatchGUI:
 
         ttk.Label(top_frame, text="预设命令:").pack(side=tk.LEFT)
         self.cmd_preset_var = tk.StringVar()
+
+        # 存储命令模板字典（使用占位符 {input} 和 {output_dir}）
+        self.cmd_templates = {
+            # ========== 默认==========
+            "生成静音音频 (anullsrc)": 'ffmpeg -y -f lavfi -i anullsrc=r=44100:cl=stereo -t 10 "{output_dir}silence.wav"',
+            "提取关键帧 (关键帧截图)": 'ffmpeg -y -i "{input}" -vf "select=eq(pict_type\\\\,I)" -vsync vfr "{output_dir}thumb_%04d.png"',
+            "查看媒体信息 (ffprobe)": 'ffprobe -v error -show_format -show_streams "{input}"',
+            "快速转码测试 (10秒)": 'ffmpeg -y -i "{input}" -c:v libx264 -preset ultrafast -t 10 "{output_dir}output_test.mp4"',
+            "生成测试视频 (彩条)": 'ffmpeg -y -f lavfi -i testsrc=duration=10:size=640x480:rate=30 -c:v libx264 "{output_dir}test.mp4"',
+            "生成测试视频 (动态)": 'ffmpeg -y -f lavfi -i testsrc2=duration=10:size=640x480:rate=30 -c:v libx264 "{output_dir}test2.mp4"',
+            "生成黑色背景视频": 'ffmpeg -y -f lavfi -i color=c=black:s=vga:r=25 -c:v libx264 -t 10 "{output_dir}out_color.mp4"',
+            "生成雪花视频": 'ffmpeg -y -f lavfi -i "nullsrc=s=640x480:r=25,geq=random(1)*255:128:128" -c:v libx264 -t 10 "{output_dir}out_snow.mp4"',
+            "生成滴一声": 'ffmpeg -y -f lavfi -i "sine=frequency=1000:duration=0.2,apad=pad_dur=0.3" "{output_dir}beep.wav"',
+            "生成滴持续": 'ffmpeg -y -f lavfi -i "sine=frequency=900:duration=10" "{output_dir}beeplong.wav"',
+
+            "生成分形曼德博图案": 'ffmpeg -y -f lavfi -i "mandelbrot=s=640x480:r=25" -c:v libx264 -t 10 "{output_dir}mandelbrot.mp4"',
+            "生成透明纯色视频(ProRes)": 'ffmpeg -y -f lavfi -i "color=c=#00000000:s=640x480:r=25,format=rgba" -c:v prores_ks -t 10 "{output_dir}transparent_bg.mov"',
+            "元胞自动机": 'ffmpeg -f lavfi -i cellauto -vf format=yuv420p -c:v libx264 -t 10 "{output_dir}cellauto.mp4"',
+            "生命活动": 'ffmpeg -f lavfi -i life -vf format=yuv420p -c:v libx264 -t 10 "{output_dir}life.mp4"',
+
+            "生成白噪音 (静电噪音)": 'ffmpeg -y -f lavfi -i "anoisesrc=duration=10:colour=white" "{output_dir}white_noise.wav"',
+            "生成粉噪音 (柔和噪声)": 'ffmpeg -y -f lavfi -i "anoisesrc=duration=10:colour=pink" "{output_dir}pink_noise.wav"',
+            "生成正弦波音频": 'ffmpeg -f lavfi -i "aevalsrc=sin(440*2*PI*t)" -t 5 "{output_dir}sin⁡_noise.wav"',
+
+
+            "按帧率提取图片 (30)": 'ffmpeg -i "{input}" -vf "fps=30" "{output_dir}output_frame_%04d.jpg"',
+        }
+
+
         preset_combo = ttk.Combobox(
             top_frame,
             textvariable=self.cmd_preset_var,
             state="readonly",
             width=25
         )
-        preset_combo['values'] = [
-            "生成静音音频 (anullsrc)",
-            "提取关键帧 (关键帧截图)",
-            "查看媒体信息 (ffprobe)",
-            "快速转码测试 (10秒)",
-            "生成测试视频 (彩条)",
-            "生成测试视频 (动态)",
-            "生成黑色背景视频",
-            "生成雪花视频"
-        ]
+        preset_combo['values'] = list(self.cmd_templates.keys())
         preset_combo.pack(side=tk.LEFT, padx=5)
         preset_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
 
@@ -9302,17 +9291,7 @@ class FFmpegBatchGUI:
         ttk.Label(btn_frame, text="（命令在独立线程执行，输出显示在日志区域）",
                   foreground="gray").pack(side=tk.LEFT, padx=10)
 
-        # 存储命令模板字典（使用占位符 {input} 和 {output_dir}）
-        self.cmd_templates = {
-            "生成静音音频 (anullsrc)": 'ffmpeg -y -f lavfi -i anullsrc=r=44100:cl=stereo -t 10 "{output_dir}silence.wav"',
-            "提取关键帧 (关键帧截图)": 'ffmpeg -y -i "{input}" -vf "select=eq(pict_type\\\\,I)" -vsync vfr "{output_dir}thumb_%04d.png"',
-            "查看媒体信息 (ffprobe)": 'ffprobe -v error -show_format -show_streams "{input}"',
-            "快速转码测试 (10秒)": 'ffmpeg -y -i "{input}" -c:v libx264 -preset ultrafast -t 10 "{output_dir}output_test.mp4"',
-            "生成测试视频 (彩条)": 'ffmpeg -y -f lavfi -i testsrc=duration=10:size=640x480:rate=30 -c:v libx264 "{output_dir}test.mp4"',
-            "生成测试视频 (动态)": 'ffmpeg -y -f lavfi -i testsrc2=duration=10:size=640x480:rate=30 -c:v libx264 "{output_dir}test2.mp4"',
-            "生成黑色背景视频": 'ffmpeg -y -f lavfi -i color=c=black:s=vga:r=25 -c:v libx264 -t 10 "{output_dir}out_color.mp4"',
-            "生成雪花视频": 'ffmpeg -y -f lavfi -i "nullsrc=s=640x480:r=25,geq=random(1)*255:128:128" -c:v libx264 -t 10 "{output_dir}out_snow.mp4"'
-        }
+
 
 
         status_frame = ttk.LabelFrame(frame, text="状态检测", padding="5")
@@ -9787,21 +9766,13 @@ class FFmpegBatchGUI:
         ttk.Label(
             segment_tab,
             text="勾选启用后，视频将按片段列表裁剪并拼接，所有片段使用相同的全局编码/滤镜设置。\n\n"
-                 "   建议使用（mpv、PotPlayer）等播放器打开视频，定位到需要的起始/结束帧，将时间（格式如 01:23.456）填入左侧输入框。ffplay 简易预览功能看不到时间。\n\n"
+                 "   建议使用（mpv、PotPlayer）等播放器打开视频，定位并获取精确到毫秒的时间。\n\n"
                  "   典型用途：简单混剪、去中间广告、提取精华片段等。",
             foreground="grey",
             wraplength=1100,
             justify=tk.LEFT
         ).pack(anchor=tk.W, padx=10, pady=(5,0))
-        
-        # 红色警告（关于任务队列的提示）
-        ttk.Label(
-            segment_tab,
-            text="建议：该功能主要用于单个文件的片段重组，不推荐作为模板批量添加到「任务队列」中，（多个片段时间不通用）。",
-            foreground="red",
-            wraplength=900,
-            justify=tk.LEFT
-        ).pack(anchor=tk.W, padx=10, pady=(0,5))
+
 
 
         adv_page = ttk.Frame(param_notebook)
