@@ -863,30 +863,154 @@ def get_encoder_strategy(encoder: str) -> EncoderStrategy:
 
 # ================== 视频编码与质量组件 ==================
 class VideoEncoderFrame(ttk.LabelFrame):
-    def __init__(self, parent, refresh_callback=None, **kwargs):
+
+    ENCODER_PROFILES = {
+        # 软件编码
+        "libx264":    ["无", "baseline", "main", "high", "high10", "high422", "high444"],
+        "libx265":    ["无", "main", "main10", "main422-10", "main444-8", "main444-10"],
+        "libvpx-vp9": ["无", "0", "1", "2", "3"],
+        "libsvtav1":  ["无", "main", "high", "professional"],
+        "mpeg4":      ["无"],
+        "libxvid":    ["无"],
+        "libtheora":  ["无"],
+
+        # NVIDIA NVENC
+        "h264_nvenc": ["无", "baseline", "main", "high"],
+        "hevc_nvenc": ["无", "main", "main10"],
+        "av1_nvenc":  ["无", "main", "high", "professional"],
+
+        # Intel QSV
+        "h264_qsv":   ["无", "baseline", "main", "high"],
+        "hevc_qsv":   ["无", "main", "main10"],
+        "av1_qsv":    ["无", "main", "high", "professional"],
+
+        # AMD AMF
+        "h264_amf":   ["无", "baseline", "main", "high"],
+        "hevc_amf":   ["无", "main", "main10"],
+        "av1_amf":    ["无", "main", "high", "professional"],
+
+        # VAAPI
+        "h264_vaapi": ["无", "baseline", "main", "high"],
+        "hevc_vaapi": ["无", "main", "main10"],
+
+        # VideoToolbox
+        "h264_videotoolbox": ["无", "baseline", "main", "high"],
+        "hevc_videotoolbox": ["无", "main", "main10"],
+
+        # 专业格式
+        "prores_ks":  ["无", "proxy", "lt", "standard", "hq", "4444", "4444xq"],
+        "prores_aw":  ["无", "standard", "hq", "4444"],
+        "dnxhdenc":   ["无"],
+        "ffv1":       ["无"],
+        "libopenjpeg":["无"],
+
+        # 图片/动图
+        "gif":        ["无"],
+        "libwebp":    ["无"],
+    }
+    DEFAULT_PROFILES = ["无"]
+
+    ENCODER_PRESETS = {
+        # 软件编码（libx264/libx265 等）
+        "libx264":    ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"],
+        "libx265":    ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"],
+        "libvpx-vp9": ["good", "best", "rt"],   # VP9 的预设
+        "libsvtav1":  ["0", "1", "2", "3", "4", "5", "6", "7", "8"],   # SVT-AV1 预设 0~8，速度从快到慢
+        "mpeg4":      ["medium"],
+        "libxvid":    ["medium"],
+        "libtheora":  ["medium"],
+
+        # NVENC
+        "h264_nvenc": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
+        "hevc_nvenc": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
+        "av1_nvenc":  ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
+
+        # Intel QSV
+        "h264_qsv":   ["veryfast", "faster", "fast", "medium", "slow", "slower"],
+        "hevc_qsv":   ["veryfast", "faster", "fast", "medium", "slow", "slower"],
+        "av1_qsv":    ["veryfast", "faster", "fast", "medium", "slow", "slower"],
+
+        # AMD AMF (常用)
+        "h264_amf":   ["quality", "speed", "balanced"],
+        "hevc_amf":   ["quality", "speed", "balanced"],
+        "av1_amf":    ["quality", "speed", "balanced"],
+
+        # VAAPI (Linux)
+        "h264_vaapi": ["quality", "speed"],
+        "hevc_vaapi": ["quality", "speed"],
+
+        # VideoToolbox (macOS)
+        "h264_videotoolbox": ["default", "quality", "speed"],
+        "hevc_videotoolbox": ["default", "quality", "speed"],
+
+        # 专业格式/无损（一般无预设或只支持默认）
+        "prores_ks":  ["standard", "hq", "4444", "4444xq"],
+        "prores_aw":  ["standard", "hq", "4444"],
+        "dnxhdenc":   ["medium"],
+        "ffv1":       ["medium"],
+        "libopenjpeg":["medium"],
+        "gif":        ["medium"],
+        "libwebp":    ["medium"],
+    }
+    DEFAULT_PRESETS = ["medium"]   # 未知编码器 fallback
+
+
+    def __init__(self, parent, app, refresh_callback=None, **kwargs):
         super().__init__(parent, text="视频编码与质量", padding="5", **kwargs)
-        self.refresh_callback = refresh_callback  # 保存刷新函数
+        self.app = app                     # 保存主界面引用
+        self.refresh_callback = refresh_callback
         self._suppress_update = False
+        self._last_encoder = None          # 用于记录上次编码器
+        self._suppress_copy_hint = False   # 加载预设时禁止提示
         self.create_widgets()
         self.setup_bindings()
 
     def create_widgets(self):
-        ttk.Label(self, text="编码器:").grid(row=0, column=0, sticky="w", padx=5, pady=2)
+        self.encoder_label = ttk.Label(self, text="编码器:")
+        self.encoder_label.grid(row=0, column=0, sticky="w", padx=5, pady=2)
+        ToolTip(self.encoder_label,
+                "【编码器分类说明】\n"
+                "• 流复制: copy (直接复制流，不重新编码)\n"
+                "• 软件编码: libx264, libx265, libvpx-vp9, libsvtav1, mpeg4, libxvid, libtheora\n"
+                "  兼容性好，画质优，适合通用场景\n"
+                "• NVIDIA NVENC: h264_nvenc, hevc_nvenc, av1_nvenc\n"
+                "  硬件加速，编码速度快，适合实时处理\n"
+                "• Intel QSV: h264_qsv, hevc_qsv, av1_qsv\n"
+                "  Intel 集显硬件加速，低功耗\n"
+                "• AMD AMF: h264_amf, hevc_amf, av1_amf\n"
+                "  AMD 显卡硬件加速\n"
+                "• 其他硬件: h264_vaapi, hevc_vaapi (Linux VAAPI),\n"
+                "  h264_videotoolbox, hevc_videotoolbox (macOS)\n"
+                "• 专业/无损格式: prores_ks, prores_aw, dnxhdenc, ffv1, libopenjpeg\n"
+                "• 图片/动图: gif, libwebp\n"
+                "提示: 硬件编码速度快但画质可能略逊，软件编码兼容性最佳。\n"
+                "• 硬件编码还需要 FFmpeg 版本和显卡 API 对应。\n",
+                wraplength=600)
+
         self.vcodec = tk.StringVar(value="libx265")
         self.vcodec_combo = ttk.Combobox(self, textvariable=self.vcodec,
                                          values=ALL_VIDEO_ENCODERS, state="readonly", width=18)
         self.vcodec_combo.grid(row=0, column=1, sticky="w", padx=5, pady=2)
-        
+
         preset_frame = ttk.Frame(self)
         preset_frame.grid(row=0, column=2, sticky="w", padx=5, pady=2)
-        ttk.Label(preset_frame, text="编码预设:").pack(side=tk.LEFT, padx=(0,5))
+        preset_label = ttk.Label(preset_frame, text="编码预设:")
+        preset_label.pack(side=tk.LEFT, padx=(0,5))
+        ToolTip(preset_label,
+                "编码预设控制速度与压缩效率的平衡，推荐保持默认 medium。\n\n"
+                "• 软件编码器：ultrafast ~ veryslow（速度递减，画质/压缩率递增）\n"
+                "• NVENC 硬件：p1 ~ p7（p1 最快，p7 画质最好）\n"
+                "• QSV 硬件：veryfast ~ slower（类似软件预设）\n"
+                "• AMF 硬件：quality / speed / balanced\n"
+                "• 其他编码器请参考 FFmpeg 文档",
+                wraplength=500)
+
         self.preset = tk.StringVar(value="medium")
         self.preset_combo = ttk.Combobox(preset_frame, textvariable=self.preset,
-                                         values=["ultrafast","superfast","veryfast","faster","fast",
-                                                 "medium","slow","slower","veryslow",
-                                                 "p1","p2","p3","p4","p5","p6","p7"],
+                                         values=[],          # ← 初始为空
                                          state="readonly", width=12)
         self.preset_combo.pack(side=tk.LEFT)
+
 
         ttk.Label(self, text="码率控制:").grid(row=2, column=0, sticky="w", padx=5, pady=2)
         self.rate_control_type = tk.StringVar(value="crf")
@@ -915,7 +1039,7 @@ class VideoEncoderFrame(ttk.LabelFrame):
         self.gif_options_btn = ttk.Button(self.gif_btn_frame, text="GIF 输出选项...", command=self.open_gif_options)
         self.gif_options_btn.pack(side=tk.LEFT)
 
-        # 高级选项面板（新建）
+        # 高级选项面板
         self.advanced_frame = ttk.Frame(self)
         self.advanced_frame.grid(row=4, column=0, columnspan=3, sticky="we", pady=5, padx=5)
         # 默认隐藏
@@ -925,21 +1049,75 @@ class VideoEncoderFrame(ttk.LabelFrame):
         row1 = ttk.Frame(self.advanced_frame)
         row1.pack(fill=tk.X, pady=2)
         
-        ttk.Label(row1, text="tune:").pack(side=tk.LEFT)
-        self.tune_var = tk.StringVar(value="无")   # 默认“无”
+        # tune
+        tune_label = ttk.Label(row1, text="tune:")
+        tune_label.pack(side=tk.LEFT)
+        ToolTip(tune_label,
+                "针对特定内容类型优化编码参数（主要适用于软件编码器）：\n"
+                "• film: 高画质电影/真人视频 (H.264)\n"
+                "• animation: 卡通/动画 (H.264)\n"
+                "• grain: 保留胶片颗粒感 (H.264/H.265)\n"
+                "• stillimage: 幻灯片/静态画面 (H.264)\n"
+                "• psnr: 优化 PSNR 指标 (H.264/H.265)\n"
+                "• ssim: 优化 SSIM 指标 (H.264/H.265)\n"
+                "• fastdecode: 加速解码 (H.264/H.265)\n"
+                "• zerolatency: 最低延迟 (H.264/H.265)\n"
+                "• vmaf: 优化 VMAF 分数 (H.264)\n"
+                "• screen: 屏幕内容/录屏优化 (H.264)\n"
+                "提示：硬件编码器及 AV1 通常不支持 tune，请保持默认。",
+                wraplength=400)
+        self.tune_var = tk.StringVar(value="无")
         tune_combo = ttk.Combobox(row1, textvariable=self.tune_var,
-                                  values=["无", "film","animation","grain","stillimage","psnr","ssim","fastdecode","zerolatency"],
+                                  values=["无", "film","animation","grain","stillimage","psnr","ssim","fastdecode","zerolatency","vmaf", "screen"],
                                   state="readonly", width=10)
         tune_combo.pack(side=tk.LEFT, padx=5)
+
         
-        ttk.Label(row1, text="profile:").pack(side=tk.LEFT, padx=(10,0))
+        # profile
+        profile_label = ttk.Label(row1, text="profile:")
+        profile_label.pack(side=tk.LEFT, padx=(10,0))
+        ToolTip(profile_label,
+                "如无特殊兼容性要求，建议保持默认（无）。\n\n"
+                "H.264 配置文件：\n"
+                "• baseline: 最广兼容（移动设备）\n"
+                "• main: 主流（电视/广播）\n"
+                "• high: 高清/蓝光（最佳画质）\n"
+                "• high10/high422/high444: 专业/高色深\n\n"
+                "HEVC (H.265) 配置文件：\n"
+                "• main10：10-bit 色深，HDR 视频常用\n"
+                "• main422-10：4:2:2 色度采样，10-bit，专业制作\n"
+                "• main444-8：4:4:4 色度采样，8-bit，无损或高质量\n"
+                "• main444-10：4:4:4 色度采样，10-bit，最高质量\n\n"
+                "AV1 配置文件：\n"
+                "• main: 基本兼容\n"
+                "• high: 支持更高色深和色度采样\n"
+                "• professional: 支持最高质量（10-bit/4:4:4）\n\n"
+                "提示：请根据所选编码器选择对应的 Profile，否则可能报错。",
+                wraplength=400)
         self.profile_var = tk.StringVar(value="无")
-        profile_combo = ttk.Combobox(row1, textvariable=self.profile_var,
-                                     values=["无", "baseline","main","high","high10","high422","high444"],
-                                     state="readonly", width=8)
-        profile_combo.pack(side=tk.LEFT, padx=5)
+        self.profile_combo = ttk.Combobox(
+            row1,
+            textvariable=self.profile_var,
+            values=[],   # 初始为空，由更新函数填充
+            state="readonly",
+            width=10
+        )
+        self.profile_combo.pack(side=tk.LEFT, padx=5)
+
         
-        ttk.Label(row1, text="level:").pack(side=tk.LEFT, padx=(10,0))
+        # level
+        level_label = ttk.Label(row1, text="level:")
+        level_label.pack(side=tk.LEFT, padx=(10,0))
+        ToolTip(level_label,
+                "必须配合 Profile 使用！不确定请保持「无」让系统自动匹配。\n\n"
+                "H.264 级别（限制码率、分辨率、帧率）：\n"
+                "• 3.0 ~ 4.2: 720p/1080p 常用\n"
+                "• 5.0 ~ 5.2: 4K 或高码率\n"
+                "• 6.0+: 8K/超高码率\n"
+                "选择过高可能导致设备不兼容，\n"
+                "选择过低可能无法播放高分辨率视频。\n\n"
+                "不同编码格式（H.265/AV1 等）级别规则有所差异，请参考 FFmpeg 文档",
+                wraplength=400)
         self.level_var = tk.StringVar(value="无")
         level_combo = ttk.Combobox(row1, textvariable=self.level_var,
                                    values=["无", "1.0","1b","1.1","1.2","1.3","2.0","2.1","2.2",
@@ -947,18 +1125,33 @@ class VideoEncoderFrame(ttk.LabelFrame):
                                            "5.0","5.1","5.2","6.0","6.1","6.2"],
                                    state="readonly", width=6)
         level_combo.pack(side=tk.LEFT, padx=5)
+
         
         # 第二行：maxrate, bufsize
         row2 = ttk.Frame(self.advanced_frame)
         row2.pack(fill=tk.X, pady=2)
-        ttk.Label(row2, text="最大比特率 (kbps):").pack(side=tk.LEFT)
+        maxrate_label = ttk.Label(row2, text="最大比特率 (kbps):")
+        maxrate_label.pack(side=tk.LEFT)
+        ToolTip(maxrate_label,
+                "设置最大比特率（kbps），用于限制峰值码率。\n"
+                "适用于流媒体或网络传输，避免瞬间码率过高。",
+                wraplength=400)
         self.maxrate_var = tk.StringVar(value="")
         maxrate_entry = ttk.Entry(row2, textvariable=self.maxrate_var, width=8)
         maxrate_entry.pack(side=tk.LEFT, padx=5)
-        ttk.Label(row2, text="缓冲区大小 (kbps):").pack(side=tk.LEFT, padx=(10,0))
+
+        
+        bufsize_label = ttk.Label(row2, text="缓冲区大小 (kbps):")
+        bufsize_label.pack(side=tk.LEFT, padx=(10,0))
+        ToolTip(bufsize_label,
+                "编码器缓冲区大小（kbps）。\n"
+                "通常设为最大比特率的 2 倍左右，\n"
+                "用于控制码率波动的平滑度。",
+                wraplength=400)
         self.bufsize_var = tk.StringVar(value="")
         bufsize_entry = ttk.Entry(row2, textvariable=self.bufsize_var, width=8)
         bufsize_entry.pack(side=tk.LEFT, padx=5)
+
 
         # GIF 参数变量（存储实际值）
         self.gif_loop = tk.IntVar(value=0)
@@ -967,9 +1160,31 @@ class VideoEncoderFrame(ttk.LabelFrame):
         self.gif_max_colors = tk.IntVar(value=256)
         
         self._on_gif_codec_toggle()
+        self._update_profile_options()
+        self._update_preset_options()
 
 
+    def _update_preset_options(self, *args):
+        """根据当前编码器动态更新 preset 下拉选项"""
+        encoder = self.vcodec.get()
+        presets = self.ENCODER_PRESETS.get(encoder, self.DEFAULT_PRESETS)
+        self.preset_combo['values'] = presets
+    
+        # 如果当前选中的值不在新列表中，自动设为列表第一个
+        current = self.preset.get()
+        if current not in presets:
+            self.preset.set(presets[0] if presets else "medium")
 
+    def _update_profile_options(self, *args):
+        """根据当前编码器动态更新 profile 下拉选项"""
+        encoder = self.vcodec.get()
+        profiles = self.ENCODER_PROFILES.get(encoder, self.DEFAULT_PROFILES)
+        self.profile_combo['values'] = profiles
+    
+        # 如果当前选中的值不在新列表中，自动设为 "无"
+        current = self.profile_var.get()
+        if current not in profiles:
+            self.profile_var.set("无")
 
     def _on_gif_codec_toggle(self, *args):
         if self.vcodec.get() == "gif":
@@ -983,7 +1198,31 @@ class VideoEncoderFrame(ttk.LabelFrame):
         self.vcodec.trace_add("write", self.auto_set_rate_control_by_codec)
         self.rate_control_type.trace_add("write", self.on_rate_control_change)
         self.vcodec.trace_add("write", self._on_gif_codec_toggle)
+        self.vcodec.trace_add("write", self._update_profile_options)
+        self.vcodec.trace_add("write", self._update_preset_options)
+        self.vcodec.trace_add("write", self._on_encoder_changed_for_copy_hint)
 
+
+    def _on_encoder_changed_for_copy_hint(self, *args):
+        """当编码器发生变化时，检测是否切换为 copy，仅在用户交互时提示"""
+        if self._suppress_copy_hint:
+            self._suppress_copy_hint = False
+            return
+    
+        new_encoder = self.vcodec.get()
+        old_encoder = getattr(self, '_last_encoder', None)
+        if old_encoder is None:
+            self._last_encoder = new_encoder
+            return
+    
+        if new_encoder == "copy" and old_encoder != "copy":
+            self._show_copy_hint()
+        self._last_encoder = new_encoder
+    
+    def _show_copy_hint(self):
+        """输出 copy 提示到主界面日志"""
+        if self.app:
+            self.app._append_info_ui("当前编码器为 copy，视频滤镜、帧率、像素格式等设置将被忽略。")
 
     def open_gif_options(self):
         win = tk.Toplevel(self)
@@ -1106,14 +1345,23 @@ class VideoEncoderFrame(ttk.LabelFrame):
 
     def on_rate_control_change(self, *args):
         if getattr(self, '_suppress_update', False):
-            return  # 加载预设时跳过所有副作用
+            return
         self.update_dynamic_controls()
         self.auto_set_codec_by_rate_control()
         rc = self.rate_control_type.get()
-        if rc == "crf" or rc == "global_quality":
-            self.preset.set("medium")
+        # 根据码率控制类型推荐预设，但需检查是否存在
+        if rc in ("crf", "global_quality"):
+            recommended = "medium"
         elif rc == "cq":
-            self.preset.set("p4")
+            recommended = "p4"
+        else:
+            recommended = "medium"
+        # 获取当前预设列表，若推荐值不在列表中，则设为列表第一个
+        available = self.preset_combo['values']
+        if available and recommended in available:
+            self.preset.set(recommended)
+        elif available:
+            self.preset.set(available[0])
 
     def auto_set_codec_by_rate_control(self):
         current = self.vcodec.get()
@@ -1171,6 +1419,7 @@ class VideoEncoderFrame(ttk.LabelFrame):
 
     def set_settings(self, settings):
         self._suppress_update = True
+        self._suppress_copy_hint = True
         try:
             # 处理 preset（兼容旧预设）
             preset_val = settings.get("preset")
@@ -1185,6 +1434,8 @@ class VideoEncoderFrame(ttk.LabelFrame):
             self.preset.set(preset_val)
             
             self.vcodec.set(settings.get("encoder", "libx265"))
+            self._update_profile_options()
+            self._update_preset_options()
             self.rate_control_type.set(settings.get("rate_control_type", "crf"))
             self.crf_value.set(settings.get("crf_value", 26))
             self.cq_value.set(settings.get("cq_value", 35))
@@ -1209,6 +1460,8 @@ class VideoEncoderFrame(ttk.LabelFrame):
             self.bufsize_var.set(settings.get("bufsize", ""))
         finally:
             self._suppress_update = False
+            self._suppress_copy_hint = False
+            self._last_encoder = self.vcodec.get()
             self.update_dynamic_controls()
 
 # ================== 视频滤镜组件 ==================
@@ -1219,6 +1472,9 @@ class VideoFilterFrame(ttk.LabelFrame):
         "p010le", "p016le", "nv12", "nv16",
         "gbrp", "gbrp10le", "gray", "gray10le", "ya8", "yuva420p"
     ]
+
+
+
 
     def __init__(self, parent, app, preview_callback=None, **kwargs):
         super().__init__(parent, text="视频滤镜 (缩放/裁剪/旋转/变速/反交错/像素格式)", padding="5", **kwargs)
@@ -1290,7 +1546,15 @@ class VideoFilterFrame(ttk.LabelFrame):
         self.scale_width = tk.StringVar(value="")
         self.scale_height = tk.StringVar(value="")
         self.scale_method = tk.StringVar(value="width")
-        ttk.Checkbutton(scale_frame, text="启用缩放", variable=self.scale_enabled).pack(side=tk.LEFT)
+        scale_check = ttk.Checkbutton(scale_frame, text="启用缩放", variable=self.scale_enabled)
+        scale_check.pack(side=tk.LEFT)
+        ToolTip(scale_check,
+                "启用视频缩放功能。\n"
+                "• 宽度(高度自动)：指定宽度，高度按比例自动计算。\n"
+                "• 高度(宽度自动)：指定高度，宽度按比例自动计算。\n"
+                "• 精确宽×高：自定义宽度和高度，可能拉伸画面。\n"
+                "提示：缩放会重新编码视频，编码器为 copy 时无效。",
+                wraplength=400)
         ttk.Radiobutton(scale_frame, text="宽度(高度自动)", variable=self.scale_method, value="width").pack(side=tk.LEFT, padx=(10,0))
         ttk.Entry(scale_frame, textvariable=self.scale_width, width=6).pack(side=tk.LEFT)
 
@@ -1370,7 +1634,14 @@ class VideoFilterFrame(ttk.LabelFrame):
 
         rot_frame = ttk.Frame(left_frame)
         rot_frame.pack(fill=tk.X, pady=2)
-        ttk.Label(rot_frame, text="旋转:").pack(side=tk.LEFT)
+        rot_label = ttk.Label(rot_frame, text="旋转:")
+        rot_label.pack(side=tk.LEFT)
+        ToolTip(rot_label,
+                "旋转画面方向（90°/180°/270°）。\n"
+                "上下/左右翻转可镜像画面。\n"
+                "提示：旋转和翻转需重新编码视频，编码器为 copy 时无效。"
+                "    当前旋转是实体旋转，不是元数据旋转。",
+                wraplength=400)
         self.rotate = tk.StringVar(value="none")
         for text, val in [("无", "none"), ("90°顺时针", "90"), ("180°", "180"), ("90°逆时针", "270")]:
             ttk.Radiobutton(rot_frame, text=text, variable=self.rotate, value=val).pack(side=tk.LEFT, padx=2)
@@ -2359,12 +2630,12 @@ class AudioFrame(ttk.LabelFrame):
         self.only_audio_cb.pack(side=tk.LEFT, padx=(50,2))
 
         ttk.Label(top_row, text="输出容器:").pack(side=tk.LEFT, padx=(12,2))
-        self.audio_format = tk.StringVar(value="mp3")
+        self.audio_format = tk.StringVar(value="m4a")
         audio_format_combo = ttk.Combobox(top_row, textvariable=self.audio_format,
                                           values=["mp3", "aac", "m4a", "flac", "opus", "wav", "ac3"],
                                           state="readonly", width=6)
         audio_format_combo.pack(side=tk.LEFT, padx=2)
-        ToolTip(self.only_audio_cb, "勾选后，将只输出音频文件（自动添加 -vn 忽略视频），输出容器将使用右边选择的音频格式", offset_x=0, offset_y=5)
+        ToolTip(self.only_audio_cb, "勾选后，将只输出音频文件（自动添加 -vn 忽略视频），\n输出容器将使用右边选择的音频格式", wraplength=440, offset_x=0, offset_y=5)
     
         controls_frame = ttk.Frame(inner)
         controls_frame.pack(fill=tk.X, expand=True, pady=(5,0))
@@ -2428,7 +2699,7 @@ class AudioFrame(ttk.LabelFrame):
         self.audio_bitrate.set(settings.get("audio_bitrate", "128k"))
         self.audio_samplerate.set(settings.get("audio_samplerate", "44100"))
         self.only_audio.set(settings.get("only_audio", False))
-        self.audio_format.set(settings.get("audio_format", "mp3"))
+        self.audio_format.set(settings.get("audio_format", "m4a"))
         vol = settings.get("volume", 1.0)
         self.volume_value.set(vol)
         self.volume_label.config(text=f"{vol:.2f}")
@@ -2699,12 +2970,40 @@ class LoopChromaFrame(ttk.LabelFrame):
         chroma_frame = ttk.LabelFrame(self, text="绿幕抠像 (色度键)", padding="5")
         chroma_frame.grid(row=0, column=1, sticky="nsew", padx=(2, 0))
         chroma_frame.columnconfigure(0, weight=1)
+        chroma_frame.columnconfigure(1, weight=1)
+
+        top_row = ttk.Frame(chroma_frame)
+        top_row.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=2)
 
         self.chroma_enabled = tk.BooleanVar(value=False)
-        ttk.Checkbutton(chroma_frame, text="启用绿幕抠像", variable=self.chroma_enabled).grid(row=0, column=0, sticky="w")
+        chk = ttk.Checkbutton(top_row, text="启用绿幕抠像", variable=self.chroma_enabled)
+        chk.pack(side=tk.LEFT, padx=(0, 10))
+        ToolTip(chk,
+                "勾选后，将使用选择的抠像算法去除纯色背景（绿幕/蓝幕/纯色）。",
+                wraplength=400)
+
+        # 滤镜类型：chromakey 和 colorkey 单选按钮
+        self.chroma_filter_type = tk.StringVar(value="chromakey")
+        rb_chroma = ttk.Radiobutton(top_row, text="chromakey", 
+                                    variable=self.chroma_filter_type, value="chromakey")
+        rb_chroma.pack(side=tk.LEFT, padx=2)
+        ToolTip(rb_chroma,
+                "基于色相/饱和度（HSV）抠像，适合视频绿幕/蓝幕，\n"
+                "对颜色渐变和光照变化有较好抗性。推荐用于视频素材。",
+                wraplength=400)
+
+        rb_color = ttk.Radiobutton(top_row, text="colorkey", 
+                                   variable=self.chroma_filter_type, value="colorkey")
+        rb_color.pack(side=tk.LEFT, padx=2)
+        ToolTip(rb_color,
+                "基于 RGB 颜色距离抠像，适合静态图片、GIF、纯色背景（白/黑），\n"
+                "对索引色（如 GIF）更稳定。若 chromakey 效果不佳可尝试此项。",
+                wraplength=400)
+
 
         color_row = ttk.Frame(chroma_frame)
         color_row.grid(row=1, column=0, sticky="w", pady=2)
+
         ttk.Label(color_row, text="抠除颜色:").pack(side=tk.LEFT)
         self.chroma_color = tk.StringVar(value="#3fff08")
         color_combo = ttk.Combobox(color_row, textvariable=self.chroma_color,
@@ -2861,6 +3160,7 @@ class LoopChromaFrame(ttk.LabelFrame):
             # 新增透明度
             "alpha_enabled": self.alpha_enabled.get(),
             "alpha_value": self.alpha_value.get(),
+            "chroma_filter_type": self.chroma_filter_type.get(),
         }
     
     def set_settings(self, settings):
@@ -2877,6 +3177,7 @@ class LoopChromaFrame(ttk.LabelFrame):
         blend = settings.get("chroma_blend", 0.1)
         self.chroma_blend.set(blend)
         self.blend_entry_var.set(f"{blend:.2f}")
+        self.chroma_filter_type.set(settings.get("chroma_filter_type", "chromakey"))
         self.color_swatch.config(bg=self.chroma_color.get())
         self._update_loop_state()
     
@@ -3515,6 +3816,7 @@ class Track:
                     "chroma_similarity": 0.3,
                     "chroma_blend": 0.1,
                     "alpha_enabled": False,
+                    "chroma_filter_type": "chromakey",   # 默认 chromakey
                     "alpha_value": 1.0,
                     "audio_source_type": "self",      # "self" | "silence" | "external"
                     "external_audio_path": "",
@@ -3740,6 +4042,12 @@ class FFmpegBatchGUI:
         self.preset_manager = PresetManager(self.preset_file_path)
         self.load_player_settings()
 
+        # ---------- 加载快速命令模板 ----------
+        preset_dir = os.path.dirname(self.preset_file_path)          # 主预设所在目录
+        self.cmd_templates_path = os.path.join(preset_dir, "quick_cmds.json")
+        self.cmd_templates = {}
+        self._load_cmd_templates()
+
         # 创建界面组件
         self.create_widgets()
         self.update_task_list()
@@ -3834,6 +4142,75 @@ class FFmpegBatchGUI:
                 except Exception as e:
                     self._append_info_ui(f"[停止] kill 进程 {p.pid} 失败: {e}")
     
+
+    def _load_cmd_templates(self):
+        """加载快速命令模板，若文件不存在则创建默认模板"""
+        os.makedirs(os.path.dirname(self.cmd_templates_path), exist_ok=True)
+        if os.path.exists(self.cmd_templates_path):
+            try:
+                with open(self.cmd_templates_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        self.cmd_templates = data
+                        self._refresh_cmd_preset_list()
+                        return
+            except Exception as e:
+                self._append_info_ui(f"⚠️ 加载快速命令模板失败: {e}，将使用默认模板")
+        
+        # 文件不存在或加载失败，创建默认模板
+        self.cmd_templates = self._get_default_cmd_templates()
+        self._save_cmd_templates()
+        self._refresh_cmd_preset_list()
+    
+    def _get_default_cmd_templates(self):
+        """返回默认的命令模板字典"""
+        return {
+            "生成静音音频 (anullsrc)": 'ffmpeg -y -f lavfi -i anullsrc=r=44100:cl=stereo -t 10 "{output_dir}silence.wav"',
+            "提取关键帧 (关键帧截图)": 'ffmpeg -y -i "{input}" -vf "select=eq(pict_type\\\\,I)" -vsync vfr "{output_dir}thumb_%04d.png"',
+            "查看媒体信息 (ffprobe)": 'ffprobe -v error -show_format -show_streams "{input}"',
+            "快速转码测试 (10秒)": 'ffmpeg -y -i "{input}" -c:v libx264 -preset ultrafast -t 10 "{output_dir}output_test.mp4"',
+            "生成测试视频 (彩条)": 'ffmpeg -y -f lavfi -i testsrc=duration=10:size=640x480:rate=30 -c:v libx264 "{output_dir}test.mp4"',
+            "生成测试视频 (动态)": 'ffmpeg -y -f lavfi -i testsrc2=duration=10:size=640x480:rate=30 -c:v libx264 "{output_dir}test2.mp4"',
+            "生成黑色背景视频": 'ffmpeg -y -f lavfi -i color=c=black:s=vga:r=25 -c:v libx264 -t 10 "{output_dir}out_color.mp4"',
+            "生成雪花视频": 'ffmpeg -y -f lavfi -i "nullsrc=s=640x480:r=25,geq=random(1)*255:128:128" -c:v libx264 -t 10 "{output_dir}out_snow.mp4"',
+            "生成滴一声": 'ffmpeg -y -f lavfi -i "sine=frequency=1000:duration=0.2,apad=pad_dur=0.3" "{output_dir}beep.wav"',
+            "生成滴持续": 'ffmpeg -y -f lavfi -i "sine=frequency=900:duration=10" "{output_dir}beeplong.wav"',
+            "生成分形曼德博图案": 'ffmpeg -y -f lavfi -i "mandelbrot=s=640x480:r=25" -c:v libx264 -t 10 "{output_dir}mandelbrot.mp4"',
+            "生成透明纯色视频(ProRes)": 'ffmpeg -y -f lavfi -i "color=c=#00000000:s=640x480:r=25,format=rgba" -c:v prores_ks -t 10 "{output_dir}transparent_bg.mov"',
+            "元胞自动机": 'ffmpeg -f lavfi -i cellauto -vf format=yuv420p -c:v libx264 -t 10 "{output_dir}cellauto.mp4"',
+            "生命活动": 'ffmpeg -f lavfi -i life -vf format=yuv420p -c:v libx264 -t 10 "{output_dir}life.mp4"',
+            "生成白噪音 (静电噪音)": 'ffmpeg -y -f lavfi -i "anoisesrc=duration=10:colour=white" "{output_dir}white_noise.wav"',
+            "生成粉噪音 (柔和噪声)": 'ffmpeg -y -f lavfi -i "anoisesrc=duration=10:colour=pink" "{output_dir}pink_noise.wav"',
+            "生成正弦波音频": 'ffmpeg -f lavfi -i "aevalsrc=sin(440*2*PI*t)" -t 5 "{output_dir}sin_noise.wav"',
+            "按帧率提取图片 (30)": 'ffmpeg -i "{input}" -vf "fps=30" "{output_dir}output_frame_%04d.jpg"',
+            "元数据旋转90° (仅MP4)": 'ffmpeg -i "{input}" -c copy -metadata:s:v rotate="90" "{output_dir}rotated.mp4"',
+            "元数据旋转180° (仅MP4)": 'ffmpeg -i "{input}" -c copy -metadata:s:v rotate="180" "{output_dir}rotated.mp4"',
+            "元数据旋转270° (仅MP4)": 'ffmpeg -i "{input}" -c copy -metadata:s:v rotate="270" "{output_dir}rotated.mp4"',
+            "音视频倒放(reverse)": 'ffmpeg -i "{input}" -vf reverse -af areverse "{output_dir}reverse.mp4"',
+            "视频四周加边框 (pad)": "ffmpeg -i \"{input}\" -vf \"pad=iw+20:ih+20:10:10:color=red\" -c:a copy \"{output_dir}bordered.mp4\"",
+            "简易英文文字水印(drawtext)": 'ffmpeg -i "{input}" -vf "drawtext=text=\'Hello\':fontsize=30:fontcolor=white:x=10:y=10" -c:a copy "{output_dir}text.mp4"',
+            "绘制矩形标记 (drawbox)": 'ffmpeg -i "{input}" -vf "drawbox=x=10:y=10:w=100:h=100:color=red@0.5:thickness=5" -c:a copy "{output_dir}box.mp4"',
+            "简易音频降噪 (afftdn)": 'ffmpeg -i "{input}" -af "afftdn" -c:v copy "{output_dir}denoised.wav"',
+        }
+    
+    def _save_cmd_templates(self):
+        """保存命令模板到 JSON 文件"""
+        try:
+            with open(self.cmd_templates_path, 'w', encoding='utf-8') as f:
+                json.dump(self.cmd_templates, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            self._append_info_ui(f"⚠️ 保存快速命令模板失败: {e}")
+    
+    def _refresh_cmd_preset_list(self):
+        """刷新命令预设下拉列表"""
+        if hasattr(self, 'cmd_preset_combo'):
+            names = list(self.cmd_templates.keys())
+            self.cmd_preset_combo['values'] = names
+            if names:
+                self.cmd_preset_var.set(names[0])
+            else:
+                self.cmd_preset_var.set("")
+
 
 
 
@@ -4383,7 +4760,7 @@ class FFmpegBatchGUI:
                 filter_parts.append(f"[{sub_idx}:v]{sub_vf}[v_temp_{i}]")
                 current_sub = f"v_temp_{i}"
     
-            # 绿幕
+            # 绿幕/纯色抠像
             if sub_settings.get("chroma_enabled", False):
                 color = sub_settings.get("chroma_color", "green")
                 if color.startswith("#"):
@@ -4392,7 +4769,14 @@ class FFmpegBatchGUI:
                 if similarity <= 0:
                     similarity = 0.00001
                 blend = sub_settings.get("chroma_blend", 0.1)
-                filter_parts.append(f"[{current_sub}]chromakey={color}:{similarity}:{blend}[v_sub_{i}]")
+                filter_type = sub_settings.get("chroma_filter_type", "chromakey")  # 默认 chromakey
+                
+                # 强制转换格式为 rgb24 提升兼容性（两种滤镜都适用）
+                if filter_type == "colorkey":
+                    filter_parts.append(f"[{current_sub}]format=rgb24,colorkey={color}:{similarity}:{blend}[v_sub_{i}]")
+                else:
+                    # chromakey 可保持原格式，也可加上 format 以确保一致（但 chromakey 支持多种格式，可省略）
+                    filter_parts.append(f"[{current_sub}]chromakey={color}:{similarity}:{blend}[v_sub_{i}]")
                 current_sub = f"v_sub_{i}"
             else:
                 filter_parts.append(f"[{current_sub}]null[v_sub_{i}]")
@@ -4653,7 +5037,7 @@ class FFmpegBatchGUI:
         base_name = os.path.basename(input_path)
         name, _ = os.path.splitext(base_name)
         if settings.get("only_audio", False):
-            container = settings.get("audio_format", "mp3")
+            container = settings.get("audio_format", "m4a")
         else:
             container = settings.get("output_container", "mp4")
         custom_name = settings.get("custom_output_name", "").strip()
@@ -4866,7 +5250,6 @@ class FFmpegBatchGUI:
             vcodec = settings.get("encoder", "libx265")
             if vcodec == "copy" and not precise_trim and not used_combo:
                 # 纯流复制，忽略所有视频处理
-                self._append_info_ui("编码器为 copy，已忽略所有视频滤镜、帧率、像素格式等设置。")
                 cmd_list.extend(["-c:v", "copy"])
             else:
                 # 构建视频滤镜（包含字幕、变速等），组合跳转时跳过 trim
@@ -4924,10 +5307,15 @@ class FFmpegBatchGUI:
         :param framerate: 图片帧率，默认30
         """
         ext = os.path.splitext(file_path)[1].lower()
-        is_image = ext in ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
-        if is_image:
+        is_image = ext in ('.png', '.jpg', '.jpeg', '.bmp', '.webp')   # 不包括 .gif
+        is_gif = ext == '.gif'
+        
+        if is_gif:
+            cmd_list.extend(["-stream_loop", "-1"])
+        elif is_image:
             cmd_list.extend(["-loop", "1", "-framerate", framerate])
         else:
+            # 普通视频
             cmd_list.extend(["-stream_loop", "-1"])
 
 
@@ -5031,9 +5419,14 @@ class FFmpegBatchGUI:
                 cmd_list.extend(["-stream_loop", "-1"])
                 cmd_list.extend(["-i", wm_file])
         else:
-            # 图片水印
-            fps = settings.get("frame_rate_custom", "30") if settings.get("frame_rate_type") == "custom" else "30"
-            cmd_list.extend(["-loop", "1", "-framerate", fps])
+            # 图片水印（静态图片或 GIF）
+            ext = os.path.splitext(wm_file)[1].lower()
+            if ext == '.gif':
+                # GIF 本身是动画，不能使用 -loop，用 -stream_loop -1 确保循环
+                cmd_list.extend(["-stream_loop", "-1"])
+            else:
+                fps = settings.get("frame_rate_custom", "30") if settings.get("frame_rate_type") == "custom" else "30"
+                cmd_list.extend(["-loop", "1", "-framerate", fps])
             cmd_list.extend(["-i", wm_file])
     
         # ---- 构建叠加滤镜 ----
@@ -6580,7 +6973,7 @@ class FFmpegBatchGUI:
             # 视频编码页面
             page_enc = ttk.Frame(notebook)
             notebook.add(page_enc, text="视频编码")
-            enc_frame = VideoEncoderFrame(page_enc)
+            enc_frame = VideoEncoderFrame(page_enc, app=self)
             enc_frame.pack(fill=tk.X, padx=5, pady=5)
             enc_frame.set_settings(task.settings)
             
@@ -6926,7 +7319,15 @@ class FFmpegBatchGUI:
         self.pip_enabled = tk.BooleanVar(value=False)
         pip_chk = ttk.Checkbutton(btn_frame, text="启用画中画", variable=self.pip_enabled)
         pip_chk.pack(side=tk.LEFT, padx=5)
-        ToolTip(pip_chk, "开启后可将多个视频叠加（视频必须重新选择编码，不能copy了），关闭时仅使用第一个视频轨道并复制流")
+        ToolTip(pip_chk,
+                "「画中画」可将多个视频/图片叠加到主画面上，适合：\n"
+                "• 多机位舞台合成（多角度同屏）\n"
+                "• 制作对比演示、分镜效果或画中画解说\n"
+                "• 图片作为背景或角标（动态图片支持循环）\n\n"
+                "启用后，所有视频流将强制重新编码（无法使用 copy），\n"
+                "   输出时长默认由主视频决定，您也可以开启「手动时长」精确控制。\n\n"
+                "提示：每个视频轨道都可独立设置位置、大小、透明度、绿幕抠像等。",
+                wraplength=700)
 
         self.concat_enabled = tk.BooleanVar(value=False)
         concat_chk = ttk.Checkbutton(btn_frame, text="串行合并（首尾拼接）", variable=self.concat_enabled)
@@ -7430,11 +7831,16 @@ class FFmpegBatchGUI:
                 sv = next((sv for sv in sub_videos if normalize_path(sv.file_path) == f_norm), None)
                 if sv and not sv.enc_settings.get("trim_enabled", False):
                     ext = os.path.splitext(f_norm)[1].lower()
-                    if ext in ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp'):
+                    if ext == '.gif':
+                        # GIF 动画，使用 -stream_loop -1 保证无限循环，不加 -loop 和 -framerate
+                        cmd.extend(["-stream_loop", "-1"])
+                    elif ext in ('.png', '.jpg', '.jpeg', '.bmp', '.webp'):
+                        # 静态图片，使用 image2 循环
                         fps = main_video.enc_settings.get("frame_rate_custom", "30") \
                               if main_video.enc_settings.get("frame_rate_type") == "custom" else "30"
                         cmd.extend(["-loop", "1", "-framerate", fps])
                     else:
+                        # 其他视频
                         cmd.extend(["-stream_loop", "-1"])
 
             cmd.extend(["-i", f_norm])
@@ -8336,7 +8742,7 @@ class FFmpegBatchGUI:
             # ---- 页面1：编码器与质量 ----
             page_enc = ttk.Frame(notebook)
             notebook.add(page_enc, text="编码器与质量")
-            enc_frame = VideoEncoderFrame(page_enc)
+            enc_frame = VideoEncoderFrame(page_enc, app=self)
             enc_frame.pack(fill=tk.X, padx=5, pady=5)
             enc_frame.set_settings(initial_settings)
 
@@ -8607,6 +9013,8 @@ class FFmpegBatchGUI:
     
     def _update_track_enc(self, idx, new_settings):
         track = self.merge_tracks[idx]  # 先获取 track 对象
+        old_encoder = track.enc_settings.get("encoder")
+        new_encoder = new_settings.get("encoder")
         track.enc_settings = new_settings
         if "enhance" in new_settings:
             track.enc_settings["enhance"] = new_settings["enhance"]
@@ -8620,6 +9028,12 @@ class FFmpegBatchGUI:
         track.pad_height = new_settings.get("pad_height", "")
         track.offset_x = new_settings.get("offset_x", "0")
         track.offset_y = new_settings.get("offset_y", "0")
+
+        # 检测是否切换为 copy（仅在视频轨道且编码器变化时）
+        if track.type == "video" and old_encoder != new_encoder:
+            if new_encoder == "copy":
+                self._append_info_ui("[封装] 该视频轨道编码器已设为 copy，视频滤镜将被忽略。")
+
         self.merge_update_track_list()
         self.merge_update_command_preview()
 
@@ -9225,49 +9639,37 @@ class FFmpegBatchGUI:
         top_frame = ttk.Frame(cmd_tool_frame)
         top_frame.pack(fill=tk.X, pady=2)
 
-        ttk.Label(top_frame, text="预设命令:").pack(side=tk.LEFT)
+        preset_label1 = ttk.Label(top_frame, text="预设命令:")
+        preset_label1.pack(side=tk.LEFT)
+        
+        ToolTip(preset_label1,
+                "从下拉列表选择预设命令，自动填充到下方编辑框。\n\n"
+                "您也可以自定义命令，编辑以下文件：\n"
+                f"• {self.cmd_templates_path}\n\n"
+                "格式为：{\"显示名称\": \"命令模板\"}\n\n"
+                "支持占位符：\n"
+                "• {input}    → 主界面「输入文件」的路径\n"
+                "• {output_dir} → 右边「输出目录」的路径\n\n"
+                "示例：\n"
+                'ffmpeg -i "{input}" -c copy "{output_dir}output.mp4"\n\n'
+                "编辑后点击右侧的「重载」按钮重新加载。",
+                wraplength=500)
+
         self.cmd_preset_var = tk.StringVar()
 
-        # 存储命令模板字典（使用占位符 {input} 和 {output_dir}）
-        self.cmd_templates = {
-            # ========== 默认==========
-            "生成静音音频 (anullsrc)": 'ffmpeg -y -f lavfi -i anullsrc=r=44100:cl=stereo -t 10 "{output_dir}silence.wav"',
-            "提取关键帧 (关键帧截图)": 'ffmpeg -y -i "{input}" -vf "select=eq(pict_type\\\\,I)" -vsync vfr "{output_dir}thumb_%04d.png"',
-            "查看媒体信息 (ffprobe)": 'ffprobe -v error -show_format -show_streams "{input}"',
-            "快速转码测试 (10秒)": 'ffmpeg -y -i "{input}" -c:v libx264 -preset ultrafast -t 10 "{output_dir}output_test.mp4"',
-            "生成测试视频 (彩条)": 'ffmpeg -y -f lavfi -i testsrc=duration=10:size=640x480:rate=30 -c:v libx264 "{output_dir}test.mp4"',
-            "生成测试视频 (动态)": 'ffmpeg -y -f lavfi -i testsrc2=duration=10:size=640x480:rate=30 -c:v libx264 "{output_dir}test2.mp4"',
-            "生成黑色背景视频": 'ffmpeg -y -f lavfi -i color=c=black:s=vga:r=25 -c:v libx264 -t 10 "{output_dir}out_color.mp4"',
-            "生成雪花视频": 'ffmpeg -y -f lavfi -i "nullsrc=s=640x480:r=25,geq=random(1)*255:128:128" -c:v libx264 -t 10 "{output_dir}out_snow.mp4"',
-            "生成滴一声": 'ffmpeg -y -f lavfi -i "sine=frequency=1000:duration=0.2,apad=pad_dur=0.3" "{output_dir}beep.wav"',
-            "生成滴持续": 'ffmpeg -y -f lavfi -i "sine=frequency=900:duration=10" "{output_dir}beeplong.wav"',
 
-            "生成分形曼德博图案": 'ffmpeg -y -f lavfi -i "mandelbrot=s=640x480:r=25" -c:v libx264 -t 10 "{output_dir}mandelbrot.mp4"',
-            "生成透明纯色视频(ProRes)": 'ffmpeg -y -f lavfi -i "color=c=#00000000:s=640x480:r=25,format=rgba" -c:v prores_ks -t 10 "{output_dir}transparent_bg.mov"',
-            "元胞自动机": 'ffmpeg -f lavfi -i cellauto -vf format=yuv420p -c:v libx264 -t 10 "{output_dir}cellauto.mp4"',
-            "生命活动": 'ffmpeg -f lavfi -i life -vf format=yuv420p -c:v libx264 -t 10 "{output_dir}life.mp4"',
-
-            "生成白噪音 (静电噪音)": 'ffmpeg -y -f lavfi -i "anoisesrc=duration=10:colour=white" "{output_dir}white_noise.wav"',
-            "生成粉噪音 (柔和噪声)": 'ffmpeg -y -f lavfi -i "anoisesrc=duration=10:colour=pink" "{output_dir}pink_noise.wav"',
-            "生成正弦波音频": 'ffmpeg -f lavfi -i "aevalsrc=sin(440*2*PI*t)" -t 5 "{output_dir}sin⁡_noise.wav"',
-
-
-            "按帧率提取图片 (30)": 'ffmpeg -i "{input}" -vf "fps=30" "{output_dir}output_frame_%04d.jpg"',
-        }
-
-
-        preset_combo = ttk.Combobox(
+        self.cmd_preset_combo = ttk.Combobox(
             top_frame,
             textvariable=self.cmd_preset_var,
             state="readonly",
             width=25
         )
-        preset_combo['values'] = list(self.cmd_templates.keys())
-        preset_combo.pack(side=tk.LEFT, padx=5)
-        preset_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
+        self.cmd_preset_combo['values'] = list(self.cmd_templates.keys())
+        self.cmd_preset_combo.pack(side=tk.LEFT, padx=5)
+        self.cmd_preset_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
 
-
-        ttk.Button(top_frame, text="清空", command=self._clear_cmd_input, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Button(top_frame, text="重载", command=self._reload_cmd_templates, width=4).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top_frame, text="清空", command=self._clear_cmd_input, width=4).pack(side=tk.LEFT, padx=5)
 
         # 输出目录（与当前工作目录结合）
         output_frame = ttk.Frame(top_frame)
@@ -9288,6 +9690,7 @@ class FFmpegBatchGUI:
         btn_frame = ttk.Frame(cmd_tool_frame)
         btn_frame.pack(fill=tk.X, pady=2)
         ttk.Button(btn_frame, text="运行命令", command=self._run_custom_command).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="复制到剪贴板", command=self._copy_custom_command).pack(side=tk.LEFT, padx=5)
         ttk.Label(btn_frame, text="（命令在独立线程执行，输出显示在日志区域）",
                   foreground="gray").pack(side=tk.LEFT, padx=10)
 
@@ -9316,6 +9719,11 @@ class FFmpegBatchGUI:
         self.mpv_path.trace_add("write", lambda *a: self.update_player_status())
         self.update_player_status()
 
+
+    def _reload_cmd_templates(self):
+        """重新加载命令模板（用户编辑 JSON 后调用）"""
+        self._load_cmd_templates()
+        self._append_info_ui("✅ 已重新加载快速命令模板")
 
     def _browse_ffmpeg_dir(self):
         path = filedialog.askdirectory(title="选择 FFmpeg 所在目录")
@@ -9365,7 +9773,17 @@ class FFmpegBatchGUI:
         """清空命令文本框"""
         self.cmd_input.delete(1.0, tk.END)
 
-    
+    def _copy_custom_command(self):
+        """复制快速命令工具中的命令到剪贴板"""
+        cmd_str = self.cmd_input.get(1.0, tk.END).strip()
+        if cmd_str:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(cmd_str)
+            self._append_info_ui("快速命令已复制到剪贴板")
+        else:
+            self._append_info_ui("命令文本框为空，无内容可复制")
+
+
     def _run_custom_command(self):
         """执行命令文本框中的命令，在独立线程中运行，支持全局停止"""
         cmd_str = self.cmd_input.get(1.0, tk.END).strip()
@@ -9731,7 +10149,7 @@ class FFmpegBatchGUI:
 
         video_enc_page = ttk.Frame(param_notebook)
         param_notebook.add(video_enc_page, text="视频编码")
-        self.video_encoder = VideoEncoderFrame(video_enc_page, refresh_callback=self.update_command_preview)
+        self.video_encoder = VideoEncoderFrame(video_enc_page, app=self, refresh_callback=self.update_command_preview)
         self.video_encoder.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         filter_page = ttk.Frame(param_notebook)
