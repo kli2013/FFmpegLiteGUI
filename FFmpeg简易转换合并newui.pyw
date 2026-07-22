@@ -4213,7 +4213,6 @@ class FFmpegBatchGUI:
 
 
 
-
     def _add_hwaccel_params(self, cmd_list: List[str], settings: dict):
         """添加硬件解码相关参数（若启用）"""
         if not settings.get("hwaccel_enabled", False):
@@ -5444,7 +5443,16 @@ class FFmpegBatchGUI:
         cmd_list.extend(["-vsync", "cfr"])
     
         # ---- 音频处理 ----
-        if settings.get("audio_enabled", True):
+        # 使用 ffprobe_json 检测主视频是否有音频流
+        info = ffprobe_json(self.ffprobe_cmd, input_path)
+        has_audio = info and any(s.get("codec_type") == "audio" for s in info.get("streams", []))
+
+        if not has_audio:
+            if settings.get("audio_enabled", True):
+                self._append_info_ui("[水印] 主视频无音频流，已自动禁用音频输出。")
+                settings["audio_enabled"] = False
+            cmd_list.append("-an")
+        elif settings.get("audio_enabled", True):
             if settings.get("precise_trim", False) and settings.get("trim_enabled", False) and duration_for_sub is not None and duration_for_sub > 0:
                 self._apply_audio_trim_and_encode(cmd_list, settings, input_path, start_sec, duration_for_sub, map_audio=True)
             else:
@@ -5658,8 +5666,382 @@ class FFmpegBatchGUI:
             canvas.create_text(cx1 + 5, cy1 + 5, anchor="nw", text=str(sub_order[sub]),
                                fill="red", font=("Arial", 10, "bold"), tags=tag)
 
+
+
+
+    # ---------- 通用公共位置可视化编辑器函数 ----------
+    def _generic_overlay_editor(self, parent, canvas_w, canvas_h,
+                                rect_x, rect_y, rect_w, rect_h,
+                                on_apply, title="可视化编辑位置",
+                                aspect_ratio=None, bg_draw_func=None,
+                                allow_resize=True,
+                                show_canvas_controls=False,
+                                coord_mode='top_left',
+                                allow_negative_offset=False,
+                                rect_color='red'):
+        """
+        通用叠加/偏移可视化编辑器（核心重构函数）
+        
+        支持三种主要使用模式：
+        
+        1. 主视频画布偏移（pad）模式
+           - allow_negative_offset=True
+           - rect_color='deepskyblue'
+           - show_canvas_controls=True（允许调整画布尺寸）
+           - 允许矩形超出画布（负偏移）
+           - 用于调整主视频内容在更大画布中的位置
+        
+        2. 子视频/画中画叠加模式
+           - allow_negative_offset=False（默认）
+           - rect_color='red'
+           - allow_resize=True（支持绘制新矩形调整大小）
+           - 矩形必须限制在画布内
+           - 用于调整画中画、水印等子视频的位置和大小
+        
+        3. 水印专用模式（通过 open_watermark_overlay_editor 调用）
+           - 与子视频模式类似，但额外支持回写缩放尺寸到滤镜框架和 watermark_dict
+        
+        参数说明：
+            on_apply: 回调函数，签名 on_apply(new_x, new_y, new_w, new_h, new_canvas_w, new_canvas_h)
+            bg_draw_func: 可选，背景绘制回调，用于画其他子视频的虚线框
+            aspect_ratio: 绘制新矩形时是否强制保持宽高比（水印/叠加常用）
+            coord_mode: 'top_left'（左上角坐标）或 'offset'（偏移量）
+        """
+        max_display_w, max_display_h = 800, 600
+        scale = min(max_display_w / canvas_w, max_display_h / canvas_h, 1.0)
+        disp_w = int(canvas_w * scale)
+        disp_h = int(canvas_h * scale)
+    
+        win = tk.Toplevel(parent)
+        win.title(title)
+        win.transient(parent)
+        win.grab_set()
+        win.withdraw()
+    
+        # ---- 内部状态 ----
+        current_x, current_y, current_w, current_h = rect_x, rect_y, rect_w, rect_h
+        current_canvas_w, current_canvas_h = canvas_w, canvas_h
+        rect_id = None
+        text_id = None
+        draw_rect_temp = None
+        draw_start = None
+        draw_mode_active = False
+        dragging = False
+        drag_start_x = 0
+        drag_start_y = 0
+        drag_mouse_start = (0, 0)
+    
+        # ---- 辅助函数 ----
+        def to_canvas(ox, oy):
+            return int(ox * scale), int(oy * scale)
+    
+        def to_real(cx, cy):
+            return int(round(cx / scale)), int(round(cy / scale))
+    
+        def clamp_rect():
+            nonlocal current_x, current_y, current_w, current_h
+            if allow_negative_offset:
+                # 允许任意偏移，不做任何限制
+                return
+            # 否则限制在画布内（子视频/水印模式）
+            current_x = max(0, min(current_x, current_canvas_w - current_w))
+            current_y = max(0, min(current_y, current_canvas_h - current_h))
+            current_w = min(current_w, current_canvas_w)
+            current_h = min(current_h, current_canvas_h)
+    
+        def create_rect():
+            nonlocal rect_id, text_id
+            cx1, cy1 = to_canvas(current_x, current_y)
+            cx2, cy2 = to_canvas(current_x + current_w, current_y + current_h)
+            rid = canvas.create_rectangle(cx1, cy1, cx2, cy2, outline=rect_color, width=2,
+                                          fill=rect_color, stipple="gray50", tags="rect")
+            tid = canvas.create_text(cx1 + 5, cy1 + 5, anchor="nw", text="叠加对象",
+                                     fill="white", font=("Arial", 9), tags="rect")
+            return rid, tid
+    
+        def update_rect_position():
+            cx1, cy1 = to_canvas(current_x, current_y)
+            cx2, cy2 = to_canvas(current_x + current_w, current_y + current_h)
+            canvas.coords(rect_id, cx1, cy1, cx2, cy2)
+            canvas.coords(text_id, cx1 + 5, cy1 + 5)
+            update_coord_display()
+    
+        def update_coord_display():
+            if coord_mode == 'offset':
+                coord_var.set(f"偏移: X={current_x}, Y={current_y}")
+            else:
+                coord_var.set(f"左上角: ({current_x}, {current_y})  宽: {current_w}  高: {current_h}")
+    
+        # ---- 画布尺寸应用 ----
+        def _apply_canvas_size():
+            nonlocal current_canvas_w, current_canvas_h, scale, disp_w, disp_h, rect_id, text_id
+            try:
+                new_w = int(canvas_w_var.get())
+                new_h = int(canvas_h_var.get())
+                if new_w <= 0 or new_h <= 0:
+                    raise ValueError
+                current_canvas_w, current_canvas_h = new_w, new_h
+                scale = min(max_display_w / current_canvas_w, max_display_h / current_canvas_h, 1.0)
+                disp_w = int(current_canvas_w * scale)
+                disp_h = int(current_canvas_h * scale)
+                win.geometry(f"{disp_w + 20}x{disp_h + 240}")
+                canvas.config(width=disp_w, height=disp_h)
+                canvas.delete("all")
+                if bg_draw_func:
+                    bg_draw_func(canvas, scale)
+                clamp_rect()
+                if rect_id:
+                    canvas.delete(rect_id)
+                    canvas.delete(text_id)
+                rect_id, text_id = create_rect()
+                update_coord_display()
+                status_var.set(f"画布已调整为 {current_canvas_w}x{current_canvas_h}")
+                win.update_idletasks()
+                # 重新居中窗口
+                x = self.root.winfo_x() + (self.root.winfo_width() - win.winfo_width()) // 2
+                y = self.root.winfo_y() + (self.root.winfo_height() - win.winfo_height()) // 2
+                win.geometry(f"+{x}+{y}")
+            except:
+                messagebox.showerror("错误", "画布尺寸无效")
+    
+        # ---- 矩形拖拽事件 ----
+        def start_move(event):
+            nonlocal drag_start_x, drag_start_y, drag_mouse_start, dragging
+            if draw_mode_active:
+                return
+            cx, cy = event.x, event.y
+            bbox = canvas.bbox(rect_id)
+            if bbox and bbox[0] <= cx <= bbox[2] and bbox[1] <= cy <= bbox[3]:
+                drag_start_x = current_x
+                drag_start_y = current_y
+                drag_mouse_start = (cx, cy)
+                dragging = True
+                status_var.set("拖拽移动矩形")
+    
+        def on_move(event):
+            nonlocal current_x, current_y, dragging
+            if not dragging or draw_mode_active:
+                return
+            dx_pixel = event.x - drag_mouse_start[0]
+            dy_pixel = event.y - drag_mouse_start[1]
+            dx = dx_pixel / scale
+            dy = dy_pixel / scale
+            new_x = int(drag_start_x + dx)
+            new_y = int(drag_start_y + dy)
+            if allow_negative_offset:
+                # 无边界限制，允许任意值（包括负数和超出画布）
+                pass
+            else:
+                new_x = max(0, min(new_x, current_canvas_w - current_w))
+                new_y = max(0, min(new_y, current_canvas_h - current_h))
+            if new_x != current_x or new_y != current_y:
+                current_x, current_y = new_x, new_y
+                update_rect_position()
+    
+        def stop_move(event):
+            nonlocal dragging
+            dragging = False
+            status_var.set("拖拽完成，可调整或应用")
+    
+        # ---- 绘制新矩形（仅当 allow_resize=True 时可用） ----
+        def start_draw(event):
+            nonlocal draw_start, draw_rect_temp, draw_mode_active
+            if not draw_mode_active:
+                return
+            if draw_rect_temp:
+                canvas.delete(draw_rect_temp)
+                draw_rect_temp = None
+            draw_start = to_real(event.x, event.y)
+    
+        def on_draw_move(event):
+            nonlocal draw_rect_temp, draw_start, draw_mode_active
+            if not draw_mode_active or draw_start is None:
+                return
+            cur = to_real(event.x, event.y)
+            x1 = min(draw_start[0], cur[0])
+            y1 = min(draw_start[1], cur[1])
+            x2 = max(draw_start[0], cur[0])
+            y2 = max(draw_start[1], cur[1])
+            w = x2 - x1
+            h = y2 - y1
+            if w == 0 or h == 0:
+                return
+            if aspect_ratio is not None:
+                if w / h > aspect_ratio:
+                    new_w = h * aspect_ratio
+                    x2 = x1 + new_w
+                else:
+                    new_h = w / aspect_ratio
+                    y2 = y1 + new_h
+            draw_x = x1
+            draw_y = y1
+            draw_w = x2 - x1
+            draw_h = y2 - y1
+            # 边界裁剪（保持矩形在画布内，不超出）
+            if draw_x < 0:
+                draw_w += draw_x
+                draw_x = 0
+            if draw_y < 0:
+                draw_h += draw_y
+                draw_y = 0
+            if draw_x + draw_w > current_canvas_w:
+                draw_w = current_canvas_w - draw_x
+                if aspect_ratio is not None:
+                    draw_h = draw_w / aspect_ratio
+            if draw_y + draw_h > current_canvas_h:
+                draw_h = current_canvas_h - draw_y
+                if aspect_ratio is not None:
+                    draw_w = draw_h * aspect_ratio
+            if draw_w <= 0 or draw_h <= 0:
+                return
+            cx1, cy1 = to_canvas(draw_x, draw_y)
+            cx2, cy2 = to_canvas(draw_x + draw_w, draw_y + draw_h)
+            if draw_rect_temp:
+                canvas.coords(draw_rect_temp, cx1, cy1, cx2, cy2)
+            else:
+                draw_rect_temp = canvas.create_rectangle(cx1, cy1, cx2, cy2,
+                                                         outline="yellow", width=2, dash=(2, 2))
+    
+        def end_draw(event):
+            nonlocal draw_mode_active, draw_start, draw_rect_temp, current_x, current_y, current_w, current_h, rect_id, text_id
+            if not draw_mode_active or draw_start is None:
+                return
+            if draw_rect_temp:
+                coords = canvas.coords(draw_rect_temp)
+                if len(coords) == 4:
+                    cx1, cy1, cx2, cy2 = coords
+                    x1, y1 = to_real(cx1, cy1)
+                    x2, y2 = to_real(cx2, cy2)
+                    new_w = x2 - x1
+                    new_h = y2 - y1
+                    if new_w > 0 and new_h > 0:
+                        current_x, current_y = x1, y1
+                        current_w, current_h = new_w, new_h
+                        clamp_rect()  # 应用边界限制（根据 allow_negative_offset）
+                        canvas.delete(rect_id)
+                        canvas.delete(text_id)
+                        rect_id, text_id = create_rect()
+                        update_coord_display()
+                        status_var.set("新矩形已创建，可拖拽移动或应用")
+                if draw_rect_temp:
+                    canvas.delete(draw_rect_temp)
+                    draw_rect_temp = None
+            draw_mode_active = False
+            if allow_resize:
+                draw_btn.config(state="normal")
+                draw_abort_btn.config(state="disabled")
+            draw_start = None
+    
+        def abort_draw():
+            nonlocal draw_mode_active, draw_rect_temp, draw_start
+            draw_mode_active = False
+            if allow_resize:
+                draw_btn.config(state="normal")
+                draw_abort_btn.config(state="disabled")
+            if draw_rect_temp:
+                canvas.delete(draw_rect_temp)
+                draw_rect_temp = None
+            draw_start = None
+            status_var.set("已取消绘制")
+    
+        def enter_draw_mode():
+            nonlocal draw_mode_active
+            if draw_mode_active:
+                return
+            draw_mode_active = True
+            draw_btn.config(state="disabled")
+            draw_abort_btn.config(state="normal")
+            status_var.set("绘制模式：按住左键拖拽绘制新矩形（保持宽高比），松开后自动替换")
+    
+        # ---- 重置位置 ----
+        def reset_position():
+            nonlocal current_x, current_y
+            current_x = current_canvas_w - current_w - 10
+            current_y = current_canvas_h - current_h - 10
+            clamp_rect()  # 应用边界限制（根据模式）
+            update_rect_position()
+            status_var.set("已重置到右下角")
+    
+        # ---- 应用与取消 ----
+        def apply():
+            clamp_rect()
+            on_apply(current_x, current_y, current_w, current_h,
+                     current_canvas_w, current_canvas_h)
+            win.destroy()
+    
+        def cancel():
+            win.destroy()
+    
+        # ---- 创建 GUI 控件 ----
+        canvas = tk.Canvas(win, width=disp_w, height=disp_h, bg="black", highlightthickness=1)
+        canvas.pack(pady=10)
+    
+        if bg_draw_func:
+            bg_draw_func(canvas, scale)
+    
+        status_var = tk.StringVar(value="红色矩形可拖拽移动。")
+        ttk.Label(win, textvariable=status_var, justify=tk.LEFT).pack(pady=5)
+    
+        coord_var = tk.StringVar(value="")
+        coord_label = ttk.Label(win, textvariable=coord_var, font=("Courier", 10))
+        coord_label.pack(pady=2)
+    
+        # 画布尺寸控件（主视频模式）
+        if show_canvas_controls:
+            canvas_ctrl_frame = ttk.Frame(win)
+            canvas_ctrl_frame.pack(pady=5)
+            ttk.Label(canvas_ctrl_frame, text="画布宽度:").pack(side=tk.LEFT)
+            canvas_w_var = tk.StringVar(value=str(canvas_w))
+            ttk.Entry(canvas_ctrl_frame, textvariable=canvas_w_var, width=8).pack(side=tk.LEFT, padx=5)
+            ttk.Label(canvas_ctrl_frame, text="画布高度:").pack(side=tk.LEFT)
+            canvas_h_var = tk.StringVar(value=str(canvas_h))
+            ttk.Entry(canvas_ctrl_frame, textvariable=canvas_h_var, width=8).pack(side=tk.LEFT, padx=5)
+            ttk.Button(canvas_ctrl_frame, text="应用画布尺寸", command=_apply_canvas_size).pack(side=tk.LEFT, padx=5)
+    
+        # 绘制矩形控件（子视频/水印模式）
+        if allow_resize:
+            draw_btn_frame = ttk.Frame(win)
+            draw_btn_frame.pack(pady=5)
+            draw_btn = ttk.Button(draw_btn_frame, text="绘制新矩形", command=enter_draw_mode)
+            draw_btn.pack(side=tk.LEFT, padx=5)
+            draw_abort_btn = ttk.Button(draw_btn_frame, text="取消绘制", command=abort_draw, state="disabled")
+            draw_abort_btn.pack(side=tk.LEFT, padx=5)
+    
+        # 通用操作按钮
+        action_frame = ttk.Frame(win)
+        action_frame.pack(pady=10)
+        ttk.Button(action_frame, text="应用", command=apply).pack(side=tk.LEFT, padx=10)
+        ttk.Button(action_frame, text="取消", command=cancel).pack(side=tk.LEFT, padx=10)
+        ttk.Button(action_frame, text="重置位置（右下角）", command=reset_position).pack(side=tk.LEFT, padx=10)
+    
+        # 绑定事件
+        canvas.tag_bind("rect", "<Button-1>", start_move)
+        canvas.tag_bind("rect", "<B1-Motion>", on_move)
+        canvas.tag_bind("rect", "<ButtonRelease-1>", stop_move)
+        canvas.bind("<Button-1>", start_draw, add=True)
+        canvas.bind("<B1-Motion>", on_draw_move, add=True)
+        canvas.bind("<ButtonRelease-1>", end_draw, add=True)
+    
+        # 初始化
+        clamp_rect()
+        rect_id, text_id = create_rect()
+        update_coord_display()
+        if rect_color == 'deepskyblue':
+            status_var.set("拖拽蓝色矩形移动，调整主视频内容在画布中的位置。")
+        else:
+            status_var.set("红色矩形可拖拽移动。")
+        if not allow_resize and 'draw_btn_frame' in locals():
+            draw_btn_frame.pack_forget()
+    
+        center_window(win, disp_w + 20, disp_h + 240)
+        win.wait_window()
+        parent.lift()
+        parent.focus_force()
+
+
     # ---------- 主视频位置可视化编辑器 ----------
-    def open_visual_pad_editor(self, track_idx, pad_w_var, pad_h_var, off_x_var, off_y_var, live_filt_frame=None, parent=None):
+    def open_visual_pad_editor(self, track_idx, pad_w_var, pad_h_var, off_x_var, off_y_var,
+                               live_filt_frame=None, parent=None):
         track = self.merge_tracks[track_idx]
         if track.type != "video":
             return
@@ -5676,336 +6058,127 @@ class FFmpegBatchGUI:
             messagebox.showerror("错误", "无法获取主视频渲染尺寸")
             return
     
+        # 获取当前画布尺寸
         try:
-            pad_w_str = pad_w_var.get().strip()
-            pad_h_str = pad_h_var.get().strip()
-            if pad_w_str and pad_h_str:
-                canvas_w = int(pad_w_str)
-                canvas_h = int(pad_h_str)
-                if canvas_w <= 0 or canvas_h <= 0:
-                    raise ValueError
-            else:
+            canvas_w = int(pad_w_var.get().strip()) if pad_w_var.get().strip() else 0
+            canvas_h = int(pad_h_var.get().strip()) if pad_h_var.get().strip() else 0
+            if canvas_w <= 0 or canvas_h <= 0:
                 raise ValueError
         except:
             canvas_w, canvas_h = main_render_w, main_render_h
             pad_w_var.set(str(canvas_w))
             pad_h_var.set(str(canvas_h))
     
-        # 从 enc_settings 读取偏移
-        pad_enabled = main_track.enc_settings.get('pad_enabled', False)
-        if pad_enabled:
-            try:
-                off_x = int(off_x_var.get()) if off_x_var.get().strip() else 0
-                off_y = int(off_y_var.get()) if off_y_var.get().strip() else 0
-            except:
-                off_x, off_y = 0, 0
-        else:
+        # 获取当前偏移
+        try:
+            off_x = int(off_x_var.get()) if off_x_var.get().strip() else 0
+            off_y = int(off_y_var.get()) if off_y_var.get().strip() else 0
+        except:
             off_x, off_y = 0, 0
     
-        def clamp_offset(x, y):
-            x = max(-main_render_w + 10, min(x, canvas_w - 10))
-            y = max(-main_render_h + 10, min(y, canvas_h - 10))
-            return x, y
-        off_x, off_y = clamp_offset(off_x, off_y)
+        # 定义应用回调
+        def apply_pad(new_x, new_y, new_w, new_h, new_canvas_w, new_canvas_h):
+            # 更新轨道设置
+            track.enc_settings['pad_enabled'] = True
+            track.enc_settings['pad_width'] = str(new_canvas_w)
+            track.enc_settings['pad_height'] = str(new_canvas_h)
+            track.enc_settings['offset_x'] = str(new_x)
+            track.enc_settings['offset_y'] = str(new_y)
+            # 同步属性
+            track.pad_enabled = True
+            track.pad_width = str(new_canvas_w)
+            track.pad_height = str(new_canvas_h)
+            track.offset_x = str(new_x)
+            track.offset_y = str(new_y)
+            # 更新界面变量
+            pad_w_var.set(str(new_canvas_w))
+            pad_h_var.set(str(new_canvas_h))
+            off_x_var.set(str(new_x))
+            off_y_var.set(str(new_y))
+            self.merge_update_track_list()
+            self.merge_update_command_preview()
+            self._append_info_ui(f"[可视化] 已设置画布 {new_canvas_w}x{new_canvas_h}, 偏移 ({new_x}, {new_y})")
     
-        max_display_w, max_display_h = 800, 600
-        scale = min(max_display_w / canvas_w, max_display_h / canvas_h, 1.0)
-        disp_w = int(canvas_w * scale)
-        disp_h = int(canvas_h * scale)
-
-        if parent is None:
-            parent = self.root
-        with self.SafeToplevel(parent) as win:
-            win.title("可视化编辑画布偏移 - 拖拽蓝色矩形")
-            win.transient(self.root)
-            center_window(win, disp_w + 20, disp_h + 200)
-            win.update_idletasks()
-    
-            canvas = tk.Canvas(win, width=disp_w, height=disp_h, bg="black", highlightthickness=1, highlightbackground="gray")
-            canvas.pack(pady=10)
-    
-            status_var = tk.StringVar(value="拖拽蓝色矩形移动，调整主视频内容在画布中的位置。绿色虚线框为从视频")
-            ttk.Label(win, textvariable=status_var, justify=tk.LEFT).pack(pady=5)
-    
-            size_frame = ttk.Frame(win)
-            size_frame.pack(pady=5)
-            ttk.Label(size_frame, text="画布宽度:").pack(side=tk.LEFT)
-            canvas_w_var = tk.StringVar(value=str(canvas_w))
-            ttk.Entry(size_frame, textvariable=canvas_w_var, width=8).pack(side=tk.LEFT, padx=5)
-            ttk.Label(size_frame, text="画布高度:").pack(side=tk.LEFT)
-            canvas_h_var = tk.StringVar(value=str(canvas_h))
-            ttk.Entry(size_frame, textvariable=canvas_h_var, width=8).pack(side=tk.LEFT, padx=5)
-            ttk.Button(size_frame, text="应用画布尺寸", command=lambda: update_canvas_size()).pack(side=tk.LEFT, padx=5)
-    
-            coord_var = tk.StringVar(value=f"偏移: X={off_x}, Y={off_y}")
-            ttk.Label(win, textvariable=coord_var, font=("Courier", 10)).pack(pady=2)
-    
+        # 背景绘制函数（显示其他子视频虚线框）
+        def draw_bg(canvas, scale):
+            # 主视频内容矩形（用于绘制主视频边界）
+            main_render_size = (main_render_w, main_render_h)
             self._draw_background(canvas, canvas_w, canvas_h, scale, main_track, sub_tracks,
-                                  off_x, off_y, (main_render_w, main_render_h), tag="bg")
+                                  off_x, off_y, main_render_size, current_edit_track=None, tag="bg")
     
-            rect_id = None
-            text_id = None
-            warning_id = None
-            drag_data = {"x": 0, "y": 0}
-            current_off_x, current_off_y = off_x, off_y
-    
-            def draw_rectangle():
-                nonlocal rect_id, text_id, warning_id
-                x1 = current_off_x
-                y1 = current_off_y
-                x2 = current_off_x + main_render_w
-                y2 = current_off_y + main_render_h
-                vis_x1 = max(0, x1)
-                vis_y1 = max(0, y1)
-                vis_x2 = min(canvas_w, x2)
-                vis_y2 = min(canvas_h, y2)
-                if vis_x2 > vis_x1 and vis_y2 > vis_y1:
-                    cx1, cy1 = self._to_canvas_coords(vis_x1, vis_y1, scale)
-                    cx2, cy2 = self._to_canvas_coords(vis_x2, vis_y2, scale)
-                    if rect_id:
-                        canvas.coords(rect_id, cx1, cy1, cx2, cy2)
-                        if text_id:
-                            canvas.coords(text_id, cx1 + 5, cy1 + 5)
-                    else:
-                        rect_id = canvas.create_rectangle(cx1, cy1, cx2, cy2, outline="deepskyblue", width=2,
-                                                          fill="skyblue", stipple="gray50")
-                        text_id = canvas.create_text(cx1 + 5, cy1 + 5, anchor="nw", text="主视频", fill="blue", font=("Arial", 9))
-                    if warning_id:
-                        canvas.delete(warning_id)
-                        warning_id = None
-                else:
-                    if rect_id:
-                        canvas.delete(rect_id)
-                        rect_id = None
-                    if text_id:
-                        canvas.delete(text_id)
-                        text_id = None
-                    if warning_id is None:
-                        warning_id = canvas.create_text(disp_w//2, disp_h//2, text="主视频完全不可见", fill="red", font=("Arial", 10))
-                    else:
-                        canvas.coords(warning_id, disp_w//2, disp_h//2)
-    
-            draw_rectangle()
-    
-            def on_mouse_down(event):
-                if rect_id is None:
-                    return
-                coords = canvas.coords(rect_id)
-                if len(coords) != 4:
-                    return
-                cx1, cy1, cx2, cy2 = coords
-                if cx1 <= event.x <= cx2 and cy1 <= event.y <= cy2:
-                    drag_data["x"] = event.x
-                    drag_data["y"] = event.y
-                    status_var.set("拖拽移动主视频位置")
-    
-            def on_mouse_move(event):
-                nonlocal current_off_x, current_off_y
-                if "x" not in drag_data:
-                    return
-                dx = event.x - drag_data["x"]
-                dy = event.y - drag_data["y"]
-                if dx == 0 and dy == 0:
-                    return
-                new_x = current_off_x + dx / scale
-                new_y = current_off_y + dy / scale
-                new_x, new_y = clamp_offset(new_x, new_y)
-                current_off_x = int(new_x)
-                current_off_y = int(new_y)
-                coord_var.set(f"偏移: X={current_off_x}, Y={current_off_y}")
-                draw_rectangle()
-                drag_data["x"] = event.x
-                drag_data["y"] = event.y
-    
-            def on_mouse_up(event):
-                drag_data.clear()
-                status_var.set("拖拽完成，点击「保存」应用偏移")
-    
-            canvas.bind("<Button-1>", on_mouse_down)
-            canvas.bind("<B1-Motion>", on_mouse_move)
-            canvas.bind("<ButtonRelease-1>", on_mouse_up)
-    
-            def update_canvas_size():
-                nonlocal canvas_w, canvas_h, scale, disp_w, disp_h, current_off_x, current_off_y
-                nonlocal rect_id, text_id, warning_id
-                try:
-                    new_w = int(canvas_w_var.get())
-                    new_h = int(canvas_h_var.get())
-                    if new_w <= 0 or new_h <= 0:
-                        raise ValueError
-                    canvas_w, canvas_h = new_w, new_h
-                    scale = min(max_display_w / canvas_w, max_display_h / canvas_h, 1.0)
-                    disp_w = int(canvas_w * scale)
-                    disp_h = int(canvas_h * scale)
-                    win.geometry(f"{disp_w + 20}x{disp_h + 200}")
-                    canvas.config(width=disp_w, height=disp_h)
-                    current_off_x, current_off_y = clamp_offset(current_off_x, current_off_y)
-                    coord_var.set(f"偏移: X={current_off_x}, Y={current_off_y}")
-                    canvas.delete("all")
-                    rect_id = text_id = warning_id = None
-                    self._draw_background(canvas, canvas_w, canvas_h, scale, main_track, sub_tracks,
-                                          current_off_x, current_off_y, (main_render_w, main_render_h), tag="bg")
-                    draw_rectangle()
-                    win.update_idletasks()
-                    x = self.root.winfo_x() + (self.root.winfo_width() - win.winfo_width()) // 2
-                    y = self.root.winfo_y() + (self.root.winfo_height() - win.winfo_height()) // 2
-                    win.geometry(f"+{x}+{y}")
-                except:
-                    messagebox.showerror("错误", "画布尺寸无效")
-    
-            def save():
-                # 更新 enc_settings 和轨道属性（同步）
-                track.enc_settings['pad_enabled'] = True
-                track.enc_settings['pad_width'] = str(canvas_w)
-                track.enc_settings['pad_height'] = str(canvas_h)
-                track.enc_settings['offset_x'] = str(current_off_x)
-                track.enc_settings['offset_y'] = str(current_off_y)
-                # 同步更新属性（兼容旧代码）
-                track.pad_enabled = True
-                track.pad_width = str(canvas_w)
-                track.pad_height = str(canvas_h)
-                track.offset_x = str(current_off_x)
-                track.offset_y = str(current_off_y)
-                pad_w_var.set(str(canvas_w))
-                pad_h_var.set(str(canvas_h))
-                off_x_var.set(str(current_off_x))
-                off_y_var.set(str(current_off_y))
-                self.merge_update_track_list()
-                self.merge_update_command_preview()
-                win.destroy()
-                self._append_info_ui(f"[可视化] 已设置画布 {canvas_w}x{canvas_h}, 偏移 ({current_off_x}, {current_off_y})")
-    
-            def cancel():
-                win.destroy()
-    
-            btn_frame = ttk.Frame(win)
-            btn_frame.pack(pady=10)
-            ttk.Button(btn_frame, text="保存", command=save).pack(side=tk.LEFT, padx=10)
-            ttk.Button(btn_frame, text="取消", command=cancel).pack(side=tk.LEFT, padx=10)
-            win.wait_window()
-        parent.lift()
-        parent.focus_force()
+        # 调用通用编辑器
+        self._generic_overlay_editor(
+            parent=parent or self.root,
+            canvas_w=canvas_w,
+            canvas_h=canvas_h,
+            rect_x=off_x,
+            rect_y=off_y,
+            rect_w=main_render_w,
+            rect_h=main_render_h,
+            on_apply=apply_pad,
+            title="可视化编辑画布偏移 - 拖拽蓝色矩形",
+            aspect_ratio=None,
+            bg_draw_func=draw_bg,
+            allow_resize=False,
+            show_canvas_controls=True,
+            coord_mode='offset',
+            allow_negative_offset=True,   # 允许负偏移
+            rect_color='deepskyblue'      # 蓝色
+        )
 
-    def _simple_visual_overlay(self, canvas_w, canvas_h, wm_w, wm_h, x_var, y_var, parent=None):
+    # ---------- 水印位置可视化编辑器 ----------
+    def open_watermark_overlay_editor(self, canvas_w, canvas_h, wm_w, wm_h, x_var, y_var,
+                                      scale_enabled_var=None, scale_w_var=None, scale_h_var=None,
+                                      watermark_dict=None, filt_frame=None, parent=None):
         """
-        水印可视化位置调整（直接基于画布和矩形尺寸）
-        parent: 父窗口（通常是 WatermarkEditor 的窗口），用于设置 transient
+        水印可视化编辑器，支持回写位置和缩放尺寸，以及更新水印字典和滤镜框架。
         """
-        if parent is None:
-            parent = self.root
-        with self.SafeToplevel(parent) as vis_win:
-            vis_win.title("可视化调整水印位置 - 拖动矩形")
-            vis_win.transient(parent)   # 设为父窗口的临时对话框
-            vis_win.grab_set()          # 模态（可选，避免操作其他窗口）
-            max_disp = 600
-            scale = min(max_disp / canvas_w, max_disp / canvas_h, 1.0)
-            disp_w = int(canvas_w * scale)
-            disp_h = int(canvas_h * scale)
-            center_window(vis_win, disp_w + 20, disp_h + 120)
-            canvas = tk.Canvas(vis_win, width=disp_w, height=disp_h, bg='black')
-            canvas.pack(pady=10)
+        # 解析当前坐标
+        rect_x = safe_eval_expr(x_var.get(), {"W": canvas_w, "H": canvas_h, "w": wm_w, "h": wm_h})
+        if rect_x is None:
+            rect_x = canvas_w - wm_w - 10
+        rect_y = safe_eval_expr(y_var.get(), {"W": canvas_w, "H": canvas_h, "w": wm_w, "h": wm_h})
+        if rect_y is None:
+            rect_y = canvas_h - wm_h - 10
+        rect_x = max(0, min(rect_x, canvas_w - wm_w))
+        rect_y = max(0, min(rect_y, canvas_h - wm_h))
     
-            # 获取当前坐标
-            x_expr = x_var.get()
-            y_expr = y_var.get()
-            ctx = {"W": canvas_w, "H": canvas_h, "w": wm_w, "h": wm_h}
-            cur_x = safe_eval_expr(x_expr, ctx) or (canvas_w - wm_w - 10)
-            cur_y = safe_eval_expr(y_expr, ctx) or (canvas_h - wm_h - 10)
-            cur_x = max(0, min(cur_x, canvas_w - wm_w))
-            cur_y = max(0, min(cur_y, canvas_h - wm_h))
+        def on_apply(new_x, new_y, new_w, new_h, new_canvas_w, new_canvas_h):
+            # 更新位置变量
+            x_var.set(str(new_x))
+            y_var.set(str(new_y))
+            # 更新缩放控件
+            if scale_enabled_var is not None:
+                scale_enabled_var.set(True)
+            if scale_w_var is not None:
+                scale_w_var.set(str(new_w))
+            if scale_h_var is not None:
+                scale_h_var.set(str(new_h))
+            # 更新水印设置字典（如果提供）
+            if watermark_dict is not None:
+                watermark_dict["scale_width"] = str(new_w)
+                watermark_dict["scale_height"] = str(new_h)
+                watermark_dict["scale_method"] = "exact"
+                watermark_dict["scale_enabled"] = True
+            # 同步滤镜框架的缩放控件（如果提供）
+            if filt_frame is not None:
+                filt_frame.scale_enabled.set(True)
+                filt_frame.scale_method.set("exact")
+                filt_frame.scale_width.set(str(new_w))
+                filt_frame.scale_height.set(str(new_h))
+            self._append_info_ui(f"[水印可视化] 已保存位置: ({new_x}, {new_y}) 尺寸: {new_w}x{new_h}")
     
-            rect_id = None
-            text_id = None
+        title = "可视化编辑水印位置及大小"
+        aspect = wm_w / wm_h if wm_h != 0 else None
+        self._generic_overlay_editor(parent or self.root, canvas_w, canvas_h,
+                                     rect_x, rect_y, wm_w, wm_h,
+                                     on_apply, title, aspect, bg_draw_func=None)
     
-            def draw_rect():
-                nonlocal rect_id, text_id
-                x1 = cur_x * scale
-                y1 = cur_y * scale
-                x2 = (cur_x + wm_w) * scale
-                y2 = (cur_y + wm_h) * scale
-                if rect_id:
-                    canvas.coords(rect_id, x1, y1, x2, y2)
-                    canvas.coords(text_id, x1+5, y1+5)
-                else:
-                    rect_id = canvas.create_rectangle(x1, y1, x2, y2, outline='red', width=2, fill='red', stipple='gray50')
-                    text_id = canvas.create_text(x1+5, y1+5, anchor='nw', text='水印', fill='white')
-    
-            draw_rect()
-    
-            drag_start = None
-            def on_click(event):
-                nonlocal drag_start
-                if rect_id:
-                    coords = canvas.coords(rect_id)
-                    if coords[0] <= event.x <= coords[2] and coords[1] <= event.y <= coords[3]:
-                        drag_start = (event.x, event.y)
-            def on_drag(event):
-                nonlocal cur_x, cur_y, drag_start
-                if drag_start:
-                    dx = (event.x - drag_start[0]) / scale
-                    dy = (event.y - drag_start[1]) / scale
-                    new_x = cur_x + dx
-                    new_y = cur_y + dy
-                    new_x = max(0, min(new_x, canvas_w - wm_w))
-                    new_y = max(0, min(new_y, canvas_h - wm_h))
-                    if new_x != cur_x or new_y != cur_y:
-                        cur_x, cur_y = new_x, new_y
-                        draw_rect()
-                        drag_start = (event.x, event.y)
-            def on_release(event):
-                nonlocal drag_start
-                drag_start = None
-    
-            canvas.bind("<Button-1>", on_click)
-            canvas.bind("<B1-Motion>", on_drag)
-            canvas.bind("<ButtonRelease-1>", on_release)
-    
-            def apply():
-                try:
-                    # 获取矩形在画布上的像素坐标
-                    coords = canvas.coords(rect_id)
-                    if not coords or len(coords) < 4:
-                        # 如果矩形不存在，使用居中位置
-                        final_x = (canvas_w - wm_w) // 2
-                        final_y = (canvas_h - wm_h) // 2
-                    else:
-                        # 像素坐标转真实坐标
-                        real_x = coords[0] / scale
-                        real_y = coords[1] / scale
-                        final_x = int(round(real_x))
-                        final_y = int(round(real_y))
-            
-                    # 回填到界面变量
-                    x_var.set(str(final_x))
-                    y_var.set(str(final_y))
-            
-                    # 保存基准（仅在首次设置）
-                    if "base_width" not in self.watermark_settings:
-                        self.watermark_settings["base_width"] = canvas_w
-                        self.watermark_settings["base_height"] = canvas_h
-                except Exception as e:
-                    self._append_info_ui(f"[可视化] 应用坐标时出错: {e}")
-                finally:
-                    # 确保窗口关闭
-                    if vis_win and vis_win.winfo_exists():
-                        vis_win.destroy()
-                    parent.lift()
-                    parent.focus_force()
-    
-            def cancel():
-                vis_win.destroy()
-                parent.lift()
-                parent.focus_force()
-    
-            btn_frame = ttk.Frame(vis_win)
-            btn_frame.pack(pady=5)
-            ttk.Button(btn_frame, text="应用", command=apply).pack(side=tk.LEFT, padx=5)
-            ttk.Button(btn_frame, text="取消", command=cancel).pack(side=tk.LEFT, padx=5)
-            vis_win.wait_window()
-
-
     # ---------- 从视频位置可视化编辑器 ----------
     def open_visual_overlay_editor(self, track_idx, ov_x_var=None, ov_y_var=None, filt_frame=None, parent=None):
+        """
+        画中画子视频叠加位置/大小可视化编辑器（保留背景虚线框）
+        """
         track = self.merge_tracks[track_idx]
         if track.type != "video":
             return
@@ -6015,305 +6188,81 @@ class FFmpegBatchGUI:
             messagebox.showerror("错误", "没有启用的视频轨道")
             return
         main_track = enabled_videos[0]
-        sub_tracks = enabled_videos[1:]
     
         curr_w, curr_h = self._get_video_render_size(track, filt_frame)
         if curr_w is None:
             messagebox.showerror("错误", "无法获取视频渲染尺寸")
             return
-        aspect = curr_w / curr_h
     
         canvas_w, canvas_h = self._get_canvas_size(main_track)
     
-        main_render_size = self._get_video_render_size(main_track)
-        if main_render_size is None:
-            main_render_size = (canvas_w, canvas_h)
-        main_pad_enabled = main_track.enc_settings.get('pad_enabled', False)
-        if main_pad_enabled:
-            off_x_expr = main_track.enc_settings.get('offset_x', '0')
-            off_y_expr = main_track.enc_settings.get('offset_y', '0')
-            offset_x = safe_eval_expr(off_x_expr, {"W": canvas_w, "H": canvas_h}) or 0
-            offset_y = safe_eval_expr(off_y_expr, {"W": canvas_w, "H": canvas_h}) or 0
-        else:
-            offset_x, offset_y = 0, 0
+        # 计算当前矩形位置
+        x_expr = track.enc_settings.get('overlay_x', '0')
+        y_expr = track.enc_settings.get('overlay_y', '0')
+        rect_x = safe_eval_expr(x_expr, {"W": canvas_w, "H": canvas_h, "w": curr_w, "h": curr_h})
+        if rect_x is None:
+            rect_x = canvas_w - curr_w - 10
+        rect_y = safe_eval_expr(y_expr, {"W": canvas_w, "H": canvas_h, "w": curr_w, "h": curr_h})
+        if rect_y is None:
+            rect_y = canvas_h - curr_h - 10
+        rect_x = max(0, min(rect_x, canvas_w - curr_w))
+        rect_y = max(0, min(rect_y, canvas_h - curr_h))
     
-        max_display_w, max_display_h = 800, 600
-        scale = min(max_display_w / canvas_w, max_display_h / canvas_h, 1.0)
-        disp_w = int(canvas_w * scale)
-        disp_h = int(canvas_h * scale)
+        def on_apply(new_x, new_y, new_w, new_h, new_canvas_w, new_canvas_h):
+            # 更新轨道设置
+            track.enc_settings['overlay_x'] = str(new_x)
+            track.enc_settings['overlay_y'] = str(new_y)
+            track.overlay_x = str(new_x)
+            track.overlay_y = str(new_y)
+            if ov_x_var is not None:
+                ov_x_var.set(str(new_x))
+            if ov_y_var is not None:
+                ov_y_var.set(str(new_y))
+            track.enc_settings["scale_enabled"] = True
+            track.enc_settings["scale_width"] = str(new_w)
+            track.enc_settings["scale_height"] = str(new_h)
+            track.enc_settings["scale_method"] = "exact"
+            track.overlay_enabled = True
+            if filt_frame is not None:
+                filt_frame.scale_enabled.set(True)
+                filt_frame.scale_method.set("exact")
+                filt_frame.scale_width.set(str(new_w))
+                filt_frame.scale_height.set(str(new_h))
+            self.merge_update_track_list()
+            self.merge_update_command_preview()
+            self._append_info_ui(f"[可视化] 已保存位置: ({new_x}, {new_y}) 大小: {new_w}x{new_h}")
     
-        if parent is None:
-            parent = self.root
-        with self.SafeToplevel(parent) as win:
-            win.title(f"可视化编辑叠加位置 - {os.path.basename(track.file_path)}")
-            win.transient(self.root)
-            center_window(win, disp_w + 20, disp_h + 240)
-            win.update_idletasks()
-    
-            canvas = tk.Canvas(win, width=disp_w, height=disp_h, bg="black", highlightthickness=1, highlightbackground="gray")
-            canvas.pack(pady=10)
-    
-            status_var = tk.StringVar(value="红色矩形可拖拽移动。点击「绘制新矩形」可重新定义大小。")
-            ttk.Label(win, textvariable=status_var, justify=tk.LEFT).pack(pady=5)
-    
-            coord_var = tk.StringVar(value="未设置")
-            ttk.Label(win, textvariable=coord_var, font=("Courier", 10)).pack(pady=2)
-    
-            ttk.Label(win, text=f"主视频偏移: X={offset_x}, Y={offset_y}", foreground="orange").pack(pady=2)
-    
+        # 定义背景绘制函数（显示其他子视频和主视频边界）
+        def draw_bg(canvas, scale):
+            # 获取主视频偏移
+            offset_x = 0
+            offset_y = 0
+            main_pad_enabled = main_track.enc_settings.get('pad_enabled', False)
+            if main_pad_enabled:
+                off_x_expr = main_track.enc_settings.get('offset_x', '0')
+                off_y_expr = main_track.enc_settings.get('offset_y', '0')
+                offset_x = safe_eval_expr(off_x_expr, {"W": canvas_w, "H": canvas_h}) or 0
+                offset_y = safe_eval_expr(off_y_expr, {"W": canvas_w, "H": canvas_h}) or 0
+            # 获取主视频渲染尺寸
+            main_render_size = self._get_video_render_size(main_track)
+            if main_render_size is None:
+                main_render_size = (canvas_w, canvas_h)
+            sub_tracks = enabled_videos[1:]
+            # 调用已有的背景绘制方法
             self._draw_background(canvas, canvas_w, canvas_h, scale, main_track, sub_tracks,
                                   offset_x, offset_y, main_render_size, current_edit_track=track, tag="bg")
     
-            rect_x, rect_y, rect_w, rect_h = 0, 0, curr_w, curr_h
-            rect_id = None
-            text_id = None
-    
-            def load_current():
-                nonlocal rect_x, rect_y, rect_w, rect_h
-                rect_w, rect_h = curr_w, curr_h
-                x_expr = track.enc_settings.get('overlay_x', '0')
-                y_expr = track.enc_settings.get('overlay_y', '0')
-                x_val = safe_eval_expr(x_expr, {"W": canvas_w, "H": canvas_h, "w": rect_w, "h": rect_h})
-                y_val = safe_eval_expr(y_expr, {"W": canvas_w, "H": canvas_h, "w": rect_w, "h": rect_h})
-                if x_val is None or y_val is None:
-                    x_val = canvas_w - rect_w - 10
-                    y_val = canvas_h - rect_h - 10
-                rect_x = max(0, min(x_val, canvas_w - rect_w))
-                rect_y = max(0, min(y_val, canvas_h - rect_h))
-                coord_var.set(f"左上角: ({rect_x}, {rect_y})  宽: {rect_w}  高: {rect_h}")
-    
-            def create_rect():
-                cx1, cy1 = self._to_canvas_coords(rect_x, rect_y, scale)
-                cx2, cy2 = self._to_canvas_coords(rect_x + rect_w, rect_y + rect_h, scale)
-                rid = canvas.create_rectangle(cx1, cy1, cx2, cy2, outline="red", width=2, fill="red", stipple="gray50", tags="rect")
-                tid = canvas.create_text(cx1 + 5, cy1 + 5, anchor="nw", text="视频", fill="white", font=("Arial", 9), tags="rect")
-                return rid, tid
-    
-            def update_rect_position():
-                cx1, cy1 = self._to_canvas_coords(rect_x, rect_y, scale)
-                cx2, cy2 = self._to_canvas_coords(rect_x + rect_w, rect_y + rect_h, scale)
-                canvas.coords(rect_id, cx1, cy1, cx2, cy2)
-                canvas.coords(text_id, cx1 + 5, cy1 + 5)
-    
-            drag_start_x = 0
-            drag_start_y = 0
-            drag_mouse_start = (0, 0)
-            dragging = False
-            draw_mode_active = False
-    
-            def start_move(event):
-                nonlocal drag_start_x, drag_start_y, drag_mouse_start, dragging, draw_mode_active
-                if draw_mode_active:
-                    return
-                cx, cy = event.x, event.y
-                bbox = canvas.bbox(rect_id)
-                if bbox and bbox[0] <= cx <= bbox[2] and bbox[1] <= cy <= bbox[3]:
-                    drag_start_x = rect_x
-                    drag_start_y = rect_y
-                    drag_mouse_start = (cx, cy)
-                    dragging = True
-                    status_var.set("拖拽移动矩形")
-    
-            def on_move(event):
-                nonlocal rect_x, rect_y, dragging, draw_mode_active, drag_start_x, drag_start_y, drag_mouse_start
-                if not dragging or draw_mode_active:
-                    return
-                dx_pixel = event.x - drag_mouse_start[0]
-                dy_pixel = event.y - drag_mouse_start[1]
-                dx = dx_pixel / scale
-                dy = dy_pixel / scale
-                new_x = int(drag_start_x + dx)
-                new_y = int(drag_start_y + dy)
-                new_x = max(0, min(new_x, canvas_w - rect_w))
-                new_y = max(0, min(new_y, canvas_h - rect_h))
-                if new_x != rect_x or new_y != rect_y:
-                    rect_x, rect_y = new_x, new_y
-                    update_rect_position()
-                    coord_var.set(f"左上角: ({rect_x}, {rect_y})  宽: {rect_w}  高: {rect_h}")
-    
-            def stop_move(event):
-                nonlocal dragging
-                dragging = False
-                status_var.set("红色矩形可拖拽移动。点击「绘制新矩形」可重新定义大小。")
-    
-            canvas.tag_bind("rect", "<Button-1>", start_move)
-            canvas.tag_bind("rect", "<B1-Motion>", on_move)
-            canvas.tag_bind("rect", "<ButtonRelease-1>", stop_move)
-    
-            draw_rect_temp = None
-            draw_start = None
-    
-            def start_draw(event):
-                nonlocal draw_start, draw_rect_temp, draw_mode_active
-                if not draw_mode_active:
-                    return
-                if draw_rect_temp:
-                    canvas.delete(draw_rect_temp)
-                    draw_rect_temp = None
-                draw_start = self._to_real_coords(event.x, event.y, scale)
-    
-            def on_draw_move(event):
-                nonlocal draw_rect_temp, draw_start, draw_mode_active
-                if not draw_mode_active or draw_start is None:
-                    return
-                cur = self._to_real_coords(event.x, event.y, scale)
-                x1 = min(draw_start[0], cur[0])
-                y1 = min(draw_start[1], cur[1])
-                x2 = max(draw_start[0], cur[0])
-                y2 = max(draw_start[1], cur[1])
-                w = x2 - x1
-                h = y2 - y1
-                if w == 0 or h == 0:
-                    return
-                if w / h > aspect:
-                    new_w = h * aspect
-                    new_x2 = x1 + new_w
-                    new_y2 = y2
-                else:
-                    new_h = w / aspect
-                    new_x2 = x2
-                    new_y2 = y1 + new_h
-                draw_x = x1
-                draw_y = y1
-                draw_w = new_x2 - x1
-                draw_h = new_y2 - y1
-                if draw_x < 0:
-                    draw_w += draw_x
-                    draw_x = 0
-                if draw_y < 0:
-                    draw_h += draw_y
-                    draw_y = 0
-                if draw_x + draw_w > canvas_w:
-                    draw_w = canvas_w - draw_x
-                    draw_h = int(draw_w / aspect) if aspect != 0 else 1
-                if draw_y + draw_h > canvas_h:
-                    draw_h = canvas_h - draw_y
-                    draw_w = int(draw_h * aspect) if aspect != 0 else 1
-                if draw_w <= 0 or draw_h <= 0:
-                    return
-                cx1, cy1 = self._to_canvas_coords(draw_x, draw_y, scale)
-                cx2, cy2 = self._to_canvas_coords(draw_x + draw_w, draw_y + draw_h, scale)
-                if draw_rect_temp:
-                    canvas.coords(draw_rect_temp, cx1, cy1, cx2, cy2)
-                else:
-                    draw_rect_temp = canvas.create_rectangle(cx1, cy1, cx2, cy2, outline="yellow", width=2, dash=(2, 2))
-    
-            def end_draw(event):
-                nonlocal draw_mode_active, draw_start, draw_rect_temp, rect_x, rect_y, rect_w, rect_h, rect_id, text_id
-                if not draw_mode_active or draw_start is None:
-                    return
-                if draw_rect_temp:
-                    coords = canvas.coords(draw_rect_temp)
-                    if len(coords) == 4:
-                        cx1, cy1, cx2, cy2 = coords
-                        x1, y1 = self._to_real_coords(cx1, cy1, scale)
-                        x2, y2 = self._to_real_coords(cx2, cy2, scale)
-                        new_w = x2 - x1
-                        new_h = y2 - y1
-                        if new_w > 0 and new_h > 0:
-                            rect_x, rect_y, rect_w, rect_h = x1, y1, new_w, new_h
-                            canvas.delete(rect_id)
-                            canvas.delete(text_id)
-                            rect_id, text_id = create_rect()
-                            coord_var.set(f"左上角: ({rect_x}, {rect_y})  宽: {rect_w}  高: {rect_h}")
-                            status_var.set("新矩形已创建，可拖拽移动或应用")
-                    if draw_rect_temp:
-                        canvas.delete(draw_rect_temp)
-                        draw_rect_temp = None
-                draw_mode_active = False
-                draw_btn.config(state="normal")
-                draw_abort_btn.config(state="disabled")
-                draw_start = None
-    
-            def abort_draw():
-                nonlocal draw_mode_active, draw_rect_temp, draw_start
-                draw_mode_active = False
-                draw_btn.config(state="normal")
-                draw_abort_btn.config(state="disabled")
-                if draw_rect_temp:
-                    canvas.delete(draw_rect_temp)
-                    draw_rect_temp = None
-                draw_start = None
-                status_var.set("已取消绘制，红色矩形可拖拽移动")
-    
-            def enter_draw_mode():
-                nonlocal draw_mode_active
-                if draw_mode_active:
-                    return
-                draw_mode_active = True
-                draw_btn.config(state="disabled")
-                draw_abort_btn.config(state="normal")
-                status_var.set("绘制模式：按住左键拖拽绘制新矩形（保持宽高比），松开后自动替换")
-    
-            canvas.bind("<Button-1>", start_draw, add=True)
-            canvas.bind("<B1-Motion>", on_draw_move, add=True)
-            canvas.bind("<ButtonRelease-1>", end_draw, add=True)
-    
-            btn_frame = ttk.Frame(win)
-            btn_frame.pack(pady=5)
-            draw_btn = ttk.Button(btn_frame, text="绘制新矩形", command=enter_draw_mode)
-            draw_btn.pack(side=tk.LEFT, padx=5)
-            draw_abort_btn = ttk.Button(btn_frame, text="取消绘制", command=abort_draw, state="disabled")
-            draw_abort_btn.pack(side=tk.LEFT, padx=5)
-    
-            def apply():
-                # 更新 enc_settings 和轨道属性（同步）
-                track.enc_settings['overlay_x'] = str(int(rect_x))
-                track.enc_settings['overlay_y'] = str(int(rect_y))
-                track.overlay_x = str(int(rect_x))
-                track.overlay_y = str(int(rect_y))
-                if ov_x_var is not None:
-                    ov_x_var.set(str(int(rect_x)))
-                if ov_y_var is not None:
-                    ov_y_var.set(str(int(rect_y)))
-                track.enc_settings["scale_enabled"] = True
-                track.enc_settings["scale_width"] = str(int(rect_w))
-                track.enc_settings["scale_height"] = str(int(rect_h))
-                track.enc_settings["scale_method"] = "exact"
-                # 同步属性（兼容旧代码，轨道对象属性）
-                track.overlay_enabled = True
-                self._append_info_ui(f"[可视化] 设置缩放: {rect_w}x{rect_h}")
-                if filt_frame is not None:
-                    filt_frame.scale_enabled.set(True)
-                    filt_frame.scale_method.set("exact")
-                    filt_frame.scale_width.set(str(int(rect_w)))
-                    filt_frame.scale_height.set(str(int(rect_h)))
-                self.merge_update_track_list()
-                self.merge_update_command_preview()
-                win.destroy()
-                self._append_info_ui(f"[可视化] 已保存位置: ({rect_x}, {rect_y}) 大小: {rect_w}x{rect_h}")
-    
-            def cancel():
-                win.destroy()
-    
-            def reset_position():
-                nonlocal rect_x, rect_y
-                rect_x = canvas_w - rect_w - 10
-                rect_y = canvas_h - rect_h - 10
-                update_rect_position()
-                coord_var.set(f"左上角: ({rect_x}, {rect_y})  宽: {rect_w}  高: {rect_h}")
-                status_var.set("已重置到右下角（可继续拖拽）")
-    
-            load_current()
-            rect_id, text_id = create_rect()
-            draw_mode_active = False
-    
-            action_frame = ttk.Frame(win)
-            action_frame.pack(pady=10)
-            ttk.Button(action_frame, text="应用", command=apply).pack(side=tk.LEFT, padx=10)
-            ttk.Button(action_frame, text="取消", command=cancel).pack(side=tk.LEFT, padx=10)
-            ttk.Button(action_frame, text="重置位置（右下角）", command=reset_position).pack(side=tk.LEFT, padx=10)
-            tip_label = ttk.Label(win, text="提示：重新绘制矩形时，如果比例不对，请先返回上一个界面取消「缩放」的勾选，已保存的上一次缩放会干扰裁剪属性。",
-                                  foreground="gray", justify=tk.LEFT, wraplength=win.winfo_width() - 20)
-            tip_label.pack(fill=tk.X, padx=10, pady=10)
-    
-            def update_wraplength(event=None):
-                tip_label.config(wraplength=win.winfo_width() - 20)
-            win.bind("<Configure>", update_wraplength)
-            update_wraplength()
-            win.wait_window()
-        parent.lift()
-        parent.focus_force()
+        title = f"可视化编辑叠加位置 - {os.path.basename(track.file_path)}"
+        aspect = curr_w / curr_h if curr_h != 0 else None
+        self._generic_overlay_editor(
+            parent or self.root,
+            canvas_w, canvas_h,
+            rect_x, rect_y, curr_w, curr_h,
+            on_apply,
+            title,
+            aspect,
+            bg_draw_func=draw_bg
+        )
 
     # ---------- 预设管理 ----------
     def load_preset_list(self):
@@ -6942,8 +6891,8 @@ class FFmpegBatchGUI:
             messagebox.showerror("导出失败", str(e))
 
     def edit_task(self, task, task_index):
-        if task.status not in ("等待", "失败"):
-            messagebox.showwarning("无法编辑", f"任务状态为“{task.status}”，只能编辑等待或失败的任务。")
+        if task.status not in ("等待", "失败", "完成"):
+            messagebox.showwarning("无法编辑", f"任务状态为“{task.status}”，只能编辑等待、失败或已完成的任务。")
             return
     
         with self.SafeToplevel(self.root) as win:
@@ -8856,10 +8805,19 @@ class FFmpegBatchGUI:
                             wm_w, wm_h = rendered
                         else:
                             wm_w, wm_h = 320, 240
-                        self._simple_visual_overlay(main_w, main_h, wm_w, wm_h,
-                                                    overlay_frame.overlay_x,
-                                                    overlay_frame.overlay_y,
-                                                    parent=win)
+                        # 调用新的水印编辑器
+                        self.open_watermark_overlay_editor(
+                            main_w, main_h,
+                            wm_w, wm_h,
+                            overlay_frame.overlay_x,
+                            overlay_frame.overlay_y,
+                            scale_enabled_var=filt_frame.scale_enabled,
+                            scale_w_var=filt_frame.scale_width,
+                            scale_h_var=filt_frame.scale_height,
+                            watermark_dict=initial_settings,   # 如果是水印编辑，传入设置字典
+                            filt_frame=filt_frame,
+                            parent=win
+                        )
                     overlay_frame = OverlayPositionFrame(
                         page_overlay,
                         app=self,
