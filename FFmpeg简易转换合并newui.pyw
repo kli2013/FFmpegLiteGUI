@@ -3720,6 +3720,19 @@ class AdvancedFrame(ttk.LabelFrame):
         if not file_path or not os.path.exists(file_path):
             messagebox.showwarning("提示", "请先选择一个有效的水印文件")
             return
+    
+        # 计算主视频渲染尺寸（考虑裁剪和缩放）
+        main_file = self.app.input_file.get().strip()
+        main_video_size = None
+        if main_file and os.path.exists(main_file):
+            orig_w, orig_h = get_video_rotated_dimensions(self.app.ffprobe_cmd, main_file, {})
+            if orig_w is not None and orig_h is not None:
+                # 获取当前主视频的裁剪/缩放设置
+                main_settings = self.app.get_current_settings()
+                main_w, main_h = compute_rendered_size(orig_w, orig_h, main_settings)
+                if main_w > 0 and main_h > 0:
+                    main_video_size = (main_w, main_h)
+    
         self.app.edit_video_settings(
             title="水印参数编辑",
             initial_settings=self.watermark_dict.copy(),
@@ -3730,7 +3743,8 @@ class AdvancedFrame(ttk.LabelFrame):
             pip_enabled_var=None,
             overlay_mode='sub',
             parent=self,
-            track_obj=None
+            track_obj=None,
+            main_video_size=main_video_size  # 传入
         )
     
     def _on_watermark_saved(self, new_settings):
@@ -4789,13 +4803,21 @@ class FFmpegBatchGUI:
     def _build_overlay_filter_complex(self, main_idx: int, main_settings: dict,
                                        sub_infos: List[Tuple[int, str, dict]],
                                        include_subtitle_main: bool = False,
-                                       enhance_settings: Optional[dict] = None) -> Tuple[str, str]:
+                                       enhance_settings: Optional[dict] = None,
+                                       reverse: bool = False) -> Tuple[str, str]:
         """
         构建主视频 + 多个子视频（画中画/水印）的 filter_complex 字符串。
         注意：此函数不会在 overlay 中添加 shortest=1，避免子视频流结束导致输出提前截断。
         输出结束由全局 -shortest 控制。
         """
         filter_parts = []
+        main_vf = build_video_filter_chain(
+            main_settings,
+            include_subtitle=include_subtitle_main,
+            include_speed=True,
+            enhance_settings=enhance_settings,
+            reverse=reverse
+        )
         # 主视频滤镜
         main_vf = build_video_filter_chain(main_settings, include_subtitle=include_subtitle_main,include_speed=True,reverse=main_settings.get('reverse_enabled', False), enhance_settings=enhance_settings)
         if main_vf and main_vf != "null":
@@ -5699,16 +5721,26 @@ class FFmpegBatchGUI:
         return [t for t in self.merge_tracks if t.enabled and t.type == "video"]
     
     def _get_canvas_size(self, main_track):
-        pad_enabled = getattr(main_track, 'pad_enabled', False)
-        if pad_enabled and main_track.pad_width and main_track.pad_height:
+        """获取主视频最终画布尺寸（考虑 pad 或 裁剪/缩放后的实际尺寸）"""
+        # 检查是否启用画布偏移
+        pad_enabled = main_track.enc_settings.get('pad_enabled', False)
+        if pad_enabled:
             try:
-                return int(main_track.pad_width), int(main_track.pad_height)
-            except:
+                w = int(main_track.enc_settings.get('pad_width', '').strip())
+                h = int(main_track.enc_settings.get('pad_height', '').strip())
+                if w > 0 and h > 0:
+                    return w, h
+            except (ValueError, TypeError):
                 pass
-        w, h = self._get_video_dimensions_cached(main_track.file_path)
+    
+        # 未启用 pad 或 pad 尺寸无效，使用主视频实际渲染尺寸
+        # 先获取原始旋转后的尺寸
+        w, h = get_video_rotated_dimensions(self.ffprobe_cmd, main_track.file_path, main_track.enc_settings)
         if w is None or h is None:
-            w, h = 1280, 720
-        return w, h
+            w, h = 1280, 720  # 降级默认值
+    
+        # 应用裁剪和缩放（如果有）
+        return compute_rendered_size(w, h, main_track.enc_settings)
     
     def _get_video_render_size(self, track, filt_frame=None):
         w, h = get_video_rotated_dimensions(self.ffprobe_cmd, track.file_path, track.enc_settings)
@@ -7207,17 +7239,21 @@ class FFmpegBatchGUI:
                     messagebox.showwarning("提示", "请先在任务设置中输入水印文件路径")
                     return
                 def on_save(new_wm):
-                    # 更新 adv_frame 的字典（原地更新）
                     adv_frame.watermark_dict.update(new_wm)
-                    # 同步界面控件
                     adv_frame.wm_path_var.set(adv_frame.watermark_dict.get("file_path", ""))
                     if hasattr(adv_frame, 'adaptive_var'):
                         adv_frame.adaptive_var.set(adv_frame.watermark_dict.get("adaptive", False))
-                    # 刷新预览
                     update_preview()
-                    # 任务设置已自动更新（因为引用同一个字典）
                     self.update_task_list()
                     self._append_info_ui("任务水印已更新")
+                # 计算主视频渲染尺寸
+                main_video_size = None
+                if task.input and os.path.exists(task.input):
+                    orig_w, orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, task.input, {})
+                    if orig_w is not None and orig_h is not None:
+                        main_w, main_h = compute_rendered_size(orig_w, orig_h, task.settings)
+                        if main_w > 0 and main_h > 0:
+                            main_video_size = (main_w, main_h)
                 self.edit_video_settings(
                     title="编辑任务水印",
                     initial_settings=task_watermark,
@@ -7226,7 +7262,8 @@ class FFmpegBatchGUI:
                     is_watermark=True,
                     parent=win,
                     track_obj=None,
-                    canvas_file=task.input
+                    canvas_file=task.input,
+                    main_video_size=main_video_size  # 传入
                 )
             # 替换 水印按钮的命令
             if hasattr(adv_frame, 'watermark_btn'):
@@ -8005,36 +8042,40 @@ class FFmpegBatchGUI:
         return True
 
 
-    def _add_audio_tracks(self, cmd, enabled_tracks, file_index):
-        """添加音频轨道"""
+    def _add_audio_tracks(self, cmd, enabled_tracks, file_index, reverse_enabled=False):
         audio_tracks = [t for t in enabled_tracks if t.type == "audio"]
         audio_map_count = 0
-
         for audio in audio_tracks:
             a_idx = file_index[audio.file_path]
             cmd.extend(["-map", f"{a_idx}:a:{audio._type_index}"])
-
-            if self._handle_audio_trim(cmd, audio, audio_map_count):
-                audio_map_count += 1
-                continue
-
+            audio.enc_settings["_file_path"] = audio.file_path
+            af_str = self._build_audio_filters(
+                audio.enc_settings,
+                include_trim=True,
+                include_volume=False,   # 画中画模式下暂不单独支持音量，可按需开启
+                include_speed=False,
+                include_reverse=reverse_enabled
+            )
             enc = audio.enc_settings.get("encoder", "copy")
+            if af_str:
+                if enc == "copy":
+                    enc = "aac"
+                    self._append_info_ui(f"音频轨 {audio_map_count+1} 应用了滤镜，编码器自动改为 aac")
+                cmd.extend([f"-af:a:{audio_map_count}", af_str])
             if enc == "copy":
                 cmd.extend([f"-c:a:{audio_map_count}", "copy"])
             else:
-                bitrate = audio.enc_settings.get("bitrate", "128k")
-                samplerate = audio.enc_settings.get("samplerate", "44100")
                 cmd.extend([
                     f"-c:a:{audio_map_count}", enc,
-                    f"-b:a:{audio_map_count}", bitrate,
-                    f"-ar:a:{audio_map_count}", samplerate
+                    f"-b:a:{audio_map_count}", audio.enc_settings.get("bitrate", "128k"),
+                    f"-ar:a:{audio_map_count}", audio.enc_settings.get("samplerate", "44100")
                 ])
             audio_map_count += 1
-
         if audio_map_count == 0:
             cmd.append("-an")
         else:
             cmd.extend(["-disposition:a:0", "default"])
+        return cmd
 
 
     def _add_subtitles_and_chapters(self, cmd, enabled_tracks, file_index, input_files):
@@ -8153,122 +8194,150 @@ class FFmpegBatchGUI:
                 cmd.append("-shortest")
                 self._append_info_ui("[封装] 无法计算主视频时长，使用 -shortest 控制输出。")
 
-
-
+    def _build_audio_filters(self, track_settings, include_trim=True, include_volume=True,
+                             include_speed=True, include_reverse=False):
+        """
+        根据单个音频轨道的设置构建音频滤镜链（不含 -af 前缀）。
+        返回滤镜字符串，若无滤镜则返回空字符串。
+        include_reverse: 外部传入的倒放标志，若为 True 则强制添加 areverse（无视轨道自身的 reverse_enabled）。
+        """
+        filters = []
+        # 截取
+        if include_trim and track_settings.get("trim_enabled", False):
+            start = track_settings.get("trim_start", "").strip()
+            end = track_settings.get("trim_end", "").strip()
+            start_sec = time_to_seconds(start) if start else 0.0
+            end_sec = time_to_seconds(end) if end else None
+            file_path = track_settings.get("_file_path", "")
+            total = self._get_media_duration(file_path) if file_path else None
+            if end_sec is not None:
+                duration = end_sec - start_sec
+            elif total is not None:
+                duration = total - start_sec
+            else:
+                duration = None
+            if duration is not None and duration > 0:
+                filters.append(f"atrim=start={start_sec:.3f}:duration={duration:.3f}")
+                filters.append("asetpts=PTS-STARTPTS")
+    
+        # 音量
+        if include_volume and track_settings.get("volume_enabled", False):
+            vol = track_settings.get("volume", 1.0)
+            if vol != 1.0:
+                filters.append(f"volume={vol:.2f}")
+    
+        # 变速（每个音频轨道独立）
+        if include_speed and track_settings.get("speed_enabled", False):
+            factor = float(track_settings.get("speed_factor", "1.0"))
+            if factor != 1.0 and factor > 0:
+                atempo = build_atempo_chain(factor)
+                if atempo:
+                    filters.append(atempo)
+    
+        # 倒放（由外部参数控制，不检查轨道自身设置）
+        if include_reverse:
+            filters.append("areverse")
+    
+        return ",".join(filters) if filters else ""
+    
     def _build_normal_cmd(self, enabled_tracks, output_norm):
         """
         普通封装模式：支持视频滤镜、多音频/字幕、音频截取、音频混合（amix）与音量调整。
         """
         cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
-    
         input_files, file_index = self._prepare_tracks_and_inputs(enabled_tracks)
-    
-        # 识别主视频（第一个启用的视频轨道）
         video_tracks = [t for t in enabled_tracks if t.type == "video"]
         if not video_tracks:
             self._append_info_ui("[封装] 没有启用的视频轨道")
             return []
         main_video = video_tracks[0]
-    
-        # 添加输入文件 + 前置选项（-ss/-to）
         cmd = self._add_input_options(cmd, input_files, main_video)
     
         # ---- 视频处理 ----
         v_idx = file_index[main_video.file_path]
         cmd.extend(["-map", f"{v_idx}:v:{main_video._type_index}"])
-    
         v_settings = main_video.enc_settings
         vcodec = v_settings.get("encoder", "copy")
     
+        # 确定是否允许倒放：仅当视频编码器不是 copy 时才允许音频倒放
+        reverse_flag = v_settings.get("reverse_enabled", False)
+        if vcodec == "copy" and reverse_flag:
+            reverse_flag = False
+     #       self._append_info_ui("[封装] 主视频为流复制模式，已自动禁用音频倒放（避免音画不同步）")
+    
         if vcodec == "copy":
- #           self._append_info_ui("[封装] 编码器为 copy，已忽略所有视频滤镜。")
             cmd.extend(["-c:v", "copy"])
         else:
-            # 构建视频滤镜
             video_filters = build_video_filter_chain(
                 v_settings,
                 include_subtitle=False,
                 include_speed=False,
-                enhance_settings=v_settings.get("enhance", {})
+                enhance_settings=v_settings.get("enhance", {}),
+                reverse=v_settings.get("reverse_enabled", False)   # 视频倒放（由编码器非copy保证）
             )
             if video_filters and video_filters != "null":
                 cmd.extend(["-vf", video_filters])
-            # 应用编码参数
             strategy = get_encoder_strategy(vcodec)
             cmd = strategy.build_params(cmd, v_settings)
     
-        # ---- 音频处理（支持截取、混合、音量调整） ----
+        # ---- 音频处理（使用统一的音频滤镜构建函数，传入修正后的 reverse_flag） ----
         audio_tracks = [t for t in enabled_tracks if t.type == "audio"]
-        # 分离勾选混合和未勾选的流
         mix_tracks = [t for t in audio_tracks if t.enc_settings.get("mix_enabled", False)]
-        non_mix_tracks = [t for t in audio_tracks if not t.enc_settings.get("mix_enabled", False)]
     
         if len(mix_tracks) == 0:
-            # ----- 无混合：保持原有行为（多音轨映射） -----
             audio_map_count = 0
             for audio in audio_tracks:
                 a_idx = file_index[audio.file_path]
                 cmd.extend(["-map", f"{a_idx}:a:{audio._type_index}"])
-                # 处理音频截取（使用 _handle_audio_trim）
-                if self._handle_audio_trim(cmd, audio, audio_map_count):
-                    audio_map_count += 1
-                    continue
-                # 普通编码
+                audio.enc_settings["_file_path"] = audio.file_path
+                af_str = self._build_audio_filters(
+                    audio.enc_settings,
+                    include_trim=True,
+                    include_volume=True,
+                    include_speed=True,
+                    include_reverse=reverse_flag   # 使用经过检测的倒放标志
+                )
                 enc = audio.enc_settings.get("encoder", "copy")
+                if af_str:
+                    if enc == "copy":
+                        enc = "aac"
+                        self._append_info_ui(f"音频轨 {audio_map_count+1} 应用了滤镜，编码器自动改为 aac")
+                    cmd.extend([f"-af:a:{audio_map_count}", af_str])
                 if enc == "copy":
                     cmd.extend([f"-c:a:{audio_map_count}", "copy"])
                 else:
-                    bitrate = audio.enc_settings.get("bitrate", "128k")
-                    samplerate = audio.enc_settings.get("samplerate", "44100")
                     cmd.extend([
                         f"-c:a:{audio_map_count}", enc,
-                        f"-b:a:{audio_map_count}", bitrate,
-                        f"-ar:a:{audio_map_count}", samplerate
+                        f"-b:a:{audio_map_count}", audio.enc_settings.get("bitrate", "128k"),
+                        f"-ar:a:{audio_map_count}", audio.enc_settings.get("samplerate", "44100")
                     ])
                 audio_map_count += 1
-    
             if audio_map_count == 0:
                 cmd.append("-an")
             else:
                 cmd.extend(["-disposition:a:0", "default"])
-    
         else:
-            # ----- 有混合：使用 amix 混合所有勾选的流 -----
-            # 如果只有一个勾选流，直接输出该流（无需 amix）
+            # 混合模式（一个或多个勾选流）
             if len(mix_tracks) == 1:
                 audio = mix_tracks[0]
                 a_idx = file_index[audio.file_path]
                 cmd.extend(["-map", f"{a_idx}:a:{audio._type_index}"])
-                # 构建音频滤镜（截取 + 音量调整）
-                af_parts = []
-                if audio.enc_settings.get("trim_enabled", False):
-                    start = audio.enc_settings.get("trim_start", "").strip()
-                    end = audio.enc_settings.get("trim_end", "").strip()
-                    start_sec = time_to_seconds(start) if start else 0.0
-                    end_sec = time_to_seconds(end) if end else None
-                    total = self._get_media_duration(audio.file_path)
-                    if end_sec is not None:
-                        duration = end_sec - start_sec
-                    elif total is not None:
-                        duration = total - start_sec
-                    else:
-                        duration = None
-                    if duration is not None and duration > 0:
-                        af_parts.append(f"atrim=start={start_sec:.3f}:duration={duration:.3f}")
-                af_parts.append("asetpts=PTS-STARTPTS")
-                vol = audio.enc_settings.get("volume", 1.0)
-                if vol != 1.0:
-                    af_parts.append(f"volume={vol:.2f}")
-                if af_parts:
-                    cmd.extend(["-af", ",".join(af_parts)])
-                # 编码参数
+                audio.enc_settings["_file_path"] = audio.file_path
+                af_str = self._build_audio_filters(
+                    audio.enc_settings,
+                    include_trim=True,
+                    include_volume=True,
+                    include_speed=True,
+                    include_reverse=reverse_flag
+                )
                 enc = audio.enc_settings.get("encoder", "copy")
-                if enc == "copy":
-                    # 如果应用了滤镜，不能使用 copy
-                    if len(af_parts) > 1:  # 有滤镜
+                if af_str:
+                    if enc == "copy":
                         enc = "aac"
-                        self._append_info_ui("[封装] 单流混合（音量/截取）强制编码为 aac")
-                    cmd.extend(["-c:a", enc])
+                        self._append_info_ui("单流混合（音量/截取/倒放）强制编码为 aac")
+                    cmd.extend(["-af", af_str])
+                if enc == "copy":
+                    cmd.extend(["-c:a", "copy"])
                 else:
                     cmd.extend([
                         "-c:a", enc,
@@ -8276,128 +8345,102 @@ class FFmpegBatchGUI:
                         "-ar", audio.enc_settings.get("samplerate", "44100")
                     ])
                 cmd.extend(["-disposition:a:0", "default"])
-                # 未勾选的流被丢弃
             else:
-                # 多个勾选流 → 使用 amix 混合
                 filter_parts = []
                 inputs = len(mix_tracks)
-                # 构建每个输入流的滤镜链（截取 + 音量调整）
                 for i, audio in enumerate(mix_tracks):
                     a_idx = file_index[audio.file_path]
-                    af_parts = []
-                    # 截取
-                    if audio.enc_settings.get("trim_enabled", False):
-                        start = audio.enc_settings.get("trim_start", "").strip()
-                        end = audio.enc_settings.get("trim_end", "").strip()
-                        start_sec = time_to_seconds(start) if start else 0.0
-                        end_sec = time_to_seconds(end) if end else None
-                        total = self._get_media_duration(audio.file_path)
-                        if end_sec is not None:
-                            duration = end_sec - start_sec
-                        elif total is not None:
-                            duration = total - start_sec
-                        else:
-                            duration = None
-                        if duration is not None and duration > 0:
-                            af_parts.append(f"atrim=start={start_sec:.3f}:duration={duration:.3f}")
-                    af_parts.append("asetpts=PTS-STARTPTS")
-                    # 音量调整
-                    vol = audio.enc_settings.get("volume", 1.0)
-                    if vol != 1.0:
-                        af_parts.append(f"volume={vol:.2f}")
-                    af_filter = ",".join(af_parts) if af_parts else "null"
-                    if af_filter and af_filter != "null":
-                        filter_parts.append(f"[{a_idx}:a]{af_filter}[a{i}]")
-                        input_label = f"[a{i}]"
+                    audio.enc_settings["_file_path"] = audio.file_path
+                    af_str = self._build_audio_filters(
+                        audio.enc_settings,
+                        include_trim=True,
+                        include_volume=True,
+                        include_speed=False,
+                        include_reverse=reverse_flag
+                    )
+                    if af_str:
+                        filter_parts.append(f"[{a_idx}:a]{af_str}[a{i}]")
                     else:
                         filter_parts.append(f"[{a_idx}:a]asetpts=PTS-STARTPTS[a{i}]")
-                        input_label = f"[a{i}]"
-    
-                # 构建 amix 滤镜（权重统一为1.0，因为音量已在之前调整）
                 amix_filter = f"{' '.join(f'[a{i}]' for i in range(inputs))}amix=inputs={inputs}:duration=longest[aout]"
                 filter_parts.append(amix_filter)
-    
                 cmd.extend(["-filter_complex", ";".join(filter_parts)])
                 cmd.extend(["-map", "[aout]"])
-    
-                # 设置音频编码参数（使用第一个勾选轨道的编码设置，或强制 aac）
                 first_mix = mix_tracks[0]
                 enc = first_mix.enc_settings.get("encoder", "aac")
                 if enc == "copy":
                     enc = "aac"
                     self._append_info_ui("[封装] 混合模式下编码器不能为 copy，已自动改为 aac")
-                bitrate = first_mix.enc_settings.get("bitrate", "128k")
-                samplerate = first_mix.enc_settings.get("samplerate", "44100")
-                cmd.extend(["-c:a", enc, "-b:a", bitrate, "-ar", samplerate])
+                cmd.extend([
+                    "-c:a", enc,
+                    "-b:a", first_mix.enc_settings.get("bitrate", "128k"),
+                    "-ar", first_mix.enc_settings.get("samplerate", "44100")
+                ])
                 cmd.extend(["-disposition:a:0", "default"])
-                # 未勾选的流被丢弃，不添加 -map
-                
-                # amix模式 以最短流结束 通常是主音频
                 cmd.append("-shortest")
     
-        # ---- 字幕 ----
+        # ---- 字幕、章节、容器优化 ----
         self._add_subtitles_and_chapters(cmd, enabled_tracks, file_index, input_files)
-    
-        # ---- 容器优化 ----
         self._add_container_optimization(cmd)
-    
         cmd.append(output_norm)
         return cmd
-
-
+    
+    
     def _build_pip_cmd(self, enabled_tracks, output_norm):
-        """画中画模式"""
+        """画中画模式（叠加多个视频）"""
         # 强制禁用组合跳转
         for track in enabled_tracks:
             if track.type == "video":
                 track.enc_settings["combo_seek"] = False
+    
         cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
-
         input_files, file_index = self._prepare_tracks_and_inputs(enabled_tracks)
-
         video_tracks = [t for t in enabled_tracks if t.type == "video"]
         if not video_tracks:
             self._append_info_ui("[封装] 没有启用的视频轨道")
             return []
         main_video = video_tracks[0]
         sub_videos = video_tracks[1:]
-
+    
         # 画中画模式下强制使用精准截取（由滤镜处理）
         main_video.enc_settings["precise_trim"] = True
-
-
-        # 添加输入文件 + 前置选项（包含子视频循环）
         cmd = self._add_input_options(cmd, input_files, main_video, sub_videos)
-
-        # ---- 视频叠加 ----
+    
         main_idx = file_index[main_video.file_path]
         sub_infos = [(file_index[sv.file_path], sv.file_path, sv.enc_settings) for sv in sub_videos]
-
+    
+        # 获取倒放标志，同时检测视频编码器（画中画强制重新编码，但为保险仍做检测）
+        vcodec = main_video.enc_settings.get("encoder", "libx265")
+        reverse_flag = main_video.enc_settings.get("reverse_enabled", False)
+        if vcodec == "copy" and reverse_flag:
+            reverse_flag = False
+        #    self._append_info_ui("[封装] 画中画模式视频为 copy（理论上不会发生），已禁用音频倒放")
+            # 但画中画模式已经强制将 copy 改为 libx265，所以此分支通常不会执行
+    
+        # 构建叠加滤镜（传递 reverse_flag 用于视频倒放）
         complex_filter, final_v_label = self._build_overlay_filter_complex(
             main_idx, main_video.enc_settings, sub_infos,
             include_subtitle_main=False,
-            enhance_settings=main_video.enc_settings.get("enhance", {})
+            enhance_settings=main_video.enc_settings.get("enhance", {}),
+            reverse=reverse_flag   # 视频倒放
         )
         cmd.extend(["-filter_complex", complex_filter])
         cmd.extend(["-map", final_v_label])
-
+    
         # 视频编码（PIP强制不使用 copy）
-        v_settings = main_video.enc_settings
-        vcodec = v_settings.get("encoder", "libx265")
         if vcodec == "copy":
             self._append_info_ui("[封装] 画中画模式不支持 copy，自动改为 libx265")
             vcodec = "libx265"
-            v_settings["encoder"] = vcodec
-
+            main_video.enc_settings["encoder"] = vcodec
         strategy = get_encoder_strategy(vcodec)
-        cmd = strategy.build_params(cmd, v_settings)
-
-        # ---- 音频、字幕、时长控制、章节 ----
-        self._add_audio_tracks(cmd, enabled_tracks, file_index)
+        cmd = strategy.build_params(cmd, main_video.enc_settings)
+    
+        # 音频处理（传入修正后的 reverse_flag）
+        self._add_audio_tracks(cmd, enabled_tracks, file_index, reverse_enabled=reverse_flag)
+    
         self._add_subtitles_and_chapters(cmd, enabled_tracks, file_index, input_files)
         self._add_pip_duration_control(cmd, main_video, enabled_tracks)
         self._add_container_optimization(cmd)
-
         cmd.append(output_norm)
         return cmd
 
@@ -8472,73 +8515,69 @@ class FFmpegBatchGUI:
 
 
     def _build_concat_reencode_mode(self, cmd, video_tracks, audio_tracks, main_video, output_norm):
-        """重新编码模式 - 使用 filter_complex concat，支持每个视频独立音频源"""
-        # 收集去重视频文件（视频轨道按顺序）
-        input_files = list(dict.fromkeys(t.file_path for t in video_tracks))
-    
-        for f in input_files:
-            cmd.extend(["-i", normalize_path(f)])
-    
-        n = len(input_files)
+        # 为每个视频轨道单独添加 -i（允许重复文件）
+        for track in video_tracks:
+            cmd.extend(["-i", normalize_path(track.file_path)])
+        
+        n = len(video_tracks)
         filter_parts = []
-    
-        # 遍历每个视频轨道（按顺序）
         for i, track in enumerate(video_tracks):
-            # 视频滤镜：setpts
+            # 视频
             filter_parts.append(f"[{i}:v]setpts=PTS-STARTPTS[v{i}]")
-    
-            # ----- 音频源处理 -----
+            # 音频
             audio_source = track.enc_settings.get("audio_source_type", "self")
             if audio_source == "self":
-                # 使用自身音频流（假设存在）
                 filter_parts.append(f"[{i}:a]asetpts=PTS-STARTPTS[a{i}]")
             elif audio_source == "silence":
-                # 生成静音流，时长 = 视频片段时长
                 start_str = track.enc_settings.get("trim_start", "").strip()
                 end_str = track.enc_settings.get("trim_end", "").strip()
                 start_sec = time_to_seconds(start_str) if start_str else 0.0
                 end_sec = time_to_seconds(end_str) if end_str else None
-    
                 total_duration = self._get_media_duration(track.file_path)
                 if end_sec is not None:
                     duration = end_sec - start_sec
                 elif total_duration is not None:
                     duration = total_duration - start_sec
                 else:
-                    duration = 10.0  # 兜底
+                    duration = 10.0
                 duration = max(0.1, duration)
-    
                 filter_parts.append(f"anullsrc=r=44100:cl=stereo:duration={duration}[a{i}]")
             else:
-                # 未知类型，降级为 self
-                self._append_info_ui(f"[串联] 音频源类型 '{audio_source}' 未知，已降级使用视频自身音频")
+                self._append_info_ui(f"[串联] 音频源类型 '{audio_source}' 未知，降级使用视频自身音频")
                 filter_parts.append(f"[{i}:a]asetpts=PTS-STARTPTS[a{i}]")
-
-
-    
-        # ----- 视频 concat -----
+        
+        # 视频 concat
         v_concat = f"[{']['.join(f'v{i}' for i in range(n))}]concat=n={n}:v=1:a=0[vout]"
         filter_parts.append(v_concat)
-    
-        # ----- 音频 concat -----
+        # 音频 concat
         a_concat = f"[{']['.join(f'a{i}' for i in range(n))}]concat=n={n}:v=0:a=1[aout]"
         filter_parts.append(a_concat)
-    
+        
+        # 整体倒放（如果主视频启用）
+        reverse_flag = main_video.enc_settings.get("reverse_enabled", False)
+        if reverse_flag:
+            filter_parts.append("[vout]reverse[vout_rev]")
+            vout_label = "vout_rev"
+            filter_parts.append("[aout]areverse[aout_rev]")
+            aout_label = "aout_rev"
+        else:
+            vout_label = "vout"
+            aout_label = "aout"
+        
         cmd.extend(["-filter_complex", ";".join(filter_parts)])
-        cmd.extend(["-map", "[vout]", "-map", "[aout]"])
-    
-        # ----- 视频编码 -----
+        cmd.extend(["-map", f"[{vout_label}]", "-map", f"[{aout_label}]"])
+        
+        # 视频编码
         v_settings = main_video.enc_settings.copy()
         vcodec = v_settings.get("encoder", "libx265")
         if vcodec == "copy":
             self._append_info_ui("[串联-编] 重新编码模式下视频编码器自动改为 libx265")
             vcodec = "libx265"
             v_settings["encoder"] = "libx265"
-    
         strategy = get_encoder_strategy(vcodec)
         cmd = strategy.build_params(cmd, v_settings)
-    
-        # ----- 音频编码 -----
+        
+        # 音频编码
         if audio_tracks:
             a_settings = audio_tracks[0].enc_settings
             enc = a_settings.get("encoder", "aac")
@@ -8552,10 +8591,9 @@ class FFmpegBatchGUI:
             ])
         else:
             cmd.extend(["-c:a", "aac", "-b:a", "128k", "-ar", "44100"])
-    
+        
         self._add_container_optimization(cmd)
         cmd.append(output_norm)
-    
         self._append_info_ui(f"[串联-编] 使用 filter_complex 重新编码模式（{n} 个片段）")
         return cmd
     
@@ -8859,7 +8897,8 @@ class FFmpegBatchGUI:
     def edit_video_settings(self, title, initial_settings, on_save, file_path=None,
                             is_watermark=False, track_idx=None, pip_enabled_var=None,
                             overlay_mode='sub', parent=None, show_loop_chroma=True,
-                            track_obj=None, is_concat_mode=False, canvas_file=None):
+                            track_obj=None, is_concat_mode=False, canvas_file=None,
+                            main_video_size=None):
         if parent is None:
             parent = self.root
         with self.SafeToplevel(parent) as win:
@@ -8966,11 +9005,17 @@ class FFmpegBatchGUI:
                     def watermark_visual_callback():
                         main_file = canvas_file or self.input_file.get().strip()
                         if not main_file or not os.path.exists(main_file):
-                            messagebox.showwarning("提示", "请先在主界面选择一个输入文件作为画布")
+                            messagebox.showwarning("提示", "请先选择一个有效的输入文件作为画布")
                             return
-                        main_w, main_h = get_video_rotated_dimensions(self.ffprobe_cmd, main_file, {})
-                        if main_w is None:
-                            main_w, main_h = 1280, 720
+                        # 使用传入的主视频渲染尺寸（如果有）
+                        if main_video_size is not None:
+                            main_w, main_h = main_video_size
+                        else:
+                            # 降级：使用原始尺寸（可能不准确）
+                            main_w, main_h = get_video_rotated_dimensions(self.ffprobe_cmd, main_file, {})
+                            if main_w is None or main_h is None:
+                                main_w, main_h = 1280, 720
+                            self._append_info_ui("[水印] 警告：未传入主视频渲染尺寸，使用原始尺寸，可能不准确。")
                         wm_file = initial_settings.get("file_path", "")
                         if not wm_file or not os.path.exists(wm_file):
                             messagebox.showwarning("提示", "水印文件未设置或不存在")
@@ -10544,32 +10589,29 @@ class EditSegmentDialog(simpledialog.Dialog):
         self.flip = self.flip_var.get()
 
 class SegmentEditor:
+    """分段拼接设置窗口"""
     def __init__(self, parent, segments, app):
         self.parent = parent
-        self.app = app  # 主程序引用，用于获取时长等信息
+        self.app = app          # 主程序引用，用于获取时长等信息
         self.segments = copy.deepcopy(segments)  # 深拷贝，独立修改
-        self.result = None  # 返回结果
+        self.result = None      # 返回结果
 
-        # 创建窗口
         self.window = tk.Toplevel(parent)
         self.window.title("分段拼接设置")
         self.window.transient(parent)
         self.window.grab_set()
-        # 窗口大小
         self.window.geometry("900x600")
-        center_window(self.window, 900, 600)  # 复用已有的center_window函数
+        center_window(self.window, 900, 600)
 
         self.create_widgets()
         self.refresh_tree()
-
-        # 绑定关闭事件
         self.window.protocol("WM_DELETE_WINDOW", self.on_cancel)
 
+    # ---------- 界面创建 ----------
     def create_widgets(self):
         main = ttk.Frame(self.window, padding="10")
         main.pack(fill=tk.BOTH, expand=True)
 
-        # 左右 PanedWindow
         paned = ttk.PanedWindow(main, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
 
@@ -10577,8 +10619,6 @@ class SegmentEditor:
         left_frame = ttk.Frame(paned)
         paned.add(left_frame, weight=3)
 
-
-        # 添加工具栏
         tool_frame = ttk.Frame(left_frame)
         tool_frame.pack(fill=tk.X, pady=2)
 
@@ -10597,6 +10637,7 @@ class SegmentEditor:
                 "此翻转仅作用于当前选中的片段内部（水平/垂直翻转）\n"
                 "不影响主界面「视频滤镜」中的全局旋转/翻转设置。",
                 wraplength=400)
+
         self.flip_var = tk.StringVar(value="无")
         self.flip_combo = ttk.Combobox(tool_frame, textvariable=self.flip_var,
                                        values=["无", "水平翻转", "垂直翻转", "水平+垂直"],
@@ -10622,7 +10663,6 @@ class SegmentEditor:
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # 操作按钮
         op_frame = ttk.Frame(left_frame)
         op_frame.pack(fill=tk.X, pady=2)
         ttk.Button(op_frame, text="删除选中", command=self.delete_selected).pack(side=tk.LEFT, padx=2)
@@ -10636,8 +10676,7 @@ class SegmentEditor:
 
         cmd_frame = ttk.LabelFrame(right_frame, text="输入外部命令或时间 - 提示", padding="5")
         cmd_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # 添加 ToolTip
+
         ToolTip(cmd_frame, 
                 "在此粘贴 FFmpeg 截取命令（每行一条），程序会自动提取其中的 -ss 和 -t/-to 时间参数。\n"
                 "点击「解析并导入所有片段」即可将提取的时间段添加到左侧列表。\n"
@@ -10659,27 +10698,24 @@ class SegmentEditor:
         ttk.Button(btn_frame, text="确定", command=self.on_ok).pack(side=tk.RIGHT, padx=5)
         ttk.Button(btn_frame, text="取消", command=self.on_cancel).pack(side=tk.RIGHT, padx=5)
 
-        # 设置左右分栏的初始比例（左侧列表占 75%，右侧命令输入占 25%）
-        def set_initial_pane_size():
-            total_width = self.window.winfo_width()
-            if total_width > 100:
-                sash_pos = int(total_width * 0.75)   # 左侧占 75%
-                paned.sashpos(0, sash_pos)
-        
-        # 窗口显示后再设置
-        self.window.after(100, set_initial_pane_size)
+        self.window.after(100, lambda: self._set_initial_pane_size(paned))
+
+    def _set_initial_pane_size(self, paned):
+        total_width = self.window.winfo_width()
+        if total_width > 100:
+            paned.sashpos(0, int(total_width * 0.75))
 
         # 绑定双击编辑
         self.tree.bind("<Double-1>", self.on_tree_double_click)
-
-    # ---------- 片段管理方法 ----------
+    # ---------- 片段管理核心方法（已优化浮点误差） ----------
     def add_segment_with_time(self, start_sec, end_sec, flip="无"):
+        """直接使用浮点数添加片段（用于外部命令导入）"""
         if start_sec is None or end_sec is None:
             return False
         if start_sec >= end_sec:
             return False
-    
-        # 检查并修正
+
+        # 检查是否超出总时长（容差 0.001 秒，自动修正）
         if self.app and self.app.input_file.get():
             dur = self.app._get_media_duration(self.app.input_file.get())
             if dur is not None:
@@ -10688,27 +10724,37 @@ class SegmentEditor:
                 if end_sec > dur + 0.001:
                     self.app._append_info_ui(f"[分段] 片段超出总时长，已跳过")
                     return False
-    
+
         start_str = seconds_to_time(start_sec)
         end_str = seconds_to_time(end_sec)
         self.segments.append({"start": start_str, "end": end_str, "flip": flip})
         self.refresh_tree()
         return True
-    
+
     def add_segment(self):
+        """
+        从界面输入添加片段。
+        若结束时间为空，自动补全为视频总时长（直接使用浮点数，避免往返转换误差）。
+        """
         start = self.start_entry.get().strip()
         end = self.end_entry.get().strip()
-    
+
         if not start:
             messagebox.showwarning("提示", "请填写开始时间")
             return
-    
+
+        start_sec = time_to_seconds(start)
+        if start_sec is None:
+            messagebox.showerror("错误", "开始时间格式无效，请使用 HH:MM:SS.ms 或秒数")
+            return
+
         # 如果结束时间为空，自动补全为视频总时长
         if not end:
             if self.app and self.app.input_file.get():
                 dur = self.app._get_media_duration(self.app.input_file.get())
                 if dur is not None:
-                    end = seconds_to_time(dur)
+                    end_sec = dur                     # 直接使用浮点数
+                    end = seconds_to_time(dur)        # 仅用于显示
                     self.app._append_info_ui(f"[分段] 结束时间自动设为总时长: {end}")
                 else:
                     messagebox.showerror("错误", "无法获取视频总时长，请手动填写结束时间")
@@ -10716,29 +10762,28 @@ class SegmentEditor:
             else:
                 messagebox.showerror("错误", "未指定输入文件，无法自动获取结束时间，请手动填写")
                 return
-    
-        start_sec = time_to_seconds(start)
-        end_sec = time_to_seconds(end)
-        if start_sec is None or end_sec is None:
-            messagebox.showerror("错误", "时间格式无效，请使用 HH:MM:SS.ms 或秒数")
-            return
+        else:
+            end_sec = time_to_seconds(end)
+            if end_sec is None:
+                messagebox.showerror("错误", "结束时间格式无效")
+                return
+
         if start_sec >= end_sec:
             messagebox.showerror("错误", "开始时间必须小于结束时间")
             return
-    
-        # 检查并修正接近总时长的结束时间（容差 0.001 秒）
-        if self.app and self.app.input_file.get():
-            dur = self.app._get_media_duration(self.app.input_file.get())
-            if dur is not None:
-                # 如果结束时间在总时长 ±1ms 内，直接修正为总时长
-                if abs(end_sec - dur) <= 0.001:
-                    end_sec = dur
-                    end = seconds_to_time(end_sec)   # 更新显示字符串
-                # 若仍明显超出（大于 1ms），则拒绝
-                if end_sec > dur + 0.001:
-                    self.app._append_info_ui(f"[分段] 片段超出总时长: {start}->{end}，已跳过")
-                    return
-    
+
+        # 仅对手动输入的结束时间进行超时检查（自动补全的已保证不超）
+        if end:  # 用户手动输入
+            if self.app and self.app.input_file.get():
+                dur = self.app._get_media_duration(self.app.input_file.get())
+                if dur is not None:
+                    if abs(end_sec - dur) <= 0.001:
+                        end_sec = dur
+                        end = seconds_to_time(dur)
+                    if end_sec > dur + 0.001:
+                        self.app._append_info_ui(f"[分段] 片段超出总时长: {start}->{end}，已跳过")
+                        return
+
         flip_value = self.flip_combo.get()
         self.segments.append({"start": start, "end": end, "flip": flip_value})
         self.refresh_tree()
@@ -10795,7 +10840,7 @@ class SegmentEditor:
             return
         idx = int(selected[0])
         seg = self.segments[idx]
-    
+
         dialog = EditSegmentDialog(self.window, "编辑片段",
                                    start=seg["start"], end=seg["end"], flip=seg["flip"])
         if dialog.start is not None and dialog.end is not None:
@@ -10807,11 +10852,11 @@ class SegmentEditor:
             if start_sec >= end_sec:
                 messagebox.showerror("错误", "开始时间必须小于结束时间")
                 return
-    
+
             start_display = seconds_to_time(start_sec)
             end_display = seconds_to_time(end_sec)
-    
-            # 检查并修正
+
+            # 检查并修正接近总时长的时间
             if self.app and self.app.input_file.get():
                 dur = self.app._get_media_duration(self.app.input_file.get())
                 if dur is not None:
@@ -10821,7 +10866,8 @@ class SegmentEditor:
                     if end_sec > dur + 0.001:
                         self.app._append_info_ui(f"[分段] 片段超出总时长: {start_display}->{end_display}，已跳过")
                         return
-    
+
+            # 存储用户输入的原始字符串（以便显示时与输入一致）
             seg["start"] = dialog.start
             seg["end"] = dialog.end
             seg["flip"] = dialog.flip
@@ -10844,7 +10890,6 @@ class SegmentEditor:
             if not line or line.startswith('#'):
                 continue
 
-            # 提取 -ss 时间
             ss_match = re.search(r'-ss\s+([\d.]+)', line, re.IGNORECASE)
             if not ss_match:
                 skipped_count += 1
@@ -10853,7 +10898,6 @@ class SegmentEditor:
 
             start_sec = float(ss_match.group(1))
 
-            # 提取 -t 或 -to
             t_match = re.search(r'-t\s+([\d.]+)', line, re.IGNORECASE)
             to_match = re.search(r'-to\s+([\d.]+)', line, re.IGNORECASE)
 
@@ -10867,20 +10911,13 @@ class SegmentEditor:
                 errors.append(f"未找到 -t 或 -to: {line[:80]}...")
                 continue
 
-
-
-            # 添加片段（翻转默认为“无”）
-
             start_str = seconds_to_time(start_sec)
             end_str = seconds_to_time(end_sec)
-            
-            # 检查是否已存在相同时间段（精确到毫秒）
+
             if any(seg["start"] == start_str and seg["end"] == end_str for seg in self.segments):
                 skipped_count += 1
                 errors.append(f"重复片段: {start_str}->{end_str}，已跳过")
                 continue
-            
-            # 添加片段（翻转默认为“无”）
             try:
                 if self.add_segment_with_time(start_sec, end_sec, flip="无"):
                     parsed_count += 1
