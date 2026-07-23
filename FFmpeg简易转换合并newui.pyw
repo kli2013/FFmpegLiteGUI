@@ -289,7 +289,7 @@ def time_to_seconds(timestr: str) -> Optional[float]:
 
 # ================== 滤镜链构建 ==================
 def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = True, include_speed: bool = True,
-                              include_trim: bool = True, include_format: bool = True, enhance_settings=None) -> str:
+                              include_trim: bool = True, include_format: bool = True, enhance_settings=None, reverse=False) -> str:
     """
     从设置字典构建视频滤镜链。
     include_subtitle: 是否包含字幕滤镜
@@ -387,7 +387,38 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
     if enhance_settings and enhance_settings.get("colorspace_enabled", False):
         matrix = enhance_settings.get("colorspace_matrix", "bt709:bt2020")
         filters.append(f"colormatrix={matrix}")
-    
+
+    # ----- 颜色校正（eq）-----
+    if enhance_settings:
+        eq_parts = []
+        b = enhance_settings.get("eq_brightness", 0.0)
+        if b != 0.0:
+            eq_parts.append(f"brightness={b:.2f}")
+        c = enhance_settings.get("eq_contrast", 1.0)
+        if c != 1.0:
+            eq_parts.append(f"contrast={c:.2f}")
+        s = enhance_settings.get("eq_saturation", 1.0)
+        if s != 1.0:
+            eq_parts.append(f"saturation={s:.2f}")
+        g = enhance_settings.get("eq_gamma", 1.0)
+        if g != 1.0:
+            eq_parts.append(f"gamma={g:.2f}")
+        if eq_parts:
+            filters.append(f"eq={':'.join(eq_parts)}")
+
+    # ----- 色相调整（hue）-----
+    if enhance_settings:
+        hue_parts = []
+        h_angle = enhance_settings.get("hue_angle", 0.0)
+        if h_angle != 0.0:
+            hue_parts.append(f"H={h_angle:.1f}")
+        h_sat = enhance_settings.get("hue_saturation", 0.0)
+        if h_sat != 0.0:
+            hue_parts.append(f"s={h_sat:.2f}")
+        if hue_parts:
+            filters.append(f"hue={':'.join(hue_parts)}")
+
+
     # ----- 像素格式 -----
     if include_format and settings.get("pix_fmt_enabled", True):
         filters.append(f"format={settings.get('pix_fmt', 'yuv420p')}")
@@ -409,13 +440,22 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
             sub_path = sub_path.replace(':', '\\:')
             sub_path = sub_path.replace("'", "\\'")
             filters.append(f"subtitles='{sub_path}'")
-    
+
+    if reverse:
+        filters.append("reverse")
+
     return ",".join(filters) if filters else "null"
 
-def build_preview_filter_chain(settings: Dict[str, Any], target_height: int = 960) -> str:
+def build_preview_filter_chain(settings: Dict[str, Any], target_height: int = 960, reverse: bool = False) -> str:
     """生成预览用的滤镜链，强制缩放到指定高度"""
     enhance_settings = settings.get("enhance", {})
-    vf = build_video_filter_chain(settings, include_subtitle=True, include_speed=True, enhance_settings=enhance_settings)
+    vf = build_video_filter_chain(
+        settings,
+        include_subtitle=True,
+        include_speed=True,
+        enhance_settings=enhance_settings,
+        reverse=reverse
+    )
     if vf != "null":
         return f"{vf},scale=-2:{target_height}"
     else:
@@ -1498,6 +1538,12 @@ class VideoFilterFrame(ttk.LabelFrame):
             "deblock_strength": 4,
             "colorspace_enabled": False,
             "colorspace_matrix": "bt709:bt2020",
+            "eq_brightness": 0.0,
+            "eq_contrast": 1.0,
+            "eq_saturation": 1.0,
+            "eq_gamma": 1.0,
+            "hue_angle": 0.0,
+            "hue_saturation": 0.0,
         }
 
     def create_widgets(self):
@@ -1664,17 +1710,22 @@ class VideoFilterFrame(ttk.LabelFrame):
         hybrid_frame.pack(fill=tk.X, pady=2)
         self.speed_enabled = tk.BooleanVar(value=False)
         self.speed_factor = tk.StringVar(value="1.0")
-        ttk.Checkbutton(hybrid_frame, text="启用变速", variable=self.speed_enabled).pack(side=tk.LEFT)
-        ttk.Label(hybrid_frame, text="速度倍数 (0.5慢,2.0快):").pack(side=tk.LEFT, padx=5)
+        speed_check = ttk.Checkbutton(hybrid_frame, text="启用变速", variable=self.speed_enabled)
+        speed_check.pack(side=tk.LEFT)
+        ToolTip(speed_check, 
+            "启用变速后，可自定义速度倍数（支持任意正数，例如 0.5x 慢放、2.0x 快放）。\n"
+            "注意：过高（>10）或过低（<0.1）的倍数会串联多个 atempo 音频滤镜计算，可能加重解码负担。\n"
+            "推荐范围：0.1 ~ 10 倍，一般使用 0.25 ~ 4.0 已足够。")
         ttk.Entry(hybrid_frame, textvariable=self.speed_factor, width=6).pack(side=tk.LEFT)
-    
-        ttk.Label(hybrid_frame, text="反交错:").pack(side=tk.LEFT, padx=(10,0))
-        self.deinterlace_filter = tk.StringVar(value="none")
-        deinterlace_combo = ttk.Combobox(hybrid_frame, textvariable=self.deinterlace_filter,
-                                         values=["none", "bwdif", "yadif", "kerndeint", "pp=lb", "fieldorder"],
-                                         state="readonly", width=10)
-        deinterlace_combo.pack(side=tk.LEFT, padx=2)
-        ToolTip(deinterlace_combo, 
+
+
+        self.reverse_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(hybrid_frame, text="启用倒放", variable=self.reverse_enabled).pack(side=tk.LEFT, padx=(10, 0))
+
+
+        deint_label = ttk.Label(hybrid_frame, text="反交错:")
+        deint_label.pack(side=tk.LEFT, padx=(10,0))
+        ToolTip(deint_label, 
                 "反交错滤镜选项：\n"
                 "yadif - 常用反交错，适合大多数隔行扫描内容\n"
                 "bwdif - 运动自适应，比yadif更锐利\n"
@@ -1682,10 +1733,27 @@ class VideoFilterFrame(ttk.LabelFrame):
                 "pp=lb - 行混合，柔和去拉丝\n"
                 "fieldorder - 仅调整场序，不反交错",
                 wraplength=400)
+        self.deinterlace_filter = tk.StringVar(value="none")
+        deinterlace_combo = ttk.Combobox(hybrid_frame, textvariable=self.deinterlace_filter,
+                                         values=["none", "bwdif", "yadif", "kerndeint", "pp=lb", "fieldorder"],
+                                         state="readonly", width=10)
+        deinterlace_combo.pack(side=tk.LEFT, padx=2)
     
         self.pix_fmt_enabled = tk.BooleanVar(value=True)
         self.pix_fmt = tk.StringVar(value="yuv420p")
-        ttk.Label(hybrid_frame, text="像素格式:").pack(side=tk.LEFT, padx=(20,0))
+        pix_label = ttk.Label(hybrid_frame, text="像素格式:")
+        pix_label.pack(side=tk.LEFT, padx=(20,0))
+        ToolTip(pix_label,
+            "像素格式决定视频的色彩采样和位深。\n\n"
+            "• yuv420p：最通用，兼容所有设备和播放器，文件小。\n"
+            "• yuv422p：色度采样更高，适合专业剪辑，兼容性稍差。\n"
+            "• yuv444p：无色彩压缩，画质最高，兼容性最差，文件大。\n"
+            "• yuv420p10le：10-bit 色深，HDR 视频常用，需 HEVC/AV1 编码。\n"
+            "• p010le：10-bit YUV 4:2:0，硬件解码友好（NVIDIA/Intel）。\n"
+            "• nv12：4:2:0 平面交错，硬件编码常用格式。\n\n"
+            "一般视频推荐保持默认 yuv420p 以保证最佳兼容性。",
+            wraplength=400)
+        
         ttk.Checkbutton(hybrid_frame, text="指定", variable=self.pix_fmt_enabled).pack(side=tk.LEFT)
         self.pix_fmt_combo = ttk.Combobox(hybrid_frame, textvariable=self.pix_fmt, 
                                           values=self.PIX_FMTS, width=12, state="normal")
@@ -1810,7 +1878,7 @@ class VideoFilterFrame(ttk.LabelFrame):
         win.title("高级增强滤镜")
         win.transient(self)
         win.grab_set()
-        center_window(win, 500, 550)
+        center_window(win, 500, 750)
     
         main = ttk.Frame(win, padding="10")
         main.pack(fill=tk.BOTH, expand=True)
@@ -1877,7 +1945,56 @@ class VideoFilterFrame(ttk.LabelFrame):
         ttk.Combobox(row5, textvariable=self.colorspace_matrix, 
                      values=["bt709:bt2020", "bt2020:bt709", "bt601:bt709", "bt709:bt601"], 
                      state="readonly", width=15).pack(side=tk.LEFT, padx=5)
-    
+
+        # ----- 颜色校正（eq + hue）-----
+        color_frame = ttk.LabelFrame(main, text="颜色校正 (eq / hue)", padding="5")
+        color_frame.pack(fill=tk.X, pady=5)
+
+        # 创建变量绑定到当前设置
+        eq_brightness_var = tk.DoubleVar(value=self.enhance_settings.get("eq_brightness", 0.0))
+        eq_contrast_var = tk.DoubleVar(value=self.enhance_settings.get("eq_contrast", 1.0))
+        eq_saturation_var = tk.DoubleVar(value=self.enhance_settings.get("eq_saturation", 1.0))
+        eq_gamma_var = tk.DoubleVar(value=self.enhance_settings.get("eq_gamma", 1.0))
+        hue_angle_var = tk.DoubleVar(value=self.enhance_settings.get("hue_angle", 0.0))
+        hue_saturation_var = tk.DoubleVar(value=self.enhance_settings.get("hue_saturation", 0.0))
+
+        def make_slider_row(parent, label, var, from_, to, resolution, fmt="{:.2f}"):
+            """辅助函数：生成一行带滑块和数值的控件"""
+            row = ttk.Frame(parent)
+            row.pack(fill=tk.X, pady=1)
+            ttk.Label(row, text=label, width=10).pack(side=tk.LEFT)
+            slider = ttk.Scale(row, from_=from_, to=to, variable=var,
+                               orient=tk.HORIZONTAL, length=150)
+            slider.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+            val_label = ttk.Label(row, text=fmt.format(var.get()), width=6)
+            val_label.pack(side=tk.LEFT)
+            def update_label(*args):
+                val_label.config(text=fmt.format(var.get()))
+            var.trace_add("write", update_label)
+            return row
+
+        # eq 参数
+        make_slider_row(color_frame, "亮度", eq_brightness_var, -1.0, 1.0, 0.01)
+        make_slider_row(color_frame, "对比度", eq_contrast_var, -2.0, 2.0, 0.01)
+        make_slider_row(color_frame, "饱和度", eq_saturation_var, 0.0, 3.0, 0.01)
+        make_slider_row(color_frame, "伽马", eq_gamma_var, 0.1, 10.0, 0.01)
+
+        # hue 参数
+        make_slider_row(color_frame, "色相", hue_angle_var, -180, 180, 1, fmt="{:.0f}")
+        make_slider_row(color_frame, "色饱和度", hue_saturation_var, -1.0, 1.0, 0.01)
+
+        def reset_color_defaults():
+            eq_brightness_var.set(0.0)
+            eq_contrast_var.set(1.0)
+            eq_saturation_var.set(1.0)
+            eq_gamma_var.set(1.0)
+            hue_angle_var.set(0.0)
+            hue_saturation_var.set(0.0)
+
+        btn_frame_color = ttk.Frame(color_frame)
+        btn_frame_color.pack(fill=tk.X, pady=(5,0))
+        ttk.Button(btn_frame_color, text="重置默认值", command=reset_color_defaults).pack(side=tk.LEFT)
+
         # ----- 按钮-----
         btn_frame = ttk.Frame(main)
         btn_frame.pack(fill=tk.X, pady=10)
@@ -1894,6 +2011,12 @@ class VideoFilterFrame(ttk.LabelFrame):
                 "deblock_strength": self.deblock_strength.get(),
                 "colorspace_enabled": self.colorspace_enabled.get(),
                 "colorspace_matrix": self.colorspace_matrix.get(),
+                "eq_brightness": eq_brightness_var.get(),
+                "eq_contrast": eq_contrast_var.get(),
+                "eq_saturation": eq_saturation_var.get(),
+                "eq_gamma": eq_gamma_var.get(),
+                "hue_angle": hue_angle_var.get(),
+                "hue_saturation": hue_saturation_var.get(),
             })
             if self.app:
                 self.app.update_command_preview()
@@ -2578,7 +2701,8 @@ class VideoFilterFrame(ttk.LabelFrame):
             "pix_fmt_enabled": self.pix_fmt_enabled.get(),
             "pix_fmt": self.pix_fmt.get(),
             "subtitle_enabled": self.subtitle_enabled.get(),
-            "subtitle_path": self.subtitle_path.get()
+            "subtitle_path": self.subtitle_path.get(),
+            "reverse_enabled": self.reverse_enabled.get(),
         }
 
     def set_settings(self, settings):
@@ -2604,6 +2728,7 @@ class VideoFilterFrame(ttk.LabelFrame):
         self.subtitle_enabled.set(settings.get("subtitle_enabled", False))
         self.subtitle_path.set(settings.get("subtitle_path", ""))
         self.toggle_subtitle()
+        self.reverse_enabled.set(settings.get("reverse_enabled", False))
 
 
 # ================== 音频组件 ==================
@@ -4397,7 +4522,10 @@ class FFmpegBatchGUI:
             cmd_list.extend(["-c:a", acodec])
             cmd_list.extend(["-b:a", settings.get("audio_bitrate", "128k")])
             cmd_list.extend(["-ar", settings.get("audio_samplerate", "44100")])
-    
+
+        if settings.get('reverse_enabled', False):
+            audio_filters.append("areverse")
+
         if audio_filters:
             cmd_list.extend(["-af", ",".join(audio_filters)])
     
@@ -4668,7 +4796,7 @@ class FFmpegBatchGUI:
         """
         filter_parts = []
         # 主视频滤镜
-        main_vf = build_video_filter_chain(main_settings, include_subtitle=include_subtitle_main,include_speed=True, enhance_settings=enhance_settings)
+        main_vf = build_video_filter_chain(main_settings, include_subtitle=include_subtitle_main,include_speed=True,reverse=main_settings.get('reverse_enabled', False), enhance_settings=enhance_settings)
         if main_vf and main_vf != "null":
             filter_parts.append(f"[{main_idx}:v]{main_vf}[v_main_proc]")
             current_v = "v_main_proc"
@@ -4707,6 +4835,7 @@ class FFmpegBatchGUI:
                 include_speed=False,
                 include_trim=False,
                 include_format=False,
+                reverse=sub_settings.get('reverse_enabled', False),
                 enhance_settings=sub_enhance
             )
             if base_vf == "null":
@@ -4940,16 +5069,21 @@ class FFmpegBatchGUI:
         """
         使用给定文件路径和设置进行预览。
         file_path: 要预览的文件路径
-        settings: 编码设置字典（包含滤镜、变速等）
+        settings: 编码设置字典（包含滤镜、变速、倒放等）
         """
         if not file_path or not os.path.exists(file_path):
             self._append_info_ui(f"文件不存在: {file_path}")
             return
     
         # ----- 1. 构建基础视频滤镜链（不含 scale） -----
-        # 使用 build_video_filter_chain，不包括 speed（变速由音频单独处理）
         enhance_settings = settings.get("enhance", {})
-        base_vf = build_video_filter_chain(settings, include_subtitle=True, include_speed=False, enhance_settings=enhance_settings)
+        base_vf = build_video_filter_chain(
+            settings,
+            include_subtitle=True,
+            include_speed=False,          # 速度在音频中单独处理
+            enhance_settings=enhance_settings,
+            reverse=settings.get('reverse_enabled', False)   # 关键：传入倒放标志
+        )
         filter_parts = []
         if base_vf and base_vf != "null":
             filter_parts.append(base_vf)
@@ -4958,31 +5092,27 @@ class FFmpegBatchGUI:
         wm_settings = settings.get("watermark", {})
         if wm_settings.get("enabled", False) and wm_settings.get("file_path", "").strip():
             wm_file = wm_settings.get("file_path", "").strip()
-            
             # 获取主视频尺寸（用于自适应）
             main_w, main_h = self._get_video_dimensions_cached(file_path)
             if main_w is None or main_h is None:
                 self._append_info_ui("[预览] 无法获取视频尺寸，跳过水印虚拟框")
             else:
-                # ---- 新增：判断是否启用自适应，如果启用则缩放设置 ----
+                # ---- 判断是否启用自适应，如果启用则缩放设置 ----
                 if wm_settings.get("adaptive", False):
                     # 使用 _adapt_sub_settings 根据当前主视频尺寸缩放
                     adapted_wm = self._adapt_sub_settings(wm_settings, main_w, main_h)
                 else:
-                    adapted_wm = wm_settings  # 或 copy，但后面只读
-                
+                    adapted_wm = wm_settings
                 # 获取水印文件的原始尺寸（考虑旋转）
                 orig_w, orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, wm_file, adapted_wm)
                 if orig_w is None or orig_h is None:
                     self._append_info_ui("[预览] 无法获取水印文件尺寸，使用默认 320x240")
                     orig_w, orig_h = 320, 240
-        
                 # 计算水印渲染尺寸（使用自适应后的设置）
                 wm_w, wm_h = compute_rendered_size(orig_w, orig_h, adapted_wm)
                 if wm_w <= 0 or wm_h <= 0:
                     self._append_info_ui("[预览] 水印渲染尺寸无效，使用原始尺寸")
                     wm_w, wm_h = orig_w, orig_h
-        
                 # 计算 X/Y 位置（使用自适应后的设置，支持表达式）
                 ctx = {"W": main_w, "H": main_h, "w": wm_w, "h": wm_h}
                 x_expr = adapted_wm.get("overlay_x", "W-w-10")
@@ -4996,32 +5126,42 @@ class FFmpegBatchGUI:
                 # 限制范围
                 x_val = max(0, min(x_val, main_w - wm_w))
                 y_val = max(0, min(y_val, main_h - wm_h))
-        
                 # 构建 drawbox 滤镜
                 drawbox = f"drawbox=x={x_val}:y={y_val}:w={wm_w}:h={wm_h}:color=red@0.3:t=3"
                 filter_parts.append(drawbox)
                 self._append_info_ui(f"[预览] 水印虚拟框: 位置({x_val}, {y_val}) 尺寸{wm_w}x{wm_h}")
     
-        # ----- 3. 最后添加 scale 到预览高度（确保所有滤镜在缩放前执行） -----
+        # ----- 3. 最后添加 scale 到预览高度 -----
         filter_parts.append("scale=-2:960")
-    
         # 合并滤镜链
         filter_chain = ",".join(filter_parts) if filter_parts else "null"
     
-        # ----- 4. 处理音频变速额外参数 -----
+        # ----- 4. 处理音频滤镜（变速 + 倒放） -----
         extra_args = []
+        af_filters = []
+    
+        # 变速（atempo）
         if settings.get("speed_enabled", False):
             try:
                 factor = float(settings.get("speed_factor", "1.0"))
                 if factor > 0 and factor != 1.0:
                     atempo = build_atempo_chain(factor)
                     if atempo:
-                        if self.use_mpv.get():
-                            extra_args.extend(["--af", atempo])
-                        else:
-                            extra_args.extend(["-af", atempo])
+                        af_filters.append(atempo)
             except ValueError:
                 pass
+    
+        # 倒放（areverse，必须放在最后）
+        if settings.get("reverse_enabled", False):
+            af_filters.append("areverse")
+    
+        # 构建音频滤镜参数
+        if af_filters:
+            af_chain = ",".join(af_filters)
+            if self.use_mpv.get():
+                extra_args.extend(["--af", af_chain])
+            else:
+                extra_args.extend(["-af", af_chain])
     
         # ----- 5. 调用播放器预览 -----
         self.preview_with_player(file_path, filter_chain, volume=10, extra_args=extra_args)
@@ -5098,7 +5238,7 @@ class FFmpegBatchGUI:
         fps_filter = f"fps={fps_value}" if fps_type == "custom" else ""
     
         # 构建预处理滤镜（不含 format 和 subtitle）
-        vf = build_video_filter_chain(settings, include_subtitle=False, include_speed=True)
+        vf = build_video_filter_chain(settings, include_subtitle=False, include_speed=True,reverse=settings.get('reverse_enabled', False),enhance_settings=enhance_settings)
         if vf and vf != "null":
             filters = [f.strip() for f in vf.split(",") if f.strip() and not f.startswith("format=")]
             if fps_filter:
@@ -5258,7 +5398,8 @@ class FFmpegBatchGUI:
                     include_subtitle=True,
                     include_speed=True,
                     include_trim=(not used_combo),   # 组合跳转时不加 trim
-                    enhance_settings=enhance_settings
+                    enhance_settings=enhance_settings,
+                    reverse=settings.get('reverse_enabled', False),
                 )
                 if vf != "null":
                     cmd_list.extend(["-vf", vf])
@@ -10337,6 +10478,7 @@ class FFmpegBatchGUI:
         self.video_filter.pix_fmt.trace_add("write", lambda *a: self.update_command_preview())
         self.video_filter.subtitle_enabled.trace_add("write", lambda *a: self.update_command_preview())
         self.video_filter.subtitle_path.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_filter.reverse_enabled.trace_add("write", lambda *a: self.update_command_preview())
         self.audio_frame.audio_enabled.trace_add("write", lambda *a: self.update_command_preview())
         self.audio_frame.audio_codec.trace_add("write", lambda *a: self.update_command_preview())
         self.audio_frame.audio_bitrate.trace_add("write", lambda *a: self.update_command_preview())
