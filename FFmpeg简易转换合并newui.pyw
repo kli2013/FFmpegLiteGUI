@@ -3714,6 +3714,7 @@ class AdvancedFrame(ttk.LabelFrame):
             self.update_callback()
 
     def open_watermark_editor(self):
+        """打开水印参数编辑窗口，使用正确的尺寸计算顺序"""
         if self.app is None:
             return
         file_path = self.watermark_dict.get("file_path", "")
@@ -3721,15 +3722,16 @@ class AdvancedFrame(ttk.LabelFrame):
             messagebox.showwarning("提示", "请先选择一个有效的水印文件")
             return
     
-        # 计算主视频渲染尺寸（考虑裁剪和缩放）
+        # 获取主界面当前完整设置（包含裁剪、旋转、缩放等）
         main_file = self.app.input_file.get().strip()
         main_video_size = None
         if main_file and os.path.exists(main_file):
-            orig_w, orig_h = get_video_rotated_dimensions(self.app.ffprobe_cmd, main_file, {})
+            main_settings = self.app.get_current_settings()
+            # 直接获取原始尺寸（不含任何旋转）
+            orig_w, orig_h = get_video_dimensions(self.app.ffprobe_cmd, main_file)
             if orig_w is not None and orig_h is not None:
-                # 获取当前主视频的裁剪/缩放设置
-                main_settings = self.app.get_current_settings()
-                main_w, main_h = compute_rendered_size(orig_w, orig_h, main_settings)
+                # 使用新函数按实际顺序计算最终尺寸
+                main_w, main_h = self.app.compute_final_size_with_order(orig_w, orig_h, main_settings)
                 if main_w > 0 and main_h > 0:
                     main_video_size = (main_w, main_h)
     
@@ -3744,7 +3746,7 @@ class AdvancedFrame(ttk.LabelFrame):
             overlay_mode='sub',
             parent=self,
             track_obj=None,
-            main_video_size=main_video_size  # 传入
+            main_video_size=main_video_size  # 传入正确的最终尺寸
         )
     
     def _on_watermark_saved(self, new_settings):
@@ -5720,27 +5722,60 @@ class FFmpegBatchGUI:
     def _get_enabled_video_tracks(self):
         return [t for t in self.merge_tracks if t.enabled and t.type == "video"]
     
-    def _get_canvas_size(self, main_track):
-        """获取主视频最终画布尺寸（考虑 pad 或 裁剪/缩放后的实际尺寸）"""
-        # 检查是否启用画布偏移
-        pad_enabled = main_track.enc_settings.get('pad_enabled', False)
-        if pad_enabled:
+    def compute_final_size_with_order(self, orig_w: int, orig_h: int, settings: dict) -> Tuple[int, int]:
+        """
+        按滤镜链顺序（crop -> rotate -> scale）计算最终输出尺寸。
+        orig_w, orig_h: 原始视频宽高（不含任何旋转）。
+        settings: 包含 crop、rotate、scale 等设置的字典。
+        """
+        w, h = orig_w, orig_h
+    
+        # 1. 裁剪（基于原始尺寸）
+        if settings.get("crop_enabled", False):
+            crop_w = settings.get("crop_width", "").strip()
+            crop_h = settings.get("crop_height", "").strip()
+            crop_left = settings.get("crop_left", "0").strip()
+            crop_top = settings.get("crop_top", "0").strip()
+            if crop_w and crop_h:
+                # 支持 iw/ih 表达式
+                cw = safe_eval_expr(crop_w, {"iw": w, "ih": h})
+                ch = safe_eval_expr(crop_h, {"iw": w, "ih": h})
+                if cw and ch and cw > 0 and ch > 0:
+                    w, h = cw, ch
+    
+        # 2. 用户旋转（交换宽高）
+        rotate = settings.get("rotate", "none")
+        if rotate in ("90", "270"):
+            w, h = h, w
+    
+        # 3. 缩放
+        if settings.get("scale_enabled", False):
+            method = settings.get("scale_method", "width")
+            sw = settings.get("scale_width", "").strip()
+            sh = settings.get("scale_height", "").strip()
             try:
-                w = int(main_track.enc_settings.get('pad_width', '').strip())
-                h = int(main_track.enc_settings.get('pad_height', '').strip())
-                if w > 0 and h > 0:
-                    return w, h
-            except (ValueError, TypeError):
+                if method == "width" and sw:
+                    target_w = int(float(sw))
+                    target_h = int(round(target_w * h / w))
+                    w, h = target_w, target_h
+                elif method == "height" and sh:
+                    target_h = int(float(sh))
+                    target_w = int(round(target_h * w / h))
+                    w, h = target_w, target_h
+                elif method == "exact" and sw and sh:
+                    w, h = int(float(sw)), int(float(sh))
+            except:
                 pass
     
-        # 未启用 pad 或 pad 尺寸无效，使用主视频实际渲染尺寸
-        # 先获取原始旋转后的尺寸
-        w, h = get_video_rotated_dimensions(self.ffprobe_cmd, main_track.file_path, main_track.enc_settings)
-        if w is None or h is None:
-            w, h = 1280, 720  # 降级默认值
+        return w, h
     
-        # 应用裁剪和缩放（如果有）
-        return compute_rendered_size(w, h, main_track.enc_settings)
+    def _get_canvas_size(self, main_track):
+        # 先获取原始尺寸（不含任何旋转）
+        w, h = get_video_dimensions(self.ffprobe_cmd, main_track.file_path)
+        if w is None or h is None:
+            w, h = 1280, 720
+        # 使用新函数计算最终尺寸
+        return self.compute_final_size_with_order(w, h, main_track.enc_settings)
     
     def _get_video_render_size(self, track, filt_frame=None):
         w, h = get_video_rotated_dimensions(self.ffprobe_cmd, track.file_path, track.enc_settings)
@@ -7238,6 +7273,7 @@ class FFmpegBatchGUI:
                 if not task_watermark.get("file_path"):
                     messagebox.showwarning("提示", "请先在任务设置中输入水印文件路径")
                     return
+            
                 def on_save(new_wm):
                     adv_frame.watermark_dict.update(new_wm)
                     adv_frame.wm_path_var.set(adv_frame.watermark_dict.get("file_path", ""))
@@ -7246,14 +7282,18 @@ class FFmpegBatchGUI:
                     update_preview()
                     self.update_task_list()
                     self._append_info_ui("任务水印已更新")
-                # 计算主视频渲染尺寸
+            
+                # 计算主视频的最终渲染尺寸（严格按 crop → rotate → scale 顺序）
                 main_video_size = None
                 if task.input and os.path.exists(task.input):
-                    orig_w, orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, task.input, {})
+                    main_settings = task.settings
+                    # 直接获取原始尺寸（不含旋转）
+                    orig_w, orig_h = get_video_dimensions(self.ffprobe_cmd, task.input)
                     if orig_w is not None and orig_h is not None:
-                        main_w, main_h = compute_rendered_size(orig_w, orig_h, task.settings)
+                        main_w, main_h = self.compute_final_size_with_order(orig_w, orig_h, main_settings)
                         if main_w > 0 and main_h > 0:
                             main_video_size = (main_w, main_h)
+            
                 self.edit_video_settings(
                     title="编辑任务水印",
                     initial_settings=task_watermark,
@@ -7263,8 +7303,9 @@ class FFmpegBatchGUI:
                     parent=win,
                     track_obj=None,
                     canvas_file=task.input,
-                    main_video_size=main_video_size  # 传入
+                    main_video_size=main_video_size
                 )
+            
             # 替换 水印按钮的命令
             if hasattr(adv_frame, 'watermark_btn'):
                 adv_frame.watermark_btn.config(command=open_task_watermark)
