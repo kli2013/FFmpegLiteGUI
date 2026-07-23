@@ -3596,7 +3596,8 @@ class AdvancedFrame(ttk.LabelFrame):
                 "  如需保留界面生成的滤镜链，请在自定义参数中复制完整的 -vf 链（可从预览区复制）并扩展。\n\n"
                 "• 界面上已单独提供的参数（如 tune、profile、level、maxrate、bufsize）请勿重复添加，以免冲突。\n\n"
                 "• 追加自定义 -t 时间 可作为应急措施，强制限制输出时长，防止因滤镜循环或参数不当导致输出无限延长（主水印模式）。\n\n"
-                "• 新手建议：仅添加界面未提供的高级选项（如 -x264-params、-bsf 等），避免覆盖关键设置。",
+                "• 新手建议：仅添加界面未提供的高级选项（如 -x264-params、-bsf 等），避免覆盖关键设置。\n"
+                "• 参数 setsar=1 强制覆盖 SAR 比例1:1，配合正方形缩放：比如400x400 可以正确压缩 16:9 画面",
                 wraplength=800)
         self.custom_args = tk.StringVar(value="")
         self.custom_entry = ttk.Entry(custom_frame, textvariable=self.custom_args, width=50)
@@ -5092,53 +5093,51 @@ class FFmpegBatchGUI:
 
     def _preview_with_settings(self, file_path: str, settings: dict):
         """
-        使用给定文件路径和设置进行预览。
-        file_path: 要预览的文件路径
-        settings: 编码设置字典（包含滤镜、变速、倒放等）
+        预览：禁用倒放，变速仅 ffplay 支持，视频自适应缩放（边距 自定义）。
         """
         if not file_path or not os.path.exists(file_path):
             self._append_info_ui(f"文件不存在: {file_path}")
             return
     
-        # ----- 1. 构建基础视频滤镜链（不含 scale） -----
+        reverse_enabled = settings.get('reverse_enabled', False)
+        if reverse_enabled:
+            self._append_info_ui("[预览] 预览不支持倒放，已忽略 reverse。")
+            settings = settings.copy()
+            settings['reverse_enabled'] = False
+    
+        # ----- 1. 构建用户视频滤镜（不含自适应缩放） -----
         enhance_settings = settings.get("enhance", {})
         base_vf = build_video_filter_chain(
             settings,
             include_subtitle=True,
-            include_speed=False,          # 速度在音频中单独处理
+            include_speed=False,
             enhance_settings=enhance_settings,
-            reverse=settings.get('reverse_enabled', False)   # 关键：传入倒放标志
+            reverse=False
         )
         filter_parts = []
         if base_vf and base_vf != "null":
             filter_parts.append(base_vf)
     
-        # ----- 2. 添加水印虚拟框（如果启用） -----
+        # ----- 2. 水印虚拟框 -----
         wm_settings = settings.get("watermark", {})
         if wm_settings.get("enabled", False) and wm_settings.get("file_path", "").strip():
             wm_file = wm_settings.get("file_path", "").strip()
-            # 获取主视频尺寸（用于自适应）
             main_w, main_h = self._get_video_dimensions_cached(file_path)
             if main_w is None or main_h is None:
                 self._append_info_ui("[预览] 无法获取视频尺寸，跳过水印虚拟框")
             else:
-                # ---- 判断是否启用自适应，如果启用则缩放设置 ----
                 if wm_settings.get("adaptive", False):
-                    # 使用 _adapt_sub_settings 根据当前主视频尺寸缩放
                     adapted_wm = self._adapt_sub_settings(wm_settings, main_w, main_h)
                 else:
                     adapted_wm = wm_settings
-                # 获取水印文件的原始尺寸（考虑旋转）
                 orig_w, orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, wm_file, adapted_wm)
                 if orig_w is None or orig_h is None:
                     self._append_info_ui("[预览] 无法获取水印文件尺寸，使用默认 320x240")
                     orig_w, orig_h = 320, 240
-                # 计算水印渲染尺寸（使用自适应后的设置）
                 wm_w, wm_h = compute_rendered_size(orig_w, orig_h, adapted_wm)
                 if wm_w <= 0 or wm_h <= 0:
                     self._append_info_ui("[预览] 水印渲染尺寸无效，使用原始尺寸")
                     wm_w, wm_h = orig_w, orig_h
-                # 计算 X/Y 位置（使用自适应后的设置，支持表达式）
                 ctx = {"W": main_w, "H": main_h, "w": wm_w, "h": wm_h}
                 x_expr = adapted_wm.get("overlay_x", "W-w-10")
                 y_expr = adapted_wm.get("overlay_y", "H-h-10")
@@ -5156,36 +5155,53 @@ class FFmpegBatchGUI:
                 filter_parts.append(drawbox)
                 self._append_info_ui(f"[预览] 水印虚拟框: 位置({x_val}, {y_val}) 尺寸{wm_w}x{wm_h}")
     
-        # ----- 3. 最后添加 scale 到预览高度 -----
-        filter_parts.append("scale=-2:960")
-        # 合并滤镜链
+        # ----- 3. 自适应缩放（固定边距） -----
+        orig_w, orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, file_path, settings)
+        if orig_w is None or orig_h is None:
+            orig_w, orig_h = self._get_video_dimensions_cached(file_path)
+            if orig_w is None or orig_h is None:
+                orig_w, orig_h = 1280, 720
+    
+        final_w, final_h = compute_rendered_size(orig_w, orig_h, settings)
+    
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        margin = 80  # 固定边距（像素）
+        max_w = screen_w - margin
+        max_h = screen_h - margin
+    
+        if final_w > max_w or final_h > max_h:
+            scale = min(max_w / final_w, max_h / final_h)
+            target_w = int(final_w * scale)
+            target_h = int(final_h * scale)
+            target_w = target_w if target_w % 2 == 0 else target_w - 1
+            target_h = target_h if target_h % 2 == 0 else target_h - 1
+            if target_w < 2: target_w = 2
+            if target_h < 2: target_h = 2
+            filter_parts.append(f"scale={target_w}:{target_h}")
+            self._append_info_ui(f"[预览] 视频尺寸 {final_w}x{final_h} 超出屏幕，缩放到 {target_w}x{target_h}")
+        else:
+            self._append_info_ui(f"[预览] 视频尺寸 {final_w}x{final_h} 适合屏幕，保持原始")
+    
         filter_chain = ",".join(filter_parts) if filter_parts else "null"
     
-        # ----- 4. 处理音频滤镜（变速 + 倒放） -----
+        # ----- 4. 音频变速（仅 ffplay） -----
         extra_args = []
         af_filters = []
-    
-        # 变速（atempo）
         if settings.get("speed_enabled", False):
             try:
                 factor = float(settings.get("speed_factor", "1.0"))
-                if factor > 0 and factor != 1.0:
+                if factor != 1.0 and factor > 0:
                     atempo = build_atempo_chain(factor)
                     if atempo:
                         af_filters.append(atempo)
             except ValueError:
                 pass
-    
-        # 倒放（areverse，必须放在最后）
-        if settings.get("reverse_enabled", False):
-            af_filters.append("areverse")
-    
-        # 构建音频滤镜参数
         if af_filters:
-            af_chain = ",".join(af_filters)
             if self.use_mpv.get():
-                extra_args.extend(["--af", af_chain])
+                self._append_info_ui("[预览] mpv 预览不支持音频变速，已忽略。")
             else:
+                af_chain = ",".join(af_filters)
                 extra_args.extend(["-af", af_chain])
     
         # ----- 5. 调用播放器预览 -----
@@ -8556,20 +8572,34 @@ class FFmpegBatchGUI:
 
 
     def _build_concat_reencode_mode(self, cmd, video_tracks, audio_tracks, main_video, output_norm):
+        """
+        重新编码模式 - 使用 filter_complex concat，支持每个视频独立音频源，
+        并统一应用主视频设置的视频滤镜（裁剪、缩放、旋转、颜色校正等）和音频滤镜（音量、变速、倒放）。
+        """
         # 为每个视频轨道单独添加 -i（允许重复文件）
         for track in video_tracks:
             cmd.extend(["-i", normalize_path(track.file_path)])
-        
+    
         n = len(video_tracks)
         filter_parts = []
+    
+        # 获取主视频设置中的增强参数
+        enhance_settings = main_video.enc_settings.get("enhance", {})
+        reverse_flag = main_video.enc_settings.get("reverse_enabled", False)
+    
+        # ---- 构建每个片段的预处理（截取、设置 PTS） ----
         for i, track in enumerate(video_tracks):
-            # 视频
+            # 视频：只设置 PTS（截取已在输入时通过 -ss/-to 处理，或通过 trim ？这里我们假设输入已截取）
+            # 但为了灵活，我们可以使用 trim 滤镜，但需要从 track.enc_settings 中读取截取时间。
+            # 当前实现使用 -ss/-to 前置，因此此处只需 setpts。
             filter_parts.append(f"[{i}:v]setpts=PTS-STARTPTS[v{i}]")
-            # 音频
+    
+            # 音频源处理
             audio_source = track.enc_settings.get("audio_source_type", "self")
             if audio_source == "self":
                 filter_parts.append(f"[{i}:a]asetpts=PTS-STARTPTS[a{i}]")
             elif audio_source == "silence":
+                # 生成静音流，时长匹配视频片段
                 start_str = track.enc_settings.get("trim_start", "").strip()
                 end_str = track.enc_settings.get("trim_end", "").strip()
                 start_sec = time_to_seconds(start_str) if start_str else 0.0
@@ -8586,29 +8616,68 @@ class FFmpegBatchGUI:
             else:
                 self._append_info_ui(f"[串联] 音频源类型 '{audio_source}' 未知，降级使用视频自身音频")
                 filter_parts.append(f"[{i}:a]asetpts=PTS-STARTPTS[a{i}]")
-        
-        # 视频 concat
+    
+        # ---- 视频 concat ----
         v_concat = f"[{']['.join(f'v{i}' for i in range(n))}]concat=n={n}:v=1:a=0[vout]"
         filter_parts.append(v_concat)
-        # 音频 concat
+    
+        # ---- 音频 concat ----
         a_concat = f"[{']['.join(f'a{i}' for i in range(n))}]concat=n={n}:v=0:a=1[aout]"
         filter_parts.append(a_concat)
-        
-        # 整体倒放（如果主视频启用）
-        reverse_flag = main_video.enc_settings.get("reverse_enabled", False)
-        if reverse_flag:
-            filter_parts.append("[vout]reverse[vout_rev]")
-            vout_label = "vout_rev"
-            filter_parts.append("[aout]areverse[aout_rev]")
-            aout_label = "aout_rev"
+    
+        # ---- 应用视频滤镜到合并后的视频流 ----
+
+        video_filters = build_video_filter_chain(
+            main_video.enc_settings,
+            include_subtitle=False,          # 字幕单独处理
+            include_speed=True,              # 变速会影响时长，但会在 concat 之后应用，可能导致音画不同步？但普通模式也是如此，所以保持。
+            include_trim=False,              # 已截取
+            include_format=True,             # 像素格式
+            enhance_settings=enhance_settings,
+            reverse=reverse_flag             # 倒放由外部控制
+        )
+    
+        if video_filters and video_filters != "null":
+            # 应用滤镜到 [vout]，输出 [vfinal]
+            filter_parts.append(f"[vout]{video_filters}[vfinal]")
+            vmap = "[vfinal]"
+            self._append_info_ui("[串联-编] 已应用视频滤镜到合并结果")
         else:
-            vout_label = "vout"
-            aout_label = "aout"
-        
+            vmap = "[vout]"
+    
+        # ---- 应用音频滤镜到合并后的音频流 ----
+        # 构建音频滤镜（音量、变速、倒放）
+        # 注意：变速会改变音频时长，需要与视频同步，通常使用 -shortest 或 -t 控制，这里保持与普通模式一致。
+        audio_filters = []
+        # 音量
+        if main_video.enc_settings.get("volume_enabled", False):
+            vol = main_video.enc_settings.get("volume", 1.0)
+            if vol != 1.0:
+                audio_filters.append(f"volume={vol:.2f}")
+        # 变速
+        if main_video.enc_settings.get("speed_enabled", False):
+            factor = float(main_video.enc_settings.get("speed_factor", "1.0"))
+            if factor != 1.0 and factor > 0:
+                atempo = build_atempo_chain(factor)
+                if atempo:
+                    audio_filters.append(atempo)
+        # 倒放
+        if reverse_flag:
+            audio_filters.append("areverse")
+    
+        if audio_filters:
+            afilter_str = ",".join(audio_filters)
+            filter_parts.append(f"[aout]{afilter_str}[afinal]")
+            amap = "[afinal]"
+            self._append_info_ui("[串联-编] 已应用音频滤镜到合并结果")
+        else:
+            amap = "[aout]"
+    
+        # 组合 filter_complex
         cmd.extend(["-filter_complex", ";".join(filter_parts)])
-        cmd.extend(["-map", f"[{vout_label}]", "-map", f"[{aout_label}]"])
-        
-        # 视频编码
+        cmd.extend(["-map", vmap, "-map", amap])
+    
+        # ---- 视频编码参数 ----
         v_settings = main_video.enc_settings.copy()
         vcodec = v_settings.get("encoder", "libx265")
         if vcodec == "copy":
@@ -8617,8 +8686,8 @@ class FFmpegBatchGUI:
             v_settings["encoder"] = "libx265"
         strategy = get_encoder_strategy(vcodec)
         cmd = strategy.build_params(cmd, v_settings)
-        
-        # 音频编码
+    
+        # ---- 音频编码参数 ----
         if audio_tracks:
             a_settings = audio_tracks[0].enc_settings
             enc = a_settings.get("encoder", "aac")
@@ -8632,7 +8701,7 @@ class FFmpegBatchGUI:
             ])
         else:
             cmd.extend(["-c:a", "aac", "-b:a", "128k", "-ar", "44100"])
-        
+    
         self._add_container_optimization(cmd)
         cmd.append(output_norm)
         self._append_info_ui(f"[串联-编] 使用 filter_complex 重新编码模式（{n} 个片段）")
@@ -8874,19 +8943,39 @@ class FFmpegBatchGUI:
         return compute_rendered_size(w, h, track.enc_settings)
 
     def merge_preview_track(self, track_idx):
+        """预览单个轨道，禁用倒放，变速仅 ffplay，自适应缩放（边距 自定义）"""
         track = self.merge_tracks[track_idx]
         if not os.path.exists(track.file_path):
             self._append_info_ui(f"[预览] 文件不存在: {track.file_path}")
             return
+    
         if track.type == "video":
-            filters = build_video_filter_chain(track.enc_settings, include_subtitle=False, include_speed=False)
+            reverse_enabled = track.enc_settings.get("reverse_enabled", False)
+            if reverse_enabled:
+                self._append_info_ui("[预览] 预览不支持倒放，已忽略 reverse。")
+                temp_settings = track.enc_settings.copy()
+                temp_settings['reverse_enabled'] = False
+            else:
+                temp_settings = track.enc_settings
+    
+            # ---- 视频滤镜（不含自适应缩放） ----
+            enhance = temp_settings.get("enhance", {})
+            filters = build_video_filter_chain(
+                temp_settings,
+                include_subtitle=False,
+                include_speed=False,
+                enhance_settings=enhance,
+                reverse=False
+            )
+    
+            # ---- 画中画模式：为主视频绘制子视频虚拟框 ----
             pip_enabled = self.pip_enabled.get()
             enabled_video_tracks = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
             is_main_video = (enabled_video_tracks and enabled_video_tracks[0] == track)
             if pip_enabled and is_main_video:
                 sub_videos = enabled_video_tracks[1:]
                 if sub_videos:
-                    main_w, main_h = get_video_rotated_dimensions(self.ffprobe_cmd, track.file_path, track.enc_settings)
+                    main_w, main_h = self._get_video_render_size(track)
                     if main_w is None:
                         self._append_info_ui("[预览] 无法获取主视频尺寸，使用默认 1280x720")
                         main_w, main_h = 1280, 720
@@ -8913,13 +9002,59 @@ class FFmpegBatchGUI:
                             filters = f"{filters},{drawbox_chain}"
                         else:
                             filters = drawbox_chain
-            if filters and filters != "null":
-                final_filter = f"{filters},scale=-2:960"
+    
+            # ---- 自适应缩放（固定边距） ----
+            orig_w, orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, track.file_path, track.enc_settings)
+            if orig_w is None or orig_h is None:
+                orig_w, orig_h = 1280, 720
+            final_w, final_h = compute_rendered_size(orig_w, orig_h, track.enc_settings)
+    
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+            margin = 80
+            max_w = screen_w - margin
+            max_h = screen_h - margin
+    
+            if final_w > max_w or final_h > max_h:
+                scale = min(max_w / final_w, max_h / final_h)
+                target_w = int(final_w * scale)
+                target_h = int(final_h * scale)
+                target_w = target_w if target_w % 2 == 0 else target_w - 1
+                target_h = target_h if target_h % 2 == 0 else target_h - 1
+                if target_w < 2: target_w = 2
+                if target_h < 2: target_h = 2
+                scale_filter = f"scale={target_w}:{target_h}"
+                if filters and filters != "null":
+                    filters = f"{filters},{scale_filter}"
+                else:
+                    filters = scale_filter
+                self._append_info_ui(f"[预览] 缩放到 {target_w}x{target_h}")
             else:
-                final_filter = "scale=-2:960"
-            self.preview_with_player(track.file_path, final_filter, volume=10)
+                self._append_info_ui(f"[预览] 保持原始尺寸 {final_w}x{final_h}")
+    
+            # ---- 音频变速（仅 ffplay） ----
+            extra_args = []
+            af_filters = []
+            if is_main_video and track.enc_settings.get("speed_enabled", False):
+                try:
+                    factor = float(track.enc_settings.get("speed_factor", "1.0"))
+                    if factor != 1.0 and factor > 0:
+                        atempo = build_atempo_chain(factor)
+                        if atempo:
+                            af_filters.append(atempo)
+                except ValueError:
+                    pass
+            if af_filters:
+                if self.use_mpv.get():
+                    self._append_info_ui("[预览] mpv 预览不支持音频变速，已忽略。")
+                else:
+                    af_chain = ",".join(af_filters)
+                    extra_args.extend(["-af", af_chain])
+    
+            self.preview_with_player(track.file_path, filters or "null", volume=10, extra_args=extra_args)
             if pip_enabled and is_main_video and sub_videos:
                 self._append_info_ui("[预览] 占位框尺寸为从视频实际渲染大小")
+    
         elif track.type == "audio":
             self.preview_with_player(track.file_path, audio_only=True, volume=10)
         else:
