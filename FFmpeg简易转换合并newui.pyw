@@ -300,7 +300,7 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
     顺序优化：
     1. 精准截取		2. 裁剪		3. 缩放		4. IVTC（反胶卷过带）	5. 反交错
     6. 去块滤波		7. 降噪		8. 锐化		9. 旋转/翻转		10. 色彩空间转换
-    11. 像素格式	12. 变速	13. 字幕烧录
+    11. 颜色校正+色相   12. 像素格式	13. 变速	        14. 倒放
     """
     filters = []
     
@@ -441,6 +441,7 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
             sub_path = sub_path.replace("'", "\\'")
             filters.append(f"subtitles='{sub_path}'")
 
+    # ----- 倒放 -----
     if reverse:
         filters.append("reverse")
 
@@ -1517,7 +1518,7 @@ class VideoFilterFrame(ttk.LabelFrame):
 
 
     def __init__(self, parent, app, preview_callback=None, **kwargs):
-        super().__init__(parent, text="视频滤镜 (缩放/裁剪/旋转/变速/反交错/像素格式)", padding="5", **kwargs)
+        super().__init__(parent, text="视频滤镜 (裁剪/缩放/反交错/旋转/像素格式/变速/倒放)", padding="5", **kwargs)
         self.app = app
         self.current_file = None
         self.current_track = None
@@ -1716,7 +1717,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             "启用变速后，可自定义速度倍数（支持任意正数，例如 0.5x 慢放、2.0x 快放）。\n"
             "注意：过高（>10）或过低（<0.1）的倍数会串联多个 atempo 音频滤镜计算，可能加重解码负担。\n"
             "推荐范围：0.1 ~ 10 倍，一般使用 0.25 ~ 4.0 已足够。")
-        ttk.Entry(hybrid_frame, textvariable=self.speed_factor, width=6).pack(side=tk.LEFT)
+        ttk.Entry(hybrid_frame, textvariable=self.speed_factor, width=6).pack(side=tk.LEFT, padx=5)
 
 
         self.reverse_enabled = tk.BooleanVar(value=False)
@@ -10674,49 +10675,41 @@ class SegmentEditor:
     # ---------- 片段管理方法 ----------
     def add_segment_with_time(self, start_sec, end_sec, flip="无"):
         if start_sec is None or end_sec is None:
-    #        self.app._append_info_ui("[分段] 时间无效，无法添加")
             return False
         if start_sec >= end_sec:
-    #        self.app._append_info_ui(f"[分段] 开始 {start_sec} >= 结束 {end_sec}，跳过")
             return False
-        start_str = seconds_to_time(start_sec)
-        end_str = seconds_to_time(end_sec)
-        # 时长检测（仅警告）
+    
+        # 检查并修正
         if self.app and self.app.input_file.get():
             dur = self.app._get_media_duration(self.app.input_file.get())
-            if dur is not None and end_sec > dur:
-                self.app._append_info_ui(f"[分段] 片段超出总时长: {start_str}->{end_str}，已跳过")
-                return False
-
-        self.segments.append({
-            "start": start_str,
-            "end": end_str,
-            "flip": flip
-        })
+            if dur is not None:
+                if abs(end_sec - dur) <= 0.001:
+                    end_sec = dur
+                if end_sec > dur + 0.001:
+                    self.app._append_info_ui(f"[分段] 片段超出总时长，已跳过")
+                    return False
+    
+        start_str = seconds_to_time(start_sec)
+        end_str = seconds_to_time(end_sec)
+        self.segments.append({"start": start_str, "end": end_str, "flip": flip})
         self.refresh_tree()
- #       self.app._append_info_ui(f"[分段] 从命令导入片段: {start_str} -> {end_str} (翻转: {flip})")
         return True
-
+    
     def add_segment(self):
-        # 获取输入
         start = self.start_entry.get().strip()
         end = self.end_entry.get().strip()
-        
-        # ---- 调试日志 ----
- #       self.app._append_info_ui(f"[分段] 用户点击添加: start='{start}', end='{end}'")
-        
+    
         if not start:
             messagebox.showwarning("提示", "请填写开始时间")
             return
     
-        # 如果未填写结束时间，尝试自动补全（但推荐强制手动填写）
+        # 如果结束时间为空，自动补全为视频总时长
         if not end:
-            # 尝试从输入文件获取总时长
             if self.app and self.app.input_file.get():
                 dur = self.app._get_media_duration(self.app.input_file.get())
                 if dur is not None:
                     end = seconds_to_time(dur)
-  #                  self.app._append_info_ui(f"[分段] 结束时间自动设为总时长: {end}")
+                    self.app._append_info_ui(f"[分段] 结束时间自动设为总时长: {end}")
                 else:
                     messagebox.showerror("错误", "无法获取视频总时长，请手动填写结束时间")
                     return
@@ -10724,7 +10717,6 @@ class SegmentEditor:
                 messagebox.showerror("错误", "未指定输入文件，无法自动获取结束时间，请手动填写")
                 return
     
-        # 解析时间
         start_sec = time_to_seconds(start)
         end_sec = time_to_seconds(end)
         if start_sec is None or end_sec is None:
@@ -10734,25 +10726,22 @@ class SegmentEditor:
             messagebox.showerror("错误", "开始时间必须小于结束时间")
             return
     
-        # 检查总时长（仅警告）
+        # 检查并修正接近总时长的结束时间（容差 0.001 秒）
         if self.app and self.app.input_file.get():
             dur = self.app._get_media_duration(self.app.input_file.get())
-            if dur is not None and end_sec > dur:
-                self.app._append_info_ui(f"[分段] 片段超出总时长: {start_str}->{end_str}，已跳过")
-                return
+            if dur is not None:
+                # 如果结束时间在总时长 ±1ms 内，直接修正为总时长
+                if abs(end_sec - dur) <= 0.001:
+                    end_sec = dur
+                    end = seconds_to_time(end_sec)   # 更新显示字符串
+                # 若仍明显超出（大于 1ms），则拒绝
+                if end_sec > dur + 0.001:
+                    self.app._append_info_ui(f"[分段] 片段超出总时长: {start}->{end}，已跳过")
+                    return
     
-        # ---- 获取翻转值（直接从控件读取） ----
         flip_value = self.flip_combo.get()
-#        self.app._append_info_ui(f"[分段] 当前翻转值: {flip_value}")
-    
-        # 添加到列表
-        self.segments.append({
-            "start": start,
-            "end": end,
-            "flip": flip_value
-        })
+        self.segments.append({"start": start, "end": end, "flip": flip_value})
         self.refresh_tree()
- #       self.app._append_info_ui(f"[分段] 已添加片段: {start} -> {end} (翻转: {flip_value})")
 
     def delete_selected(self):
         selected = self.tree.selection()
@@ -10806,7 +10795,7 @@ class SegmentEditor:
             return
         idx = int(selected[0])
         seg = self.segments[idx]
-
+    
         dialog = EditSegmentDialog(self.window, "编辑片段",
                                    start=seg["start"], end=seg["end"], flip=seg["flip"])
         if dialog.start is not None and dialog.end is not None:
@@ -10818,16 +10807,24 @@ class SegmentEditor:
             if start_sec >= end_sec:
                 messagebox.showerror("错误", "开始时间必须小于结束时间")
                 return
+    
+            start_display = seconds_to_time(start_sec)
+            end_display = seconds_to_time(end_sec)
+    
+            # 检查并修正
             if self.app and self.app.input_file.get():
                 dur = self.app._get_media_duration(self.app.input_file.get())
-                if dur is not None and end_sec > dur:
-                    self.app._append_info_ui(f"[分段] 片段超出总时长: {start_str}->{end_str}，已跳过")
-                    return
+                if dur is not None:
+                    if abs(end_sec - dur) <= 0.001:
+                        end_sec = dur
+                        end_display = seconds_to_time(end_sec)
+                    if end_sec > dur + 0.001:
+                        self.app._append_info_ui(f"[分段] 片段超出总时长: {start_display}->{end_display}，已跳过")
+                        return
+    
             seg["start"] = dialog.start
             seg["end"] = dialog.end
-      #      self.app._append_info_ui(f"[编辑] 修改前翻转: {seg['flip']}, 修改后: {dialog.flip}")
             seg["flip"] = dialog.flip
-      #      self.app._append_info_ui(f"[编辑] 实际存储: {seg['flip']}")
             self.refresh_tree()
 
     # ---------- 外部命令导入 ----------
