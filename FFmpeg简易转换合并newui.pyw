@@ -5678,7 +5678,12 @@ class FFmpegBatchGUI:
                                 show_canvas_controls=False,
                                 coord_mode='top_left',
                                 allow_negative_offset=False,
-                                rect_color='red'):
+                                rect_color='red',
+                                extra_info="",   #子视频的额外主视频偏移信息
+                                rect_label='',   # 单独的方框显示名
+                                min_visible_pixels=0,  # 主视频偏移限制 至少留10  默认传0
+                                show_scale_tip=False   # 子视频和水印的 新绘制操作提示
+                                ):
         """
         通用叠加/偏移可视化编辑器（核心重构函数）
         
@@ -5740,14 +5745,21 @@ class FFmpegBatchGUI:
     
         def clamp_rect():
             nonlocal current_x, current_y, current_w, current_h
-            if allow_negative_offset:
-                # 允许任意偏移，不做任何限制
-                return
-            # 否则限制在画布内（子视频/水印模式）
-            current_x = max(0, min(current_x, current_canvas_w - current_w))
-            current_y = max(0, min(current_y, current_canvas_h - current_h))
-            current_w = min(current_w, current_canvas_w)
-            current_h = min(current_h, current_canvas_h)
+            if allow_negative_offset and min_visible_pixels > 0:
+                # 允许负偏移，但至少保留 min_visible_pixels 像素可见
+                current_x = max(-current_w + min_visible_pixels, 
+                                min(current_x, current_canvas_w - min_visible_pixels))
+                current_y = max(-current_h + min_visible_pixels, 
+                                min(current_y, current_canvas_h - min_visible_pixels))
+            elif allow_negative_offset:
+                # 完全放开，无任何限制
+                pass
+            else:
+                # 严格限制在画布内（子视频/水印模式）
+                current_x = max(0, min(current_x, current_canvas_w - current_w))
+                current_y = max(0, min(current_y, current_canvas_h - current_h))
+                current_w = min(current_w, current_canvas_w)
+                current_h = min(current_h, current_canvas_h)
     
         def create_rect():
             nonlocal rect_id, text_id
@@ -5755,7 +5767,7 @@ class FFmpegBatchGUI:
             cx2, cy2 = to_canvas(current_x + current_w, current_y + current_h)
             rid = canvas.create_rectangle(cx1, cy1, cx2, cy2, outline=rect_color, width=2,
                                           fill=rect_color, stipple="gray50", tags="rect")
-            tid = canvas.create_text(cx1 + 5, cy1 + 5, anchor="nw", text="叠加对象",
+            tid = canvas.create_text(cx1 + 5, cy1 + 5, anchor="nw", text=rect_label,
                                      fill="white", font=("Arial", 9), tags="rect")
             return rid, tid
     
@@ -5828,14 +5840,9 @@ class FFmpegBatchGUI:
             dy = dy_pixel / scale
             new_x = int(drag_start_x + dx)
             new_y = int(drag_start_y + dy)
-            if allow_negative_offset:
-                # 无边界限制，允许任意值（包括负数和超出画布）
-                pass
-            else:
-                new_x = max(0, min(new_x, current_canvas_w - current_w))
-                new_y = max(0, min(new_y, current_canvas_h - current_h))
             if new_x != current_x or new_y != current_y:
                 current_x, current_y = new_x, new_y
+                clamp_rect()   # 应用边界约束（根据 allow_negative_offset 和 min_visible_pixels）
                 update_rect_position()
     
         def stop_move(event):
@@ -5917,7 +5924,7 @@ class FFmpegBatchGUI:
                     if new_w > 0 and new_h > 0:
                         current_x, current_y = x1, y1
                         current_w, current_h = new_w, new_h
-                        clamp_rect()  # 应用边界限制（根据 allow_negative_offset）
+                        clamp_rect()  # 应用边界限制（根据 allow_negative_offset 和 min_visible_pixels）
                         canvas.delete(rect_id)
                         canvas.delete(text_id)
                         rect_id, text_id = create_rect()
@@ -5956,11 +5963,17 @@ class FFmpegBatchGUI:
         # ---- 重置位置 ----
         def reset_position():
             nonlocal current_x, current_y
-            current_x = current_canvas_w - current_w - 10
-            current_y = current_canvas_h - current_h - 10
-            clamp_rect()  # 应用边界限制（根据模式）
+            # 如果是主视频模式（允许负偏移且为蓝色），重置到左上角 (0,0)
+            if allow_negative_offset and rect_color == 'deepskyblue':
+                current_x = 0
+                current_y = 0
+            else:
+                # 否则（子视频/水印）重置到右下角（保留 10px 边距）
+                current_x = current_canvas_w - current_w - 10
+                current_y = current_canvas_h - current_h - 10
+            clamp_rect()
             update_rect_position()
-            status_var.set("已重置到右下角")
+            status_var.set("已重置位置")
     
         # ---- 应用与取消 ----
         def apply():
@@ -5983,8 +5996,11 @@ class FFmpegBatchGUI:
         ttk.Label(win, textvariable=status_var, justify=tk.LEFT).pack(pady=5)
     
         coord_var = tk.StringVar(value="")
-        coord_label = ttk.Label(win, textvariable=coord_var, font=("Courier", 10))
+        coord_label = ttk.Label(win, textvariable=coord_var, font=("", 10))
         coord_label.pack(pady=2)
+        if extra_info:
+            extra_label = ttk.Label(win, text=extra_info, foreground="orange")
+            extra_label.pack(pady=2)
     
         # 画布尺寸控件（主视频模式）
         if show_canvas_controls:
@@ -6012,8 +6028,17 @@ class FFmpegBatchGUI:
         action_frame.pack(pady=10)
         ttk.Button(action_frame, text="应用", command=apply).pack(side=tk.LEFT, padx=10)
         ttk.Button(action_frame, text="取消", command=cancel).pack(side=tk.LEFT, padx=10)
-        ttk.Button(action_frame, text="重置位置（右下角）", command=reset_position).pack(side=tk.LEFT, padx=10)
-    
+        ttk.Button(action_frame, text="重置位置", command=reset_position).pack(side=tk.LEFT, padx=10)
+
+        if show_scale_tip:
+            tip_text = "提示：重新绘制矩形时，如果比例不对，请先返回上一个界面取消「缩放」的勾选，已保存的上一次缩放会干扰裁剪属性。"
+            tip_label = ttk.Label(win, text=tip_text, foreground="gray", 
+                                  justify=tk.LEFT, wraplength=win.winfo_width() - 20)
+            tip_label.pack(fill=tk.X, padx=10, pady=5)
+            def update_wraplength(event):
+                tip_label.config(wraplength=win.winfo_width() - 20)
+            win.bind("<Configure>", update_wraplength)
+
         # 绑定事件
         canvas.tag_bind("rect", "<Button-1>", start_move)
         canvas.tag_bind("rect", "<B1-Motion>", on_move)
@@ -6097,7 +6122,7 @@ class FFmpegBatchGUI:
             off_y_var.set(str(new_y))
             self.merge_update_track_list()
             self.merge_update_command_preview()
-            self._append_info_ui(f"[可视化] 已设置画布 {new_canvas_w}x{new_canvas_h}, 偏移 ({new_x}, {new_y})")
+            self._append_info_ui(f"[可视化-主] 已设置画布 {new_canvas_w}x{new_canvas_h}, 偏移 ({new_x}, {new_y})")
     
         # 背景绘制函数（显示其他子视频虚线框）
         def draw_bg(canvas, scale):
@@ -6123,7 +6148,9 @@ class FFmpegBatchGUI:
             show_canvas_controls=True,
             coord_mode='offset',
             allow_negative_offset=True,   # 允许负偏移
-            rect_color='deepskyblue'      # 蓝色
+            rect_color='deepskyblue',      # 蓝色
+            rect_label='主视频',
+            min_visible_pixels=10
         )
 
     # ---------- 水印位置可视化编辑器 ----------
@@ -6166,13 +6193,14 @@ class FFmpegBatchGUI:
                 filt_frame.scale_method.set("exact")
                 filt_frame.scale_width.set(str(new_w))
                 filt_frame.scale_height.set(str(new_h))
-            self._append_info_ui(f"[水印可视化] 已保存位置: ({new_x}, {new_y}) 尺寸: {new_w}x{new_h}")
+            self._append_info_ui(f"[可视化-水] 已保存位置: ({new_x}, {new_y}) 尺寸: {new_w}x{new_h}")
     
         title = "可视化编辑水印位置及大小"
         aspect = wm_w / wm_h if wm_h != 0 else None
         self._generic_overlay_editor(parent or self.root, canvas_w, canvas_h,
                                      rect_x, rect_y, wm_w, wm_h,
-                                     on_apply, title, aspect, bg_draw_func=None)
+                                     on_apply, title, aspect, bg_draw_func=None,rect_label='水印',
+                                     min_visible_pixels=0,show_scale_tip=True)
     
     # ---------- 从视频位置可视化编辑器 ----------
     def open_visual_overlay_editor(self, track_idx, ov_x_var=None, ov_y_var=None, filt_frame=None, parent=None):
@@ -6230,25 +6258,25 @@ class FFmpegBatchGUI:
                 filt_frame.scale_height.set(str(new_h))
             self.merge_update_track_list()
             self.merge_update_command_preview()
-            self._append_info_ui(f"[可视化] 已保存位置: ({new_x}, {new_y}) 大小: {new_w}x{new_h}")
+            self._append_info_ui(f"[可视化-从] 已保存位置: ({new_x}, {new_y}) 大小: {new_w}x{new_h}")
     
-        # 定义背景绘制函数（显示其他子视频和主视频边界）
+        main_pad_enabled = main_track.enc_settings.get('pad_enabled', False)
+        if main_pad_enabled:
+            off_x_expr = main_track.enc_settings.get('offset_x', '0')
+            off_y_expr = main_track.enc_settings.get('offset_y', '0')
+            offset_x = safe_eval_expr(off_x_expr, {"W": canvas_w, "H": canvas_h}) or 0
+            offset_y = safe_eval_expr(off_y_expr, {"W": canvas_w, "H": canvas_h}) or 0
+        else:
+            offset_x, offset_y = 0, 0
+        extra_info = f"主视频偏移: X={offset_x}, Y={offset_y}"
+
+        # ----- 定义背景绘制函数（现在内部只需使用 offset_x/offset_y 而不需定义 extra_info）-----
         def draw_bg(canvas, scale):
-            # 获取主视频偏移
-            offset_x = 0
-            offset_y = 0
-            main_pad_enabled = main_track.enc_settings.get('pad_enabled', False)
-            if main_pad_enabled:
-                off_x_expr = main_track.enc_settings.get('offset_x', '0')
-                off_y_expr = main_track.enc_settings.get('offset_y', '0')
-                offset_x = safe_eval_expr(off_x_expr, {"W": canvas_w, "H": canvas_h}) or 0
-                offset_y = safe_eval_expr(off_y_expr, {"W": canvas_w, "H": canvas_h}) or 0
             # 获取主视频渲染尺寸
             main_render_size = self._get_video_render_size(main_track)
             if main_render_size is None:
                 main_render_size = (canvas_w, canvas_h)
             sub_tracks = enabled_videos[1:]
-            # 调用已有的背景绘制方法
             self._draw_background(canvas, canvas_w, canvas_h, scale, main_track, sub_tracks,
                                   offset_x, offset_y, main_render_size, current_edit_track=track, tag="bg")
     
@@ -6261,7 +6289,11 @@ class FFmpegBatchGUI:
             on_apply,
             title,
             aspect,
-            bg_draw_func=draw_bg
+            bg_draw_func=draw_bg,
+            extra_info=extra_info,
+            rect_label='当前子视频',
+            min_visible_pixels=0,
+            show_scale_tip=True
         )
 
     # ---------- 预设管理 ----------
