@@ -6033,10 +6033,10 @@ class FFmpegBatchGUI:
         if show_scale_tip:
             tip_text = "提示：重新绘制矩形时，如果比例不对，请先返回上一个界面取消「缩放」的勾选，已保存的上一次缩放会干扰裁剪属性。"
             tip_label = ttk.Label(win, text=tip_text, foreground="gray", 
-                                  justify=tk.LEFT, wraplength=win.winfo_width() - 20)
+                                  justify=tk.LEFT, wraplength=win.winfo_width() - 30)
             tip_label.pack(fill=tk.X, padx=10, pady=5)
             def update_wraplength(event):
-                tip_label.config(wraplength=win.winfo_width() - 20)
+                tip_label.config(wraplength=win.winfo_width() - 30)
             win.bind("<Configure>", update_wraplength)
 
         # 绑定事件
@@ -7083,7 +7083,8 @@ class FFmpegBatchGUI:
                     file_path=task_watermark.get("file_path"),
                     is_watermark=True,
                     parent=win,
-                    track_obj=None
+                    track_obj=None,
+                    canvas_file=task.input
                 )
             # 替换 水印按钮的命令
             if hasattr(adv_frame, 'watermark_btn'):
@@ -7244,7 +7245,11 @@ class FFmpegBatchGUI:
         ttk.Entry(f1, textvariable=self.merge_video).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         ttk.Button(f1, text="浏览", command=self.merge_select_video).pack(side=tk.RIGHT, padx=(2,15))
 
-        ttk.Label(parent, text="轨道列表（可单独设置编码参数）").pack(anchor=tk.W, pady=(10,2))
+        if DND_AVAILABLE:
+            label_text = "轨道列表（可单独设置编码参数，支持批量拖拽添加文件）"
+        else:
+            label_text = "轨道列表（可单独设置编码参数）"
+        ttk.Label(parent, text=label_text).pack(anchor=tk.W, pady=(10,2))
 
         list_container = ttk.Frame(parent)
         list_container.pack(fill=tk.X, pady=5)
@@ -8712,7 +8717,7 @@ class FFmpegBatchGUI:
     def edit_video_settings(self, title, initial_settings, on_save, file_path=None,
                             is_watermark=False, track_idx=None, pip_enabled_var=None,
                             overlay_mode='sub', parent=None, show_loop_chroma=True,
-                            track_obj=None, is_concat_mode=False):
+                            track_obj=None, is_concat_mode=False, canvas_file=None):
         if parent is None:
             parent = self.root
         with self.SafeToplevel(parent) as win:
@@ -8817,7 +8822,7 @@ class FFmpegBatchGUI:
                 if is_watermark:
                     # 水印模式，使用 visual_callback
                     def watermark_visual_callback():
-                        main_file = self.input_file.get().strip()
+                        main_file = canvas_file or self.input_file.get().strip()
                         if not main_file or not os.path.exists(main_file):
                             messagebox.showwarning("提示", "请先在主界面选择一个输入文件作为画布")
                             return
@@ -10214,7 +10219,13 @@ class FFmpegBatchGUI:
                              height=btn_height, width=12, relief=tk.RAISED)
         btn1_copy.pack(side=tk.LEFT, padx=5)
 
-        preview_frame = ttk.LabelFrame(settings_frame, text="当前命令模板", padding="5")
+
+        if DND_AVAILABLE:
+            preview_label_text = "当前命令模板 - 拖拽文件可以按当前模板添加到队列"
+        else:
+            preview_label_text = "当前命令模板"
+
+        preview_frame = ttk.LabelFrame(settings_frame, text=preview_label_text, padding="5")
         preview_frame.pack(fill=tk.X, pady=0)
         self.cmd_preview = scrolledtext.ScrolledText(preview_frame, height=4, wrap=tk.WORD, font=("Microsoft YaHei",9))
         self.cmd_preview.pack(fill=tk.BOTH, expand=True)
