@@ -4661,7 +4661,7 @@ class FFmpegBatchGUI:
     def _generate_segment_concat_command(self, input_path: str, output_path: str, settings: dict) -> List[str]:
         """
         生成分段拼接的 FFmpeg 命令，使用 filter_complex。
-        settings 包含编码、音频、全局滤镜等设置。
+        现已支持增强滤镜（降噪、锐化、颜色校正等）。
         """
         segments = settings.get("segments", [])
         if not segments:
@@ -4676,7 +4676,7 @@ class FFmpegBatchGUI:
         n = len(segments)
         v_filters = []
         a_filters = []
-        disable_audio = not settings.get("audio_enabled", True)  # 注意：audio_enabled 默认 True
+        disable_audio = not settings.get("audio_enabled", True)
     
         for i, seg in enumerate(segments):
             start = time_to_seconds(seg["start"])
@@ -4701,7 +4701,6 @@ class FFmpegBatchGUI:
     
         # 视频 concat
         v_concat = f"[{']['.join(f'v{i}' for i in range(n))}]concat=n={n}:v=1:a=0[vout]"
-        # 合并所有滤镜
         filter_parts = v_filters + [v_concat]
         if not disable_audio:
             filter_parts.extend(a_filters)
@@ -4709,8 +4708,9 @@ class FFmpegBatchGUI:
             filter_parts.append(a_concat)
         all_filters = ";".join(filter_parts)
     
-        # ----- 全局滤镜（缩放、裁剪、旋转、帧率、像素格式）-----
+        # ----- 全局滤镜（缩放、裁剪、旋转、翻转、帧率、像素格式，现增加增强滤镜） -----
         global_filters = []
+    
         # 缩放
         if settings.get("scale_enabled", False):
             method = settings.get("scale_method", "width")
@@ -4722,6 +4722,7 @@ class FFmpegBatchGUI:
                 global_filters.append(f"scale=-2:{h}")
             elif method == "exact" and w and h:
                 global_filters.append(f"scale={w}:{h}")
+    
         # 裁剪
         if settings.get("crop_enabled", False):
             cw = settings.get("crop_width", "").strip()
@@ -4730,6 +4731,7 @@ class FFmpegBatchGUI:
             cy = settings.get("crop_top", "0").strip()
             if cw and ch:
                 global_filters.append(f"crop={cw}:{ch}:{cx}:{cy}")
+    
         # 旋转
         rotate = settings.get("rotate", "none")
         if rotate == "90":
@@ -4738,22 +4740,54 @@ class FFmpegBatchGUI:
             global_filters.append("transpose=2,transpose=2")
         elif rotate == "270":
             global_filters.append("transpose=2")
-        # 翻转（全局翻转，如果用户在主界面勾选，但片段内已经独立翻转，这里可以叠加，但一般不需要）
+    
+        # 翻转（全局）
         if settings.get("vflip", False):
             global_filters.append("vflip")
         if settings.get("hflip", False):
             global_filters.append("hflip")
+    
         # 帧率
         if settings.get("frame_rate_type") == "custom":
             fps = settings.get("frame_rate_custom", "").strip()
             if fps:
                 global_filters.append(f"fps={fps}")
+    
         # 像素格式
         if settings.get("pix_fmt_enabled", True):
             pix = settings.get("pix_fmt", "yuv420p")
             if pix:
                 global_filters.append(f"format={pix}")
     
+        # ⭐ 新增：增强滤镜（降噪、锐化、颜色校正等）
+        enhance_settings = settings.get("enhance", {})
+        if enhance_settings:
+            # 构建临时设置，仅包含 enhance，其他所有开关关闭，避免重复滤镜
+            temp_settings = {
+                "crop_enabled": False,
+                "scale_enabled": False,
+                "rotate": "none",
+                "vflip": False,
+                "hflip": False,
+                "speed_enabled": False,
+                "deinterlace_filter": "none",
+                "pix_fmt_enabled": False,
+                "subtitle_enabled": False,
+                "reverse_enabled": False,
+                "enhance": enhance_settings,
+            }
+            enhance_filter = build_video_filter_chain(
+                temp_settings,
+                include_subtitle=False,
+                include_speed=False,
+                include_trim=False,
+                include_format=False,
+                enhance_settings=enhance_settings
+            )
+            if enhance_filter and enhance_filter != "null":
+                global_filters.append(enhance_filter)
+    
+        # 如果存在全局滤镜，追加到 all_filters
         if global_filters:
             global_filter_str = ",".join(global_filters)
             all_filters += f";[vout]{global_filter_str}[final_v]"
@@ -4772,7 +4806,6 @@ class FFmpegBatchGUI:
         # ----- 视频编码参数 -----
         vcodec = settings.get("encoder", "libx265")
         if vcodec == "copy":
-            # 拼接必须重新编码，强制改为 libx265
             self._append_info_ui("分段拼接模式不支持 copy，自动改为 libx265")
             vcodec = "libx265"
             settings["encoder"] = vcodec
