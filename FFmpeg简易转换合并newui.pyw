@@ -464,7 +464,7 @@ def build_preview_filter_chain(settings: Dict[str, Any], target_height: int = 96
 
 def build_atempo_chain(factor: float) -> str:
     """构建音频变速滤镜链，支持大于2倍或小于0.5倍的场景"""
-    if factor == 1.0:
+    if factor <= 0 or factor == 1.0:
         return ""
     chain = []
     r = factor
@@ -3646,7 +3646,17 @@ class AdvancedFrame(ttk.LabelFrame):
         # ---- 水印设置按钮 ----
         self.watermark_btn = ttk.Button(wm_frame, text="水印叠加设置", command=self.open_watermark_editor)
         self.watermark_btn.pack(side=tk.LEFT, padx=5)
-        ToolTip(self.watermark_btn, "打开独立窗口配置水印（支持缩放、裁剪、绿幕、位置调整等）。\n注意：水印会应用在主视频之上，且会忽略水印自身的音频。")
+        ToolTip(
+            self.watermark_btn,
+            "打开独立窗口配置水印（支持缩放、裁剪、旋转、绿幕抠像、透明度、位置调整等）。\n\n"
+            "注意：\n"
+            "• 水印会叠加在主视频之上，水印自身的音频将被忽略。\n"
+            "• 水印不支持变速功能（为避免时长计算混乱），如需变速请先单独预处理水印文件。\n"
+            "• 循环控制通过启用截取并设置循环次数实现，可用于视频水印的重复播放。\n"
+            "• 勾选「自适应」可根据主视频尺寸自动缩放水印大小和位置。\n"
+            "• 此变速限制同样适用于画中画（子视频）模式，若子视频需变速，请先预处理。",
+            wraplength=500
+        )
         
         # 保留探测时长按钮和时长标签变量（隐藏），以免其他代码引用报错
         self.wm_duration_label = ttk.Label(wm_frame, text="", foreground="gray")
@@ -4660,8 +4670,7 @@ class FFmpegBatchGUI:
 
     def _generate_segment_concat_command(self, input_path: str, output_path: str, settings: dict) -> List[str]:
         """
-        生成分段拼接的 FFmpeg 命令，使用 filter_complex。
-        现已支持增强滤镜（降噪、锐化、颜色校正等）。
+        生成分段拼接的 FFmpeg 命令，支持仅音频、硬件解码、增强滤镜等。
         """
         segments = settings.get("segments", [])
         if not segments:
@@ -4670,13 +4679,20 @@ class FFmpegBatchGUI:
         input_path = normalize_path(input_path)
         output_path = normalize_path(output_path)
     
-        cmd = [self.ffmpeg_cmd, "-y", "-i", input_path]
+        # 检测仅音频模式
+        only_audio = settings.get("only_audio", False)
+        disable_audio = not settings.get("audio_enabled", True)
+    
+        cmd = [self.ffmpeg_cmd, "-y"]
+
+        self._add_hwaccel_params(cmd, settings)
+    
+        cmd.extend(["-i", input_path])
     
         # ----- 构建 filter_complex -----
         n = len(segments)
         v_filters = []
         a_filters = []
-        disable_audio = not settings.get("audio_enabled", True)
     
         for i, seg in enumerate(segments):
             start = time_to_seconds(seg["start"])
@@ -4695,132 +4711,158 @@ class FFmpegBatchGUI:
             elif flip == "水平+垂直":
                 flip_filter = ",hflip,vflip"
     
-            v_filters.append(f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS{flip_filter}[v{i}]")
+            # 视频trim（仅非仅音频模式）
+            if not only_audio:
+                v_filters.append(f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS{flip_filter}[v{i}]")
+    
+            # 音频trim（除非完全禁用音频）
             if not disable_audio:
                 a_filters.append(f"[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a{i}]")
     
-        # 视频 concat
-        v_concat = f"[{']['.join(f'v{i}' for i in range(n))}]concat=n={n}:v=1:a=0[vout]"
-        filter_parts = v_filters + [v_concat]
-        if not disable_audio:
+        filter_parts = []
+    
+        # 视频处理
+        if not only_audio and v_filters:
+            filter_parts.extend(v_filters)
+            v_concat = f"[{']['.join(f'v{i}' for i in range(n))}]concat=n={n}:v=1:a=0[vout]"
+            filter_parts.append(v_concat)
+    
+            # ----- 全局视频滤镜（缩放、裁剪、旋转、翻转、帧率、像素格式、增强） -----
+            global_filters = []
+    
+        # 缩放
+            if settings.get("scale_enabled", False):
+                method = settings.get("scale_method", "width")
+                w = settings.get("scale_width", "").strip()
+                h = settings.get("scale_height", "").strip()
+                if method == "width" and w:
+                    global_filters.append(f"scale={w}:-2")
+                elif method == "height" and h:
+                    global_filters.append(f"scale=-2:{h}")
+                elif method == "exact" and w and h:
+                    global_filters.append(f"scale={w}:{h}")
+    
+        # 裁剪
+            if settings.get("crop_enabled", False):
+                cw = settings.get("crop_width", "").strip()
+                ch = settings.get("crop_height", "").strip()
+                cx = settings.get("crop_left", "0").strip()
+                cy = settings.get("crop_top", "0").strip()
+                if cw and ch:
+                    global_filters.append(f"crop={cw}:{ch}:{cx}:{cy}")
+    
+        # 旋转
+            rotate = settings.get("rotate", "none")
+            if rotate == "90":
+                global_filters.append("transpose=1")
+            elif rotate == "180":
+                global_filters.append("transpose=2,transpose=2")
+            elif rotate == "270":
+                global_filters.append("transpose=2")
+    
+        # 翻转（全局）
+            if settings.get("vflip", False):
+                global_filters.append("vflip")
+            if settings.get("hflip", False):
+                global_filters.append("hflip")
+    
+        # 帧率
+            if settings.get("frame_rate_type") == "custom":
+                fps = settings.get("frame_rate_custom", "").strip()
+                if fps:
+                    global_filters.append(f"fps={fps}")
+    
+        # 像素格式
+            if settings.get("pix_fmt_enabled", True):
+                pix = settings.get("pix_fmt", "yuv420p")
+                if pix:
+                    global_filters.append(f"format={pix}")
+    
+            # 增强滤镜（降噪、锐化、颜色校正等）
+            enhance_settings = settings.get("enhance", {})
+            if enhance_settings:
+                temp_settings = {
+                    "crop_enabled": False,
+                    "scale_enabled": False,
+                    "rotate": "none",
+                    "vflip": False,
+                    "hflip": False,
+                    "speed_enabled": False,
+                    "deinterlace_filter": "none",
+                    "pix_fmt_enabled": False,
+                    "subtitle_enabled": False,
+                    "reverse_enabled": False,
+                    "enhance": enhance_settings,
+                }
+                enhance_filter = build_video_filter_chain(
+                    temp_settings,
+                    include_subtitle=False,
+                    include_speed=False,
+                    include_trim=False,
+                    include_format=False,
+                    enhance_settings=enhance_settings
+                )
+                if enhance_filter and enhance_filter != "null":
+                    global_filters.append(enhance_filter)
+    
+            if global_filters:
+                global_filter_str = ",".join(global_filters)
+                filter_parts.append(f"[vout]{global_filter_str}[final_v]")
+                map_v = "[final_v]"
+            else:
+                map_v = "[vout]"
+    
+        # 音频 concat（如果存在音频片段）
+        if a_filters:
             filter_parts.extend(a_filters)
             a_concat = f"[{']['.join(f'a{i}' for i in range(n))}]concat=n={n}:v=0:a=1[aout]"
             filter_parts.append(a_concat)
+    
         all_filters = ";".join(filter_parts)
+        if all_filters:
+            cmd.extend(["-filter_complex", all_filters])
     
-        # ----- 全局滤镜（缩放、裁剪、旋转、翻转、帧率、像素格式，现增加增强滤镜） -----
-        global_filters = []
-    
-        # 缩放
-        if settings.get("scale_enabled", False):
-            method = settings.get("scale_method", "width")
-            w = settings.get("scale_width", "").strip()
-            h = settings.get("scale_height", "").strip()
-            if method == "width" and w:
-                global_filters.append(f"scale={w}:-2")
-            elif method == "height" and h:
-                global_filters.append(f"scale=-2:{h}")
-            elif method == "exact" and w and h:
-                global_filters.append(f"scale={w}:{h}")
-    
-        # 裁剪
-        if settings.get("crop_enabled", False):
-            cw = settings.get("crop_width", "").strip()
-            ch = settings.get("crop_height", "").strip()
-            cx = settings.get("crop_left", "0").strip()
-            cy = settings.get("crop_top", "0").strip()
-            if cw and ch:
-                global_filters.append(f"crop={cw}:{ch}:{cx}:{cy}")
-    
-        # 旋转
-        rotate = settings.get("rotate", "none")
-        if rotate == "90":
-            global_filters.append("transpose=1")
-        elif rotate == "180":
-            global_filters.append("transpose=2,transpose=2")
-        elif rotate == "270":
-            global_filters.append("transpose=2")
-    
-        # 翻转（全局）
-        if settings.get("vflip", False):
-            global_filters.append("vflip")
-        if settings.get("hflip", False):
-            global_filters.append("hflip")
-    
-        # 帧率
-        if settings.get("frame_rate_type") == "custom":
-            fps = settings.get("frame_rate_custom", "").strip()
-            if fps:
-                global_filters.append(f"fps={fps}")
-    
-        # 像素格式
-        if settings.get("pix_fmt_enabled", True):
-            pix = settings.get("pix_fmt", "yuv420p")
-            if pix:
-                global_filters.append(f"format={pix}")
-    
-        # ⭐ 新增：增强滤镜（降噪、锐化、颜色校正等）
-        enhance_settings = settings.get("enhance", {})
-        if enhance_settings:
-            # 构建临时设置，仅包含 enhance，其他所有开关关闭，避免重复滤镜
-            temp_settings = {
-                "crop_enabled": False,
-                "scale_enabled": False,
-                "rotate": "none",
-                "vflip": False,
-                "hflip": False,
-                "speed_enabled": False,
-                "deinterlace_filter": "none",
-                "pix_fmt_enabled": False,
-                "subtitle_enabled": False,
-                "reverse_enabled": False,
-                "enhance": enhance_settings,
-            }
-            enhance_filter = build_video_filter_chain(
-                temp_settings,
-                include_subtitle=False,
-                include_speed=False,
-                include_trim=False,
-                include_format=False,
-                enhance_settings=enhance_settings
-            )
-            if enhance_filter and enhance_filter != "null":
-                global_filters.append(enhance_filter)
-    
-        # 如果存在全局滤镜，追加到 all_filters
-        if global_filters:
-            global_filter_str = ",".join(global_filters)
-            all_filters += f";[vout]{global_filter_str}[final_v]"
-            map_v = "[final_v]"
+        # ----- 映射流 -----
+        if only_audio:
+            cmd.extend(["-map", "[aout]"])
+            cmd.append("-vn")
         else:
-            map_v = "[vout]"
+            if v_filters:
+                # 视频流已处理
+                cmd.extend(["-map", map_v])
+                if a_filters:
+                    cmd.extend(["-map", "[aout]"])
+            else:
+                # 不应该发生，因为至少有一个视频片段，但若没有则报错
+                raise ValueError("没有视频片段")
+            # 视频编码参数
+            vcodec = settings.get("encoder", "libx265")
+            if vcodec == "copy":
+                self._append_info_ui("分段拼接模式不支持 copy，自动改为 libx265")
+                vcodec = "libx265"
+                settings["encoder"] = vcodec
+            strategy = get_encoder_strategy(vcodec)
+            cmd = strategy.build_params(cmd, settings)
     
-        cmd.extend(["-filter_complex", all_filters])
-    
-        # 映射
-        if disable_audio:
-            cmd.extend(["-map", map_v])
-        else:
-            cmd.extend(["-map", map_v, "-map", "[aout]"])
-    
-        # ----- 视频编码参数 -----
-        vcodec = settings.get("encoder", "libx265")
-        if vcodec == "copy":
-            self._append_info_ui("分段拼接模式不支持 copy，自动改为 libx265")
-            vcodec = "libx265"
-            settings["encoder"] = vcodec
-    
-        strategy = get_encoder_strategy(vcodec)
-        cmd = strategy.build_params(cmd, settings)
-    
-        # ----- 音频编码参数（如果启用）-----
+        # 音频编码参数（如果启用且不是仅音频模式时，音频编码单独处理）
         if not disable_audio:
-            acodec = settings.get("audio_codec", "aac")
-            abitrate = settings.get("audio_bitrate", "128k")
-            arate = settings.get("audio_samplerate", "44100")
-            cmd.extend(["-c:a", acodec, "-b:a", abitrate, "-ar", arate])
+            if only_audio:
+                # 仅音频模式，直接输出音频
+                acodec = settings.get("audio_codec", "aac")
+                abitrate = settings.get("audio_bitrate", "128k")
+                arate = settings.get("audio_samplerate", "44100")
+                cmd.extend(["-c:a", acodec, "-b:a", abitrate, "-ar", arate])
+            else:
+                # 视频模式，音频编码（如果有音频）
+                if a_filters:
+                    acodec = settings.get("audio_codec", "aac")
+                    abitrate = settings.get("audio_bitrate", "128k")
+                    arate = settings.get("audio_samplerate", "44100")
+                    cmd.extend(["-c:a", acodec, "-b:a", abitrate, "-ar", arate])
+        else:
+            cmd.append("-an")
     
-        # ----- 自定义参数 -----
+        # 自定义参数
         custom = settings.get("custom_args", "").strip()
         if custom:
             try:
@@ -4828,7 +4870,7 @@ class FFmpegBatchGUI:
             except ValueError:
                 self._append_info_ui(f"警告：自定义参数格式错误，已忽略：{custom}")
     
-        # ----- 容器优化 -----
+        # 容器优化
         container = settings.get("output_container", "mp4").lower()
         if container in ("mp4", "mov"):
             cmd.extend(["-movflags", "+faststart"])
@@ -5819,17 +5861,34 @@ class FFmpegBatchGUI:
         return w, h
     
     def _get_canvas_size(self, main_track):
-        # 先获取原始尺寸（不含任何旋转）
+        """
+        获取主视频最终画布尺寸（考虑 pad 或 裁剪/旋转/缩放后的实际尺寸）。
+        """
+        # 检查是否启用画布偏移（pad）
+        pad_enabled = main_track.enc_settings.get('pad_enabled', False)
+        if pad_enabled:
+            try:
+                w = int(main_track.enc_settings.get('pad_width', '').strip())
+                h = int(main_track.enc_settings.get('pad_height', '').strip())
+                if w > 0 and h > 0:
+                    return w, h
+            except (ValueError, TypeError):
+                pass
+    
+        # 未启用 pad 或 pad 尺寸无效，使用主视频实际渲染尺寸（按正确顺序计算）
+        # 先获取原始尺寸（不含旋转）
         w, h = get_video_dimensions(self.ffprobe_cmd, main_track.file_path)
         if w is None or h is None:
-            w, h = 1280, 720
-        # 使用新函数计算最终尺寸
+            w, h = 1280, 720  # 降级默认值
+    
+        # 使用新函数按 crop -> rotate -> scale 顺序计算
         return self.compute_final_size_with_order(w, h, main_track.enc_settings)
     
     def _get_video_render_size(self, track, filt_frame=None):
-        w, h = get_video_rotated_dimensions(self.ffprobe_cmd, track.file_path, track.enc_settings)
-        if w is None:
-            return None, None
+        """
+        获取视频轨道在应用了裁剪、旋转、缩放后的最终渲染尺寸。
+        若提供了 filt_frame，则从该控件读取设置，否则从 track.enc_settings 读取。
+        """
         if filt_frame is not None:
             settings = {
                 "crop_enabled": filt_frame.crop_enabled.get(),
@@ -5843,35 +5902,14 @@ class FFmpegBatchGUI:
             }
         else:
             settings = track.enc_settings
-        rotate = settings.get("rotate", "none")
-        if rotate in ("90", "270"):
-            w, h = h, w
-        if settings.get("crop_enabled", False):
-            crop_w = settings.get("crop_width", "").strip()
-            crop_h = settings.get("crop_height", "").strip()
-            if crop_w and crop_h:
-                cw = safe_eval_expr(crop_w, {"iw": w, "ih": h})
-                ch = safe_eval_expr(crop_h, {"iw": w, "ih": h})
-                if cw and ch and cw > 0 and ch > 0:
-                    w, h = cw, ch
-        if settings.get("scale_enabled", False):
-            method = settings.get("scale_method", "width")
-            sw = settings.get("scale_width", "").strip()
-            sh = settings.get("scale_height", "").strip()
-            try:
-                if method == "width" and sw:
-                    target_w = int(float(sw))
-                    target_h = int(round(target_w * h / w))
-                    w, h = target_w, target_h
-                elif method == "height" and sh:
-                    target_h = int(float(sh))
-                    target_w = int(round(target_h * w / h))
-                    w, h = target_w, target_h
-                elif method == "exact" and sw and sh:
-                    w, h = int(float(sw)), int(float(sh))
-            except:
-                pass
-        return w, h
+    
+        # 获取原始尺寸（不含任何旋转，直接从 ffprobe 获取）
+        w, h = get_video_dimensions(self.ffprobe_cmd, track.file_path)
+        if w is None:
+            return None, None
+    
+        # 使用统一顺序计算（crop -> rotate -> scale）
+        return self.compute_final_size_with_order(w, h, settings)
     
     def _to_canvas_coords(self, x, y, scale):
         return int(x * scale), int(y * scale)
@@ -6837,6 +6875,9 @@ class FFmpegBatchGUI:
     def add_task(self, input_path, settings=None):
         if settings is None:
             settings = self.get_current_settings()
+        # 如果水印未启用（路径为空），则移除 watermark 键，避免残留参数污染任务
+        if not settings.get("watermark", {}).get("enabled", False) or not settings.get("watermark", {}).get("file_path", "").strip():
+            settings.pop("watermark", None)
         settings["segment_enabled"] = self.segment_enabled.get()
         settings["segments"] = copy.deepcopy(self.segments)
         try:
@@ -7237,6 +7278,8 @@ class FFmpegBatchGUI:
             audio_frame = AudioFrame(container, enable_checkbox=True)
             audio_frame.pack(fill=tk.X)
             audio_frame.set_settings(task.settings)
+            audio_frame.volume_value.trace_add("write", lambda *a: update_preview())
+            audio_frame.volume_enabled.trace_add("write", lambda *a: update_preview())
     
             # 截取片段页面
             page_trim = ttk.Frame(notebook)
@@ -7246,6 +7289,7 @@ class FFmpegBatchGUI:
             trim_frame.set_settings(task.settings)
             
             filt_frame.set_get_trim_settings_callback(lambda: trim_frame.get_settings())
+            trim_frame.precise_trim.trace_add("write", lambda *a: update_preview())
 
 
             # ----- 分段拼接页面 -----
@@ -7432,6 +7476,8 @@ class FFmpegBatchGUI:
             audio_frame.audio_samplerate.trace_add("write", update_preview)
             audio_frame.only_audio.trace_add("write", update_preview)
             audio_frame.audio_format.trace_add("write", update_preview)
+
+
             trim_frame.trim_enabled.trace_add("write", update_preview)
             trim_frame.trim_start.trace_add("write", update_preview)
             trim_frame.trim_end.trace_add("write", update_preview)
@@ -8335,12 +8381,21 @@ class FFmpegBatchGUI:
         普通封装模式：支持视频滤镜、多音频/字幕、音频截取、音频混合（amix）与音量调整。
         """
         cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
-        input_files, file_index = self._prepare_tracks_and_inputs(enabled_tracks)
+    
+        # 获取视频轨道
         video_tracks = [t for t in enabled_tracks if t.type == "video"]
         if not video_tracks:
             self._append_info_ui("[封装] 没有启用的视频轨道")
             return []
         main_video = video_tracks[0]
+    
+        # 在添加输入之前插入硬件解码参数（使用主视频设置）
+        self._add_hwaccel_params(cmd, main_video.enc_settings)
+    
+        # 准备输入文件和索引
+        input_files, file_index = self._prepare_tracks_and_inputs(enabled_tracks)
+    
+        # 添加输入选项（-i 及前置 -ss/-to）
         cmd = self._add_input_options(cmd, input_files, main_video)
     
         # ---- 视频处理 ----
@@ -8353,7 +8408,7 @@ class FFmpegBatchGUI:
         reverse_flag = v_settings.get("reverse_enabled", False)
         if vcodec == "copy" and reverse_flag:
             reverse_flag = False
-     #       self._append_info_ui("[封装] 主视频为流复制模式，已自动禁用音频倒放（避免音画不同步）")
+            self._append_info_ui("[封装] 主视频为流复制模式，已自动禁用音频倒放（避免音画不同步）")
     
         if vcodec == "copy":
             cmd.extend(["-c:v", "copy"])
@@ -8370,7 +8425,7 @@ class FFmpegBatchGUI:
             strategy = get_encoder_strategy(vcodec)
             cmd = strategy.build_params(cmd, v_settings)
     
-        # ---- 音频处理（使用统一的音频滤镜构建函数，传入修正后的 reverse_flag） ----
+        # ---- 音频处理 ----
         audio_tracks = [t for t in enabled_tracks if t.type == "audio"]
         mix_tracks = [t for t in audio_tracks if t.enc_settings.get("mix_enabled", False)]
     
@@ -8385,7 +8440,7 @@ class FFmpegBatchGUI:
                     include_trim=True,
                     include_volume=True,
                     include_speed=True,
-                    include_reverse=reverse_flag   # 使用经过检测的倒放标志
+                    include_reverse=reverse_flag
                 )
                 enc = audio.enc_settings.get("encoder", "copy")
                 if af_str:
@@ -8407,7 +8462,7 @@ class FFmpegBatchGUI:
             else:
                 cmd.extend(["-disposition:a:0", "default"])
         else:
-            # 混合模式（一个或多个勾选流）
+            # 混合模式
             if len(mix_tracks) == 1:
                 audio = mix_tracks[0]
                 a_idx = file_index[audio.file_path]
@@ -8493,6 +8548,7 @@ class FFmpegBatchGUI:
         sub_videos = video_tracks[1:]
     
         # 画中画模式下强制使用精准截取（由滤镜处理）
+        self._add_hwaccel_params(cmd, main_video.enc_settings)
         main_video.enc_settings["precise_trim"] = True
         cmd = self._add_input_options(cmd, input_files, main_video, sub_videos)
     
@@ -8559,6 +8615,10 @@ class FFmpegBatchGUI:
 
         cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
 
+        # 硬件解码参数（流复制模式通常无需，但保留以兼容）
+        if video_tracks:
+            self._add_hwaccel_params(cmd, video_tracks[0].enc_settings)
+
         if use_copy_mode:
             return self._build_concat_copy_mode(cmd, video_tracks, audio_tracks, output_norm, preview=preview)
         else:
@@ -8622,9 +8682,7 @@ class FFmpegBatchGUI:
     
         # ---- 构建每个片段的预处理（截取、设置 PTS） ----
         for i, track in enumerate(video_tracks):
-            # 视频：只设置 PTS（截取已在输入时通过 -ss/-to 处理，或通过 trim ？这里我们假设输入已截取）
-            # 但为了灵活，我们可以使用 trim 滤镜，但需要从 track.enc_settings 中读取截取时间。
-            # 当前实现使用 -ss/-to 前置，因此此处只需 setpts。
+            # 视频：只设置 PTS（截取已在输入时通过 -ss/-to 处理）
             filter_parts.append(f"[{i}:v]setpts=PTS-STARTPTS[v{i}]")
     
             # 音频源处理
@@ -8659,19 +8717,17 @@ class FFmpegBatchGUI:
         filter_parts.append(a_concat)
     
         # ---- 应用视频滤镜到合并后的视频流 ----
-
         video_filters = build_video_filter_chain(
             main_video.enc_settings,
-            include_subtitle=False,          # 字幕单独处理
-            include_speed=True,              # 变速会影响时长，但会在 concat 之后应用，可能导致音画不同步？但普通模式也是如此，所以保持。
-            include_trim=False,              # 已截取
-            include_format=True,             # 像素格式
+            include_subtitle=False,
+            include_speed=True,          # 变速会影响时长，但会在 concat 之后应用，普通模式也如此
+            include_trim=False,          # 已截取
+            include_format=True,         # 像素格式
             enhance_settings=enhance_settings,
-            reverse=reverse_flag             # 倒放由外部控制
+            reverse=reverse_flag
         )
     
         if video_filters and video_filters != "null":
-            # 应用滤镜到 [vout]，输出 [vfinal]
             filter_parts.append(f"[vout]{video_filters}[vfinal]")
             vmap = "[vfinal]"
             self._append_info_ui("[串联-编] 已应用视频滤镜到合并结果")
@@ -8679,8 +8735,6 @@ class FFmpegBatchGUI:
             vmap = "[vout]"
     
         # ---- 应用音频滤镜到合并后的音频流 ----
-        # 构建音频滤镜（音量、变速、倒放）
-        # 注意：变速会改变音频时长，需要与视频同步，通常使用 -shortest 或 -t 控制，这里保持与普通模式一致。
         audio_filters = []
         # 音量
         if main_video.enc_settings.get("volume_enabled", False):
@@ -9216,38 +9270,67 @@ class FFmpegBatchGUI:
                         if not main_file or not os.path.exists(main_file):
                             messagebox.showwarning("提示", "请先选择一个有效的输入文件作为画布")
                             return
-                        # 使用传入的主视频渲染尺寸（如果有）
+                    
+                        # 获取主视频尺寸（优先使用传入的 main_video_size）
                         if main_video_size is not None:
                             main_w, main_h = main_video_size
                         else:
-                            # 降级：使用原始尺寸（可能不准确）
-                            main_w, main_h = get_video_rotated_dimensions(self.ffprobe_cmd, main_file, {})
-                            if main_w is None or main_h is None:
-                                main_w, main_h = 1280, 720
-                            self._append_info_ui("[水印] 警告：未传入主视频渲染尺寸，使用原始尺寸，可能不准确。")
+                            # 从 filt_frame 读取主视频设置计算
+                            main_settings = {
+                                "crop_enabled": filt_frame.crop_enabled.get(),
+                                "crop_width": filt_frame.crop_width.get(),
+                                "crop_height": filt_frame.crop_height.get(),
+                                "scale_enabled": filt_frame.scale_enabled.get(),
+                                "scale_method": filt_frame.scale_method.get(),
+                                "scale_width": filt_frame.scale_width.get(),
+                                "scale_height": filt_frame.scale_height.get(),
+                                "rotate": filt_frame.rotate.get()
+                            }
+                            orig_w, orig_h = get_video_dimensions(self.ffprobe_cmd, main_file)
+                            if orig_w is None or orig_h is None:
+                                orig_w, orig_h = 1280, 720
+                            main_w, main_h = self.compute_final_size_with_order(orig_w, orig_h, main_settings)
+                    
                         wm_file = initial_settings.get("file_path", "")
                         if not wm_file or not os.path.exists(wm_file):
                             messagebox.showwarning("提示", "水印文件未设置或不存在")
                             return
-                        filt_settings = filt_frame.get_settings()
-                        orig_w, orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, wm_file, {})
-                        if orig_w is None:
+                    
+                        # 从 filt_frame 获取当前水印的滤镜设置（因为用户可能已修改）
+                        # 注意：filt_frame 是主视频的滤镜框架，但在水印编辑模式下，它被用于水印设置
+                        wm_settings = {
+                            "crop_enabled": filt_frame.crop_enabled.get(),
+                            "crop_width": filt_frame.crop_width.get(),
+                            "crop_height": filt_frame.crop_height.get(),
+                            "scale_enabled": filt_frame.scale_enabled.get(),
+                            "scale_method": filt_frame.scale_method.get(),
+                            "scale_width": filt_frame.scale_width.get(),
+                            "scale_height": filt_frame.scale_height.get(),
+                            "rotate": filt_frame.rotate.get(),
+                            "vflip": filt_frame.vflip.get(),
+                            "hflip": filt_frame.hflip.get(),
+                            # 其他增强滤镜不影响尺寸，不需要
+                        }
+                    
+                        orig_w, orig_h = get_video_dimensions(self.ffprobe_cmd, wm_file)
+                        if orig_w is None or orig_h is None:
                             orig_w, orig_h = 320, 240
-                        rendered = compute_rendered_size(orig_w, orig_h, filt_settings)
-                        if rendered:
-                            wm_w, wm_h = rendered
-                        else:
-                            wm_w, wm_h = 320, 240
-                        # 调用新的水印编辑器
+                    
+                        # 计算水印渲染尺寸（包含旋转）
+                        wm_w, wm_h = self.compute_final_size_with_order(orig_w, orig_h, wm_settings)
+                        if wm_w <= 0 or wm_h <= 0:
+                            wm_w, wm_h = orig_w, orig_h
+                    
+                        # 打开编辑器
                         self.open_watermark_overlay_editor(
                             main_w, main_h,
                             wm_w, wm_h,
                             overlay_frame.overlay_x,
                             overlay_frame.overlay_y,
-                            scale_enabled_var=filt_frame.scale_enabled,
+                            scale_enabled_var=filt_frame.scale_enabled,   # 用于回写缩放
                             scale_w_var=filt_frame.scale_width,
                             scale_h_var=filt_frame.scale_height,
-                            watermark_dict=initial_settings,   # 如果是水印编辑，传入设置字典
+                            watermark_dict=initial_settings,  # 用于回写水印设置
                             filt_frame=filt_frame,
                             parent=win
                         )
