@@ -4308,7 +4308,7 @@ class FFmpegBatchGUI:
                         self._refresh_cmd_preset_list()
                         return
             except Exception as e:
-                self._append_info_ui(f"⚠️ 加载快速命令模板失败: {e}，将使用默认模板")
+                self._append_info_ui(f"加载快速命令模板失败: {e}，将使用默认模板")
         
         # 文件不存在或加载失败，创建默认模板
         self.cmd_templates = self._get_default_cmd_templates()
@@ -4352,7 +4352,7 @@ class FFmpegBatchGUI:
             with open(self.cmd_templates_path, 'w', encoding='utf-8') as f:
                 json.dump(self.cmd_templates, f, indent=4, ensure_ascii=False)
         except Exception as e:
-            self._append_info_ui(f"⚠️ 保存快速命令模板失败: {e}")
+            self._append_info_ui(f"保存快速命令模板失败: {e}")
     
     def _refresh_cmd_preset_list(self):
         """刷新命令预设下拉列表"""
@@ -5352,6 +5352,7 @@ class FFmpegBatchGUI:
         fps_type = settings.get("frame_rate_type", "keep")
         fps_value = settings.get("frame_rate_custom", "30")
         fps_filter = f"fps={fps_value}" if fps_type == "custom" else ""
+        enhance_settings = settings.get("enhance", {})
     
         # 构建预处理滤镜（不含 format 和 subtitle）
         vf = build_video_filter_chain(settings, include_subtitle=False, include_speed=True,reverse=settings.get('reverse_enabled', False),enhance_settings=enhance_settings)
@@ -8542,7 +8543,7 @@ class FFmpegBatchGUI:
         input_files, file_index = self._prepare_tracks_and_inputs(enabled_tracks)
         video_tracks = [t for t in enabled_tracks if t.type == "video"]
         if not video_tracks:
-            self._append_info_ui("[封装] 没有启用的视频轨道")
+            self._append_info_ui("[封装-画] 没有启用的视频轨道")
             return []
         main_video = video_tracks[0]
         sub_videos = video_tracks[1:]
@@ -8551,9 +8552,20 @@ class FFmpegBatchGUI:
         self._add_hwaccel_params(cmd, main_video.enc_settings)
         main_video.enc_settings["precise_trim"] = True
         cmd = self._add_input_options(cmd, input_files, main_video, sub_videos)
-    
+
         main_idx = file_index[main_video.file_path]
-        sub_infos = [(file_index[sv.file_path], sv.file_path, sv.enc_settings) for sv in sub_videos]
+
+        
+        # ---- 构建子视频信息列表（临时复制设置，避免修改原轨道） ----
+        sub_infos = []
+        for sv in sub_videos:
+            sv_settings = sv.enc_settings.copy()   # 复制一份，不影响原轨道
+            
+            if sv_settings.get("encoder") == "copy":
+                sv_settings["encoder"] = "libx265"
+                self._append_info_ui(f"[封装-画] 从视频 {os.path.basename(sv.file_path)} copy 已临时改为 libx265（画中画必须重新编码）")
+            
+            sub_infos.append((file_index[sv.file_path], sv.file_path, sv_settings))
     
         # 获取倒放标志，同时检测视频编码器（画中画强制重新编码，但为保险仍做检测）
         vcodec = main_video.enc_settings.get("encoder", "libx265")
@@ -8563,19 +8575,20 @@ class FFmpegBatchGUI:
         #    self._append_info_ui("[封装] 画中画模式视频为 copy（理论上不会发生），已禁用音频倒放")
             # 但画中画模式已经强制将 copy 改为 libx265，所以此分支通常不会执行
     
-        # 构建叠加滤镜（传递 reverse_flag 用于视频倒放）
+        # 构建叠加滤镜（传递 reverse_flag 用于视频倒放） 检查主视频是否启用字幕烧录
+        include_subtitle_main = main_video.enc_settings.get("subtitle_enabled", False) and bool(main_video.enc_settings.get("subtitle_path", "").strip())
         complex_filter, final_v_label = self._build_overlay_filter_complex(
             main_idx, main_video.enc_settings, sub_infos,
-            include_subtitle_main=False,
+            include_subtitle_main=include_subtitle_main,
             enhance_settings=main_video.enc_settings.get("enhance", {}),
-            reverse=reverse_flag   # 视频倒放
+            reverse=reverse_flag
         )
         cmd.extend(["-filter_complex", complex_filter])
         cmd.extend(["-map", final_v_label])
     
         # 视频编码（PIP强制不使用 copy）
         if vcodec == "copy":
-            self._append_info_ui("[封装] 画中画模式不支持 copy，自动改为 libx265")
+            self._append_info_ui("[封装-画] 画中画模式不支持 copy，自动改为 libx265")
             vcodec = "libx265"
             main_video.enc_settings["encoder"] = vcodec
         strategy = get_encoder_strategy(vcodec)
@@ -8705,7 +8718,7 @@ class FFmpegBatchGUI:
                 duration = max(0.1, duration)
                 filter_parts.append(f"anullsrc=r=44100:cl=stereo:duration={duration}[a{i}]")
             else:
-                self._append_info_ui(f"[串联] 音频源类型 '{audio_source}' 未知，降级使用视频自身音频")
+                self._append_info_ui(f"[串联-编] 音频源类型 '{audio_source}' 未知，降级使用视频自身音频")
                 filter_parts.append(f"[{i}:a]asetpts=PTS-STARTPTS[a{i}]")
     
         # ---- 视频 concat ----
@@ -10507,7 +10520,7 @@ class FFmpegBatchGUI:
         if not self.ffprobe_cmd: missing.append("ffprobe")
         if missing:
             missing_str = "、".join(missing)
-            self._append_info_ui("⚠️ 必要组件缺失: " + missing_str)
+            self._append_info_ui("必要组件缺失: " + missing_str)
             self._append_info_ui("请确保 FFmpeg 已正确安装。快捷方法：")
             self._append_info_ui("  ① 将 ffmpeg.exe、ffplay.exe、ffprobe.exe 放在本脚本同一目录下（推荐，绿色便携）")
             self._append_info_ui("  ② 或者将它们所在文件夹的路径添加到系统 Path 环境变量中")
