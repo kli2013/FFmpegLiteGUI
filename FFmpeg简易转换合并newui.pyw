@@ -298,9 +298,8 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
     include_format: 是否包含像素格式转换（format）滤镜
     enhance_settings:高级一点的滤镜
     顺序优化：
-    1. 精准截取		2. 裁剪		3. 缩放		4. IVTC（反胶卷过带）	5. 反交错
-    6. 去块滤波		7. 降噪		8. 锐化		9. 旋转/翻转		10. 色彩空间转换
-    11. 颜色校正+色相   12. 像素格式	13. 变速	        14. 倒放
+    精准截取 → 裁剪 → 旋转/翻转 → 缩放 → IVTC（反胶卷过带） → 反交错 → 
+    去块滤波 → 降噪 → 锐化 → 色彩空间转换 → 颜色校正+色相 → 像素格式 → 变速 → 倒放
     """
     filters = []
     
@@ -328,7 +327,20 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
         top = settings.get("crop_top", "0").strip()
         if w and h:
             filters.append(f"crop={w}:{h}:{left}:{top}")
-    
+
+    # ----- 旋转/翻转 -----
+    rot = settings.get("rotate", "none")
+    if rot == "90":
+        filters.append("transpose=1")
+    elif rot == "180":
+        filters.append("transpose=2,transpose=2")
+    elif rot == "270":
+        filters.append("transpose=2")
+    if settings.get("vflip", False):
+        filters.append("vflip")
+    if settings.get("hflip", False):
+        filters.append("hflip")
+
     # ----- 缩放 -----
     if settings.get("scale_enabled", False):
         method = settings.get("scale_method", "width")
@@ -370,18 +382,7 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
         # unsharp 参数：luma_msize_x:luma_msize_y:luma_amount:chroma_msize_x:chroma_msize_y:chroma_amount
         filters.append(f"unsharp=5:5:{strength:.2f}:5:5:{strength*0.5:.2f}")
     
-    # ----- 旋转/翻转 -----
-    rot = settings.get("rotate", "none")
-    if rot == "90":
-        filters.append("transpose=1")
-    elif rot == "180":
-        filters.append("transpose=2,transpose=2")
-    elif rot == "270":
-        filters.append("transpose=2")
-    if settings.get("vflip", False):
-        filters.append("vflip")
-    if settings.get("hflip", False):
-        filters.append("hflip")
+
     
     # ----- 色彩空间转换 -----
     if enhance_settings and enhance_settings.get("colorspace_enabled", False):
@@ -890,6 +891,25 @@ class OtherEncoderStrategy(EncoderStrategy):
         vcodec = settings["encoder"]
         bitrate = fix_bitrate_value(settings["bitrate_video"])
         cmd_list.extend(["-c:v", vcodec, "-b:v", bitrate or '1000k'])
+
+        # 预设参数（不同编码器不同）
+        preset = settings.get("preset", "").strip()
+        if preset:
+            # 根据编码器映射预设参数名
+            if vcodec in ("h264_amf", "hevc_amf", "av1_amf"):
+                cmd_list.extend(["-quality", preset])
+            elif vcodec in ("h264_vaapi", "hevc_vaapi"):
+                cmd_list.extend(["-compression_level", preset])
+            elif vcodec in ("h264_videotoolbox", "hevc_videotoolbox"):
+                cmd_list.extend(["-quality", preset])
+            elif vcodec in ("prores_ks", "prores_aw"):
+                # ProRes 预设实际上对应 profile，已在另一处处理，此处可忽略
+                pass
+            else:
+                # 默认使用 -preset（适用于大多数编码器）
+                cmd_list.extend(["-preset", preset])
+
+        # 可选：profile/level 等也可在此添加，但 SoftwareEncoderStrategy 已处理
         return cmd_list
 
 def get_encoder_strategy(encoder: str) -> EncoderStrategy:
@@ -977,8 +997,8 @@ class VideoEncoderFrame(ttk.LabelFrame):
         "av1_amf":    ["quality", "speed", "balanced"],
 
         # VAAPI (Linux)
-        "h264_vaapi": ["quality", "speed"],
-        "hevc_vaapi": ["quality", "speed"],
+        "h264_vaapi": ["7", "1"],
+        "hevc_vaapi": ["7", "1"],
 
         # VideoToolbox (macOS)
         "h264_videotoolbox": ["default", "quality", "speed"],
@@ -991,7 +1011,7 @@ class VideoEncoderFrame(ttk.LabelFrame):
         "ffv1":       ["medium"],
         "libopenjpeg":["medium"],
         "gif":        ["medium"],
-        "libwebp":    ["medium"],
+        "libwebp":    ["default", "photo", "picture", "drawing", "icon", "text"],
     }
     DEFAULT_PRESETS = ["medium"]   # 未知编码器 fallback
 
@@ -7450,6 +7470,7 @@ class FFmpegBatchGUI:
             enc_frame.cq_value.trace_add("write", update_preview)
             enc_frame.global_quality.trace_add("write", update_preview)
             enc_frame.bitrate_video.trace_add("write", update_preview)
+            enc_frame.preset.trace_add("write", lambda *a: update_preview())
             filt_frame.frame_rate_type.trace_add("write", update_preview)
             filt_frame.frame_rate_custom.trace_add("write", update_preview)
             filt_frame.scale_enabled.trace_add("write", update_preview)
@@ -10808,6 +10829,7 @@ class FFmpegBatchGUI:
         self.video_encoder.cq_value.trace_add("write", lambda *a: self.update_command_preview())
         self.video_encoder.global_quality.trace_add("write", lambda *a: self.update_command_preview())
         self.video_encoder.bitrate_video.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_encoder.preset.trace_add("write", lambda *a: self.update_command_preview())
         self.video_filter.frame_rate_type.trace_add("write", lambda *a: self.update_command_preview())
         self.video_filter.frame_rate_custom.trace_add("write", lambda *a: self.update_command_preview())
         self.video_filter.scale_enabled.trace_add("write", lambda *a: self.update_command_preview())
