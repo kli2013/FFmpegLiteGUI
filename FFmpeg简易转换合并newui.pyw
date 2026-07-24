@@ -4139,6 +4139,7 @@ class FFmpegBatchGUI:
         self._watermark_precise_hint_shown = False
         self._preview_after_id = None   # after 回调 ID
         self._preview_pending = False   # 是否有待处理的刷新
+        self._pip_reverse_audio_hint_shown = False
         
         self.cmd_output_path = tk.StringVar(value="")
 
@@ -7648,8 +7649,9 @@ class FFmpegBatchGUI:
                 "• 制作对比演示、分镜效果或画中画解说\n"
                 "• 图片作为背景或角标（动态图片支持循环）\n\n"
                 "启用后，所有视频流将强制重新编码（无法使用 copy），\n"
-                "   输出时长默认由主视频决定，您也可以开启「手动时长」精确控制。\n\n"
-                "提示：每个视频轨道都可独立设置位置、大小、透明度、绿幕抠像等。",
+                "    输出时长默认由主视频决定，您也可以开启「手动时长」精确控制。\n\n"
+                "提示：每个视频轨道都可独立设置位置、大小、透明度、绿幕抠像等。\n"
+                "    画中画模式每个音频的倒放是独立的。\n",
                 wraplength=700)
 
         self.concat_enabled = tk.BooleanVar(value=False)
@@ -7795,6 +7797,7 @@ class FFmpegBatchGUI:
         # 当画中画被禁用时（切回普通模式），重置水印提示
         if not self.pip_enabled.get():
             self._trim_precise_hint_shown = False
+            self._pip_reverse_audio_hint_shown = False
         self.merge_update_command_preview()
         self.merge_update_track_list()
 
@@ -7803,6 +7806,7 @@ class FFmpegBatchGUI:
             self.pip_enabled.set(False)
         if not self.concat_enabled.get():
             self._trim_precise_hint_shown = False
+            self._pip_reverse_audio_hint_shown = False
         self.merge_update_command_preview()
         self.merge_update_track_list()
 
@@ -8207,12 +8211,18 @@ class FFmpegBatchGUI:
             a_idx = file_index[audio.file_path]
             cmd.extend(["-map", f"{a_idx}:a:{audio._type_index}"])
             audio.enc_settings["_file_path"] = audio.file_path
+    
+            # 独立倒放优先，否则使用全局
+            track_reverse = audio.enc_settings.get("audio_reverse", None)
+            if track_reverse is None:
+                track_reverse = reverse_enabled
+    
             af_str = self._build_audio_filters(
                 audio.enc_settings,
                 include_trim=True,
-                include_volume=False,   # 画中画模式下暂不单独支持音量，可按需开启
+                include_volume=True,
                 include_speed=False,
-                include_reverse=reverse_enabled
+                include_reverse=track_reverse
             )
             enc = audio.enc_settings.get("encoder", "copy")
             if af_str:
@@ -8615,8 +8625,9 @@ class FFmpegBatchGUI:
         strategy = get_encoder_strategy(vcodec)
         cmd = strategy.build_params(cmd, main_video.enc_settings)
     
-        # 音频处理（传入修正后的 reverse_flag）
-        self._add_audio_tracks(cmd, enabled_tracks, file_index, reverse_enabled=reverse_flag)
+        # 音频处理（传入修正后的 reverse_flag）   
+        # 新改动 画中画音频独立控制 所以传入 False
+        self._add_audio_tracks(cmd, enabled_tracks, file_index, reverse_enabled=False)
     
         self._add_subtitles_and_chapters(cmd, enabled_tracks, file_index, input_files)
         self._add_pip_duration_control(cmd, main_video, enabled_tracks)
@@ -9524,6 +9535,19 @@ class FFmpegBatchGUI:
         old_encoder = track.enc_settings.get("encoder")
         new_encoder = new_settings.get("encoder")
         track.enc_settings = new_settings
+
+        # 画中画模式下，视频倒放时提示音频倒放为独立的
+        if self.pip_enabled.get() and new_settings.get("reverse_enabled", False) and not self._pip_reverse_audio_hint_shown:
+            self._pip_reverse_audio_hint_shown = True
+            messagebox.showinfo(
+                "音频倒放独立控制",
+                "您已为当前视频轨道启用倒放。\n\n"
+                "在画中画模式下，视频倒放与音频倒放是独立的。\n"
+                "若需要此视频的音频也倒放，请单独编辑对应的音频轨道，\n"
+                "在音频设置中勾选「音频倒放（独立于视频）」。"
+            )
+            self._append_info_ui("[提示] 画中画模式下音频倒放独立，请至音频轨道单独设置。")
+
         if "enhance" in new_settings:
             track.enc_settings["enhance"] = new_settings["enhance"]
         # 同步属性（兼容旧代码）
@@ -9556,32 +9580,71 @@ class FFmpegBatchGUI:
             main_frame = ttk.Frame(win, padding="10")
             main_frame.pack(fill=tk.BOTH, expand=True)
     
-            # ---- 编码设置 ----
+            # ---- 编码参数（水平布局） ----
             enc_frame = ttk.LabelFrame(main_frame, text="编码参数", padding="5")
             enc_frame.pack(fill=tk.X, pady=5)
     
-            ttk.Label(enc_frame, text="编码器:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+            row = ttk.Frame(enc_frame)
+            row.pack(fill=tk.X, pady=2)
+    
+            ttk.Label(row, text="编码器:").pack(side=tk.LEFT, padx=5)
             encoder_var = tk.StringVar(value=track.enc_settings.get("encoder", "copy"))
-            ttk.Combobox(enc_frame, textvariable=encoder_var, values=ALL_AUDIO_ENCODERS, state="readonly", width=15).grid(row=0, column=1, sticky="w", padx=5, pady=5)
+            encoder_combo = ttk.Combobox(row, textvariable=encoder_var, values=ALL_AUDIO_ENCODERS, state="readonly", width=12)
+            encoder_combo.pack(side=tk.LEFT, padx=5)
     
-            ttk.Label(enc_frame, text="比特率:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+            ttk.Label(row, text="比特率:").pack(side=tk.LEFT, padx=5)
             bitrate_var = tk.StringVar(value=track.enc_settings.get("bitrate", "128k"))
-            ttk.Entry(enc_frame, textvariable=bitrate_var, width=10).grid(row=1, column=1, sticky="w", padx=5, pady=5)
+            bitrate_entry = ttk.Entry(row, textvariable=bitrate_var, width=8)
+            bitrate_entry.pack(side=tk.LEFT, padx=5)
     
-            ttk.Label(enc_frame, text="采样率:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+            ttk.Label(row, text="采样率:").pack(side=tk.LEFT, padx=5)
             samplerate_var = tk.StringVar(value=track.enc_settings.get("samplerate", "44100"))
-            ttk.Entry(enc_frame, textvariable=samplerate_var, width=10).grid(row=2, column=1, sticky="w", padx=5, pady=5)
-    
-            # ========== 音频混合（仅普通封装模式可用） ==========
+            samplerate_entry = ttk.Entry(row, textvariable=samplerate_var, width=8)
+            samplerate_entry.pack(side=tk.LEFT, padx=5)
+
+            # 获取模式标志
             is_pip = self.pip_enabled.get()
             is_concat = self.concat_enabled.get()
+
+            # ---- 音量控制（仅普通和画中画模式） ----
+            if not is_concat:
+                volume_frame = ttk.LabelFrame(main_frame, text="音量调整", padding="5")
+                volume_frame.pack(fill=tk.X, pady=5)
+            
+                vol_enabled_var = tk.BooleanVar(value=track.enc_settings.get("volume_enabled", False))
+                vol_value_var = tk.DoubleVar(value=track.enc_settings.get("volume", 1.0))
+            
+                vol_check = ttk.Checkbutton(volume_frame, text="启用音量调整", variable=vol_enabled_var)
+                vol_check.pack(anchor=tk.W, pady=(0,5))
+            
+                vol_control_frame = ttk.Frame(volume_frame)
+                vol_control_frame.pack(fill=tk.X)
+            
+                ttk.Label(vol_control_frame, text="倍数:").pack(side=tk.LEFT)
+                vol_slider = ttk.Scale(vol_control_frame, from_=0.1, to=3.0, variable=vol_value_var,
+                                       orient=tk.HORIZONTAL, length=150, state=tk.DISABLED)
+                vol_slider.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+                vol_label = ttk.Label(vol_control_frame, text="1.0", width=5)
+                vol_label.pack(side=tk.LEFT)
+                vol_slider.configure(command=lambda v: vol_label.config(text=f"{float(v):.2f}"))
+            
+                def on_vol_enabled(*args):
+                    state = tk.NORMAL if vol_enabled_var.get() else tk.DISABLED
+                    vol_slider.config(state=state)
+                vol_enabled_var.trace_add("write", on_vol_enabled)
+                on_vol_enabled()
+            else:
+                # 串联模式：创建隐藏变量，保存时强制禁用
+                vol_enabled_var = tk.BooleanVar(value=False)
+                vol_value_var = tk.DoubleVar(value=1.0)
+    
+            # ---- 音频混合（仅普通封装模式可用） ----
             if not is_pip and not is_concat:
                 mix_frame = ttk.LabelFrame(main_frame, text="音频混合 (amix)", padding="5")
                 mix_frame.pack(fill=tk.X, pady=5)
-    
-                self.mix_enabled_var = tk.BooleanVar(value=track.enc_settings.get("mix_enabled", False))
+                mix_enabled_var = tk.BooleanVar(value=track.enc_settings.get("mix_enabled", False))
                 mix_cb = ttk.Checkbutton(mix_frame, text="参与混合 (启用后，该流将与其它勾选流合并为单音轨)",
-                                         variable=self.mix_enabled_var)
+                                         variable=mix_enabled_var)
                 mix_cb.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=2)
                 ToolTip(mix_cb,
                         "勾选后，该音频流将参与混合。\n"
@@ -9589,30 +9652,26 @@ class FFmpegBatchGUI:
                         "未勾选的流将被丢弃（不输出）。\n"
                         "若只有一个轨道勾选，则无需混合，直接输出该流。",
                         wraplength=400)
-    
-                # ---------- 音量调整（替代权重） ----------
-                vol_frame = ttk.Frame(mix_frame)
-                vol_frame.grid(row=1, column=0, columnspan=3, sticky="we", pady=5, padx=5)
-    
-                ttk.Label(vol_frame, text="音量倍数:").pack(side=tk.LEFT)
-                self.volume_var = tk.DoubleVar(value=track.enc_settings.get("volume", 1.0))
-                # 滑块
-                vol_slider = ttk.Scale(vol_frame, from_=0.1, to=3.0, variable=self.volume_var,
-                                       orient=tk.HORIZONTAL, length=150)
-                vol_slider.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-                # 数值显示
-                self.volume_label = ttk.Label(vol_frame, text="1.0", width=5)
-                self.volume_label.pack(side=tk.LEFT)
-                vol_slider.configure(command=lambda v: self.volume_label.config(text=f"{float(v):.2f}"))
-                # 输入框（可选）
-                vol_entry = ttk.Entry(vol_frame, textvariable=self.volume_var, width=6)
-                vol_entry.pack(side=tk.LEFT, padx=5)
-    
             else:
-                # 其他模式不显示混合控件，但保留变量，避免保存时报错
-                self.mix_enabled_var = tk.BooleanVar(value=track.enc_settings.get("mix_enabled", False))
-                self.volume_var = tk.DoubleVar(value=track.enc_settings.get("volume", 1.0))
+                mix_enabled_var = tk.BooleanVar(value=False)
     
+
+            # ---- 画中画模式：独立音频倒放 ----
+            if is_pip:
+                reverse_frame = ttk.Frame(main_frame)
+                reverse_frame.pack(fill=tk.X, pady=5)
+                audio_reverse_var = tk.BooleanVar(value=track.enc_settings.get("audio_reverse", False))
+                chk_reverse = ttk.Checkbutton(
+                    reverse_frame,
+                    text="音频倒放（独立于视频，仅当前轨道）",
+                    variable=audio_reverse_var
+                )
+                chk_reverse.pack(anchor=tk.W, padx=5)
+                ToolTip(chk_reverse, "勾选后，此音频流将单独倒放，不影响其他轨道。")
+            else:
+                audio_reverse_var = tk.BooleanVar(value=False)
+
+
             # ---- 截取设置 ----
             trim_frame = ttk.LabelFrame(main_frame, text="音频截取（精确到毫秒）", padding="5")
             trim_frame.pack(fill=tk.X, pady=5)
@@ -9637,20 +9696,21 @@ class FFmpegBatchGUI:
             ttk.Checkbutton(trim_frame, text="精准模式（精确到帧）", variable=precise_trim_var).grid(row=3, column=0, columnspan=3, sticky="w", padx=5, pady=5)
     
             ttk.Label(trim_frame, text="注意：启用截取后，编码器将自动改为非 copy 格式（如 aac）", foreground="gray").grid(row=4, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+ 
     
             # ---- 保存按钮 ----
             def save():
                 enc = encoder_var.get()
+                # 如果截取启用且编码器为 copy，强制改 aac
                 if trim_enabled_var.get() and enc == "copy":
                     enc = "aac"
                     self._append_info_ui("音频截取启用，编码器已从 copy 改为 aac")
-    
-                # 如果混合启用（仅普通模式），且编码器为 copy，强制改为 aac
-                if not is_pip and not is_concat and self.mix_enabled_var.get() and enc == "copy":
+                # 混合启用时同样强制改 aac（普通模式）
+                if not is_pip and not is_concat and mix_enabled_var.get() and enc == "copy":
                     enc = "aac"
                     self._append_info_ui("音频混合启用，编码器已从 copy 改为 aac")
     
-                track.enc_settings = {
+                track.enc_settings.update({
                     "encoder": enc,
                     "bitrate": bitrate_var.get(),
                     "samplerate": samplerate_var.get(),
@@ -9658,9 +9718,22 @@ class FFmpegBatchGUI:
                     "trim_start": trim_start_var.get().strip(),
                     "trim_end": trim_end_var.get().strip(),
                     "precise_trim": precise_trim_var.get(),
-                    "mix_enabled": self.mix_enabled_var.get(),
-                    "volume": self.volume_var.get(),
-                }
+                    "mix_enabled": mix_enabled_var.get(),
+                    "volume": vol_value_var.get(),
+                    "volume_enabled": vol_enabled_var.get(),
+                })
+                if is_pip:
+                    track.enc_settings["audio_reverse"] = audio_reverse_var.get()
+                else:
+                    track.enc_settings.pop("audio_reverse", None)  # 清除残留
+                if is_concat:
+                    # 串联模式强制禁用音量
+                    track.enc_settings["volume_enabled"] = False
+                    track.enc_settings["volume"] = 1.0
+                else:
+                    track.enc_settings["volume_enabled"] = vol_enabled_var.get()
+                    track.enc_settings["volume"] = vol_value_var.get()
+    
                 self.merge_update_track_list()
                 self.merge_update_command_preview()
                 win.destroy()
