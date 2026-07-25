@@ -3615,7 +3615,8 @@ class AdvancedFrame(ttk.LabelFrame):
                 "• 如果添加了 -vf / -filter_complex / -af / -map 等，会覆盖界面生成的对应设置（滤镜、音频滤镜、流映射）。\n"
                 "  如需保留界面生成的滤镜链，请在自定义参数中复制完整的 -vf 链（可从预览区复制）并扩展。\n\n"
                 "• 界面上已单独提供的参数（如 tune、profile、level、maxrate、bufsize）请勿重复添加，以免冲突。\n\n"
-                "• 追加自定义 -t 时间 可作为应急措施，强制限制输出时长，防止因滤镜循环或参数不当导致输出无限延长（主水印模式）。\n\n"
+                "• 追加自定义 -t 时间 可作为应急措施，强制限制输出时长，防止因滤镜循环或参数不当导致输出无限延长（主水印模式）。\n"
+                "   或者手动 -t 10 输出10秒片段查看结果，程序的预览命令功能不一定传递了所有滤镜，特别是水印只有占位框。\n\n"
                 "• 新手建议：仅添加界面未提供的高级选项（如 -x264-params、-bsf 等），避免覆盖关键设置。\n"
                 "• 参数 setsar=1 强制覆盖 SAR 比例1:1，配合正方形缩放：比如400x400 可以正确压缩 16:9 画面",
                 wraplength=800)
@@ -7695,6 +7696,7 @@ class FFmpegBatchGUI:
         ToolTip(chk_manual,
             "勾选后，将使用您输入的时长作为输出总时长（手动 -t）。\n\n"
             "主要用途：作为应急保险，防止因滤镜循环或参数不当导致输出无限延长（尤其是画中画模式）。\n\n"
+            "次要用途：可以手动设置 -t 10 转换个10秒片段查看结果，预览命令里水印只有占位框。\n\n"
             "「视频转码」页面可使用自定义参数 -t 实现同功能。",
             wraplength=600
         )
@@ -11077,11 +11079,22 @@ class SegmentEditor:
         cmd_frame = ttk.LabelFrame(right_frame, text="输入外部命令或时间 - 提示", padding="5")
         cmd_frame.pack(fill=tk.BOTH, expand=True)
 
-        ToolTip(cmd_frame, 
-                "在此粘贴 FFmpeg 截取命令（每行一条），程序会自动提取其中的 -ss 和 -t/-to 时间参数。\n"
-                "点击「解析并导入所有片段」即可将提取的时间段添加到左侧列表。\n"
-                "提示：此为高级功能，普通用户可直接在左侧手动添加片段。",
-                wraplength=400)
+        ToolTip(cmd_frame,
+                "在此粘贴 FFmpeg 截取命令（每行一条），程序自动提取 -ss 和 -t/-to 时间参数。\n\n"
+                "支持的格式：\n"
+                "• 单 -ss + -to/-t：\n"
+                "    -ss 10.5 -to 20.3\n"
+                "    -ss 00:01:30 -t 5\n"
+                "• 双 -ss（组合跳转）：提取最后一个 -ss 与 -to/-t 组合\n"
+                "    -ss 5 -i input.mp4 -ss 10 -to 15\n\n"
+                "时间格式：秒数（如 10.5）或 HH:MM:SS.ms\n\n"
+                "不支持解析：\n"
+                "• -vf 或 -filter_complex 中的 trim 滤镜参数\n"
+                "• -ss 出现在 -i 之后且不带 -to/-t（无法确定结束时间）\n\n"
+                "提示：此为高级功能，普通用户可直接在左侧手动添加片段。\n"
+                "每行以 # 开头的行将被忽略。",
+                wraplength=500
+        )
 
         self.cmd_input = scrolledtext.ScrolledText(cmd_frame, height=15, wrap=tk.NONE,
                                                    font=("Consolas", 9))
@@ -11095,8 +11108,38 @@ class SegmentEditor:
         # ---- 底部按钮 ----
         btn_frame = ttk.Frame(main)
         btn_frame.pack(fill=tk.X, pady=10)
-        ttk.Button(btn_frame, text="确定", command=self.on_ok).pack(side=tk.RIGHT, padx=5)
+        
+        label = tk.Label(btn_frame, text="分段切割:", fg="blue", font=("", 10, "bold"))
+        label.pack(side=tk.LEFT, padx=(0, 5))
+        ToolTip(label,
+                "额外功能：生成可执行的 FFmpeg 分段切割脚本，或直接发送到任务队列。\n"
+                "• 快速 (copy)：流复制截取，不重新编码，速度极快。\n"
+                "• 精确 (含滤镜)：应用主界面全部滤镜设置，需重新编码，帧级精准。\n"
+                "两种模式均可：\n"
+                "  - 导出脚本：保存为 .bat/.sh 文件，手动运行。\n"
+                "  - 发送到队列：自动添加到任务列表，一键执行。\n"
+                "发送到队列/导出脚本的精确模式会弹出选择框，让您决定使用 trim 滤镜还是双 -ss（组合跳转）加速。\n"
+                "双 -ss 适合长视频，能显著提升截取速度。\n"
+                "输出文件自动命名为：原文件名_seg序号.mp4。",
+                wraplength=800
+        )
+
+
+        ttk.Label(btn_frame, text="发送到队列").pack(side=tk.LEFT, padx=(10, 5))
+        ttk.Button(btn_frame, text="快速", command=self.send_quick_to_queue, width=6).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="精确", command=self.send_precise_to_queue, width=6).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(btn_frame, text=" 导出为脚本").pack(side=tk.LEFT, padx=(10, 5))
+        quick_btn = ttk.Button(btn_frame, text="快速", command=self.export_quick_script, width=6)
+        quick_btn.pack(side=tk.LEFT, padx=5)
+        precise_btn = ttk.Button(btn_frame, text="精确", command=self.export_precise_script, width=6)
+        precise_btn.pack(side=tk.LEFT, padx=5)
+
+
+
         ttk.Button(btn_frame, text="取消", command=self.on_cancel).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="确定", command=self.on_ok).pack(side=tk.RIGHT, padx=5)
+
 
         self.window.after(100, lambda: self._set_initial_pane_size(paned))
 
@@ -11107,6 +11150,232 @@ class SegmentEditor:
 
         # 绑定双击编辑
         self.tree.bind("<Double-1>", self.on_tree_double_click)
+
+
+    def send_quick_to_queue(self):
+        """发送分段切割任务到队列（流复制模式）"""
+        input_file = self.app.input_file.get().strip()
+        if not input_file or not os.path.exists(input_file):
+            messagebox.showerror("错误", "请先在主界面选择输入文件")
+            return
+        if not self.segments:
+            messagebox.showinfo("提示", "片段列表为空")
+            return
+    
+        output_dir = os.path.dirname(input_file)
+        basename = os.path.splitext(os.path.basename(input_file))[0]
+        container = "mp4"  # 可改为用户当前选择，但快速模式通常 mp4
+    
+        count = 0
+        for i, seg in enumerate(self.segments, start=1):
+            # 构建最小设置（仅截取 + copy）
+            settings = {
+                "encoder": "copy",
+                "trim_enabled": True,
+                "trim_start": seg["start"],
+                "trim_end": seg["end"],
+                "precise_trim": False,
+                "output_dir": output_dir,
+                "custom_output_name": f"{basename}_seg{i}.{container}",
+                "output_container": container,
+                "audio_enabled": True,
+                "audio_codec": "copy",
+                "only_audio": False,
+                # 其他必要默认值（避免报错）
+                "output_suffix": "",
+                "scale_enabled": False,
+                "crop_enabled": False,
+                "rotate": "none",
+                "vflip": False,
+                "hflip": False,
+                "speed_enabled": False,
+                "subtitle_enabled": False,
+                "pix_fmt_enabled": False,  # copy模式忽略
+                "watermark": {},  # 确保无水印
+            }
+            if self.app.add_task(input_file, settings):
+                count += 1
+    
+        self.app.update_task_list()
+        self.app._append_info_ui(f"已添加 {count} 个快速分段任务到队列")
+        messagebox.showinfo("成功", f"已添加 {count} 个快速分段任务到队列")
+    
+    def send_precise_to_queue(self):
+        """发送分段切割任务到队列（精确模式，应用主界面滤镜，可选择双 -ss 或 trim）"""
+        input_file = self.app.input_file.get().strip()
+        if not input_file or not os.path.exists(input_file):
+            messagebox.showerror("错误", "请先在主界面选择输入文件")
+            return
+        if not self.segments:
+            messagebox.showinfo("提示", "片段列表为空")
+            return
+    
+        # 弹出模式选择
+        use_combo = messagebox.askyesno(
+            "选择截取模式",
+            "精确模式支持两种截取方式：\n\n"
+            "• 是 (Yes)  → 双 -ss（组合跳转）\n"
+            "  先快速跳转到目标附近，再精确微调，适合长视频，解码速度快。\n\n"
+            "• 否 (No)  → trim 滤镜\n"
+            "  完全基于解码帧截取，精度更高，但解码较慢。\n\n"
+            "请选择是否使用双 -ss 加速？",
+            icon='question'
+        )
+    
+        base_settings = self.app.get_current_settings()
+        output_dir = os.path.dirname(input_file)
+        basename = os.path.splitext(os.path.basename(input_file))[0]
+        container = base_settings.get("output_container", "mp4")
+    
+        count = 0
+        for i, seg in enumerate(self.segments, start=1):
+            settings = base_settings.copy()
+            settings["trim_enabled"] = True
+            settings["trim_start"] = seg["start"]
+            settings["trim_end"] = seg["end"]
+            
+            if use_combo:
+                # 双 -ss 模式：启用 combo_seek，禁用 precise_trim
+                settings["combo_seek"] = True
+                settings["precise_trim"] = False
+                settings["combo_threshold"] = 30
+            else:
+                # trim 模式：禁用 combo_seek，启用 precise_trim
+                settings["combo_seek"] = False
+                settings["precise_trim"] = True
+    
+            settings["output_dir"] = output_dir
+            settings["custom_output_name"] = f"{basename}_seg{i}.{container}"
+            
+            # 添加调试日志
+            self.app._append_info_ui(f"[分段] 片段 {i} 模式: {'双-ss' if use_combo else 'trim'}, start={seg['start']}")
+            
+            if self.app.add_task(input_file, settings):
+                count += 1
+    
+        self.app.update_task_list()
+        mode_str = "双 -ss" if use_combo else "trim"
+        self.app._append_info_ui(f"已添加 {count} 个精确分段任务到队列（模式：{mode_str}）")
+        messagebox.showinfo("成功", f"已添加 {count} 个精确分段任务到队列（模式：{mode_str}）")
+
+
+    def export_quick_script(self):
+        input_file = self.app.input_file.get().strip()
+        if not input_file or not os.path.exists(input_file):
+            messagebox.showerror("错误", "请先在主界面选择输入文件")
+            return
+        if not self.segments:
+            messagebox.showinfo("提示", "片段列表为空")
+            return
+    
+        # 选择保存路径
+        save_path = filedialog.asksaveasfilename(
+            title="保存快速切割脚本",
+            defaultextension=".bat" if sys.platform == "win32" else ".sh",
+            filetypes=[("批处理文件", "*.bat"), ("Shell脚本", "*.sh")]
+        )
+        if not save_path:
+            return
+    
+        output_dir = os.path.dirname(input_file)
+        basename = os.path.splitext(os.path.basename(input_file))[0]
+        lines = []
+        # 添加文件头
+        if save_path.endswith(".sh"):
+            lines.append("#!/bin/bash")
+        else:
+            lines.append("@echo off")
+            lines.append("chcp 65001 >nul")
+        lines.append("")
+    
+        for i, seg in enumerate(self.segments, start=1):
+            start = seg["start"]
+            end = seg["end"]
+            out_name = f"{basename}_seg{i}.mp4"
+            out_path = os.path.join(output_dir, out_name)
+            # 转义路径中的空格和特殊字符（Windows用双引号，Unix用单引号或转义）
+            # 这里使用双引号简单处理
+            cmd = f'ffmpeg -ss {start} -i "{input_file}" -to {end} -c copy "{out_path}"'
+            lines.append(cmd)
+    
+        with open(save_path, 'w', encoding='utf-8') as f:
+            f.write("\n".join(lines))
+    
+        messagebox.showinfo("成功", f"脚本已保存到:\n{save_path}")
+    
+    
+    def export_precise_script(self):
+        """导出精确切割脚本（应用主界面滤镜），可选择 trim 或 双 -ss 模式"""
+        input_file = self.app.input_file.get().strip()
+        if not input_file or not os.path.exists(input_file):
+            messagebox.showerror("错误", "请先在主界面选择输入文件")
+            return
+        if not self.segments:
+            messagebox.showinfo("提示", "片段列表为空")
+            return
+    
+        # 弹出模式选择
+        choice = messagebox.askyesno(
+            "选择截取模式",
+            "导出精确脚本支持两种截取方式：\n\n"
+            "• 是 (Yes)  → 双 -ss（组合跳转）\n"
+            "  先快速跳转到目标附近，再精确微调，适合长视频，解码速度快。\n\n"
+            "• 否 (No)  → trim 滤镜\n"
+            "  完全基于解码帧截取，精度更高，但解码较慢。\n\n"
+            "请选择是否使用双 -ss 加速？",
+            icon='question'
+        )
+        # choice: True -> 双 -ss，False -> trim
+    
+        save_path = filedialog.asksaveasfilename(
+            title="保存精确切割脚本",
+            defaultextension=".bat" if sys.platform == "win32" else ".sh",
+            filetypes=[("批处理文件", "*.bat"), ("Shell脚本", "*.sh")]
+        )
+        if not save_path:
+            return
+    
+        base_settings = self.app.get_current_settings()
+        output_dir = os.path.dirname(input_file)
+        basename = os.path.splitext(os.path.basename(input_file))[0]
+        lines = []
+        if save_path.endswith(".sh"):
+            lines.append("#!/bin/bash")
+        else:
+            lines.append("@echo off")
+            lines.append("chcp 65001 >nul")
+        lines.append("")
+    
+        for i, seg in enumerate(self.segments, start=1):
+            settings = base_settings.copy()
+            settings["trim_enabled"] = True
+            settings["trim_start"] = seg["start"]
+            settings["trim_end"] = seg["end"]
+            if choice:
+                settings["combo_seek"] = True
+                settings["precise_trim"] = False
+                settings["combo_threshold"] = 30
+            else:
+                settings["combo_seek"] = False
+                settings["precise_trim"] = True
+    
+            out_name = f"{basename}_seg{i}.mp4"
+            out_path = os.path.join(output_dir, out_name)
+    
+            try:
+                cmd_list = self.app.generate_ffmpeg_command(input_file, out_path, settings)
+                cmd_str = format_cmd_for_display(cmd_list)
+            except Exception as e:
+                cmd_str = f"# 错误：{e}"
+            lines.append(cmd_str)
+    
+        with open(save_path, 'w', encoding='utf-8') as f:
+            f.write("\n".join(lines))
+    
+        mode_str = "双 -ss" if choice else "trim"
+        messagebox.showinfo("成功", f"精确切割脚本已保存到:\n{save_path}\n模式：{mode_str}")
+
+
     # ---------- 片段管理核心方法（已优化浮点误差） ----------
     def add_segment_with_time(self, start_sec, end_sec, flip="无"):
         """直接使用浮点数添加片段（用于外部命令导入）"""
