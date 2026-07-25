@@ -5142,67 +5142,88 @@ class FFmpegBatchGUI:
             "ffmpeg_dir_path": self.ffmpeg_dir_path.get()
         })
 
-    def preview_with_player(self, input_path, filters=None, audio_only=False, volume=10, extra_args=None):
-        """使用安全列表命令预览"""
+    def preview_with_player(self, input_path, filters=None, audio_only=False, volume=10,
+                            extra_args=None, start_time=None, duration=None):
+        """
+        启动播放器预览
+        :param start_time: 起始时间（秒或时间字符串），仅 ffplay 使用，mpv 通过 extra_args 传递 --start
+        :param duration: 播放时长（秒），仅 ffplay 使用
+        """
+        file_path = normalize_path(input_path)
+        extra_args = extra_args or []
+    
         if audio_only:
             if self.use_mpv.get():
                 player = self.mpv_path.get().strip() or "mpv"
-                cmd_list = [player, input_path, "--no-video", f"--volume={volume}", "--autoexit"]
-                cmd_str = f'"{player}" "{input_path}" --no-video --volume={volume} --autoexit'
+                cmd = [player, file_path]
+                if start_time is not None:
+                    cmd.append(f"--start={start_time}")
+                if duration is not None:
+                    cmd.append(f"--length={duration}")
             else:
                 if not self.ffplay_cmd:
                     self._append_info_ui("未找到 ffplay，无法预览。")
                     return
-                cmd_list = [self.ffplay_cmd, "-nodisp", "-autoexit", "-volume", str(volume), input_path]
-                cmd_str = " ".join(f'"{p}"' if os.path.sep in p else p for p in cmd_list)
+                cmd = [self.ffplay_cmd, "-nodisp", "-autoexit", "-volume", str(volume)]
+                if start_time is not None:
+                    cmd.extend(["-ss", str(start_time)])
+                if duration is not None:
+                    cmd.extend(["-t", str(duration)])
+                cmd.append(file_path)
         else:
             if self.use_mpv.get():
                 player = self.mpv_path.get().strip() or "mpv"
-                cmd_list = [player, input_path]
+                cmd = [player, file_path]
                 if filters:
-                    cmd_list.extend(["--vf", filters])
+                    cmd.append(f"--vf={filters}")
+                if start_time is not None:
+                    cmd.append(f"--start={start_time}")
+                if duration is not None:
+                    cmd.append(f"--length={duration}")
                 if extra_args:
-                    cmd_list.extend(extra_args)
-                cmd_parts = [f'"{player}"', f'"{input_path}"']
-                if filters:
-                    cmd_parts.append(f'--vf={filters}')
-                if extra_args:
-                    cmd_parts.extend(extra_args)
-                cmd_str = " ".join(cmd_parts)
+                    cmd.extend(extra_args)
             else:
                 if not self.ffplay_cmd:
                     self._append_info_ui("未找到 ffplay，无法预览。")
                     return
-                cmd_list = [self.ffplay_cmd, "-i", input_path]
+                cmd = [self.ffplay_cmd]
+                if start_time is not None:
+                    cmd.extend(["-ss", str(start_time)])
+                if duration is not None:
+                    cmd.extend(["-t", str(duration)])
+                cmd.extend(["-i", file_path])
                 if filters:
-                    cmd_list.extend(["-vf", filters])
-                cmd_list.extend(["-volume", str(volume)])
+                    cmd.extend(["-vf", filters])
+                cmd.extend(["-volume", str(volume)])
                 if extra_args:
-                    cmd_list.extend(extra_args)
-                if "-window_title" not in cmd_list:
-                    cmd_list.extend(["-window_title", f"预览: {os.path.basename(input_path)}"])
-                cmd_str = " ".join(f'"{p}"' if os.path.sep in p and p != "-vf" and not p.startswith('--') else p for p in cmd_list)
-
-        self._append_info_ui("执行命令: " + cmd_str)
-        launch_player(input_path, filters or "", audio_only, volume, extra_args,
-                      self.use_mpv.get(), self.mpv_path.get(), self.ffplay_cmd)
-        self._append_info_ui(f"正在预览: {os.path.basename(input_path)}")
-
+                    cmd.extend(extra_args)
+                if "-window_title" not in cmd:
+                    cmd.extend(["-window_title", f"预览: {os.path.basename(file_path)}"])
+    
+        self._append_info_ui("执行命令: " + format_cmd_for_display(cmd))
+        try:
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
+        except Exception as e:
+            self._append_info_ui(f"预览失败: {e}")
+    
     def _preview_with_settings(self, file_path: str, settings: dict):
         """
-        预览：禁用倒放，变速仅 ffplay 支持，视频自适应缩放（边距 自定义）。
+        预览：禁用倒放，变速仅 ffplay 支持，视频自适应缩放，
+        截取通过播放器原生跳转参数（-ss/--start）实现。
         """
         if not file_path or not os.path.exists(file_path):
             self._append_info_ui(f"文件不存在: {file_path}")
             return
     
+        # ---- 禁用倒放 ----
         reverse_enabled = settings.get('reverse_enabled', False)
         if reverse_enabled:
             self._append_info_ui("[预览] 预览不支持倒放，已忽略 reverse。")
             settings = settings.copy()
             settings['reverse_enabled'] = False
     
-        # ----- 1. 构建用户视频滤镜（不含自适应缩放） -----
+        # ----- 1. 构建基础视频滤镜（不含变速、倒放） -----
         enhance_settings = settings.get("enhance", {})
         base_vf = build_video_filter_chain(
             settings,
@@ -5229,11 +5250,9 @@ class FFmpegBatchGUI:
                     adapted_wm = wm_settings
                 orig_w, orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, wm_file, adapted_wm)
                 if orig_w is None or orig_h is None:
-                    self._append_info_ui("[预览] 无法获取水印文件尺寸，使用默认 320x240")
                     orig_w, orig_h = 320, 240
                 wm_w, wm_h = compute_rendered_size(orig_w, orig_h, adapted_wm)
                 if wm_w <= 0 or wm_h <= 0:
-                    self._append_info_ui("[预览] 水印渲染尺寸无效，使用原始尺寸")
                     wm_w, wm_h = orig_w, orig_h
                 ctx = {"W": main_w, "H": main_h, "w": wm_w, "h": wm_h}
                 x_expr = adapted_wm.get("overlay_x", "W-w-10")
@@ -5244,15 +5263,13 @@ class FFmpegBatchGUI:
                     x_val = main_w - wm_w - 10
                 if y_val is None:
                     y_val = main_h - wm_h - 10
-                # 限制范围
                 x_val = max(0, min(x_val, main_w - wm_w))
                 y_val = max(0, min(y_val, main_h - wm_h))
-                # 构建 drawbox 滤镜
                 drawbox = f"drawbox=x={x_val}:y={y_val}:w={wm_w}:h={wm_h}:color=red@0.3:t=3"
                 filter_parts.append(drawbox)
                 self._append_info_ui(f"[预览] 水印虚拟框: 位置({x_val}, {y_val}) 尺寸{wm_w}x{wm_h}")
     
-        # ----- 3. 自适应缩放（固定边距） -----
+        # ----- 3. 自适应缩放 -----
         orig_w, orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, file_path, settings)
         if orig_w is None or orig_h is None:
             orig_w, orig_h = self._get_video_dimensions_cached(file_path)
@@ -5263,7 +5280,7 @@ class FFmpegBatchGUI:
     
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
-        margin = 80  # 固定边距（像素）
+        margin = 80
         max_w = screen_w - margin
         max_h = screen_h - margin
     
@@ -5280,7 +5297,8 @@ class FFmpegBatchGUI:
         else:
             self._append_info_ui(f"[预览] 视频尺寸 {final_w}x{final_h} 适合屏幕，保持原始")
     
-        filter_chain = ",".join(filter_parts) if filter_parts else "null"
+        # ----- 构建最终滤镜链（空则留空，不用 "null"） -----
+        filter_chain = ",".join(filter_parts) if filter_parts else ""
     
         # ----- 4. 音频变速（仅 ffplay） -----
         extra_args = []
@@ -5301,8 +5319,27 @@ class FFmpegBatchGUI:
                 af_chain = ",".join(af_filters)
                 extra_args.extend(["-af", af_chain])
     
-        # ----- 5. 调用播放器预览 -----
-        self.preview_with_player(file_path, filter_chain, volume=10, extra_args=extra_args)
+        # ----- 5. 截取参数 -----
+        start_sec = None
+        duration = None
+        if settings.get("trim_enabled", False):
+            start_str = settings.get("trim_start", "").strip()
+            end_str = settings.get("trim_end", "").strip()
+            start_sec = time_to_seconds(start_str) if start_str else None
+            end_sec = time_to_seconds(end_str) if end_str else None
+            if start_sec is not None and end_sec is not None and end_sec > start_sec:
+                duration = end_sec - start_sec
+            # 只有开始时间，播放到末尾
+    
+        # ----- 6. 调用播放器 -----
+        self.preview_with_player(
+            file_path,
+            filter_chain,
+            volume=10,
+            extra_args=extra_args,
+            start_time=start_sec,
+            duration=duration
+        )
 
 
 
@@ -9185,7 +9222,20 @@ class FFmpegBatchGUI:
                     af_chain = ",".join(af_filters)
                     extra_args.extend(["-af", af_chain])
     
-            self.preview_with_player(track.file_path, filters or "null", volume=10, extra_args=extra_args)
+            # ---- 截取参数 ----
+            start_sec = None
+            duration = None
+            if track.enc_settings.get("trim_enabled", False):
+                start_str = track.enc_settings.get("trim_start", "").strip()
+                end_str = track.enc_settings.get("trim_end", "").strip()
+                start_sec = time_to_seconds(start_str) if start_str else None
+                end_sec = time_to_seconds(end_str) if end_str else None
+                if start_sec is not None and end_sec is not None and end_sec > start_sec:
+                    duration = end_sec - start_sec
+    
+            # ---- 调用播放器 ----
+            self.preview_with_player(track.file_path, filters or "", volume=10, extra_args=extra_args,
+                                     start_time=start_sec, duration=duration)
             if pip_enabled and is_main_video and sub_videos:
                 self._append_info_ui("[预览] 占位框尺寸为从视频实际渲染大小")
     
@@ -11114,6 +11164,7 @@ class SegmentEditor:
         ToolTip(label,
                 "额外功能：生成可执行的 FFmpeg 分段切割脚本，或直接发送到任务队列。\n"
                 "• 快速 (copy)：流复制截取，不重新编码，速度极快。\n"
+                "      流复制截取的片段不准确，适合作为预处理片段，或者无所谓精确的存档。\n"
                 "• 精确 (含滤镜)：应用主界面全部滤镜设置，需重新编码，帧级精准。\n"
                 "两种模式均可：\n"
                 "  - 导出脚本：保存为 .bat/.sh 文件，手动运行。\n"
@@ -11176,7 +11227,7 @@ class SegmentEditor:
                 "trim_end": seg["end"],
                 "precise_trim": False,
                 "output_dir": output_dir,
-                "custom_output_name": f"{basename}_seg{i}.{container}",
+                "custom_output_name": f"{basename}_seg{i:03d}.{container}",
                 "output_container": container,
                 "audio_enabled": True,
                 "audio_codec": "copy",
@@ -11245,7 +11296,7 @@ class SegmentEditor:
                 settings["precise_trim"] = True
     
             settings["output_dir"] = output_dir
-            settings["custom_output_name"] = f"{basename}_seg{i}.{container}"
+            settings["custom_output_name"] = f"{basename}_seg{i:03d}.{container}"
             
             # 添加调试日志
             self.app._append_info_ui(f"[分段] 片段 {i} 模式: {'双-ss' if use_combo else 'trim'}, start={seg['start']}")
@@ -11291,7 +11342,7 @@ class SegmentEditor:
         for i, seg in enumerate(self.segments, start=1):
             start = seg["start"]
             end = seg["end"]
-            out_name = f"{basename}_seg{i}.mp4"
+            out_name = f"{basename}_seg{i:03d}.mp4"
             out_path = os.path.join(output_dir, out_name)
             # 转义路径中的空格和特殊字符（Windows用双引号，Unix用单引号或转义）
             # 这里使用双引号简单处理
@@ -11359,7 +11410,7 @@ class SegmentEditor:
                 settings["combo_seek"] = False
                 settings["precise_trim"] = True
     
-            out_name = f"{basename}_seg{i}.mp4"
+            out_name = f"{basename}_seg{i:03d}.mp4"
             out_path = os.path.join(output_dir, out_name)
     
             try:
