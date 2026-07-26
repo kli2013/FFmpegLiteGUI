@@ -166,6 +166,8 @@ def seconds_to_time(sec):
 
 
 
+
+
 # ================== 预设管理 ==================
 class PresetManager:
     def __init__(self, preset_path: str, app_name: str = "FFLiteGUI"):
@@ -1937,7 +1939,7 @@ class VideoFilterFrame(ttk.LabelFrame):
         ttk.Label(row3, textvariable=self.sharpen_strength, width=4).pack(side=tk.LEFT)
     
         # ----- IVTC（反胶卷过带）-----
-        ivtc_frame = ttk.LabelFrame(main, text="反胶卷过带 (IVTC)", padding="5")
+        ivtc_frame = ttk.LabelFrame(main, text="反胶卷过带 (IVTC) - 预览失败时请关闭该滤镜", padding="5")
         ivtc_frame.pack(fill=tk.X, pady=5)
         self.ivtc_enabled = tk.BooleanVar(value=self.enhance_settings.get("ivtc_enabled", False))
         ttk.Checkbutton(ivtc_frame, text="启用 IVTC (适用于 60i -> 24p)", variable=self.ivtc_enabled).pack(anchor=tk.W)
@@ -4234,6 +4236,59 @@ class FFmpegBatchGUI:
             self.root.dnd_bind('<<Drop>>', self.on_files_dropped)
 
         self.show_quick_warning()
+
+    def update_progress(self, current=0, total=0):
+        """
+        更新转码进度
+        :param current: 当前已处理秒数
+        :param total:   视频总时长（秒），为 0 时视为重置
+        """
+        if total == 0:
+            # 重置进度（转码结束或失败）
+            self.reset_progress()
+            return
+    
+        if total > 0:
+            percent = int(100 * current / total)
+            # 仅当进度变化时更新，避免频繁刷新
+            if not hasattr(self, '_last_progress') or self._last_progress != percent:
+                self._last_progress = percent
+                # 更新进度条
+#                 if hasattr(self, 'progress_bar'):
+#                     self.progress_bar['value'] = percent
+#                     self.progress_label.config(text=f"{percent}%")
+#                     self.root.update_idletasks()
+                # 更新窗口标题（可选）
+#                self.root.title(f"FFmpeg 多功能工具 - 转码中 {percent}%")
+                # 日志记录（可选）
+                self._append_info_ui(f"[进度] {percent}% ({current}/{total} 秒)")
+    
+    def reset_progress(self):
+        """重置进度显示"""
+#         if hasattr(self, 'progress_bar'):
+#             self.progress_bar['value'] = 0
+#             self.progress_label.config(text="0%")
+#             self.root.update_idletasks()
+#        self.root.title("FFmpeg 多功能工具")  # 恢复窗口标题
+        self._last_progress = 0  # 重置进度缓存
+        self._append_info_ui("[进度] 转码结束")
+
+    # 过滤转换日志的无用信息
+    @staticmethod
+    def _is_ffmpeg_banner_line(line: str) -> bool:
+        """判断是否为 FFmpeg 启动时的编译信息行，应被忽略"""
+        line = line.strip()
+#         if line.startswith("ffmpeg version"):
+#             return True
+        if line.startswith("built with"):
+            return True
+        if line.startswith("configuration:"):
+            return True
+        if line.startswith(("libav", "libsw", "libpostproc")):
+            return True
+        if "Press [q] to stop" in line:
+            return True
+        return False
 
     def _update_ffmpeg_paths(self):
         """根据自定义目录设置更新 ffmpeg/ffprobe/ffplay 路径，并统一斜杠"""
@@ -7104,12 +7159,18 @@ class FFmpegBatchGUI:
         self.root.after(0, lambda: self.append_detail(text))
 
     def _process_single_task(self, task):
+        """处理单个任务（队列模式）"""
         task.status = "转码中"
         self._update_task_list_ui()
         self._append_info_ui(f"\n========== 开始转码: {os.path.basename(task.input)} ==========")
         cmd_str = format_cmd_for_display(task.cmd)
         self._append_info_ui(f">>> {cmd_str}")
         self.ensure_output_dir(task.output)
+    
+        # 获取视频总时长用于进度
+        total_duration = self._get_media_duration(task.input)
+        if total_duration is None:
+            total_duration = 0
     
         proc = None
         try:
@@ -7127,7 +7188,18 @@ class FFmpegBatchGUI:
                 self.running_procs.append(proc)
     
             for line in proc.stdout:
-                self.safe_append_detail(line)
+                # 过滤 FFmpeg 启动信息
+                if not self._is_ffmpeg_banner_line(line):
+                    self.safe_append_detail(line)
+    
+                    # 解析进度（time=）
+                    if total_duration > 0 and "time=" in line:
+                        match = re.search(r'time=(\d+):(\d+):(\d+\.?\d*)', line)
+                        if match:
+                            h, m, s = match.groups()
+                            current_sec = int(h) * 3600 + int(m) * 60 + float(s)
+                            # 更新进度（可自定义实现）
+                            self.update_progress(current=int(current_sec), total=int(total_duration))
     
             retcode = proc.wait()
             if retcode == 0:
@@ -7141,10 +7213,15 @@ class FFmpegBatchGUI:
             self._update_task_list_ui()
         except Exception as e:
             self._append_info_ui(f"任务异常: {e}")
+            task.status = "失败"
+            task.error_msg = str(e)
+            self._update_task_list_ui()
         finally:
             with self._proc_lock:
                 if proc in self.running_procs:
                     self.running_procs.remove(proc)
+            # 重置进度（转码结束）
+            self.update_progress(current=0, total=0)
         return task
 
     def _on_task_done(self, future):
@@ -7207,9 +7284,14 @@ class FFmpegBatchGUI:
         threading.Thread(target=self._run_single_transcode, args=(cmd_list, input_file), daemon=True).start()
 
     def _run_single_transcode(self, cmd_list, input_name):
+        """单文件转码（非队列）"""
         self._append_info_ui(f"\n========== 当前选择转码: {os.path.basename(input_name)} ==========")
         cmd_str = format_cmd_for_display(cmd_list)
         self._append_info_ui(f">>> {cmd_str}")
+    
+        total_duration = self._get_media_duration(input_name)
+        if total_duration is None:
+            total_duration = 0
     
         proc = None
         try:
@@ -7227,7 +7309,15 @@ class FFmpegBatchGUI:
                 self.running_procs.append(proc)
     
             for line in proc.stdout:
-                self.safe_append_detail(line)
+                if not self._is_ffmpeg_banner_line(line):
+                    self.safe_append_detail(line)
+    
+                    if total_duration > 0 and "time=" in line:
+                        match = re.search(r'time=(\d+):(\d+):(\d+\.?\d*)', line)
+                        if match:
+                            h, m, s = match.groups()
+                            current_sec = int(h) * 3600 + int(m) * 60 + float(s)
+                            self.update_progress(current=int(current_sec), total=int(total_duration))
     
             retcode = proc.wait()
             if retcode == 0:
@@ -7241,6 +7331,7 @@ class FFmpegBatchGUI:
             with self._proc_lock:
                 if proc in self.running_procs:
                     self.running_procs.remove(proc)
+            self.update_progress(current=0, total=0)
 
     def ensure_output_dir(self, output_path):
         dirname = os.path.dirname(output_path)
@@ -9937,6 +10028,9 @@ class FFmpegBatchGUI:
     
     
     def merge_do_merge(self, cmd_list, final_output):
+        """
+        执行合并/转码命令，并实时显示进度。
+        """
         if not cmd_list:
             self._append_info_ui("[封装] 命令列表为空，无法执行")
             self.root.after(0, lambda: self.merge_btn.config(state="normal"))
@@ -9949,6 +10043,12 @@ class FFmpegBatchGUI:
         for t in self.merge_tracks:
             if t.enabled and t.file_path not in source_files:
                 source_files.add(t.file_path)
+    
+        # 获取主视频总时长用于进度
+        main_video = self.merge_video.get().strip()
+        total_duration = self._get_media_duration(main_video) if main_video else 0
+        if total_duration is None:
+            total_duration = 0
     
         proc = None
         try:
@@ -9967,6 +10067,13 @@ class FFmpegBatchGUI:
     
             for line in proc.stdout:
                 self.safe_append_detail(line)
+                # 解析进度
+                if total_duration > 0 and "time=" in line:
+                    match = re.search(r'time=(\d+):(\d+):(\d+\.?\d*)', line)
+                    if match:
+                        h, m, s = match.groups()
+                        current_sec = int(h) * 3600 + int(m) * 60 + float(s)
+                        self.update_progress(current=int(current_sec), total=int(total_duration))
     
             ret = proc.wait()
             if ret == 0:
@@ -9988,6 +10095,8 @@ class FFmpegBatchGUI:
             with self._proc_lock:
                 if proc in self.running_procs:
                     self.running_procs.remove(proc)
+            # 重置进度（转码结束或失败）
+            self.update_progress(current=0, total=0)
             self.root.after(0, lambda: self.merge_btn.config(state="normal"))
 
     def _confirm_delete_sources(self, source_files, output_file):
@@ -10705,6 +10814,15 @@ class FFmpegBatchGUI:
         main_frame.columnconfigure(1, weight=0)
         main_frame.rowconfigure(0, weight=1)
 
+#         # 转换进度条
+#         progress_frame = ttk.Frame(right_panel)
+#         progress_frame.pack(fill=tk.X, pady=5)
+#         ttk.Label(progress_frame, text="进度:").pack(side=tk.LEFT)
+#         self.progress_bar = ttk.Progressbar(progress_frame, length=200, mode='determinate',)
+#         self.progress_bar.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+#         self.progress_label = ttk.Label(progress_frame, text="0%", width=5)
+#         self.progress_label.pack(side=tk.LEFT)
+
         info_frame = ttk.LabelFrame(right_panel, text="关键信息", padding="5")
         info_frame.pack(fill=tk.BOTH, expand=True, pady=(0,5))
         info_top = ttk.Frame(info_frame)
@@ -10715,6 +10833,8 @@ class FFmpegBatchGUI:
                                                    selectbackground='#CCF09C', selectforeground='black',
                                                    font=("Microsoft YaHei",9,"normal"), wrap=tk.WORD)
         self.info_text.pack(fill=tk.BOTH, expand=True)
+
+
 
         detail_frame = ttk.LabelFrame(right_panel, text="转换进程信息", padding="5")
         detail_frame.pack(fill=tk.BOTH, expand=True)
