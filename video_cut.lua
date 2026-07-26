@@ -65,7 +65,7 @@ local o = {
     keybind_n      = "n",         -- 标记/复制时间
     keybind_cut    = "c",         -- 常规切割（优先无损）
     keybind_transcode = "t",      -- 精确转码（直接编码）
-    keybind_export = "Ctrl+n",    -- 导出时间参数    供 FFmpegLiteGUI 的分段拼接导入用
+    keybind_export = "v",         -- 导出时间参数    供 FFmpegLiteGUI 的分段拼接导入用
     keybind_exit   = "Esc",       -- 退出标记模式
     -- OSD 设置
     osd_font_size = 40,
@@ -291,9 +291,9 @@ function external_copy_time()
         local seconds = pos % 60
         local time_str = string.format("%02d:%02d:%06.3f", hours, minutes, seconds)
         copy_to_clipboard(time_str)
-        show_temp_message("已复制时间: " .. time_str, 3)
+        mp.osd_message("已复制时间: " .. time_str, 2)
     else
-        show_temp_message("无法获取当前播放时间", 2)
+        mp.osd_message("无法获取当前播放时间", 2)
     end
 end
 
@@ -586,7 +586,7 @@ function run_cut_transcode()
         local res = utils.subprocess({ args = precise_args, cancellable = false, playback_only = false })
         if res.status == 0 then
             show_temp_message(string.format("片段 %d 精确转码完成", i), 2)
-            -- 已经通过 precise_args 记录了命令，无需重复写入
+            write_cut_log("[执行成功(精确转码)] " .. precise_cmd, log_file)
         else
             local err = res.stderr or "无错误输出"
             mp.msg.error("片段 %d 精确转码失败，stderr: %s", i, err:sub(1, 200))
