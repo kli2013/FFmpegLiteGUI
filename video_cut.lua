@@ -1,16 +1,16 @@
 -- ============================================================
 -- multi_cut.lua - 视频片段标记与切割工具（增强版）
 -- ============================================================
--- 配置方法（在 script-opts/multi_cut.conf 中）：
+-- 自定义配置方法（在 script-opts/multi_cut.conf 中）：
 --   ffmpeg_path=D:\ffmpeg\bin\ffmpeg.exe
 --   log_dir=D:\cut_logs
---   use_bom=yes
---   prefer_copy=yes
---   enable_external_copy=yes   （控制非标记模式下 n 键是否被脚本占用）
---   log_enabled=yes            （是否写入日志文件，默认 yes）
---   keybind_toggle=Ctrl+m      （切换标记模式，始终全局有效）
---   keybind_n=n                （标记/复制时间）
---   keybind_cut=c              （常规切割：优先无损复制，失败回退转码）
+--   use_bom=true
+--   prefer_copy=true
+--   enable_external_copy = true   （控制非标记模式下 n 键是否被脚本占用）
+--   log_enabled=true              （是否写入日志文件，默认 true）
+--   keybind_toggle=Ctrl+m         （切换标记模式，始终全局有效）
+--   keybind_mark=n                （标记/复制时间）
+--   keybind_cut=c                 （快速无损：优先无损复制，失败回退转码）
 --   keybind_transcode=t        （精确转码：直接使用 libx265 CRF 28 编码）
 --   keybind_export=Ctrl+n      （导出时间参数，仅标记模式内）
 --   keybind_exit=Esc           （退出标记模式，仅标记模式内）
@@ -62,8 +62,10 @@ local o = {
     log_enabled = true,           -- 日志开关
     -- ====== 快捷键集中配置 ======
     keybind_toggle = "Ctrl+m",    -- 切换标记模式（始终全局有效）
-    keybind_n      = "n",         -- 标记/复制时间
-    keybind_cut    = "c",         -- 常规切割（优先无损）
+    keybind_mark   = "n",         -- 本按键有2种功能 
+                                  -- 1. 进入标记模式后的标记功能
+                                  -- 2. 当enable_external_copy = true 时，标记模式外是复制当前时间到剪贴板
+    keybind_cut    = "c",         -- 快速无损（无损失败会换转码）
     keybind_transcode = "t",      -- 精确转码（直接编码）
     keybind_export = "v",         -- 导出时间参数    供 FFmpegLiteGUI 的分段拼接导入用
     keybind_exit   = "Esc",       -- 退出标记模式
@@ -99,7 +101,7 @@ local function update_osd()
 
     -- 第一行：快捷键提示
     local hint = string.format("标记模式  [%s:标记] [%s:快速无损] [%s:精确转码] [%s:导出时间] [%s:退出]",
-        o.keybind_n, o.keybind_cut, o.keybind_transcode, o.keybind_export, o.keybind_exit)
+        o.keybind_mark, o.keybind_cut, o.keybind_transcode, o.keybind_export, o.keybind_exit)
     ass:append(hint .. "\\N")
 
     -- 第二行：标记状态（动态）
@@ -192,7 +194,7 @@ end
 
 -- ====================== 内部快捷键绑定/解绑 ======================
 local function bind_internal_keys()
-    mp.add_forced_key_binding(o.keybind_n, INTERNAL_BIND_NAME, mark_current_time)
+    mp.add_forced_key_binding(o.keybind_mark, INTERNAL_BIND_NAME, mark_current_time)
     mp.add_forced_key_binding(o.keybind_cut, "cut_segments", run_cut)
     mp.add_forced_key_binding(o.keybind_transcode, "transcode_segments", run_cut_transcode)
     mp.add_forced_key_binding(o.keybind_export, "export_times", export_commands_only)
@@ -233,7 +235,7 @@ function toggle_marking_mode()
         update_chapter_marks()
         unbind_internal_keys()
         if o.enable_external_copy then
-            mp.add_key_binding(o.keybind_n, EXTERNAL_BIND_NAME, external_copy_time)
+            mp.add_key_binding(o.keybind_mark, EXTERNAL_BIND_NAME, external_copy_time)
         end
         update_osd()  -- 清空 OSD
         mp.osd_message("已退出标记模式", 2)
@@ -406,7 +408,7 @@ local function check_ffmpeg(ffmpeg)
     return test_res.status == 0
 end
 
--- ====================== 构建精确转码参数（用于日志记录） ======================
+-- ====================== 构建精确转码参数（用于日志记录和直接转码模式） ======================
 local function build_precise_args(ffmpeg, path, seg, out)
     local duration = seg.end_ - seg.start
     return {
@@ -654,7 +656,7 @@ mp.add_key_binding(o.keybind_toggle, "toggle_marking_mode", toggle_marking_mode)
 
 -- 2. 外部 n 键（仅当 enable_external_copy 为 true 时注册）
 if o.enable_external_copy then
-    mp.add_key_binding(o.keybind_n, EXTERNAL_BIND_NAME, external_copy_time)
+    mp.add_key_binding(o.keybind_mark, EXTERNAL_BIND_NAME, external_copy_time)
 end
 
 mp.msg.verbose("multi_cut 脚本已加载。按 " .. o.keybind_toggle .. " 切换标记模式。")
