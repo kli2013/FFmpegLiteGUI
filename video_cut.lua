@@ -1,4 +1,4 @@
-﻿-- ============================================================
+-- ============================================================
 -- multi_cut.lua - 视频片段标记与切割工具（增强版）
 -- ============================================================
 -- 配置方法（在 script-opts/multi_cut.conf 中）：
@@ -29,6 +29,7 @@
 --            [执行成功(转码)] <完整 ffmpeg 命令>
 --          转码失败 → 记录一条：
 --            [执行失败(转码)] stderr: <错误信息>
+--    - 无损模式的时间可能不准 基于关键帧前后浮动 ,但是很快
 --    - 无论成功失败会加一条精确转码模式的<完整 ffmpeg 参考命令> 方便后期手动精确转码
 -- 
 -- 2. 精确转码模式（对应 `keybind_transcode`，默认 `t`）
@@ -64,10 +65,10 @@ local o = {
     keybind_n      = "n",         -- 标记/复制时间
     keybind_cut    = "c",         -- 常规切割（优先无损）
     keybind_transcode = "t",      -- 精确转码（直接编码）
-    keybind_export = "Ctrl+n",    -- 导出时间参数     供 FFmpegLiteGUI 的分段拼接导入用
+    keybind_export = "Ctrl+n",    -- 导出时间参数    供 FFmpegLiteGUI 的分段拼接导入用
     keybind_exit   = "Esc",       -- 退出标记模式
     -- OSD 设置
-    osd_font_size = 24,
+    osd_font_size = 40,
 }
 options.read_options(o, 'multi_cut')
 
@@ -97,7 +98,7 @@ local function update_osd()
     ass:append("{\\fs" .. tostring(o.osd_font_size) .. "}")
 
     -- 第一行：快捷键提示
-    local hint = string.format("标记模式  [%s:标记] [%s:常规切割] [%s:精确转码] [%s:导出] [%s:退出]",
+    local hint = string.format("标记模式  [%s:标记] [%s:快速无损] [%s:精确转码] [%s:导出时间] [%s:退出]",
         o.keybind_n, o.keybind_cut, o.keybind_transcode, o.keybind_export, o.keybind_exit)
     ass:append(hint .. "\\N")
 
