@@ -1540,7 +1540,7 @@ class VideoFilterFrame(ttk.LabelFrame):
 
 
     def __init__(self, parent, app, preview_callback=None, **kwargs):
-        super().__init__(parent, text="视频滤镜 (裁剪/缩放/反交错/旋转/像素格式/变速/倒放)", padding="5", **kwargs)
+        super().__init__(parent, text="视频滤镜 (裁剪/旋转/缩放/反交错/像素格式/变速/倒放)", padding="5", **kwargs)
         self.app = app
         self.current_file = None
         self.current_track = None
@@ -10175,11 +10175,15 @@ class FFmpegBatchGUI:
 
     # -------------------- 拖放处理 --------------------
     def on_files_dropped(self, event):
+        """根窗口拖放：仅处理添加到队列（输入/输出框由独立回调处理）"""
+        # 注意：如果拖放目标不是输入/输出框，则触发此回调
+        # 但因为我们为子控件注册了回调并返回 "break"，根回调不会收到这些事件
         files = self.root.tk.splitlist(event.data)
         self._append_info_ui(f"拖拽了 {len(files)} 个文件")
         current_tab = self.notebook.index(self.notebook.select())
+    
         if current_tab == 0:
-            # 转码标签页
+            # 转码标签页：添加到任务队列
             for file in files:
                 if os.path.exists(file):
                     self.add_task(file)
@@ -10199,6 +10203,37 @@ class FFmpegBatchGUI:
                     for file in files:
                         if os.path.exists(file):
                             self.merge_handle_dropped_file(file)
+
+    def on_input_drop(self, event):
+        """拖放到输入文件框：设置输入文件，并自动设置输出目录"""
+        files = self.root.tk.splitlist(event.data)
+        if not files:
+            return
+        first_file = files[0]
+        if os.path.exists(first_file):
+            self.input_file.set(normalize_path(first_file))
+            if not self.output_dir.get():
+                self.output_dir.set(os.path.dirname(first_file))
+            self._append_info_ui(f"已设置输入文件: {os.path.basename(first_file)}")
+            self.update_command_preview()
+        else:
+            self._append_info_ui(f"文件不存在: {first_file}")
+        return "break"  # 阻止事件冒泡到根窗口
+    
+    def on_output_drop(self, event):
+        """拖放到输出目录框：设置输出目录（若为文件则取其目录）"""
+        files = self.root.tk.splitlist(event.data)
+        if not files:
+            return
+        path = files[0]
+        if os.path.isdir(path):
+            self.output_dir.set(normalize_path(path))
+            self._append_info_ui(f"已设置输出目录: {path}")
+        else:
+            self.output_dir.set(normalize_path(os.path.dirname(path)))
+            self._append_info_ui(f"已提取输出目录: {os.path.dirname(path)}")
+        self.update_command_preview()
+        return "break"
 
     def merge_handle_dropped_file(self, path):
         def process():
@@ -10299,6 +10334,15 @@ class FFmpegBatchGUI:
             tk.Button(dialog, text="取消", command=dialog.destroy).pack(pady=10)
             dialog.wait_window()
         threading.Thread(target=run_in_thread, daemon=True).start()
+
+    def clear_input_output(self):
+        """清空输入文件和输出目录（带确认）"""
+        if messagebox.askyesno("确认清空", "确定要清空输入文件和输出目录吗？"):
+            self.input_file.set("")
+            self.output_dir.set("")
+            self.update_command_preview()
+            self._append_info_ui("已清空输入文件和输出目录")
+
 
     # ---------- 播放器设置标签页 ----------
     def create_player_settings_tab(self, parent):
@@ -10887,14 +10931,29 @@ class FFmpegBatchGUI:
         io_frame = ttk.LabelFrame(settings_frame, text="输入 / 输出", padding="5")
         io_frame.pack(fill=tk.X, pady=5)
         ttk.Label(io_frame, text="输入文件:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(io_frame, textvariable=self.input_file, width=70).grid(row=0, column=1, padx=5)
+
+        self.input_entry = ttk.Entry(io_frame, textvariable=self.input_file, width=90)
+        self.input_entry.grid(row=0, column=1, padx=5)
+        if DND_AVAILABLE:
+            self.input_entry.drop_target_register(DND_FILES)
+            self.input_entry.dnd_bind('<<Drop>>', self.on_input_drop)
+
         ttk.Button(io_frame, text="浏览", command=self.select_input).grid(row=0, column=2)
         ttk.Button(io_frame, text="添加到任务列表", command=self.add_current_as_task).grid(row=0, column=3, padx=5)
+
         ttk.Label(io_frame, text="输出目录:").grid(row=1, column=0, sticky="w")
-        ttk.Entry(io_frame, textvariable=self.output_dir, width=70).grid(row=1, column=1, padx=5)
+
+        self.output_entry = ttk.Entry(io_frame, textvariable=self.output_dir, width=90)
+        self.output_entry.grid(row=1, column=1, padx=5)
+        if DND_AVAILABLE:
+            self.output_entry.drop_target_register(DND_FILES)
+            self.output_entry.dnd_bind('<<Drop>>', self.on_output_drop)
+
         ttk.Button(io_frame, text="浏览", command=self.select_output_dir).grid(row=1, column=2)
+        ttk.Button(io_frame, text="清空", command=self.clear_input_output, width=12).grid(row=1, column=3, padx=5)
         suffix_frame = ttk.Frame(io_frame)
         suffix_frame.grid(row=2, column=0, columnspan=4, sticky="w", pady=2)
+
         ttk.Label(suffix_frame, text="输出文件名后缀 (如 _new):").pack(side=tk.LEFT)
         ttk.Entry(suffix_frame, textvariable=self.output_suffix, width=15).pack(side=tk.LEFT, padx=5)
         ttk.Label(suffix_frame, text="完整自定义名称 (覆盖后缀):").pack(side=tk.LEFT, padx=(20,0))
