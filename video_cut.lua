@@ -236,7 +236,7 @@ function toggle_marking_mode()
             mp.add_key_binding(o.keybind_n, EXTERNAL_BIND_NAME, external_copy_time)
         end
         update_osd()  -- 清空 OSD
-        show_temp_message("已退出标记模式", 2)
+        mp.osd_message("已退出标记模式", 2)
     end
 end
 
