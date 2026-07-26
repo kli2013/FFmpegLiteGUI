@@ -4239,39 +4239,63 @@ class FFmpegBatchGUI:
 
     def update_progress(self, current=0, total=0):
         """
-        更新转码进度
+        更新转码进度，每5%输出一次，并在日志区域原地刷新（同一行替换）。
         :param current: 当前已处理秒数
         :param total:   视频总时长（秒），为 0 时视为重置
         """
         if total == 0:
-            # 重置进度（转码结束或失败）
             self.reset_progress()
             return
     
         if total > 0:
             percent = int(100 * current / total)
-            # 仅当进度变化时更新，避免频繁刷新
-            if not hasattr(self, '_last_progress') or self._last_progress != percent:
-                self._last_progress = percent
+            if not hasattr(self, '_last_logged_percent'):
+                self._last_logged_percent = -1
+    
+            # 输出条件：0% 或 100% 必须输出，或与上次输出相差 >=5%
+            if percent == 0 or percent == 100 or (percent - self._last_logged_percent >= 5):
+                self._last_logged_percent = percent
                 # 更新进度条
 #                 if hasattr(self, 'progress_bar'):
 #                     self.progress_bar['value'] = percent
 #                     self.progress_label.config(text=f"{percent}%")
 #                     self.root.update_idletasks()
-                # 更新窗口标题（可选）
+                # 更新窗口标题
 #                self.root.title(f"FFmpeg 多功能工具 - 转码中 {percent}%")
-                # 日志记录（可选）
-                self._append_info_ui(f"[进度] {percent}% ({current}/{total} 秒)")
+    
+                # 更新日志区域最后一行（原地替换）
+                info = self.info_text
+                # 获取最后一行起始位置
+                last_line_start = info.index("end-2l linestart")
+                last_line = info.get(last_line_start, "end-1c")
+                # 如果最后一行包含 "[进度]"，则删除它
+                if "[进度]" in last_line:
+                    info.delete(last_line_start, "end-1c")
+                # 插入新的进度行
+                info.insert(tk.END, f"[进度] {percent}% ({current}/{total} 秒)\n")
+                info.see(tk.END)
     
     def reset_progress(self):
-        """重置进度显示"""
+        """重置进度：恢复窗口标题，并删除日志中的进度行"""
 #         if hasattr(self, 'progress_bar'):
 #             self.progress_bar['value'] = 0
 #             self.progress_label.config(text="0%")
 #             self.root.update_idletasks()
 #        self.root.title("FFmpeg 多功能工具")  # 恢复窗口标题
-        self._last_progress = 0  # 重置进度缓存
-        self._append_info_ui("[进度] 转码结束")
+        self._last_logged_percent = -1
+    
+        # 删除日志中最后一行（如果它是进度行）
+        info = self.info_text
+        last_line_start = info.index("end-2l linestart")
+        last_line = info.get(last_line_start, "end-1c")
+        if "[进度]" in last_line:
+            info.delete(last_line_start, "end-1c")
+            # 删除后可能产生空行，可再删一次空行（可选）
+            info.insert(tk.END, "[进度] 转码结束\n")
+        else:
+            # 如果没有进度行，直接追加结束信息
+            info.insert(tk.END, "[进度] 转码结束\n")
+        info.see(tk.END)
 
     # 过滤转换日志的无用信息
     @staticmethod
