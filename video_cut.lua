@@ -2,8 +2,8 @@
 -- multi_cut.lua - 视频片段标记与切割工具（增强版）
 -- ============================================================
 -- 自定义配置方法（在 script-opts/multi_cut.conf 中）：
---   ffmpeg_path=D:\ffmpeg\bin\ffmpeg.exe
---   log_dir=D:\cut_logs
+--   ffmpeg_path=D:/ffmpeg/bin/ffmpeg.exe   
+--   log_dir=D:/cut_logs           （斜杠必须用/ 或者转义的\\）
 --   use_bom=true
 --   prefer_copy=true
 --   enable_external_copy = true   （控制非标记模式下 n 键是否被脚本占用）
