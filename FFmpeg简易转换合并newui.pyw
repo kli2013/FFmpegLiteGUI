@@ -7023,11 +7023,17 @@ class FFmpegBatchGUI:
     def add_task(self, input_path, settings=None):
         if settings is None:
             settings = self.get_current_settings()
+    
         # 如果水印未启用（路径为空），则移除 watermark 键，避免残留参数污染任务
         if not settings.get("watermark", {}).get("enabled", False) or not settings.get("watermark", {}).get("file_path", "").strip():
             settings.pop("watermark", None)
-        settings["segment_enabled"] = self.segment_enabled.get()
-        settings["segments"] = copy.deepcopy(self.segments)
+    
+        # 分段拼接设置：尊重调用方传入的值，否则使用界面当前值
+        if "segment_enabled" not in settings:
+            settings["segment_enabled"] = self.segment_enabled.get()
+        if "segments" not in settings:
+            settings["segments"] = copy.deepcopy(self.segments)
+    
         try:
             output_path = self.generate_output_path(input_path, settings)
             self._append_info_ui(f"生成输出路径: {output_path}")
@@ -7039,9 +7045,8 @@ class FFmpegBatchGUI:
             messagebox.showerror("错误", err_msg)
             return False
     
-        # ---- 统一处理所有冲突（文件系统 + 任务列表） ----
         output_path = self._resolve_path_conflict(output_path)
-        if output_path is None:   # 实际上不会返回 None，但保留防御
+        if output_path is None:
             self._append_info_ui("添加任务已取消")
             return False
     
@@ -7437,6 +7442,7 @@ class FFmpegBatchGUI:
             container_var = tk.StringVar(value=task.settings.get("output_container", "mp4"))
             ttk.Label(page_io, text="输出目录:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
             ttk.Entry(page_io, textvariable=out_dir_var, width=60).grid(row=0, column=1, padx=5, pady=5)
+            
             ttk.Button(page_io, text="浏览", command=lambda: out_dir_var.set(normalize_path(filedialog.askdirectory() or out_dir_var.get()))).grid(row=0, column=2, padx=5)
             ttk.Label(page_io, text="文件名后缀:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
             ttk.Entry(page_io, textvariable=suffix_var, width=30).grid(row=1, column=1, sticky="w", padx=5)
@@ -10482,7 +10488,8 @@ class FFmpegBatchGUI:
                 "• {output_dir} → 右边「输出目录」的路径\n\n"
                 "示例：\n"
                 'ffmpeg -i "{input}" -c copy "{output_dir}output.mp4"\n\n'
-                "编辑后点击右侧的「重载」按钮重新加载。",
+                "编辑后点击右侧的「重载」按钮重新加载。\n"
+                "如果编辑错误导致读取异常，可以删除该json文件后重启程序。",
                 wraplength=500)
 
         self.cmd_preset_var = tk.StringVar()
@@ -11418,7 +11425,6 @@ class SegmentEditor:
 
 
     def send_quick_to_queue(self):
-        """发送分段切割任务到队列（流复制模式）"""
         input_file = self.app.input_file.get().strip()
         if not input_file or not os.path.exists(input_file):
             messagebox.showerror("错误", "请先在主界面选择输入文件")
@@ -11427,37 +11433,42 @@ class SegmentEditor:
             messagebox.showinfo("提示", "片段列表为空")
             return
     
-        output_dir = os.path.dirname(input_file)
-        basename = os.path.splitext(os.path.basename(input_file))[0]
-        container = "mp4"  # 可改为用户当前选择，但快速模式通常 mp4
+        # 获取完整设置，并强制为 copy 模式
+        base_settings = self.app.get_current_settings()
+        base_settings.pop("watermark", None)          # 移除水印
+        base_settings["encoder"] = "copy"             # 强制流复制
+        # 禁用所有可能影响 copy 的滤镜
+        base_settings["scale_enabled"] = False
+        base_settings["crop_enabled"] = False
+        base_settings["rotate"] = "none"
+        base_settings["vflip"] = False
+        base_settings["hflip"] = False
+        base_settings["subtitle_enabled"] = False
+        base_settings["pix_fmt_enabled"] = False
+        base_settings["speed_enabled"] = False
+        base_settings["reverse_enabled"] = False
+        base_settings["audio_codec"] = "copy"         # 音频也复制
+        base_settings["audio_enabled"] = True
     
+        output_dir = self.app.output_dir.get().strip()
+        if not output_dir or not os.path.exists(output_dir):
+            output_dir = os.path.dirname(input_file)
+        basename = os.path.splitext(os.path.basename(input_file))[0]
+        container = base_settings.get("output_container", "mp4")
         count = 0
+    
         for i, seg in enumerate(self.segments, start=1):
-            # 构建最小设置（仅截取 + copy）
-            settings = {
-                "encoder": "copy",
-                "trim_enabled": True,
-                "trim_start": seg["start"],
-                "trim_end": seg["end"],
-                "precise_trim": False,
-                "output_dir": output_dir,
-                "custom_output_name": f"{basename}_seg{i:03d}.{container}",
-                "output_container": container,
-                "audio_enabled": True,
-                "audio_codec": "copy",
-                "only_audio": False,
-                # 其他必要默认值（避免报错）
-                "output_suffix": "",
-                "scale_enabled": False,
-                "crop_enabled": False,
-                "rotate": "none",
-                "vflip": False,
-                "hflip": False,
-                "speed_enabled": False,
-                "subtitle_enabled": False,
-                "pix_fmt_enabled": False,  # copy模式忽略
-                "watermark": {},  # 确保无水印
-            }
+            settings = base_settings.copy()
+            settings["trim_enabled"] = True
+            settings["trim_start"] = seg["start"]
+            settings["trim_end"] = seg["end"]
+            settings["precise_trim"] = False
+            settings["output_dir"] = output_dir
+            settings["custom_output_name"] = f"{basename}_seg{i:03d}.{container}"
+            # 关键：禁用分段拼接模式
+            settings["segment_enabled"] = False
+            settings.pop("segments", None)
+    
             if self.app.add_task(input_file, settings):
                 count += 1
     
@@ -11466,7 +11477,6 @@ class SegmentEditor:
         messagebox.showinfo("成功", f"已添加 {count} 个快速分段任务到队列")
     
     def send_precise_to_queue(self):
-        """发送分段切割任务到队列（精确模式，应用主界面滤镜，可选择双 -ss 或 trim）"""
         input_file = self.app.input_file.get().strip()
         if not input_file or not os.path.exists(input_file):
             messagebox.showerror("错误", "请先在主界面选择输入文件")
@@ -11475,7 +11485,6 @@ class SegmentEditor:
             messagebox.showinfo("提示", "片段列表为空")
             return
     
-        # 弹出模式选择
         use_combo = messagebox.askyesno(
             "选择截取模式",
             "精确模式支持两种截取方式：\n\n"
@@ -11488,33 +11497,35 @@ class SegmentEditor:
         )
     
         base_settings = self.app.get_current_settings()
-        output_dir = os.path.dirname(input_file)
+        base_settings.pop("watermark", None)   # 移除水印（保留其他滤镜）
+    
+        output_dir = self.app.output_dir.get().strip()
+        if not output_dir or not os.path.exists(output_dir):
+            output_dir = os.path.dirname(input_file)
         basename = os.path.splitext(os.path.basename(input_file))[0]
         container = base_settings.get("output_container", "mp4")
-    
         count = 0
+    
         for i, seg in enumerate(self.segments, start=1):
             settings = base_settings.copy()
             settings["trim_enabled"] = True
             settings["trim_start"] = seg["start"]
             settings["trim_end"] = seg["end"]
-            
             if use_combo:
-                # 双 -ss 模式：启用 combo_seek，禁用 precise_trim
                 settings["combo_seek"] = True
                 settings["precise_trim"] = False
                 settings["combo_threshold"] = 30
             else:
-                # trim 模式：禁用 combo_seek，启用 precise_trim
                 settings["combo_seek"] = False
                 settings["precise_trim"] = True
-    
             settings["output_dir"] = output_dir
             settings["custom_output_name"] = f"{basename}_seg{i:03d}.{container}"
-            
-            # 添加调试日志
+            # 禁用拼接模式
+            settings["segment_enabled"] = False
+            settings.pop("segments", None)
+    
             self.app._append_info_ui(f"[分段] 片段 {i} 模式: {'双-ss' if use_combo else 'trim'}, start={seg['start']}")
-            
+    
             if self.app.add_task(input_file, settings):
                 count += 1
     
@@ -11522,7 +11533,6 @@ class SegmentEditor:
         mode_str = "双 -ss" if use_combo else "trim"
         self.app._append_info_ui(f"已添加 {count} 个精确分段任务到队列（模式：{mode_str}）")
         messagebox.showinfo("成功", f"已添加 {count} 个精确分段任务到队列（模式：{mode_str}）")
-
 
     def export_quick_script(self):
         input_file = self.app.input_file.get().strip()
@@ -11542,7 +11552,9 @@ class SegmentEditor:
         if not save_path:
             return
     
-        output_dir = os.path.dirname(input_file)
+        output_dir = self.app.output_dir.get().strip()
+        if not output_dir or not os.path.exists(output_dir):
+            output_dir = os.path.dirname(input_file)
         basename = os.path.splitext(os.path.basename(input_file))[0]
         lines = []
         # 添加文件头
@@ -11560,7 +11572,7 @@ class SegmentEditor:
             out_path = os.path.join(output_dir, out_name)
             # 转义路径中的空格和特殊字符（Windows用双引号，Unix用单引号或转义）
             # 这里使用双引号简单处理
-            cmd = f'ffmpeg -ss {start} -i "{input_file}" -to {end} -c copy "{out_path}"'
+            cmd = f'ffmpeg -ss {start} -to {end} -i "{input_file}" -c copy "{out_path}"'
             lines.append(cmd)
     
         with open(save_path, 'w', encoding='utf-8') as f:
@@ -11570,7 +11582,6 @@ class SegmentEditor:
     
     
     def export_precise_script(self):
-        """导出精确切割脚本（应用主界面滤镜），可选择 trim 或 双 -ss 模式"""
         input_file = self.app.input_file.get().strip()
         if not input_file or not os.path.exists(input_file):
             messagebox.showerror("错误", "请先在主界面选择输入文件")
@@ -11579,7 +11590,6 @@ class SegmentEditor:
             messagebox.showinfo("提示", "片段列表为空")
             return
     
-        # 弹出模式选择
         choice = messagebox.askyesno(
             "选择截取模式",
             "导出精确脚本支持两种截取方式：\n\n"
@@ -11590,7 +11600,6 @@ class SegmentEditor:
             "请选择是否使用双 -ss 加速？",
             icon='question'
         )
-        # choice: True -> 双 -ss，False -> trim
     
         save_path = filedialog.asksaveasfilename(
             title="保存精确切割脚本",
@@ -11601,7 +11610,10 @@ class SegmentEditor:
             return
     
         base_settings = self.app.get_current_settings()
-        output_dir = os.path.dirname(input_file)
+        base_settings.pop("watermark", None)   # 移除水印
+        output_dir = self.app.output_dir.get().strip()
+        if not output_dir or not os.path.exists(output_dir):
+            output_dir = os.path.dirname(input_file)
         basename = os.path.splitext(os.path.basename(input_file))[0]
         lines = []
         if save_path.endswith(".sh"):
@@ -11623,6 +11635,9 @@ class SegmentEditor:
             else:
                 settings["combo_seek"] = False
                 settings["precise_trim"] = True
+            # 禁用拼接
+            settings["segment_enabled"] = False
+            settings.pop("segments", None)
     
             out_name = f"{basename}_seg{i:03d}.mp4"
             out_path = os.path.join(output_dir, out_name)
