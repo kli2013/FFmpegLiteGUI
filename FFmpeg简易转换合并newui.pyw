@@ -3927,6 +3927,8 @@ class Task:
         self.status = "等待"
         self.error_msg = ""
         self.progress = 0
+        self._task_list_update_after = None   # 任务列表刷新去抖 ID
+        self.stopped_by_user = False
 
     def get_short_cmd(self):
         """生成简短显示命令（隐藏路径细节）"""
@@ -4145,6 +4147,8 @@ class FFmpegBatchGUI:
         self._preview_pending = False   # 是否有待处理的刷新
         self._pip_reverse_audio_hint_shown = False
         
+        self._running_tasks = []  # 存储 (proc, task)
+        
         self.cmd_output_path = tk.StringVar(value="")
 
         self._duration_cache = {}
@@ -4241,61 +4245,61 @@ class FFmpegBatchGUI:
     def update_progress(self, current=0, total=0, task=None, log_progress=True):
         """
         更新转码进度。
-        - task: 如果提供，则更新任务列表中的进度（队列任务使用）。
-        - log_progress: 是否在日志中输出进度行（单文件/合并使用）。
+        - task: 队列任务对象（用于更新任务列表）
+        - log_progress: 是否在日志中输出进度（单文件/合并使用）
         """
-        # 处理重置：total == 0 表示结束
+        # 重置
         if total == 0:
             if task is not None:
                 task.progress = 0
-                self.root.after(0, self.update_task_list)
-            # 如果日志进度已启用，则删除进度行并插入结束信息
+                self._schedule_task_list_update()
             if log_progress:
-                info = self.info_text
-                try:
-                    last_line_start = info.index("end-2l linestart")
-                    last_line = info.get(last_line_start, "end-1c")
-                    if "[进度]" in last_line:
-                        info.delete(last_line_start, "end-1c")
-                        info.insert(tk.END, "[进度] 转码结束\n")
-                    else:
-                        info.insert(tk.END, "[进度] 转码结束\n")
-                    info.see(tk.END)
-                except:
-                    pass
-            # 重置窗口标题
+                self._update_log_progress("转码结束")
 #            self.root.title("FFmpeg 多功能工具")
             self._last_logged_percent = -1
             return
     
-        # 计算百分比
         percent = int(100 * current / total)
     
-        # 更新任务列表进度（如果提供了 task）
+        # 更新任务列表（队列任务）
         if task is not None:
             task.progress = percent
-            self.root.after(0, self.update_task_list)
+            self._schedule_task_list_update()
     
-        # 日志进度（仅当 log_progress=True 时）
+        # 更新日志和标题（单文件/合并）
         if log_progress:
-            # 控制输出频率：每5%输出一次
+            # 每5%更新一次（0%, 5%, 10%, ... 100%）
             if not hasattr(self, '_last_logged_percent'):
                 self._last_logged_percent = -1
             if percent == 0 or percent == 100 or (percent - self._last_logged_percent >= 5):
                 self._last_logged_percent = percent
-                # 更新窗口标题（如果只有单任务，可显示进度）
 #                self.root.title(f"FFmpeg 多功能工具 - 转码中 {percent}%")
-                # 替换日志最后一行（如果是进度行）
-                info = self.info_text
-                try:
-                    last_line_start = info.index("end-2l linestart")
-                    last_line = info.get(last_line_start, "end-1c")
-                    if "[进度]" in last_line:
-                        info.delete(last_line_start, "end-1c")
-                except:
-                    pass
-                info.insert(tk.END, f"[进度] {percent}% ({current}/{total} 秒)\n")
-                info.see(tk.END)
+                self._update_log_progress(f"{percent}% ({current}/{total} 秒)")
+    
+    def _schedule_task_list_update(self):
+        """去抖刷新任务列表"""
+        if hasattr(self, '_task_list_update_after') and self._task_list_update_after is not None:
+            self.root.after_cancel(self._task_list_update_after)
+        self._task_list_update_after = self.root.after(100, self._update_task_list_ui_safe)
+    
+    def _update_task_list_ui_safe(self):
+        """安全刷新任务列表"""
+        self._task_list_update_after = None
+        self.update_task_list()
+    
+    def _update_log_progress(self, text):
+        """更新日志进度行（替换最后一行）"""
+        info = self.info_text
+        try:
+            last_line_start = info.index("end-2l linestart")
+            last_line = info.get(last_line_start, "end-1c")
+            if "[进度]" in last_line:
+                info.delete(last_line_start, "end-1c")
+        except:
+            pass
+        info.insert(tk.END, f"[进度] {text}\n")
+        info.see(tk.END)
+
     
 
 
@@ -4344,23 +4348,26 @@ class FFmpegBatchGUI:
         self.ffplay_cmd = normalize_path(ffplay) if ffplay else None
 
     def stop_all_transcodes(self):
-        """停止所有转码进程"""
+        """停止所有转码进程（发送 q 信号，并标记任务为已停止）"""
+        self.stop_flag = True  # 标记全局停止，阻止新任务启动
         with self._proc_lock:
-            # 清理已结束的
+            # 清理已结束的进程和任务映射
             self.running_procs = [p for p in self.running_procs if p.poll() is None]
-            
+            self._running_tasks = [(p, t) for (p, t) in self._running_tasks if p.poll() is None]
             if not self.running_procs:
                 self.root.after(0, lambda: messagebox.showinfo("提示", "当前没有正在运行的转码进程"))
                 return
     
-        if not messagebox.askyesno("确认停止", 
-                                   f"将停止 {len(self.running_procs)} 个正在运行的转码进程，确定吗？"):
+        # 确认是否继续
+        if not messagebox.askyesno("确认停止", f"将停止 {len(self.running_procs)} 个正在运行的转码进程，确定吗？"):
             return
     
-        with self._proc_lock:
-            procs = list(self.running_procs)   # 安全拷贝
+        # 标记任务为已停止
+        for _, task in self._running_tasks:
+            task.stopped_by_user = True
     
-        # 发送 q
+        # 发送 'q' 给每个进程
+        procs = list(self.running_procs)  # 快照
         for proc in procs:
             if proc.poll() is None and proc.stdin:
                 try:
@@ -4370,7 +4377,7 @@ class FFmpegBatchGUI:
                 except Exception as e:
                     self._append_info_ui(f"[停止] 发送 q 到进程 {proc.pid} 失败: {e}")
     
-        # 3秒后检查并 terminate
+        # 3 秒后检查并强制终止
         self.root.after(3000, lambda: self._check_and_terminate(procs))
     
     def _check_and_terminate(self, procs):
@@ -7221,23 +7228,24 @@ class FFmpegBatchGUI:
             )
             with self._proc_lock:
                 self.running_procs.append(proc)
+                self._running_tasks.append((proc, task))
     
             for line in proc.stdout:
-                # 过滤 FFmpeg 启动信息
                 if not self._is_ffmpeg_banner_line(line):
                     self.safe_append_detail(line)
-    
-                    # 解析进度（time=）
                     if total_duration > 0 and "time=" in line:
                         match = re.search(r'time=(\d+):(\d+):(\d+\.?\d*)', line)
                         if match:
                             h, m, s = match.groups()
                             current_sec = int(h) * 3600 + int(m) * 60 + float(s)
-                            # 更新进度（可自定义实现）
                             self.update_progress(current=int(current_sec), total=int(total_duration), task=task, log_progress=False)
     
             retcode = proc.wait()
-            if retcode == 0:
+            # 优先判断用户停止
+            if task.stopped_by_user:
+                task.status = "已停止"
+                self._append_info_ui(f"⏹️ 任务已停止: {os.path.basename(task.input)}")
+            elif retcode == 0:
                 task.status = "完成"
                 self._append_info_ui(f"✅ 任务完成: {os.path.basename(task.input)}")
                 self._log_command_to_file(cmd_str)
@@ -7255,7 +7263,7 @@ class FFmpegBatchGUI:
             with self._proc_lock:
                 if proc in self.running_procs:
                     self.running_procs.remove(proc)
-            # 重置进度（转码结束）
+                self._running_tasks = [(p, t) for (p, t) in self._running_tasks if p != proc]
             self.update_progress(current=0, total=0, task=task, log_progress=False)
         return task
 
@@ -7275,6 +7283,7 @@ class FFmpegBatchGUI:
             self.executor.shutdown(wait=False)
             self.executor = None
         self.current_hw_encoding_count = 0
+        self.stop_flag = False
         if self.stop_flag:
             self._append_info_ui("\n队列已停止")
         else:
@@ -10892,15 +10901,6 @@ class FFmpegBatchGUI:
         main_frame.columnconfigure(0, weight=1)
         main_frame.columnconfigure(1, weight=0)
         main_frame.rowconfigure(0, weight=1)
-
-#         # 转换进度条
-#         progress_frame = ttk.Frame(right_panel)
-#         progress_frame.pack(fill=tk.X, pady=5)
-#         ttk.Label(progress_frame, text="进度:").pack(side=tk.LEFT)
-#         self.progress_bar = ttk.Progressbar(progress_frame, length=200, mode='determinate',)
-#         self.progress_bar.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-#         self.progress_label = ttk.Label(progress_frame, text="0%", width=5)
-#         self.progress_label.pack(side=tk.LEFT)
 
         info_frame = ttk.LabelFrame(right_panel, text="关键信息", padding="5")
         info_frame.pack(fill=tk.BOTH, expand=True, pady=(0,5))
