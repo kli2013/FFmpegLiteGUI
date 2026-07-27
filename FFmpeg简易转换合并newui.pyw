@@ -3926,6 +3926,7 @@ class Task:
         self.cmd = cmd_list
         self.status = "等待"
         self.error_msg = ""
+        self.progress = 0
 
     def get_short_cmd(self):
         """生成简短显示命令（隐藏路径细节）"""
@@ -4237,65 +4238,66 @@ class FFmpegBatchGUI:
 
         self.show_quick_warning()
 
-    def update_progress(self, current=0, total=0):
+    def update_progress(self, current=0, total=0, task=None, log_progress=True):
         """
-        更新转码进度，每5%输出一次，并在日志区域原地刷新（同一行替换）。
-        :param current: 当前已处理秒数
-        :param total:   视频总时长（秒），为 0 时视为重置
+        更新转码进度。
+        - task: 如果提供，则更新任务列表中的进度（队列任务使用）。
+        - log_progress: 是否在日志中输出进度行（单文件/合并使用）。
         """
+        # 处理重置：total == 0 表示结束
         if total == 0:
-            self.reset_progress()
+            if task is not None:
+                task.progress = 0
+                self.root.after(0, self.update_task_list)
+            # 如果日志进度已启用，则删除进度行并插入结束信息
+            if log_progress:
+                info = self.info_text
+                try:
+                    last_line_start = info.index("end-2l linestart")
+                    last_line = info.get(last_line_start, "end-1c")
+                    if "[进度]" in last_line:
+                        info.delete(last_line_start, "end-1c")
+                        info.insert(tk.END, "[进度] 转码结束\n")
+                    else:
+                        info.insert(tk.END, "[进度] 转码结束\n")
+                    info.see(tk.END)
+                except:
+                    pass
+            # 重置窗口标题
+#            self.root.title("FFmpeg 多功能工具")
+            self._last_logged_percent = -1
             return
     
-        if total > 0:
-            percent = int(100 * current / total)
+        # 计算百分比
+        percent = int(100 * current / total)
+    
+        # 更新任务列表进度（如果提供了 task）
+        if task is not None:
+            task.progress = percent
+            self.root.after(0, self.update_task_list)
+    
+        # 日志进度（仅当 log_progress=True 时）
+        if log_progress:
+            # 控制输出频率：每5%输出一次
             if not hasattr(self, '_last_logged_percent'):
                 self._last_logged_percent = -1
-    
-            # 输出条件：0% 或 100% 必须输出，或与上次输出相差 >=5%
             if percent == 0 or percent == 100 or (percent - self._last_logged_percent >= 5):
                 self._last_logged_percent = percent
-                # 更新进度条
-#                 if hasattr(self, 'progress_bar'):
-#                     self.progress_bar['value'] = percent
-#                     self.progress_label.config(text=f"{percent}%")
-#                     self.root.update_idletasks()
-                # 更新窗口标题
+                # 更新窗口标题（如果只有单任务，可显示进度）
 #                self.root.title(f"FFmpeg 多功能工具 - 转码中 {percent}%")
-    
-                # 更新日志区域最后一行（原地替换）
+                # 替换日志最后一行（如果是进度行）
                 info = self.info_text
-                # 获取最后一行起始位置
-                last_line_start = info.index("end-2l linestart")
-                last_line = info.get(last_line_start, "end-1c")
-                # 如果最后一行包含 "[进度]"，则删除它
-                if "[进度]" in last_line:
-                    info.delete(last_line_start, "end-1c")
-                # 插入新的进度行
+                try:
+                    last_line_start = info.index("end-2l linestart")
+                    last_line = info.get(last_line_start, "end-1c")
+                    if "[进度]" in last_line:
+                        info.delete(last_line_start, "end-1c")
+                except:
+                    pass
                 info.insert(tk.END, f"[进度] {percent}% ({current}/{total} 秒)\n")
                 info.see(tk.END)
     
-    def reset_progress(self):
-        """重置进度：恢复窗口标题，并删除日志中的进度行"""
-#         if hasattr(self, 'progress_bar'):
-#             self.progress_bar['value'] = 0
-#             self.progress_label.config(text="0%")
-#             self.root.update_idletasks()
-#        self.root.title("FFmpeg 多功能工具")  # 恢复窗口标题
-        self._last_logged_percent = -1
-    
-        # 删除日志中最后一行（如果它是进度行）
-        info = self.info_text
-        last_line_start = info.index("end-2l linestart")
-        last_line = info.get(last_line_start, "end-1c")
-        if "[进度]" in last_line:
-            info.delete(last_line_start, "end-1c")
-            # 删除后可能产生空行，可再删一次空行（可选）
-            info.insert(tk.END, "[进度] 转码结束\n")
-        else:
-            # 如果没有进度行，直接追加结束信息
-            info.insert(tk.END, "[进度] 转码结束\n")
-        info.see(tk.END)
+
 
     # 过滤转换日志的无用信息
     @staticmethod
@@ -7061,17 +7063,26 @@ class FFmpegBatchGUI:
         self.add_task(input_path)
 
     def update_task_list(self):
+        """刷新任务列表，状态列显示进度（转码中时）"""
+        # 清空现有列表
         for item in self.task_tree.get_children():
             self.task_tree.delete(item)
+    
         for i, task in enumerate(self.tasks):
             seq = i + 1
             tag = 'odd' if i % 2 == 0 else 'even'
+            # 状态显示：转码中显示进度百分比
+            if task.status == "转码中":
+                status_display = f"转码中 {task.progress}%"
+            else:
+                status_display = task.status
+    
             self.task_tree.insert("", tk.END, iid=str(i), values=(
                 seq,
                 os.path.basename(task.input),
                 task.output,
                 task.get_short_cmd(),
-                task.status,
+                status_display,
                 task.error_msg[:100] if task.error_msg else ""
             ), tags=(tag,))
 
@@ -7223,7 +7234,7 @@ class FFmpegBatchGUI:
                             h, m, s = match.groups()
                             current_sec = int(h) * 3600 + int(m) * 60 + float(s)
                             # 更新进度（可自定义实现）
-                            self.update_progress(current=int(current_sec), total=int(total_duration))
+                            self.update_progress(current=int(current_sec), total=int(total_duration), task=task, log_progress=False)
     
             retcode = proc.wait()
             if retcode == 0:
@@ -7245,7 +7256,7 @@ class FFmpegBatchGUI:
                 if proc in self.running_procs:
                     self.running_procs.remove(proc)
             # 重置进度（转码结束）
-            self.update_progress(current=0, total=0)
+            self.update_progress(current=0, total=0, task=task, log_progress=False)
         return task
 
     def _on_task_done(self, future):
@@ -7341,7 +7352,7 @@ class FFmpegBatchGUI:
                         if match:
                             h, m, s = match.groups()
                             current_sec = int(h) * 3600 + int(m) * 60 + float(s)
-                            self.update_progress(current=int(current_sec), total=int(total_duration))
+                            self.update_progress(current=int(current_sec), total=int(total_duration), task=None, log_progress=True)
     
             retcode = proc.wait()
             if retcode == 0:
@@ -7355,7 +7366,7 @@ class FFmpegBatchGUI:
             with self._proc_lock:
                 if proc in self.running_procs:
                     self.running_procs.remove(proc)
-            self.update_progress(current=0, total=0)
+            self.update_progress(current=0, total=0, task=None, log_progress=True)
 
     def ensure_output_dir(self, output_path):
         dirname = os.path.dirname(output_path)
@@ -10097,7 +10108,7 @@ class FFmpegBatchGUI:
                     if match:
                         h, m, s = match.groups()
                         current_sec = int(h) * 3600 + int(m) * 60 + float(s)
-                        self.update_progress(current=int(current_sec), total=int(total_duration))
+                        self.update_progress(current=int(current_sec), total=int(total_duration), task=None, log_progress=True)
     
             ret = proc.wait()
             if ret == 0:
@@ -10120,7 +10131,7 @@ class FFmpegBatchGUI:
                 if proc in self.running_procs:
                     self.running_procs.remove(proc)
             # 重置进度（转码结束或失败）
-            self.update_progress(current=0, total=0)
+            self.update_progress(current=0, total=0, task=None, log_progress=True)
             self.root.after(0, lambda: self.merge_btn.config(state="normal"))
 
     def _confirm_delete_sources(self, source_files, output_file):
