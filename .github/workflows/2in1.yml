@@ -15,12 +15,10 @@ jobs:
   build-and-release:
     runs-on: windows-latest
     steps:
-      # 1. 升级 checkout 到 v6 以支持 Node 24
+      # 1. 拉取代码
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0  # 必须拉取所有历史，确保 git describe 能拿到正确的 Tag
 
-      # 2. setup-python 保持 v5
+      # 2. 设置 Python 环境
       - name: 设置 Python
         uses: actions/setup-python@v5
         with:
@@ -34,21 +32,24 @@ jobs:
           pip install pyinstaller
           pip install tkinterdnd2
 
-      # 4. 获取版本号
+      # 4. 获取版本号（优化：无Tag时使用干净的短 Hash）
       - name: 获取版本号
         id: version
         shell: pwsh
         run: |
           if ("${{ github.event.inputs.version }}" -ne "") {
+            # 优先使用手动填写的版本号
             $VER = "${{ github.event.inputs.version }}"
           } else {
-            $VER = git describe --tags --always --dirty 2>$null
-            if (-not $VER) { $VER = "continuous-${{ github.run_number }}" }
+            # 核心优化：只取当前最新的短 Hash (如 87e32d9)，避免难看的 git describe 格式
+            $SHORT_HASH = git rev-parse --short HEAD
+            $VER = "continuous-$SHORT_HASH"
+            Write-Host "⚠️ 未检测到手动版本号，使用自动生成的版本号: $VER"
           }
           echo "VERSION=$VER" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           echo "版本号: $VER"
 
-      # ========== 【核心修复版】动态更新 version.txt 中的版本号 ==========
+      # 5. 动态更新 version.txt 中的版本号（带安全校验，防止打包报错）
       - name: 动态更新版本信息文件
         shell: pwsh
         run: |
@@ -63,10 +64,10 @@ jobs:
               $verTuple += ",0"
               Write-Host "✅ 检测到标准版本号: $cleanVer"
             } else {
-              # 如果包含字母（如 continuous-123 或 git hash），强制回退为 1.0.0
+              # 如果包含字母（如 continuous-87e32d9），强制回退为 1.0.0，防止 PyInstaller 报错
               $verTuple = "1,0,0,0"
               $cleanVer = "1.0.0"
-              Write-Host "⚠️ 检测到非标准版本号 (${{ env.VERSION }})，自动回退为 1.0.0 以防止打包报错"
+              Write-Host "⚠️ 检测到非标准版本号 (${{ env.VERSION }})，exe属性版本自动回退为 1.0.0"
             }
             
             # 替换 version.txt 中的内容
@@ -78,7 +79,7 @@ jobs:
             Write-Warning "⚠️ 未找到 version.txt，跳过版本信息更新。"
           }
 
-      # ========== 5. 编译主程序 (FFmpeg简易转换合并newui) ==========
+      # 6. 编译主程序 (FFmpeg简易转换合并newui)
       - name: 构建主程序 (文件夹版)
         shell: pwsh
         run: |
@@ -86,7 +87,7 @@ jobs:
           pyinstaller -D -w --name $mainName --icon 35.ico --add-data "ffmpeg_presets.json;." --version-file version.txt "FFmpeg简易转换合并newui.pyw"
           echo "MAIN_EXE_DIR=dist\$mainName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      # ========== 6. 编译附属程序 (水印轨迹编排器 多轨道) ==========
+      # 7. 编译附属程序 (水印轨迹编排器 多轨道)
       - name: 构建附属程序 (文件夹版)
         shell: pwsh
         run: |
@@ -94,7 +95,7 @@ jobs:
           pyinstaller -D -w --name $subName --icon 35.ico --version-file version.txt "水印轨迹编排器 多轨道.pyw"
           echo "SUB_EXE_DIR=dist\$subName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      # ========== 7. 复制附属程序到主程序目录 ==========
+      # 8. 复制附属程序到主程序目录
       - name: 合并产物
         shell: pwsh
         run: |
@@ -107,7 +108,7 @@ jobs:
           Copy-Item -Path $subExe.FullName -Destination $env:MAIN_EXE_DIR -Force
           Write-Host "复制完成: $($subExe.Name) -> $env:MAIN_EXE_DIR"
 
-      # ========== 8. 打包并上传到 Release ==========
+      # 9. 打包最终产物
       - name: 打包最终产物
         shell: pwsh
         run: |
@@ -116,13 +117,16 @@ jobs:
           Compress-Archive -Path "$env:MAIN_EXE_DIR\*" -DestinationPath "upload_files\$mainDirName.zip" -Force
           Write-Host "打包完成: upload_files\$mainDirName.zip"
 
+      # 10. 创建 Release 并上传附件（优化：自动附加 Commit 描述）
       - name: 创建 Release 并上传附件
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.VERSION }}
           name: "Release ${{ env.VERSION }}"
+          # 核心优化：开启 generate_release_notes，GitHub 会自动提取并附带本次更新的 Commit 描述
+          generate_release_notes: true
           body: |
-            自动构建版本 ${{ env.VERSION }}
+            🚀 自动构建版本 ${{ env.VERSION }}
             
             - 包含 **FFmpeg简易转换合并newui** (文件夹便携版)
             - 内置 **水印轨迹编排器 多轨道** 可执行文件
