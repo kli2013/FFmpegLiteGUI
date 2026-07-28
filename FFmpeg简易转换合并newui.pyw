@@ -873,6 +873,14 @@ class NVENCEncoderStrategy(EncoderStrategy):
         elif rc == "bitrate":
             bitrate = fix_bitrate_value(settings["bitrate_video"])
             cmd_list.extend(["-b:v", bitrate or '1000k'])
+        
+
+        maxrate = settings.get("maxrate", "").strip()
+        if maxrate:
+            cmd_list.extend(["-maxrate", maxrate + "k"])
+        bufsize = settings.get("bufsize", "").strip()
+        if bufsize:
+            cmd_list.extend(["-bufsize", bufsize + "k"])
         return cmd_list
 
 class QSVEncoderStrategy(EncoderStrategy):
@@ -886,6 +894,13 @@ class QSVEncoderStrategy(EncoderStrategy):
         elif rc == "bitrate":
             bitrate = fix_bitrate_value(settings["bitrate_video"])
             cmd_list.extend(["-b:v", bitrate or '1000k'])
+        
+        maxrate = settings.get("maxrate", "").strip()
+        if maxrate:
+            cmd_list.extend(["-maxrate", maxrate + "k"])
+        bufsize = settings.get("bufsize", "").strip()
+        if bufsize:
+            cmd_list.extend(["-bufsize", bufsize + "k"])
         return cmd_list
 
 class OtherEncoderStrategy(EncoderStrategy):
@@ -893,11 +908,10 @@ class OtherEncoderStrategy(EncoderStrategy):
         vcodec = settings["encoder"]
         bitrate = fix_bitrate_value(settings["bitrate_video"])
         cmd_list.extend(["-c:v", vcodec, "-b:v", bitrate or '1000k'])
-
+        
         # 预设参数（不同编码器不同）
         preset = settings.get("preset", "").strip()
         if preset:
-            # 根据编码器映射预设参数名
             if vcodec in ("h264_amf", "hevc_amf", "av1_amf"):
                 cmd_list.extend(["-quality", preset])
             elif vcodec in ("h264_vaapi", "hevc_vaapi"):
@@ -905,13 +919,17 @@ class OtherEncoderStrategy(EncoderStrategy):
             elif vcodec in ("h264_videotoolbox", "hevc_videotoolbox"):
                 cmd_list.extend(["-quality", preset])
             elif vcodec in ("prores_ks", "prores_aw"):
-                # ProRes 预设实际上对应 profile，已在另一处处理，此处可忽略
                 pass
             else:
-                # 默认使用 -preset（适用于大多数编码器）
                 cmd_list.extend(["-preset", preset])
+        
 
-        # 可选：profile/level 等也可在此添加，但 SoftwareEncoderStrategy 已处理
+        maxrate = settings.get("maxrate", "").strip()
+        if maxrate:
+            cmd_list.extend(["-maxrate", maxrate + "k"])
+        bufsize = settings.get("bufsize", "").strip()
+        if bufsize:
+            cmd_list.extend(["-bufsize", bufsize + "k"])
         return cmd_list
 
 def get_encoder_strategy(encoder: str) -> EncoderStrategy:
@@ -1128,7 +1146,7 @@ class VideoEncoderFrame(ttk.LabelFrame):
                 "• vmaf: 优化 VMAF 分数 (H.264)\n"
                 "• screen: 屏幕内容/录屏优化 (H.264)\n"
                 "提示：硬件编码器及 AV1 通常不支持 tune，请保持默认。",
-                wraplength=400)
+                wraplength=500)
         self.tune_var = tk.StringVar(value="无")
         tune_combo = ttk.Combobox(row1, textvariable=self.tune_var,
                                   values=["无", "film","animation","grain","stillimage","psnr","ssim","fastdecode","zerolatency","vmaf", "screen"],
@@ -1156,7 +1174,7 @@ class VideoEncoderFrame(ttk.LabelFrame):
                 "• high: 支持更高色深和色度采样\n"
                 "• professional: 支持最高质量（10-bit/4:4:4）\n\n"
                 "提示：请根据所选编码器选择对应的 Profile，否则可能报错。",
-                wraplength=400)
+                wraplength=500)
         self.profile_var = tk.StringVar(value="无")
         self.profile_combo = ttk.Combobox(
             row1,
@@ -1180,7 +1198,7 @@ class VideoEncoderFrame(ttk.LabelFrame):
                 "选择过高可能导致设备不兼容，\n"
                 "选择过低可能无法播放高分辨率视频。\n\n"
                 "不同编码格式（H.265/AV1 等）级别规则有所差异，请参考 FFmpeg 文档",
-                wraplength=400)
+                wraplength=500)
         self.level_var = tk.StringVar(value="无")
         level_combo = ttk.Combobox(row1, textvariable=self.level_var,
                                    values=["无", "1.0","1b","1.1","1.2","1.3","2.0","2.1","2.2",
@@ -1597,8 +1615,12 @@ class VideoFilterFrame(ttk.LabelFrame):
     
         self.subtitle_enabled = tk.BooleanVar(value=False)
         self.subtitle_path = tk.StringVar()
-        ttk.Checkbutton(line1, text="烧录字幕", variable=self.subtitle_enabled,
-                        command=self.toggle_subtitle).pack(side=tk.LEFT, padx=(2, 5))
+
+        subtitle_label = ttk.Label(line1, text="烧录字幕:")
+        subtitle_label.pack(side=tk.LEFT, padx=(2, 5))
+        ToolTip(subtitle_label, 
+                "将字幕永久嵌入视频画面（硬烧录），需重新编码。\n"
+                "若希望保留独立字幕轨道（流复制），请在「封装/合并」页面添加外部字幕。")
         self.subtitle_entry = ttk.Entry(line1, textvariable=self.subtitle_path,
                                         width=30, state="disabled")
         self.subtitle_entry.pack(side=tk.LEFT, padx=5)
@@ -1679,7 +1701,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                 "• 检测从第1帧开始（skip=0）。若第一帧为黑屏，请手动增加分析帧数或跳过片头。\n"
                 "可根据截取起始时间或者可视化窗口内自定义时间获取需要片段的黑边参数。\n"
                 "检测仅需约0.5秒，可快速尝试调整参数。",
-                wraplength=400)
+                wraplength=600)
 
         # 增加分析帧数和round设置
         ttk.Label(crop_frame, text="帧:").pack(side=tk.LEFT, padx=(5,0))
@@ -1699,7 +1721,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                 "• 显示视频首帧画面，可用鼠标拖拽绘制矩形选区\n"
                 "• 选区参数会回填到「启用裁剪」的各项输入框中\n"
                 "• 仍保留「自动检测黑边」功能，可辅助定位",
-                wraplength=400)
+                wraplength=500)
 
         rot_frame = ttk.Frame(left_frame)
         rot_frame.pack(fill=tk.X, pady=2)
@@ -1710,7 +1732,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                 "上下/左右翻转可镜像画面。\n"
                 "提示：旋转和翻转需重新编码视频，编码器为 copy 时无效。"
                 "    当前旋转是实体旋转，不是元数据旋转。",
-                wraplength=400)
+                wraplength=500)
         self.rotate = tk.StringVar(value="none")
         for text, val in [("无", "none"), ("90°顺时针", "90"), ("180°", "180"), ("90°逆时针", "270")]:
             ttk.Radiobutton(rot_frame, text=text, variable=self.rotate, value=val).pack(side=tk.LEFT, padx=2)
@@ -2806,7 +2828,7 @@ class AudioFrame(ttk.LabelFrame):
         self.volume_enabled = tk.BooleanVar(value=False)
         chk_volume = ttk.Checkbutton(volume_frame, text="启用音量调整", variable=self.volume_enabled)
         chk_volume.pack(side=tk.LEFT, padx=(0,5))
-        ToolTip(chk_volume, "勾选后启用音量倍数调整，可拖动滑块设置倍数（0.1~3.0）\n\n1.0=原始音量", wraplength=200)
+        ToolTip(chk_volume, "勾选后启用音量倍数调整，可拖动滑块设置倍数（0.1~3.0）\n\n1.0=原始音量", wraplength=400)
         ttk.Label(volume_frame, text="倍数:").pack(side=tk.LEFT, padx=(5,0))
         self.volume_value = tk.DoubleVar(value=1.0)
         self.volume_slider = ttk.Scale(volume_frame, from_=0.1, to=3.0, variable=self.volume_value,
@@ -3075,7 +3097,7 @@ class LoopChromaFrame(ttk.LabelFrame):
                 "勾选后可设置显示次数或仅显示一次。\n"
                 "注意：图片文件时长就1帧，若选择“一次”会导致瞬间消失，\n"
                 "您可复制生成的命令，手动修改 enable 表达式中的时间值以达到预期效果。",
-                wraplength=400)
+                wraplength=500)
 
         # 次数控制区域（始终显示，但默认禁用）
         self.count_frame = ttk.Frame(loop_frame)
@@ -4455,20 +4477,35 @@ class FFmpegBatchGUI:
             "生成滴持续": 'ffmpeg -y -f lavfi -i "sine=frequency=900:duration=10" "{output_dir}beeplong.wav"',
             "生成分形曼德博图案": 'ffmpeg -y -f lavfi -i "mandelbrot=s=640x480:r=25" -c:v libx264 -t 10 "{output_dir}mandelbrot.mp4"',
             "生成透明纯色视频(ProRes)": 'ffmpeg -y -f lavfi -i "color=c=#00000000:s=640x480:r=25,format=rgba" -c:v prores_ks -t 10 "{output_dir}transparent_bg.mov"',
-            "元胞自动机": 'ffmpeg -f lavfi -i cellauto -vf format=yuv420p -c:v libx264 -t 10 "{output_dir}cellauto.mp4"',
-            "生命活动": 'ffmpeg -f lavfi -i life -vf format=yuv420p -c:v libx264 -t 10 "{output_dir}life.mp4"',
+            "元胞自动机": 'ffmpeg -y -f lavfi -i cellauto -vf format=yuv420p -c:v libx264 -t 10 "{output_dir}cellauto.mp4"',
+            "生命活动": 'ffmpeg -y -f lavfi -i life -vf format=yuv420p -c:v libx264 -t 10 "{output_dir}life.mp4"',
             "生成白噪音 (静电噪音)": 'ffmpeg -y -f lavfi -i "anoisesrc=duration=10:colour=white" "{output_dir}white_noise.wav"',
             "生成粉噪音 (柔和噪声)": 'ffmpeg -y -f lavfi -i "anoisesrc=duration=10:colour=pink" "{output_dir}pink_noise.wav"',
-            "生成正弦波音频": 'ffmpeg -f lavfi -i "aevalsrc=sin(440*2*PI*t)" -t 5 "{output_dir}sin_noise.wav"',
-            "按帧率提取图片 (30)": 'ffmpeg -i "{input}" -vf "fps=30" "{output_dir}output_frame_%04d.jpg"',
-            "元数据旋转90° (仅MP4)": 'ffmpeg -i "{input}" -c copy -metadata:s:v rotate="90" "{output_dir}rotated.mp4"',
-            "元数据旋转180° (仅MP4)": 'ffmpeg -i "{input}" -c copy -metadata:s:v rotate="180" "{output_dir}rotated.mp4"',
-            "元数据旋转270° (仅MP4)": 'ffmpeg -i "{input}" -c copy -metadata:s:v rotate="270" "{output_dir}rotated.mp4"',
-            "音视频倒放(reverse)": 'ffmpeg -i "{input}" -vf reverse -af areverse "{output_dir}reverse.mp4"',
-            "视频四周加边框 (pad)": "ffmpeg -i \"{input}\" -vf \"pad=iw+20:ih+20:10:10:color=red\" -c:a copy \"{output_dir}bordered.mp4\"",
-            "简易英文文字水印(drawtext)": 'ffmpeg -i "{input}" -vf "drawtext=text=\'Hello\':fontsize=30:fontcolor=white:x=10:y=10" -c:a copy "{output_dir}text.mp4"',
-            "绘制矩形标记 (drawbox)": 'ffmpeg -i "{input}" -vf "drawbox=x=10:y=10:w=100:h=100:color=red@0.5:thickness=5" -c:a copy "{output_dir}box.mp4"',
-            "简易音频降噪 (afftdn)": 'ffmpeg -i "{input}" -af "afftdn" -c:v copy "{output_dir}denoised.wav"',
+            "生成正弦波音频": 'ffmpeg -y -f lavfi -i "aevalsrc=sin(440*2*PI*t)" -t 5 "{output_dir}sin_noise.wav"',
+            "按帧率提取图片 (30)": 'ffmpeg -y -i "{input}" -vf "fps=30" "{output_dir}output_frame_%04d.jpg"',
+            "元数据旋转90° (仅MP4)": 'ffmpeg -y -i "{input}" -c copy -metadata:s:v rotate="90" "{output_dir}rotated.mp4"',
+            "元数据旋转180° (仅MP4)": 'ffmpeg -y -i "{input}" -c copy -metadata:s:v rotate="180" "{output_dir}rotated.mp4"',
+            "元数据旋转270° (仅MP4)": 'ffmpeg -y -i "{input}" -c copy -metadata:s:v rotate="270" "{output_dir}rotated.mp4"',
+            "音视频倒放(reverse)": 'ffmpeg -y -i "{input}" -vf reverse -af areverse "{output_dir}reverse.mp4"',
+            "视频四周加边框 (pad)": 'ffmpeg -y -i \"{input}\" -vf \"pad=iw+20:ih+20:10:10:color=red\" -c:a copy \"{output_dir}bordered.mp4\"',
+            "简易英文文字水印(drawtext)": 'ffmpeg -y -i "{input}" -vf "drawtext=text=\'Hello\':fontsize=30:fontcolor=white:x=10:y=10" -c:a copy "{output_dir}text.mp4"',
+            "绘制矩形标记 (drawbox)": 'ffmpeg -y -i "{input}" -vf "drawbox=x=10:y=10:w=100:h=100:color=red@0.5:thickness=5" -c:a copy "{output_dir}box.mp4"',
+            "简易音频降噪 (afftdn)": 'ffmpeg -y -i "{input}" -af "afftdn" -c:v copy "{output_dir}denoised.wav"',
+
+            "视频半速 + 60帧插值": 'ffmpeg -y -i \"{input}\" -filter_complex \"[0:v]setpts=2*PTS,minterpolate=\'mi_mode=mci:mc_mode=aobmc:vsbmc=1:fps=60\'[v];[0:a]atempo=0.5[a]\" -map \"[v]\" -map \"[a]\" \"{output_dir}half_speed_60fps.mp4\"',
+            "60帧插值": 'ffmpeg -y -i \"{input}\" -filter_complex \"[0:v]minterpolate=\'mi_mode=mci:mc_mode=aobmc:vsbmc=1:fps=60\'\" \"{output_dir}60fps_interpolated.mp4\"',
+            "设置画面比例": 'ffmpeg -y -i \"{input}\" -aspect 16:9 \"{output_dir}aspect_16x9.mp4\"',
+            "视频流时间戳偏移": 'ffmpeg -y -itsoffset 1 -i \"{input}\" -c copy -map 0:v -map 1:a \"{output_dir}offset_video.mp4\"',
+            "提取画面内容不同的帧(0.1-0.3)": 'ffmpeg -y -i \"{input}\" -vf \"select=gt(scene\\,0.1)\" -vsync 0 \"{output_dir}%04d.jpg\"',
+            "静态图像制作视频": 'ffmpeg -y -loop 1 -i \"{input}\" -i audio.mp3 -c:v libx264 -tune stillimage -c:a aac -shortest \"{output_dir}still_video.mp4\"',
+            "音频响度标准化": 'ffmpeg -y -i \"{input}\" -filter:a \"loudnorm=I=-23:LRA=7:TP=-2\" -c:v copy \"{output_dir}normalized.mp4\"',
+            "静音特定音频通道": 'ffmpeg -y -i \"{input}\" -af \"pan=stereo|c0=c0|c1=0*c1\" -c:v copy \"{output_dir}right_channel_muted.mp4\"',
+            "交换左右音频通道": 'ffmpeg -y -i \"{input}\" -af \"pan=stereo|c0=c1|c1=c0\" -c:v copy \"{output_dir}swapped_channels.mp4\"',
+            "合并两个音频流": 'ffmpeg -y -i \"{input}\" -i input2.mp3 -filter_complex \"[0:a][1:a]amerge=inputs=2[a]\" -map \"[a]\" \"{output_dir}merged.mp4\"',
+            "创建视频缩略图": 'ffmpeg -y -i \"{input}\" -ss 00:00:05 -vframes 1 \"{output_dir}thumbnail.jpg"',
+
+
+
         }
     
     def _save_cmd_templates(self):
@@ -7625,6 +7662,7 @@ class FFmpegBatchGUI:
             preview_frame.pack(fill=tk.X, pady=5, padx=5)
             preview_text = scrolledtext.ScrolledText(preview_frame, height=10, wrap=tk.WORD)
             preview_text.pack(fill=tk.BOTH, expand=True)
+            ToolTip(preview_text, "预览区手动修改不影响实际转码，仅用于复制。")
             
             def update_preview(*args):
                 new_settings = {}
@@ -7962,9 +8000,14 @@ class FFmpegBatchGUI:
         self.merge_btn = tk.Button(opt_action_frame, text="开始合并", command=self.merge_start,
                                    height=1, width=12, bg="#4CAF50", fg="white")
         self.merge_btn.pack(side=tk.LEFT, padx=5)
+
+        btn_refresh_merge = tk.Button(opt_action_frame, text="刷新命令", 
+                                      command=self.merge_update_command_preview,
+                                      height=1, width=12, relief=tk.RAISED)
+        btn_refresh_merge.pack(side=tk.LEFT, padx=5)
         
-        btn_copy = tk.Button(opt_action_frame, text="复制命令到剪贴板", command=self.merge_copy_command,
-                             height=1, width=20, relief=tk.RAISED)
+        btn_copy = tk.Button(opt_action_frame, text="复制命令", command=self.merge_copy_command,
+                             height=1, width=12, relief=tk.RAISED)
         btn_copy.pack(side=tk.LEFT, padx=5)
 
         preview_frame = ttk.LabelFrame(parent, text="即将执行的命令预览", padding="5")
@@ -7975,6 +8018,7 @@ class FFmpegBatchGUI:
             content_frame, height=1, wrap=tk.WORD, font=("Microsoft YaHei", 9)
         )
         self.merge_cmd_preview.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        ToolTip(self.merge_cmd_preview, "预览区手动修改不影响实际转码，仅用于复制或手动微调后供快速命令区获取。",wraplength=500)
 
         self.merge_video.trace_add("write", lambda *a: self.merge_load_video_info())
         self.merge_container.trace_add("write", lambda *a: self.merge_update_command_preview())
@@ -9873,7 +9917,7 @@ class FFmpegBatchGUI:
                         "如果至少一个轨道勾选，则所有勾选的流会通过 amix 滤镜合并为单音轨输出。\n"
                         "未勾选的流将被丢弃（不输出）。\n"
                         "若只有一个轨道勾选，则无需混合，直接输出该流。",
-                        wraplength=400)
+                        wraplength=500)
             else:
                 mix_enabled_var = tk.BooleanVar(value=False)
     
@@ -9976,7 +10020,7 @@ class FFmpegBatchGUI:
             ToolTip(win.grid_slaves(row=0, column=0)[0], 
                     "对于 ASS/SSA 字幕，推荐使用 MKV 容器并选择「copy」流，\n"
                     "MP4 容器支持不佳（会丢失样式），MP4 必须用 mov_text",
-                    wraplength=300)
+                    wraplength=500)
             ttk.Label(win, text="语言代码:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
             lang_var = tk.StringVar(value=getattr(track, 'language', ''))
             lang_combo = ttk.Combobox(win, textvariable=lang_var,
@@ -10547,7 +10591,8 @@ class FFmpegBatchGUI:
             top_frame,
             textvariable=self.cmd_preset_var,
             state="readonly",
-            width=25
+            width=25,
+            height=20
         )
         self.cmd_preset_combo['values'] = list(self.cmd_templates.keys())
         self.cmd_preset_combo.pack(side=tk.LEFT, padx=5)
@@ -10555,6 +10600,7 @@ class FFmpegBatchGUI:
 
         ttk.Button(top_frame, text="重载", command=self._reload_cmd_templates, width=4).pack(side=tk.LEFT, padx=2)
         ttk.Button(top_frame, text="清空", command=self._clear_cmd_input, width=4).pack(side=tk.LEFT, padx=5)
+        ttk.Button(top_frame, text="获取", command=self._fetch_cmd_from_preview, width=4).pack(side=tk.LEFT, padx=2)
 
         # 输出目录（与当前工作目录结合）
         output_frame = ttk.Frame(top_frame)
@@ -10603,6 +10649,34 @@ class FFmpegBatchGUI:
         self.use_mpv.trace_add("write", lambda *a: self.update_player_status())
         self.mpv_path.trace_add("write", lambda *a: self.update_player_status())
         self.update_player_status()
+
+
+    def _fetch_cmd_from_preview(self):
+        """从预览区获取命令（转换或合并）到快速命令区"""
+        # 询问用户选择
+        result = messagebox.askyesno(
+            "获取命令",
+            "是否从转换预览区获取命令？\n（点击“是”获取转换命令，点击“否”获取合并命令）"
+        )
+        if result is None:  # 用户关闭对话框
+            return
+        if result:
+            source = self.cmd_preview
+            source_name = "转换"
+        else:
+            source = self.merge_cmd_preview
+            source_name = "合并"
+        
+        cmd_str = source.get(1.0, tk.END).strip()
+        if not cmd_str:
+            self._append_info_ui(f"{source_name}预览区无命令")
+            messagebox.showinfo("提示", f"{source_name}预览区为空")
+            return
+        
+        self.cmd_input.delete(1.0, tk.END)
+        self.cmd_input.insert(tk.END, cmd_str)
+        self._append_info_ui(f"已从{source_name}预览区获取命令")
+        self.cmd_input.focus_set()
 
 
     def _reload_cmd_templates(self):
@@ -11137,6 +11211,7 @@ class FFmpegBatchGUI:
         self.cmd_preview = scrolledtext.ScrolledText(preview_frame, height=4, wrap=tk.WORD, font=("Microsoft YaHei",9))
         self.cmd_preview.pack(fill=tk.BOTH, expand=True)
         self.cmd_preview.insert(tk.END, "请选择输入文件，或调整参数...")
+        ToolTip(self.cmd_preview, "预览区手动修改不影响实际转码，仅用于复制或手动微调后供快速命令区获取。",wraplength=500)
 
         tasks_frame = ttk.Frame(transcode_vpane)
         tasks_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0,0))
