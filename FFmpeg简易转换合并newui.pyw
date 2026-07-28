@@ -4169,6 +4169,10 @@ class FFmpegBatchGUI:
         self._preview_pending = False   # 是否有待处理的刷新
         self._pip_reverse_audio_hint_shown = False
         
+
+        self.preview_editable_var = tk.BooleanVar(value=False)
+ 
+        
         self._running_tasks = []  # 存储 (proc, task)
         
         self.cmd_output_path = tk.StringVar(value="")
@@ -4251,6 +4255,8 @@ class FFmpegBatchGUI:
         self.cmd_templates_path = os.path.join(preset_dir, "quick_cmds.json")
         self.cmd_templates = {}
         self._load_cmd_templates()
+        
+        self._initialized = False
 
         # 创建界面组件
         self.create_widgets()
@@ -5267,6 +5273,10 @@ class FFmpegBatchGUI:
         ffmpeg_dir_path = settings.get("ffmpeg_dir_path", "")
         self.ffmpeg_dir_enabled.set(ffmpeg_dir_enabled)
         self.ffmpeg_dir_path.set(ffmpeg_dir_path)
+
+        preview_editable = settings.get("preview_editable", False)
+        self.preview_editable_var.set(preview_editable)
+
         # 更新路径
         self._update_ffmpeg_paths()
 
@@ -5279,7 +5289,8 @@ class FFmpegBatchGUI:
             "overwrite_policy": self.overwrite_policy.get(),
             "cmd_output_path": self.cmd_output_path.get(),
             "ffmpeg_dir_enabled": self.ffmpeg_dir_enabled.get(),
-            "ffmpeg_dir_path": self.ffmpeg_dir_path.get()
+            "ffmpeg_dir_path": self.ffmpeg_dir_path.get(),
+            "preview_editable": self.preview_editable_var.get(),
         })
 
     def preview_with_player(self, input_path, filters=None, audio_only=False, volume=10,
@@ -6965,9 +6976,8 @@ class FFmpegBatchGUI:
         self._preview_after_id = self.root.after(50, self._do_update_command_preview)
 
     def _do_update_command_preview(self):
-        """实际执行命令刷新的函数（原 update_command_preview 的所有代码）"""
+        """实际执行命令刷新的函数"""
         self._preview_after_id = None
-        # 以下为原有的全部代码，请原样复制粘贴
         if getattr(self, '_loading_preset', False):
             return
         if hasattr(self, '_updating_preview') and self._updating_preview:
@@ -6987,7 +6997,7 @@ class FFmpegBatchGUI:
                 if self.trim_frame.show_combo_seek and self.trim_frame.combo_check:
                     self.trim_frame.combo_check.config(state='normal')
             # -------------------------------------------------
-
+    
             input_file = self.input_file.get()
             try:
                 if not input_file:
@@ -6999,8 +7009,17 @@ class FFmpegBatchGUI:
                 cmd_str = format_cmd_for_display(cmd_list)
             except Exception as e:
                 cmd_str = f"生成命令时出错: {e}"
-            self.cmd_preview.delete(1.0, tk.END)
-            self.cmd_preview.insert(tk.END, cmd_str)
+    
+            # 更新预览区（根据全局开关控制状态）
+            preview = self.cmd_preview
+            preview.config(state='normal')
+            preview.delete(1.0, tk.END)
+            preview.insert(tk.END, cmd_str)
+            if hasattr(self, 'preview_editable_var') and self.preview_editable_var.get():
+                preview.config(state='normal')
+            else:
+                preview.config(state='disabled')
+    
             # ---- 同步精准截取 ----
             try:
                 watermark_enabled = self.watermark_settings.get("enabled", False)
@@ -7662,7 +7681,12 @@ class FFmpegBatchGUI:
             preview_frame.pack(fill=tk.X, pady=5, padx=5)
             preview_text = scrolledtext.ScrolledText(preview_frame, height=10, wrap=tk.WORD)
             preview_text.pack(fill=tk.BOTH, expand=True)
-            ToolTip(preview_text, "预览区手动修改不影响实际转码，仅用于复制。")
+            
+            # 根据全局开关设置初始状态
+            if hasattr(self, 'preview_editable_var') and self.preview_editable_var.get():
+                preview_text.config(state='normal')
+            else:
+                preview_text.config(state='disabled')
             
             def update_preview(*args):
                 new_settings = {}
@@ -7688,8 +7712,13 @@ class FFmpegBatchGUI:
                     new_cmd_str = format_cmd_for_display(new_cmd_list)
                 except ValueError as e:
                     new_cmd_str = f"参数错误: {e}"
+            
+                # 更新预览，保持用户状态
+                current_state = preview_text.cget('state')
+                preview_text.config(state='normal')
                 preview_text.delete(1.0, tk.END)
                 preview_text.insert(tk.END, new_cmd_str)
+                preview_text.config(state=current_state)
 
             filt_frame._preview_callback = update_preview   
             adv_frame.update_callback = update_preview
@@ -7819,7 +7848,7 @@ class FFmpegBatchGUI:
             label_text = "轨道列表（可单独设置编码参数，支持批量拖拽添加文件）"
         else:
             label_text = "轨道列表（可单独设置编码参数）"
-        ttk.Label(parent, text=label_text).pack(anchor=tk.W, pady=(10,2))
+        ttk.Label(parent, text=label_text).pack(anchor=tk.W, pady=(0,2))
 
         list_container = ttk.Frame(parent)
         list_container.pack(fill=tk.X, pady=5)
@@ -7937,7 +7966,7 @@ class FFmpegBatchGUI:
                                                      textvariable=self.merge_manual_duration,
                                                      width=8)
         self.merge_manual_duration_entry.pack(side=tk.LEFT, padx=2)
-        ttk.Label(btn_frame, text="秒 (覆盖自动时长)").pack(side=tk.LEFT, padx=(0,5))
+        ttk.Label(btn_frame, text="秒 (覆盖自动时长)").pack(side=tk.LEFT, padx=0)
 
 
 
@@ -7949,7 +7978,7 @@ class FFmpegBatchGUI:
         chapter_frame = ttk.LabelFrame(parent, text="章节处理", padding="3")
         chapter_frame.pack(fill=tk.X, pady=5)
         chapter_row = ttk.Frame(chapter_frame)
-        chapter_row.pack(fill=tk.X, padx=5, pady=2)
+        chapter_row.pack(fill=tk.X, padx=5, pady=(0,2))
         ttk.Checkbutton(
             chapter_row, text="从源文件复制章节 (map_chapters)", 
             variable=self.copy_chapters
@@ -7960,13 +7989,13 @@ class FFmpegBatchGUI:
         chapter_entry = ttk.Entry(right_area, textvariable=self.chapter_file)
         chapter_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         ttk.Button(
-            right_area, text="浏览...", command=self.browse_chapter_file
-        ).pack(side=tk.LEFT)
+            right_area, text="浏览...", command=self.browse_chapter_file, width=10
+        ).pack(side=tk.LEFT, padx=(0, 5))
 
         row_frame = ttk.Frame(parent)
         row_frame.pack(fill=tk.X, pady=2)
         left_container = ttk.Frame(row_frame)
-        left_container.pack(side=tk.LEFT, padx=(0, 5))
+        left_container.pack(side=tk.LEFT, padx=(5, 5))
         ttk.Label(left_container, text="输出容器:").pack(side=tk.LEFT)
         container_combo = ttk.Combobox(
             left_container, textvariable=self.merge_container,
@@ -7983,7 +8012,7 @@ class FFmpegBatchGUI:
         )
         ttk.Button(
             right_container, text="浏览...",
-            command=self.merge_select_output, width=8
+            command=self.merge_select_output, width=10
         ).pack(side=tk.LEFT, padx=(0, 15))
 
         opt_action_frame = ttk.Frame(parent)
@@ -8018,7 +8047,7 @@ class FFmpegBatchGUI:
             content_frame, height=1, wrap=tk.WORD, font=("Microsoft YaHei", 9)
         )
         self.merge_cmd_preview.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
-        ToolTip(self.merge_cmd_preview, "预览区手动修改不影响实际转码，仅用于复制或手动微调后供快速命令区获取。",wraplength=500)
+
 
         self.merge_video.trace_add("write", lambda *a: self.merge_load_video_info())
         self.merge_container.trace_add("write", lambda *a: self.merge_update_command_preview())
@@ -9160,14 +9189,22 @@ class FFmpegBatchGUI:
     def merge_update_command_preview(self, output_override=None):
         if self._batch_update:
             return
+    
+        # 临时启用以便更新内容
+        current_state = self.merge_cmd_preview.cget('state')
+        self.merge_cmd_preview.config(state='normal')
+    
+        # 清空并填充
+        self.merge_cmd_preview.delete(1.0, tk.END)
         cmd_list = self.merge_build_cmd_list(output_override=output_override, preview=True)
         if not cmd_list:
-            self.merge_cmd_preview.delete(1.0, tk.END)
             self.merge_cmd_preview.insert(tk.END, "参数不完整，无法生成命令")
-            return
-        cmd_str = format_cmd_for_display(cmd_list)
-        self.merge_cmd_preview.delete(1.0, tk.END)
-        self.merge_cmd_preview.insert(tk.END, cmd_str)
+        else:
+            cmd_str = format_cmd_for_display(cmd_list)
+            self.merge_cmd_preview.insert(tk.END, cmd_str)
+    
+        # 恢复用户设置的编辑状态
+        self.merge_cmd_preview.config(state=current_state)
 
     def merge_get_media_info(self, path):
         return ffprobe_json(self.ffprobe_cmd, path)
@@ -10469,7 +10506,7 @@ class FFmpegBatchGUI:
         self.mpv_check = ttk.Checkbutton(frame, text="启用 mpv 作为预览播放器（推荐，支持进度条等）",
                                          variable=self.use_mpv,
                                          command=self.on_player_changed)
-        self.mpv_check.pack(anchor=tk.W, pady=5)
+        self.mpv_check.pack(anchor=tk.W, pady=0)
         path_frame = ttk.Frame(frame)
         path_frame.pack(fill=tk.X, pady=5)
         ttk.Label(path_frame, text="mpv 可执行文件路径:").pack(side=tk.LEFT, padx=(0,5))
@@ -10479,7 +10516,7 @@ class FFmpegBatchGUI:
 
         # ---- 日志记录控制 ----
         log_frame = ttk.Frame(frame)
-        log_frame.pack(fill=tk.X, pady=5)
+        log_frame.pack(fill=tk.X, pady=0)
         chk_log = ttk.Checkbutton(log_frame, text="记录成功命令到日志", variable=self.log_enabled_var)
         chk_log.pack(side=tk.LEFT)
         log_entry = ttk.Entry(log_frame, textvariable=self.log_path_var, width=30)
@@ -10509,14 +10546,19 @@ class FFmpegBatchGUI:
         entry = ttk.Entry(ffmpeg_row, textvariable=self.ffmpeg_dir_path, width=40)
         entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
 
-        ttk.Button(ffmpeg_row, text="浏览", command=self._browse_ffmpeg_dir).pack(side=tk.LEFT, padx=2)
+        ttk.Button(ffmpeg_row, text="浏览", command=self._browse_ffmpeg_dir).pack(side=tk.LEFT, padx=5)
 
         self.ffmpeg_dir_path.trace_add('write', self._on_ffmpeg_dir_changed)
 
 
-        # ---- 同名文件处理策略 ----
-        policy_frame = ttk.LabelFrame(frame, text="全局同名文件处理策略", padding="5")
-        policy_frame.pack(fill=tk.X, pady=5)
+
+        # ---- 水平布局：同名文件处理 + 预览编辑权限 ----
+        horizontal_frame = ttk.Frame(frame)
+        horizontal_frame.pack(fill=tk.X, pady=5)
+        
+        # 左：同名文件处理策略
+        policy_frame = ttk.LabelFrame(horizontal_frame, text="全局同名文件处理策略", padding="5")
+        policy_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
         
         ttk.Label(policy_frame, text="当输出文件已存在时:").pack(side=tk.LEFT)
         policy_combo = ttk.Combobox(
@@ -10527,15 +10569,24 @@ class FFmpegBatchGUI:
             width=12
         )
         policy_combo.pack(side=tk.LEFT, padx=5)
-        # 添加解释
-        desc = ttk.Label(
-            policy_frame,
-            text="询问/自动重命名/直接覆盖",
-            foreground="gray"
-        )
+        desc = ttk.Label(policy_frame, text="询问/自动重命名/直接覆盖", foreground="gray")
         desc.pack(side=tk.LEFT, padx=5)
-        # 绑定事件，保存设置
         self.overwrite_policy.trace_add("write", lambda *a: self.save_player_settings())
+        
+        # 右：预览编辑权限控制
+        edit_frame = ttk.LabelFrame(horizontal_frame, text="预览编辑权限", padding="5")
+        edit_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
+        
+        self.preview_edit_check = ttk.Checkbutton(
+            edit_frame,
+            text="允许编辑预览（修改不影响实际转码）",
+            variable=self.preview_editable_var,
+            command=self._update_preview_edit_state
+        )
+        self.preview_edit_check.pack(anchor=tk.W, padx=5, pady=5)
+        ToolTip(self.preview_edit_check, "勾选后，所有命令预览区可编辑，方便修改后复制命令，不会影响实际转码。")
+
+
 
         # ---- 停止所有转码按钮 ----
         stop_frame = ttk.Frame(frame)
@@ -10565,7 +10616,7 @@ class FFmpegBatchGUI:
 
         # 顶部：预设下拉 + 输出目录 + 清空
         top_frame = ttk.Frame(cmd_tool_frame)
-        top_frame.pack(fill=tk.X, pady=2)
+        top_frame.pack(fill=tk.X, pady=(0,2))
 
         preset_label1 = ttk.Label(top_frame, text="预设命令:")
         preset_label1.pack(side=tk.LEFT)
@@ -10629,10 +10680,10 @@ class FFmpegBatchGUI:
 
 
         status_frame = ttk.LabelFrame(frame, text="状态检测", padding="5")
-        status_frame.pack(fill=tk.X, pady=(15, 5))
+        status_frame.pack(fill=tk.X, pady=(0, 5))
         self.status_text = tk.Text(status_frame, height=20, width=80, wrap=tk.WORD,
                                    bg="#f8f8f8", relief=tk.FLAT)
-        self.status_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.status_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=(0,5))
         self.status_text.config(state=tk.DISABLED)
         btn_frame = ttk.Frame(status_frame)
         btn_frame.pack(fill=tk.X, pady=(0, 5))
@@ -10650,6 +10701,18 @@ class FFmpegBatchGUI:
         self.mpv_path.trace_add("write", lambda *a: self.update_player_status())
         self.update_player_status()
 
+
+    def _update_preview_edit_state(self):
+        editable = self.preview_editable_var.get()
+        # 更新转码预览区（如果存在）
+        if hasattr(self, 'cmd_preview'):
+            self.cmd_preview.config(state='normal' if editable else 'disabled')
+        # 更新合并预览区（如果存在）
+        if hasattr(self, 'merge_cmd_preview'):
+            self.merge_cmd_preview.config(state='normal' if editable else 'disabled')
+        # 仅在初始化完成后保存设置
+        if hasattr(self, '_initialized') and self._initialized:
+            self.save_player_settings()
 
     def _fetch_cmd_from_preview(self):
         """从预览区获取命令（转换或合并）到快速命令区"""
@@ -11031,10 +11094,10 @@ class FFmpegBatchGUI:
         main_frame.columnconfigure(1, weight=0)
         main_frame.rowconfigure(0, weight=1)
 
-        info_frame = ttk.LabelFrame(right_panel, text="关键信息", padding="5")
+        info_frame = ttk.LabelFrame(right_panel, text="关键信息", padding="1")
         info_frame.pack(fill=tk.BOTH, expand=True, pady=(0,5))
         info_top = ttk.Frame(info_frame)
-        info_top.pack(fill=tk.X, pady=2)
+        info_top.pack(fill=tk.X, pady=(0,2))
         ttk.Button(info_top, text="清空日志", command=lambda: self.info_text.delete(1.0, tk.END)).pack(side=tk.RIGHT, padx=2)
         ttk.Button(info_top, text="保存日志", command=lambda: self.save_log(self.info_text)).pack(side=tk.RIGHT, padx=2)
         self.info_text = scrolledtext.ScrolledText(info_frame, bg='#EAF4FC', fg='black',
@@ -11044,10 +11107,10 @@ class FFmpegBatchGUI:
 
 
 
-        detail_frame = ttk.LabelFrame(right_panel, text="转换进程信息", padding="5")
+        detail_frame = ttk.LabelFrame(right_panel, text="转换进程信息", padding="1")
         detail_frame.pack(fill=tk.BOTH, expand=True)
         detail_top = ttk.Frame(detail_frame)
-        detail_top.pack(fill=tk.X, pady=2)
+        detail_top.pack(fill=tk.X, pady=(0,2))
         ttk.Button(detail_top, text="清空日志", command=lambda: self.detail_text.delete(1.0, tk.END)).pack(side=tk.RIGHT, padx=2)
         ttk.Button(detail_top, text="保存日志", command=lambda: self.save_log(self.detail_text)).pack(side=tk.RIGHT, padx=2)
         self.detail_text = scrolledtext.ScrolledText(detail_frame, bg='#EAF4FC', fg='black',
@@ -11104,10 +11167,10 @@ class FFmpegBatchGUI:
         container_combo.pack(side=tk.LEFT, padx=5)
 
         preset_frame = ttk.LabelFrame(settings_frame, text="参数预设", padding="5")
-        preset_frame.pack(fill=tk.X, pady=5)
+        preset_frame.pack(fill=tk.X, pady=(0,5))
         ttk.Label(preset_frame, text="预设名称:").pack(side=tk.LEFT)
         self.preset_name = tk.StringVar()
-        self.preset_combo = ttk.Combobox(preset_frame, textvariable=self.preset_name, width=25, state="readonly")
+        self.preset_combo = ttk.Combobox(preset_frame, textvariable=self.preset_name, width=25, height=20, state="readonly")
         self.preset_combo.pack(side=tk.LEFT, padx=5)
         self.load_preset_list()
         self.preset_combo.bind("<<ComboboxSelected>>", lambda e: self.load_preset(self.preset_name.get()))
@@ -11175,7 +11238,7 @@ class FFmpegBatchGUI:
         self.adv_frame.pack(fill=tk.X, padx=5, pady=5)
 
         bottom_btn_frame = ttk.Frame(settings_frame)
-        bottom_btn_frame.pack(fill=tk.X, pady=5)
+        bottom_btn_frame.pack(fill=tk.X, pady=(0,5))
 
         btn_height = 1 if self.scaling >= 1.4 else 2
 
@@ -11211,7 +11274,7 @@ class FFmpegBatchGUI:
         self.cmd_preview = scrolledtext.ScrolledText(preview_frame, height=4, wrap=tk.WORD, font=("Microsoft YaHei",9))
         self.cmd_preview.pack(fill=tk.BOTH, expand=True)
         self.cmd_preview.insert(tk.END, "请选择输入文件，或调整参数...")
-        ToolTip(self.cmd_preview, "预览区手动修改不影响实际转码，仅用于复制或手动微调后供快速命令区获取。",wraplength=500)
+
 
         tasks_frame = ttk.Frame(transcode_vpane)
         tasks_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0,0))
@@ -11290,6 +11353,11 @@ class FFmpegBatchGUI:
         player_tab = ttk.Frame(self.notebook)
         self.notebook.add(player_tab, text="信息与播放器")
         self.create_player_settings_tab(player_tab)
+
+        self._initialized = True
+        self._update_preview_edit_state()   # 应用加载后的状态
+
+
 
         # 绑定各种控件刷新命令预览
         self.video_encoder.vcodec.trace_add("write", lambda *a: self.update_command_preview())
