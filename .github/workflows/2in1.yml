@@ -18,7 +18,7 @@ jobs:
       # 1. 升级 checkout 到 v6 以支持 Node 24
       - uses: actions/checkout@v6
         with:
-          fetch-depth: 0  # 建议加上这个，确保 git describe 能拿到所有 tag
+          fetch-depth: 0  # 必须拉取所有历史，确保 git describe 能拿到正确的 Tag
 
       # 2. setup-python 保持 v5
       - name: 设置 Python
@@ -27,13 +27,14 @@ jobs:
           python-version: '3.x'
           architecture: 'x64'
 
+      # 3. 安装依赖
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
           pip install pyinstaller
           pip install tkinterdnd2
 
-      # 3. 获取版本号
+      # 4. 获取版本号
       - name: 获取版本号
         id: version
         shell: pwsh
@@ -47,27 +48,37 @@ jobs:
           echo "VERSION=$VER" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           echo "版本号: $VER"
 
-      # ========== 【新增】动态更新 version.txt 中的版本号 ==========
+      # ========== 【核心修复版】动态更新 version.txt 中的版本号 ==========
       - name: 动态更新版本信息文件
         shell: pwsh
         run: |
           if (Test-Path version.txt) {
-            # 去掉版本号开头的 'v'，例如 v1.0.0 变成 1.0.0
             $cleanVer = "${{ env.VERSION }}".TrimStart('v')
-            # 将 1.0.0 转换为 1,0,0,0 格式，如果不是纯数字格式，默认补 0
-            $verParts = $cleanVer.Split('.')
-            $verTuple = ($verParts[0..2] | ForEach-Object { if ($_ -match '^\d+$') { $_ } else { '0' } }) -join ','
-            $verTuple += ",0"
             
-            # 替换 filevers 和 FileVersion 字符串
+            # 核心修复：校验版本号是否为合法的 x.x.x 纯数字格式
+            if ($cleanVer -match '^\d+\.\d+\.\d+') {
+              # 提取前三位数字，不足四位补0
+              $verParts = $cleanVer.Split('.')
+              $verTuple = ($verParts[0..2] | ForEach-Object { $_ }) -join ','
+              $verTuple += ",0"
+              Write-Host "✅ 检测到标准版本号: $cleanVer"
+            } else {
+              # 如果包含字母（如 continuous-123 或 git hash），强制回退为 1.0.0
+              $verTuple = "1,0,0,0"
+              $cleanVer = "1.0.0"
+              Write-Host "⚠️ 检测到非标准版本号 (${{ env.VERSION }})，自动回退为 1.0.0 以防止打包报错"
+            }
+            
+            # 替换 version.txt 中的内容
             (Get-Content version.txt -Raw) -replace 'filevers=\(.*?\)', "filevers=($verTuple)" | Set-Content version.txt -NoNewline
             (Get-Content version.txt -Raw) -replace "u'FileVersion', u'.*?'", "u'FileVersion', u'$cleanVer'" | Set-Content version.txt -NoNewline
-            Write-Host "✅ 已更新 version.txt 为版本: $cleanVer (元组: $verTuple)"
+            (Get-Content version.txt -Raw) -replace "u'ProductVersion', u'.*?'", "u'ProductVersion', u'$cleanVer'" | Set-Content version.txt -NoNewline
+            Write-Host "🔧 最终写入 version.txt 的版本元组: ($verTuple)"
           } else {
             Write-Warning "⚠️ 未找到 version.txt，跳过版本信息更新。"
           }
 
-      # ========== 1. 编译主程序 ==========
+      # ========== 5. 编译主程序 (FFmpeg简易转换合并newui) ==========
       - name: 构建主程序 (文件夹版)
         shell: pwsh
         run: |
@@ -75,7 +86,7 @@ jobs:
           pyinstaller -D -w --name $mainName --icon 35.ico --add-data "ffmpeg_presets.json;." --version-file version.txt "FFmpeg简易转换合并newui.pyw"
           echo "MAIN_EXE_DIR=dist\$mainName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      # ========== 2. 编译附属程序 ==========
+      # ========== 6. 编译附属程序 (水印轨迹编排器 多轨道) ==========
       - name: 构建附属程序 (文件夹版)
         shell: pwsh
         run: |
@@ -83,7 +94,7 @@ jobs:
           pyinstaller -D -w --name $subName --icon 35.ico --version-file version.txt "水印轨迹编排器 多轨道.pyw"
           echo "SUB_EXE_DIR=dist\$subName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      # ========== 3. 复制附属程序到主程序目录 ==========
+      # ========== 7. 复制附属程序到主程序目录 ==========
       - name: 合并产物
         shell: pwsh
         run: |
@@ -96,7 +107,7 @@ jobs:
           Copy-Item -Path $subExe.FullName -Destination $env:MAIN_EXE_DIR -Force
           Write-Host "复制完成: $($subExe.Name) -> $env:MAIN_EXE_DIR"
 
-      # ========== 4. 打包并上传到 Release ==========
+      # ========== 8. 打包并上传到 Release ==========
       - name: 打包最终产物
         shell: pwsh
         run: |
