@@ -4232,6 +4232,20 @@ class FFmpegBatchGUI:
 
         # 创建界面组件
         self.create_widgets()
+        
+        # 处理命令行参数（支持从资源管理器“发送到”打开文件）
+        if len(sys.argv) > 1:
+            # 取第一个非脚本参数作为文件路径
+            file_path = sys.argv[1]
+            if os.path.exists(file_path):
+                self.input_file.set(normalize_path(file_path))
+                if not self.output_dir.get():
+                    self.output_dir.set(os.path.dirname(file_path))
+                self._append_info_ui(f"已从命令行加载文件: {os.path.basename(file_path)}")
+                self.update_command_preview()
+            else:
+                self._append_info_ui(f"命令行参数文件不存在: {file_path}")
+
         self.update_task_list()
         self.update_command_preview()
 
@@ -4254,8 +4268,9 @@ class FFmpegBatchGUI:
                 task.progress = 0
                 self._schedule_task_list_update()
             if log_progress:
-                self._update_log_progress("转码结束")
+#                self._update_log_progress("转码结束")
 #            self.root.title("FFmpeg 多功能工具")
+                pass   #  上面2句注释空了 所以需要pass占位
             self._last_logged_percent = -1
             return
     
@@ -7995,6 +8010,9 @@ class FFmpegBatchGUI:
         强制添加视频作为画中画（不弹出询问对话框）。
         - add_audio: 是否同时添加该文件的所有音频流
         """
+        if os.path.isdir(path):
+            self._append_info_ui(f"[封装] 忽略文件夹: {os.path.basename(path)}，请选择文件")
+            return
         info = ffprobe_json(self.ffprobe_cmd, path)
         if not info:
             self._append_info_ui(f"[封装] 无法解析文件: {path}")
@@ -8051,6 +8069,9 @@ class FFmpegBatchGUI:
         """
         强制添加视频作为串联片段（不弹出询问对话框，自动添加所有音频和字幕流）
         """
+        if os.path.isdir(path):
+            self._append_info_ui(f"[封装] 忽略文件夹: {os.path.basename(path)}，请选择文件")
+            return
         info = ffprobe_json(self.ffprobe_cmd, path)
         if not info:
             self._append_info_ui(f"[封装] 无法解析文件: {path}")
@@ -8099,6 +8120,9 @@ class FFmpegBatchGUI:
         audio_exts = ('.mp3', '.aac', '.m4a', '.wav', '.flac', '.ogg', '.opus', '.ac3', '.dts')
     
         for f in files:
+            if os.path.isdir(f):
+                self._append_info_ui(f"[封装] 忽略文件夹: {os.path.basename(f)}，请选择文件")
+                continue
             ext = os.path.splitext(f)[1].lower()
             if ext in video_exts:
                 video_files.append(f)
@@ -8158,6 +8182,9 @@ class FFmpegBatchGUI:
         subtitle_exts = ('.srt', '.ass', '.ssa', '.vtt', '.idx', '.sup')
     
         for f in files:
+            if os.path.isdir(f):
+                self._append_info_ui(f"[封装] 忽略文件夹: {os.path.basename(f)}，请选择文件")
+                continue
             ext = os.path.splitext(f)[1].lower()
             if ext in video_exts:
                 self._add_concat_video_forced(f)  # 自动添加所有流
@@ -8195,7 +8222,8 @@ class FFmpegBatchGUI:
         )
         if not path:
             return
-    
+
+
         info = ffprobe_json(self.ffprobe_cmd, path)
         if not info:
             self._append_info_ui(f"[封装] 无法解析文件: {path}")
@@ -8235,7 +8263,8 @@ class FFmpegBatchGUI:
         )
         if not path:
             return
-    
+
+
         info = ffprobe_json(self.ffprobe_cmd, path)
         if not info:
             self._append_info_ui(f"[封装] 无法解析文件: {path}")
@@ -9993,6 +10022,9 @@ class FFmpegBatchGUI:
    #         self.merge_update_output_preview()
 
     def merge_add_external(self, ftype, path=None):
+        if os.path.isdir(path):
+            self._append_info_ui(f"[封装] 忽略文件夹: {os.path.basename(path)}，请选择文件")
+            return
         if not self.merge_video.get():
             self._append_info_ui("[封装] 请先设置主视频")
             return
@@ -10004,6 +10036,7 @@ class FFmpegBatchGUI:
             path = filedialog.askopenfilename(filetypes=types)
             if not path:
                 return
+
         info = ffprobe_json(self.ffprobe_cmd, path)
         if not info:
             self._append_info_ui(f"[封装] 无法解析: {path}")
@@ -10202,27 +10235,39 @@ class FFmpegBatchGUI:
     # -------------------- 拖放处理 --------------------
     def on_files_dropped(self, event):
         """根窗口拖放：仅处理添加到队列（输入/输出框由独立回调处理）"""
-        # 注意：如果拖放目标不是输入/输出框，则触发此回调
-        # 但因为我们为子控件注册了回调并返回 "break"，根回调不会收到这些事件
         files = self.root.tk.splitlist(event.data)
-        self._append_info_ui(f"拖拽了 {len(files)} 个文件")
+        self._append_info_ui(f"拖拽了 {len(files)} 个文件/文件夹")
         current_tab = self.notebook.index(self.notebook.select())
     
         if current_tab == 0:
             # 转码标签页：添加到任务队列
-            for file in files:
-                if os.path.exists(file):
-                    self.add_task(file)
+            # 定义视频扩展名列表
+            video_exts = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.ts', '.webm', '.m2ts', '.mpg', '.mpeg', '.wmv', '.3gp')
+            for item in files:
+                if os.path.isfile(item):
+                    # 如果是视频文件，直接添加
+                    if os.path.splitext(item)[1].lower() in video_exts:
+                        self.add_task(item)
+                    else:
+                        self._append_info_ui(f"忽略非视频文件: {os.path.basename(item)}")
+                elif os.path.isdir(item):
+                    # 如果是目录，递归扫描所有视频文件
+                    self._append_info_ui(f"扫描目录: {item}")
+                    for root_dir, _, filenames in os.walk(item):
+                        for filename in filenames:
+                            file_path = os.path.join(root_dir, filename)
+                            if os.path.splitext(file_path)[1].lower() in video_exts:
+                                self.add_task(file_path)
+                    self._append_info_ui(f"目录扫描完成: {item}")
                 else:
-                    self._append_info_ui(f"文件不存在: {file}")
+                    self._append_info_ui(f"忽略无效路径: {item}")
         else:
-            # 根据模式调用不同的处理函数
+            # 封装/合并标签页的处理保持不变
             if self.pip_enabled.get():
                 self._handle_drop_pip_mode(files)
             elif self.concat_enabled.get():
                 self._handle_drop_concat_mode(files)
             else:
-                #普通模式
                 if len(files) >= 2:
                     self.merge_handle_batch_dropped(files)
                 else:
@@ -10263,6 +10308,9 @@ class FFmpegBatchGUI:
 
     def merge_handle_dropped_file(self, path):
         def process():
+            if os.path.isdir(path):
+                self._append_info_ui(f"[封装] 忽略文件夹: {os.path.basename(path)}，请选择文件")
+                return
             video_exts = ['.mp4','.mkv','.avi','.mov','.flv','.ts','.webm']
             ext = os.path.splitext(path)[1].lower()
             if ext in video_exts:
