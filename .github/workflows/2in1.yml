@@ -18,7 +18,7 @@ jobs:
       # 1. 升级 checkout 到 v6 以支持 Node 24
       - uses: actions/checkout@v6
 
-      # 2. setup-python 目前官方最新为 v5，保持原样（若后续有 v6 再行升级）
+      # 2. setup-python 目前官方最新为 v5，保持原样
       - name: 设置 Python
         uses: actions/setup-python@v5
         with:
@@ -31,6 +31,7 @@ jobs:
           pip install pyinstaller
           pip install tkinterdnd2
 
+      # ========== 3. 获取版本号 ==========
       - name: 获取版本号
         id: version
         shell: pwsh
@@ -44,8 +45,9 @@ jobs:
           echo "VERSION=$VER" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           echo "版本号: $VER"
 
-      # ========== 【新增】动态更新 version.txt 中的版本号（带安全校验） ==========
-      - name: 动态更新版本信息文件
+
+      # ========== 4. 动态更新主程序 version.txt ==========
+      - name: 动态更新主程序版本信息 (version.txt)
         shell: pwsh
         run: |
           if (Test-Path version.txt) {
@@ -63,7 +65,7 @@ jobs:
             (Get-Content version.txt -Raw) -replace "u'ProductVersion', u'.*?'", "u'ProductVersion', u'$cleanVer'" | Set-Content version.txt -NoNewline
           }
 
-      # ========== 1. 编译主程序 (FFmpeg简易转换合并newui) ==========
+      # ========== 5. 编译主程序 (FFmpeg简易转换合并newui) ==========
       - name: 构建主程序 (文件夹版)
         shell: pwsh
         run: |
@@ -71,15 +73,34 @@ jobs:
           pyinstaller -D -w --name $mainName --icon 35.ico --add-data "ffmpeg_presets.json;." --version-file version.txt "FFmpeg简易转换合并newui.pyw"
           echo "MAIN_EXE_DIR=dist\$mainName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      # ========== 2. 编译附属程序 (水印轨迹编排器 多轨道) ==========
+      # ========== 6. 动态更新附属程序 version1.txt ==========
+      - name: 动态更新附属程序版本信息 (version1.txt)
+        shell: pwsh
+        run: |
+          if (Test-Path version1.txt) {
+            $cleanVer = "${{ env.VERSION }}".TrimStart('v')
+            if ($cleanVer -match '^\d+\.\d+\.\d+') {
+              $verParts = $cleanVer.Split('.')
+              $verTuple = ($verParts[0..2] | ForEach-Object { $_ }) -join ','
+              $verTuple += ",0"
+            } else {
+              $verTuple = "1,0,0,0"
+              $cleanVer = "1.0.0"
+            }
+            (Get-Content version1.txt -Raw) -replace 'filevers=\(.*?\)', "filevers=($verTuple)" | Set-Content version1.txt -NoNewline
+            (Get-Content version1.txt -Raw) -replace "u'FileVersion', u'.*?'", "u'FileVersion', u'$cleanVer'" | Set-Content version1.txt -NoNewline
+            (Get-Content version1.txt -Raw) -replace "u'ProductVersion', u'.*?'", "u'ProductVersion', u'$cleanVer'" | Set-Content version1.txt -NoNewline
+          }
+
+      # ========== 7. 编译附属程序 (水印轨迹编排器 多轨道) ==========
       - name: 构建附属程序 (文件夹版)
         shell: pwsh
         run: |
           $subName = "水印轨迹编排器_多轨道_folder_${{ env.VERSION }}"
-          pyinstaller -D -w --name $subName --icon 35.ico --version-file version.txt "水印轨迹编排器 多轨道.pyw"
+          pyinstaller -D -w --name $subName --icon 35.ico --version-file version1.txt "水印轨迹编排器 多轨道.pyw"
           echo "SUB_EXE_DIR=dist\$subName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      # ========== 3. 复制附属程序到主程序目录 ==========
+      # ========== 8. 复制附属程序到主程序目录 ==========
       - name: 合并产物
         shell: pwsh
         run: |
@@ -94,7 +115,7 @@ jobs:
           Copy-Item -Path $subExe.FullName -Destination $env:MAIN_EXE_DIR -Force
           Write-Host "复制完成: $($subExe.Name) -> $env:MAIN_EXE_DIR"
 
-      # ========== 4. 打包并上传到 Release ==========
+      # ========== 9. 打包并上传到 Release ==========
       - name: 打包最终产物
         shell: pwsh
         run: |
@@ -103,7 +124,7 @@ jobs:
           Compress-Archive -Path "$env:MAIN_EXE_DIR\*" -DestinationPath "upload_files\$mainDirName.zip" -Force
           Write-Host "打包完成: upload_files\$mainDirName.zip"
 
-      # 3. 升级 release action 到 v3 以支持 Node 24
+      # 10. 升级 release action 到 v3 以支持 Node 24
       - name: 创建 Release 并上传附件
         uses: softprops/action-gh-release@v3
         with:
