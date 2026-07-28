@@ -15,71 +15,55 @@ jobs:
   build-and-release:
     runs-on: windows-latest
     steps:
-      # 1. 拉取代码
+      # 1. 升级 checkout 到 v6 以支持 Node 24
       - uses: actions/checkout@v6
 
-      # 2. 设置 Python 环境
+      # 2. setup-python 目前官方最新为 v5，保持原样（若后续有 v6 再行升级）
       - name: 设置 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
           architecture: 'x64'
 
-      # 3. 安装依赖
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
           pip install pyinstaller
           pip install tkinterdnd2
 
-      # 4. 获取版本号（优化：无Tag时使用干净的短 Hash）
       - name: 获取版本号
         id: version
         shell: pwsh
         run: |
           if ("${{ github.event.inputs.version }}" -ne "") {
-            # 优先使用手动填写的版本号
             $VER = "${{ github.event.inputs.version }}"
           } else {
-            # 核心优化：只取当前最新的短 Hash (如 87e32d9)，避免难看的 git describe 格式
-            $SHORT_HASH = git rev-parse --short HEAD
-            $VER = "continuous-$SHORT_HASH"
-            Write-Host "⚠️ 未检测到手动版本号，使用自动生成的版本号: $VER"
+            $VER = git describe --tags --always --dirty 2>$null
+            if (-not $VER) { $VER = "continuous-${{ github.run_number }}" }
           }
           echo "VERSION=$VER" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           echo "版本号: $VER"
 
-      # 5. 动态更新 version.txt 中的版本号（带安全校验，防止打包报错）
+      # ========== 【新增】动态更新 version.txt 中的版本号（带安全校验） ==========
       - name: 动态更新版本信息文件
         shell: pwsh
         run: |
           if (Test-Path version.txt) {
             $cleanVer = "${{ env.VERSION }}".TrimStart('v')
-            
-            # 核心修复：校验版本号是否为合法的 x.x.x 纯数字格式
             if ($cleanVer -match '^\d+\.\d+\.\d+') {
-              # 提取前三位数字，不足四位补0
               $verParts = $cleanVer.Split('.')
               $verTuple = ($verParts[0..2] | ForEach-Object { $_ }) -join ','
               $verTuple += ",0"
-              Write-Host "✅ 检测到标准版本号: $cleanVer"
             } else {
-              # 如果包含字母（如 continuous-87e32d9），强制回退为 1.0.0，防止 PyInstaller 报错
               $verTuple = "1,0,0,0"
               $cleanVer = "1.0.0"
-              Write-Host "⚠️ 检测到非标准版本号 (${{ env.VERSION }})，exe属性版本自动回退为 1.0.0"
             }
-            
-            # 替换 version.txt 中的内容
             (Get-Content version.txt -Raw) -replace 'filevers=\(.*?\)', "filevers=($verTuple)" | Set-Content version.txt -NoNewline
             (Get-Content version.txt -Raw) -replace "u'FileVersion', u'.*?'", "u'FileVersion', u'$cleanVer'" | Set-Content version.txt -NoNewline
             (Get-Content version.txt -Raw) -replace "u'ProductVersion', u'.*?'", "u'ProductVersion', u'$cleanVer'" | Set-Content version.txt -NoNewline
-            Write-Host "🔧 最终写入 version.txt 的版本元组: ($verTuple)"
-          } else {
-            Write-Warning "⚠️ 未找到 version.txt，跳过版本信息更新。"
           }
 
-      # 6. 编译主程序 (FFmpeg简易转换合并newui)
+      # ========== 1. 编译主程序 (FFmpeg简易转换合并newui) ==========
       - name: 构建主程序 (文件夹版)
         shell: pwsh
         run: |
@@ -87,7 +71,7 @@ jobs:
           pyinstaller -D -w --name $mainName --icon 35.ico --add-data "ffmpeg_presets.json;." --version-file version.txt "FFmpeg简易转换合并newui.pyw"
           echo "MAIN_EXE_DIR=dist\$mainName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      # 7. 编译附属程序 (水印轨迹编排器 多轨道)
+      # ========== 2. 编译附属程序 (水印轨迹编排器 多轨道) ==========
       - name: 构建附属程序 (文件夹版)
         shell: pwsh
         run: |
@@ -95,20 +79,22 @@ jobs:
           pyinstaller -D -w --name $subName --icon 35.ico --version-file version.txt "水印轨迹编排器 多轨道.pyw"
           echo "SUB_EXE_DIR=dist\$subName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      # 8. 复制附属程序到主程序目录
+      # ========== 3. 复制附属程序到主程序目录 ==========
       - name: 合并产物
         shell: pwsh
         run: |
           Write-Host "正在将附属程序复制到主程序目录..."
+          # 查找附属程序生成的 exe
           $subExe = Get-ChildItem -Path $env:SUB_EXE_DIR -Filter "*.exe" | Select-Object -First 1
           if (-not $subExe) {
             Write-Error "未找到附属程序的 exe 文件！"
             exit 1
           }
+          # 复制到主程序目录
           Copy-Item -Path $subExe.FullName -Destination $env:MAIN_EXE_DIR -Force
           Write-Host "复制完成: $($subExe.Name) -> $env:MAIN_EXE_DIR"
 
-      # 9. 打包最终产物
+      # ========== 4. 打包并上传到 Release ==========
       - name: 打包最终产物
         shell: pwsh
         run: |
@@ -117,16 +103,14 @@ jobs:
           Compress-Archive -Path "$env:MAIN_EXE_DIR\*" -DestinationPath "upload_files\$mainDirName.zip" -Force
           Write-Host "打包完成: upload_files\$mainDirName.zip"
 
-      # 10. 创建 Release 并上传附件（优化：自动附加 Commit 描述）
+      # 3. 升级 release action 到 v3 以支持 Node 24
       - name: 创建 Release 并上传附件
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.VERSION }}
           name: "Release ${{ env.VERSION }}"
-          # 核心优化：开启 generate_release_notes，GitHub 会自动提取并附带本次更新的 Commit 描述
-          generate_release_notes: true
           body: |
-            🚀 自动构建版本 ${{ env.VERSION }}
+            自动构建版本 ${{ env.VERSION }}
             
             - 包含 **FFmpeg简易转换合并newui** (文件夹便携版)
             - 内置 **水印轨迹编排器 多轨道** 可执行文件
