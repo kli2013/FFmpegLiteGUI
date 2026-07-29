@@ -69,7 +69,6 @@ class SegmentEditor(tk.Toplevel):
         self.refresh_entries(scrollable)
 
     def refresh_entries(self, parent):
-        # （此部分内容不变，完全沿用之前的实现）
         for widget in parent.winfo_children():
             widget.destroy()
         self.rows.clear()
@@ -103,7 +102,6 @@ class SegmentEditor(tk.Toplevel):
             self.rows.append((mode_var, dur_var))
 
     def save_and_close(self):
-        # （此部分内容不变）
         new_modes = []
         new_durations = []
         for mode_var, dur_var in self.rows:
@@ -201,7 +199,7 @@ class TrackFrame(ttk.LabelFrame):
         time_row = ttk.Frame(self)
         time_row.pack(fill="x", padx=5, pady=2, anchor="w")
 
-        ttk.Label(time_row, text="周期(秒):").pack(side="left")
+        ttk.Label(time_row, text="轨迹运动周期(秒):").pack(side="left")
         self.cycle_entry = ttk.Entry(time_row, width=6)
         self.cycle_entry.pack(side="left", padx=2)
         self.cycle_entry.insert(0, "")
@@ -418,12 +416,18 @@ class MultiTrackWatermarkGUI:
         self.root = root
         self.root.title("FFmpeg 多轨道水印轨迹编排器 v17.3")
 
-        win_width, win_height = 1100, 850
+        # ===== 屏幕自适应 =====
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
-        x = (screen_width - win_width) // 2
-        y = (screen_height - win_height) // 2
-        self.root.geometry(f"{win_width}x{win_height}+{x}+{y}")
+        # 目标尺寸：不超过屏幕的90%，同时保留最小尺寸（800x600）以保证界面可用
+        target_width = min(1100, int(screen_width * 0.9))
+        target_height = min(850, int(screen_height * 0.9))
+        target_width = max(target_width, 800)
+        target_height = max(target_height, 600)
+        x = (screen_width - target_width) // 2
+        y = (screen_height - target_height) // 2
+        self.root.geometry(f"{target_width}x{target_height}+{x}+{y}")
+        # ===== 自适应结束 =====
 
         style = ttk.Style()
         style.configure(".", font=("Microsoft YaHei", 9))
