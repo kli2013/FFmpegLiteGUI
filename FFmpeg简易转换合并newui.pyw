@@ -1587,6 +1587,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             "hue_saturation": 0.0,
         }
 
+
     def create_widgets(self):
         main_pane = ttk.Frame(self)
         main_pane.pack(fill=tk.BOTH, expand=True)
@@ -1784,7 +1785,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                                          state="readonly", width=10)
         deinterlace_combo.pack(side=tk.LEFT, padx=2)
     
-        self.pix_fmt_enabled = tk.BooleanVar(value=True)
+        self.pix_fmt_enabled = tk.BooleanVar(value=self.app.pix_fmt_enabled_default.get())
         self.pix_fmt = tk.StringVar(value="yuv420p")
         pix_label = ttk.Label(hybrid_frame, text="像素格式:")
         pix_label.pack(side=tk.LEFT, padx=(20,0))
@@ -1803,6 +1804,12 @@ class VideoFilterFrame(ttk.LabelFrame):
         self.pix_fmt_combo = ttk.Combobox(hybrid_frame, textvariable=self.pix_fmt, 
                                           values=self.PIX_FMTS, width=12, state="normal")
         self.pix_fmt_combo.pack(side=tk.LEFT, padx=5)
+        
+        self.pix_fmt_enabled.trace_add("write", self._on_pix_fmt_changed)
+
+    def _on_pix_fmt_changed(self, *args):
+        self.app.pix_fmt_enabled_default.set(self.pix_fmt_enabled.get())
+        self.app.save_player_settings()
 
 
     def _swap_width_height(self):
@@ -4164,6 +4171,7 @@ class FFmpegBatchGUI:
         self._preview_after_id = None   # after 回调 ID
         self._preview_pending = False   # 是否有待处理的刷新
         self._pip_reverse_audio_hint_shown = False
+        self.pix_fmt_enabled_default = tk.BooleanVar(value=True)
         
 
         self.preview_editable_var = tk.BooleanVar(value=False)
@@ -5319,6 +5327,9 @@ class FFmpegBatchGUI:
         preview_editable = settings.get("preview_editable", False)
         self.preview_editable_var.set(preview_editable)
 
+        pix_fmt_default = settings.get("pix_fmt_enabled_default", True)
+        self.pix_fmt_enabled_default.set(pix_fmt_default)
+
         # 更新路径
         self._update_ffmpeg_paths()
 
@@ -5333,6 +5344,7 @@ class FFmpegBatchGUI:
             "ffmpeg_dir_enabled": self.ffmpeg_dir_enabled.get(),
             "ffmpeg_dir_path": self.ffmpeg_dir_path.get(),
             "preview_editable": self.preview_editable_var.get(),
+            "pix_fmt_enabled_default": self.pix_fmt_enabled_default.get(),
         })
 
     def preview_with_player(self, input_path, filters=None, audio_only=False, volume=10,
