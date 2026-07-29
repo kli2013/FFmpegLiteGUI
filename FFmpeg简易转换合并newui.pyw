@@ -358,7 +358,7 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
     # ----- IVTC（反胶卷过带）----- 
     ivtc_enabled = enhance_settings and enhance_settings.get("ivtc_enabled", False)
     if ivtc_enabled:
-        filters.append("ivtc=1")
+        filters.append("fieldmatch,decimate")
     
     # ----- 反交错（仅当 IVTC 未启用时执行） -----
     if not ivtc_enabled:  # 添加条件
@@ -1923,88 +1923,93 @@ class VideoFilterFrame(ttk.LabelFrame):
         win.title("高级增强滤镜")
         win.transient(self)
         win.grab_set()
-        center_window(win, 500, 750)
+        center_window(win, 650, 450)  # 宽度稍宽，高度降低
     
         main = ttk.Frame(win, padding="10")
         main.pack(fill=tk.BOTH, expand=True)
     
-        # ----- 降噪（hqdn3d）-----
-        denoise_frame = ttk.LabelFrame(main, text="降噪 (hqdn3d)", padding="5")
-        denoise_frame.pack(fill=tk.X, pady=5)
+        # ---- 左右分栏 ----
+        paned = ttk.PanedWindow(main, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True)
     
+        # ---- 左栏：画质修复 ----
+        left_frame = ttk.Frame(paned)
+        paned.add(left_frame, weight=1)
+    
+        # 降噪
+        denoise_frame = ttk.LabelFrame(left_frame, text="降噪 (hqdn3d)", padding="5")
+        denoise_frame.pack(fill=tk.X, pady=5)
         self.denoise_enabled = tk.BooleanVar(value=self.enhance_settings.get("denoise_enabled", False))
         ttk.Checkbutton(denoise_frame, text="启用降噪", variable=self.denoise_enabled).pack(anchor=tk.W)
-    
         row1 = ttk.Frame(denoise_frame); row1.pack(fill=tk.X, pady=2)
         ttk.Label(row1, text="空间强度 (0~10):").pack(side=tk.LEFT)
         self.denoise_spatial = tk.DoubleVar(value=self.enhance_settings.get("denoise_spatial", 4.0))
         ttk.Scale(row1, from_=0, to=10, variable=self.denoise_spatial, orient=tk.HORIZONTAL, length=150).pack(side=tk.LEFT, padx=5)
         ttk.Label(row1, textvariable=self.denoise_spatial, width=4).pack(side=tk.LEFT)
-    
         row2 = ttk.Frame(denoise_frame); row2.pack(fill=tk.X, pady=2)
         ttk.Label(row2, text="时间强度 (0~10):").pack(side=tk.LEFT)
         self.denoise_temporal = tk.DoubleVar(value=self.enhance_settings.get("denoise_temporal", 3.0))
         ttk.Scale(row2, from_=0, to=10, variable=self.denoise_temporal, orient=tk.HORIZONTAL, length=150).pack(side=tk.LEFT, padx=5)
         ttk.Label(row2, textvariable=self.denoise_temporal, width=4).pack(side=tk.LEFT)
     
-        # ----- 锐化（unsharp）-----
-        sharpen_frame = ttk.LabelFrame(main, text="锐化 (unsharp)", padding="5")
+        # 锐化
+        sharpen_frame = ttk.LabelFrame(left_frame, text="锐化 (unsharp)", padding="5")
         sharpen_frame.pack(fill=tk.X, pady=5)
-    
         self.sharpen_enabled = tk.BooleanVar(value=self.enhance_settings.get("sharpen_enabled", False))
         ttk.Checkbutton(sharpen_frame, text="启用锐化", variable=self.sharpen_enabled).pack(anchor=tk.W)
-    
         row3 = ttk.Frame(sharpen_frame); row3.pack(fill=tk.X, pady=2)
         ttk.Label(row3, text="锐化强度 (0~5):").pack(side=tk.LEFT)
         self.sharpen_strength = tk.DoubleVar(value=self.enhance_settings.get("sharpen_strength", 1.0))
         ttk.Scale(row3, from_=0, to=5, variable=self.sharpen_strength, orient=tk.HORIZONTAL, length=150).pack(side=tk.LEFT, padx=5)
         ttk.Label(row3, textvariable=self.sharpen_strength, width=4).pack(side=tk.LEFT)
     
-        # ----- IVTC（反胶卷过带）-----
-        ivtc_frame = ttk.LabelFrame(main, text="反胶卷过带 (IVTC) - 预览失败时请关闭该滤镜", padding="5")
+        # IVTC（反胶卷过带）
+        ivtc_frame = ttk.LabelFrame(left_frame, text="反胶卷过带 (IVTC)", padding="5")
         ivtc_frame.pack(fill=tk.X, pady=5)
         self.ivtc_enabled = tk.BooleanVar(value=self.enhance_settings.get("ivtc_enabled", False))
-        ttk.Checkbutton(ivtc_frame, text="启用 IVTC (适用于 60i -> 24p)", variable=self.ivtc_enabled).pack(anchor=tk.W)
+        chk_ivtc = ttk.Checkbutton(ivtc_frame, text="启用 IVTC (适用于 60i -> 24p)", variable=self.ivtc_enabled)
+        chk_ivtc.pack(anchor=tk.W)
+
     
-        # ----- 去块滤波（deblock）-----
-        deblock_frame = ttk.LabelFrame(main, text="去块滤波 (deblock)", padding="5")
+        # 去块滤波
+        deblock_frame = ttk.LabelFrame(left_frame, text="去块滤波 (deblock)", padding="5")
         deblock_frame.pack(fill=tk.X, pady=5)
         self.deblock_enabled = tk.BooleanVar(value=self.enhance_settings.get("deblock_enabled", False))
         ttk.Checkbutton(deblock_frame, text="启用去块", variable=self.deblock_enabled).pack(anchor=tk.W)
-    
         row4 = ttk.Frame(deblock_frame); row4.pack(fill=tk.X, pady=2)
         ttk.Label(row4, text="强度 (1~8):").pack(side=tk.LEFT)
         self.deblock_strength = tk.IntVar(value=self.enhance_settings.get("deblock_strength", 4))
         ttk.Scale(row4, from_=1, to=8, variable=self.deblock_strength, orient=tk.HORIZONTAL, length=150).pack(side=tk.LEFT, padx=5)
         ttk.Label(row4, textvariable=self.deblock_strength, width=4).pack(side=tk.LEFT)
     
-        # ----- 色彩空间转换-----
-        colorspace_frame = ttk.LabelFrame(main, text="色彩空间转换", padding="5")
+        # ---- 右栏：色彩调整 ----
+        right_frame = ttk.Frame(paned)
+        paned.add(right_frame, weight=1)
+    
+        # 色彩空间转换
+        colorspace_frame = ttk.LabelFrame(right_frame, text="色彩空间转换", padding="5")
         colorspace_frame.pack(fill=tk.X, pady=5)
         self.colorspace_enabled = tk.BooleanVar(value=self.enhance_settings.get("colorspace_enabled", False))
         ttk.Checkbutton(colorspace_frame, text="启用转换", variable=self.colorspace_enabled).pack(anchor=tk.W)
-    
         row5 = ttk.Frame(colorspace_frame); row5.pack(fill=tk.X, pady=2)
         ttk.Label(row5, text="目标色彩矩阵:").pack(side=tk.LEFT)
         self.colorspace_matrix = tk.StringVar(value=self.enhance_settings.get("colorspace_matrix", "bt709:bt2020"))
-        ttk.Combobox(row5, textvariable=self.colorspace_matrix, 
-                     values=["bt709:bt2020", "bt2020:bt709", "bt601:bt709", "bt709:bt601"], 
+        ttk.Combobox(row5, textvariable=self.colorspace_matrix,
+                     values=["bt709:bt2020", "bt2020:bt709", "bt601:bt709", "bt709:bt601"],
                      state="readonly", width=15).pack(side=tk.LEFT, padx=5)
-
-        # ----- 颜色校正（eq + hue）-----
-        color_frame = ttk.LabelFrame(main, text="颜色校正 (eq / hue)", padding="5")
+    
+        # 颜色校正（eq + hue）
+        color_frame = ttk.LabelFrame(right_frame, text="颜色校正 (eq / hue)", padding="5")
         color_frame.pack(fill=tk.X, pady=5)
-
-        # 创建变量绑定到当前设置
+    
         eq_brightness_var = tk.DoubleVar(value=self.enhance_settings.get("eq_brightness", 0.0))
         eq_contrast_var = tk.DoubleVar(value=self.enhance_settings.get("eq_contrast", 1.0))
         eq_saturation_var = tk.DoubleVar(value=self.enhance_settings.get("eq_saturation", 1.0))
         eq_gamma_var = tk.DoubleVar(value=self.enhance_settings.get("eq_gamma", 1.0))
         hue_angle_var = tk.DoubleVar(value=self.enhance_settings.get("hue_angle", 0.0))
         hue_saturation_var = tk.DoubleVar(value=self.enhance_settings.get("hue_saturation", 0.0))
-
+    
         def make_slider_row(parent, label, var, from_, to, resolution, fmt="{:.2f}"):
-            """辅助函数：生成一行带滑块和数值的控件"""
             row = ttk.Frame(parent)
             row.pack(fill=tk.X, pady=1)
             ttk.Label(row, text=label, width=10).pack(side=tk.LEFT)
@@ -2017,30 +2022,21 @@ class VideoFilterFrame(ttk.LabelFrame):
                 val_label.config(text=fmt.format(var.get()))
             var.trace_add("write", update_label)
             return row
-
-        # eq 参数
+    
         make_slider_row(color_frame, "亮度", eq_brightness_var, -1.0, 1.0, 0.01)
         make_slider_row(color_frame, "对比度", eq_contrast_var, -2.0, 2.0, 0.01)
         make_slider_row(color_frame, "饱和度", eq_saturation_var, 0.0, 3.0, 0.01)
         make_slider_row(color_frame, "伽马", eq_gamma_var, 0.1, 10.0, 0.01)
-
-        # hue 参数
         make_slider_row(color_frame, "色相", hue_angle_var, -180, 180, 1, fmt="{:.0f}")
         make_slider_row(color_frame, "色饱和度", hue_saturation_var, -1.0, 1.0, 0.01)
-
-        def reset_color_defaults():
-            eq_brightness_var.set(0.0)
-            eq_contrast_var.set(1.0)
-            eq_saturation_var.set(1.0)
-            eq_gamma_var.set(1.0)
-            hue_angle_var.set(0.0)
-            hue_saturation_var.set(0.0)
-
-        btn_frame_color = ttk.Frame(color_frame)
-        btn_frame_color.pack(fill=tk.X, pady=(5,0))
-        ttk.Button(btn_frame_color, text="重置默认值", command=reset_color_defaults).pack(side=tk.LEFT)
-
-        # ----- 按钮-----
+    
+        reset_btn = ttk.Button(color_frame, text="重置默认值",
+                               command=lambda: [eq_brightness_var.set(0.0), eq_contrast_var.set(1.0),
+                                                eq_saturation_var.set(1.0), eq_gamma_var.set(1.0),
+                                                hue_angle_var.set(0.0), hue_saturation_var.set(0.0)])
+        reset_btn.pack(pady=5)
+    
+        # ---- 底部按钮 ----
         btn_frame = ttk.Frame(main)
         btn_frame.pack(fill=tk.X, pady=10)
     
@@ -2051,7 +2047,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                 "denoise_temporal": self.denoise_temporal.get(),
                 "sharpen_enabled": self.sharpen_enabled.get(),
                 "sharpen_strength": self.sharpen_strength.get(),
-                "ivtc_enabled": self.ivtc_enabled.get(),
+                "ivtc_enabled": self.ivtc_enabled.get() if not chk_ivtc.cget('state') == 'disabled' else False,
                 "deblock_enabled": self.deblock_enabled.get(),
                 "deblock_strength": self.deblock_strength.get(),
                 "colorspace_enabled": self.colorspace_enabled.get(),
@@ -2065,7 +2061,6 @@ class VideoFilterFrame(ttk.LabelFrame):
             })
             if self.app:
                 self.app.update_command_preview()
-            # 刷新编辑窗口预览（如果存在回调）
             if hasattr(self, '_preview_callback') and self._preview_callback:
                 self._preview_callback()
             win.destroy()
