@@ -11380,7 +11380,7 @@ class FFmpegBatchGUI:
         h_scrollbar = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL)
         h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
         
-        columns = ("序号", "文件名", "输出路径", "命令 (简洁)", "状态", "错误信息")
+        columns = ("序号", "文件名", "输出路径", "命令 (简洁) 双击编辑", "状态", "错误信息")
         self.task_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=12,
                                       yscrollcommand=v_scrollbar.set,
                                       xscrollcommand=h_scrollbar.set)
@@ -11388,12 +11388,13 @@ class FFmpegBatchGUI:
         self.task_tree.tag_configure('even', background='#ffffff')
         v_scrollbar.config(command=self.task_tree.yview)
         h_scrollbar.config(command=self.task_tree.xview)
-        widths = {"序号":50, "文件名":150, "输出路径":200, "命令 (简洁)":400, "状态":80, "错误信息":200}
+        widths = {"序号":50, "文件名":150, "输出路径":200, "命令 (简洁) 双击编辑":400, "状态":80, "错误信息":200}
         for col in columns:
             self.task_tree.heading(col, text=col)
             self.task_tree.column(col, width=widths.get(col,100), minwidth=50, stretch=False)
         self.task_tree.pack(fill=tk.BOTH, expand=True)
         self.task_tree.bind("<Double-1>", self.on_task_double_click)
+
 
         merge_tab = ttk.Frame(self.notebook)
         self.notebook.add(merge_tab, text="封装/合并/画中画")
