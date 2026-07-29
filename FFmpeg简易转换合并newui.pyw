@@ -4100,6 +4100,7 @@ class FFmpegBatchGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("FFmpeg 多功能工具")
+        self._set_window_icon()
         screen_width = root.winfo_screenwidth()
         screen_height = root.winfo_screenheight()
         self.scaling = get_dpi_scaling(root)
@@ -4283,6 +4284,52 @@ class FFmpegBatchGUI:
             self.root.dnd_bind('<<Drop>>', self.on_files_dropped)
 
         self.show_quick_warning()
+
+    def _set_window_icon(self):
+        """设置窗口图标，使用与 find_executable 相同的路径搜索逻辑（不检查可执行权限）"""
+        icon_name = "35.ico"
+        script_dir = get_script_dir()
+        
+        # 1. 脚本目录（开发环境或 one-dir 顶层）
+        path = os.path.join(script_dir, icon_name)
+        if os.path.isfile(path):
+            try:
+                self.root.iconbitmap(default=path)
+                print(f"窗口图标加载成功: {path}")
+                return
+            except Exception as e:
+                print(f"加载图标失败 {path}: {e}")
+                return
+        
+        # 2. 打包后 one-dir 模式的 _internal 目录
+        if getattr(sys, 'frozen', False):
+            path = os.path.join(script_dir, '_internal', icon_name)
+            if os.path.isfile(path):
+                try:
+                    self.root.iconbitmap(default=path)
+                    print(f"窗口图标加载成功: {path}")
+                    return
+                except Exception as e:
+                    print(f"加载图标失败 {path}: {e}")
+                    return
+        
+        # 3. onefile 模式下的 _MEIPASS 临时目录
+        if getattr(sys, 'frozen', False):
+            meipass = getattr(sys, '_MEIPASS', None)
+            if meipass:
+                path = os.path.join(meipass, icon_name)
+                if os.path.isfile(path):
+                    try:
+                        self.root.iconbitmap(default=path)
+                        print(f"窗口图标加载成功: {path}")
+                        return
+                    except Exception as e:
+                        print(f"加载图标失败 {path}: {e}")
+                        return
+        
+        # 未找到图标
+        print("未找到窗口图标文件 35.ico")
+
 
     def update_progress(self, current=0, total=0, task=None, log_progress=True):
         """
@@ -10574,17 +10621,17 @@ class FFmpegBatchGUI:
         self.overwrite_policy.trace_add("write", lambda *a: self.save_player_settings())
         
         # 右：预览编辑权限控制
-        edit_frame = ttk.LabelFrame(horizontal_frame, text="预览编辑权限", padding="5")
+        edit_frame = ttk.LabelFrame(horizontal_frame, text="预览区编辑权限", padding="5")
         edit_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
         
         self.preview_edit_check = ttk.Checkbutton(
             edit_frame,
-            text="允许编辑预览（修改不影响实际转码）",
+            text="允许编辑预览命令（修改不影响实际转码）",
             variable=self.preview_editable_var,
             command=self._update_preview_edit_state
         )
         self.preview_edit_check.pack(anchor=tk.W, padx=5, pady=5)
-        ToolTip(self.preview_edit_check, "勾选后，所有命令预览区可编辑，方便修改后复制命令，不会影响实际转码。")
+        ToolTip(self.preview_edit_check, "勾选后，所有命令预览区可编辑，方便修改后复制命令，不会影响实际转码，改错后只需刷新命令就会还原。")
 
 
 
@@ -11133,10 +11180,12 @@ class FFmpegBatchGUI:
 
         io_frame = ttk.LabelFrame(settings_frame, text="输入 / 输出", padding="5")
         io_frame.pack(fill=tk.X, pady=5)
+        io_frame.columnconfigure(1, weight=1)
+        
         ttk.Label(io_frame, text="输入文件:").grid(row=0, column=0, sticky="w")
 
-        self.input_entry = ttk.Entry(io_frame, textvariable=self.input_file, width=90)
-        self.input_entry.grid(row=0, column=1, padx=5)
+        self.input_entry = ttk.Entry(io_frame, textvariable=self.input_file)
+        self.input_entry.grid(row=0, column=1, padx=5, sticky="ew")
         if DND_AVAILABLE:
             self.input_entry.drop_target_register(DND_FILES)
             self.input_entry.dnd_bind('<<Drop>>', self.on_input_drop)
@@ -11146,8 +11195,8 @@ class FFmpegBatchGUI:
 
         ttk.Label(io_frame, text="输出目录:").grid(row=1, column=0, sticky="w")
 
-        self.output_entry = ttk.Entry(io_frame, textvariable=self.output_dir, width=90)
-        self.output_entry.grid(row=1, column=1, padx=5)
+        self.output_entry = ttk.Entry(io_frame, textvariable=self.output_dir)
+        self.output_entry.grid(row=1, column=1, padx=5, sticky="ew")
         if DND_AVAILABLE:
             self.output_entry.drop_target_register(DND_FILES)
             self.output_entry.dnd_bind('<<Drop>>', self.on_output_drop)
