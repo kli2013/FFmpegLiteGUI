@@ -11383,10 +11383,8 @@ class FFmpegBatchGUI:
         columns = ("序号", "文件名", "输出路径", "命令 (简洁) 双击编辑", "状态", "错误信息")
         
         # ---- 高 DPI 适配 ----
-        scaling = self.scaling
         style = ttk.Style()
-        style.configure("Treeview", rowheight=int(22 * scaling), font=("Microsoft YaHei", int(9 * scaling)))
-        style.configure("Treeview.Heading", font=("Microsoft YaHei", int(10 * scaling)))
+        style.configure("Treeview", rowheight=int(22 * self.scaling))
         
         self.task_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=12,
                                       yscrollcommand=v_scrollbar.set,
