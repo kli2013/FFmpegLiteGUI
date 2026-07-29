@@ -1923,7 +1923,7 @@ class VideoFilterFrame(ttk.LabelFrame):
         win.title("高级增强滤镜")
         win.transient(self)
         win.grab_set()
-        center_window(win, 650, 450)  # 宽度稍宽，高度降低
+        center_window(win, 650, 430)  # 宽度稍宽，高度降低
     
         main = ttk.Frame(win, padding="10")
         main.pack(fill=tk.BOTH, expand=True)
@@ -2038,7 +2038,7 @@ class VideoFilterFrame(ttk.LabelFrame):
     
         # ---- 底部按钮 ----
         btn_frame = ttk.Frame(main)
-        btn_frame.pack(fill=tk.X, pady=10)
+        btn_frame.pack(fill=tk.X, pady=(5,10))
     
         def save_and_close():
             self.enhance_settings.update({
@@ -2047,7 +2047,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                 "denoise_temporal": self.denoise_temporal.get(),
                 "sharpen_enabled": self.sharpen_enabled.get(),
                 "sharpen_strength": self.sharpen_strength.get(),
-                "ivtc_enabled": self.ivtc_enabled.get() if not chk_ivtc.cget('state') == 'disabled' else False,
+                "ivtc_enabled": self.ivtc_enabled.get(),
                 "deblock_enabled": self.deblock_enabled.get(),
                 "deblock_strength": self.deblock_strength.get(),
                 "colorspace_enabled": self.colorspace_enabled.get(),
@@ -11125,16 +11125,33 @@ class FFmpegBatchGUI:
         main_frame = ttk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        left_container = ttk.Frame(main_frame)
-        left_container.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
+        main_paned = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
+        main_paned.pack(fill=tk.BOTH, expand=True)
 
-        right_panel = ttk.Frame(main_frame)
-        right_panel.grid(row=0, column=1, sticky="ns", padx=0, pady=0)
-        right_panel.pack_propagate(False)
-        right_panel.config(width=420)
-        main_frame.columnconfigure(0, weight=1)
-        main_frame.columnconfigure(1, weight=0)
-        main_frame.rowconfigure(0, weight=1)
+        left_container = ttk.Frame(main_paned)
+        right_panel = ttk.Frame(main_paned)
+
+        main_paned.add(left_container, weight=1)
+        main_paned.add(right_panel, weight=1)
+
+        self.left_container = left_container
+        self.right_panel = right_panel
+
+        def set_sash_position():
+            self.root.update_idletasks()
+            total_width = self.root.winfo_width()
+            
+            if total_width > 600:                    # 窗口已正常显示
+                sash_pos = int(total_width * 0.705)   # 左侧 %
+                main_paned.sashpos(0, sash_pos)
+            else:
+                # 窗口还没准备好，再等一下
+                self.root.after(100, set_sash_position)
+
+        # 多重保险
+        self.root.after(30, set_sash_position)
+        self.root.after(150, set_sash_position)
+        self.root.after(400, set_sash_position)
 
         info_frame = ttk.LabelFrame(right_panel, text="关键信息", padding="1")
         info_frame.pack(fill=tk.BOTH, expand=True, pady=(0,5))
