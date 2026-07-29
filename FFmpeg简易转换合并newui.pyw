@@ -2793,7 +2793,7 @@ class AudioFrame(ttk.LabelFrame):
         top_row.pack(fill=tk.X, pady=(0,5))
 
         if self.enable_checkbox:
-            self.audio_enabled = tk.BooleanVar(value=True)
+            self.audio_enabled = tk.BooleanVar(value=False)
             chk = ttk.Checkbutton(top_row, text="保留音频", variable=self.audio_enabled)
             chk.pack(side=tk.LEFT)
 
@@ -5327,7 +5327,7 @@ class FFmpegBatchGUI:
         preview_editable = settings.get("preview_editable", False)
         self.preview_editable_var.set(preview_editable)
 
-        pix_fmt_default = settings.get("pix_fmt_enabled_default", True)
+        pix_fmt_default = settings.get("pix_fmt_enabled_default", False)
         self.pix_fmt_enabled_default.set(pix_fmt_default)
 
         # 更新路径
