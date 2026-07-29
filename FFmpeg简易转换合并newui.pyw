@@ -2793,7 +2793,7 @@ class AudioFrame(ttk.LabelFrame):
         top_row.pack(fill=tk.X, pady=(0,5))
 
         if self.enable_checkbox:
-            self.audio_enabled = tk.BooleanVar(value=False)
+            self.audio_enabled = tk.BooleanVar(value=True)
             chk = ttk.Checkbutton(top_row, text="保留音频", variable=self.audio_enabled)
             chk.pack(side=tk.LEFT)
 
