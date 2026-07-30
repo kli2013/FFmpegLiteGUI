@@ -59,8 +59,7 @@
 ---
 
 ## 界面预览
-
-![主界面1](https://github.com/user-attachments/assets/08cb7048-ef43-4b0a-b340-15908099b500)
+![主界面1](https://github.com/user-attachments/assets/b939c5dd-f060-41d9-935d-a614a47db26e)
 ![主界面2](https://github.com/user-attachments/assets/e2bb13cb-fb94-4f16-845c-87c109d9778f)
 ![主界面3](https://github.com/user-attachments/assets/f836280e-4c7e-4d84-b62d-e7f0ef2fca82)
 
