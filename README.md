@@ -60,9 +60,9 @@
 
 ## 界面预览
 
-<img width="690" height="452" alt="11" src="https://github.com/user-attachments/assets/08cb7048-ef43-4b0a-b340-15908099b500" />
+![主界面1](https://github.com/user-attachments/assets/08cb7048-ef43-4b0a-b340-15908099b500)
 ![主界面2](https://github.com/user-attachments/assets/e2bb13cb-fb94-4f16-845c-87c109d9778f)
-<img width="1018" height="767" alt="33" src="https://github.com/user-attachments/assets/f836280e-4c7e-4d84-b62d-e7f0ef2fca82" />
+![主界面3](https://github.com/user-attachments/assets/f836280e-4c7e-4d84-b62d-e7f0ef2fca82)
 
 ---
 
