@@ -4181,6 +4181,13 @@ class FFmpegBatchGUI:
 
         self._stream_info_cache = {}
 
+        # ffprobe 并发数量计算
+        cpu_count = os.cpu_count() or 4
+        if cpu_count <= 16:
+            default_parallel = max(1, cpu_count - 4)
+        else:
+            default_parallel = 16
+        self.ffprobe_parallel = tk.IntVar(value=default_parallel)
         
         self._running_tasks = []  # 存储 (proc, task)
         
@@ -5338,6 +5345,12 @@ class FFmpegBatchGUI:
         self.pix_fmt_enabled_default.set(pix_fmt_default)
 
 
+        parallel = settings.get("ffprobe_parallel")
+        if parallel is not None and parallel > 0:
+            self.ffprobe_parallel.set(parallel)
+        else:
+            # 如果预设中没有值，则保存当前计算值（确保预设中有记录）
+            self.save_player_settings()
 
         # 更新路径
         self._update_ffmpeg_paths()
@@ -5355,6 +5368,7 @@ class FFmpegBatchGUI:
             "preview_editable": self.preview_editable_var.get(),
             "pix_fmt_enabled_default": self.pix_fmt_enabled_default.get(),
 
+            "ffprobe_parallel": self.ffprobe_parallel.get(),
         })
 
     def preview_with_player(self, input_path, filters=None, audio_only=False, volume=10,
@@ -8196,12 +8210,7 @@ class FFmpegBatchGUI:
         if os.path.isdir(path):
             self._append_info_ui(f"[封装] 忽略文件夹: {os.path.basename(path)}，请选择文件")
             return
-        if path in self._stream_info_cache:
-            info = self._stream_info_cache[path]
-        else:
-            info = ffprobe_json(self.ffprobe_cmd, path)
-            if info:
-                self._stream_info_cache[path] = info
+        info = self._get_cached_stream_info(path)
         if not info:
             self._append_info_ui(f"[封装] 无法解析文件: {path}")
             return
@@ -8261,12 +8270,7 @@ class FFmpegBatchGUI:
         if os.path.isdir(path):
             self._append_info_ui(f"[封装] 忽略文件夹: {os.path.basename(path)}，请选择文件")
             return
-        if path in self._stream_info_cache:
-            info = self._stream_info_cache[path]
-        else:
-            info = ffprobe_json(self.ffprobe_cmd, path)
-            if info:
-                self._stream_info_cache[path] = info
+        info = self._get_cached_stream_info(path)
         if not info:
             self._append_info_ui(f"[封装] 无法解析文件: {path}")
             return
@@ -8360,7 +8364,7 @@ class FFmpegBatchGUI:
             self.merge_update_track_list()
             self.merge_auto_recommend_container()
             self.merge_update_output_preview()
-            self.merge_update_command_preview()
+
     
     def _handle_drop_concat_mode(self, files):
         """
@@ -8394,7 +8398,7 @@ class FFmpegBatchGUI:
         try:
             # 从缓存中添加视频及其所有音频/字幕流
             for vf in video_files:
-                info = self._stream_info_cache.get(vf)
+                info = self._get_cached_stream_info(vf)
                 if not info:
                     self._append_info_ui(f"[封装] 无法获取 {os.path.basename(vf)} 的媒体信息，跳过")
                     continue
@@ -9409,8 +9413,26 @@ class FFmpegBatchGUI:
         # 恢复用户设置的编辑状态
         self.merge_cmd_preview.config(state=current_state)
 
+    def _get_cached_stream_info(self, path):
+        """
+        获取媒体流信息，带缓存。
+        缓存键 = (normalize_path(path), mtime)，文件修改后自动失效。
+        """
+        norm_path = normalize_path(path)
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = None
+        key = (norm_path, mtime)
+        if key in self._stream_info_cache:
+            return self._stream_info_cache[key]
+        info = ffprobe_json(self.ffprobe_cmd, path)
+        if info:
+            self._stream_info_cache[key] = info
+        return info
+
     def merge_get_media_info(self, path):
-        return ffprobe_json(self.ffprobe_cmd, path)
+        return self._get_cached_stream_info(path)
 
     def merge_load_video_info(self):
         path = self.merge_video.get().strip()
@@ -9424,7 +9446,7 @@ class FFmpegBatchGUI:
         try:
             ext = os.path.splitext(path)[1].lower().lstrip('.')
             self.original_container = ext if ext in ['mp4', 'mkv', 'mov', 'avi', 'webm'] else 'mp4'
-            info = ffprobe_json(self.ffprobe_cmd, path)
+            info = self._get_cached_stream_info(path)
             if not info:
                 self._append_info_ui(f"[封装] 无法解析媒体信息: {path}，可能 ffprobe 失败")
                 self.merge_tracks = []
@@ -10324,7 +10346,7 @@ class FFmpegBatchGUI:
             if not path:
                 return
 
-        info = ffprobe_json(self.ffprobe_cmd, path)
+        info = self._get_cached_stream_info(path)
         if not info:
             self._append_info_ui(f"[封装] 无法解析: {path}")
             return
@@ -10622,11 +10644,16 @@ class FFmpegBatchGUI:
 
     def _parse_files_concurrently(self, file_paths, max_workers=4, description="文件"):
         """
-        并发解析文件，结果存入 _stream_info_cache。
+        并发解析文件，结果自动存入 _stream_info_cache（通过 merge_get_media_info）。
         返回成功解析的文件路径列表。
         """
+        if max_workers is None:
+            max_workers = self.ffprobe_parallel.get()
+        if max_workers < 1:
+            max_workers = 1
         if not file_paths:
             return []
+        successful = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_path = {executor.submit(self.merge_get_media_info, f): f for f in file_paths}
             for future in concurrent.futures.as_completed(future_to_path):
@@ -10634,12 +10661,12 @@ class FFmpegBatchGUI:
                 try:
                     info = future.result()
                     if info:
-                        self._stream_info_cache[f] = info
+                        successful.append(f)
                     else:
                         self._append_info_ui(f"[封装] 无法解析{description}: {os.path.basename(f)}")
                 except Exception as e:
                     self._append_info_ui(f"[封装] 解析{description} {os.path.basename(f)} 异常: {e}")
-        return [f for f in file_paths if f in self._stream_info_cache]
+        return successful
     
     def _add_tracks_from_cache(self, file_paths, track_types=('audio', 'subtitle')):
         """
@@ -10648,7 +10675,7 @@ class FFmpegBatchGUI:
         """
         added = 0
         for f in file_paths:
-            info = self._stream_info_cache.get(f)
+            info = self._get_cached_stream_info(f)
             if not info:
                 continue
             streams = info.get('streams', [])
