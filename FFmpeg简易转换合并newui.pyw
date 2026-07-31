@@ -4180,6 +4180,7 @@ class FFmpegBatchGUI:
 
 
         self._stream_info_cache = {}
+        self._suppress_main_video_trace = False
 
         # ffprobe 并发数量计算
         cpu_count = os.cpu_count() or 4
@@ -4299,6 +4300,35 @@ class FFmpegBatchGUI:
             self.root.dnd_bind('<<Drop>>', self.on_files_dropped)
 
         self.show_quick_warning()
+
+    def _ensure_main_video(self, disable_scale=False):
+        """确保 self.merge_video 已设置：若未设置，则从列表中取第一个启用的视频轨道。
+        如果 disable_scale=True，则将该视频轨道的缩放禁用（仅当自动设置时）。
+        """
+        if not self.merge_video.get().strip():
+            enabled_videos = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
+            if enabled_videos:
+                # 临时禁用 trace，避免触发 merge_load_video_info
+                self._suppress_main_video_trace = True
+                self.merge_video.set(enabled_videos[0].file_path)
+                self._suppress_main_video_trace = False
+    
+                if disable_scale:
+                    # 禁用主视频的缩放
+                    main_track = enabled_videos[0]
+                    main_track.enc_settings["scale_enabled"] = False
+             #       main_track.enc_settings["scale_width"] = ""
+             #       main_track.enc_settings["scale_height"] = ""
+                    # 刷新列表，显示变化
+                    self.merge_update_track_list()
+    
+                self._append_info_ui(f"[自动] 主视频未设置，自动设为: {os.path.basename(enabled_videos[0].file_path)}")
+                return True
+            else:
+                self.merge_video.set("")
+                return False
+        return True
+
 
     def _set_window_icon(self):
         """设置窗口图标，使用与 find_executable 相同的路径搜索逻辑（不检查可执行权限）"""
@@ -7950,6 +7980,8 @@ class FFmpegBatchGUI:
         ttk.Button(tool_frame, text="删除", command=self.merge_delete_selected).pack(side=tk.LEFT, padx=2)
         ttk.Button(tool_frame, text="清空", command=self.merge_clear_tracks).pack(side=tk.LEFT, padx=2)
         ttk.Button(tool_frame, text="恢复列宽", command=self.merge_reset_column_widths).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text="按文件名排序", command=self.merge_sort_by_filename).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text="按修改时间排序", command=self.merge_sort_by_mtime).pack(side=tk.LEFT, padx=2)
     
         # 自定义样式
         merge_style = ttk.Style()
@@ -8185,6 +8217,61 @@ class FFmpegBatchGUI:
         self.concat_enabled.trace_add('write', self._on_concat_toggle)
 
 
+    def merge_sort_tracks(self, key_func):
+        """按文件分组排序轨道（同一文件的所有轨道保持在一起）"""
+        if not self.merge_tracks:
+            self._append_info_ui("[排序] 轨道列表为空，无需排序")
+            return
+    
+        # 按文件路径分组
+        file_groups = {}
+        for track in self.merge_tracks:
+            file_path = track.file_path
+            if file_path not in file_groups:
+                file_groups[file_path] = []
+            file_groups[file_path].append(track)
+    
+        # 对文件排序
+        sorted_files = sorted(file_groups.keys(), key=key_func)
+    
+        # 重建轨道列表
+        new_tracks = []
+        for f in sorted_files:
+            new_tracks.extend(file_groups[f])
+    
+        self.merge_tracks = new_tracks
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+        self._append_info_ui(f"[排序] 已按选择顺序重新排序，共 {len(self.merge_tracks)} 个轨道")
+    
+    def merge_sort_by_filename(self):
+        """按文件名自然排序（仅在串联模式下可用）"""
+        if not self.concat_enabled.get():
+            messagebox.showinfo("提示", "排序功能仅在「串行合并（首尾拼接）」模式下可用。\n请先勾选「串行合并（首尾拼接）」选项。")
+            return
+    
+        def natural_key(text):
+            import re
+            parts = [p for p in re.split(r'(\d+)', text) if p]  # 过滤空字符串
+            def convert(part):
+                return int(part) if part.isdigit() else part.lower()
+            return [convert(p) for p in parts]
+    
+        self.merge_sort_tracks(key_func=lambda p: natural_key(os.path.basename(p)))
+    
+    def merge_sort_by_mtime(self):
+        """按修改时间排序（仅在串联模式下可用）"""
+        if not self.concat_enabled.get():
+            messagebox.showinfo("提示", "排序功能仅在「串行合并（首尾拼接）」模式下可用。\n请先勾选「串行合并（首尾拼接）」选项。")
+            return
+        def get_mtime(p):
+            try:
+                return os.path.getmtime(p)
+            except OSError:
+                return 0
+        self.merge_sort_tracks(key_func=get_mtime)
+
+
     def _on_pip_toggle(self, *args):
         if self.pip_enabled.get() and self.concat_enabled.get():
             self.concat_enabled.set(False)
@@ -8365,7 +8452,9 @@ class FFmpegBatchGUI:
             self._batch_update = False
             self.merge_update_track_list()
             self.merge_auto_recommend_container()
+            self._ensure_main_video(disable_scale=True)
             self.merge_update_output_preview()
+            
 
     
     def _handle_drop_concat_mode(self, files):
@@ -8430,8 +8519,10 @@ class FFmpegBatchGUI:
             self._batch_update = False
             self.merge_update_track_list()
             self.merge_auto_recommend_container()
+            self._ensure_main_video()
             self.merge_update_output_preview()
-            self.merge_update_command_preview()
+
+
 
 
 
@@ -8865,7 +8956,6 @@ class FFmpegBatchGUI:
         audio_tracks = [t for t in enabled_tracks if t.type == "audio"]
     
         if only_audio:
-            # 仅音频模式：只收集音频文件的输入
             input_files = []
             file_index = {}
             audio_tracks = [t for t in enabled_tracks if t.type == "audio"]
@@ -9450,6 +9540,9 @@ class FFmpegBatchGUI:
         return self._get_cached_stream_info(path)
 
     def merge_load_video_info(self):
+        if self._suppress_main_video_trace:
+            return
+
         path = self.merge_video.get().strip()
         if not path or not os.path.exists(path):
             self.merge_tracks = []
