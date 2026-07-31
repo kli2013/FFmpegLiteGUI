@@ -3953,6 +3953,7 @@ class Task:
         self.progress = 0
         self._task_list_update_after = None   # 任务列表刷新去抖 ID
         self.stopped_by_user = False
+        self.is_custom = False
 
     def get_short_cmd(self):
         """生成简短显示命令（隐藏路径细节）"""
@@ -4175,7 +4176,11 @@ class FFmpegBatchGUI:
         
 
         self.preview_editable_var = tk.BooleanVar(value=False)
- 
+
+
+
+        self._stream_info_cache = {}
+
         
         self._running_tasks = []  # 存储 (proc, task)
         
@@ -4332,6 +4337,8 @@ class FFmpegBatchGUI:
         
         # 未找到图标
         print("未找到窗口图标文件 35.ico")
+
+
 
 
     def update_progress(self, current=0, total=0, task=None, log_progress=True):
@@ -5330,6 +5337,8 @@ class FFmpegBatchGUI:
         pix_fmt_default = settings.get("pix_fmt_enabled_default", False)
         self.pix_fmt_enabled_default.set(pix_fmt_default)
 
+
+
         # 更新路径
         self._update_ffmpeg_paths()
 
@@ -5345,6 +5354,7 @@ class FFmpegBatchGUI:
             "ffmpeg_dir_path": self.ffmpeg_dir_path.get(),
             "preview_editable": self.preview_editable_var.get(),
             "pix_fmt_enabled_default": self.pix_fmt_enabled_default.get(),
+
         })
 
     def preview_with_player(self, input_path, filters=None, audio_only=False, volume=10,
@@ -7743,6 +7753,8 @@ class FFmpegBatchGUI:
                 preview_text.config(state='disabled')
             
             def update_preview(*args):
+
+
                 new_settings = {}
                 new_settings.update(enc_frame.get_settings())
                 new_settings.update(filt_frame.get_settings())
@@ -7836,6 +7848,7 @@ class FFmpegBatchGUI:
             update_preview()
     
             def save_changes():
+
                 new_settings = {}
                 new_settings.update(enc_frame.get_settings())
                 new_settings.update(filt_frame.get_settings())
@@ -7922,7 +7935,9 @@ class FFmpegBatchGUI:
             canvas.itemconfig("all", width=event.width)
         canvas.bind("<Configure>", canvas_configure)
         def on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            if canvas.yview() != (0.0, 1.0):
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            return "break"
         canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", on_mousewheel))
         canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
         canvas.bind("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
@@ -8078,8 +8093,49 @@ class FFmpegBatchGUI:
         
         ttk.Checkbutton(
             opt_action_frame, text="验证输出文件", variable=self.merge_verify
-        ).pack(side=tk.LEFT, padx=(5,50))
+        ).pack(side=tk.LEFT, padx=5)
+
+        self.merge_only_audio = tk.BooleanVar(value=False)
+        self.only_audio_checkbox = ttk.Checkbutton(
+            opt_action_frame, 
+            text="仅音频", 
+            variable=self.merge_only_audio,
+            command=self.merge_update_command_preview
+        )
+        self.only_audio_checkbox.pack(side=tk.LEFT, padx=(5,50))
+        ToolTip(
+            self.only_audio_checkbox,
+            "仅音频（简易实现）：输出纯音频文件（无视频流）。\n\n"
+            "核心目的：将多个音频轨道进行混合（amix），各轨道仍可单独调节音量、截取或倒放。\n"
+            "    若只需提取单音轨，请使用转码页面的仅音频功能。\n\n"
+            "使用说明：\n"
+            "• 本功能依赖「主视频」作为参数占位（简易实现，未完全重构生成逻辑），\n"
+            "  您可随意拖入一个视频文件作为占位，并删除或禁用其音频轨道，\n"
+            "  然后添加需要处理的音频轨道，待所有音频设置完成后再勾选此选项执行。\n"
+            "  注意：请记得修改输出文件名。\n\n"
+            "• 仅普通封装模式（非画中画/串行合并）下可用；\n"
+            "  若勾选画中画或串行合并，此选项会自动禁用并取消勾选。\n\n"
+            "• 输出文件扩展名将自动调整为 .m4a（或根据所选容器生成）。\n"
+            "  若扩展名不符，可手动修改后复制到快速命令区运行。",
+            wraplength=600
+        )
         
+        # 增加状态联动：当画中画或串行合并模式变化时，禁用/启用该复选框
+        def _update_only_audio_state(*args):
+            if self.pip_enabled.get() or self.concat_enabled.get():
+                self.merge_only_audio.set(False)
+                self.only_audio_checkbox.config(state='disabled')
+                self._append_info_ui("[封装] 画中画/串行合并模式下不支持仅音频，已自动禁用")
+            else:
+                self.only_audio_checkbox.config(state='normal')
+            # 仅当主视频已设置时才刷新预览
+            if self.merge_video.get().strip():
+                self.root.after(40, self.merge_update_command_preview)
+        
+        self.pip_enabled.trace_add('write', _update_only_audio_state)
+        self.concat_enabled.trace_add('write', _update_only_audio_state)
+
+
         self.merge_btn = tk.Button(opt_action_frame, text="开始合并", command=self.merge_start,
                                    height=1, width=12, bg="#4CAF50", fg="white")
         self.merge_btn.pack(side=tk.LEFT, padx=5)
@@ -8140,10 +8196,16 @@ class FFmpegBatchGUI:
         if os.path.isdir(path):
             self._append_info_ui(f"[封装] 忽略文件夹: {os.path.basename(path)}，请选择文件")
             return
-        info = ffprobe_json(self.ffprobe_cmd, path)
+        if path in self._stream_info_cache:
+            info = self._stream_info_cache[path]
+        else:
+            info = ffprobe_json(self.ffprobe_cmd, path)
+            if info:
+                self._stream_info_cache[path] = info
         if not info:
             self._append_info_ui(f"[封装] 无法解析文件: {path}")
             return
+
     
         # 检测是否为图片
         img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
@@ -8199,10 +8261,16 @@ class FFmpegBatchGUI:
         if os.path.isdir(path):
             self._append_info_ui(f"[封装] 忽略文件夹: {os.path.basename(path)}，请选择文件")
             return
-        info = ffprobe_json(self.ffprobe_cmd, path)
+        if path in self._stream_info_cache:
+            info = self._stream_info_cache[path]
+        else:
+            info = ffprobe_json(self.ffprobe_cmd, path)
+            if info:
+                self._stream_info_cache[path] = info
         if not info:
             self._append_info_ui(f"[封装] 无法解析文件: {path}")
             return
+
     
         # 添加所有视频流（通常只有一个）
         video_streams = [s for s in info["streams"] if s.get("codec_type") == "video"]
@@ -8260,46 +8328,43 @@ class FFmpegBatchGUI:
             else:
                 other_files.append(f)
     
-        # 处理图片（直接添加）
-        for img in image_files:
-            self._add_pip_video_forced(img, add_audio=False)  # 图片无音频
+        self._batch_update = True
+        try:
+            # 图片
+            for img in image_files:
+                self._add_pip_video_forced(img, add_audio=False)
     
-        # 处理音频（直接添加为外部音轨）
-        for audio in audio_files:
-            self.merge_add_external("audio", audio)
+            # 音频
+            for audio in audio_files:
+                self.merge_add_external("audio", audio)
     
-        # 处理视频（询问是否添加音频）
-        if video_files:
-            # 批量时只询问一次
-            if len(video_files) > 1:
-                add_audio = messagebox.askyesno(
-                    "添加音频",
-                    f"是否同时添加这 {len(video_files)} 个视频文件的音频流？\n选“是”将添加所有音频流，选“否”仅添加视频作为水印。"
-                )
-            else:
-                add_audio = messagebox.askyesno(
-                    "添加音频",
-                    f"是否同时添加文件「{os.path.basename(video_files[0])}」的音频流？\n选“是”将添加音频，选“否”仅添加视频作为水印。"
-                )
+            # 视频
+            if video_files:
+                if len(video_files) > 1:
+                    add_audio = messagebox.askyesno(
+                        "添加音频",
+                        f"是否同时添加这 {len(video_files)} 个视频文件的音频流？\n选“是”将添加所有音频流，选“否”仅添加视频作为水印。"
+                    )
+                else:
+                    add_audio = messagebox.askyesno(
+                        "添加音频",
+                        f"是否同时添加文件「{os.path.basename(video_files[0])}」的音频流？\n选“是”将添加音频，选“否”仅添加视频作为水印。"
+                    )
+                for video in video_files:
+                    self._add_pip_video_forced(video, add_audio=add_audio)
     
-            for video in video_files:
-                self._add_pip_video_forced(video, add_audio=add_audio)
-    
-        # 其他文件提示
-        if other_files:
-            self._append_info_ui(f"[拖拽] 忽略不支持的文件类型: {', '.join(os.path.basename(f) for f in other_files)}")
-    
-        # 最后统一更新界面
-        self.merge_update_track_list()
-        self.merge_auto_recommend_container()
-        self.merge_update_output_preview()
+            if other_files:
+                self._append_info_ui(f"[拖拽] 忽略不支持的文件类型: {', '.join(os.path.basename(f) for f in other_files)}")
+        finally:
+            self._batch_update = False
+            self.merge_update_track_list()
+            self.merge_auto_recommend_container()
+            self.merge_update_output_preview()
+            self.merge_update_command_preview()
     
     def _handle_drop_concat_mode(self, files):
         """
-        串行合并模式下的拖拽处理（不询问，直接添加所有视频/音频/字幕）
-        - 视频：添加所有视频流、音频流、字幕流
-        - 音频：直接添加为独立音轨（虽然串行合并主要用视频自带的音频，但用户可以手动调整）
-        - 字幕：直接添加为独立字幕轨
+        串行合并模式下的拖拽处理（优化：并发解析视频文件）
         """
         if not files:
             return
@@ -8308,23 +8373,59 @@ class FFmpegBatchGUI:
         audio_exts = ('.mp3', '.aac', '.m4a', '.wav', '.flac', '.ogg', '.opus', '.ac3', '.dts')
         subtitle_exts = ('.srt', '.ass', '.ssa', '.vtt', '.idx', '.sup')
     
+        video_files = []
+        other_files = []
         for f in files:
             if os.path.isdir(f):
                 self._append_info_ui(f"[封装] 忽略文件夹: {os.path.basename(f)}，请选择文件")
                 continue
             ext = os.path.splitext(f)[1].lower()
             if ext in video_exts:
-                self._add_concat_video_forced(f)  # 自动添加所有流
-            elif ext in audio_exts:
-                self.merge_add_external("audio", f)
-            elif ext in subtitle_exts:
-                self.merge_add_external("subtitle", f)
+                video_files.append(f)
             else:
-                self._append_info_ui(f"[拖拽] 忽略不支持的文件: {os.path.basename(f)}")
+                other_files.append(f)
     
-        self.merge_update_track_list()
-        self.merge_auto_recommend_container()
-        self.merge_update_output_preview()
+        # ---- 并发解析视频文件 ----
+        if video_files:
+            self._parse_files_concurrently(video_files, description="串联视频文件")
+    
+        # ---- 添加所有轨道（批量） ----
+        self._batch_update = True
+        try:
+            # 从缓存中添加视频及其所有音频/字幕流
+            for vf in video_files:
+                info = self._stream_info_cache.get(vf)
+                if not info:
+                    self._append_info_ui(f"[封装] 无法获取 {os.path.basename(vf)} 的媒体信息，跳过")
+                    continue
+                streams = info.get('streams', [])
+                for s in streams:
+                    st = s.get('codec_type')
+                    if st not in ('video', 'audio', 'subtitle'):
+                        continue
+                    # 检查是否已存在相同轨道（避免重复）
+                    exists = any(t.file_path == vf and t.index == s['index'] for t in self.merge_tracks)
+                    if exists:
+                        continue
+                    track = Track(s['index'], st, s.get('codec_name', 'unknown'), vf, True)
+                    self.merge_tracks.append(track)
+                self._append_info_ui(f"[封装] 已添加串联视频: {os.path.basename(vf)}")
+    
+            # 处理其他文件（音频/字幕）
+            for f in other_files:
+                ext = os.path.splitext(f)[1].lower()
+                if ext in audio_exts:
+                    self.merge_add_external("audio", f)
+                elif ext in subtitle_exts:
+                    self.merge_add_external("subtitle", f)
+                else:
+                    self._append_info_ui(f"[拖拽] 忽略不支持的文件: {os.path.basename(f)}")
+        finally:
+            self._batch_update = False
+            self.merge_update_track_list()
+            self.merge_auto_recommend_container()
+            self.merge_update_output_preview()
+            self.merge_update_command_preview()
 
 
 
@@ -8703,7 +8804,7 @@ class FFmpegBatchGUI:
         """
         根据单个音频轨道的设置构建音频滤镜链（不含 -af 前缀）。
         返回滤镜字符串，若无滤镜则返回空字符串。
-        include_reverse: 外部传入的倒放标志，若为 True 则强制添加 areverse（无视轨道自身的 reverse_enabled）。
+        include_reverse 作为默认倒放标志，若轨道有 audio_reverse 则优先使用。
         """
         filters = []
         # 截取
@@ -8730,7 +8831,7 @@ class FFmpegBatchGUI:
             if vol != 1.0:
                 filters.append(f"volume={vol:.2f}")
     
-        # 变速（每个音频轨道独立）
+        # 变速
         if include_speed and track_settings.get("speed_enabled", False):
             factor = float(track_settings.get("speed_factor", "1.0"))
             if factor != 1.0 and factor > 0:
@@ -8738,77 +8839,99 @@ class FFmpegBatchGUI:
                 if atempo:
                     filters.append(atempo)
     
-        # 倒放（由外部参数控制，不检查轨道自身设置）
-        if include_reverse:
+        # 倒放：优先使用轨道独立设置，否则使用传入的 include_reverse
+        track_reverse = track_settings.get("audio_reverse")
+        if track_reverse is None:
+            track_reverse = include_reverse
+        if track_reverse:
             filters.append("areverse")
     
         return ",".join(filters) if filters else ""
     
-    def _build_normal_cmd(self, enabled_tracks, output_norm):
+    def _build_normal_cmd(self, enabled_tracks, output_norm, only_audio=False):
         """
         普通封装模式：支持视频滤镜、多音频/字幕、音频截取、音频混合（amix）与音量调整。
+        若 only_audio=True，则仅处理音频流，忽略视频和字幕。
         """
         cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
     
-        # 获取视频轨道
-        video_tracks = [t for t in enabled_tracks if t.type == "video"]
-        if not video_tracks:
-            self._append_info_ui("[封装] 没有启用的视频轨道")
-            return []
-        main_video = video_tracks[0]
-    
-        # 在添加输入之前插入硬件解码参数（使用主视频设置）
-        self._add_hwaccel_params(cmd, main_video.enc_settings)
-    
-        # 准备输入文件和索引
-        input_files, file_index = self._prepare_tracks_and_inputs(enabled_tracks)
-    
-        # 添加输入选项（-i 及前置 -ss/-to）
-        cmd = self._add_input_options(cmd, input_files, main_video)
-    
-        # ---- 视频处理 ----
-        v_idx = file_index[main_video.file_path]
-        cmd.extend(["-map", f"{v_idx}:v:{main_video._type_index}"])
-        v_settings = main_video.enc_settings
-        vcodec = v_settings.get("encoder", "copy")
-    
-        # 确定是否允许倒放：仅当视频编码器不是 copy 时才允许音频倒放
-        reverse_flag = v_settings.get("reverse_enabled", False)
-        if vcodec == "copy" and reverse_flag:
-            reverse_flag = False
-            self._append_info_ui("[封装] 主视频为流复制模式，已自动禁用音频倒放（避免音画不同步）")
-    
-        if vcodec == "copy":
-            cmd.extend(["-c:v", "copy"])
-        else:
-            video_filters = build_video_filter_chain(
-                v_settings,
-                include_subtitle=False,
-                include_speed=False,
-                enhance_settings=v_settings.get("enhance", {}),
-                reverse=v_settings.get("reverse_enabled", False)   # 视频倒放（由编码器非copy保证）
-            )
-            if video_filters and video_filters != "null":
-                cmd.extend(["-vf", video_filters])
-            strategy = get_encoder_strategy(vcodec)
-            cmd = strategy.build_params(cmd, v_settings)
-    
-        # ---- 音频处理 ----
+        # 获取所有音频轨道（无论是否仅音频模式）
         audio_tracks = [t for t in enabled_tracks if t.type == "audio"]
+    
+        if only_audio:
+            # 仅音频模式：只收集音频文件的输入
+            input_files = []
+            file_index = {}
+            for t in audio_tracks:
+                if t.file_path not in file_index:
+                    file_index[t.file_path] = len(input_files)
+                    input_files.append(t.file_path)
+            for f in input_files:
+                cmd.extend(["-i", normalize_path(f)])
+            main_video = None
+            video_reverse = False
+            video_tracks = []
+        else:
+            # 完整模式
+            input_files, file_index = self._prepare_tracks_and_inputs(enabled_tracks)
+            video_tracks = [t for t in enabled_tracks if t.type == "video"]
+            if not video_tracks:
+                self._append_info_ui("[封装] 没有启用的视频轨道")
+                return []
+            main_video = video_tracks[0]
+    
+            # 在添加输入之前插入硬件解码参数（使用主视频设置）
+            self._add_hwaccel_params(cmd, main_video.enc_settings)
+    
+            # 准备输入文件和索引
+            input_files, file_index = self._prepare_tracks_and_inputs(enabled_tracks)
+    
+            # 添加输入选项（-i 及前置 -ss/-to）
+            cmd = self._add_input_options(cmd, input_files, main_video)
+    
+            # 视频处理
+            v_idx = file_index[main_video.file_path]
+            cmd.extend(["-map", f"{v_idx}:v:{main_video._type_index}"])
+            v_settings = main_video.enc_settings
+            vcodec = v_settings.get("encoder", "copy")
+            video_reverse = v_settings.get("reverse_enabled", False)
+            if vcodec == "copy" and video_reverse:
+                video_reverse = False
+                self._append_info_ui("[封装] 主视频为流复制模式，已自动禁用视频倒放")
+    
+            if vcodec == "copy":
+                cmd.extend(["-c:v", "copy"])
+            else:
+                video_filters = build_video_filter_chain(
+                    v_settings,
+                    include_subtitle=False,
+                    include_speed=False,
+                    enhance_settings=v_settings.get("enhance", {}),
+                    reverse=video_reverse
+                )
+                if video_filters and video_filters != "null":
+                    cmd.extend(["-vf", video_filters])
+                strategy = get_encoder_strategy(vcodec)
+                cmd = strategy.build_params(cmd, v_settings)
+    
+        # ---- 音频处理（所有模式） ----
         mix_tracks = [t for t in audio_tracks if t.enc_settings.get("mix_enabled", False)]
     
-        if len(mix_tracks) == 0:
+        if not mix_tracks:
             audio_map_count = 0
             for audio in audio_tracks:
                 a_idx = file_index[audio.file_path]
                 cmd.extend(["-map", f"{a_idx}:a:{audio._type_index}"])
                 audio.enc_settings["_file_path"] = audio.file_path
+                track_reverse = audio.enc_settings.get("audio_reverse")
+                if track_reverse is None:
+                    track_reverse = video_reverse
                 af_str = self._build_audio_filters(
                     audio.enc_settings,
                     include_trim=True,
                     include_volume=True,
                     include_speed=True,
-                    include_reverse=reverse_flag
+                    include_reverse=track_reverse
                 )
                 enc = audio.enc_settings.get("encoder", "copy")
                 if af_str:
@@ -8830,7 +8953,6 @@ class FFmpegBatchGUI:
             else:
                 cmd.extend(["-disposition:a:0", "default"])
         else:
-            # 混合模式
             if len(mix_tracks) == 1:
                 audio = mix_tracks[0]
                 a_idx = file_index[audio.file_path]
@@ -8841,7 +8963,7 @@ class FFmpegBatchGUI:
                     include_trim=True,
                     include_volume=True,
                     include_speed=True,
-                    include_reverse=reverse_flag
+                    include_reverse=audio.enc_settings.get("audio_reverse", video_reverse)
                 )
                 enc = audio.enc_settings.get("encoder", "copy")
                 if af_str:
@@ -8869,7 +8991,7 @@ class FFmpegBatchGUI:
                         include_trim=True,
                         include_volume=True,
                         include_speed=False,
-                        include_reverse=reverse_flag
+                        include_reverse=audio.enc_settings.get("audio_reverse", video_reverse)
                     )
                     if af_str:
                         filter_parts.append(f"[{a_idx}:a]{af_str}[a{i}]")
@@ -8890,11 +9012,19 @@ class FFmpegBatchGUI:
                     "-ar", first_mix.enc_settings.get("samplerate", "44100")
                 ])
                 cmd.extend(["-disposition:a:0", "default"])
-                cmd.append("-shortest")
     
-        # ---- 字幕、章节、容器优化 ----
-        self._add_subtitles_and_chapters(cmd, enabled_tracks, file_index, input_files)
-        self._add_container_optimization(cmd)
+        if only_audio:
+            cmd.append("-vn")
+    
+        # 字幕与章节（仅非仅音频模式）
+        if not only_audio:
+            self._add_subtitles_and_chapters(cmd, enabled_tracks, file_index, input_files)
+    
+        # 容器优化
+        container = self.merge_container.get().lower()
+        if container in ("mp4", "mov") and not only_audio:
+            cmd.extend(["-movflags", "+faststart"])
+    
         cmd.append(output_norm)
         return cmd
     
@@ -9176,6 +9306,9 @@ class FFmpegBatchGUI:
         return cmd
     
     def merge_build_cmd_list(self, output_override=None, preview=False) -> List[str]:
+        """
+        根据当前模式生成合并/封装的 FFmpeg 命令列表。
+        """
         if not self.ffmpeg_cmd:
             self._append_info_ui("未找到 ffmpeg，无法生成合并命令。")
             return []
@@ -9187,21 +9320,39 @@ class FFmpegBatchGUI:
         if not output:
             return []
     
-        output_norm = normalize_path(output)
+        only_audio = self.merge_only_audio.get() if hasattr(self, 'merge_only_audio') else False
         enabled_tracks = [t for t in self.merge_tracks if t.enabled]
         if not enabled_tracks:
             self._append_info_ui("[封装] 没有启用的轨道")
             return []
     
-        # 根据模式生成命令
-        if self.pip_enabled.get():
-            cmd_list = self._build_pip_cmd(enabled_tracks, output_norm)
-        elif self.concat_enabled.get():
-            cmd_list = self._build_concat_cmd(enabled_tracks, output_norm, preview=preview)
-        else:
-            cmd_list = self._build_normal_cmd(enabled_tracks, output_norm)
+        output_norm = normalize_path(output)
     
-        # ------ 手动时长覆盖（最高优先级） ------
+        # ---- 仅音频模式：强制普通封装，并自动调整输出扩展名 ----
+        if only_audio:
+            self._append_info_ui("[封装] 已切换为仅音频模式（忽略视频和字幕）")
+            if self.pip_enabled.get() or self.concat_enabled.get():
+                self._append_info_ui("[封装] 仅音频模式已自动切换到普通封装模式")
+            # 如果扩展名不是常见音频格式，改为 .m4a
+            base, ext = os.path.splitext(output_norm)
+            if ext.lower() not in ('.m4a', '.mp3', '.flac', '.wav', '.aac', '.opus', '.ac3', '.ogg'):
+                output_norm = base + ".m4a"
+                self._append_info_ui(f"[封装] 仅音频模式，输出扩展名自动改为 .m4a")
+            cmd_list = self._build_normal_cmd(enabled_tracks, output_norm, only_audio=True)
+        else:
+            # 根据模式选择命令生成函数
+            if self.pip_enabled.get():
+                cmd_list = self._build_pip_cmd(enabled_tracks, output_norm)
+            elif self.concat_enabled.get():
+                cmd_list = self._build_concat_cmd(enabled_tracks, output_norm, preview=preview)
+            else:
+                cmd_list = self._build_normal_cmd(enabled_tracks, output_norm)
+    
+        if not cmd_list:
+            self._append_info_ui("[封装] 命令生成失败，请检查设置")
+            return []
+    
+        # ---- 手动时长覆盖（最高优先级） ----
         if self.merge_manual_duration_enabled.get():
             dur_str = self.merge_manual_duration.get().strip()
             if dur_str:
@@ -9216,16 +9367,14 @@ class FFmpegBatchGUI:
                             continue
                         if arg in ('-t', '-shortest'):
                             if arg == '-t':
-                                # 如果下一个参数不是选项（即 -t 的值），跳过
                                 if i+1 < len(cmd_list) and not cmd_list[i+1].startswith('-'):
                                     skip_next = True
                             continue
                         new_cmd.append(arg)
-                    # 在输出文件之前插入 -t（输出文件是最后一个元素）
                     if new_cmd and new_cmd[-1] != '-t':
-                        output = new_cmd.pop()
+                        output_path = new_cmd.pop()
                         new_cmd.extend(['-t', f'{dur_sec:.3f}'])
-                        new_cmd.append(output)
+                        new_cmd.append(output_path)
                     cmd_list = new_cmd
                 else:
                     self._append_info_ui("警告：手动时长格式无效，已忽略")
@@ -9300,9 +9449,12 @@ class FFmpegBatchGUI:
             self.merge_update_output_preview()
         finally:
             self._batch_update = False
+            self.merge_update_track_list()
             self.merge_update_command_preview()  # 最终统一刷新一次
 
     def merge_update_track_list(self):
+        if self._batch_update:
+            return
         for w in self.merge_track_frame.winfo_children():
             w.destroy()
         if not self.merge_tracks:
@@ -9931,7 +10083,7 @@ class FFmpegBatchGUI:
         track = self.merge_tracks[track_idx]
         with self.SafeToplevel(self.root) as win:
             win.title(f"音频轨道设置 - {track.codec}")
-            center_window(win, 500, 500)
+            center_window(win, 500, 510)
             win.transient(self.root)
     
             main_frame = ttk.Frame(win, padding="10")
@@ -10013,8 +10165,8 @@ class FFmpegBatchGUI:
                 mix_enabled_var = tk.BooleanVar(value=False)
     
 
-            # ---- 画中画模式：独立音频倒放 ----
-            if is_pip:
+            # ---- 音频倒放（独立于视频，普通和画中画模式可用） ----
+            if not is_concat:
                 reverse_frame = ttk.Frame(main_frame)
                 reverse_frame.pack(fill=tk.X, pady=5)
                 audio_reverse_var = tk.BooleanVar(value=track.enc_settings.get("audio_reverse", False))
@@ -10079,7 +10231,7 @@ class FFmpegBatchGUI:
                     "volume": vol_value_var.get(),
                     "volume_enabled": vol_enabled_var.get(),
                 })
-                if is_pip:
+                if not is_concat:
                     track.enc_settings["audio_reverse"] = audio_reverse_var.get()
                 else:
                     track.enc_settings.pop("audio_reverse", None)  # 清除残留
@@ -10468,24 +10620,132 @@ class FFmpegBatchGUI:
                     self.merge_add_external("subtitle", path)
         self.root.after(0, process)
 
+    def _parse_files_concurrently(self, file_paths, max_workers=4, description="文件"):
+        """
+        并发解析文件，结果存入 _stream_info_cache。
+        返回成功解析的文件路径列表。
+        """
+        if not file_paths:
+            return []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_path = {executor.submit(self.merge_get_media_info, f): f for f in file_paths}
+            for future in concurrent.futures.as_completed(future_to_path):
+                f = future_to_path[future]
+                try:
+                    info = future.result()
+                    if info:
+                        self._stream_info_cache[f] = info
+                    else:
+                        self._append_info_ui(f"[封装] 无法解析{description}: {os.path.basename(f)}")
+                except Exception as e:
+                    self._append_info_ui(f"[封装] 解析{description} {os.path.basename(f)} 异常: {e}")
+        return [f for f in file_paths if f in self._stream_info_cache]
+    
+    def _add_tracks_from_cache(self, file_paths, track_types=('audio', 'subtitle')):
+        """
+        从缓存中读取指定文件列表的流信息，添加轨道到 merge_tracks（自动去重）。
+        返回成功添加的轨道数量。
+        """
+        added = 0
+        for f in file_paths:
+            info = self._stream_info_cache.get(f)
+            if not info:
+                continue
+            streams = info.get('streams', [])
+            for s in streams:
+                st = s.get('codec_type')
+                if st not in track_types:
+                    continue
+                # 检查是否已存在相同轨道（避免重复）
+                exists = any(t.file_path == f and t.index == s['index'] for t in self.merge_tracks)
+                if exists:
+                    continue
+                track = Track(s['index'], st, s.get('codec_name', 'unknown'), f, True)
+                self.merge_tracks.append(track)
+                added += 1
+        return added
+
     def merge_handle_batch_dropped(self, files):
+        """
+        批量拖拽文件到合并标签页时的处理（普通模式）
+        """
+        # 分类文件
+        files_sorted = sorted(files, key=lambda x: os.path.basename(x).lower())
+        video_exts = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.ts', '.webm', '.m2ts', '.mpg', '.mpeg', '.wmv')
+        video_files = []
+        other_files = []
+        for f in files_sorted:
+            if os.path.isdir(f):
+                continue
+            ext = os.path.splitext(f)[1].lower()
+            if ext in video_exts:
+                video_files.append(f)
+            else:
+                other_files.append(f)
+    
+        # ---- 没有视频文件 ----
+        if not video_files:
+            if self.merge_video.get().strip():
+                # 已有主视频，直接添加音频/字幕
+                self._batch_update = True
+                try:
+                    # 并发解析其他文件
+                    self._parse_files_concurrently(other_files, description="音频/字幕文件")
+                    # 从缓存添加轨道
+                    self._add_tracks_from_cache(other_files)
+                finally:
+                    self._batch_update = False
+                    self.merge_update_track_list()
+                    self.merge_auto_recommend_container()
+                    self.merge_update_command_preview()
+                    self._append_info_ui(f"[封装] 已添加 {len(other_files)} 个音频/字幕文件")
+                return
+            else:
+                messagebox.showinfo("提示", "未检测到视频文件，请先拖入或选择视频作为主视频")
+                return
+    
+        # ---- 有视频文件 ----
+        if len(video_files) > 10:
+            result = messagebox.askyesno(
+                "批量处理提示",
+                f"您正在普通模式下拖拽 {len(video_files)} 个视频文件，解析可能较慢。\n\n"
+                "建议：\n"
+                "• 若文件数超过 10 个，推荐使用「串行合并」模式批量添加。\n"
+                "  这个模式无多余解析，添加速度快，可添加完后切换回普通模式增删。\n\n"
+                "是否继续使用普通模式？\n（选“是”继续，选“否”取消本次操作）",
+                icon='warning'
+            )
+            if not result:
+                self._append_info_ui("[封装] 用户取消批量添加，请切换到串行或画中画模式重试。")
+                return
+    
+        # 后台解析视频文件
         def run_in_thread():
-            files_sorted = sorted(files, key=lambda x: os.path.basename(x).lower())
-            video_exts = ['.mp4','.mkv','.avi','.mov','.flv','.ts','.webm','.m2ts']
-            video_files = [f for f in files_sorted if os.path.splitext(f)[1].lower() in video_exts]
-            other_files = [f for f in files_sorted if f not in video_files]
-            root_tk = self.root
-            dialog = tk.Toplevel(root_tk)
-            dialog.title("批量处理选项")
-            height = min(350 + len(video_files) * 25, 600) + 20
-            center_window(dialog, 600, height)
-            dialog.transient(root_tk)
-            dialog.grab_set()
-            has_main = bool(self.merge_video.get().strip())
-            info_text = "请选择操作：\n\n• [All] 按钮：仅添加音频（不改变主视频）\n• 点击下方视频按钮：设为主视频，其余添加音频"
-            tk.Label(dialog, text=info_text, justify=tk.LEFT).pack(pady=10, padx=10)
-            def all_action():
-                def do_all():
+            self._parse_files_concurrently(video_files, description="视频文件")
+            self.root.after(0, self._show_main_video_selection_dialog, video_files, other_files)
+    
+        threading.Thread(target=run_in_thread, daemon=True).start()
+    
+    def _show_main_video_selection_dialog(self, video_files, other_files):
+        """
+        显示选择主视频的对话框（在主线程中执行）
+        """
+        root_tk = self.root
+        dialog = tk.Toplevel(root_tk)
+        dialog.title("批量处理选项")
+        height = min(350 + len(video_files) * 25, 600) + 40
+        center_window(dialog, 600, height)
+        dialog.transient(root_tk)
+        dialog.grab_set()
+    
+        has_main = bool(self.merge_video.get().strip())
+        info_text = "请选择操作：\n\n• [All] 按钮：仅添加音频（不改变主视频）\n• 点击下方视频按钮：设为主视频，其余添加音频"
+        tk.Label(dialog, text=info_text, justify=tk.LEFT).pack(pady=10, padx=10)
+    
+        def all_action():
+            def do_all():
+                self._batch_update = True
+                try:
                     if not has_main and video_files:
                         main = video_files[0]
                         self.merge_video.set(main)
@@ -10493,56 +10753,68 @@ class FFmpegBatchGUI:
                         start_idx = 1
                     else:
                         start_idx = 0
-                    for f in video_files[start_idx:]:
-                        self.merge_add_external("audio", f)
-                        self.merge_add_external("subtitle", f)
+                    # 添加除主视频外的其他视频的音频/字幕
+                    self._add_tracks_from_cache(video_files[start_idx:])
+                    # 处理其他文件（音频/字幕）
                     for f in other_files:
                         self.merge_handle_dropped_file(f)
+                finally:
+                    self._batch_update = False
                     self.merge_update_track_list()
                     self.merge_auto_recommend_container()
+                    self.merge_update_output_preview()
                     self.merge_update_command_preview()
-                    dialog.destroy()
-                self.root.after(0, do_all)
-            btn_all = tk.Button(dialog, text="[All] 仅音频", command=all_action,
-                                bg="#4CAF50", fg="white", width=22, wraplength=300)
-            btn_all.pack(pady=5, padx=10)
-            canvas_frame = ttk.Frame(dialog)
-            canvas_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-            canvas = tk.Canvas(canvas_frame, highlightthickness=0)
-            scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=canvas.yview)
-            scrollable_frame = ttk.Frame(canvas)
-            scrollable_frame.bind(
-                "<Configure>",
-                lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-            )
-            canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-            canvas.configure(yscrollcommand=scrollbar.set)
-            def select_main_video(idx):
-                def do_select():
+                dialog.destroy()
+            self.root.after(0, do_all)
+    
+        btn_all = tk.Button(dialog, text="[All] 仅音频", command=all_action,
+                            bg="#4CAF50", fg="white", width=22, wraplength=300)
+        btn_all.pack(pady=5, padx=10)
+    
+        # 视频选择列表
+        canvas_frame = ttk.Frame(dialog)
+        canvas_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        canvas = tk.Canvas(canvas_frame, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+    
+        def select_main_video(idx):
+            def do_select():
+                self._batch_update = True
+                try:
                     main = video_files[idx]
                     self.merge_video.set(main)
                     self._append_info_ui(f"[封装] 设置主视频为: {os.path.basename(main)}")
-                    for i, f in enumerate(video_files):
-                        if i != idx:
-                            self.merge_add_external("audio", f)
-                            self.merge_add_external("subtitle", f)
+                    # 添加除主视频外的其他视频的音频/字幕
+                    other_videos = [f for i, f in enumerate(video_files) if i != idx]
+                    self._add_tracks_from_cache(other_videos)
+                    # 处理其他文件（音频/字幕）
                     for f in other_files:
                         self.merge_handle_dropped_file(f)
+                finally:
+                    self._batch_update = False
                     self.merge_update_track_list()
                     self.merge_auto_recommend_container()
+                    self.merge_update_output_preview()
                     self.merge_update_command_preview()
-                    dialog.destroy()
-                self.root.after(0, do_select)
-            for i, vf in enumerate(video_files):
-                btn = tk.Button(scrollable_frame, text=f"{i+1}. {os.path.basename(vf)}",
-                                wraplength=550, anchor="w", justify=tk.LEFT,
-                                command=lambda idx=i: select_main_video(idx))
-                btn.pack(fill=tk.X, pady=2, padx=5)
-            canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-            tk.Button(dialog, text="取消", command=dialog.destroy).pack(pady=10)
-            dialog.wait_window()
-        threading.Thread(target=run_in_thread, daemon=True).start()
+                dialog.destroy()
+            self.root.after(0, do_select)
+    
+        for i, vf in enumerate(video_files):
+            btn = tk.Button(scrollable_frame, text=f"{i+1}. {os.path.basename(vf)}",
+                            wraplength=550, anchor="w", justify=tk.LEFT,
+                            command=lambda idx=i: select_main_video(idx))
+            btn.pack(fill=tk.X, pady=2, padx=5)
+    
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        tk.Button(dialog, text="取消", command=dialog.destroy).pack(pady=10)
 
     def clear_input_output(self):
         """清空输入文件和输出目录（带确认）"""
@@ -11132,6 +11404,10 @@ class FFmpegBatchGUI:
 
 
 
+
+
+
+
     # -------------------- 界面创建 --------------------
     def create_widgets(self):
         main_frame = ttk.Frame(self.root)
@@ -11428,6 +11704,7 @@ class FFmpegBatchGUI:
         merge_tab = ttk.Frame(self.notebook)
         self.notebook.add(merge_tab, text="封装/合并/画中画")
         self.create_merge_tab(merge_tab)
+
 
         player_tab = ttk.Frame(self.notebook)
         self.notebook.add(player_tab, text="信息与播放器")
