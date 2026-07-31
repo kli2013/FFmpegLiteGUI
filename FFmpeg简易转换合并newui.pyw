@@ -5458,6 +5458,7 @@ class FFmpegBatchGUI:
             settings,
             include_subtitle=True,
             include_speed=False,
+            include_trim=False,
             enhance_settings=enhance_settings,
             reverse=False
         )
@@ -7924,60 +7925,61 @@ class FFmpegBatchGUI:
         ttk.Label(f1, text="主视频文件:").pack(side=tk.LEFT)
         ttk.Entry(f1, textvariable=self.merge_video).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         ttk.Button(f1, text="浏览", command=self.merge_select_video).pack(side=tk.RIGHT, padx=(2,15))
-
+    
         if DND_AVAILABLE:
-            label_text = "轨道列表（可单独设置编码参数，支持批量拖拽添加文件）"
+            label_text = "轨道列表（可双击编辑单独设置编码参数，支持批量拖拽添加文件）"
         else:
-            label_text = "轨道列表（可单独设置编码参数）"
+            label_text = "轨道列表（可双击编辑单独设置编码参数）"
         ttk.Label(parent, text=label_text).pack(anchor=tk.W, pady=(0,2))
-
+    
+        # 轨道列表（Treeview）
         list_container = ttk.Frame(parent)
-        list_container.pack(fill=tk.X, pady=5)
-        list_container.pack_propagate(False)
-        min_height = int(400 * self.scaling)
-        list_container.config(height=min_height)
-
-        canvas = tk.Canvas(list_container, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        self.merge_track_frame = ttk.Frame(canvas, relief=tk.SUNKEN, borderwidth=1)
-        canvas.create_window((0, 0), window=self.merge_track_frame, anchor="nw", width=canvas.winfo_width())
-        def configure_scroll_region(event):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-        self.merge_track_frame.bind("<Configure>", configure_scroll_region)
-        def canvas_configure(event):
-            canvas.itemconfig("all", width=event.width)
-        canvas.bind("<Configure>", canvas_configure)
-        def on_mousewheel(event):
-            if canvas.yview() != (0.0, 1.0):
-                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-            return "break"
-        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", on_mousewheel))
-        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
-        canvas.bind("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
-        canvas.bind("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        resize_bar = ttk.Frame(list_container, height=6, cursor="sb_v_double_arrow")
-        resize_bar.pack(fill=tk.X, side=tk.BOTTOM)
-
-        self._drag_start_y = None
-        self._start_height = None
-
-        def on_resize_start(event):
-            self._drag_start_y = event.y_root
-            self._start_height = list_container.winfo_height()
-
-        def on_resize_motion(event):
-            if self._drag_start_y is not None:
-                delta = event.y_root - self._drag_start_y
-                new_height = max(150, self._start_height + delta)
-                list_container.config(height=new_height)
-                event.widget.master.update_idletasks()
-
-        resize_bar.bind("<Button-1>", on_resize_start)
-        resize_bar.bind("<B1-Motion>", on_resize_motion)
+        list_container.pack(fill=tk.BOTH, expand=True, pady=(0,0))
+#         list_container.pack_propagate(False)
+#         min_height = int(400 * self.scaling)
+#         list_container.config(height=min_height)
+    
+        # 工具栏
+        tool_frame = ttk.Frame(list_container)
+        tool_frame.pack(fill=tk.X, pady=2)
+        ttk.Button(tool_frame, text="启用/禁用", command=self.merge_toggle_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text="编辑", command=self.merge_edit_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text="预览", command=self.merge_preview_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text="上移", command=self.merge_move_up_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text="下移", command=self.merge_move_down_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text="删除", command=self.merge_delete_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text="清空", command=self.merge_clear_tracks).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text="恢复列宽", command=self.merge_reset_column_widths).pack(side=tk.LEFT, padx=2)
+    
+        # 自定义样式
+        merge_style = ttk.Style()
+        merge_style.configure("Merge.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0")
+        merge_style.configure("Merge.Treeview.Heading", background="#d9d9d9")
+    
+        # 创建 Treeview（只一次）
+        columns = ("启用", "类型", "编码", "来源", "编码设置 双击编辑")
+        self.merge_tree = ttk.Treeview(list_container, columns=columns, show="headings",
+                                       height=8, style="Merge.Treeview")
+        self.merge_tree.heading("启用", text="启用")
+        self.merge_tree.heading("类型", text="类型")
+        self.merge_tree.heading("编码", text="编码")
+        self.merge_tree.heading("来源", text="来源")
+        self.merge_tree.heading("编码设置 双击编辑", text="编码设置 双击编辑")
+        self.merge_tree.column("启用", width=20, anchor="center")
+        self.merge_tree.column("类型", width=40)
+        self.merge_tree.column("编码", width=30)
+        self.merge_tree.column("来源", width=500)
+        self.merge_tree.column("编码设置 双击编辑", width=150)
+        self.merge_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    
+        # 滚动条
+        vbar = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=self.merge_tree.yview)
+        self.merge_tree.configure(yscrollcommand=vbar.set)
+        vbar.pack(side=tk.RIGHT, fill=tk.Y)
+    
+        # 绑定双击编辑
+        self.merge_tree.bind("<Double-1>", self.merge_on_tree_double_click)
+    
 
         btn_frame = ttk.Frame(parent)
         btn_frame.pack(fill=tk.X, pady=5)
@@ -8866,10 +8868,23 @@ class FFmpegBatchGUI:
             # 仅音频模式：只收集音频文件的输入
             input_files = []
             file_index = {}
-            for t in audio_tracks:
-                if t.file_path not in file_index:
-                    file_index[t.file_path] = len(input_files)
-                    input_files.append(t.file_path)
+            audio_tracks = [t for t in enabled_tracks if t.type == "audio"]
+            for audio in audio_tracks:
+                if audio.file_path not in file_index:
+                    file_index[audio.file_path] = len(input_files)
+                    input_files.append(audio.file_path)
+            # 为每个音频轨道设置 _type_index
+            for audio in audio_tracks:
+                info = self._get_cached_stream_info(audio.file_path)
+                if info:
+                    audio_indices = [s['index'] for s in info['streams'] if s.get('codec_type') == 'audio']
+                    try:
+                        audio._type_index = audio_indices.index(audio.index)
+                    except ValueError:
+                        audio._type_index = 0
+                else:
+                    audio._type_index = 0
+            # 然后添加输入
             for f in input_files:
                 cmd.extend(["-i", normalize_path(f)])
             main_video = None
@@ -9477,80 +9492,172 @@ class FFmpegBatchGUI:
     def merge_update_track_list(self):
         if self._batch_update:
             return
-        for w in self.merge_track_frame.winfo_children():
-            w.destroy()
-        if not self.merge_tracks:
-            tk.Label(self.merge_track_frame, text="未加载轨道").pack()
-            return
-        container = self.merge_track_frame
-        main_video = self.merge_video.get().strip()
-        col_bg_headers = ["#cccccc", "#e0e0e0", "#cccccc", "#e0e0e0", "#cccccc", "#e0e0e0", "#cccccc", "#e0e0e0", "#cccccc"]
-        ROW_BG_EVEN = ["#e0e0e0", "#cccccc", "#e0e0e0", "#cccccc", "#e0e0e0", "#cccccc", "#e0e0e0", "#cccccc", "#e0e0e0"]
-        ROW_BG_ODD  = ["#cccccc", "#e0e0e0", "#cccccc", "#e0e0e0", "#cccccc", "#e0e0e0", "#cccccc", "#e0e0e0", "#cccccc"]
-        headers = ["启用", "类型", "编码", "来源", "编码设置", "预览", "上移", "下移", "删除"]
-        col_widths = [5, 8, 10, None, 10, 6, 4, 4, 6]
-        for col, text in enumerate(headers):
-            width = col_widths[col]
-            if width is None:
-                label = tk.Label(container, text=text, anchor="center", bg=col_bg_headers[col])
-                label.grid(row=0, column=col, sticky="nsew", padx=0, pady=0)
-            else:
-                label = tk.Label(container, text=text, anchor="center", width=width, bg=col_bg_headers[col])
-                label.grid(row=0, column=col, sticky="nsew", padx=0, pady=0)
+    
+        # 清空现有行
+        for item in self.merge_tree.get_children():
+            self.merge_tree.delete(item)
+    
+        # 配置标签颜色（主视频、子视频、音频、字幕）
+        # 每种类型有两套：偶数行和奇数行（交替）
+        self.merge_tree.tag_configure('even_main', background='#d9e8f7')
+        self.merge_tree.tag_configure('odd_main', background='#c2d6ed')
+        self.merge_tree.tag_configure('even_pip', background='#d9f0d9')
+        self.merge_tree.tag_configure('odd_pip', background='#bde0bd')
+        self.merge_tree.tag_configure('even_concat', background='#fdebd0')
+        self.merge_tree.tag_configure('odd_concat', background='#fad7a5')
+        self.merge_tree.tag_configure('even_audio', background='#f0f0f0')
+        self.merge_tree.tag_configure('odd_audio', background='#e0e0e0')
+        self.merge_tree.tag_configure('even_subtitle', background='#e8e0f0')
+        self.merge_tree.tag_configure('odd_subtitle', background='#d8cfe8')
+        self.merge_tree.tag_configure('even_video', background='#f0f0f0')
+        self.merge_tree.tag_configure('odd_video', background='#e0e0e0')
+    
+        # 确定主视频
+        enabled_video_tracks = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
+        main_video = enabled_video_tracks[0] if enabled_video_tracks else None
+    
         for i, track in enumerate(self.merge_tracks):
-            row_num = i + 1
-            row_bg = ROW_BG_EVEN if (i % 2 == 0) else ROW_BG_ODD
-            chk_frame = tk.Frame(container, bg=row_bg[0])
-            chk_frame.grid(row=row_num, column=0, sticky="nsew", padx=0, pady=0)
-            var = tk.BooleanVar(value=track.enabled)
-            cb = tk.Checkbutton(chk_frame, variable=var, bg=row_bg[0], activebackground=row_bg[0],
-                                command=lambda idx=i, v=var: self.merge_set_track_enabled(idx, v.get()))
-            cb.pack(expand=True)
+            # 根据轨道类型和模式确定标签
             if track.type == "video":
-                type_bg = "#cce5ff"
-            elif track.type == "audio" and track.file_path == main_video:
-                type_bg = "#e6f2e6"
+                if track == main_video:
+                    tag = 'even_main' if i % 2 == 0 else 'odd_main'
+                elif self.pip_enabled.get():
+                    tag = 'even_pip' if i % 2 == 0 else 'odd_pip'
+                elif self.concat_enabled.get():
+                    tag = 'even_concat' if i % 2 == 0 else 'odd_concat'
+                else:
+                    tag = 'even_video' if i % 2 == 0 else 'odd_video'
+            elif track.type == "audio":
+                tag = 'even_audio' if i % 2 == 0 else 'odd_audio'
+            elif track.type == "subtitle":
+                tag = 'even_subtitle' if i % 2 == 0 else 'odd_subtitle'
             else:
-                type_bg = row_bg[1]
-            enabled_video_tracks = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
-            is_main_video = (enabled_video_tracks and enabled_video_tracks[0] == track)
-            display_type = "视频(主)" if is_main_video and track.type == "video" else track.type
-            if self.concat_enabled.get() and track.type == "video" and not is_main_video:
-                display_type = "视频(串)"
-            elif self.pip_enabled.get() and track.type == "video" and not is_main_video:
-                display_type = "视频(画)"
-            lbl_type = tk.Label(container, text=display_type, anchor="center", width=col_widths[1], bg=type_bg)
-            lbl_type.grid(row=row_num, column=1, sticky="nsew", padx=0, pady=0)
-            lbl_codec = tk.Label(container, text=track.codec[:10], anchor="center", width=col_widths[2], bg=row_bg[2])
-            lbl_codec.grid(row=row_num, column=2, sticky="nsew", padx=0, pady=0)
-            src = os.path.basename(track.file_path) if track.file_path else "外部"
-            lbl_src = tk.Label(container, text=src, anchor="w", bg=row_bg[3])
-            lbl_src.grid(row=row_num, column=3, sticky="nsew", padx=0, pady=0)
+                tag = 'even' if i % 2 == 0 else 'odd'  # fallback
+    
+            # 显示内容
+            enabled_text = "✓" if track.enabled else "✗"
             enc_text = "复制流" if not track.is_encoding() else track.enc_settings.get("encoder", "?")
-            btn_enc = ttk.Button(container, text=enc_text, width=col_widths[4],
-                                 command=lambda idx=i: self.merge_edit_track_settings(idx))
-            btn_enc.grid(row=row_num, column=4, padx=1, pady=1)
-            btn_preview = ttk.Button(container, text="预览", width=col_widths[5],
-                                     command=lambda idx=i: self.merge_preview_track(idx))
-            btn_preview.grid(row=row_num, column=5, padx=1, pady=1)
-            btn_up = ttk.Button(container, text="↑", width=col_widths[6],
-                                command=lambda idx=i: self.merge_move_track_up(idx))
-            if i == 0:
-                btn_up.state(['disabled'])
-            btn_up.grid(row=row_num, column=6, padx=1, pady=1)
-            btn_down = ttk.Button(container, text="↓", width=col_widths[7],
-                                  command=lambda idx=i: self.merge_move_track_down(idx))
-            if i == len(self.merge_tracks) - 1:
-                btn_down.state(['disabled'])
-            btn_down.grid(row=row_num, column=7, padx=1, pady=1)
-            btn_del = ttk.Button(container, text="删除", width=col_widths[8],
-                                 command=lambda idx=i: self.merge_remove_track(idx))
-            btn_del.grid(row=row_num, column=8, padx=1, pady=1)
-        for col in range(len(headers)):
-            if col == 3:
-                container.columnconfigure(col, weight=1)
-            else:
-                container.columnconfigure(col, weight=0)
+            display_type = track.type
+            if track.type == "video" and track == main_video:
+                display_type = "视频(主)"
+            elif track.type == "video":
+                if self.pip_enabled.get():
+                    display_type = "视频(画)"
+                elif self.concat_enabled.get():
+                    display_type = "视频(串)"
+                else:
+                    display_type = "视频(从)"
+    
+            values = (
+                enabled_text,
+                display_type,
+                track.codec[:10],
+                os.path.basename(track.file_path) if track.file_path else "外部",
+                enc_text
+            )
+            iid = f"track_{i}"
+            self.merge_tree.insert("", tk.END, iid=iid, values=values, tags=(tag,))
+    
+        if not self.merge_tracks:
+            self.merge_tree.insert("", tk.END, values=("", "未加载轨道", "", "", ""))
+
+    def _get_selected_track_indices(self):
+        """获取选中行的轨道索引列表（按实际列表顺序）"""
+        selected = self.merge_tree.selection()
+        indices = []
+        for iid in selected:
+            idx = int(iid.split('_')[1])
+            if 0 <= idx < len(self.merge_tracks):
+                indices.append(idx)
+        return sorted(indices)
+    
+    def merge_toggle_selected(self):
+        indices = self._get_selected_track_indices()
+        if not indices:
+            messagebox.showinfo("提示", "请先选中轨道")
+            return
+        # 如果所有选中的都启用，则全部禁用；否则全部启用
+        all_enabled = all(self.merge_tracks[idx].enabled for idx in indices)
+        new_state = not all_enabled
+        for idx in indices:
+            self.merge_tracks[idx].enabled = new_state
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+    
+    def merge_edit_selected(self):
+        indices = self._get_selected_track_indices()
+        if not indices:
+            messagebox.showinfo("提示", "请先选中轨道")
+            return
+        # 只编辑第一个选中项
+        self.merge_edit_track_settings(indices[0])
+    
+    def merge_preview_selected(self):
+        indices = self._get_selected_track_indices()
+        if not indices:
+            messagebox.showinfo("提示", "请先选中轨道")
+            return
+        self.merge_preview_track(indices[0])
+    
+    def merge_move_up_selected(self):
+        indices = self._get_selected_track_indices()
+        if not indices:
+            return
+        idx = indices[0]
+        if idx <= 0:
+            return
+        self.merge_tracks[idx], self.merge_tracks[idx-1] = self.merge_tracks[idx-1], self.merge_tracks[idx]
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+        # 保持选中状态
+        self.merge_tree.selection_set(f"track_{idx-1}")
+    
+    def merge_move_down_selected(self):
+        indices = self._get_selected_track_indices()
+        if not indices:
+            return
+        idx = indices[-1]  # 最后一个选中项下移
+        if idx >= len(self.merge_tracks) - 1:
+            return
+        self.merge_tracks[idx], self.merge_tracks[idx+1] = self.merge_tracks[idx+1], self.merge_tracks[idx]
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+        self.merge_tree.selection_set(f"track_{idx+1}")
+    
+    def merge_delete_selected(self):
+        indices = self._get_selected_track_indices()
+        if not indices:
+            messagebox.showinfo("提示", "请先选中轨道")
+            return
+        # 从大到小删除
+        for idx in reversed(indices):
+            removed = self.merge_tracks.pop(idx)
+            self._append_info_ui(f"[封装] 已删除轨道: {removed.type} - {os.path.basename(removed.file_path)}")
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+    
+    def merge_clear_tracks(self):
+        if self.merge_tracks and messagebox.askyesno("确认", "确定清空所有轨道吗？"):
+            self.merge_tracks.clear()
+            self.merge_update_track_list()
+            self.merge_update_command_preview()
+            self._append_info_ui("[封装] 已清空所有附加轨道")
+    
+    def merge_on_tree_double_click(self, event):
+        """双击编辑第一个选中的轨道"""
+        self.merge_edit_selected()
+
+    def merge_reset_column_widths(self):
+        """恢复合并页面 Treeview 各列的默认宽度"""
+        # 原创建时的列宽设置
+        self.merge_tree.column("启用", width=20)
+        self.merge_tree.column("类型", width=40)
+        self.merge_tree.column("编码", width=30)
+        self.merge_tree.column("来源", width=500)
+        self.merge_tree.column("编码设置 双击编辑", width=150)
+        self._append_info_ui("[布局] 已恢复合并列表的列宽")
+
+
 
     def merge_move_track_up(self, idx):
         if idx <= 0:
