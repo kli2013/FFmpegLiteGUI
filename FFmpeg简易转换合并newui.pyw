@@ -3979,7 +3979,7 @@ class Track:
         self.codec = codec
         self.file_path = file_path
         self.enabled = enabled
-        # 字幕专用字段（仅对字幕有效）
+        # 字幕专用字段
         self.language = ""
         self.title = ""
         
@@ -4056,10 +4056,10 @@ class Track:
                 self.enc_settings = {"encoder": "copy"}
         else:
             self.enc_settings = copy.deepcopy(enc_settings)
-            # 对于字幕，从 enc_settings 中读取语言和标题
-            if typ == "subtitle":
-                self.language = self.enc_settings.get("language", "")
-                self.title = self.enc_settings.get("title", "")
+            # 读取字幕元数据
+            self.language = self.enc_settings.get("language", "")
+            self.title = self.enc_settings.get("title", "")
+
             # 对于视频，从 enc_settings 恢复属性（兼容旧代码）
             if typ == "video":
                 self.overlay_enabled = self.enc_settings.get("overlay_enabled", False)
@@ -9041,6 +9041,14 @@ class FFmpegBatchGUI:
                 strategy = get_encoder_strategy(vcodec)
                 cmd = strategy.build_params(cmd, v_settings)
     
+                # ---- 视频元数据 ----
+                lang = main_video.language
+                title = main_video.title
+                if lang:
+                    cmd.extend(["-metadata:s:v:0", f"language={lang}"])
+                if title:
+                    cmd.extend(["-metadata:s:v:0", f"title={title}"])
+    
         # ---- 音频处理（所有模式） ----
         mix_tracks = [t for t in audio_tracks if t.enc_settings.get("mix_enabled", False)]
     
@@ -9074,6 +9082,16 @@ class FFmpegBatchGUI:
                         f"-b:a:{audio_map_count}", audio.enc_settings.get("bitrate", "128k"),
                         f"-ar:a:{audio_map_count}", audio.enc_settings.get("samplerate", "44100")
                     ])
+    
+                # ---- 音频元数据 ----
+                lang_audio = audio.language
+                title_audio = audio.title
+                if lang_audio:
+                    cmd.extend([f"-metadata:s:a:{audio_map_count}", f"language={lang_audio}"])
+                if title_audio:
+                    cmd.extend([f"-metadata:s:a:{audio_map_count}", f"title={title_audio}"])
+                    cmd.extend([f"-metadata:s:a:{audio_map_count}", f"handler_name={title_audio}"])
+    
                 audio_map_count += 1
             if audio_map_count == 0:
                 cmd.append("-an")
@@ -9106,6 +9124,14 @@ class FFmpegBatchGUI:
                         "-b:a", audio.enc_settings.get("bitrate", "128k"),
                         "-ar", audio.enc_settings.get("samplerate", "44100")
                     ])
+                # ---- 混合音频元数据 ----
+                lang = audio.language
+                title = audio.title
+                if lang:
+                    cmd.extend(["-metadata:s:a:0", f"language={lang}"])
+                if title:
+                    cmd.extend(["-metadata:s:a:0", f"title={title}"])
+                    cmd.extend(["-metadata:s:a:0", f"handler_name={title}"])
                 cmd.extend(["-disposition:a:0", "default"])
             else:
                 filter_parts = []
@@ -9138,6 +9164,14 @@ class FFmpegBatchGUI:
                     "-b:a", first_mix.enc_settings.get("bitrate", "128k"),
                     "-ar", first_mix.enc_settings.get("samplerate", "44100")
                 ])
+                # ---- 混合音频元数据（使用第一个混合轨道的元数据） ----
+                lang = first_mix.language
+                title = first_mix.title
+            if lang:
+                cmd.extend(["-metadata:s:a:0", f"language={lang}"])
+            if title:
+                cmd.extend(["-metadata:s:a:0", f"title={title}"])
+                cmd.extend(["-metadata:s:a:0", f"handler_name={title}"])
                 cmd.extend(["-disposition:a:0", "default"])
     
         if only_audio:
@@ -9768,7 +9802,6 @@ class FFmpegBatchGUI:
             if track.type == "video":
                 orig_w, orig_h = self._get_video_dimensions_cached(track.file_path)
                 if orig_w and orig_h:
-                    # 检查是否启用缩放
                     if track.enc_settings.get("scale_enabled", False):
                         method = track.enc_settings.get("scale_method", "width")
                         sw = track.enc_settings.get("scale_width", "").strip()
@@ -9780,7 +9813,7 @@ class FFmpegBatchGUI:
                         elif method == "exact" and sw and sh:
                             scale_str = f"{sw}x{sh}"
                         else:
-                            scale_str = ""  # 不应发生
+                            scale_str = ""
                         if scale_str:
                             detail = f"{orig_w}x{orig_h} → {scale_str}"
                         else:
@@ -9789,6 +9822,10 @@ class FFmpegBatchGUI:
                         detail = f"{orig_w}x{orig_h}"
                 else:
                     detail = "未知"
+                # 追加时长
+                dur = self._get_media_duration(track.file_path)
+                if dur is not None:
+                    detail += f" ({seconds_to_time(dur)})"
             elif track.type == "audio":
                 info = self._get_cached_stream_info(track.file_path)
                 if info:
@@ -9815,6 +9852,10 @@ class FFmpegBatchGUI:
                                 if channels:
                                     parts.append(f"{channels}ch")
                                 detail = " ".join(parts) if parts else "-"
+                            # 追加时长
+                            dur = self._get_media_duration(track.file_path)
+                            if dur is not None:
+                                detail += f" ({seconds_to_time(dur)})"
                             break
                     else:
                         detail = "-"
@@ -10376,8 +10417,23 @@ class FFmpegBatchGUI:
                 overlay_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
                 overlay_frame.set_settings(initial_settings)
 
+            # ---- 页面6：轨道元数据（仅视频轨道非水印） ----
+            if track_obj is not None and not is_watermark:
+                page_meta = ttk.Frame(notebook)
+                notebook.add(page_meta, text="轨道元数据")
+                meta_frame = ttk.Frame(page_meta, padding="10")
+                meta_frame.pack(fill=tk.X, pady=5)
+                ttk.Label(meta_frame, text="语言代码 (如 chi, eng):").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+                lang_var = tk.StringVar(value=track_obj.language)
+                lang_entry = ttk.Entry(meta_frame, textvariable=lang_var, width=15)
+                lang_entry.grid(row=0, column=1, padx=5, pady=5)
+                ttk.Label(meta_frame, text="轨道标题:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+                title_var = tk.StringVar(value=track_obj.title)
+                title_entry = ttk.Entry(meta_frame, textvariable=title_var, width=30)
+                title_entry.grid(row=1, column=1, padx=5, pady=5)
+                ttk.Label(meta_frame, text="常见语言: chi(中文), eng(英语), jpn(日语), kor(韩语)", foreground="gray").grid(row=2, column=0, columnspan=2, sticky="w", padx=5)
 
-            # ================== 页面6：音频绑定 ==================
+            # ================== 页面7：音频绑定 ==================
             # 仅在串接模式下显示此页（水印无音频绑定需求）
             if is_concat_mode and not is_watermark and track_obj is not None and track_obj.type == "video":
                 page_audio_binding = ttk.Frame(notebook)
@@ -10448,6 +10504,11 @@ class FFmpegBatchGUI:
                             # new_settings["external_audio_stream"] = "0:a:0"
 
                     new_settings["enhance"] = filt_frame.get_enhance_settings()
+
+                    if track_obj is not None and not is_watermark:
+                        new_settings["language"] = lang_var.get().strip()
+                        new_settings["title"] = title_var.get().strip()
+
                     on_save(new_settings)
                 except Exception as e:
                     import traceback
@@ -10509,6 +10570,9 @@ class FFmpegBatchGUI:
         old_encoder = track.enc_settings.get("encoder")
         new_encoder = new_settings.get("encoder")
         track.enc_settings = new_settings
+        # 更新字幕元数据
+        track.language = new_settings.get("language", "")
+        track.title = new_settings.get("title", "")
 
         # 画中画模式下，视频倒放时提示音频倒放为独立的
         if self.pip_enabled.get() and new_settings.get("reverse_enabled", False) and not self._pip_reverse_audio_hint_shown:
@@ -10548,7 +10612,7 @@ class FFmpegBatchGUI:
         track = self.merge_tracks[track_idx]
         with self.SafeToplevel(self.root) as win:
             win.title(f"音频轨道设置 - {track.codec}")
-            center_window(win, 500, 510)
+            center_window(win, 500, 540)
             win.transient(self.root)
     
             main_frame = ttk.Frame(win, padding="10")
@@ -10575,6 +10639,21 @@ class FFmpegBatchGUI:
             samplerate_var = tk.StringVar(value=track.enc_settings.get("samplerate", "44100"))
             samplerate_entry = ttk.Entry(row, textvariable=samplerate_var, width=8)
             samplerate_entry.pack(side=tk.LEFT, padx=5)
+
+
+            # ---- 轨道元数据 ----
+            meta_row = ttk.Frame(main_frame)
+            meta_row.pack(fill=tk.X, pady=5)
+            ttk.Label(meta_row, text="轨道元数据:").pack(side=tk.LEFT, padx=5)
+            ttk.Label(meta_row, text="语言:").pack(side=tk.LEFT, padx=5)
+            lang_var = tk.StringVar(value=track.language)
+            lang_entry = ttk.Entry(meta_row, textvariable=lang_var, width=10)
+            lang_entry.pack(side=tk.LEFT, padx=5)
+            ttk.Label(meta_row, text="标题:").pack(side=tk.LEFT, padx=5)
+            title_var = tk.StringVar(value=track.title)
+            title_entry = ttk.Entry(meta_row, textvariable=title_var, width=30)
+            title_entry.pack(side=tk.LEFT, padx=5)
+
 
             # 获取模式标志
             is_pip = self.pip_enabled.get()
@@ -10707,7 +10786,13 @@ class FFmpegBatchGUI:
                 else:
                     track.enc_settings["volume_enabled"] = vol_enabled_var.get()
                     track.enc_settings["volume"] = vol_value_var.get()
-    
+
+                track.language = lang_var.get().strip()
+                track.title = title_var.get().strip()
+                track.enc_settings["language"] = track.language
+                track.enc_settings["title"] = track.title
+
+
                 self.merge_update_track_list()
                 self.merge_update_command_preview()
                 win.destroy()
