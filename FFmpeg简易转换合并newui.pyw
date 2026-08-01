@@ -4185,6 +4185,8 @@ class FFmpegBatchGUI:
         self._suppress_main_video_trace = False
         
         self._concat_params_cache = {}
+        
+        self._merge_preview_after_id = None   # 合并命令预览防抖 ID
 
         # ffprobe 并发数量计算
         cpu_count = os.cpu_count() or 4
@@ -9609,12 +9611,20 @@ class FFmpegBatchGUI:
     
 
 
-
     def merge_update_command_preview(self, output_override=None):
-
+        # 取消之前排队的更新
+        if hasattr(self, '_merge_preview_after_id') and self._merge_preview_after_id:
+            self.root.after_cancel(self._merge_preview_after_id)
+            self._merge_preview_after_id = None
+    
+        # 延迟执行真正的更新（100ms 足够覆盖连续操作）
+        self._merge_preview_after_id = self.root.after(100, self._do_merge_update_command_preview, output_override)
+    
+    def _do_merge_update_command_preview(self, output_override=None):
+        self._merge_preview_after_id = None
         if self._batch_update:
             return
-    
+
         # 临时启用以便更新内容
         current_state = self.merge_cmd_preview.cget('state')
         self.merge_cmd_preview.config(state='normal')
@@ -11164,20 +11174,20 @@ class FFmpegBatchGUI:
                 messagebox.showinfo("提示", "未检测到视频文件，请先拖入或选择视频作为主视频")
                 return
     
-        # ---- 有视频文件 ----
-        if len(video_files) > 10:
-            result = messagebox.askyesno(
-                "批量处理提示",
-                f"您正在普通模式下拖拽 {len(video_files)} 个视频文件，解析可能较慢。\n\n"
-                "建议：\n"
-                "• 若文件数超过 10 个，推荐使用「串行合并」模式批量添加。\n"
-                "  这个模式无多余解析，添加速度快，可添加完后切换回普通模式增删。\n\n"
-                "是否继续使用普通模式？\n（选“是”继续，选“否”取消本次操作）",
-                icon='warning'
-            )
-            if not result:
-                self._append_info_ui("[封装] 用户取消批量添加，请切换到串行或画中画模式重试。")
-                return
+#         # ---- 有视频文件 ----
+#         if len(video_files) > 10:
+#             result = messagebox.askyesno(
+#                 "批量处理提示",
+#                 f"您正在普通模式下拖拽 {len(video_files)} 个视频文件，解析可能较慢。\n\n"
+#                 "建议：\n"
+#                 "• 若文件数超过 10 个，推荐使用「串行合并」模式批量添加。\n"
+#                 "  这个模式无多余解析，添加速度快，可添加完后切换回普通模式增删。\n\n"
+#                 "是否继续使用普通模式？\n（选“是”继续，选“否”取消本次操作）",
+#                 icon='warning'
+#             )
+#             if not result:
+#                 self._append_info_ui("[封装] 用户取消批量添加，请切换到串行或画中画模式重试。")
+#                 return
     
         # 后台解析视频文件
         def run_in_thread():
