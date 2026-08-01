@@ -4269,7 +4269,10 @@ class FFmpegBatchGUI:
             os.makedirs(user_dir, exist_ok=True)
             self.preset_file_path = os.path.join(user_dir, "ffmpeg_presets.json")
         self.preset_manager = PresetManager(self.preset_file_path)
+
+        self._loading_settings = True
         self.load_player_settings()
+        self._loading_settings = False
 
         # ---------- 加载快速命令模板 ----------
         preset_dir = os.path.dirname(self.preset_file_path)          # 主预设所在目录
@@ -8011,9 +8014,9 @@ class FFmpegBatchGUI:
         self.merge_tree.heading("来源", text="来源")
         self.merge_tree.heading("编码设置 双击编辑", text="编码设置 双击编辑")
         self.merge_tree.column("启用", width=5, anchor="center")
-        self.merge_tree.column("类型", width=30)
-        self.merge_tree.column("规格", width=40)
-        self.merge_tree.column("编码", width=30)
+        self.merge_tree.column("类型", width=20)
+        self.merge_tree.column("规格", width=100)
+        self.merge_tree.column("编码", width=20)
         self.merge_tree.column("来源", width=500)
         self.merge_tree.column("编码设置 双击编辑", width=80)
         self.merge_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -9513,6 +9516,8 @@ class FFmpegBatchGUI:
     def _check_video_params_consistent(self, video_tracks, silent=False) -> bool:
         """
         检查所有视频轨道的编码参数是否一致（用于串联 copy 模式）。
+        对比参数包括编码器名称 (codec_name)、分辨率 (高宽)、像素格式 (pix_fmt)、时间基 (time_base)、帧率 (avg_frame_rate 或 r_frame_rate)、
+        这些参数是 流复制模式下 concat 要求一致的关键参数。缺少任一项都可能导致输出异常（如花屏、音画不同步、无法播放）。
         使用缓存避免重复检查，缓存键基于所有文件的路径+修改时间。
         返回 True 表示参数一致，False 表示不一致（建议切换到重新编码模式）。
         """
@@ -9554,12 +9559,12 @@ class FFmpegBatchGUI:
             return False
     
         # 提取参考参数
-        ref_codec = ref_stream.get('codec_name')
-        ref_w = ref_stream.get('width')
+        ref_codec = ref_stream.get('codec_name')          #编码器名称
+        ref_w = ref_stream.get('width')                   #宽度
         ref_h = ref_stream.get('height')
-        ref_pix_fmt = ref_stream.get('pix_fmt')
-        ref_time_base = ref_stream.get('time_base')
-        ref_frame_rate = ref_stream.get('avg_frame_rate') or ref_stream.get('r_frame_rate')
+        ref_pix_fmt = ref_stream.get('pix_fmt')           #像素格式
+        ref_time_base = ref_stream.get('time_base')       #时间基
+        ref_frame_rate = ref_stream.get('avg_frame_rate') or ref_stream.get('r_frame_rate')     #帧率
     
         # 逐个比较后续轨道
         for track in video_tracks[1:]:
@@ -9751,8 +9756,29 @@ class FFmpegBatchGUI:
     
             # ---- 规格 ----
             if track.type == "video":
-                w, h = self._get_video_dimensions_cached(track.file_path)
-                detail = f"{w}x{h}" if w and h else "未知"
+                orig_w, orig_h = self._get_video_dimensions_cached(track.file_path)
+                if orig_w and orig_h:
+                    # 检查是否启用缩放
+                    if track.enc_settings.get("scale_enabled", False):
+                        method = track.enc_settings.get("scale_method", "width")
+                        sw = track.enc_settings.get("scale_width", "").strip()
+                        sh = track.enc_settings.get("scale_height", "").strip()
+                        if method == "width" and sw:
+                            scale_str = f"{sw}x-2"
+                        elif method == "height" and sh:
+                            scale_str = f"-2x{sh}"
+                        elif method == "exact" and sw and sh:
+                            scale_str = f"{sw}x{sh}"
+                        else:
+                            scale_str = ""  # 不应发生
+                        if scale_str:
+                            detail = f"{orig_w}x{orig_h} → {scale_str}"
+                        else:
+                            detail = f"{orig_w}x{orig_h}"
+                    else:
+                        detail = f"{orig_w}x{orig_h}"
+                else:
+                    detail = "未知"
             elif track.type == "audio":
                 info = self._get_cached_stream_info(track.file_path)
                 if info:
@@ -9854,26 +9880,72 @@ class FFmpegBatchGUI:
         indices = self._get_selected_track_indices()
         if not indices:
             return
-        idx = indices[0]
-        if idx <= 0:
-            return
-        self.merge_tracks[idx], self.merge_tracks[idx-1] = self.merge_tracks[idx-1], self.merge_tracks[idx]
-        self.merge_update_track_list()
-        self.merge_update_command_preview()
-        # 保持选中状态
-        self.merge_tree.selection_set(f"track_{idx-1}")
+        self._move_selected_tracks(indices, direction=-1)
     
     def merge_move_down_selected(self):
         indices = self._get_selected_track_indices()
         if not indices:
             return
-        idx = indices[-1]  # 最后一个选中项下移
-        if idx >= len(self.merge_tracks) - 1:
+        self._move_selected_tracks(indices, direction=1)
+    
+    def _move_selected_tracks(self, indices, direction):
+        """
+        将选中的轨道整体上移（direction=-1）或下移（direction=1）。
+        仅当选中轨道连续时支持整体移动，否则只移动第一个选中项。
+        """
+        if not indices:
             return
-        self.merge_tracks[idx], self.merge_tracks[idx+1] = self.merge_tracks[idx+1], self.merge_tracks[idx]
+    
+        # 排序
+        indices = sorted(indices)
+        min_idx = indices[0]
+        max_idx = indices[-1]
+    
+        # 检查是否连续
+        if max_idx - min_idx + 1 != len(indices):
+            # 不连续：只移动第一个
+            self._append_info_ui("[提示] 选中轨道不连续，仅移动第一个。请选择连续轨道以整体移动。")
+            idx = indices[0]
+            if direction == -1:
+                if idx > 0:
+                    self.merge_tracks[idx], self.merge_tracks[idx-1] = self.merge_tracks[idx-1], self.merge_tracks[idx]
+            else:
+                if idx < len(self.merge_tracks) - 1:
+                    self.merge_tracks[idx], self.merge_tracks[idx+1] = self.merge_tracks[idx+1], self.merge_tracks[idx]
+            new_selection = str(idx + direction)  # 移动后的索引
+            self.merge_update_track_list()
+            if 0 <= idx + direction < len(self.merge_tracks):
+                self.merge_tree.selection_set(f"track_{idx + direction}")
+            return
+    
+        # 连续：整体移动
+        if direction == -1:
+            if min_idx == 0:
+                self._append_info_ui("[提示] 已在顶部，无法上移")
+                return
+            # 将选中的块整体上移一位
+            block = self.merge_tracks[min_idx:max_idx+1]
+            before = self.merge_tracks[min_idx-1]
+            # 重新赋值：将 before 插入到块末尾，块整体前移
+            self.merge_tracks[min_idx-1:max_idx+1] = block + [before]
+            new_min = min_idx - 1
+            new_max = max_idx - 1
+        else:  # direction == 1
+            if max_idx == len(self.merge_tracks) - 1:
+                self._append_info_ui("[提示] 已在底部，无法下移")
+                return
+            block = self.merge_tracks[min_idx:max_idx+1]
+            after = self.merge_tracks[max_idx+1]
+            self.merge_tracks[min_idx:max_idx+2] = [after] + block
+            new_min = min_idx + 1
+            new_max = max_idx + 1
+    
+        # 刷新列表并恢复选中状态
         self.merge_update_track_list()
+        for i in range(new_min, new_max + 1):
+            self.merge_tree.selection_add(f"track_{i}")
         self.merge_update_command_preview()
-        self.merge_tree.selection_set(f"track_{idx+1}")
+        self._append_info_ui(f"[移动] 已整体{'上移' if direction == -1 else '下移'} {len(indices)} 个轨道")
     
     def merge_delete_selected(self):
         indices = self._get_selected_track_indices()
@@ -9902,9 +9974,9 @@ class FFmpegBatchGUI:
         """恢复合并页面 Treeview 各列的默认宽度"""
         # 原创建时的列宽设置
         self.merge_tree.column("启用", width=5)
-        self.merge_tree.column("类型", width=30)
-        self.merge_tree.column("规格", width=40)
-        self.merge_tree.column("编码", width=30)
+        self.merge_tree.column("类型", width=20)
+        self.merge_tree.column("规格", width=100)
+        self.merge_tree.column("编码", width=20)
         self.merge_tree.column("来源", width=500)
         self.merge_tree.column("编码设置 双击编辑", width=80)
         self._append_info_ui("[布局] 已恢复合并列表的列宽")
