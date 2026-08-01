@@ -1808,6 +1808,8 @@ class VideoFilterFrame(ttk.LabelFrame):
         self.pix_fmt_enabled.trace_add("write", self._on_pix_fmt_changed)
 
     def _on_pix_fmt_changed(self, *args):
+        if getattr(self, '_loading_settings', False):
+            return
         self.app.pix_fmt_enabled_default.set(self.pix_fmt_enabled.get())
         self.app.save_player_settings()
 
@@ -4181,6 +4183,8 @@ class FFmpegBatchGUI:
 
         self._stream_info_cache = {}
         self._suppress_main_video_trace = False
+        
+        self._concat_params_cache = {}
 
         # ffprobe 并发数量计算
         cpu_count = os.cpu_count() or 4
@@ -5351,41 +5355,49 @@ class FFmpegBatchGUI:
 
     # ---------- 播放器设置相关方法 ----------
     def load_player_settings(self):
-        settings = self.preset_manager.load_player_settings()
-        self.use_mpv.set(settings.get("use_mpv", False))
-        self.mpv_path.set(settings.get("mpv_path", "mpv"))
-        # 读取日志设置，缺失时使用默认值
-        self.log_enabled_var.set(settings.get("log_enabled", True))
-        log_path = settings.get("log_path", os.path.join(get_script_dir(), "editlog.txt"))
-        self.log_path_var.set(normalize_path(log_path))
-        self.overwrite_policy.set(settings.get("overwrite_policy", "ask"))
-        cmd_path = settings.get("cmd_output_path", "")
-        if cmd_path:
-            self.cmd_output_path.set(cmd_path)
-        # 读取 FFmpeg 目录设置
-        ffmpeg_dir_enabled = settings.get("ffmpeg_dir_enabled", False)
-        ffmpeg_dir_path = settings.get("ffmpeg_dir_path", "")
-        self.ffmpeg_dir_enabled.set(ffmpeg_dir_enabled)
-        self.ffmpeg_dir_path.set(ffmpeg_dir_path)
+        self._loading_settings = True
+        try:
+            settings = self.preset_manager.load_player_settings()
+            self.use_mpv.set(settings.get("use_mpv", False))
+            self.mpv_path.set(settings.get("mpv_path", "mpv"))
+            # 读取日志设置，缺失时使用默认值
+            self.log_enabled_var.set(settings.get("log_enabled", True))
+            log_path = settings.get("log_path", os.path.join(get_script_dir(), "editlog.txt"))
+            self.log_path_var.set(normalize_path(log_path))
+            self.overwrite_policy.set(settings.get("overwrite_policy", "ask"))
+            cmd_path = settings.get("cmd_output_path", "")
+            if cmd_path:
+                self.cmd_output_path.set(cmd_path)
+            # 读取 FFmpeg 目录设置
+            ffmpeg_dir_enabled = settings.get("ffmpeg_dir_enabled", False)
+            ffmpeg_dir_path = settings.get("ffmpeg_dir_path", "")
+            self.ffmpeg_dir_enabled.set(ffmpeg_dir_enabled)
+            self.ffmpeg_dir_path.set(ffmpeg_dir_path)
+    
+            preview_editable = settings.get("preview_editable", False)
+            self.preview_editable_var.set(preview_editable)
+    
+            pix_fmt_default = settings.get("pix_fmt_enabled_default", False)
+            self.pix_fmt_enabled_default.set(pix_fmt_default)
+    
 
-        preview_editable = settings.get("preview_editable", False)
-        self.preview_editable_var.set(preview_editable)
-
-        pix_fmt_default = settings.get("pix_fmt_enabled_default", False)
-        self.pix_fmt_enabled_default.set(pix_fmt_default)
-
-
-        parallel = settings.get("ffprobe_parallel")
-        if parallel is not None and parallel > 0:
-            self.ffprobe_parallel.set(parallel)
-        else:
-            # 如果预设中没有值，则保存当前计算值（确保预设中有记录）
-            self.save_player_settings()
+    
+    
+            parallel = settings.get("ffprobe_parallel")
+            if parallel is not None and parallel > 0:
+                self.ffprobe_parallel.set(parallel)
+            else:
+                # 如果预设中没有值，则保存当前计算值（确保预设中有记录）
+                pass
+        finally:
+            self._loading_settings = False
 
         # 更新路径
         self._update_ffmpeg_paths()
 
     def save_player_settings(self):
+        if getattr(self, '_suppress_save', False) or getattr(self, '_loading_settings', False):
+            return
         self.preset_manager.save_player_settings({
             "use_mpv": self.use_mpv.get(),
             "mpv_path": self.mpv_path.get(),
@@ -7989,19 +8001,21 @@ class FFmpegBatchGUI:
         merge_style.configure("Merge.Treeview.Heading", background="#d9d9d9")
     
         # 创建 Treeview（只一次）
-        columns = ("启用", "类型", "编码", "来源", "编码设置 双击编辑")
+        columns = ("启用", "类型", "规格", "编码", "来源", "编码设置 双击编辑")
         self.merge_tree = ttk.Treeview(list_container, columns=columns, show="headings",
                                        height=8, style="Merge.Treeview")
         self.merge_tree.heading("启用", text="启用")
         self.merge_tree.heading("类型", text="类型")
+        self.merge_tree.heading("规格", text="规格")
         self.merge_tree.heading("编码", text="编码")
         self.merge_tree.heading("来源", text="来源")
         self.merge_tree.heading("编码设置 双击编辑", text="编码设置 双击编辑")
-        self.merge_tree.column("启用", width=20, anchor="center")
-        self.merge_tree.column("类型", width=40)
+        self.merge_tree.column("启用", width=5, anchor="center")
+        self.merge_tree.column("类型", width=30)
+        self.merge_tree.column("规格", width=40)
         self.merge_tree.column("编码", width=30)
         self.merge_tree.column("来源", width=500)
-        self.merge_tree.column("编码设置 双击编辑", width=150)
+        self.merge_tree.column("编码设置 双击编辑", width=80)
         self.merge_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     
         # 滚动条
@@ -8251,7 +8265,6 @@ class FFmpegBatchGUI:
             return
     
         def natural_key(text):
-            import re
             parts = [p for p in re.split(r'(\d+)', text) if p]  # 过滤空字符串
             def convert(part):
                 return int(part) if part.isdigit() else part.lower()
@@ -9240,6 +9253,11 @@ class FFmpegBatchGUI:
             self._add_hwaccel_params(cmd, video_tracks[0].enc_settings)
 
         if use_copy_mode:
+            if not self._check_video_params_consistent(video_tracks, silent=True):  # silent=True 避免内部打印
+                self._append_info_ui("[串联] 检测到视频参数不一致，自动切换到重新编码模式以确保兼容性。")
+                use_copy_mode = False
+        
+        if use_copy_mode:
             return self._build_concat_copy_mode(cmd, video_tracks, audio_tracks, output_norm, preview=preview)
         else:
             return self._build_concat_reencode_mode(cmd, video_tracks, audio_tracks, main_video, output_norm)
@@ -9418,6 +9436,7 @@ class FFmpegBatchGUI:
         """
         根据当前模式生成合并/封装的 FFmpeg 命令列表。
         """
+
         if not self.ffmpeg_cmd:
             self._append_info_ui("未找到 ffmpeg，无法生成合并命令。")
             return []
@@ -9491,7 +9510,95 @@ class FFmpegBatchGUI:
         return cmd_list
     
     
+    def _check_video_params_consistent(self, video_tracks, silent=False) -> bool:
+        """
+        检查所有视频轨道的编码参数是否一致（用于串联 copy 模式）。
+        使用缓存避免重复检查，缓存键基于所有文件的路径+修改时间。
+        返回 True 表示参数一致，False 表示不一致（建议切换到重新编码模式）。
+        """
+        if len(video_tracks) < 2:
+            return True
     
+        # ---- 构建缓存键 ----
+        # 使用 (文件路径, 修改时间) 元组列表作为键
+        cache_key_parts = []
+        for track in video_tracks:
+            path = track.file_path
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                mtime = 0
+            cache_key_parts.append((path, mtime))
+        cache_key = tuple(cache_key_parts)  # 元组可哈希
+    
+        # 检查缓存
+        if not hasattr(self, '_concat_params_cache'):
+            self._concat_params_cache = {}
+        if cache_key in self._concat_params_cache:
+            return self._concat_params_cache[cache_key]
+    
+        # ---- 实际检查 ----
+        ref_track = video_tracks[0]
+        ref_info = self._get_cached_stream_info(ref_track.file_path)
+        if not ref_info:
+            self._concat_params_cache[cache_key] = False
+            return False
+    
+        ref_stream = None
+        for s in ref_info.get('streams', []):
+            if s.get('codec_type') == 'video':
+                ref_stream = s
+                break
+        if not ref_stream:
+            self._concat_params_cache[cache_key] = False
+            return False
+    
+        # 提取参考参数
+        ref_codec = ref_stream.get('codec_name')
+        ref_w = ref_stream.get('width')
+        ref_h = ref_stream.get('height')
+        ref_pix_fmt = ref_stream.get('pix_fmt')
+        ref_time_base = ref_stream.get('time_base')
+        ref_frame_rate = ref_stream.get('avg_frame_rate') or ref_stream.get('r_frame_rate')
+    
+        # 逐个比较后续轨道
+        for track in video_tracks[1:]:
+            info = self._get_cached_stream_info(track.file_path)
+            if not info:
+                self._concat_params_cache[cache_key] = False
+                return False
+    
+            stream = None
+            for s in info.get('streams', []):
+                if s.get('codec_type') == 'video':
+                    stream = s
+                    break
+            if not stream:
+                self._concat_params_cache[cache_key] = False
+                return False
+    
+            # 比较关键参数
+            if stream.get('codec_name') != ref_codec:
+                self._concat_params_cache[cache_key] = False
+                return False
+            if stream.get('width') != ref_w or stream.get('height') != ref_h:
+                self._concat_params_cache[cache_key] = False
+                return False
+            if stream.get('pix_fmt') != ref_pix_fmt:
+                self._concat_params_cache[cache_key] = False
+                return False
+            if stream.get('time_base') != ref_time_base:
+                self._concat_params_cache[cache_key] = False
+                return False
+    
+            frame_rate = stream.get('avg_frame_rate') or stream.get('r_frame_rate')
+            if frame_rate != ref_frame_rate:
+                self._concat_params_cache[cache_key] = False
+                return False
+    
+        # 所有参数一致
+        self._concat_params_cache[cache_key] = True
+        return True  
     
     
     
@@ -9499,6 +9606,7 @@ class FFmpegBatchGUI:
 
 
     def merge_update_command_preview(self, output_override=None):
+
         if self._batch_update:
             return
     
@@ -9593,7 +9701,7 @@ class FFmpegBatchGUI:
         # 配置标签颜色（主视频、子视频、音频、字幕）
         # 每种类型有两套：偶数行和奇数行（交替）
         self.merge_tree.tag_configure('even_main', background='#d9e8f7')
-        self.merge_tree.tag_configure('odd_main', background='#c2d6ed')
+        self.merge_tree.tag_configure('odd_main', background='#85C1E9')
         self.merge_tree.tag_configure('even_pip', background='#d9f0d9')
         self.merge_tree.tag_configure('odd_pip', background='#bde0bd')
         self.merge_tree.tag_configure('even_concat', background='#fdebd0')
@@ -9641,9 +9749,59 @@ class FFmpegBatchGUI:
                 else:
                     display_type = "视频(从)"
     
+            # ---- 规格 ----
+            if track.type == "video":
+                w, h = self._get_video_dimensions_cached(track.file_path)
+                detail = f"{w}x{h}" if w and h else "未知"
+            elif track.type == "audio":
+                info = self._get_cached_stream_info(track.file_path)
+                if info:
+                    streams = info.get('streams', [])
+                    for s in streams:
+                        if s.get('codec_type') == 'audio' and s.get('index') == track.index:
+                            bitrate = s.get('bit_rate')
+                            if bitrate:
+                                try:
+                                    bitrate_kbps = int(bitrate) // 1000
+                                    detail = f"{bitrate_kbps} kbps"
+                                except:
+                                    detail = s.get('codec_name', '音频')
+                            else:
+                                # 构建备选信息
+                           #     codec_name = s.get('codec_name', '')
+                                sample_rate = s.get('sample_rate')
+                                channels = s.get('channels')
+                                parts = []
+                      #          if codec_name:
+                      #              parts.append(codec_name)
+                                if sample_rate:
+                                    parts.append(f"{int(sample_rate)//1000}kHz")
+                                if channels:
+                                    parts.append(f"{channels}ch")
+                                detail = " ".join(parts) if parts else "-"
+                            break
+                    else:
+                        detail = "-"
+                else:
+                    detail = "-"
+            elif track.type == "subtitle":
+                info = self._get_cached_stream_info(track.file_path)
+                lang = ""
+                if info:
+                    streams = info.get('streams', [])
+                    for s in streams:
+                        if s.get('codec_type') == 'subtitle' and s.get('index') == track.index:
+                            tags = s.get('tags', {})
+                            lang = tags.get('language', '')
+                            break
+                detail = f"{lang}" if lang else "-"
+            else:
+                detail = "-"
+            
             values = (
                 enabled_text,
                 display_type,
+                detail,
                 track.codec[:10],
                 os.path.basename(track.file_path) if track.file_path else "外部",
                 enc_text
@@ -9743,11 +9901,12 @@ class FFmpegBatchGUI:
     def merge_reset_column_widths(self):
         """恢复合并页面 Treeview 各列的默认宽度"""
         # 原创建时的列宽设置
-        self.merge_tree.column("启用", width=20)
-        self.merge_tree.column("类型", width=40)
+        self.merge_tree.column("启用", width=5)
+        self.merge_tree.column("类型", width=30)
+        self.merge_tree.column("规格", width=40)
         self.merge_tree.column("编码", width=30)
         self.merge_tree.column("来源", width=500)
-        self.merge_tree.column("编码设置 双击编辑", width=150)
+        self.merge_tree.column("编码设置 双击编辑", width=80)
         self._append_info_ui("[布局] 已恢复合并列表的列宽")
 
 
@@ -9768,6 +9927,8 @@ class FFmpegBatchGUI:
 
     def merge_clear_tracks(self):
         self.merge_tracks.clear()
+        self.merge_video.set("")
+        self.merge_output.set("")
         self.merge_update_track_list()
         self.merge_auto_recommend_container()
         self.merge_update_command_preview()
@@ -11256,6 +11417,8 @@ class FFmpegBatchGUI:
 
 
     def _update_preview_edit_state(self):
+        if getattr(self, '_loading_settings', False):
+            return
         editable = self.preview_editable_var.get()
         # 更新转码预览区（如果存在）
         if hasattr(self, 'cmd_preview'):
@@ -11308,6 +11471,8 @@ class FFmpegBatchGUI:
             self._on_ffmpeg_dir_changed()
     
     def _on_ffmpeg_dir_changed(self):
+        if getattr(self, '_loading_settings', False):
+            return
         self._update_ffmpeg_paths()
         self.save_player_settings()
         # 刷新命令预览（因为 ffmpeg 路径改变了）
@@ -11937,8 +12102,9 @@ class FFmpegBatchGUI:
         self.notebook.add(player_tab, text="信息与播放器")
         self.create_player_settings_tab(player_tab)
 
-        self._initialized = True
+
         self._update_preview_edit_state()   # 应用加载后的状态
+        self._initialized = True
 
 
 
