@@ -7358,20 +7358,25 @@ class FFmpegBatchGUI:
     def _submit_next_batch(self):
         if not self.is_processing or self.executor is None:
             return
-        if self.stop_flag and not self.running_futures:
+    
+        # ---- 停止信号处理 ----
+        if self.stop_flag:
+            # 如果有正在运行的任务，让它们继续运行，但不启动新任务
+            if not self.running_futures:
+                self._finish_queue()   # 所有任务已完成，结束队列
+            return
+    
+        if not self.pending_tasks and not self.running_futures:
             self._finish_queue()
             return
-
-        if not self.stop_flag and not self.pending_tasks and not self.running_futures:
-            self._finish_queue()
-            return
-
+    
         max_total = self.max_parallel.get()
         max_hw = self.max_hw_parallel.get()
-
+    
         if len(self.running_futures) >= max_total:
             return
-
+    
+        # 查找可提交的任务
         to_submit_idx = None
         for idx, task in enumerate(self.pending_tasks):
             if task.status != "等待":
@@ -7402,6 +7407,36 @@ class FFmpegBatchGUI:
     def safe_append_detail(self, text):
         self.root.after(0, lambda: self.append_detail(text))
 
+
+    def _get_effective_duration(self, settings: dict, input_path: str) -> Optional[float]:
+        """
+        计算当前设置下的实际处理时长（考虑截取和精准模式）。
+        若未启用截取或无法计算，则返回文件总时长。
+        """
+        # 如果未启用截取，直接返回总时长
+        if not settings.get("trim_enabled", False):
+            return self._get_media_duration(input_path)
+    
+        # 获取截取起止时间
+        start_str = settings.get("trim_start", "").strip()
+        end_str = settings.get("trim_end", "").strip()
+        start_sec = time_to_seconds(start_str) if start_str else 0.0
+        end_sec = time_to_seconds(end_str) if end_str else None
+    
+        total_duration = self._get_media_duration(input_path)
+        if total_duration is None:
+            return None
+    
+        if end_sec is not None and end_sec > start_sec:
+            duration = end_sec - start_sec
+        else:
+            # 结束时间未填或无效，截取到文件末尾
+            duration = total_duration - start_sec
+    
+        # 若为精准模式（trim 滤镜），实际时长就是截取时长；若为快速模式（命令行 -ss/-to），也是截取时长
+        # 但注意：若 start_sec 很大，FFmpeg 可能从关键帧开始，但实际处理时长仍为截取时长
+        return max(0.0, duration)
+
     def _process_single_task(self, task):
         """处理单个任务（队列模式）"""
         task.status = "转码中"
@@ -7412,7 +7447,7 @@ class FFmpegBatchGUI:
         self.ensure_output_dir(task.output)
     
         # 获取视频总时长用于进度
-        total_duration = self._get_media_duration(task.input)
+        total_duration = self._get_effective_duration(task.settings, task.input)
         if total_duration is None:
             total_duration = 0
     
@@ -7527,15 +7562,15 @@ class FFmpegBatchGUI:
         except ValueError as e:
             messagebox.showerror("命令生成错误", str(e))
             return
-        threading.Thread(target=self._run_single_transcode, args=(cmd_list, input_file), daemon=True).start()
+        threading.Thread(target=self._run_single_transcode, args=(cmd_list, input_file, settings), daemon=True).start()
 
-    def _run_single_transcode(self, cmd_list, input_name):
+    def _run_single_transcode(self, cmd_list, input_name, settings):
         """单文件转码（非队列）"""
         self._append_info_ui(f"\n========== 当前选择转码: {os.path.basename(input_name)} ==========")
         cmd_str = format_cmd_for_display(cmd_list)
         self._append_info_ui(f">>> {cmd_str}")
     
-        total_duration = self._get_media_duration(input_name)
+        total_duration = self._get_effective_duration(settings, input_name)
         if total_duration is None:
             total_duration = 0
     
@@ -8002,7 +8037,7 @@ class FFmpegBatchGUI:
     
         # 自定义样式
         merge_style = ttk.Style()
-        merge_style.configure("Merge.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0")
+        merge_style.configure("Merge.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0", rowheight=int(22 * self.scaling))
         merge_style.configure("Merge.Treeview.Heading", background="#d9d9d9")
     
         # 创建 Treeview（只一次）
@@ -9293,7 +9328,7 @@ class FFmpegBatchGUI:
 
         if use_copy_mode:
             if not self._check_video_params_consistent(video_tracks, silent=True):  # silent=True 避免内部打印
-                self._append_info_ui("[串联] 检测到视频参数不一致，自动切换到重新编码模式以确保兼容性。")
+                self._append_info_ui("[串联] 检测到视频参数不一致，可在规格列查看，自动切换到重新编码模式以确保兼容性。")
                 use_copy_mode = False
         
         if use_copy_mode:
@@ -9309,7 +9344,7 @@ class FFmpegBatchGUI:
         if preview:
             # 预览模式：使用占位符，不创建实际文件
             list_path = "concat_random.txt"
-            self._append_info_ui("[串联-流] 预览命令，txt列表使用占位名，开始合并时随机生成")
+            self._append_info_ui("[串联-流] 预览命令，txt列表使用占位名，点击开始合并后随机生成")
         else:
             # 实际执行：创建临时文件
             fd, list_path = tempfile.mkstemp(suffix='.txt', prefix='concat_', text=True)
@@ -12186,77 +12221,80 @@ class FFmpegBatchGUI:
 
         tasks_frame = ttk.Frame(transcode_vpane)
         tasks_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0,0))
-
-        tasks_frame.rowconfigure(0, weight=0)
-        tasks_frame.rowconfigure(1, weight=1)
-        tasks_frame.columnconfigure(0, weight=1)
         
-        btn_container = ttk.Frame(tasks_frame)
-        btn_container.grid(row=0, column=0, sticky="ew", pady=0)
-        canvas = tk.Canvas(btn_container, highlightthickness=0, height=1)
-        canvas.pack(side=tk.TOP, fill=tk.X, expand=True)
-        h_scroll = ttk.Scrollbar(btn_container, orient=tk.HORIZONTAL, command=canvas.xview)
-        h_scroll.pack(side=tk.BOTTOM, fill=tk.X, pady=(4,0))
-        canvas.configure(xscrollcommand=h_scroll.set)
-        button_frame = ttk.Frame(canvas)
-        canvas.create_window((0, 0), window=button_frame, anchor="nw")
-        def _on_frame_configure(event):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            new_height = button_frame.winfo_reqheight()
-            if canvas.cget("height") != new_height:
-                canvas.configure(height=new_height)
-        button_frame.bind("<Configure>", _on_frame_configure)
+        # ---------- 工具栏（水平排列） ----------
+        tool_frame = ttk.Frame(tasks_frame)
+        tool_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 5))
         
-        btn_start = tk.Button(button_frame, text="开始队列", command=self.start_queue,
+        btn_start = tk.Button(tool_frame, text="开始队列", command=self.start_queue,
                               bg="#4CAF50", fg="white", width=12, relief=tk.RAISED)
         btn_start.pack(side=tk.LEFT, padx=5)
         
+        # 并行任务
         self.max_parallel = tk.IntVar(value=1)
-        label_parallel = ttk.Label(button_frame, text="并行任务:")
-        label_parallel.pack(side=tk.LEFT, padx=(10,2))
+        label_parallel = ttk.Label(tool_frame, text="并行任务:")
+        label_parallel.pack(side=tk.LEFT, padx=(10, 2))
         ToolTip(label_parallel, "同时运行的任务数量，建议不超过3以避免资源过度占用")
-        self.parallel_spin = ttk.Spinbox(button_frame, from_=1, to=5, width=3, textvariable=self.max_parallel, state="readonly")
+        self.parallel_spin = ttk.Spinbox(tool_frame, from_=1, to=5, width=3,
+                                         textvariable=self.max_parallel, state="readonly")
         self.parallel_spin.pack(side=tk.LEFT, padx=2)
         
-        label_hw = ttk.Label(button_frame, text="硬编并发限制:")
-        label_hw.pack(side=tk.LEFT, padx=(10,2))
+        # 硬编并发限制
+        label_hw = ttk.Label(tool_frame, text="硬编并发限制:")
+        label_hw.pack(side=tk.LEFT, padx=(10, 2))
         ToolTip(label_hw, "同时进行的硬件编码〔NVENC/QSV/AMF等〕任务的最大数量，推荐不超过2，显存里可能数据打架")
-        self.max_hw_spin = ttk.Spinbox(button_frame, from_=1, to=4, width=3, textvariable=self.max_hw_parallel, state="readonly")
+        self.max_hw_spin = ttk.Spinbox(tool_frame, from_=1, to=4, width=3,
+                                       textvariable=self.max_hw_parallel, state="readonly")
         self.max_hw_spin.pack(side=tk.LEFT, padx=2)
         
-        for text, cmd in [("移除选中任务", self.remove_selected_tasks), ("清空全部任务", self.clear_all_tasks),
-                          ("清空已完成/失败任务", self.clear_finished_tasks), ("停止队列", self.stop_queue),
-                          ("导出为脚本", self.export_script), ("预览选中任务", self.preview_selected_task)]:
-            ttk.Button(button_frame, text=text, command=cmd).pack(side=tk.LEFT, padx=5)
+        # 操作按钮（去除分隔符，直接连续排列）
+        for text, cmd in [("移除选中任务", self.remove_selected_tasks),
+                          ("清空全部任务", self.clear_all_tasks),
+                          ("清空已完成/失败任务", self.clear_finished_tasks),
+                          ("停止队列", self.stop_queue),
+                          ("导出为脚本", self.export_script),
+                          ("预览选中任务", self.preview_selected_task)]:
+            ttk.Button(tool_frame, text=text, command=cmd).pack(side=tk.LEFT, padx=5)
         
+        # ---------- 树形视图区域 ----------
         tree_frame = ttk.Frame(tasks_frame)
-        tree_frame.grid(row=1, column=0, sticky="nsew", pady=5)
-        tree_frame.rowconfigure(0, weight=1)
-        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         
+        # 自定义样式（可选，与第二个代码块一致）
+        style = ttk.Style()
+        style.configure("Custom.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0", rowheight=int(22 * self.scaling))
+        style.configure("Custom.Treeview.Heading", background="#d9d9d9")
+        
+        # 滚动条（垂直）
         v_scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
         v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # 水平滚动条（如果需要）
         h_scrollbar = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL)
         h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
         
         columns = ("序号", "文件名", "输出路径", "命令 (简洁) 双击编辑", "状态", "错误信息")
         
-        # ---- 高 DPI 适配 ----
-        style = ttk.Style()
-        style.configure("Treeview", rowheight=int(22 * self.scaling))
-        
+        # Treeview 使用自定义样式
         self.task_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=12,
                                       yscrollcommand=v_scrollbar.set,
-                                      xscrollcommand=h_scrollbar.set)
+                                      xscrollcommand=h_scrollbar.set,
+                                      style="Custom.Treeview")  # 应用样式
         self.task_tree.tag_configure('odd', background='#e8e8e8')
         self.task_tree.tag_configure('even', background='#ffffff')
+        
         v_scrollbar.config(command=self.task_tree.yview)
         h_scrollbar.config(command=self.task_tree.xview)
-        widths = {"序号":50, "文件名":150, "输出路径":200, "命令 (简洁) 双击编辑":400, "状态":80, "错误信息":200}
+        
+        # 列宽设置（可保持原值或按需调整）
+        widths = {"序号":50, "文件名":150, "输出路径":200, "命令 (简洁) 双击编辑":410, "状态":110, "错误信息":58}
         for col in columns:
             self.task_tree.heading(col, text=col)
             self.task_tree.column(col, width=widths.get(col,100), minwidth=50, stretch=False)
-        self.task_tree.pack(fill=tk.BOTH, expand=True)
+        
+        self.task_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # 双击编辑绑定
         self.task_tree.bind("<Double-1>", self.on_task_double_click)
 
 
