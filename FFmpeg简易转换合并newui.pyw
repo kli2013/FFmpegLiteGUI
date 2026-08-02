@@ -58,20 +58,27 @@ def get_script_dir() -> str:
         return os.path.dirname(os.path.abspath(__file__))
 
 def find_executable(name: str) -> Optional[str]:
-    """查找可执行文件：优先脚本目录，再检查打包后的 _internal 目录，最后搜索 PATH"""
     script_dir = get_script_dir()
-    # 1. 脚本目录（开发环境或 one-dir 顶层）
+
+    # 1. 检查脚本目录本身
     local_path = os.path.join(script_dir, name)
     if os.path.isfile(local_path) and os.access(local_path, os.X_OK):
         return local_path
 
-    # 2. 打包后 one-dir 模式的 _internal 目录
+    # 2. 打包模式：检查脚本目录下的一级子目录（适配不同打包工具）
     if getattr(sys, 'frozen', False):
-        internal_path = os.path.join(script_dir, '_internal', name)
-        if os.path.isfile(internal_path) and os.access(internal_path, os.X_OK):
-            return internal_path
+        try:
+            # 只遍历 script_dir 的直接子目录（深度为1）
+            for entry in os.listdir(script_dir):
+                sub_dir = os.path.join(script_dir, entry)
+                if os.path.isdir(sub_dir):
+                    candidate = os.path.join(sub_dir, name)
+                    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                        return candidate
+        except Exception:
+            pass
 
-    # 3. 系统 PATH 环境变量
+    # 3. 系统 PATH
     return shutil.which(name)
 
 def get_dpi_scaling(root: tk.Tk) -> float:
@@ -4181,6 +4188,15 @@ class FFmpegBatchGUI:
 
 
 
+        self.extract_custom_dir = tk.BooleanVar(value=False)   # 流提取 是否启用自定义输出目录
+        self.extract_output_dir = tk.StringVar(value="")       # 流提取 自定义输出目录路径
+        self.current_preview_file = None
+        self.auto_match_subtitle_ext = tk.BooleanVar(value=True)
+        self.auto_match_audio_ext = tk.BooleanVar(value=True)
+        self.extract_keep_chapters = tk.BooleanVar(value=True)
+        self.extract_clear_metadata = tk.BooleanVar(value=False)
+        self.extract_file_list = []
+        self._suppress_save = False
 
         self._stream_info_cache = {}
         self._suppress_main_video_trace = False
@@ -4198,6 +4214,10 @@ class FFmpegBatchGUI:
             default_parallel = 16
         self.ffprobe_parallel = tk.IntVar(value=default_parallel)
 
+        # 流提取相关
+        self.extract_parser_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.ffprobe_parallel.get()
+        )
 
 
         self._running_tasks = []  # 存储 (proc, task)
@@ -4388,6 +4408,37 @@ class FFmpegBatchGUI:
         # 未找到图标
         print("未找到窗口图标文件 35.ico")
 
+    # 流提取相关
+    def add_custom_task(self, input_path: str, output_path: str, cmd_list: List[str], settings: dict = None):
+        """
+        直接添加自定义命令的任务（跳过命令生成逻辑）。
+        input_path, output_path 仅用于显示和冲突检测。
+        """
+        if settings is None:
+            settings = {}
+        # 处理冲突，获得最终路径
+        final_output = self._resolve_path_conflict(output_path, show_dialog=True)
+        if final_output is None:
+            return False
+        # 更新命令列表中的输出路径（假设输出文件是最后一个参数）
+        if cmd_list and cmd_list[-1] == output_path:
+            cmd_list[-1] = final_output
+        else:
+            # 更安全的做法：若最后一个参数不是原输出路径，则尝试替换所有匹配项
+            # 但通常最后一个就是输出，这里做兼容处理
+            for i, arg in enumerate(cmd_list):
+                if arg == output_path:
+                    cmd_list[i] = final_output
+                    break
+            else:
+                # 如果没找到，直接追加到最后？但可能破坏命令结构，此处警告
+                self._append_info_ui(f"警告：未在命令中找到输出路径 {output_path}，已忽略路径更新")
+        task = Task(input_path, final_output, settings, cmd_list)
+        task.is_custom = True
+        self.tasks.append(task)
+        self.update_task_list()
+        self._append_info_ui(f"✅ 已添加提取任务: {os.path.basename(input_path)} -> {final_output}")
+        return True
 
 
     def update_progress(self, current=0, total=0, task=None, log_progress=True):
@@ -5388,7 +5439,13 @@ class FFmpegBatchGUI:
             pix_fmt_default = settings.get("pix_fmt_enabled_default", False)
             self.pix_fmt_enabled_default.set(pix_fmt_default)
     
-
+            # 流提取相关
+            self.extract_custom_dir.set(settings.get("extract_custom_dir", False))
+            self.extract_output_dir.set(settings.get("extract_output_dir", ""))
+            self.auto_match_subtitle_ext.set(settings.get("auto_match_subtitle_ext", True))
+            self.auto_match_audio_ext.set(settings.get("auto_match_audio_ext", True))
+            self.extract_keep_chapters.set(settings.get("extract_keep_chapters", True))
+            self.extract_clear_metadata.set(settings.get("extract_clear_metadata", False))
     
     
             parallel = settings.get("ffprobe_parallel")
@@ -5418,6 +5475,11 @@ class FFmpegBatchGUI:
             "preview_editable": self.preview_editable_var.get(),
             "pix_fmt_enabled_default": self.pix_fmt_enabled_default.get(),
 
+            # 流提取相关
+            "extract_custom_dir": self.extract_custom_dir.get(),
+            "extract_output_dir": self.extract_output_dir.get().strip(),
+            "auto_match_audio_ext": self.auto_match_audio_ext.get(),
+            "auto_match_subtitle_ext": self.auto_match_subtitle_ext.get(),
 
             "ffprobe_parallel": self.ffprobe_parallel.get(),
         })
@@ -7870,6 +7932,15 @@ class FFmpegBatchGUI:
             
             def update_preview(*args):
 
+                current_state = preview_text.cget('state')
+                if task.is_custom:
+                    # 直接显示保存的命令   # 流提取相关
+                    cmd_str = format_cmd_for_display(task.cmd)
+                    preview_text.config(state='normal')
+                    preview_text.delete(1.0, tk.END)
+                    preview_text.insert(tk.END, cmd_str)
+                    preview_text.config(state=current_state)
+                    return
 
                 new_settings = {}
                 new_settings.update(enc_frame.get_settings())
@@ -7964,7 +8035,11 @@ class FFmpegBatchGUI:
             update_preview()
     
             def save_changes():
-
+	        # 流提取相关
+                if task.is_custom:
+                    messagebox.showinfo("提示", "此任务为流提取生成的自定义任务，不支持修改参数。")
+                    win.destroy()
+                    return
                 new_settings = {}
                 new_settings.update(enc_frame.get_settings())
                 new_settings.update(filt_frame.get_settings())
@@ -12004,12 +12079,868 @@ class FFmpegBatchGUI:
         else:
             self._append_info_ui("[封装] 无命令可复制")
 
+    # 流提取页面创建
+    def create_extract_tab(self, parent):
+        main_frame = ttk.Frame(parent, padding="5")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+    
+        # ---- 文件列表（Treeview） ----
+        if DND_AVAILABLE:
+            label_text = "输入文件列表 - 支持拖拽添加文件"
+        else:
+            label_text = "输入文件列表"
+        list_frame = ttk.LabelFrame(main_frame, text=label_text, padding="5")
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+    
+        # 工具栏（包含所有操作按钮）
+        tree_toolbar = ttk.Frame(list_frame)
+        tree_toolbar.pack(fill=tk.X, pady=2)
+        ttk.Button(tree_toolbar, text="添加文件", command=self.extract_add_file).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tree_toolbar, text="清空列表", command=self.extract_clear_files).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tree_toolbar, text="删除选中", command=self.extract_delete_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tree_toolbar, text="预览选中", command=self.extract_preview_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tree_toolbar, text="发送选中", command=self.extract_send_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Label(tree_toolbar, text="（双击行预览当前文件）").pack(side=tk.LEFT, padx=10)
+
+    
+        # 自定义样式
+        extract_style = ttk.Style()
+        extract_style.configure("Extract.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0", rowheight=int(22 * self.scaling))
+        extract_style.configure("Extract.Treeview.Heading", background="#d9d9d9")
+    
+        # 创建 Treeview
+        columns = ("文件名", "完整路径")
+        self.extract_tree = ttk.Treeview(list_frame, columns=columns, show="headings",
+                                         height=8, style="Extract.Treeview")
+        self.extract_tree.heading("文件名", text="文件名")
+        self.extract_tree.heading("完整路径", text="完整路径")
+        self.extract_tree.column("文件名", width=200, minwidth=100)
+        self.extract_tree.column("完整路径", width=400, minwidth=200)
+        self.extract_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    
+        # 滚动条
+        vbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.extract_tree.yview)
+        self.extract_tree.configure(yscrollcommand=vbar.set)
+        vbar.pack(side=tk.RIGHT, fill=tk.Y)
+    
+        # 双击预览
+        self.extract_tree.bind("<Double-1>", self.extract_on_tree_double_click)
+    
+        # ---- 拖拽绑定（确保只在此页面生效） ----
+        if DND_AVAILABLE:
+            list_frame.drop_target_register(DND_FILES)
+            list_frame.dnd_bind('<<Drop>>', self.extract_on_drop)
+    
+        # ---- 提取选项（保持不变） ----
+        opt_frame = ttk.LabelFrame(main_frame, text="提取选项", padding="5")
+        opt_frame.pack(fill=tk.X, pady=5)
+        opt_frame.columnconfigure(3, weight=0)
+    
+        self.extract_video = tk.BooleanVar(value=True)
+        self.extract_audio = tk.BooleanVar(value=True)
+        self.extract_subtitle = tk.BooleanVar(value=True)
+        self.extract_only_first = tk.BooleanVar(value=False)
+        self.extract_subfolders = tk.BooleanVar(value=False)
+    
+        # 第一行：视频
+        chk_video = ttk.Checkbutton(opt_frame, text="提取视频流", variable=self.extract_video)
+        chk_video.grid(row=0, column=0, sticky="w", padx=10)
+        ttk.Label(opt_frame, text="输出容器: ").grid(row=0, column=1, padx=(20,0))
+        self.extract_video_container = tk.StringVar(value="mkv")
+        ttk.Combobox(opt_frame, textvariable=self.extract_video_container,
+                     values=["mkv", "mp4", "mov"], state="readonly", width=6).grid(row=0, column=2, sticky="w")
+
+        chk_chapters = ttk.Checkbutton(opt_frame, text="保留章节", variable=self.extract_keep_chapters)
+        chk_chapters.grid(row=0, column=3, sticky="w", padx=(0,10))
+        ToolTip(chk_chapters,
+                "勾选后，提取视频流音频流时会保留章节标记（-map_chapters 0）。\n\n"
+                "支持的格式：\n"
+                "• 视频：MKV、MP4、MOV 等主流容器均支持章节。\n"
+                "• 音频：M4A / M4B（推荐）、MKA 原生支持；MP3 / FLAC / OGG 虽也支持但播放器兼容性较差。\n\n"
+                "重要提示（音频提取）：\n"
+                "如果您希望保留专辑分轨或有声书章节，请关闭「自动匹配」，并手动选择输出格式为 M4A 或 MKA，以确保章节信息被完整保留。自动匹配可能根据编码扩展名选择不支持章节的格式（如 .mp3），导致章节丢失。")
+        self.extract_keep_chapters.trace_add('write', lambda *a: self.save_player_settings())
+
+
+        # 第二行：音频 + 自动匹配
+        chk_audio = ttk.Checkbutton(opt_frame, text="提取音频流", variable=self.extract_audio)
+        chk_audio.grid(row=1, column=0, sticky="w", padx=10)
+        ttk.Label(opt_frame, text="输出格式: ").grid(row=1, column=1, padx=(20,0))
+        self.extract_audio_format = tk.StringVar(value="mka")
+        self.extract_audio_format_combo = ttk.Combobox(opt_frame, textvariable=self.extract_audio_format,
+                                                        values=["m4a", "mp3", "flac", "wav", "aac", "mka"], state="readonly", width=6)
+        self.extract_audio_format_combo.grid(row=1, column=2, sticky="w", padx=(0,5))
+        chk_auto_audio = ttk.Checkbutton(opt_frame, text="自动匹配", variable=self.auto_match_audio_ext,
+                                         command=self._on_auto_audio_toggle)
+        chk_auto_audio.grid(row=1, column=3, sticky="w", padx=(0,10))
+        ToolTip(chk_auto_audio, "根据检测到的音频编码自动选择输出扩展名（如 AAC→.m4a, MP3→.mp3, FLAC→.flac）")
+
+        self.auto_match_audio_ext.trace_add('write', lambda *a: self.save_player_settings())
+
+        # 第三行：字幕 + 自动匹配
+        chk_sub = ttk.Checkbutton(opt_frame, text="提取字幕流", variable=self.extract_subtitle)
+        chk_sub.grid(row=2, column=0, sticky="w", padx=10)
+        ttk.Label(opt_frame, text="输出格式: ").grid(row=2, column=1, padx=(20,0))
+        self.extract_subtitle_format = tk.StringVar(value="srt")
+        self.extract_subtitle_format_combo = ttk.Combobox(opt_frame, textvariable=self.extract_subtitle_format,
+                                                          values=["srt", "ass", "vtt", "mov_text"], state="readonly", width=6)
+        self.extract_subtitle_format_combo.grid(row=2, column=2, sticky="w", padx=(0,5))
+        chk_auto_ext = ttk.Checkbutton(opt_frame, text="自动匹配", variable=self.auto_match_subtitle_ext,
+                                       command=self._on_auto_ext_toggle)
+        chk_auto_ext.grid(row=2, column=3, sticky="w", padx=(0,10))
+        ToolTip(chk_auto_ext, "根据检测到的字幕编码自动选择输出扩展名（如 ASS→.ass, SRT→.srt）")
+
+        self.auto_match_subtitle_ext.trace_add('write', lambda *a: self.save_player_settings())
+
+
+        # 第四行：仅第一轨、分文件夹
+        chk_only_first = ttk.Checkbutton(opt_frame, text="仅提取第一轨（取消则提取全部匹配轨）",
+                                         variable=self.extract_only_first)
+        chk_only_first.grid(row=3, column=0, sticky="w", padx=10, pady=5)
+        ToolTip(chk_only_first,
+                "勾选后，每种流类型仅提取第一个轨道（如第一条音频、第一条字幕）。\n"
+                "取消勾选则提取该类型的所有轨道。\n\n"
+                "如需更精确的选择（如提取第三条字幕），请先将任务添加到队列，然后在任务列表中手动删除不需要的任务。\n\n"
+                "每种类型流从 0 开始计算，所以对应需要 -1，比如第三音频轨会是 audio_2 那一条任务。\n\n"
+                "或者直接在预览区复制想单独提取那一条的命令手动运行。",
+                wraplength=700)
+    
+        ttk.Checkbutton(opt_frame, text="按流类型分文件夹存放（video/audio/subtitle）",
+                        variable=self.extract_subfolders).grid(row=3, column=1, columnspan=2, sticky="w", padx=10, pady=5)
+
+        chk_metadata = ttk.Checkbutton(opt_frame, text="清除元数据", variable=self.extract_clear_metadata)
+        chk_metadata.grid(row=3, column=3, sticky="w", padx=10, pady=5)
+        ToolTip(chk_metadata, "勾选后，输出文件将不包含任何元数据（如作者、专辑等），适用于铃声或素材提取。")
+
+
+        self.extract_clear_metadata.trace_add('write', lambda *a: self.save_player_settings())
+
+        # 初始化自动匹配状态
+        self._suppress_save = True
+        self._on_auto_ext_toggle()
+        self._on_auto_audio_toggle()
+        self._on_extract_custom_dir_toggle()
+        self._suppress_save = False
+    
+        # ---- 输出目录 ----
+        out_frame = ttk.Frame(main_frame)
+        out_frame.pack(fill=tk.X, pady=5)
+    
+        btn_send = tk.Button(out_frame, text="发送所有到任务队列", command=self.extract_add_to_queue,
+                             bg="#4CAF50", fg="white", font=("", 10, "bold"),
+                             relief=tk.RAISED, padx=10, pady=2)
+        btn_send.pack(side=tk.LEFT, padx=(5, 25))
+    
+        chk_custom = ttk.Checkbutton(out_frame, text="输出到自定义目录", variable=self.extract_custom_dir,
+                                     command=self._on_extract_custom_dir_toggle)
+        chk_custom.pack(side=tk.LEFT, padx=5)
+        self.extract_output_entry = ttk.Entry(out_frame, textvariable=self.extract_output_dir, width=30, state='disabled')
+        self.extract_output_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        self.extract_browse_btn = ttk.Button(out_frame, text="浏览", command=self.extract_browse_output, state='disabled')
+        self.extract_browse_btn.pack(side=tk.LEFT, padx=5)
+        ToolTip(chk_custom,
+                "勾选后，输出文件将保存到下方指定的目录（路径会被自动记忆）。\n"
+                "不勾选时，输出文件默认保存在输入文件所在目录。")
+
+    
+        # ---- 命令预览区 ----
+        preview_frame = ttk.LabelFrame(main_frame, text="命令预览（点击行预览按钮查看对应文件）", padding="5")
+        preview_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        self.extract_preview_text = scrolledtext.ScrolledText(preview_frame, height=8, wrap=tk.WORD)
+        self.extract_preview_text.pack(fill=tk.BOTH, expand=True)
+    
+        # 绑定选项变更事件，自动刷新当前预览
+        self.extract_video.trace_add('write', self._on_extract_option_changed)
+        self.extract_audio.trace_add('write', self._on_extract_option_changed)
+        self.extract_subtitle.trace_add('write', self._on_extract_option_changed)
+        self.extract_only_first.trace_add('write', self._on_extract_option_changed)
+        self.extract_subfolders.trace_add('write', self._on_extract_option_changed)
+        self.extract_video_container.trace_add('write', self._on_extract_option_changed)
+        self.extract_audio_format.trace_add('write', self._on_extract_option_changed)
+        self.extract_subtitle_format.trace_add('write', self._on_extract_option_changed)
+        self.auto_match_subtitle_ext.trace_add('write', self._on_extract_option_changed)
+        self.auto_match_audio_ext.trace_add('write', self._on_extract_option_changed)
+        self.extract_keep_chapters.trace_add('write', lambda *a: self._on_extract_option_changed())
+        self.extract_clear_metadata.trace_add('write', lambda *a: self._on_extract_option_changed())
+
+
+        # 初始化列表
+
+        self._refresh_extract_file_list()
+
+    def _on_extract_option_changed(self, *args):
+        # 如果预览文本控件尚未创建，则直接返回
+        if not hasattr(self, 'extract_preview_text'):
+            return
+        # 如果当前有预览文件且在列表中，刷新它
+        if self.current_preview_file and self.current_preview_file in self.extract_file_list:
+            self._extract_preview_file(self.current_preview_file)
+        elif self.extract_file_list:
+            # 否则预览第一个文件
+            self.current_preview_file = self.extract_file_list[0]
+            self._extract_preview_file(self.current_preview_file)
+        else:
+            # 列表为空，清空预览
+            self.extract_preview_text.delete(1.0, tk.END)
+            self.extract_preview_text.insert(tk.END, "文件列表为空")
+
+    def extract_remove_file(self, file_path):
+        if file_path in self.extract_file_list:
+            self.extract_file_list.remove(file_path)
+            # 如果删除的是当前预览文件，清除预览
+            if self.current_preview_file == file_path:
+                self.current_preview_file = None
+            self._refresh_extract_file_list()
+            self._append_info_ui(f"[流提取] 已删除: {os.path.basename(file_path)}")
+
+    def _refresh_extract_file_list(self):
+        """刷新流提取文件列表（Treeview），交替行颜色"""
+        for item in self.extract_tree.get_children():
+            self.extract_tree.delete(item)
+    
+        # 配置交替行标签（不会影响其他 Treeview）
+        self.extract_tree.tag_configure('odd', background='#D9F0D9')
+        self.extract_tree.tag_configure('even', background='#FDEBD0')
+    
+        for i, path in enumerate(self.extract_file_list):
+            tag = 'odd' if i % 2 == 0 else 'even'
+            self.extract_tree.insert("", tk.END, iid=f"file_{i}",
+                                     values=(os.path.basename(path), path),
+                                     tags=(tag,))
+    
+        # 自动预览第一个文件
+        if self.extract_file_list:
+            self.current_preview_file = self.extract_file_list[0]
+            self._extract_preview_file(self.current_preview_file)
+        else:
+            self.current_preview_file = None
+            self.extract_preview_text.delete(1.0, tk.END)
+            self.extract_preview_text.insert(tk.END, "文件列表为空")
+
+    def extract_delete_selected(self):
+        """删除选中的文件"""
+        selected = self.extract_tree.selection()
+        if not selected:
+            return
+        # 按索引从大到小删除，避免越界
+        indices = sorted([int(item.split('_')[1]) for item in selected], reverse=True)
+        for idx in indices:
+            if 0 <= idx < len(self.extract_file_list):
+                removed = self.extract_file_list.pop(idx)
+                self._append_info_ui(f"[流提取] 已删除: {os.path.basename(removed)}")
+        self._refresh_extract_file_list()
+    
+    def extract_preview_selected(self):
+        """预览选中的第一个文件"""
+        selected = self.extract_tree.selection()
+        if not selected:
+            messagebox.showinfo("提示", "请先选中一个文件")
+            return
+        iid = selected[0]
+        idx = int(iid.split('_')[1])
+        if 0 <= idx < len(self.extract_file_list):
+            self._extract_preview_file(self.extract_file_list[idx])
+    
+    def extract_send_selected(self):
+        """发送选中的文件到任务队列"""
+        selected = self.extract_tree.selection()
+        if not selected:
+            messagebox.showinfo("提示", "请先选中文件")
+            return
+        files = []
+        for iid in selected:
+            idx = int(iid.split('_')[1])
+            if 0 <= idx < len(self.extract_file_list):
+                files.append(self.extract_file_list[idx])
+        if files:
+            self._process_send_files_to_queue(files)
+    
+
+    
+    def extract_on_tree_double_click(self, event):
+        """双击行预览该文件"""
+        item = self.extract_tree.selection()
+        if item:
+            self.extract_preview_selected()
+
+
+    def _extract_preview_file(self, file_path):
+        """预览指定文件的全部提取命令（根据当前选项），自动添加轨道语言和标题"""
+        self.current_preview_file = file_path
+        stream_indices = self.extract_get_stream_indices(file_path)
+        if not any(stream_indices.values()):
+            self.extract_preview_text.delete(1.0, tk.END)
+            self.extract_preview_text.insert(tk.END, f"文件 {os.path.basename(file_path)} 未检测到任何流")
+            return
+    
+        options = {
+            'video': self.extract_video.get(),
+            'audio': self.extract_audio.get(),
+            'subtitle': self.extract_subtitle.get(),
+            'only_first': self.extract_only_first.get(),
+            'video_container': self.extract_video_container.get(),
+            'audio_format': self.extract_audio_format.get(),
+            'subtitle_format': self.extract_subtitle_format.get(),
+            'subfolders': self.extract_subfolders.get(),
+            'auto_match': self.auto_match_subtitle_ext.get(),
+            'auto_match_audio': self.auto_match_audio_ext.get(),
+            'keep_chapters': self.extract_keep_chapters.get(),
+            'clear_metadata': self.extract_clear_metadata.get(),
+        }
+    
+        if self.extract_custom_dir.get() and self.extract_output_dir.get().strip():
+            base_output_dir = self.extract_output_dir.get().strip()
+        else:
+            base_output_dir = os.path.dirname(file_path)
+    
+        base = os.path.splitext(os.path.basename(file_path))[0]
+        cmd_list_lines = []
+    
+        # ---- 视频流 ----
+        if options['video'] and stream_indices['video']:
+            indices = stream_indices['video'][:1] if options['only_first'] else stream_indices['video']
+            for idx in indices:
+                tags = self._get_stream_tags(file_path, 'video', idx)
+                lang = tags.get('language', '')
+                title = tags.get('title', '')
+                name_suffix = f"_{idx}" if len(indices) > 1 else ""
+                if lang:
+                    name_suffix += f"_{lang}"
+                subdir = "video" if options['subfolders'] else ""
+                out_dir = os.path.join(base_output_dir, subdir) if subdir else base_output_dir
+                ext = options['video_container']
+                out_path = normalize_path(os.path.join(out_dir, f"{base}_video{name_suffix}.{ext}"))
+                cmd = [self.ffmpeg_cmd, "-y", "-i", file_path,
+                       "-map", f"0:v:{idx}?", "-c:v", "copy"]
+                if options.get('keep_chapters', False):
+                    cmd.extend(["-map_chapters", "0"])
+                if options.get('clear_metadata', False):
+                    cmd.extend(["-map_metadata", "-1"])
+                else:
+                    if lang:
+                        cmd.extend(["-metadata:s:0", f"language={lang}"])
+                    if title:
+                        cmd.extend(["-metadata:s:0", f"title={title}"])
+                cmd.append(out_path)
+                cmd_list_lines.append(format_cmd_for_display(cmd))
+    
+        # ---- 音频流 ----
+        if options['audio'] and stream_indices['audio']:
+            indices = stream_indices['audio'][:1] if options['only_first'] else stream_indices['audio']
+            for idx in indices:
+                tags = self._get_stream_tags(file_path, 'audio', idx)
+                lang = tags.get('language', '')
+                title = tags.get('title', '')
+                if options.get('auto_match_audio', True):
+                    codec = self._get_stream_codec(file_path, 'audio', idx)
+                    ext = self._map_audio_codec_to_ext(codec)
+                else:
+                    ext = options['audio_format']
+                if not ext:
+                    ext = 'm4a'
+                name_suffix = f"_{idx}" if len(indices) > 1 else ""
+                if lang:
+                    name_suffix += f"_{lang}"
+                subdir = "audio" if options['subfolders'] else ""
+                out_dir = os.path.join(base_output_dir, subdir) if subdir else base_output_dir
+                out_path = normalize_path(os.path.join(out_dir, f"{base}_audio{name_suffix}.{ext}"))
+                cmd = [self.ffmpeg_cmd, "-y", "-i", file_path,
+                       "-map", f"0:a:{idx}?", "-c:a", "copy"]
+                if options.get('keep_chapters', False):
+                    cmd.extend(["-map_chapters", "0"])
+                if options.get('clear_metadata', False):
+                    cmd.extend(["-map_metadata", "-1"])
+                else:
+                    if lang:
+                        cmd.extend(["-metadata:s:0", f"language={lang}"])
+                    if title:
+                        cmd.extend(["-metadata:s:0", f"title={title}"])
+                cmd.append(out_path)
+                cmd_list_lines.append(format_cmd_for_display(cmd))
+    
+        # ---- 字幕流 ----
+        if options['subtitle'] and stream_indices['subtitle']:
+            indices = stream_indices['subtitle'][:1] if options['only_first'] else stream_indices['subtitle']
+            for idx in indices:
+                tags = self._get_stream_tags(file_path, 'subtitle', idx)
+                lang = tags.get('language', '')
+                title = tags.get('title', '')
+                if options['auto_match']:
+                    codec = self._get_stream_codec(file_path, 'subtitle', idx)
+                    ext = self._map_codec_to_ext(codec)
+                else:
+                    ext = options['subtitle_format']
+                if not ext:
+                    ext = 'srt'
+                name_suffix = f"_{idx}" if len(indices) > 1 else ""
+                if lang:
+                    name_suffix += f"_{lang}"
+                subdir = "subtitle" if options['subfolders'] else ""
+                out_dir = os.path.join(base_output_dir, subdir) if subdir else base_output_dir
+                out_path = normalize_path(os.path.join(out_dir, f"{base}_sub{name_suffix}.{ext}"))
+                cmd = [self.ffmpeg_cmd, "-y", "-i", file_path,
+                       "-map", f"0:s:{idx}?", "-c:s", "copy"]
+                # 字幕通常不保留章节，但保留元数据清除
+                if options.get('clear_metadata', False):
+                    cmd.extend(["-map_metadata", "-1"])
+                else:
+                    if lang:
+                        cmd.extend(["-metadata:s:0", f"language={lang}"])
+                    if title:
+                        cmd.extend(["-metadata:s:0", f"title={title}"])
+                cmd.append(out_path)
+                cmd_list_lines.append(format_cmd_for_display(cmd))
+    
+        self.extract_preview_text.delete(1.0, tk.END)
+        if not cmd_list_lines:
+            self.extract_preview_text.insert(tk.END, f"文件 {os.path.basename(file_path)} 不包含用户勾选的任何流")
+        else:
+            preview_text = f"--- 预览文件: {os.path.basename(file_path)} ---\n\n"
+            preview_text += "\n\n".join(cmd_list_lines)
+            self.extract_preview_text.insert(tk.END, preview_text)
+
+    def _on_auto_ext_toggle(self):
+        if getattr(self, '_loading_settings', False):
+            return
+        if self.auto_match_subtitle_ext.get():
+            # 禁用字幕格式下拉框，并清空提示（可选）
+            self.extract_subtitle_format_combo.config(state='disabled')
+            self.extract_subtitle_format.set("")  # 或保留当前值但实际不生效
+        else:
+            self.extract_subtitle_format_combo.config(state='readonly')
+            # 若当前为空，则设置默认值
+            if not self.extract_subtitle_format.get():
+                self.extract_subtitle_format.set("srt")
+
+    def _on_auto_audio_toggle(self):
+        if getattr(self, '_loading_settings', False):
+            return
+        if self.auto_match_audio_ext.get():
+            self.extract_audio_format_combo.config(state='disabled')
+            self.extract_audio_format.set("")  # 清空显示，表示自动
+        else:
+            self.extract_audio_format_combo.config(state='readonly')
+            if not self.extract_audio_format.get():
+                self.extract_audio_format.set("mka")
+        self.save_player_settings()
+
+    def _on_extract_custom_dir_toggle(self):
+        if getattr(self, '_loading_settings', False):
+            return
+        """自定义目录开关切换时，启用/禁用输入框和浏览按钮，并自动保存设置"""
+        enabled = self.extract_custom_dir.get()
+        state = 'normal' if enabled else 'disabled'
+        # 确保控件已创建
+        if hasattr(self, 'extract_output_entry') and hasattr(self, 'extract_browse_btn'):
+            self.extract_output_entry.config(state=state)
+            self.extract_browse_btn.config(state=state)
+        # 保存设置（使状态持久化）
+        self.save_player_settings()
+        self._on_extract_option_changed()
 
 
 
+    # ---------- 流提取标签页方法 ----------
+    def extract_add_file(self, path=None):
+        if path is None:
+            paths = filedialog.askopenfilenames(title="选择文件", filetypes=[("所有文件", "*.*")])
+            if not paths:
+                return
+        else:
+            paths = [path]
+    
+        # 批量模式下禁止重绘
+        self._batch_update = True
+        try:
+            for p in paths:
+                self._add_file(p)   # 注意 _add_file 内部仍然会刷新，需要改造
+        finally:
+            self._batch_update = False
+            self._refresh_extract_file_list()   # 最终刷新一次
+    
+    def _add_file(self, path):
+        if os.path.isdir(path):
+            return
+        if path in self.extract_file_list:
+            self._append_info_ui(f"[流提取] 文件已在列表中: {os.path.basename(path)}")
+            return
+        self.extract_file_list.append(path)
+        self._refresh_extract_file_list()   # 刷新 Treeview
+        self._append_info_ui(f"[流提取] 已添加: {os.path.basename(path)}")
+    
 
 
+    def extract_clear_files(self):
+        if self.extract_file_list and messagebox.askyesno("确认", "确定清空所有文件吗？"):
+            self.extract_file_list.clear()
+            self._stream_info_cache.clear()
+            self._refresh_extract_file_list()
+            self._append_info_ui("[流提取] 已清空文件列表")
+    
+    def extract_on_drop(self, event):
+        files = self.root.tk.splitlist(event.data)
+        self._batch_update = True
+        try:
+            for f in files:
+                if os.path.exists(f):
+                    self._add_file(f)
+        finally:
+            self._batch_update = False
+            self._refresh_extract_file_list()
+        return "break"
+    
+    def extract_browse_output(self):
+        if not self.extract_custom_dir.get():
+            return  # 按钮已禁用，实际不会触发
+        dirpath = filedialog.askdirectory()
+        if dirpath:
+            self.extract_output_dir.set(normalize_path(dirpath))
+            # 路径变化自动触发保存（已在 trace 中处理，或可在此主动保存）
+            self.save_player_settings()
+            self._on_extract_option_changed()
+    
+    def _get_stream_tags(self, file_path: str, stream_type: str, index: int) -> Dict[str, str]:
+        """获取指定文件、流类型、类型内索引的 tags 字典（language, title 等）"""
+        data = self._get_stream_data(file_path)
+        if not data:
+            return {}
+        streams = data.get('streams', [])
+        count = 0
+        for s in streams:
+            if s.get('codec_type') == stream_type:
+                if count == index:
+                    return s.get('tags', {})
+                count += 1
+        return {}
+    
+    def _get_stream_data(self, file_path: str) -> Optional[Dict[str, Any]]:
+        """获取文件的 ffprobe 流信息（带缓存）"""
+        if file_path not in self._stream_info_cache:
+            self._stream_info_cache[file_path] = ffprobe_json(self.ffprobe_cmd, file_path)
+        return self._stream_info_cache[file_path]
+    
+    def extract_get_stream_info(self, file_path: str) -> dict:
+        data = self._get_stream_data(file_path)
+        if not data:
+            return {'video': False, 'audio': False, 'subtitle': False}
+        streams = data.get('streams', [])
+        has_video = any(s.get('codec_type') == 'video' for s in streams)
+        has_audio = any(s.get('codec_type') == 'audio' for s in streams)
+        has_subtitle = any(s.get('codec_type') == 'subtitle' for s in streams)
+        return {'video': has_video, 'audio': has_audio, 'subtitle': has_subtitle}
+    
+    def extract_get_stream_indices(self, file_path: str) -> dict:
+        """
+        获取文件中各类型的流索引（该类型在文件中的顺序索引，从0开始）。
+        返回: {'video': [0,1,...], 'audio': [0,1,...], 'subtitle': [0,1,...]}
+        """
+        data = self._get_stream_data(file_path)
+        if not data:
+            return {'video': [], 'audio': [], 'subtitle': []}
+        streams = data.get('streams', [])
+        indices = {'video': [], 'audio': [], 'subtitle': []}
+        video_count = audio_count = subtitle_count = 0
+        for s in streams:
+            typ = s.get('codec_type')
+            if typ == 'video':
+                indices['video'].append(video_count)
+                video_count += 1
+            elif typ == 'audio':
+                indices['audio'].append(audio_count)
+                audio_count += 1
+            elif typ == 'subtitle':
+                indices['subtitle'].append(subtitle_count)
+                subtitle_count += 1
+        return indices
 
+    def _get_stream_codec(self, file_path: str, stream_type: str, index: int) -> Optional[str]:
+        """
+        获取指定文件、流类型、类型内索引的编码名称（如 'ass', 'subrip'）。
+        返回 None 若找不到。
+        """
+        data = self._get_stream_data(file_path)
+        if not data:
+            return None
+        streams = data.get('streams', [])
+        count = 0
+        for s in streams:
+            typ = s.get('codec_type')
+            if typ == stream_type:
+                if count == index:
+                    return s.get('codec_name')
+                count += 1
+        return None
+
+    def _map_codec_to_ext(self, codec_name: Optional[str]) -> str:
+        if not codec_name:
+            return 'srt'
+        mapping = {
+            'ass': 'ass', 'ssa': 'ass',
+            'subrip': 'srt', 'srt': 'srt',
+            'webvtt': 'vtt', 'vtt': 'vtt',
+            'mov_text': 'mov_text',
+            'dvd_subtitle': 'sup',
+            'hdmv_pgs_subtitle': 'sup',
+            # 其他可根据需要扩展
+        }
+        return mapping.get(codec_name, 'srt')
+
+    def _map_audio_codec_to_ext(self, codec_name: Optional[str]) -> str:
+        if not codec_name:
+            return 'mka'
+        mapping = {
+            'aac': 'm4a',
+            'mp3': 'mp3',
+            'mp2': 'mp2',
+            'mp1': 'mp3',
+            'flac': 'flac',
+            'opus': 'opus',
+            'vorbis': 'ogg',
+            'ac3': 'ac3',
+            'eac3': 'eac3',
+            'dts': 'dts',
+            'pcm_s16le': 'wav',
+            'pcm_s24le': 'wav',
+            'pcm_s32le': 'wav',
+            'alac': 'm4a',
+            'libfdk_aac': 'm4a',
+            'truehd': 'truehd',  # 或 .mlp
+            'mlp': 'mlp',
+            'wmav2': 'wma',
+            'wmapro': 'wma',
+            # 其他常见
+        }
+        return mapping.get(codec_name, 'mka')
+
+
+    def _process_send_files_to_queue(self, file_list):
+        """
+        将指定的文件列表按当前选项发送到任务队列（支持单文件/批量）
+        自动添加轨道语言和标题到元数据，文件名中加入语言代码
+        """
+        if not file_list:
+            return
+        if not self.extract_video.get() and not self.extract_audio.get() and not self.extract_subtitle.get():
+            messagebox.showwarning("提示", "请至少勾选一种流类型")
+            return
+    
+        single_mode = len(file_list) == 1
+        if self.extract_custom_dir.get() and self.extract_output_dir.get().strip():
+            base_output_dir = self.extract_output_dir.get().strip()
+        else:
+            base_output_dir = os.path.dirname(file_list[0])
+    
+        options = {
+            'video': self.extract_video.get(),
+            'audio': self.extract_audio.get(),
+            'subtitle': self.extract_subtitle.get(),
+            'only_first': self.extract_only_first.get(),
+            'video_container': self.extract_video_container.get(),
+            'audio_format': self.extract_audio_format.get(),
+            'subtitle_format': self.extract_subtitle_format.get(),
+            'subfolders': self.extract_subfolders.get(),
+            'auto_match': self.auto_match_subtitle_ext.get(),
+            'auto_match_audio': self.auto_match_audio_ext.get(),
+            'keep_chapters': self.extract_keep_chapters.get(),
+            'clear_metadata': self.extract_clear_metadata.get(),
+        }
+    
+        total_count = 0
+        for path in file_list:
+            stream_indices = self.extract_get_stream_indices(path)
+            if not any(stream_indices.values()):
+                self._append_info_ui(f"[流提取] 警告: {os.path.basename(path)} 未检测到任何流，跳过")
+                continue
+    
+            base = os.path.splitext(os.path.basename(path))[0]
+    
+            # ---- 视频流 ----
+            if options['video'] and stream_indices['video']:
+                indices = stream_indices['video'][:1] if options['only_first'] else stream_indices['video']
+                for idx in indices:
+                    tags = self._get_stream_tags(path, 'video', idx)
+                    lang = tags.get('language', '')
+                    title = tags.get('title', '')
+                    name_suffix = f"_{idx}" if len(indices) > 1 else ""
+                    if lang:
+                        name_suffix += f"_{lang}"
+                    subdir = "video" if options['subfolders'] else ""
+                    out_dir = os.path.join(base_output_dir, subdir) if subdir else base_output_dir
+                    ext = options['video_container']
+                    out_path = normalize_path(os.path.join(out_dir, f"{base}_video{name_suffix}.{ext}"))
+                    cmd = [self.ffmpeg_cmd, "-y", "-i", path,
+                           "-map", f"0:v:{idx}?", "-c:v", "copy"]
+                    if options.get('keep_chapters', False):
+                        cmd.extend(["-map_chapters", "0"])
+                    if options.get('clear_metadata', False):
+                        cmd.extend(["-map_metadata", "-1"])
+                    else:
+                        if lang:
+                            cmd.extend(["-metadata:s:0", f"language={lang}"])
+                        if title:
+                            cmd.extend(["-metadata:s:0", f"title={title}"])
+                    cmd.append(out_path)
+                    self.add_custom_task(path, out_path, cmd)
+                    total_count += 1
+    
+            # ---- 音频流 ----
+            if options['audio'] and stream_indices['audio']:
+                indices = stream_indices['audio'][:1] if options['only_first'] else stream_indices['audio']
+                for idx in indices:
+                    tags = self._get_stream_tags(path, 'audio', idx)
+                    lang = tags.get('language', '')
+                    title = tags.get('title', '')
+                    if options.get('auto_match_audio', True):
+                        codec = self._get_stream_codec(path, 'audio', idx)
+                        ext = self._map_audio_codec_to_ext(codec)
+                    else:
+                        ext = options['audio_format']
+                    if not ext:
+                        ext = 'mka'
+                    name_suffix = f"_{idx}" if len(indices) > 1 else ""
+                    if lang:
+                        name_suffix += f"_{lang}"
+                    subdir = "audio" if options['subfolders'] else ""
+                    out_dir = os.path.join(base_output_dir, subdir) if subdir else base_output_dir
+                    out_path = normalize_path(os.path.join(out_dir, f"{base}_audio{name_suffix}.{ext}"))
+                    cmd = [self.ffmpeg_cmd, "-y", "-i", path,
+                           "-map", f"0:a:{idx}?", "-c:a", "copy"]
+                    if options.get('keep_chapters', False):
+                        cmd.extend(["-map_chapters", "0"])
+                    if options.get('clear_metadata', False):
+                        cmd.extend(["-map_metadata", "-1"])
+                    else:
+                        if lang:
+                            cmd.extend(["-metadata:s:0", f"language={lang}"])
+                        if title:
+                            cmd.extend(["-metadata:s:0", f"title={title}"])
+                    cmd.append(out_path)
+                    self.add_custom_task(path, out_path, cmd)
+                    total_count += 1
+    
+            # ---- 字幕流 ----
+            if options['subtitle'] and stream_indices['subtitle']:
+                indices = stream_indices['subtitle'][:1] if options['only_first'] else stream_indices['subtitle']
+                for idx in indices:
+                    tags = self._get_stream_tags(path, 'subtitle', idx)
+                    lang = tags.get('language', '')
+                    title = tags.get('title', '')
+                    if options['auto_match']:
+                        codec = self._get_stream_codec(path, 'subtitle', idx)
+                        ext = self._map_codec_to_ext(codec)
+                    else:
+                        ext = options['subtitle_format']
+                    if not ext:
+                        ext = 'srt'
+                    name_suffix = f"_{idx}" if len(indices) > 1 else ""
+                    if lang:
+                        name_suffix += f"_{lang}"
+                    subdir = "subtitle" if options['subfolders'] else ""
+                    out_dir = os.path.join(base_output_dir, subdir) if subdir else base_output_dir
+                    out_path = normalize_path(os.path.join(out_dir, f"{base}_sub{name_suffix}.{ext}"))
+                    cmd = [self.ffmpeg_cmd, "-y", "-i", path,
+                           "-map", f"0:s:{idx}?", "-c:s", "copy"]
+                    if options.get('clear_metadata', False):
+                        cmd.extend(["-map_metadata", "-1"])
+                    else:
+                        if lang:
+                            cmd.extend(["-metadata:s:0", f"language={lang}"])
+                        if title:
+                            cmd.extend(["-metadata:s:0", f"title={title}"])
+                    cmd.append(out_path)
+                    self.add_custom_task(path, out_path, cmd)
+                    total_count += 1
+    
+        if total_count == 0:
+            if single_mode:
+                self._append_info_ui(f"[流提取] 文件 {os.path.basename(file_list[0])} 不包含用户勾选的任何流")
+            else:
+                self._append_info_ui("[流提取] 未添加任何任务，请检查文件是否包含所勾选的流类型")
+        else:
+            if single_mode:
+                self._append_info_ui(f"[流提取] 已为 {os.path.basename(file_list[0])} 添加 {total_count} 个任务到队列")
+            else:
+                self._append_info_ui(f"[流提取] 共添加 {total_count} 个提取任务到队列")
+        self.update_task_list()
+
+    def extract_add_to_queue(self):
+        if not self.extract_file_list:
+            messagebox.showwarning("提示", "文件列表为空")
+            return
+        self._process_send_files_to_queue(self.extract_file_list)
+    
+    def _extract_send_single_to_queue(self, file_path):
+        self._process_send_files_to_queue([file_path])
+    
+    def extract_preview_command(self):
+        children = self.extract_tree.get_children()
+        if not children:
+            self.extract_preview_text.delete(1.0, tk.END)
+            self.extract_preview_text.insert(tk.END, "文件列表为空")
+            return
+        first_path = self.extract_tree.item(children[0], "values")[1]
+    
+        # 确定输出目录（与队列逻辑一致）
+        if self.extract_custom_dir.get() and self.extract_output_dir.get().strip():
+            base_output_dir = self.extract_output_dir.get().strip()
+        else:
+            base_output_dir = os.path.dirname(first_path)
+    
+        stream_indices = self.extract_get_stream_indices(first_path)
+        if not any(stream_indices.values()):
+            self.extract_preview_text.delete(1.0, tk.END)
+            self.extract_preview_text.insert(tk.END, "该文件未检测到任何流，无法预览命令")
+            return
+    
+        options = {
+            'video': self.extract_video.get(),
+            'audio': self.extract_audio.get(),
+            'subtitle': self.extract_subtitle.get(),
+            'only_first': self.extract_only_first.get(),
+            'video_container': self.extract_video_container.get(),
+            'audio_format': self.extract_audio_format.get(),
+            'subtitle_format': self.extract_subtitle_format.get(),
+            'subfolders': self.extract_subfolders.get(),
+        }
+    
+        cmd = [self.ffmpeg_cmd, "-y", "-i", first_path]
+        base = os.path.splitext(os.path.basename(first_path))[0]
+    
+        # 预览仅展示第一个文件的第一条流（若存在）
+        if options['video'] and stream_indices['video']:
+            idx = stream_indices['video'][0]
+            sub = "video/" if options['subfolders'] else ""
+            out_path = normalize_path(os.path.join(base_output_dir, sub, f"{base}_video_{idx}.{options['video_container']}"))
+            cmd.extend(["-map", f"0:v:{idx}?", "-c:v", "copy", out_path])
+    
+        if options['audio'] and stream_indices['audio']:
+            idx = stream_indices['audio'][0]
+            sub = "audio/" if options['subfolders'] else ""
+            out_path = normalize_path(os.path.join(base_output_dir, sub, f"{base}_audio_{idx}.{options['audio_format']}"))
+            cmd.extend(["-map", f"0:a:{idx}?", "-c:a", "copy", out_path])
+    
+        if options['subtitle'] and stream_indices['subtitle']:
+            idx = stream_indices['subtitle'][0]
+            # 确定扩展名（预览也使用自动匹配逻辑）
+            if self.auto_match_subtitle_ext.get():
+                codec = self._get_stream_codec(first_path, 'subtitle', idx)
+                ext = self._map_codec_to_ext(codec)
+            else:
+                ext = options['subtitle_format']
+            if not ext:
+                ext = 'srt'
+            sub = "subtitle/" if options['subfolders'] else ""
+            out_path = normalize_path(os.path.join(base_output_dir, sub, f"{base}_sub_{idx}.{ext}"))
+            cmd.extend(["-map", f"0:s:{idx}?", "-c:s", "copy", out_path])
+    
+        if len(cmd) == 3:  # 只有 ffmpeg -y -i file
+            cmd_str = "文件不包含用户勾选的任何流类型，无法生成预览命令"
+        else:
+            cmd_str = format_cmd_for_display(cmd)
+    
+        self.extract_preview_text.delete(1.0, tk.END)
+        self.extract_preview_text.insert(tk.END, cmd_str)
+    
 
 
     # -------------------- 界面创建 --------------------
@@ -12229,29 +13160,43 @@ class FFmpegBatchGUI:
         self.cmd_preview.insert(tk.END, "请选择输入文件，或调整参数...")
 
 
-        # ========== 任务列表区域==========
+        # ========== 任务列表区域 ==========
         tasks_frame = ttk.Frame(transcode_vpane)
-        tasks_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(5, 0))
+        tasks_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0, 0))
         
-        # 工具栏
-        tool_frame = ttk.Frame(tasks_frame)
-        tool_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 5))
+        # ---------- 工具栏（支持水平滚动） ----------
+        toolbar_height = max(20, int(30 * self.scaling))
+        tool_canvas = tk.Canvas(tasks_frame, height=toolbar_height, highlightthickness=0)
+        tool_canvas.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
         
-        btn_start = tk.Button(tool_frame, text="开始队列", command=self.start_queue,
+        h_scrollbar = ttk.Scrollbar(tasks_frame, orient=tk.HORIZONTAL, command=tool_canvas.xview)
+        h_scrollbar.pack(side=tk.TOP, fill=tk.X)
+        tool_canvas.configure(xscrollcommand=h_scrollbar.set)
+        
+        tool_container = ttk.Frame(tool_canvas)
+        tool_canvas.create_window((0, 0), window=tool_container, anchor='nw')
+        
+        # 当内部框架尺寸变化时，更新滚动区域
+        def configure_tool_canvas(event):
+            tool_canvas.configure(scrollregion=tool_canvas.bbox('all'))
+        tool_container.bind('<Configure>', configure_tool_canvas)
+        
+        # 所有按钮和控件都放到 tool_container 中（使用 pack(side=tk.LEFT) 水平排列）
+        btn_start = tk.Button(tool_container, text="开始队列", command=self.start_queue,
                               bg="#4CAF50", fg="white", width=12, relief=tk.RAISED)
         btn_start.pack(side=tk.LEFT, padx=5)
         
-        label_parallel = ttk.Label(tool_frame, text="并行任务:")
+        label_parallel = ttk.Label(tool_container, text="并行任务:")
         label_parallel.pack(side=tk.LEFT, padx=(10, 2))
         self.max_parallel = tk.IntVar(value=1)
-        self.parallel_spin = ttk.Spinbox(tool_frame, from_=1, to=5, width=3,
+        self.parallel_spin = ttk.Spinbox(tool_container, from_=1, to=5, width=3,
                                          textvariable=self.max_parallel, state="readonly")
         self.parallel_spin.pack(side=tk.LEFT, padx=2)
         
-        label_hw = ttk.Label(tool_frame, text="硬编并发限制:")
+        label_hw = ttk.Label(tool_container, text="硬编并发限制:")
         label_hw.pack(side=tk.LEFT, padx=(10, 2))
         self.max_hw_parallel = tk.IntVar(value=2)
-        self.max_hw_spin = ttk.Spinbox(tool_frame, from_=1, to=4, width=3,
+        self.max_hw_spin = ttk.Spinbox(tool_container, from_=1, to=4, width=3,
                                        textvariable=self.max_hw_parallel, state="readonly")
         self.max_hw_spin.pack(side=tk.LEFT, padx=2)
         
@@ -12261,11 +13206,12 @@ class FFmpegBatchGUI:
                           ("停止队列", self.stop_queue),
                           ("导出为脚本", self.export_script),
                           ("预览选中任务", self.preview_selected_task)]:
-            ttk.Button(tool_frame, text=text, command=cmd).pack(side=tk.LEFT, padx=5)
+            ttk.Button(tool_container, text=text, command=cmd).pack(side=tk.LEFT, padx=5)
         
-        # ---------- 列表容器 ----------
+        # ---------- 任务列表  ----------
         list_container = ttk.Frame(tasks_frame)
-        list_container.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
+        list_container.pack(fill=tk.BOTH, expand=True, pady=(0, 0))
+
         
         # 自定义样式
         Batch_style = ttk.Style()
@@ -12308,6 +13254,10 @@ class FFmpegBatchGUI:
         self.notebook.add(merge_tab, text="封装/合并/画中画")
         self.create_merge_tab(merge_tab)
 
+
+        extract_tab = ttk.Frame(self.notebook)
+        self.notebook.add(extract_tab, text="流提取")
+        self.create_extract_tab(extract_tab)
 
         player_tab = ttk.Frame(self.notebook)
         self.notebook.add(player_tab, text="信息与播放器")
