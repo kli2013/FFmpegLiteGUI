@@ -5358,12 +5358,19 @@ class FFmpegBatchGUI:
         complex_filter = ";".join(filter_parts)
         return complex_filter, f"[{current_v}]"
 
-    def _get_effective_duration(self, settings: dict, raw_duration: Optional[float]) -> Optional[float]:
+    def _get_effective_duration(self, settings: dict, raw_duration: Optional[float] = None, input_path: str = None) -> Optional[float]:
         """
-        计算子视频的有效时长（考虑截取设置）。
-        返回值为秒数，若无法计算或无效则返回 None。
+        计算有效时长（考虑截取设置）。
+        若传入 raw_duration 则直接使用，否则从 input_path 获取。
+        返回秒数，失败返回 None。
         """
-        if not settings.get("trim_enabled", False) or raw_duration is None or raw_duration <= 0:
+        # 获取原始时长
+        if raw_duration is None and input_path:
+            raw_duration = self._get_media_duration(input_path)
+        if raw_duration is None:
+            return None
+    
+        if not settings.get("trim_enabled", False):
             return raw_duration
     
         start_str = settings.get("trim_start", "").strip()
@@ -5374,12 +5381,9 @@ class FFmpegBatchGUI:
         if end_sec is not None and end_sec > start_sec:
             effective = end_sec - start_sec
         else:
-            # 无结束或结束无效，截取到末尾
             effective = raw_duration - start_sec
     
-        if effective <= 0:
-            return None
-        return effective
+        return effective if effective > 0 else None
 
     def _calc_enable_expr(self, enc_settings: dict, duration: Optional[float]) -> str:
         loop_enabled = enc_settings.get("loop_enabled", False)
@@ -7474,34 +7478,6 @@ class FFmpegBatchGUI:
         self.root.after(0, lambda: self.append_detail(text))
 
 
-    def _get_effective_duration(self, settings: dict, input_path: str) -> Optional[float]:
-        """
-        计算当前设置下的实际处理时长（考虑截取和精准模式）。
-        若未启用截取或无法计算，则返回文件总时长。
-        """
-        # 如果未启用截取，直接返回总时长
-        if not settings.get("trim_enabled", False):
-            return self._get_media_duration(input_path)
-    
-        # 获取截取起止时间
-        start_str = settings.get("trim_start", "").strip()
-        end_str = settings.get("trim_end", "").strip()
-        start_sec = time_to_seconds(start_str) if start_str else 0.0
-        end_sec = time_to_seconds(end_str) if end_str else None
-    
-        total_duration = self._get_media_duration(input_path)
-        if total_duration is None:
-            return None
-    
-        if end_sec is not None and end_sec > start_sec:
-            duration = end_sec - start_sec
-        else:
-            # 结束时间未填或无效，截取到文件末尾
-            duration = total_duration - start_sec
-    
-        # 若为精准模式（trim 滤镜），实际时长就是截取时长；若为快速模式（命令行 -ss/-to），也是截取时长
-        # 但注意：若 start_sec 很大，FFmpeg 可能从关键帧开始，但实际处理时长仍为截取时长
-        return max(0.0, duration)
 
     def _process_single_task(self, task):
         """处理单个任务（队列模式）"""
@@ -7513,7 +7489,8 @@ class FFmpegBatchGUI:
         self.ensure_output_dir(task.output)
     
         # 获取视频总时长用于进度
-        total_duration = self._get_effective_duration(task.settings, task.input)
+        raw_duration = self._get_media_duration(task.input)
+        total_duration = self._get_effective_duration(task.settings, raw_duration) if raw_duration is not None else 0
         if total_duration is None:
             total_duration = 0
     
@@ -7642,7 +7619,7 @@ class FFmpegBatchGUI:
             self.task_tree.column("文件名", width=150)
             self.task_tree.column("输出路径", width=200)
             self.task_tree.column("命令 (简洁) 双击编辑", width=410)
-            self.task_tree.column("状态", width=110)
+            self.task_tree.column("状态", width=105)
             self.task_tree.column("错误信息", width=58)
 
     def _run_single_transcode(self, cmd_list, input_name, settings):
@@ -7651,7 +7628,8 @@ class FFmpegBatchGUI:
         cmd_str = format_cmd_for_display(cmd_list)
         self._append_info_ui(f">>> {cmd_str}")
     
-        total_duration = self._get_effective_duration(settings, input_name)
+        raw_duration = self._get_media_duration(input_name)
+        total_duration = self._get_effective_duration(settings, raw_duration) if raw_duration is not None else 0
         if total_duration is None:
             total_duration = 0
     
@@ -8110,7 +8088,7 @@ class FFmpegBatchGUI:
     
         # 轨道列表（Treeview）
         list_container = ttk.Frame(parent)
-        list_container.pack(fill=tk.BOTH, expand=True, pady=(0,0))
+        list_container.pack(fill=tk.BOTH, expand=True, padx=(5,0), pady=(0,0))
 #         list_container.pack_propagate(False)
 #         min_height = int(400 * self.scaling)
 #         list_container.config(height=min_height)
@@ -8345,14 +8323,14 @@ class FFmpegBatchGUI:
                              height=1, width=12, relief=tk.RAISED)
         btn_copy.pack(side=tk.LEFT, padx=5)
 
-        preview_frame = ttk.LabelFrame(parent, text="即将执行的命令预览", padding="5")
-        preview_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        preview_frame = ttk.LabelFrame(parent, text="即将执行的命令预览", padding="0")
+        preview_frame.pack(fill=tk.BOTH, expand=True, padx=(5,0), pady=5)
         content_frame = ttk.Frame(preview_frame)
         content_frame.pack(fill=tk.BOTH, expand=True)
         self.merge_cmd_preview = scrolledtext.ScrolledText(
             content_frame, height=1, wrap=tk.WORD, font=("Microsoft YaHei", 9)
         )
-        self.merge_cmd_preview.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        self.merge_cmd_preview.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=0)
 
 
         self.merge_video.trace_add("write", lambda *a: self.merge_load_video_info())
@@ -12081,36 +12059,38 @@ class FFmpegBatchGUI:
 
     # 流提取页面创建
     def create_extract_tab(self, parent):
-        main_frame = ttk.Frame(parent, padding="5")
+        main_frame = ttk.Frame(parent, padding="0")
         main_frame.pack(fill=tk.BOTH, expand=True)
     
-        # ---- 文件列表（Treeview） ----
+        # ---- 独立的标签行（显示提示文本） ----
         if DND_AVAILABLE:
             label_text = "输入文件列表 - 支持拖拽添加文件"
         else:
             label_text = "输入文件列表"
-        list_frame = ttk.LabelFrame(main_frame, text=label_text, padding="5")
-        list_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        ttk.Label(main_frame, text=label_text).pack(anchor=tk.W, padx=5, pady=(0, 0))
     
-        # 工具栏（包含所有操作按钮）
-        tree_toolbar = ttk.Frame(list_frame)
-        tree_toolbar.pack(fill=tk.X, pady=2)
+        # ---- 文件列表容器（无边框） ----
+        list_container = ttk.Frame(main_frame)
+        list_container.pack(fill=tk.BOTH, expand=True, padx=(5,0), pady=2)
+    
+        # ---- 工具栏（只包含按钮，不再重复显示标题） ----
+        tree_toolbar = ttk.Frame(list_container)
+        tree_toolbar.pack(fill=tk.X, pady=3)
+    
         ttk.Button(tree_toolbar, text="添加文件", command=self.extract_add_file).pack(side=tk.LEFT, padx=2)
         ttk.Button(tree_toolbar, text="清空列表", command=self.extract_clear_files).pack(side=tk.LEFT, padx=2)
         ttk.Button(tree_toolbar, text="删除选中", command=self.extract_delete_selected).pack(side=tk.LEFT, padx=2)
         ttk.Button(tree_toolbar, text="预览选中", command=self.extract_preview_selected).pack(side=tk.LEFT, padx=2)
         ttk.Button(tree_toolbar, text="发送选中", command=self.extract_send_selected).pack(side=tk.LEFT, padx=2)
         ttk.Label(tree_toolbar, text="（双击行预览当前文件）").pack(side=tk.LEFT, padx=10)
-
     
-        # 自定义样式
+        # ---- Treeview 与滚动条 ----
         extract_style = ttk.Style()
         extract_style.configure("Extract.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0", rowheight=int(22 * self.scaling))
         extract_style.configure("Extract.Treeview.Heading", background="#d9d9d9")
     
-        # 创建 Treeview
         columns = ("文件名", "完整路径")
-        self.extract_tree = ttk.Treeview(list_frame, columns=columns, show="headings",
+        self.extract_tree = ttk.Treeview(list_container, columns=columns, show="headings",
                                          height=8, style="Extract.Treeview")
         self.extract_tree.heading("文件名", text="文件名")
         self.extract_tree.heading("完整路径", text="完整路径")
@@ -12118,8 +12098,7 @@ class FFmpegBatchGUI:
         self.extract_tree.column("完整路径", width=400, minwidth=200)
         self.extract_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     
-        # 滚动条
-        vbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.extract_tree.yview)
+        vbar = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=self.extract_tree.yview)
         self.extract_tree.configure(yscrollcommand=vbar.set)
         vbar.pack(side=tk.RIGHT, fill=tk.Y)
     
@@ -12128,8 +12107,8 @@ class FFmpegBatchGUI:
     
         # ---- 拖拽绑定（确保只在此页面生效） ----
         if DND_AVAILABLE:
-            list_frame.drop_target_register(DND_FILES)
-            list_frame.dnd_bind('<<Drop>>', self.extract_on_drop)
+            list_container.drop_target_register(DND_FILES)
+            list_container.dnd_bind('<<Drop>>', self.extract_on_drop)
     
         # ---- 提取选项（保持不变） ----
         opt_frame = ttk.LabelFrame(main_frame, text="提取选项", padding="5")
@@ -12244,10 +12223,10 @@ class FFmpegBatchGUI:
 
     
         # ---- 命令预览区 ----
-        preview_frame = ttk.LabelFrame(main_frame, text="命令预览（点击行预览按钮查看对应文件）", padding="5")
+        preview_frame = ttk.LabelFrame(main_frame, text="命令预览（点击行预览按钮查看对应文件）", padding="0")
         preview_frame.pack(fill=tk.BOTH, expand=True, pady=5)
         self.extract_preview_text = scrolledtext.ScrolledText(preview_frame, height=8, wrap=tk.WORD)
-        self.extract_preview_text.pack(fill=tk.BOTH, expand=True)
+        self.extract_preview_text.pack(fill=tk.BOTH, expand=True, padx=(5,0))
     
         # 绑定选项变更事件，自动刷新当前预览
         self.extract_video.trace_add('write', self._on_extract_option_changed)
@@ -13142,6 +13121,7 @@ class FFmpegBatchGUI:
                                 command=self.refresh_with_reset,
                                 height=btn_height, width=12, relief=tk.RAISED)
         btn_refresh.pack(side=tk.LEFT, padx=5, pady=5)
+        ToolTip(btn_refresh, "刷新命令或重置队列区列宽")
         
         btn1_copy = tk.Button(bottom_btn_frame, text="复制命令", command=self.copy_command,
                              height=btn_height, width=12, relief=tk.RAISED)
@@ -13153,10 +13133,10 @@ class FFmpegBatchGUI:
         else:
             preview_label_text = "当前命令模板"
 
-        preview_frame = ttk.LabelFrame(settings_frame, text=preview_label_text, padding="5")
+        preview_frame = ttk.LabelFrame(settings_frame, text=preview_label_text, padding="1")
         preview_frame.pack(fill=tk.X, pady=0)
         self.cmd_preview = scrolledtext.ScrolledText(preview_frame, height=4, wrap=tk.WORD, font=("Microsoft YaHei",9))
-        self.cmd_preview.pack(fill=tk.BOTH, expand=True)
+        self.cmd_preview.pack(fill=tk.BOTH, expand=True, padx=(4,0))
         self.cmd_preview.insert(tk.END, "请选择输入文件，或调整参数...")
 
 
@@ -13188,6 +13168,7 @@ class FFmpegBatchGUI:
         
         label_parallel = ttk.Label(tool_container, text="并行任务:")
         label_parallel.pack(side=tk.LEFT, padx=(10, 2))
+        ToolTip(label_parallel, "同时运行的任务数量，建议不超过3以避免资源过度占用")
         self.max_parallel = tk.IntVar(value=1)
         self.parallel_spin = ttk.Spinbox(tool_container, from_=1, to=5, width=3,
                                          textvariable=self.max_parallel, state="readonly")
@@ -13195,6 +13176,7 @@ class FFmpegBatchGUI:
         
         label_hw = ttk.Label(tool_container, text="硬编并发限制:")
         label_hw.pack(side=tk.LEFT, padx=(10, 2))
+        ToolTip(label_hw, "同时进行的硬件编码〔NVENC/QSV/AMF等〕任务的最大数量，推荐不超过2，显存里可能数据打架")
         self.max_hw_parallel = tk.IntVar(value=2)
         self.max_hw_spin = ttk.Spinbox(tool_container, from_=1, to=4, width=3,
                                        textvariable=self.max_hw_parallel, state="readonly")
@@ -13210,7 +13192,7 @@ class FFmpegBatchGUI:
         
         # ---------- 任务列表  ----------
         list_container = ttk.Frame(tasks_frame)
-        list_container.pack(fill=tk.BOTH, expand=True, pady=(0, 0))
+        list_container.pack(fill=tk.BOTH, expand=True, padx=(5,0), pady=(0, 0))
 
         
         # 自定义样式
@@ -13229,12 +13211,12 @@ class FFmpegBatchGUI:
         self.task_tree.heading("错误信息", text="错误信息")
         
         # 列宽设置：
-        self.task_tree.column("序号", width=50, minwidth=40)
-        self.task_tree.column("文件名", width=150, minwidth=100)
-        self.task_tree.column("输出路径", width=200, minwidth=120)
-        self.task_tree.column("命令 (简洁) 双击编辑", width=410, minwidth=200)   # 重点：不设 stretch=False
-        self.task_tree.column("状态", width=110, minwidth=80)
-        self.task_tree.column("错误信息", width=58, minwidth=50)
+        self.task_tree.column("序号", width=50, minwidth=20)
+        self.task_tree.column("文件名", width=150, minwidth=20)
+        self.task_tree.column("输出路径", width=200, minwidth=20)
+        self.task_tree.column("命令 (简洁) 双击编辑", width=410, minwidth=20)
+        self.task_tree.column("状态", width=105, minwidth=20)
+        self.task_tree.column("错误信息", width=58, minwidth=20)
 
         self.task_tree.tag_configure('odd', background='#e8e8e8')
         self.task_tree.tag_configure('even', background='#ffffff')
