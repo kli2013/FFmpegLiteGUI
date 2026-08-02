@@ -4181,12 +4181,14 @@ class FFmpegBatchGUI:
 
 
 
+
         self._stream_info_cache = {}
         self._suppress_main_video_trace = False
         
         self._concat_params_cache = {}
         
         self._merge_preview_after_id = None   # 合并命令预览防抖 ID
+
 
         # ffprobe 并发数量计算
         cpu_count = os.cpu_count() or 4
@@ -4195,7 +4197,9 @@ class FFmpegBatchGUI:
         else:
             default_parallel = 16
         self.ffprobe_parallel = tk.IntVar(value=default_parallel)
-        
+
+
+
         self._running_tasks = []  # 存储 (proc, task)
         
         self.cmd_output_path = tk.StringVar(value="")
@@ -4383,7 +4387,6 @@ class FFmpegBatchGUI:
         
         # 未找到图标
         print("未找到窗口图标文件 35.ico")
-
 
 
 
@@ -5414,6 +5417,7 @@ class FFmpegBatchGUI:
             "ffmpeg_dir_path": self.ffmpeg_dir_path.get(),
             "preview_editable": self.preview_editable_var.get(),
             "pix_fmt_enabled_default": self.pix_fmt_enabled_default.get(),
+
 
             "ffprobe_parallel": self.ffprobe_parallel.get(),
         })
@@ -7564,6 +7568,21 @@ class FFmpegBatchGUI:
             return
         threading.Thread(target=self._run_single_transcode, args=(cmd_list, input_file, settings), daemon=True).start()
 
+    def refresh_with_reset(self):
+        """点击刷新按钮时：先重置列宽，再刷新命令预览"""
+        self.reset_task_tree_columns()
+        self.update_command_preview()   #刷新
+
+    def reset_task_tree_columns(self):
+        """重置任务列表列宽为默认值（与创建时一致）"""
+        if hasattr(self, 'task_tree'):
+            self.task_tree.column("序号", width=50)
+            self.task_tree.column("文件名", width=150)
+            self.task_tree.column("输出路径", width=200)
+            self.task_tree.column("命令 (简洁) 双击编辑", width=410)
+            self.task_tree.column("状态", width=110)
+            self.task_tree.column("错误信息", width=58)
+
     def _run_single_transcode(self, cmd_list, input_name, settings):
         """单文件转码（非队列）"""
         self._append_info_ui(f"\n========== 当前选择转码: {os.path.basename(input_name)} ==========")
@@ -8625,14 +8644,10 @@ class FFmpegBatchGUI:
             self._append_info_ui(f"[封装] 已添加画中画视频: {os.path.basename(path)}")
     
         # 统一更新界面
-        self._batch_update = True
-        try:
-            self.merge_update_track_list()
-            self.merge_auto_recommend_container()
-            self.merge_update_output_preview()
-        finally:
-            self._batch_update = False
-            self.merge_update_command_preview()
+        self.merge_update_track_list()
+        self.merge_auto_recommend_container()
+        self.merge_update_output_preview()
+
     
     def _add_concat_video(self):
         path = filedialog.askopenfilename(
@@ -8653,14 +8668,9 @@ class FFmpegBatchGUI:
         self._append_info_ui(f"[封装] 已添加串联视频: {os.path.basename(path)}")
     
         # 统一更新界面
-        self._batch_update = True
-        try:
-            self.merge_update_track_list()
-            self.merge_auto_recommend_container()
-            self.merge_update_output_preview()
-        finally:
-            self._batch_update = False
-            self.merge_update_command_preview()
+        self.merge_update_track_list()
+        self.merge_auto_recommend_container()
+        self.merge_update_output_preview()
 
 
 
@@ -12198,7 +12208,7 @@ class FFmpegBatchGUI:
         btn_preview.pack(side=tk.LEFT, padx=5, pady=5)
 
         btn_refresh = tk.Button(bottom_btn_frame, text="刷新命令",
-                                command=self.update_command_preview,
+                                command=self.refresh_with_reset,
                                 height=btn_height, width=12, relief=tk.RAISED)
         btn_refresh.pack(side=tk.LEFT, padx=5, pady=5)
         
@@ -12219,10 +12229,11 @@ class FFmpegBatchGUI:
         self.cmd_preview.insert(tk.END, "请选择输入文件，或调整参数...")
 
 
+        # ========== 任务列表区域==========
         tasks_frame = ttk.Frame(transcode_vpane)
-        tasks_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0,0))
+        tasks_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(5, 0))
         
-        # ---------- 工具栏（水平排列） ----------
+        # 工具栏
         tool_frame = ttk.Frame(tasks_frame)
         tool_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 5))
         
@@ -12230,24 +12241,20 @@ class FFmpegBatchGUI:
                               bg="#4CAF50", fg="white", width=12, relief=tk.RAISED)
         btn_start.pack(side=tk.LEFT, padx=5)
         
-        # 并行任务
-        self.max_parallel = tk.IntVar(value=1)
         label_parallel = ttk.Label(tool_frame, text="并行任务:")
         label_parallel.pack(side=tk.LEFT, padx=(10, 2))
-        ToolTip(label_parallel, "同时运行的任务数量，建议不超过3以避免资源过度占用")
+        self.max_parallel = tk.IntVar(value=1)
         self.parallel_spin = ttk.Spinbox(tool_frame, from_=1, to=5, width=3,
                                          textvariable=self.max_parallel, state="readonly")
         self.parallel_spin.pack(side=tk.LEFT, padx=2)
         
-        # 硬编并发限制
         label_hw = ttk.Label(tool_frame, text="硬编并发限制:")
         label_hw.pack(side=tk.LEFT, padx=(10, 2))
-        ToolTip(label_hw, "同时进行的硬件编码〔NVENC/QSV/AMF等〕任务的最大数量，推荐不超过2，显存里可能数据打架")
+        self.max_hw_parallel = tk.IntVar(value=2)
         self.max_hw_spin = ttk.Spinbox(tool_frame, from_=1, to=4, width=3,
                                        textvariable=self.max_hw_parallel, state="readonly")
         self.max_hw_spin.pack(side=tk.LEFT, padx=2)
         
-        # 操作按钮（去除分隔符，直接连续排列）
         for text, cmd in [("移除选中任务", self.remove_selected_tasks),
                           ("清空全部任务", self.clear_all_tasks),
                           ("清空已完成/失败任务", self.clear_finished_tasks),
@@ -12256,45 +12263,44 @@ class FFmpegBatchGUI:
                           ("预览选中任务", self.preview_selected_task)]:
             ttk.Button(tool_frame, text=text, command=cmd).pack(side=tk.LEFT, padx=5)
         
-        # ---------- 树形视图区域 ----------
-        tree_frame = ttk.Frame(tasks_frame)
-        tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        # ---------- 列表容器 ----------
+        list_container = ttk.Frame(tasks_frame)
+        list_container.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
         
-        # 自定义样式（可选，与第二个代码块一致）
-        style = ttk.Style()
-        style.configure("Custom.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0", rowheight=int(22 * self.scaling))
-        style.configure("Custom.Treeview.Heading", background="#d9d9d9")
-        
-        # 滚动条（垂直）
-        v_scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
-        v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # 水平滚动条（如果需要）
-        h_scrollbar = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL)
-        h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
+        # 自定义样式
+        Batch_style = ttk.Style()
+        Batch_style.configure("Batch.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0", rowheight=int(22 * self.scaling))
+        Batch_style.configure("Batch.Treeview.Heading", background="#d9d9d9")
         
         columns = ("序号", "文件名", "输出路径", "命令 (简洁) 双击编辑", "状态", "错误信息")
+        self.task_tree = ttk.Treeview(list_container, columns=columns, show="headings",
+                                       height=8, style="Batch.Treeview")
+        self.task_tree.heading("序号", text="序号")
+        self.task_tree.heading("文件名", text="文件名")
+        self.task_tree.heading("输出路径", text="输出路径")
+        self.task_tree.heading("命令 (简洁) 双击编辑", text="命令 (简洁) 双击编辑")
+        self.task_tree.heading("状态", text="状态")
+        self.task_tree.heading("错误信息", text="错误信息")
         
-        # Treeview 使用自定义样式
-        self.task_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=12,
-                                      yscrollcommand=v_scrollbar.set,
-                                      xscrollcommand=h_scrollbar.set,
-                                      style="Custom.Treeview")  # 应用样式
+        # 列宽设置：
+        self.task_tree.column("序号", width=50, minwidth=40)
+        self.task_tree.column("文件名", width=150, minwidth=100)
+        self.task_tree.column("输出路径", width=200, minwidth=120)
+        self.task_tree.column("命令 (简洁) 双击编辑", width=410, minwidth=200)   # 重点：不设 stretch=False
+        self.task_tree.column("状态", width=110, minwidth=80)
+        self.task_tree.column("错误信息", width=58, minwidth=50)
+
         self.task_tree.tag_configure('odd', background='#e8e8e8')
         self.task_tree.tag_configure('even', background='#ffffff')
-        
-        v_scrollbar.config(command=self.task_tree.yview)
-        h_scrollbar.config(command=self.task_tree.xview)
-        
-        # 列宽设置（可保持原值或按需调整）
-        widths = {"序号":50, "文件名":150, "输出路径":200, "命令 (简洁) 双击编辑":410, "状态":110, "错误信息":58}
-        for col in columns:
-            self.task_tree.heading(col, text=col)
-            self.task_tree.column(col, width=widths.get(col,100), minwidth=50, stretch=False)
+
+        # 垂直滚动条
+        vbar = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=self.task_tree.yview)
+        self.task_tree.configure(yscrollcommand=vbar.set)
         
         self.task_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vbar.pack(side=tk.RIGHT, fill=tk.Y)
         
-        # 双击编辑绑定
+        # 绑定双击编辑
         self.task_tree.bind("<Double-1>", self.on_task_double_click)
 
 
