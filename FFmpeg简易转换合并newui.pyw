@@ -1714,7 +1714,7 @@ class VideoFilterFrame(ttk.LabelFrame):
         self.current_track = None
         self.override_settings = None
         self.get_trim_settings_callback = None
-        self.preview_callback = preview_callback
+        self._preview_callback = preview_callback
         self._visual_crop_start_time = None
         self.create_widgets()
 
@@ -3776,12 +3776,13 @@ class OverlayPositionFrame(ttk.LabelFrame):
         self.tile_rows = tk.IntVar(value=4)
         ttk.Spinbox(param_row, from_=1, to=10, width=3, textvariable=self.tile_rows).pack(side=tk.LEFT, padx=2)
 
-        aspect‌_row = ttk.Frame(right_frame)
-        aspect‌_row.pack(anchor=tk.W, fill=tk.X, pady=5)
 
-        ttk.Label(aspect‌_row, text="方向:").pack(side=tk.LEFT)
+        aspect_row = ttk.Frame(right_frame)
+        aspect_row.pack(anchor=tk.W, fill=tk.X, pady=5)
+
+        ttk.Label(aspect_row, text="方向:").pack(side=tk.LEFT)
         self.tile_orientation = tk.StringVar(value="横排优先")
-        orientation_combo = ttk.Combobox(aspect‌_row, textvariable=self.tile_orientation,
+        orientation_combo = ttk.Combobox(aspect_row, textvariable=self.tile_orientation,
                                          values=["自动", "横排优先", "竖排优先"],
                                          state="readonly", width=8)
         orientation_combo.pack(side=tk.LEFT, padx=2)
@@ -3824,7 +3825,7 @@ class OverlayPositionFrame(ttk.LabelFrame):
             # track.scale_enabled = False  # 若存在此类属性
             # track.crop_enabled = False
             modified += 1
-    
+
         if modified:
             self.app.merge_update_track_list()
             self.app.merge_update_command_preview()
@@ -3963,7 +3964,7 @@ class AdvancedFrame(ttk.LabelFrame):
         ToolTip(
             chk_adaptive,
             "勾选后，水印的大小和位置会根据当前模板里*水印和载入视频*的比例为基准。\n\n"
-	    "自动在新添加视频命令里缩放大小和调整边距。\n\n"
+            "自动在新添加视频命令里缩放大小和调整边距。\n\n"
             "取消勾选则保持原始像素值，不进行任何缩放。\n\n"
             "**单个任务编辑框里勾选取消是更改当前任务(主界面要有基准)**",
             wraplength=600
@@ -4379,13 +4380,20 @@ class FFmpegBatchGUI:
             return self.window
 
         def __exit__(self, exc_type, exc_val, exc_tb):
-            if self.window and self.window.winfo_exists():
-                self.window.destroy()
-            if self.master:
-                try:
-                    self.master.grab_release()
-                except:
-                    pass
+            # 无论销毁是否成功，都要释放 grab
+            try:
+                if self.window and self.window.winfo_exists():
+                    self.window.destroy()
+            except Exception:
+                # 忽略销毁过程中的异常，继续清理
+                pass
+            finally:
+                if self.master:
+                    try:
+                        self.master.grab_release()
+                    except Exception:
+                        # 忽略 grab 释放时的异常（如主窗口已销毁）
+                        pass
 
     def __init__(self, root):
         self.root = root
@@ -8324,7 +8332,7 @@ class FFmpegBatchGUI:
                 preview_text.insert(tk.END, new_cmd_str)
                 preview_text.config(state=current_state)
 
-            filt_frame._preview_callback = update_preview   
+            filt_frame._preview_callback = update_preview
             adv_frame.update_callback = update_preview
             trim_frame.update_callback = update_preview
 
@@ -8384,9 +8392,9 @@ class FFmpegBatchGUI:
             enc_frame.bufsize_var.trace_add("write", update_preview)
 
             update_preview()
-    
+
             def save_changes():
-	        # 流提取相关
+                # 流提取相关
                 if task.is_custom:
                     messagebox.showinfo("提示", "此任务为流提取生成的自定义任务，不支持修改参数。")
                     win.destroy()
@@ -14640,10 +14648,10 @@ if __name__ == "__main__":
     if sys.platform == "win32":
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(2)
-        except AttributeError:
+        except (AttributeError, Exception):
             try:
                 ctypes.windll.user32.SetProcessDPIAware()
-            except:
+            except Exception:
                 pass
     if DND_AVAILABLE:
         root = TkinterDnD.Tk()
