@@ -4256,7 +4256,7 @@ class FFmpegBatchGUI:
 
     def __init__(self, root):
         self.root = root
-#        self.root.withdraw()
+        self.root.withdraw()
         self.root.title("FFmpeg 多功能工具")
         self._set_window_icon()
         screen_width = root.winfo_screenwidth()
@@ -4486,7 +4486,9 @@ class FFmpegBatchGUI:
             self.root.dnd_bind('<<Drop>>', self.on_files_dropped)
 
         self.show_quick_warning()
-#        self.root.deiconify()
+
+        self.root.update_idletasks()
+        self.root.deiconify()
 
 
 
@@ -10478,10 +10480,16 @@ class FFmpegBatchGUI:
     def merge_clear_tracks(self):
         if self.merge_tracks and messagebox.askyesno("确认", "确定清空所有轨道吗？"):
             self.merge_tracks.clear()
+            self.merge_video.set("")
+            self.merge_output.set("")
             self.merge_update_track_list()
+            self.merge_auto_recommend_container()
             self.merge_update_command_preview()
+            self.merge_reset_column_widths()    #调用恢复列宽
             self._append_info_ui("[封装] 已清空所有附加轨道")
-    
+
+
+
     def merge_on_tree_double_click(self, event):
         """双击编辑第一个选中的轨道"""
         self.merge_edit_selected()
@@ -10514,14 +10522,7 @@ class FFmpegBatchGUI:
         self.merge_update_track_list()
         self.merge_update_command_preview()
 
-    def merge_clear_tracks(self):
-        self.merge_tracks.clear()
-        self.merge_video.set("")
-        self.merge_output.set("")
-        self.merge_update_track_list()
-        self.merge_auto_recommend_container()
-        self.merge_update_command_preview()
-        self._append_info_ui("[封装] 已清空所有附加轨道")
+
 
     def merge_remove_track(self, track_idx):
         if 0 <= track_idx < len(self.merge_tracks):
