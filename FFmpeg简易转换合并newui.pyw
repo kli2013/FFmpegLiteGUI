@@ -57,28 +57,45 @@ def get_script_dir() -> str:
     else:
         return os.path.dirname(os.path.abspath(__file__))
 
-def find_executable(name: str) -> Optional[str]:
+def find_resource(filename: str) -> Optional[str]:
+    """
+    在脚本目录及其所有一级子目录中查找指定文件（不要求可执行权限）。
+    返回找到的第一个完整路径，未找到则返回 None。
+    """
     script_dir = get_script_dir()
+    
+    # 1. 脚本目录本身
+    path = os.path.join(script_dir, filename)
+    if os.path.isfile(path):
+        return path
 
-    # 1. 检查脚本目录本身
-    local_path = os.path.join(script_dir, name)
-    if os.path.isfile(local_path) and os.access(local_path, os.X_OK):
-        return local_path
+    # 2. 脚本目录的一级子目录（无论是否打包都扫描）
+    try:
+        for entry in os.listdir(script_dir):
+            sub_dir = os.path.join(script_dir, entry)
+            if os.path.isdir(sub_dir):
+                candidate = os.path.join(sub_dir, filename)
+                if os.path.isfile(candidate):
+                    return candidate
+    except OSError:
+        pass
 
-    # 2. 打包模式：检查脚本目录下的一级子目录（适配不同打包工具）
+    # 3. PyInstaller one-file 模式下的临时解压目录 (_MEIPASS)
     if getattr(sys, 'frozen', False):
-        try:
-            # 只遍历 script_dir 的直接子目录（深度为1）
-            for entry in os.listdir(script_dir):
-                sub_dir = os.path.join(script_dir, entry)
-                if os.path.isdir(sub_dir):
-                    candidate = os.path.join(sub_dir, name)
-                    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-                        return candidate
-        except Exception:
-            pass
+        meipass = getattr(sys, '_MEIPASS', None)
+        if meipass:
+            candidate = os.path.join(meipass, filename)
+            if os.path.isfile(candidate):
+                return candidate
 
-    # 3. 系统 PATH
+    return None
+
+
+def find_executable(name: str) -> Optional[str]:
+    candidate = find_resource(name)
+    if candidate and os.access(candidate, os.X_OK):
+        return candidate
+    # 未在脚本目录找到，回退到系统 PATH
     return shutil.which(name)
 
 def get_dpi_scaling(root: tk.Tk) -> float:
@@ -177,43 +194,169 @@ def seconds_to_time(sec):
 
 # ================== 预设管理 ==================
 class PresetManager:
+    # 默认预设模板（精简版）
+    DEFAULT_PRESET_TEMPLATE = {
+        "TEST 裁一半保留右边": {
+            "vcodec": "libx265",
+            "rate_control_type": "crf",
+            "crf_value": 25,
+            "frame_rate_type": "keep",
+            "frame_rate_custom": "24",
+            "crop_enabled": True,
+            "crop_left": "iw/2",
+            "crop_top": "0",
+            "crop_width": "iw/2",
+            "crop_height": "ih",
+        },
+        "TEST 裁一半保留左边": {
+            "vcodec": "libx265",
+            "rate_control_type": "crf",
+            "crf_value": 25,
+            "frame_rate_type": "keep",
+            "frame_rate_custom": "24",
+            "crop_enabled": True,
+            "crop_left": "0",
+            "crop_top": "0",
+            "crop_width": "iw/2",
+            "crop_height": "ih",
+        },
+        "TEST 缩放 600宽": {
+            "vcodec": "libx265",
+            "rate_control_type": "crf",
+            "crf_value": 25,
+            "frame_rate_type": "keep",
+            "frame_rate_custom": "24",
+            "scale_enabled": True,
+            "scale_width": "600",
+            "scale_height": "",
+            "scale_method": "width",
+        },
+        "TEST 横1920": {
+            "vcodec": "libx265",
+            "rate_control_type": "crf",
+            "crf_value": 25,
+            "frame_rate_type": "custom",
+            "frame_rate_custom": "30",
+            "scale_enabled": True,
+            "scale_width": "1920",
+            "scale_height": "-2",
+            "scale_method": "width",
+        },
+        "TEST 竖1920": {
+            "vcodec": "libx265",
+            "rate_control_type": "crf",
+            "crf_value": 25,
+            "frame_rate_type": "custom",
+            "frame_rate_custom": "30",
+            "scale_enabled": True,
+            "scale_width": "-2",
+            "scale_height": "1920",
+            "scale_method": "height",
+        },
+        "无损复制流": {
+            "encoder": "copy",
+            "audio_codec": "copy",
+        },
+        "H264 Fast 1080p30 (通用高清)": {
+            "encoder": "libx264",
+            "preset": "fast",
+            "rate_control_type": "crf",
+            "crf_value": 23,
+            "frame_rate_type": "custom",
+            "frame_rate_custom": "30",
+            "scale_enabled": True,
+            "scale_width": "1920",
+            "scale_height": "1080",
+            "scale_method": "exact",
+        },
+        "H264 Fast 720p30 (通用标清)": {
+            "encoder": "libx264",
+            "preset": "fast",
+            "rate_control_type": "crf",
+            "crf_value": 23,
+            "frame_rate_type": "custom",
+            "frame_rate_custom": "30",
+            "scale_enabled": True,
+            "scale_width": "1280",
+            "scale_height": "720",
+            "scale_method": "exact",
+        },
+        "H264 Very Fast 1080p30 (极速高清)": {
+            "encoder": "libx264",
+            "preset": "veryfast",
+            "rate_control_type": "crf",
+            "crf_value": 23,
+            "frame_rate_type": "custom",
+            "frame_rate_custom": "30",
+            "scale_enabled": True,
+            "scale_width": "1920",
+            "scale_height": "1080",
+            "scale_method": "exact",
+        },
+        "H264 HQ 1080p30 (高质量)": {
+            "encoder": "libx264",
+            "preset": "slow",
+            "rate_control_type": "crf",
+            "crf_value": 20,
+            "frame_rate_type": "custom",
+            "frame_rate_custom": "30",
+            "scale_enabled": True,
+            "scale_width": "1920",
+            "scale_height": "1080",
+            "scale_method": "exact",
+        },
+        "H265 HEVC 1080p (高效压缩)": {
+            "encoder": "libx265",
+            "preset": "medium",
+            "rate_control_type": "crf",
+            "crf_value": 24,
+            "frame_rate_type": "keep",
+            "frame_rate_custom": "30",
+            "scale_enabled": True,
+            "scale_width": "1920",
+            "scale_height": "1080",
+            "scale_method": "exact",
+        },
+        "H265 HEVC 4K (高质量)": {
+            "encoder": "libx265",
+            "preset": "slow",
+            "rate_control_type": "crf",
+            "crf_value": 22,
+            "frame_rate_type": "keep",
+            "frame_rate_custom": "30",
+            "scale_enabled": True,
+            "scale_width": "3840",
+            "scale_height": "2160",
+            "scale_method": "exact",
+        }
+    }
     def __init__(self, preset_path: str, app_name: str = "FFLiteGUI"):
         self.preset_path = preset_path
         self.user_data_dir = os.path.join(os.path.expanduser("~"), f".{app_name}")
         os.makedirs(self.user_data_dir, exist_ok=True)
-        self._ensure_default_preset()
+#        self._ensure_default_preset()
 
     def _ensure_default_preset(self):
         if os.path.exists(self.preset_path):
             return
     
-        # 可能的捆绑路径列表
-        possible_paths = []
-        script_dir = get_script_dir()
+        # 尝试从内置资源复制
+        bundled = find_resource("ffmpeg_presets.json")
+        if bundled:
+            try:
+                shutil.copy2(bundled, self.preset_path)
+                print(f"首次运行，已从内部释放默认配置到：{self.preset_path}")
+                return
+            except Exception as e:
+                print(f"释放配置文件失败: {e}")
     
-        # 1. 脚本目录（开发环境或 one-dir 顶层）
-        possible_paths.append(os.path.join(script_dir, "ffmpeg_presets.json"))
-    
-        # 2. 打包后 one-dir 模式的 _internal 目录
-        if getattr(sys, 'frozen', False):
-            possible_paths.append(os.path.join(script_dir, '_internal', "ffmpeg_presets.json"))
-    
-        # 3. onefile 模式下的 _MEIPASS 临时目录（若存在）
-        if getattr(sys, 'frozen', False):
-            meipass = getattr(sys, '_MEIPASS', None)
-            if meipass:
-                possible_paths.append(os.path.join(meipass, "ffmpeg_presets.json"))
-    
-        for bundled in possible_paths:
-            if os.path.exists(bundled):
-                try:
-                    shutil.copy2(bundled, self.preset_path)
-                    print(f"首次运行，已从内部释放默认配置到：{self.preset_path}")
-                    return
-                except Exception as e:
-                    print(f"释放配置文件失败: {e}")
-                    # 继续尝试下一个路径（但通常复制失败后不再尝试其他）
-                    break
+        # 没有内置预设，写入精简默认模板
+        try:
+            with open(self.preset_path, 'w', encoding='utf-8') as f:
+                json.dump(self.DEFAULT_PRESET_TEMPLATE, f, indent=4, ensure_ascii=False)
+            print(f"首次运行，已创建精简预设模板：{self.preset_path}")
+        except Exception as e:
+            print(f"创建预设文件失败: {e}")
 
     def load_all(self) -> Dict[str, Any]:
         """加载所有预设，返回字典 {预设名: 设置字典}，不含播放器设置"""
@@ -3960,6 +4103,8 @@ class Task:
         self.status = "等待"
         self.error_msg = ""
         self.progress = 0
+        self.current_sec = 0
+        self.total_sec = 0
         self._task_list_update_after = None   # 任务列表刷新去抖 ID
         self.stopped_by_user = False
         self.is_custom = False
@@ -4306,11 +4451,18 @@ class FFmpegBatchGUI:
         self.cmd_templates = {}
         self._load_cmd_templates()
         
-        self._initialized = False
+        self._initialized = False   # 标记 UI 已创建但未完成文件加载
 
         # 创建界面组件
         self.create_widgets()
         
+        self.default_settings = self.get_current_settings()
+
+        # 启动后台初始化（文件释放和加载）
+        self.root.after(100, self._delayed_init)   # 延迟 100ms 让窗口先显示
+
+
+
         # 处理命令行参数（支持从资源管理器“发送到”打开文件）
         if len(sys.argv) > 1:
             # 取第一个非脚本参数作为文件路径
@@ -4333,6 +4485,43 @@ class FFmpegBatchGUI:
             self.root.dnd_bind('<<Drop>>', self.on_files_dropped)
 
         self.show_quick_warning()
+
+
+
+    def _delayed_init(self):
+        """在后台线程中释放预设文件和命令模板，避免阻塞 UI"""
+        def worker():
+            # 1. 确保预设文件存在
+            if not os.path.exists(self.preset_file_path):
+                self.preset_manager._ensure_default_preset()
+            
+            # 2. 确保快速命令模板文件存在且有效
+            if not os.path.exists(self.cmd_templates_path):
+                # 文件不存在，创建默认模板
+                self.cmd_templates = self._get_default_cmd_templates()
+                self._save_cmd_templates()
+            else:
+                # 文件存在，尝试加载
+                self._load_cmd_templates()
+                # 如果加载后为空（可能文件损坏），则重建
+                if not self.cmd_templates:
+                    self._append_info_ui("快速命令模板文件损坏或为空，将重建默认模板")
+                    self.cmd_templates = self._get_default_cmd_templates()
+                    self._save_cmd_templates()
+                    self._load_cmd_templates()  # 重新加载
+            
+            # 3. 回到主线程更新 UI
+            self.root.after(0, self._finish_delayed_init)
+        
+        threading.Thread(target=worker, daemon=True).start()
+    
+    def _finish_delayed_init(self):
+        """延迟初始化完成后的 UI 更新"""
+        self.load_preset_list()
+        self._refresh_cmd_preset_list()
+        self._initialized = True
+#        self._append_info_ui("预设和快速命令模板已就绪")
+
 
     def _ensure_main_video(self, disable_scale=False):
         """确保 self.merge_video 已设置：若未设置，则从列表中取第一个启用的视频轨道。
@@ -4364,49 +4553,16 @@ class FFmpegBatchGUI:
 
 
     def _set_window_icon(self):
-        """设置窗口图标，使用与 find_executable 相同的路径搜索逻辑（不检查可执行权限）"""
-        icon_name = "35.ico"
-        script_dir = get_script_dir()
-        
-        # 1. 脚本目录（开发环境或 one-dir 顶层）
-        path = os.path.join(script_dir, icon_name)
-        if os.path.isfile(path):
+        icon_path = find_resource("35.ico")
+        if icon_path:
             try:
-                self.root.iconbitmap(default=path)
-                print(f"窗口图标加载成功: {path}")
+                self.root.iconbitmap(default=icon_path)
+                print(f"窗口图标加载成功: {icon_path}")
                 return
             except Exception as e:
-                print(f"加载图标失败 {path}: {e}")
-                return
-        
-        # 2. 打包后 one-dir 模式的 _internal 目录
-        if getattr(sys, 'frozen', False):
-            path = os.path.join(script_dir, '_internal', icon_name)
-            if os.path.isfile(path):
-                try:
-                    self.root.iconbitmap(default=path)
-                    print(f"窗口图标加载成功: {path}")
-                    return
-                except Exception as e:
-                    print(f"加载图标失败 {path}: {e}")
-                    return
-        
-        # 3. onefile 模式下的 _MEIPASS 临时目录
-        if getattr(sys, 'frozen', False):
-            meipass = getattr(sys, '_MEIPASS', None)
-            if meipass:
-                path = os.path.join(meipass, icon_name)
-                if os.path.isfile(path):
-                    try:
-                        self.root.iconbitmap(default=path)
-                        print(f"窗口图标加载成功: {path}")
-                        return
-                    except Exception as e:
-                        print(f"加载图标失败 {path}: {e}")
-                        return
-        
-        # 未找到图标
-        print("未找到窗口图标文件 35.ico")
+                print(f"加载图标失败 {icon_path}: {e}")
+        else:
+            print("未找到窗口图标文件 35.ico")
 
     # 流提取相关
     def add_custom_task(self, input_path: str, output_path: str, cmd_list: List[str], settings: dict = None):
@@ -4464,6 +4620,8 @@ class FFmpegBatchGUI:
         # 更新任务列表（队列任务）
         if task is not None:
             task.progress = percent
+            task.current_sec = current
+            task.total_sec = total
             self._schedule_task_list_update()
     
         # 更新日志和标题（单文件/合并）
@@ -4607,23 +4765,17 @@ class FFmpegBatchGUI:
     
 
     def _load_cmd_templates(self):
-        """加载快速命令模板，若文件不存在则创建默认模板"""
-        os.makedirs(os.path.dirname(self.cmd_templates_path), exist_ok=True)
+        """仅从文件加载快速命令模板，若文件不存在则保留空字典（不创建）"""
+        self.cmd_templates = {}
         if os.path.exists(self.cmd_templates_path):
             try:
                 with open(self.cmd_templates_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     if isinstance(data, dict):
                         self.cmd_templates = data
-                        self._refresh_cmd_preset_list()
-                        return
             except Exception as e:
-                self._append_info_ui(f"加载快速命令模板失败: {e}，将使用默认模板")
-        
-        # 文件不存在或加载失败，创建默认模板
-        self.cmd_templates = self._get_default_cmd_templates()
-        self._save_cmd_templates()
-        self._refresh_cmd_preset_list()
+                self._append_info_ui(f"加载快速命令模板失败: {e}")
+        # 如果文件不存在，则 cmd_templates 保持为空字典，稍后由后台线程创建
     
     def _get_default_cmd_templates(self):
         """返回默认的命令模板字典"""
@@ -4665,14 +4817,17 @@ class FFmpegBatchGUI:
             "静音特定音频通道": 'ffmpeg -y -i \"{input}\" -af \"pan=stereo|c0=c0|c1=0*c1\" -c:v copy \"{output_dir}right_channel_muted.mp4\"',
             "交换左右音频通道": 'ffmpeg -y -i \"{input}\" -af \"pan=stereo|c0=c1|c1=c0\" -c:v copy \"{output_dir}swapped_channels.mp4\"',
             "合并两个音频流": 'ffmpeg -y -i \"{input}\" -i input2.mp3 -filter_complex \"[0:a][1:a]amerge=inputs=2[a]\" -map \"[a]\" \"{output_dir}merged.mp4\"',
-            "创建视频缩略图": 'ffmpeg -y -i \"{input}\" -ss 00:00:05 -vframes 1 \"{output_dir}thumbnail.jpg"',
+            "提取内置封面 (cover art)": 'ffmpeg -y -i "{input}" -map 0:v:0? -c:v copy "{output_dir}cover.jpg"',
+            "提取第一帧截图": 'ffmpeg -y -i "{input}" -vframes 1 "{output_dir}thumb.jpg"',
+            "提取指定时间帧 (需改 -ss)": 'ffmpeg -y -i "{input}" -ss 00:00:05 -vframes 1 "{output_dir}thumb.jpg"',
 
 
 
         }
     
     def _save_cmd_templates(self):
-        """保存命令模板到 JSON 文件"""
+        """保存命令模板到 JSON 文件（覆盖写入）"""
+        os.makedirs(os.path.dirname(self.cmd_templates_path), exist_ok=True)
         try:
             with open(self.cmd_templates_path, 'w', encoding='utf-8') as f:
                 json.dump(self.cmd_templates, f, indent=4, ensure_ascii=False)
@@ -7005,9 +7160,32 @@ class FFmpegBatchGUI:
         preset_names = list(presets.keys())
         self.preset_combo['values'] = preset_names
 
+    def _clean_settings(self, settings: dict, defaults: dict = None) -> dict:
+        """
+        递归清洗设置字典，移除与默认值相同的字段。
+        """
+        if defaults is None:
+            defaults = self.default_settings
+        cleaned = {}
+        for key, value in settings.items():
+            if key not in defaults:
+                # 如果键不在默认字典中，保留（通常不会发生）
+                cleaned[key] = value
+                continue
+            default_value = defaults[key]
+            if isinstance(value, dict) and isinstance(default_value, dict):
+                # 递归处理子字典，并传入对应的默认值
+                sub_cleaned = self._clean_settings(value, default_value)
+                if sub_cleaned:  # 只有子字典非空才保留
+                    cleaned[key] = sub_cleaned
+            elif value != default_value:
+                cleaned[key] = value
+            # 值相同则忽略
+        return cleaned
+
     def save_preset(self):
         preset_name = simpledialog.askstring("保存预设", "请输入预设名称:", parent=self.root)
-        if not preset_name: 
+        if not preset_name:
             return
         preset_settings = self.get_current_settings()
 
@@ -7016,12 +7194,19 @@ class FFmpegBatchGUI:
         # ---- 移除分段拼接数据（如果您也不希望保存） ----
         preset_settings.pop("segment_enabled", None)
         preset_settings.pop("segments", None)
-        # ---- 移除普通截取参数 ----
+        # ---- 移除截取参数 ----
         preset_settings.pop("trim_enabled", None)
         preset_settings.pop("trim_start", None)
         preset_settings.pop("trim_end", None)
         preset_settings.pop("precise_trim", None)
-        self.preset_manager.save_preset(preset_name, preset_settings)
+        preset_settings.pop("combo_seek", None)
+        preset_settings.pop("combo_threshold", None)
+    
+        # 清洗
+#        print("原始设置:", preset_settings)
+        cleaned = self._clean_settings(preset_settings)
+ #       print("清洗后:", cleaned)
+        self.preset_manager.save_preset(preset_name, cleaned)
         self.load_preset_list()
         messagebox.showinfo("成功", f"预设“{preset_name}”已保存到:\n{self.preset_file_path}")
 
@@ -7352,7 +7537,10 @@ class FFmpegBatchGUI:
             tag = 'odd' if i % 2 == 0 else 'even'
             # 状态显示：转码中显示进度百分比
             if task.status == "转码中":
-                status_display = f"转码中 {task.progress}%"
+                if task.total_sec > 0:
+                    status_display = f"转码中 {task.progress}% ({task.current_sec}/{task.total_sec} 秒)"
+                else:
+                    status_display = f"转码中 {task.progress}%"
             else:
                 status_display = task.status
     
@@ -8096,16 +8284,18 @@ class FFmpegBatchGUI:
         # 工具栏
         tool_frame = ttk.Frame(list_container)
         tool_frame.pack(fill=tk.X, pady=2)
-        ttk.Button(tool_frame, text="启用/禁用", command=self.merge_toggle_selected).pack(side=tk.LEFT, padx=2)
-        ttk.Button(tool_frame, text="编辑", command=self.merge_edit_selected).pack(side=tk.LEFT, padx=2)
-        ttk.Button(tool_frame, text="预览", command=self.merge_preview_selected).pack(side=tk.LEFT, padx=2)
-        ttk.Button(tool_frame, text="上移", command=self.merge_move_up_selected).pack(side=tk.LEFT, padx=2)
-        ttk.Button(tool_frame, text="下移", command=self.merge_move_down_selected).pack(side=tk.LEFT, padx=2)
-        ttk.Button(tool_frame, text="删除", command=self.merge_delete_selected).pack(side=tk.LEFT, padx=2)
-        ttk.Button(tool_frame, text="清空", command=self.merge_clear_tracks).pack(side=tk.LEFT, padx=2)
-        ttk.Button(tool_frame, text="恢复列宽", command=self.merge_reset_column_widths).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text="启用/禁用", command=self.merge_toggle_selected, width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text="编辑", command=self.merge_edit_selected, width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text="预览", command=self.merge_preview_selected, width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text="上移", command=self.merge_move_up_selected, width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text="下移", command=self.merge_move_down_selected, width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text="删除", command=self.merge_delete_selected, width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text="清空", command=self.merge_clear_tracks, width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text="恢复列宽", command=self.merge_reset_column_widths, width=8).pack(side=tk.LEFT, padx=2)
         ttk.Button(tool_frame, text="按文件名排序", command=self.merge_sort_by_filename).pack(side=tk.LEFT, padx=2)
         ttk.Button(tool_frame, text="按修改时间排序", command=self.merge_sort_by_mtime).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text="💾 保存项目", command=self.save_merge_project).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text="📂 加载项目", command=self.load_merge_project).pack(side=tk.LEFT, padx=2)
     
         # 自定义样式
         merge_style = ttk.Style()
@@ -8113,20 +8303,22 @@ class FFmpegBatchGUI:
         merge_style.configure("Merge.Treeview.Heading", background="#d9d9d9")
     
         # 创建 Treeview（只一次）
-        columns = ("启用", "类型", "规格", "编码", "来源", "编码设置 双击编辑")
+        columns = ("序号", "启用", "类型", "规格", "编码", "来源", "编码设置 双击编辑")
         self.merge_tree = ttk.Treeview(list_container, columns=columns, show="headings",
                                        height=8, style="Merge.Treeview")
+        self.merge_tree.heading("序号", text="序号")
         self.merge_tree.heading("启用", text="启用")
         self.merge_tree.heading("类型", text="类型")
         self.merge_tree.heading("规格", text="规格")
         self.merge_tree.heading("编码", text="编码")
         self.merge_tree.heading("来源", text="来源")
         self.merge_tree.heading("编码设置 双击编辑", text="编码设置 双击编辑")
+        self.merge_tree.column("序号", width=5, anchor="center")
         self.merge_tree.column("启用", width=5, anchor="center")
         self.merge_tree.column("类型", width=20)
         self.merge_tree.column("规格", width=100)
         self.merge_tree.column("编码", width=20)
-        self.merge_tree.column("来源", width=500)
+        self.merge_tree.column("来源", width=495)
         self.merge_tree.column("编码设置 双击编辑", width=80)
         self.merge_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     
@@ -8342,6 +8534,134 @@ class FFmpegBatchGUI:
         self.pip_enabled.trace_add('write', self._on_pip_toggle)
         self.concat_enabled.trace_add('write', self._on_concat_toggle)
 
+
+
+    def save_merge_project(self):
+        """手动保存合并项目到 .fflgproject 文件"""
+        file_path = filedialog.asksaveasfilename(
+            title="保存合并项目",
+            defaultextension=".fflgproject",
+            filetypes=[("fflgproject 项目文件", "*.fflgproject"), ("JSON 文件", "*.json"), ("所有文件", "*.*")]
+        )
+        if not file_path:
+            return
+        
+        # 构造状态字典（复用之前的序列化逻辑）
+        state = self._build_merge_state_dict()
+        
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(state, f, indent=2, ensure_ascii=False)
+            self._append_info_ui(f"✅ 项目已保存到: {os.path.basename(file_path)}")
+        except Exception as e:
+            self._append_info_ui(f"❌ 保存项目失败: {e}")
+            messagebox.showerror("保存失败", str(e))
+    
+    def _build_merge_state_dict(self):
+        state = {
+            "version": "1.0",
+            "merge_video": self.merge_video.get(),
+            "merge_output": self.merge_output.get(),
+            "merge_container": self.merge_container.get(),
+            "pip_enabled": self.pip_enabled.get(),
+            "concat_enabled": self.concat_enabled.get(),
+            "merge_only_audio": self.merge_only_audio.get(),
+            "merge_manual_duration_enabled": self.merge_manual_duration_enabled.get(),
+            "merge_manual_duration": self.merge_manual_duration.get(),
+            "copy_chapters": self.copy_chapters.get(),
+            "chapter_file": self.chapter_file.get(),
+            "merge_verify": self.merge_verify.get(),
+            "merge_delete_source": self.merge_delete_source.get(),
+            "tracks": []
+        }
+        for track in self.merge_tracks:
+            enc_settings_copy = track.enc_settings.copy()
+            enc_settings_copy.pop("_file_path", None)  # 移除临时字段
+            track_dict = {
+                "type": track.type,
+                "codec": track.codec,
+                "file_path": track.file_path,
+                "index": track.index,
+                "enabled": track.enabled,
+                "language": track.language,
+                "title": track.title,
+                "enc_settings": enc_settings_copy
+            }
+            state["tracks"].append(track_dict)
+        return state
+
+    def load_merge_project(self):
+        """从 .fflgproject 文件加载合并项目"""
+        # 如果有未保存的更改，提示是否保存当前项目
+        if self.merge_tracks and messagebox.askyesno("未保存的项目", "当前有轨道，是否先保存当前项目？\n（选“是”保存，选“否”直接加载新项目）"):
+            self.save_merge_project()
+            # 用户可能取消保存，但继续加载，没问题
+        
+        file_path = filedialog.askopenfilename(
+            title="加载合并项目",
+            filetypes=[("fflgproject 项目文件", "*.fflgproject"), ("JSON 文件", "*.json"), ("所有文件", "*.*")]
+        )
+        if not file_path:
+            return
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+        except Exception as e:
+            self._append_info_ui(f"❌ 读取项目文件失败: {e}")
+            messagebox.showerror("读取失败", str(e))
+            return
+        
+        # 恢复状态
+        self._restore_merge_state_dict(state)
+        self._append_info_ui(f"✅ 项目已加载: {os.path.basename(file_path)}")
+
+    def _restore_merge_state_dict(self, state):
+        self._suppress_main_video_trace = True
+        try:
+            self.merge_tracks.clear()
+    
+            self.merge_video.set(state.get("merge_video", ""))
+            self.merge_output.set(state.get("merge_output", ""))
+            self.merge_container.set(state.get("merge_container", "mkv"))
+            self.pip_enabled.set(state.get("pip_enabled", False))
+            self.concat_enabled.set(state.get("concat_enabled", False))
+            self.merge_only_audio.set(state.get("merge_only_audio", False))
+            self.merge_manual_duration_enabled.set(state.get("merge_manual_duration_enabled", False))
+            self.merge_manual_duration.set(state.get("merge_manual_duration", ""))
+            self.copy_chapters.set(state.get("copy_chapters", True))
+            self.chapter_file.set(state.get("chapter_file", ""))
+            self.merge_verify.set(state.get("merge_verify", True))
+            self.merge_delete_source.set(state.get("merge_delete_source", False))
+    
+            for track_dict in state.get("tracks", []):
+                track = Track(
+                    track_dict["index"],
+                    track_dict["type"],
+                    track_dict["codec"],
+                    track_dict["file_path"],
+                    track_dict["enabled"],
+                    copy.deepcopy(track_dict["enc_settings"])
+                )
+                track.file_path = track_dict["file_path"]
+                track.language = track_dict.get("language", "")
+                track.title = track_dict.get("title", "")
+                if track.type == "video":
+                    track.overlay_enabled = track.enc_settings.get("overlay_enabled", False)
+                    track.overlay_x = track.enc_settings.get("overlay_x", "W-w-10")
+                    track.overlay_y = track.enc_settings.get("overlay_y", "H-h-10")
+                    track.pad_enabled = track.enc_settings.get("pad_enabled", False)
+                    track.pad_width = track.enc_settings.get("pad_width", "")
+                    track.pad_height = track.enc_settings.get("pad_height", "")
+                    track.offset_x = track.enc_settings.get("offset_x", "0")
+                    track.offset_y = track.enc_settings.get("offset_y", "0")
+                self.merge_tracks.append(track)
+        finally:
+            self._suppress_main_video_trace = False
+    
+        self.merge_update_track_list()
+        self.merge_update_output_preview()
+        self.merge_update_command_preview()
 
     def merge_sort_tracks(self, key_func):
         """按文件分组排序轨道（同一文件的所有轨道保持在一起）"""
@@ -9974,6 +10294,7 @@ class FFmpegBatchGUI:
                 detail = "-"
             
             values = (
+                i + 1,
                 enabled_text,
                 display_type,
                 detail,
@@ -10122,11 +10443,12 @@ class FFmpegBatchGUI:
     def merge_reset_column_widths(self):
         """恢复合并页面 Treeview 各列的默认宽度"""
         # 原创建时的列宽设置
+        self.merge_tree.column("序号", width=5)
         self.merge_tree.column("启用", width=5)
         self.merge_tree.column("类型", width=20)
         self.merge_tree.column("规格", width=100)
         self.merge_tree.column("编码", width=20)
-        self.merge_tree.column("来源", width=500)
+        self.merge_tree.column("来源", width=495)
         self.merge_tree.column("编码设置 双击编辑", width=80)
         self._append_info_ui("[布局] 已恢复合并列表的列宽")
 
