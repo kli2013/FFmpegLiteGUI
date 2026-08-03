@@ -191,7 +191,6 @@ def seconds_to_time(sec):
 
 
 
-
 # ================== 预设管理 ==================
 class PresetManager:
     # 默认预设模板（精简版）
@@ -4394,6 +4393,97 @@ class FFmpegBatchGUI:
                     except Exception:
                         # 忽略 grab 释放时的异常（如主窗口已销毁）
                         pass
+
+
+    
+    # ================== 语言映射 ==================
+    # ISO 639-2/B 标准三字母码映射表（短码 → 标准码）
+    LANGUAGE_MAP = {
+        # 中文
+        "zh": "chi", "zho": "chi", "chi": "chi",
+        "cn": "chi", "chs": "chi", "cht": "chi",
+        # 英语
+        "en": "eng", "eng": "eng", "en-us": "eng", "en-gb": "eng",
+        # 日语
+        "ja": "jpn", "jp": "jpn", "jpn": "jpn",
+        # 韩语
+        "ko": "kor", "kr": "kor", "kor": "kor",
+        # 法语
+        "fr": "fre", "fra": "fre", "fre": "fre",
+        # 德语
+        "de": "ger", "deu": "ger", "ger": "ger",
+        # 西班牙语
+        "es": "spa", "spa": "spa",
+        # 意大利语
+        "it": "ita", "ita": "ita",
+        # 葡萄牙语
+        "pt": "por", "por": "por",
+        # 俄语
+        "ru": "rus", "rus": "rus",
+        # 阿拉伯语
+        "ar": "ara", "ara": "ara",
+        # 印地语
+        "hi": "hin", "hin": "hin",
+        # 泰语
+        "th": "tha", "tha": "tha",
+        # 越南语
+        "vi": "vie", "vie": "vie",
+        # 印尼语
+        "id": "ind", "ind": "ind",
+        # 马来语
+        "ms": "may", "may": "may", "msa": "may",
+        # 他加禄语/菲律宾语
+        "tl": "tgl", "tgl": "tgl", "fil": "fil",
+        "nan": "chi",
+        # 其他常用
+        "nl": "dut", "nld": "dut", "dut": "dut",
+        "sv": "swe", "swe": "swe",
+        "da": "dan", "dan": "dan",
+        "fi": "fin", "fin": "fin",
+        "no": "nor", "nor": "nor",
+        "pl": "pol", "pol": "pol",
+        "tr": "tur", "tur": "tur",
+        "cs": "cze", "ces": "cze", "cze": "cze",
+        "hu": "hun", "hun": "hun",
+        "ro": "rum", "ron": "rum", "rum": "rum",
+        "el": "gre", "ell": "gre", "gre": "gre",
+        "he": "heb", "heb": "heb",
+        "uk": "ukr", "ukr": "ukr",
+        "und": "und",
+    }
+    
+    # 常用语言下拉列表（显示名, ISO码）
+    COMMON_LANGUAGES = [
+        ("粤语 (yue)",        "yue"),
+        ("普通话 (cmn)",      "cmn"),
+        ("中文 (chi)",        "chi"),
+        ("英语 (eng)",        "eng"),
+        ("日语 (jpn)",        "jpn"),
+        ("韩语 (kor)",        "kor"),
+        ("法语 (fre)",        "fre"),
+        ("德语 (ger)",        "ger"),
+        ("西班牙语 (spa)",    "spa"),
+        ("意大利语 (ita)",    "ita"),
+        ("葡萄牙语 (por)",    "por"),
+        ("俄语 (rus)",        "rus"),
+        ("阿拉伯语 (ara)",    "ara"),
+        ("印地语 (hin)",      "hin"),
+        ("泰语 (tha)",        "tha"),
+        ("越南语 (vie)",      "vie"),
+        ("印尼语 (ind)",      "ind"),
+        ("马来语 (may)",      "may"),
+        ("荷兰语 (dut)",      "dut"),
+        ("瑞典语 (swe)",      "swe"),
+        ("波兰语 (pol)",      "pol"),
+        ("土耳其语 (tur)",    "tur"),
+        ("泰米尔语 (tam)",    "tam"),
+        ("未指定 (und)",      "und"),
+    ]
+
+
+
+
+
 
     def __init__(self, root):
         self.root = root
@@ -11203,15 +11293,41 @@ class FFmpegBatchGUI:
                 notebook.add(page_meta, text="轨道元数据")
                 meta_frame = ttk.Frame(page_meta, padding="10")
                 meta_frame.pack(fill=tk.X, pady=5)
-                ttk.Label(meta_frame, text="语言代码 (如 chi, eng):").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+            
+                # 语言选择（下拉框 + 自定义输入）
+                ttk.Label(meta_frame, text="语言:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
                 lang_var = tk.StringVar(value=track_obj.language)
-                lang_entry = ttk.Entry(meta_frame, textvariable=lang_var, width=15)
-                lang_entry.grid(row=0, column=1, padx=5, pady=5)
+                # 下拉框显示友好名称
+                lang_combo = ttk.Combobox(meta_frame, textvariable=lang_var,
+                                          values=[display for display, code in self.COMMON_LANGUAGES],
+                                          state="normal", width=20)
+                lang_combo.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+            
+                # 自定义输入框（用于输入未列出的代码）
+                ttk.Label(meta_frame, text="或手动输入:").grid(row=0, column=2, padx=5, pady=5)
+                custom_lang_var = tk.StringVar(value=track_obj.language)  # 初始同步
+                custom_lang_entry = ttk.Entry(meta_frame, textvariable=custom_lang_var, width=10)
+                custom_lang_entry.grid(row=0, column=3, padx=5, pady=5, sticky="w")
+            
+                # 绑定事件：从下拉框选择时，自动填充自定义框（填入标准码）
+                def on_lang_select(event):
+                    selected = lang_var.get()
+                    for display, code in self.COMMON_LANGUAGES:
+                        if display == selected:
+                            custom_lang_entry.delete(0, tk.END)
+                            custom_lang_entry.insert(0, code)
+                            break
+                lang_combo.bind("<<ComboboxSelected>>", on_lang_select)
+            
+                # 轨道标题（不变）
                 ttk.Label(meta_frame, text="轨道标题:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
                 title_var = tk.StringVar(value=track_obj.title)
                 title_entry = ttk.Entry(meta_frame, textvariable=title_var, width=30)
-                title_entry.grid(row=1, column=1, padx=5, pady=5)
-                ttk.Label(meta_frame, text="常见语言: chi(中文), eng(英语), jpn(日语), kor(韩语)", foreground="gray").grid(row=2, column=0, columnspan=2, sticky="w", padx=5)
+                title_entry.grid(row=1, column=1, columnspan=3, padx=5, pady=5, sticky="w")
+            
+                # 提示信息
+                ttk.Label(meta_frame, text="从下拉框选择常用语言，或直接输入 ISO 639-2/B 代码（如 cmn、yue）",
+                          foreground="gray").grid(row=2, column=0, columnspan=4, sticky="w", padx=5, pady=2)
 
             # ================== 页面7：音频绑定 ==================
             # 仅在串接模式下显示此页（水印无音频绑定需求）
@@ -11286,7 +11402,25 @@ class FFmpegBatchGUI:
                     new_settings["enhance"] = filt_frame.get_enhance_settings()
 
                     if track_obj is not None and not is_watermark:
-                        new_settings["language"] = lang_var.get().strip()
+                        # 优先使用自定义输入框，否则使用下拉框值
+                        raw_lang = custom_lang_var.get().strip() or lang_var.get().strip()
+                        # 尝试映射为标准码
+                        if raw_lang:
+                            # 如果下拉框选了显示名，但自定义框为空，这里 raw_lang 可能是显示名，需要映射
+                            # 我们只对纯代码进行映射，显示名通过下拉框关联
+                            # 但为了安全，先尝试从 COMMON_LANGUAGES 反向查找
+                            found_code = None
+                            for display, code in self.COMMON_LANGUAGES:
+                                if display == raw_lang:
+                                    found_code = code
+                                    break
+                            if found_code:
+                                new_settings["language"] = found_code
+                            else:
+                                # 否则视为代码，应用映射表
+                                new_settings["language"] = self.LANGUAGE_MAP.get(raw_lang.lower(), raw_lang)
+                        else:
+                            new_settings["language"] = ""
                         new_settings["title"] = title_var.get().strip()
 
                     on_save(new_settings)
@@ -11419,40 +11553,88 @@ class FFmpegBatchGUI:
             samplerate_var = tk.StringVar(value=track.enc_settings.get("samplerate", "44100"))
             samplerate_entry = ttk.Entry(row, textvariable=samplerate_var, width=8)
             samplerate_entry.pack(side=tk.LEFT, padx=5)
-
-
-            # ---- 轨道元数据 ----
-            meta_row = ttk.Frame(main_frame)
-            meta_row.pack(fill=tk.X, pady=5)
-            ttk.Label(meta_row, text="轨道元数据:").pack(side=tk.LEFT, padx=5)
-            ttk.Label(meta_row, text="语言:").pack(side=tk.LEFT, padx=5)
-            lang_var = tk.StringVar(value=track.language)
-            lang_entry = ttk.Entry(meta_row, textvariable=lang_var, width=10)
-            lang_entry.pack(side=tk.LEFT, padx=5)
-            ttk.Label(meta_row, text="标题:").pack(side=tk.LEFT, padx=5)
+    
+            # ---- 轨道元数据（语言下拉+自定义输入，标题） ----
+            meta_frame = ttk.LabelFrame(main_frame, text="轨道元数据", padding="5")
+            meta_frame.pack(fill=tk.X, pady=5)
+    
+            # 语言部分：下拉框 + 手动输入框
+            lang_row = ttk.Frame(meta_frame)
+            lang_row.pack(fill=tk.X, pady=2)
+    
+            ttk.Label(lang_row, text="语言:").pack(side=tk.LEFT, padx=5)
+            
+            lang_display_var = tk.StringVar()
+            # 显示名列表
+            lang_display_list = [display for display, code in self.COMMON_LANGUAGES]
+            lang_combo = ttk.Combobox(lang_row, textvariable=lang_display_var,
+                                      values=lang_display_list,
+                                      state="normal", width=18)
+            lang_combo.pack(side=tk.LEFT, padx=5)
+    
+            # 手动输入框（用于输入未列出的代码，如 "cmn"）
+            ttk.Label(lang_row, text="或输入代码:").pack(side=tk.LEFT, padx=(10,2))
+            custom_lang_entry = ttk.Entry(lang_row, width=10)
+            custom_lang_entry.pack(side=tk.LEFT, padx=2)
+            
+            # 从现有语言值初始化（track.language 可能是标准码）
+            current_lang = track.language or ""
+            if current_lang:
+                # 查找是否在映射表中
+                found_display = None
+                for display, code in self.COMMON_LANGUAGES:
+                    if code == current_lang:
+                        found_display = display
+                        break
+                if found_display:
+                    lang_display_var.set(found_display)
+                    custom_lang_entry.delete(0, tk.END)
+                    custom_lang_entry.insert(0, current_lang)
+                else:
+                    # 未找到，直接填入手动输入框
+                    custom_lang_entry.insert(0, current_lang)
+                    # 尝试在下拉框中匹配显示名（可能为"未指定 (und)"等）
+                    for display, code in self.COMMON_LANGUAGES:
+                        if code == "und":
+                            lang_display_var.set(display)
+                            break
+    
+            # 绑定下拉选择事件：自动填充自定义框
+            def on_lang_select(event):
+                selected = lang_display_var.get()
+                for display, code in self.COMMON_LANGUAGES:
+                    if display == selected:
+                        custom_lang_entry.delete(0, tk.END)
+                        custom_lang_entry.insert(0, code)
+                        break
+            lang_combo.bind("<<ComboboxSelected>>", on_lang_select)
+    
+            # 标题
+            title_row = ttk.Frame(meta_frame)
+            title_row.pack(fill=tk.X, pady=2)
+            ttk.Label(title_row, text="标题:").pack(side=tk.LEFT, padx=5)
             title_var = tk.StringVar(value=track.title)
-            title_entry = ttk.Entry(meta_row, textvariable=title_var, width=30)
+            title_entry = ttk.Entry(title_row, textvariable=title_var, width=40)
             title_entry.pack(side=tk.LEFT, padx=5)
-
-
+    
             # 获取模式标志
             is_pip = self.pip_enabled.get()
             is_concat = self.concat_enabled.get()
-
+    
             # ---- 音量控制（仅普通和画中画模式） ----
             if not is_concat:
                 volume_frame = ttk.LabelFrame(main_frame, text="音量调整", padding="5")
                 volume_frame.pack(fill=tk.X, pady=5)
-            
+    
                 vol_enabled_var = tk.BooleanVar(value=track.enc_settings.get("volume_enabled", False))
                 vol_value_var = tk.DoubleVar(value=track.enc_settings.get("volume", 1.0))
-            
+    
                 vol_check = ttk.Checkbutton(volume_frame, text="启用音量调整", variable=vol_enabled_var)
                 vol_check.pack(anchor=tk.W, pady=(0,5))
-            
+    
                 vol_control_frame = ttk.Frame(volume_frame)
                 vol_control_frame.pack(fill=tk.X)
-            
+    
                 ttk.Label(vol_control_frame, text="倍数:").pack(side=tk.LEFT)
                 vol_slider = ttk.Scale(vol_control_frame, from_=0.1, to=3.0, variable=vol_value_var,
                                        orient=tk.HORIZONTAL, length=150, state=tk.DISABLED)
@@ -11460,14 +11642,13 @@ class FFmpegBatchGUI:
                 vol_label = ttk.Label(vol_control_frame, text="1.0", width=5)
                 vol_label.pack(side=tk.LEFT)
                 vol_slider.configure(command=lambda v: vol_label.config(text=f"{float(v):.2f}"))
-            
+    
                 def on_vol_enabled(*args):
                     state = tk.NORMAL if vol_enabled_var.get() else tk.DISABLED
                     vol_slider.config(state=state)
                 vol_enabled_var.trace_add("write", on_vol_enabled)
                 on_vol_enabled()
             else:
-                # 串联模式：创建隐藏变量，保存时强制禁用
                 vol_enabled_var = tk.BooleanVar(value=False)
                 vol_value_var = tk.DoubleVar(value=1.0)
     
@@ -11488,7 +11669,6 @@ class FFmpegBatchGUI:
             else:
                 mix_enabled_var = tk.BooleanVar(value=False)
     
-
             # ---- 音频倒放（独立于视频，普通和画中画模式可用） ----
             if not is_concat:
                 reverse_frame = ttk.Frame(main_frame)
@@ -11503,8 +11683,7 @@ class FFmpegBatchGUI:
                 ToolTip(chk_reverse, "勾选后，此音频流将单独倒放，不影响其他轨道。")
             else:
                 audio_reverse_var = tk.BooleanVar(value=False)
-
-
+    
             # ---- 截取设置 ----
             trim_frame = ttk.LabelFrame(main_frame, text="音频截取（精确到毫秒）", padding="5")
             trim_frame.pack(fill=tk.X, pady=5)
@@ -11529,10 +11708,27 @@ class FFmpegBatchGUI:
             ttk.Checkbutton(trim_frame, text="精准模式（精确到帧）", variable=precise_trim_var).grid(row=3, column=0, columnspan=3, sticky="w", padx=5, pady=5)
     
             ttk.Label(trim_frame, text="注意：启用截取后，编码器将自动改为非 copy 格式（如 aac）", foreground="gray").grid(row=4, column=0, columnspan=3, sticky="w", padx=5, pady=5)
- 
     
             # ---- 保存按钮 ----
             def save():
+                # 获取语言：优先手动输入，其次下拉框
+                lang_code = custom_lang_entry.get().strip()
+                if not lang_code:
+                    # 从下拉框获取显示名，转为代码
+                    display = lang_display_var.get().strip()
+                    if display:
+                        for d, code in self.COMMON_LANGUAGES:
+                            if d == display:
+                                lang_code = code
+                                break
+                    else:
+                        lang_code = ""
+                # 映射标准化
+                if lang_code:
+                    lang_code = self.LANGUAGE_MAP.get(lang_code.lower(), lang_code)
+                else:
+                    lang_code = ""
+    
                 enc = encoder_var.get()
                 # 如果截取启用且编码器为 copy，强制改 aac
                 if trim_enabled_var.get() and enc == "copy":
@@ -11558,21 +11754,13 @@ class FFmpegBatchGUI:
                 if not is_concat:
                     track.enc_settings["audio_reverse"] = audio_reverse_var.get()
                 else:
-                    track.enc_settings.pop("audio_reverse", None)  # 清除残留
-                if is_concat:
-                    # 串联模式强制禁用音量
-                    track.enc_settings["volume_enabled"] = False
-                    track.enc_settings["volume"] = 1.0
-                else:
-                    track.enc_settings["volume_enabled"] = vol_enabled_var.get()
-                    track.enc_settings["volume"] = vol_value_var.get()
-
-                track.language = lang_var.get().strip()
+                    track.enc_settings.pop("audio_reverse", None)
+    
+                track.language = lang_code
                 track.title = title_var.get().strip()
                 track.enc_settings["language"] = track.language
                 track.enc_settings["title"] = track.title
-
-
+    
                 self.merge_update_track_list()
                 self.merge_update_command_preview()
                 win.destroy()
@@ -11586,6 +11774,7 @@ class FFmpegBatchGUI:
             win.title(f"字幕轨道设置 - {track.codec}")
             center_window(win, 450, 270)
             win.transient(self.root)
+            
             ttk.Label(win, text="编码器:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
             encoder_var = tk.StringVar(value=track.enc_settings.get("encoder", "copy"))
             combo = ttk.Combobox(win, textvariable=encoder_var, values=["copy", "mov_text", "srt"], state="readonly")
@@ -11594,27 +11783,81 @@ class FFmpegBatchGUI:
                     "对于 ASS/SSA 字幕，推荐使用 MKV 容器并选择「copy」流，\n"
                     "MP4 容器支持不佳（会丢失样式），MP4 必须用 mov_text",
                     wraplength=500)
-            ttk.Label(win, text="语言代码:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
-            lang_var = tk.StringVar(value=getattr(track, 'language', ''))
-            lang_combo = ttk.Combobox(win, textvariable=lang_var,
-                                      values=["", "chi", "eng", "jpn", "kor", "fre", "ger", "rus", "spa", "ita"],
-                                      state="normal", width=10)
-            lang_combo.grid(row=1, column=1, padx=5, pady=5, sticky="w")
-            ttk.Label(win, text="常见: chi(中文), eng(英语), jpn(日语)", foreground="gray").grid(row=2, column=1, sticky="w", padx=5)
-            ttk.Label(win, text="轨道标题:").grid(row=3, column=0, sticky="w", padx=5, pady=5)
-            title_var = tk.StringVar(value=getattr(track, 'title', ''))
+            
+            # ---- 语言：下拉+自定义 ----
+            ttk.Label(win, text="语言:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+            lang_frame = ttk.Frame(win)
+            lang_frame.grid(row=1, column=1, sticky="w", padx=5)
+            
+            lang_display_var = tk.StringVar()
+            lang_combo = ttk.Combobox(lang_frame, textvariable=lang_display_var,
+                                      values=[display for display, code in self.COMMON_LANGUAGES],
+                                      state="normal", width=18)
+            lang_combo.pack(side=tk.LEFT)
+            
+            ttk.Label(lang_frame, text="或输入代码:").pack(side=tk.LEFT, padx=(10,2))
+            custom_lang_entry = ttk.Entry(lang_frame, width=10)
+            custom_lang_entry.pack(side=tk.LEFT)
+            
+            current_lang = track.language or ""
+            if current_lang:
+                found_display = None
+                for display, code in self.COMMON_LANGUAGES:
+                    if code == current_lang:
+                        found_display = display
+                        break
+                if found_display:
+                    lang_display_var.set(found_display)
+                    custom_lang_entry.delete(0, tk.END)
+                    custom_lang_entry.insert(0, current_lang)
+                else:
+                    custom_lang_entry.insert(0, current_lang)
+                    for display, code in self.COMMON_LANGUAGES:
+                        if code == "und":
+                            lang_display_var.set(display)
+                            break
+            
+            def on_lang_select(event):
+                selected = lang_display_var.get()
+                for display, code in self.COMMON_LANGUAGES:
+                    if display == selected:
+                        custom_lang_entry.delete(0, tk.END)
+                        custom_lang_entry.insert(0, code)
+                        break
+            lang_combo.bind("<<ComboboxSelected>>", on_lang_select)
+            
+            # 标题
+            ttk.Label(win, text="轨道标题:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+            title_var = tk.StringVar(value=track.title)
             title_entry = ttk.Entry(win, textvariable=title_var, width=30)
-            title_entry.grid(row=3, column=1, padx=5, pady=5, sticky="w")
+            title_entry.grid(row=2, column=1, padx=5, pady=5, sticky="w")
+            
             def save():
+                lang_code = custom_lang_entry.get().strip()
+                if not lang_code:
+                    display = lang_display_var.get().strip()
+                    if display:
+                        for d, code in self.COMMON_LANGUAGES:
+                            if d == display:
+                                lang_code = code
+                                break
+                    else:
+                        lang_code = ""
+                if lang_code:
+                    lang_code = self.LANGUAGE_MAP.get(lang_code.lower(), lang_code)
+                else:
+                    lang_code = ""
+                    
                 track.enc_settings["encoder"] = encoder_var.get()
-                track.language = lang_var.get().strip()
+                track.language = lang_code
                 track.title = title_var.get().strip()
                 track.enc_settings["language"] = track.language
                 track.enc_settings["title"] = track.title
                 self.merge_update_track_list()
                 self.merge_update_command_preview()
                 win.destroy()
-            ttk.Button(win, text="保存", command=save).grid(row=4, column=0, columnspan=2, pady=10)
+            
+            ttk.Button(win, text="保存", command=save).grid(row=3, column=0, columnspan=2, pady=10)
             win.wait_window()
 
     def merge_set_track_enabled(self, idx, enabled):
@@ -13261,7 +13504,6 @@ class FFmpegBatchGUI:
             self._on_extract_option_changed()
     
     def _get_stream_tags(self, file_path: str, stream_type: str, index: int) -> Dict[str, str]:
-        """获取指定文件、流类型、类型内索引的 tags 字典（language, title 等）"""
         data = self._get_stream_data(file_path)
         if not data:
             return {}
@@ -13270,7 +13512,13 @@ class FFmpegBatchGUI:
         for s in streams:
             if s.get('codec_type') == stream_type:
                 if count == index:
-                    return s.get('tags', {})
+                    tags = s.get('tags', {})
+                    # ------ 新增语言映射 ------
+                    if 'language' in tags:
+                        raw = tags['language'].lower().strip()
+                        tags['language'] = self.LANGUAGE_MAP.get(raw, raw)
+                    # --------------------------
+                    return tags
                 count += 1
         return {}
     
