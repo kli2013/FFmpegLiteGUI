@@ -4256,6 +4256,7 @@ class FFmpegBatchGUI:
 
     def __init__(self, root):
         self.root = root
+#        self.root.withdraw()
         self.root.title("FFmpeg 多功能工具")
         self._set_window_icon()
         screen_width = root.winfo_screenwidth()
@@ -4485,6 +4486,7 @@ class FFmpegBatchGUI:
             self.root.dnd_bind('<<Drop>>', self.on_files_dropped)
 
         self.show_quick_warning()
+#        self.root.deiconify()
 
 
 
@@ -4519,6 +4521,7 @@ class FFmpegBatchGUI:
         """延迟初始化完成后的 UI 更新"""
         self.load_preset_list()
         self._refresh_cmd_preset_list()
+        self.update_player_status()
         self._initialized = True
 #        self._append_info_ui("预设和快速命令模板已就绪")
 
@@ -5539,6 +5542,22 @@ class FFmpegBatchGUI:
             effective = raw_duration - start_sec
     
         return effective if effective > 0 else None
+
+    def _calc_segments_total_duration(self, settings: dict) -> float:
+        """计算分段拼接模式下所有片段的总时长（秒）"""
+        segments = settings.get("segments", [])
+        if not segments:
+            return 0.0
+        total = 0.0
+        for seg in segments:
+            start = time_to_seconds(seg.get("start", ""))
+            end = time_to_seconds(seg.get("end", ""))
+            if start is not None and end is not None and end > start:
+                total += (end - start)
+            else:
+                # 如果某个片段时间无效，返回0（后续会回退到原始逻辑）
+                return 0.0
+        return total
 
     def _calc_enable_expr(self, enc_settings: dict, duration: Optional[float]) -> str:
         loop_enabled = enc_settings.get("loop_enabled", False)
@@ -7677,8 +7696,23 @@ class FFmpegBatchGUI:
         self.ensure_output_dir(task.output)
     
         # 获取视频总时长用于进度
-        raw_duration = self._get_media_duration(task.input)
-        total_duration = self._get_effective_duration(task.settings, raw_duration) if raw_duration is not None else 0
+        total_duration = 0
+        if task.settings.get("segment_enabled", False) and task.settings.get("segments"):
+            # 分段拼接模式：计算所有片段时长之和
+            segments = task.settings.get("segments", [])
+            total_duration = 0.0
+            for seg in segments:
+                start = time_to_seconds(seg.get("start", "0"))
+                end = time_to_seconds(seg.get("end", "0"))
+                if start is not None and end is not None and end > start:
+                    total_duration += (end - start)
+            # 如果片段总时长计算失败，回退到原始方式
+            if total_duration <= 0:
+                raw_duration = self._get_media_duration(task.input)
+                total_duration = self._get_effective_duration(task.settings, raw_duration) if raw_duration is not None else 0
+        else:
+            raw_duration = self._get_media_duration(task.input)
+            total_duration = self._get_effective_duration(task.settings, raw_duration) if raw_duration is not None else 0
         if total_duration is None:
             total_duration = 0
     
@@ -7803,12 +7837,12 @@ class FFmpegBatchGUI:
     def reset_task_tree_columns(self):
         """重置任务列表列宽为默认值（与创建时一致）"""
         if hasattr(self, 'task_tree'):
-            self.task_tree.column("序号", width=50)
-            self.task_tree.column("文件名", width=150)
-            self.task_tree.column("输出路径", width=200)
+            self.task_tree.column("序号", width=25)
+            self.task_tree.column("文件名", width=75)
+            self.task_tree.column("输出路径", width=100)
             self.task_tree.column("命令 (简洁) 双击编辑", width=410)
-            self.task_tree.column("状态", width=105)
-            self.task_tree.column("错误信息", width=58)
+            self.task_tree.column("状态", width=52)
+            self.task_tree.column("错误信息", width=30)
 
     def _run_single_transcode(self, cmd_list, input_name, settings):
         """单文件转码（非队列）"""
@@ -7816,8 +7850,16 @@ class FFmpegBatchGUI:
         cmd_str = format_cmd_for_display(cmd_list)
         self._append_info_ui(f">>> {cmd_str}")
     
-        raw_duration = self._get_media_duration(input_name)
-        total_duration = self._get_effective_duration(settings, raw_duration) if raw_duration is not None else 0
+        total_duration = 0
+        if settings.get("segment_enabled", False):
+            total_duration = self._calc_segments_total_duration(settings)
+            if total_duration <= 0:
+                raw_duration = self._get_media_duration(input_name)
+                if raw_duration is not None:
+                    total_duration = raw_duration
+        else:
+            raw_duration = self._get_media_duration(input_name)
+            total_duration = self._get_effective_duration(settings, raw_duration) if raw_duration is not None else 0
         if total_duration is None:
             total_duration = 0
     
@@ -8618,11 +8660,11 @@ class FFmpegBatchGUI:
 
     def _restore_merge_state_dict(self, state):
         self._suppress_main_video_trace = True
+        self._batch_update = True          # 抑制所有中间刷新
         try:
-            self.merge_tracks.clear()
-    
+            # 恢复基本设置（先恢复 merge_video 和 merge_output）
             self.merge_video.set(state.get("merge_video", ""))
-            self.merge_output.set(state.get("merge_output", ""))
+            self.merge_output.set(state.get("merge_output", ""))   # 直接保存的路径
             self.merge_container.set(state.get("merge_container", "mkv"))
             self.pip_enabled.set(state.get("pip_enabled", False))
             self.concat_enabled.set(state.get("concat_enabled", False))
@@ -8634,6 +8676,8 @@ class FFmpegBatchGUI:
             self.merge_verify.set(state.get("merge_verify", True))
             self.merge_delete_source.set(state.get("merge_delete_source", False))
     
+            # 恢复轨道
+            self.merge_tracks = []
             for track_dict in state.get("tracks", []):
                 track = Track(
                     track_dict["index"],
@@ -8656,11 +8700,13 @@ class FFmpegBatchGUI:
                     track.offset_x = track.enc_settings.get("offset_x", "0")
                     track.offset_y = track.enc_settings.get("offset_y", "0")
                 self.merge_tracks.append(track)
+    
         finally:
             self._suppress_main_video_trace = False
+            self._batch_update = False
     
+        # 手动刷新（不调用 merge_update_output_preview，避免覆盖 merge_output）
         self.merge_update_track_list()
-        self.merge_update_output_preview()
         self.merge_update_command_preview()
 
     def merge_sort_tracks(self, key_func):
@@ -12000,7 +12046,7 @@ class FFmpegBatchGUI:
         self.update_mpv_path_state()
         self.use_mpv.trace_add("write", lambda *a: self.update_player_status())
         self.mpv_path.trace_add("write", lambda *a: self.update_player_status())
-        self.update_player_status()
+ #       self.update_player_status()
 
 
     def _update_preview_edit_state(self):
@@ -13248,35 +13294,276 @@ class FFmpegBatchGUI:
     def create_widgets(self):
         main_frame = ttk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True)
+    
+        self.main_paned = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
+        self.main_paned.pack(fill=tk.BOTH, expand=True)
+    
+        # ======== 左侧容器 ========
+        left_container = ttk.Frame(self.main_paned)
+        self.left_container = left_container  # 保存以备后用
+        self.main_paned.add(left_container, weight=1)
 
-        main_paned = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
-        main_paned.pack(fill=tk.BOTH, expand=True)
+        # ======== 左侧所有内容 ========
+        left_vpane = ttk.PanedWindow(left_container, orient=tk.VERTICAL)
+        left_vpane.pack(fill=tk.BOTH, expand=True)
+        self.notebook = ttk.Notebook(left_vpane)
+        left_vpane.add(self.notebook, weight=1)
+    
+        # ---- 视频转码标签页 ----
+        transcode_tab = ttk.Frame(self.notebook)
+        self.notebook.add(transcode_tab, text="视频转码")
+        transcode_vpane = ttk.Frame(transcode_tab)
+        transcode_vpane.pack(fill=tk.BOTH, expand=True)
+    
+        settings_frame = ttk.Frame(transcode_vpane)
+        settings_frame.pack(side=tk.TOP, fill=tk.X, expand=False, pady=(0,5))
+    
+        # 输入/输出框架
+        io_frame = ttk.LabelFrame(settings_frame, text="输入 / 输出", padding="5")
+        io_frame.pack(fill=tk.X, pady=5)
+        io_frame.columnconfigure(1, weight=1)
+    
+        ttk.Label(io_frame, text="输入文件:").grid(row=0, column=0, sticky="w")
+        self.input_entry = ttk.Entry(io_frame, textvariable=self.input_file)
+        self.input_entry.grid(row=0, column=1, padx=5, sticky="ew")
+        if DND_AVAILABLE:
+            self.input_entry.drop_target_register(DND_FILES)
+            self.input_entry.dnd_bind('<<Drop>>', self.on_input_drop)
+        ttk.Button(io_frame, text="浏览", command=self.select_input).grid(row=0, column=2)
+        ttk.Button(io_frame, text="添加到任务列表", command=self.add_current_as_task).grid(row=0, column=3, padx=5)
+    
+        ttk.Label(io_frame, text="输出目录:").grid(row=1, column=0, sticky="w")
+        self.output_entry = ttk.Entry(io_frame, textvariable=self.output_dir)
+        self.output_entry.grid(row=1, column=1, padx=5, sticky="ew")
+        if DND_AVAILABLE:
+            self.output_entry.drop_target_register(DND_FILES)
+            self.output_entry.dnd_bind('<<Drop>>', self.on_output_drop)
+        ttk.Button(io_frame, text="浏览", command=self.select_output_dir).grid(row=1, column=2)
+        ttk.Button(io_frame, text="清空", command=self.clear_input_output, width=12).grid(row=1, column=3, padx=5)
+    
+        suffix_frame = ttk.Frame(io_frame)
+        suffix_frame.grid(row=2, column=0, columnspan=4, sticky="w", pady=2)
+        ttk.Label(suffix_frame, text="输出文件名后缀 (如 _new):").pack(side=tk.LEFT)
+        ttk.Entry(suffix_frame, textvariable=self.output_suffix, width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Label(suffix_frame, text="完整自定义名称 (覆盖后缀):").pack(side=tk.LEFT, padx=(20,0))
+        ttk.Entry(suffix_frame, textvariable=self.custom_output_name, width=30).pack(side=tk.LEFT, padx=5)
+        ttk.Label(suffix_frame, text="输出容器:").pack(side=tk.LEFT, padx=(20,0))
+        container_combo = ttk.Combobox(suffix_frame, textvariable=self.output_container,
+                                       values=["mp4", "mkv", "mov", "avi", "webm","gif","webp"], state="readonly", width=6)
+        container_combo.pack(side=tk.LEFT, padx=5)
+    
+        # 预设框架
+        preset_frame = ttk.LabelFrame(settings_frame, text="参数预设", padding="5")
+        preset_frame.pack(fill=tk.X, pady=(0,5))
+        ttk.Label(preset_frame, text="预设名称:").pack(side=tk.LEFT)
+        self.preset_name = tk.StringVar()
+        self.preset_combo = ttk.Combobox(preset_frame, textvariable=self.preset_name, width=25, height=20, state="readonly")
+        self.preset_combo.pack(side=tk.LEFT, padx=5)
+        self.preset_combo.bind("<<ComboboxSelected>>", lambda e: self.load_preset(self.preset_name.get()))
+        btn_save = ttk.Button(preset_frame, text="保存当前参数为预设", command=self.save_preset)
+        btn_save.pack(side=tk.LEFT, padx=5)
+        btn_delete = ttk.Button(preset_frame, text="删除预设", command=self.delete_preset)
+        btn_delete.pack(side=tk.LEFT, padx=5)
+        btn_export = ttk.Button(preset_frame, text="导出所有预设(备份)", command=self.export_all_presets)
+        btn_export.pack(side=tk.LEFT, padx=5)
+        btn_import = ttk.Button(preset_frame, text="导入预设(恢复)", command=self.import_presets)
+        btn_import.pack(side=tk.LEFT, padx=5)
+    
+        # 参数笔记本
+        param_notebook = ttk.Notebook(settings_frame)
+        param_notebook.pack(fill=tk.BOTH, expand=True, pady=5)
+    
+        # 视频编码页
+        video_enc_page = ttk.Frame(param_notebook)
+        param_notebook.add(video_enc_page, text="视频编码")
+        self.video_encoder = VideoEncoderFrame(video_enc_page, app=self, refresh_callback=self.update_command_preview)
+        self.video_encoder.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+    
+        # 视频滤镜页
+        filter_page = ttk.Frame(param_notebook)
+        param_notebook.add(filter_page, text="视频滤镜")
+        self.video_filter = VideoFilterFrame(filter_page, app=self)
+        self.video_filter.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+    
+        # 音频页
+        audio_page = ttk.Frame(param_notebook)
+        param_notebook.add(audio_page, text="音频")
+        self.audio_frame = AudioFrame(audio_page, enable_checkbox=True)
+        self.audio_frame.pack(fill=tk.X, padx=5, pady=5)
+    
+        # 截取片段页
+        trim_page = ttk.Frame(param_notebook)
+        param_notebook.add(trim_page, text="截取片段")
+        self.trim_frame = TrimFrame(trim_page, update_callback=self.update_command_preview)
+        self.trim_frame.pack(fill=tk.X, padx=5, pady=5)
+    
+        # 分段拼接页
+        segment_tab = ttk.Frame(param_notebook)
+        param_notebook.add(segment_tab, text="分段拼接")
+        seg_control_frame = ttk.Frame(segment_tab)
+        seg_control_frame.pack(fill=tk.X, pady=10)
+        ttk.Checkbutton(seg_control_frame, text="启用分段拼接模式 (将忽略『截取片段』设置)",
+                        variable=self.segment_enabled).pack(side=tk.LEFT, padx=5)
+        ttk.Button(seg_control_frame, text="打开分段设置...",
+                   command=self.open_segment_editor).pack(side=tk.LEFT, padx=10)
+        ttk.Label(segment_tab, text="勾选启用后，视频将按片段列表裁剪并拼接，所有片段使用相同的全局编码/滤镜设置。\n\n"
+                                   "   建议使用（mpv、PotPlayer）等播放器打开视频，定位并获取精确到毫秒的时间。\n\n"
+                                   "   典型用途：简单混剪、去中间广告、提取精华片段等。",
+                  foreground="grey", wraplength=1100, justify=tk.LEFT).pack(anchor=tk.W, padx=10, pady=(5,0))
+    
+        # 高级选项页
+        adv_page = ttk.Frame(param_notebook)
+        param_notebook.add(adv_page, text="高级选项")
+        self.adv_frame = AdvancedFrame(adv_page, update_callback=self.update_command_preview, app=self)
+        self.adv_frame.pack(fill=tk.X, padx=5, pady=5)
+    
+        # 底部按钮
+        bottom_btn_frame = ttk.Frame(settings_frame)
+        bottom_btn_frame.pack(fill=tk.X, pady=(0,5))
+        btn_height = 1 if self.scaling >= 1.4 else 2
+    
+        btn_single = tk.Button(bottom_btn_frame, text="开始编码", command=self.transcode_single,
+                               height=btn_height, width=18, relief=tk.RAISED,
+                               bg="#4CAF50", fg="white", font=("",12,"bold"))
+        btn_single.pack(side=tk.LEFT, padx=5, pady=5)
+    
+        btn_preview = tk.Button(bottom_btn_frame, text="预览当前命令", command=self.preview_current_file,
+                                height=btn_height, width=18, relief=tk.RAISED,
+                                bg="#2196F3", fg="white", font=("",12,"bold"))
+        btn_preview.pack(side=tk.LEFT, padx=5, pady=5)
+    
+        btn_refresh = tk.Button(bottom_btn_frame, text="刷新命令", command=self.refresh_with_reset,
+                                height=btn_height, width=12, relief=tk.RAISED)
+        btn_refresh.pack(side=tk.LEFT, padx=5, pady=5)
+        ToolTip(btn_refresh, "刷新命令或重置队列区列宽")
+    
+        btn1_copy = tk.Button(bottom_btn_frame, text="复制命令", command=self.copy_command,
+                              height=btn_height, width=12, relief=tk.RAISED)
+        btn1_copy.pack(side=tk.LEFT, padx=5)
+    
+        # 命令预览
+        if DND_AVAILABLE:
+            preview_label_text = "当前命令模板 - 拖拽文件可以按当前模板添加到队列"
+        else:
+            preview_label_text = "当前命令模板"
+        preview_frame = ttk.LabelFrame(settings_frame, text=preview_label_text, padding="1")
+        preview_frame.pack(fill=tk.X, pady=0)
+        self.cmd_preview = scrolledtext.ScrolledText(preview_frame, height=4, wrap=tk.WORD, font=("Microsoft YaHei",9))
+        self.cmd_preview.pack(fill=tk.BOTH, expand=True, padx=(4,0))
+        self.cmd_preview.insert(tk.END, "请选择输入文件，或调整参数...")
+    
+        # 任务列表区域
+        tasks_frame = ttk.Frame(transcode_vpane)
+        tasks_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0, 0))
+    
+        # 工具栏（水平滚动）
+        toolbar_height = max(20, int(30 * self.scaling))
+        tool_canvas = tk.Canvas(tasks_frame, height=toolbar_height, highlightthickness=0)
+        tool_canvas.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
+        h_scrollbar = ttk.Scrollbar(tasks_frame, orient=tk.HORIZONTAL, command=tool_canvas.xview)
+        h_scrollbar.pack(side=tk.TOP, fill=tk.X)
+        tool_canvas.configure(xscrollcommand=h_scrollbar.set)
+        tool_container = ttk.Frame(tool_canvas)
+        tool_canvas.create_window((0, 0), window=tool_container, anchor='nw')
+        def configure_tool_canvas(event):
+            tool_canvas.configure(scrollregion=tool_canvas.bbox('all'))
+        tool_container.bind('<Configure>', configure_tool_canvas)
+    
+        btn_start = tk.Button(tool_container, text="开始队列", command=self.start_queue,
+                              bg="#4CAF50", fg="white", width=12, relief=tk.RAISED)
+        btn_start.pack(side=tk.LEFT, padx=5)
+    
+        label_parallel = ttk.Label(tool_container, text="并行任务:")
+        label_parallel.pack(side=tk.LEFT, padx=(10, 2))
+        ToolTip(label_parallel, "同时运行的任务数量，建议不超过3以避免资源过度占用")
+        self.max_parallel = tk.IntVar(value=1)
+        self.parallel_spin = ttk.Spinbox(tool_container, from_=1, to=5, width=3,
+                                         textvariable=self.max_parallel, state="readonly")
+        self.parallel_spin.pack(side=tk.LEFT, padx=2)
+    
+        label_hw = ttk.Label(tool_container, text="硬编并发限制:")
+        label_hw.pack(side=tk.LEFT, padx=(10, 2))
+        ToolTip(label_hw, "同时进行的硬件编码〔NVENC/QSV/AMF等〕任务的最大数量，推荐不超过2，显存里可能数据打架")
+        self.max_hw_parallel = tk.IntVar(value=2)
+        self.max_hw_spin = ttk.Spinbox(tool_container, from_=1, to=4, width=3,
+                                       textvariable=self.max_hw_parallel, state="readonly")
+        self.max_hw_spin.pack(side=tk.LEFT, padx=2)
+    
+        for text, cmd in [("移除选中任务", self.remove_selected_tasks),
+                          ("清空全部任务", self.clear_all_tasks),
+                          ("清空已完成/失败任务", self.clear_finished_tasks),
+                          ("停止队列", self.stop_queue),
+                          ("导出为脚本", self.export_script),
+                          ("预览选中任务", self.preview_selected_task)]:
+            ttk.Button(tool_container, text=text, command=cmd).pack(side=tk.LEFT, padx=5)
+    
+        # 任务列表 Treeview
+        list_container = ttk.Frame(tasks_frame)
+        list_container.pack(fill=tk.BOTH, expand=True, padx=(5,0), pady=(0, 0))
+    
+        Batch_style = ttk.Style()
+        Batch_style.configure("Batch.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0", rowheight=int(22 * self.scaling))
+        Batch_style.configure("Batch.Treeview.Heading", background="#d9d9d9")
+    
+        columns = ("序号", "文件名", "输出路径", "命令 (简洁) 双击编辑", "状态", "错误信息")
+        self.task_tree = ttk.Treeview(list_container, columns=columns, show="headings",
+                                       height=8, style="Batch.Treeview")
+        self.task_tree.heading("序号", text="序号")
+        self.task_tree.heading("文件名", text="文件名")
+        self.task_tree.heading("输出路径", text="输出路径")
+        self.task_tree.heading("命令 (简洁) 双击编辑", text="命令 (简洁) 双击编辑")
+        self.task_tree.heading("状态", text="状态")
+        self.task_tree.heading("错误信息", text="错误信息")
+        self.task_tree.column("序号", width=25, minwidth=20)
+        self.task_tree.column("文件名", width=75, minwidth=20)
+        self.task_tree.column("输出路径", width=100, minwidth=20)
+        self.task_tree.column("命令 (简洁) 双击编辑", width=410, minwidth=20)
+        self.task_tree.column("状态", width=72, minwidth=20)
+        self.task_tree.column("错误信息", width=30, minwidth=20)
+        self.task_tree.tag_configure('odd', background='#e8e8e8')
+        self.task_tree.tag_configure('even', background='#ffffff')
+    
+        vbar = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=self.task_tree.yview)
+        self.task_tree.configure(yscrollcommand=vbar.set)
+        vbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.task_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        left_container = ttk.Frame(main_paned)
-        right_panel = ttk.Frame(main_paned)
-
-        main_paned.add(left_container, weight=1)
-        main_paned.add(right_panel, weight=1)
-
-        self.left_container = left_container
+        self.task_tree.bind("<Double-1>", self.on_task_double_click)
+    
+        # ---- 合并标签页 ----
+        merge_tab = ttk.Frame(self.notebook)
+        self.notebook.add(merge_tab, text="封装/合并/画中画")
+        self.create_merge_tab(merge_tab)
+    
+        # ---- 流提取标签页 ----
+        extract_tab = ttk.Frame(self.notebook)
+        self.notebook.add(extract_tab, text="流提取")
+        self.create_extract_tab(extract_tab)
+    
+        # ---- 信息与播放器标签页 ----
+        player_tab = ttk.Frame(self.notebook)
+        self.notebook.add(player_tab, text="信息与播放器")
+        self.create_player_settings_tab(player_tab)
+    
+        # ======== 右侧容器 ========
+        right_panel = ttk.Frame(self.main_paned)
+        self.main_paned.add(right_panel, weight=1)
         self.right_panel = right_panel
 
-        def set_sash_position():
-            self.root.update_idletasks()
-            total_width = self.root.winfo_width()
-            
-            if total_width > 600:                    # 窗口已正常显示
-                sash_pos = int(total_width * 0.705)   # 左侧 %
-                main_paned.sashpos(0, sash_pos)
-            else:
-                # 窗口还没准备好，再等一下
-                self.root.after(100, set_sash_position)
+        def on_paned_configure(event):
+            if event.widget is not self.main_paned:
+                return
+            total = event.width
+            if total > 600 and not getattr(self, '_sash_set', False):
+                self.main_paned.sashpos(0, int(total * 0.7))
+                self._sash_set = True
+                self.main_paned.unbind('<Configure>', self._paned_bind_id)
+        
+        self._sash_set = False
+        self._paned_bind_id = self.main_paned.bind('<Configure>', on_paned_configure)
 
-        # 多重保险
-        self.root.after(30, set_sash_position)
-        self.root.after(150, set_sash_position)
-        self.root.after(400, set_sash_position)
 
+        # 关键信息日志区
         info_frame = ttk.LabelFrame(right_panel, text="关键信息", padding="1")
         info_frame.pack(fill=tk.BOTH, expand=True, pady=(0,5))
         info_top = ttk.Frame(info_frame)
@@ -13287,9 +13574,8 @@ class FFmpegBatchGUI:
                                                    selectbackground='#CCF09C', selectforeground='black',
                                                    font=("Microsoft YaHei",9,"normal"), wrap=tk.WORD)
         self.info_text.pack(fill=tk.BOTH, expand=True)
-
-
-
+    
+        # 转换进程信息日志区
         detail_frame = ttk.LabelFrame(right_panel, text="转换进程信息", padding="1")
         detail_frame.pack(fill=tk.BOTH, expand=True)
         detail_top = ttk.Frame(detail_frame)
@@ -13300,279 +13586,7 @@ class FFmpegBatchGUI:
                                                      selectbackground='#CCF09C', selectforeground='black',
                                                      font=("Microsoft YaHei",8,"normal"), wrap=tk.WORD)
         self.detail_text.pack(fill=tk.BOTH, expand=True)
-
-        left_vpane = ttk.PanedWindow(left_container, orient=tk.VERTICAL)
-        left_vpane.pack(fill=tk.BOTH, expand=True)
-        self.notebook = ttk.Notebook(left_vpane)
-        left_vpane.add(self.notebook, weight=1)
-
-        transcode_tab = ttk.Frame(self.notebook)
-        self.notebook.add(transcode_tab, text="视频转码")
-        transcode_vpane = ttk.Frame(transcode_tab)
-        transcode_vpane.pack(fill=tk.BOTH, expand=True)
-        
-        settings_frame = ttk.Frame(transcode_vpane)
-        settings_frame.pack(side=tk.TOP, fill=tk.X, expand=False, pady=(0,5))
-
-        io_frame = ttk.LabelFrame(settings_frame, text="输入 / 输出", padding="5")
-        io_frame.pack(fill=tk.X, pady=5)
-        io_frame.columnconfigure(1, weight=1)
-        
-        ttk.Label(io_frame, text="输入文件:").grid(row=0, column=0, sticky="w")
-
-        self.input_entry = ttk.Entry(io_frame, textvariable=self.input_file)
-        self.input_entry.grid(row=0, column=1, padx=5, sticky="ew")
-        if DND_AVAILABLE:
-            self.input_entry.drop_target_register(DND_FILES)
-            self.input_entry.dnd_bind('<<Drop>>', self.on_input_drop)
-
-        ttk.Button(io_frame, text="浏览", command=self.select_input).grid(row=0, column=2)
-        ttk.Button(io_frame, text="添加到任务列表", command=self.add_current_as_task).grid(row=0, column=3, padx=5)
-
-        ttk.Label(io_frame, text="输出目录:").grid(row=1, column=0, sticky="w")
-
-        self.output_entry = ttk.Entry(io_frame, textvariable=self.output_dir)
-        self.output_entry.grid(row=1, column=1, padx=5, sticky="ew")
-        if DND_AVAILABLE:
-            self.output_entry.drop_target_register(DND_FILES)
-            self.output_entry.dnd_bind('<<Drop>>', self.on_output_drop)
-
-        ttk.Button(io_frame, text="浏览", command=self.select_output_dir).grid(row=1, column=2)
-        ttk.Button(io_frame, text="清空", command=self.clear_input_output, width=12).grid(row=1, column=3, padx=5)
-        suffix_frame = ttk.Frame(io_frame)
-        suffix_frame.grid(row=2, column=0, columnspan=4, sticky="w", pady=2)
-
-        ttk.Label(suffix_frame, text="输出文件名后缀 (如 _new):").pack(side=tk.LEFT)
-        ttk.Entry(suffix_frame, textvariable=self.output_suffix, width=15).pack(side=tk.LEFT, padx=5)
-        ttk.Label(suffix_frame, text="完整自定义名称 (覆盖后缀):").pack(side=tk.LEFT, padx=(20,0))
-        ttk.Entry(suffix_frame, textvariable=self.custom_output_name, width=30).pack(side=tk.LEFT, padx=5)
-        ttk.Label(suffix_frame, text="输出容器:").pack(side=tk.LEFT, padx=(20,0))
-        container_combo = ttk.Combobox(suffix_frame, textvariable=self.output_container,
-                                       values=["mp4", "mkv", "mov", "avi", "webm","gif","webp"], state="readonly", width=6)
-        container_combo.pack(side=tk.LEFT, padx=5)
-
-        preset_frame = ttk.LabelFrame(settings_frame, text="参数预设", padding="5")
-        preset_frame.pack(fill=tk.X, pady=(0,5))
-        ttk.Label(preset_frame, text="预设名称:").pack(side=tk.LEFT)
-        self.preset_name = tk.StringVar()
-        self.preset_combo = ttk.Combobox(preset_frame, textvariable=self.preset_name, width=25, height=20, state="readonly")
-        self.preset_combo.pack(side=tk.LEFT, padx=5)
-        self.load_preset_list()
-        self.preset_combo.bind("<<ComboboxSelected>>", lambda e: self.load_preset(self.preset_name.get()))
-        btn_save = ttk.Button(preset_frame, text="保存当前参数为预设", command=self.save_preset)
-        btn_save.pack(side=tk.LEFT, padx=5)
-        btn_delete = ttk.Button(preset_frame, text="删除预设", command=self.delete_preset)
-        btn_delete.pack(side=tk.LEFT, padx=5)
-        btn_export = ttk.Button(preset_frame, text="导出所有预设(备份)", command=self.export_all_presets)
-        btn_export.pack(side=tk.LEFT, padx=5)
-        btn_import = ttk.Button(preset_frame, text="导入预设(恢复)", command=self.import_presets)
-        btn_import.pack(side=tk.LEFT, padx=5)
-
-        param_notebook = ttk.Notebook(settings_frame)
-        param_notebook.pack(fill=tk.BOTH, expand=True, pady=5)
-
-        video_enc_page = ttk.Frame(param_notebook)
-        param_notebook.add(video_enc_page, text="视频编码")
-        self.video_encoder = VideoEncoderFrame(video_enc_page, app=self, refresh_callback=self.update_command_preview)
-        self.video_encoder.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-        filter_page = ttk.Frame(param_notebook)
-        param_notebook.add(filter_page, text="视频滤镜")
-        self.video_filter = VideoFilterFrame(filter_page, app=self)
-        self.video_filter.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-        audio_page = ttk.Frame(param_notebook)
-        param_notebook.add(audio_page, text="音频")
-        self.audio_frame = AudioFrame(audio_page, enable_checkbox=True)
-        self.audio_frame.pack(fill=tk.X, padx=5, pady=5)
-
-        trim_page = ttk.Frame(param_notebook)
-        param_notebook.add(trim_page, text="截取片段")
-        self.trim_frame = TrimFrame(trim_page, update_callback=self.update_command_preview)
-        self.trim_frame.pack(fill=tk.X, padx=5, pady=5)
-
-        # 在 create_widgets 中，adv_page 之后添加：
-        segment_tab = ttk.Frame(param_notebook)
-        param_notebook.add(segment_tab, text="分段拼接")
-        
-        seg_control_frame = ttk.Frame(segment_tab)
-        seg_control_frame.pack(fill=tk.X, pady=10)
-        
-        ttk.Checkbutton(seg_control_frame, text="启用分段拼接模式 (将忽略『截取片段』设置)",
-                        variable=self.segment_enabled).pack(side=tk.LEFT, padx=5)
-        
-        ttk.Button(seg_control_frame, text="打开分段设置...",
-                   command=self.open_segment_editor).pack(side=tk.LEFT, padx=10)
-        
-        # 灰色说明（包含功能描述和时间码获取提示）
-        ttk.Label(
-            segment_tab,
-            text="勾选启用后，视频将按片段列表裁剪并拼接，所有片段使用相同的全局编码/滤镜设置。\n\n"
-                 "   建议使用（mpv、PotPlayer）等播放器打开视频，定位并获取精确到毫秒的时间。\n\n"
-                 "   典型用途：简单混剪、去中间广告、提取精华片段等。",
-            foreground="grey",
-            wraplength=1100,
-            justify=tk.LEFT
-        ).pack(anchor=tk.W, padx=10, pady=(5,0))
-
-
-
-        adv_page = ttk.Frame(param_notebook)
-        param_notebook.add(adv_page, text="高级选项")
-        self.adv_frame = AdvancedFrame(adv_page, update_callback=self.update_command_preview, app=self)
-        self.adv_frame.pack(fill=tk.X, padx=5, pady=5)
-
-        bottom_btn_frame = ttk.Frame(settings_frame)
-        bottom_btn_frame.pack(fill=tk.X, pady=(0,5))
-
-        btn_height = 1 if self.scaling >= 1.4 else 2
-
-        btn_single = tk.Button(bottom_btn_frame, text="开始编码",
-                               command=self.transcode_single,
-                               height=btn_height, width=18, relief=tk.RAISED,
-                               bg="#4CAF50", fg="white", font=("",12,"bold"))
-        btn_single.pack(side=tk.LEFT, padx=5, pady=5)
-
-        btn_preview = tk.Button(bottom_btn_frame, text="预览当前命令",
-                                command=self.preview_current_file,
-                                height=btn_height, width=18, relief=tk.RAISED,
-                                bg="#2196F3", fg="white", font=("",12,"bold"))
-        btn_preview.pack(side=tk.LEFT, padx=5, pady=5)
-
-        btn_refresh = tk.Button(bottom_btn_frame, text="刷新命令",
-                                command=self.refresh_with_reset,
-                                height=btn_height, width=12, relief=tk.RAISED)
-        btn_refresh.pack(side=tk.LEFT, padx=5, pady=5)
-        ToolTip(btn_refresh, "刷新命令或重置队列区列宽")
-        
-        btn1_copy = tk.Button(bottom_btn_frame, text="复制命令", command=self.copy_command,
-                             height=btn_height, width=12, relief=tk.RAISED)
-        btn1_copy.pack(side=tk.LEFT, padx=5)
-
-
-        if DND_AVAILABLE:
-            preview_label_text = "当前命令模板 - 拖拽文件可以按当前模板添加到队列"
-        else:
-            preview_label_text = "当前命令模板"
-
-        preview_frame = ttk.LabelFrame(settings_frame, text=preview_label_text, padding="1")
-        preview_frame.pack(fill=tk.X, pady=0)
-        self.cmd_preview = scrolledtext.ScrolledText(preview_frame, height=4, wrap=tk.WORD, font=("Microsoft YaHei",9))
-        self.cmd_preview.pack(fill=tk.BOTH, expand=True, padx=(4,0))
-        self.cmd_preview.insert(tk.END, "请选择输入文件，或调整参数...")
-
-
-        # ========== 任务列表区域 ==========
-        tasks_frame = ttk.Frame(transcode_vpane)
-        tasks_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0, 0))
-        
-        # ---------- 工具栏（支持水平滚动） ----------
-        toolbar_height = max(20, int(30 * self.scaling))
-        tool_canvas = tk.Canvas(tasks_frame, height=toolbar_height, highlightthickness=0)
-        tool_canvas.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
-        
-        h_scrollbar = ttk.Scrollbar(tasks_frame, orient=tk.HORIZONTAL, command=tool_canvas.xview)
-        h_scrollbar.pack(side=tk.TOP, fill=tk.X)
-        tool_canvas.configure(xscrollcommand=h_scrollbar.set)
-        
-        tool_container = ttk.Frame(tool_canvas)
-        tool_canvas.create_window((0, 0), window=tool_container, anchor='nw')
-        
-        # 当内部框架尺寸变化时，更新滚动区域
-        def configure_tool_canvas(event):
-            tool_canvas.configure(scrollregion=tool_canvas.bbox('all'))
-        tool_container.bind('<Configure>', configure_tool_canvas)
-        
-        # 所有按钮和控件都放到 tool_container 中（使用 pack(side=tk.LEFT) 水平排列）
-        btn_start = tk.Button(tool_container, text="开始队列", command=self.start_queue,
-                              bg="#4CAF50", fg="white", width=12, relief=tk.RAISED)
-        btn_start.pack(side=tk.LEFT, padx=5)
-        
-        label_parallel = ttk.Label(tool_container, text="并行任务:")
-        label_parallel.pack(side=tk.LEFT, padx=(10, 2))
-        ToolTip(label_parallel, "同时运行的任务数量，建议不超过3以避免资源过度占用")
-        self.max_parallel = tk.IntVar(value=1)
-        self.parallel_spin = ttk.Spinbox(tool_container, from_=1, to=5, width=3,
-                                         textvariable=self.max_parallel, state="readonly")
-        self.parallel_spin.pack(side=tk.LEFT, padx=2)
-        
-        label_hw = ttk.Label(tool_container, text="硬编并发限制:")
-        label_hw.pack(side=tk.LEFT, padx=(10, 2))
-        ToolTip(label_hw, "同时进行的硬件编码〔NVENC/QSV/AMF等〕任务的最大数量，推荐不超过2，显存里可能数据打架")
-        self.max_hw_parallel = tk.IntVar(value=2)
-        self.max_hw_spin = ttk.Spinbox(tool_container, from_=1, to=4, width=3,
-                                       textvariable=self.max_hw_parallel, state="readonly")
-        self.max_hw_spin.pack(side=tk.LEFT, padx=2)
-        
-        for text, cmd in [("移除选中任务", self.remove_selected_tasks),
-                          ("清空全部任务", self.clear_all_tasks),
-                          ("清空已完成/失败任务", self.clear_finished_tasks),
-                          ("停止队列", self.stop_queue),
-                          ("导出为脚本", self.export_script),
-                          ("预览选中任务", self.preview_selected_task)]:
-            ttk.Button(tool_container, text=text, command=cmd).pack(side=tk.LEFT, padx=5)
-        
-        # ---------- 任务列表  ----------
-        list_container = ttk.Frame(tasks_frame)
-        list_container.pack(fill=tk.BOTH, expand=True, padx=(5,0), pady=(0, 0))
-
-        
-        # 自定义样式
-        Batch_style = ttk.Style()
-        Batch_style.configure("Batch.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0", rowheight=int(22 * self.scaling))
-        Batch_style.configure("Batch.Treeview.Heading", background="#d9d9d9")
-        
-        columns = ("序号", "文件名", "输出路径", "命令 (简洁) 双击编辑", "状态", "错误信息")
-        self.task_tree = ttk.Treeview(list_container, columns=columns, show="headings",
-                                       height=8, style="Batch.Treeview")
-        self.task_tree.heading("序号", text="序号")
-        self.task_tree.heading("文件名", text="文件名")
-        self.task_tree.heading("输出路径", text="输出路径")
-        self.task_tree.heading("命令 (简洁) 双击编辑", text="命令 (简洁) 双击编辑")
-        self.task_tree.heading("状态", text="状态")
-        self.task_tree.heading("错误信息", text="错误信息")
-        
-        # 列宽设置：
-        self.task_tree.column("序号", width=50, minwidth=20)
-        self.task_tree.column("文件名", width=150, minwidth=20)
-        self.task_tree.column("输出路径", width=200, minwidth=20)
-        self.task_tree.column("命令 (简洁) 双击编辑", width=410, minwidth=20)
-        self.task_tree.column("状态", width=105, minwidth=20)
-        self.task_tree.column("错误信息", width=58, minwidth=20)
-
-        self.task_tree.tag_configure('odd', background='#e8e8e8')
-        self.task_tree.tag_configure('even', background='#ffffff')
-
-        # 垂直滚动条
-        vbar = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=self.task_tree.yview)
-        self.task_tree.configure(yscrollcommand=vbar.set)
-        
-        self.task_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # 绑定双击编辑
-        self.task_tree.bind("<Double-1>", self.on_task_double_click)
-
-
-        merge_tab = ttk.Frame(self.notebook)
-        self.notebook.add(merge_tab, text="封装/合并/画中画")
-        self.create_merge_tab(merge_tab)
-
-
-        extract_tab = ttk.Frame(self.notebook)
-        self.notebook.add(extract_tab, text="流提取")
-        self.create_extract_tab(extract_tab)
-
-        player_tab = ttk.Frame(self.notebook)
-        self.notebook.add(player_tab, text="信息与播放器")
-        self.create_player_settings_tab(player_tab)
-
-
-        self._update_preview_edit_state()   # 应用加载后的状态
-        self._initialized = True
-
-
-
+    
         # 绑定各种控件刷新命令预览
         self.video_encoder.vcodec.trace_add("write", lambda *a: self.update_command_preview())
         self.video_encoder.rate_control_type.trace_add("write", lambda *a: self.update_command_preview())
@@ -13631,6 +13645,9 @@ class FFmpegBatchGUI:
         self.video_encoder.bufsize_var.trace_add("write", lambda *a: self.update_command_preview())
 
         self.segment_enabled.trace_add("write", lambda *a: self.update_command_preview())
+    
+        self._update_preview_edit_state()
+        self._initialized = True
 
 
 class EditSegmentDialog(simpledialog.Dialog):
@@ -14233,61 +14250,84 @@ class SegmentEditor:
         if not text:
             messagebox.showinfo("提示", "请先在右侧粘贴 FFmpeg 命令")
             return
-
+    
         lines = text.splitlines()
         parsed_count = 0
         skipped_count = 0
         errors = []
-
+    
         for line in lines:
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
-
-            ss_match = re.search(r'-ss\s+([\d.]+)', line, re.IGNORECASE)
+    
+            # 匹配 -ss 时间（支持 10.5 或 00:00:10.500 或 00:10.500）
+            ss_match = re.search(r'-ss\s+([\d:.]+)', line, re.IGNORECASE)
             if not ss_match:
                 skipped_count += 1
                 errors.append(f"未找到 -ss: {line[:80]}...")
                 continue
-
-            start_sec = float(ss_match.group(1))
-
-            t_match = re.search(r'-t\s+([\d.]+)', line, re.IGNORECASE)
-            to_match = re.search(r'-to\s+([\d.]+)', line, re.IGNORECASE)
-
+    
+            start_str = ss_match.group(1)
+            start_sec = time_to_seconds(start_str)
+            if start_sec is None:
+                skipped_count += 1
+                errors.append(f"无效的开始时间: {start_str}，跳过")
+                continue
+    
+            # 匹配 -t 或 -to
+            t_match = re.search(r'-t\s+([\d:.]+)', line, re.IGNORECASE)
+            to_match = re.search(r'-to\s+([\d:.]+)', line, re.IGNORECASE)
+    
             if t_match:
-                duration_sec = float(t_match.group(1))
+                duration_str = t_match.group(1)
+                duration_sec = time_to_seconds(duration_str)
+                if duration_sec is None:
+                    skipped_count += 1
+                    errors.append(f"无效的持续时间: {duration_str}，跳过")
+                    continue
                 end_sec = start_sec + duration_sec
             elif to_match:
-                end_sec = float(to_match.group(1))
+                end_str = to_match.group(1)
+                end_sec = time_to_seconds(end_str)
+                if end_sec is None:
+                    skipped_count += 1
+                    errors.append(f"无效的结束时间: {end_str}，跳过")
+                    continue
             else:
                 skipped_count += 1
                 errors.append(f"未找到 -t 或 -to: {line[:80]}...")
                 continue
-
-            start_str = seconds_to_time(start_sec)
-            end_str = seconds_to_time(end_sec)
-
-            if any(seg["start"] == start_str and seg["end"] == end_str for seg in self.segments):
+    
+            if end_sec <= start_sec:
                 skipped_count += 1
-                errors.append(f"重复片段: {start_str}->{end_str}，已跳过")
+                errors.append(f"结束时间必须大于开始时间: {start_str}->{end_str}，跳过")
                 continue
-            try:
-                if self.add_segment_with_time(start_sec, end_sec, flip="无"):
-                    parsed_count += 1
-                else:
-                    skipped_count += 1
-                    errors.append(f"无效时间: start={start_sec}, end={end_sec}")
-            except Exception as e:
+    
+            # 检查是否重复
+            start_display = seconds_to_time(start_sec)
+            end_display = seconds_to_time(end_sec)
+            if any(seg["start"] == start_display and seg["end"] == end_display for seg in self.segments):
                 skipped_count += 1
-                errors.append(f"添加片段异常: {e}")
-                self.app._append_info_ui(f"[分段] 导入异常: {e}")
-
+                errors.append(f"重复片段: {start_display}->{end_display}，已跳过")
+                continue
+    
+            # 尝试添加片段（可能会检查总时长等）
+            if self.add_segment_with_time(start_sec, end_sec, flip="无"):
+                parsed_count += 1
+            else:
+                skipped_count += 1
+                errors.append(f"添加失败（可能超出总时长）: {start_display}->{end_display}")
+    
         msg = f"成功导入 {parsed_count} 个片段"
         if skipped_count > 0:
             msg += f"，{skipped_count} 行被跳过"
             if errors:
-                messagebox.showwarning("导入警告", msg + "\n\n错误详情（前10条）：\n" + "\n".join(errors[:10]))
+                # 只显示前10条错误
+                error_preview = "\n".join(errors[:10])
+                if len(errors) > 10:
+                    error_preview += f"\n... 还有 {len(errors)-10} 条错误"
+                messagebox.showwarning("导入警告", msg + "\n\n错误详情：\n" + error_preview)
             else:
                 messagebox.showinfo("导入完成", msg)
         else:
