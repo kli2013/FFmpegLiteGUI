@@ -13600,10 +13600,12 @@ class FFmpegBatchGUI:
         self.main_paned.pack(fill=tk.BOTH, expand=True)
     
         # ======== 左侧容器 ========
-        left_container = ttk.Frame(self.main_paned)
-        self.left_container = left_container  # 保存以备后用
+        base_width = int(1155 * self.scaling)
+        left_container = ttk.Frame(self.main_paned, width=base_width)
+        left_container.pack_propagate(False)
+        self.left_container = left_container
         self.main_paned.add(left_container, weight=1)
-
+  
         # ======== 左侧所有内容 ========
         left_vpane = ttk.PanedWindow(left_container, orient=tk.VERTICAL)
         left_vpane.pack(fill=tk.BOTH, expand=True)
@@ -13828,7 +13830,7 @@ class FFmpegBatchGUI:
         self.task_tree.configure(yscrollcommand=vbar.set)
         vbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.task_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
+    
         self.task_tree.bind("<Double-1>", self.on_task_double_click)
     
         # ---- 合并标签页 ----
@@ -13850,20 +13852,33 @@ class FFmpegBatchGUI:
         right_panel = ttk.Frame(self.main_paned)
         self.main_paned.add(right_panel, weight=1)
         self.right_panel = right_panel
+    
 
-        def on_paned_configure(event):
-            if event.widget is not self.main_paned:
-                return
-            total = event.width
-            if total > 600 and not getattr(self, '_sash_set', False):
-                self.main_paned.sashpos(0, int(total * 0.7))
-                self._sash_set = True
-                self.main_paned.unbind('<Configure>', self._paned_bind_id)
-        
         self._sash_set = False
-        self._paned_bind_id = self.main_paned.bind('<Configure>', on_paned_configure)
-
-
+        
+        def _delayed_set_sash():
+            if self._sash_set:
+                return
+            self.main_paned.update_idletasks()
+            total = self.main_paned.winfo_width()
+            if total <= 1:
+                # 窗口还没准备好，100ms 后再试
+                self.main_paned.after(100, _delayed_set_sash)
+                return
+            # 目标：左边占 30%（sash 在 70% 位置）
+            target = int(total * 0.7)
+            # 保险：即使计算出来很小，sash 也至少留出 260px 给左边
+            target = max(target, 260)
+            self.main_paned.sashpos(0, target)
+            self._sash_set = True
+            # 恢复自适应，让左侧面板可以随窗口缩放正常调整
+            left_container.pack_propagate(True)
+        
+        # 双保险触发：idle 后立即执行，如果 missed 再用 after
+        self.main_paned.after_idle(_delayed_set_sash)
+        self.main_paned.after(300, _delayed_set_sash)
+    
+    
         # 关键信息日志区
         info_frame = ttk.LabelFrame(right_panel, text="关键信息", padding="1")
         info_frame.pack(fill=tk.BOTH, expand=True, pady=(0,5))
