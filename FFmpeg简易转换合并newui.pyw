@@ -3781,7 +3781,7 @@ class OverlayPositionFrame(ttk.LabelFrame):
         aspect_row.pack(anchor=tk.W, fill=tk.X, pady=5)
 
         ttk.Label(aspect_row, text="方向:").pack(side=tk.LEFT)
-        self.tile_orientation = tk.StringVar(value="横排优先")
+        self.tile_orientation = tk.StringVar(value="自动")
         orientation_combo = ttk.Combobox(aspect_row, textvariable=self.tile_orientation,
                                          values=["自动", "横排优先", "竖排优先"],
                                          state="readonly", width=8)
@@ -8771,50 +8771,70 @@ class FFmpegBatchGUI:
                     w, h = 320, 240
             infos.append((w, h, t))
     
-        # ---- 方向决策 ----
-        if orientation == 'auto':
-            total_w = sum(w for w, h, t in infos[1:])  # 只考虑子视频
-            total_h = sum(h for w, h, t in infos[1:])
-            if total_h == 0:
-                total_h = 1
-            horizontal_priority = (total_w / total_h) >= 1.0
-        elif orientation == 'horizontal':
-            horizontal_priority = True
-        else:
-            horizontal_priority = False
-    
-        # ---- 按方向排列 ----
-        if horizontal_priority:
-            cols = items_per_row
-            rows = (n + cols - 1) // cols
-            # 按行顺序填充（从左到右，从上到下）
-            # 直接按顺序分配行号
-            row_groups = []
-            for r in range(rows):
-                start = r * cols
-                end = min(start + cols, n)
-                row_groups.append(infos[start:end])
-        else:
-            rows = items_per_col
-            cols = (n + rows - 1) // rows
-            # 按列顺序填充（从上到下，从左到右）
-            # 先按列分组：每列 rows 个
-            col_groups = []
-            for c in range(cols):
-                start = c * rows
-                end = min(start + rows, n)
-                col_groups.append(infos[start:end])
-            # 转置为行组（因为最终画布是按行排列的）
-            row_groups = []
-            for r in range(rows):
-                row_items = []
+        # ---- 核心改进：方向决策与智能排列 ----
+        def calculate_layout(is_horizontal):
+            """内部函数：根据方向计算布局及画布比例"""
+            if is_horizontal:
+                cols = items_per_row
+                rows = (n + cols - 1) // cols
+                row_groups = []
+                for r in range(rows):
+                    start = r * cols
+                    end = min(start + cols, n)
+                    row_groups.append(infos[start:end])
+            else:
+                rows = items_per_col
+                cols = (n + rows - 1) // rows
+                col_groups = []
                 for c in range(cols):
-                    if r < len(col_groups[c]):
-                        row_items.append(col_groups[c][r])
-                if row_items:
-                    row_groups.append(row_items)
-    
-        # ---- 计算每行高度和总宽度 ----
+                    start = c * rows
+                    end = min(start + rows, n)
+                    col_groups.append(infos[start:end])
+                # 转置为行组（因为最终画布是按行排列的）
+                row_groups = []
+                for r in range(rows):
+                    row_items = []
+                    for c in range(cols):
+                        if r < len(col_groups[c]):
+                            row_items.append(col_groups[c][r])
+                    if row_items:
+                        row_groups.append(row_items)
+            
+            # 计算该布局下的画布真实宽高
+            c_w = max(sum(w for w, h, t in row) for row in row_groups) if row_groups else 0
+            c_h = sum(max(h for w, h, t in row) for row in row_groups) if row_groups else 0
+            return row_groups, c_w, c_h
+
+        if orientation == 'auto':
+            # 1. 模拟横向优先
+            h_groups, h_w, h_h = calculate_layout(True)
+            h_ratio = h_w / h_h if h_h > 0 else float('inf')
+            
+            # 2. 模拟纵向优先
+            v_groups, v_w, v_h = calculate_layout(False)
+            v_ratio = v_w / v_h if v_h > 0 else float('inf')
+            
+            # 3. 智能选择：哪种布局的宽高比更接近 16:9 (1.777)？
+            target_ratio = 16 / 9 
+            h_diff = abs(h_ratio - target_ratio)
+            v_diff = abs(v_ratio - target_ratio)
+            
+            if h_diff <= v_diff:
+                horizontal_priority = True
+                row_groups, canvas_w, canvas_h = h_groups, h_w, h_h
+            else:
+                horizontal_priority = False
+                row_groups, canvas_w, canvas_h = v_groups, v_w, v_h
+        else:
+            horizontal_priority = (orientation == 'horizontal')
+            row_groups, canvas_w, canvas_h = calculate_layout(horizontal_priority)
+
+        # 如果画布尺寸计算失败，直接报错返回
+        if canvas_w == 0 or canvas_h == 0:
+            messagebox.showerror("错误", "计算画布尺寸失败")
+            return
+
+        # 精确计算每行的高度和宽度（用于后续偏移量计算）
         row_heights = []
         row_widths = []
         for row in row_groups:
@@ -8826,14 +8846,11 @@ class FFmpegBatchGUI:
                 row_w = 0
             row_heights.append(row_h)
             row_widths.append(row_w)
-    
+        
+        # 用精确计算的 canvas_w 覆盖（防止浮点数或边缘情况误差）
         canvas_w = max(row_widths) if row_widths else 0
         canvas_h = sum(row_heights)
-    
-        if canvas_w == 0 or canvas_h == 0:
-            messagebox.showerror("错误", "计算画布尺寸失败")
-            return
-    
+
         # ---- 更新主视频的 pad 设置 ----
         main_track.enc_settings['pad_enabled'] = True
         main_track.enc_settings['pad_width'] = str(canvas_w)
@@ -8857,12 +8874,8 @@ class FFmpegBatchGUI:
         for row_idx, row in enumerate(row_groups):
             x_offset = 0
             for w, h, t in row:
-                # 如果是主视频，也更新位置（但主视频本身不叠加，但是为了统一，我们只设置子视频的位置）
-                # 主视频的位置永远在 (0,0)，所以我们跳过主视频的 overlay 设置
-                if t == main_track:
-                    # 主视频已经固定在 (0,0)（通过 pad 偏移），不需要设置 overlay
-                    pass
-                else:
+                # 主视频已经固定在 (0,0)（通过 pad 偏移），不需要设置 overlay
+                if t != main_track:
                     t.enc_settings['overlay_x'] = str(x_offset)
                     t.enc_settings['overlay_y'] = str(y_offset)
                     t.overlay_x = str(x_offset)
@@ -13865,7 +13878,7 @@ class FFmpegBatchGUI:
                 # 窗口还没准备好，100ms 后再试
                 self.main_paned.after(100, _delayed_set_sash)
                 return
-            # 目标：左边占 30%（sash 在 70% 位置）
+            # 目标：右边占 30%（sash 在 70% 位置）
             target = int(total * 0.7)
             # 保险：即使计算出来很小，sash 也至少留出 260px 给左边
             target = max(target, 260)
