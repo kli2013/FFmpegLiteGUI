@@ -3621,20 +3621,28 @@ class OverlayPositionFrame(ttk.LabelFrame):
         self._controls.append(btn)
 
     def _create_main_controls(self):
-        """主视频画布偏移控件"""
+        """主视频画布偏移控件 - 左右分栏（左侧偏移设置，右侧快捷操作）"""
+        # 主容器：水平分割
+        main_container = ttk.Frame(self)
+        main_container.pack(fill=tk.BOTH, expand=True)
+    
+        # ---------- 左容器：偏移设置 ----------
+        left_frame = ttk.Frame(main_container)
+        left_frame.pack(side=tk.LEFT, fill=tk.Y, expand=False)
+    
         self.pad_enabled = tk.BooleanVar(value=False)
-        cb = ttk.Checkbutton(self, text="启用画布偏移", variable=self.pad_enabled)
+        cb = ttk.Checkbutton(left_frame, text="启用画布偏移", variable=self.pad_enabled)
         cb.pack(anchor=tk.W, pady=(0,5))
         self._controls.append(cb)
-
-        w_frame = ttk.Frame(self)
+    
+        w_frame = ttk.Frame(left_frame)
         w_frame.pack(fill=tk.X, pady=2)
         ttk.Label(w_frame, text="画布宽度:").pack(side=tk.LEFT)
         self.pad_width = tk.StringVar(value="")
         entry = ttk.Entry(w_frame, textvariable=self.pad_width, width=10)
         entry.pack(side=tk.LEFT, padx=5)
         self._controls.extend([w_frame, entry])
-
+    
         if self.app:
             def fetch_size():
                 main_file = self.app.merge_video.get().strip() if self.app.merge_video else ""
@@ -3653,32 +3661,31 @@ class OverlayPositionFrame(ttk.LabelFrame):
             btn = ttk.Button(w_frame, text="获取尺寸", command=fetch_size)
             btn.pack(side=tk.LEFT, padx=5)
             self._controls.append(btn)
-
-        h_frame = ttk.Frame(self)
+    
+        h_frame = ttk.Frame(left_frame)
         h_frame.pack(fill=tk.X, pady=2)
         ttk.Label(h_frame, text="画布高度:").pack(side=tk.LEFT)
         self.pad_height = tk.StringVar(value="")
         entry = ttk.Entry(h_frame, textvariable=self.pad_height, width=10)
         entry.pack(side=tk.LEFT, padx=5)
         self._controls.extend([h_frame, entry])
-
-        ox_frame = ttk.Frame(self)
+    
+        ox_frame = ttk.Frame(left_frame)
         ox_frame.pack(fill=tk.X, pady=2)
         ttk.Label(ox_frame, text="偏移 X:").pack(side=tk.LEFT)
         self.offset_x = tk.StringVar(value="0")
         entry = ttk.Entry(ox_frame, textvariable=self.offset_x, width=10)
         entry.pack(side=tk.LEFT, padx=5)
         self._controls.extend([ox_frame, entry])
-
-        oy_frame = ttk.Frame(self)
+    
+        oy_frame = ttk.Frame(left_frame)
         oy_frame.pack(fill=tk.X, pady=2)
         ttk.Label(oy_frame, text="偏移 Y:").pack(side=tk.LEFT)
         self.offset_y = tk.StringVar(value="0")
         entry = ttk.Entry(oy_frame, textvariable=self.offset_y, width=10)
         entry.pack(side=tk.LEFT, padx=5)
         self._controls.extend([oy_frame, entry])
-
-
+    
         def open_pad_editor():
             if not self.pad_enabled.get():
                 messagebox.showinfo("提示", "请先勾选「启用画布偏移」再使用可视化编辑功能。")
@@ -3696,9 +3703,135 @@ class OverlayPositionFrame(ttk.LabelFrame):
                 )
             else:
                 messagebox.showinfo("提示", "无法启动可视化编辑：缺少轨道索引")
-        btn = ttk.Button(self, text="🎨 可视化编辑画布偏移", command=open_pad_editor)
-        btn.pack(side=tk.LEFT,pady=5)
+        btn = ttk.Button(left_frame, text="🎨 可视化编辑画布偏移", command=open_pad_editor)
+        btn.pack(anchor=tk.W, pady=5)
         self._controls.append(btn)
+    
+        # ---------- 右容器：快捷操作 ----------
+        right_frame = ttk.Frame(main_container)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(10, 0))
+    
+        # 第一行：取消子视频缩放/裁剪
+        btn_reset_sub = ttk.Button(
+            right_frame,
+            text="取消子视频缩放/裁剪",
+            command=self._reset_sub_video_filters,
+            width=22
+        )
+        btn_reset_sub.pack(anchor=tk.W, pady=(0, 10))
+        ToolTip(btn_reset_sub,
+                "将所有子视频（非主视频）的「启用缩放」和「启用裁剪」复选框取消勾选，\n"
+                "恢复子视频为原始尺寸。")
+    
+        def smart_tile():
+            if self.track_idx is not None:
+                orient_map = {
+                    "自动": "auto",
+                    "横排优先": "horizontal",
+                    "竖排优先": "vertical"
+                }
+                orientation = orient_map.get(self.tile_orientation.get(), "auto")
+                self.app.merge_smart_tile(
+                    self.track_idx,
+                    pad_enabled_var=self.pad_enabled,
+                    pad_width_var=self.pad_width,
+                    pad_height_var=self.pad_height,
+                    items_per_row=self.tile_cols.get(),
+                    items_per_col=self.tile_rows.get(),
+                    orientation=orientation
+                )
+            else:
+                messagebox.showinfo("提示", "无法获取主视频轨道索引")
+        
+        tile_btn = ttk.Button(right_frame, text="计算平铺", command=smart_tile, width=8)
+        tile_btn.pack(anchor=tk.W, pady=(0, 5))
+        ToolTip(tile_btn,
+                "画中画模式下，拖入的子视频默认会缩放到320宽（便于快速预览）。\n"
+                "提示：若视频尺寸一致且希望以原始大小排列，\n"
+                "    可先使用「取消子视频缩放/裁剪」批量恢复原始尺寸，再执行平铺。\n"
+                "    或者先去每个子视频重新裁剪缩放为需要的画面，再执行平铺。\n\n"
+                "「计算平铺」会根据子视频当前的实际尺寸（包括已应用的缩放和裁剪），\n"
+                "    自动计算最佳平铺布局，将多个画面整齐排列在画布中。\n\n"
+                "支持三种排列方向：\n"
+                "• 自动：根据画面宽高比智能选择横向或纵向优先。\n"
+                "• 横排优先：按行排列，适合宽屏显示器。\n"
+                "• 竖排优先：按列排列，适合竖屏或手机视频。\n\n"
+                "典型用途：\n"
+                "• 多机位舞台合成（演唱会、访谈等）。\n"
+                "• 分屏对比（画质、色彩、动作同步）。\n"
+                "• 监控画面拼接。",
+                wraplength=700)
+
+
+
+        # 第三行：参数（每行、每列、方向）水平排列
+        param_row = ttk.Frame(right_frame)
+        param_row.pack(anchor=tk.W, fill=tk.X, pady=5)
+        
+        ttk.Label(param_row, text="每行:").pack(side=tk.LEFT)
+        self.tile_cols = tk.IntVar(value=4)
+        ttk.Spinbox(param_row, from_=1, to=10, width=3, textvariable=self.tile_cols).pack(side=tk.LEFT, padx=2)
+        
+        ttk.Label(param_row, text="每列:").pack(side=tk.LEFT, padx=(10,0))
+        self.tile_rows = tk.IntVar(value=4)
+        ttk.Spinbox(param_row, from_=1, to=10, width=3, textvariable=self.tile_rows).pack(side=tk.LEFT, padx=2)
+
+        aspect‌_row = ttk.Frame(right_frame)
+        aspect‌_row.pack(anchor=tk.W, fill=tk.X, pady=5)
+
+        ttk.Label(aspect‌_row, text="方向:").pack(side=tk.LEFT)
+        self.tile_orientation = tk.StringVar(value="横排优先")
+        orientation_combo = ttk.Combobox(aspect‌_row, textvariable=self.tile_orientation,
+                                         values=["自动", "横排优先", "竖排优先"],
+                                         state="readonly", width=8)
+        orientation_combo.pack(side=tk.LEFT, padx=2)
+        
+        # 第四行：小提示（左对齐）
+        tip_label = ttk.Label(right_frame, text="先取消缩放/裁剪，再平铺，效果更佳",
+                              foreground="gray", font=("", 8))
+        tip_label.pack(anchor=tk.W, pady=(5,0))
+
+    def _reset_sub_video_filters(self):
+        """取消所有子视频（非主视频）的缩放和裁剪勾选"""
+        if not self.app:
+            return
+        tracks = self.app.merge_tracks
+        if not tracks:
+            return
+    
+        # 确定主视频轨道（根据 self.track_idx 或第一个视频）
+        main_idx = self.track_idx
+        if main_idx is None:
+            # 如果 track_idx 未传入，则取第一个启用的视频作为主视频
+            for i, t in enumerate(tracks):
+                if t.type == "video" and t.enabled:
+                    main_idx = i
+                    break
+        if main_idx is None:
+            self.app._append_info_ui("[取消子视频滤镜] 未找到主视频轨道")
+            return
+    
+        modified = 0
+        for i, track in enumerate(tracks):
+            if i == main_idx:
+                continue   # 跳过主视频
+            if track.type != "video" or not track.enabled:
+                continue
+            # 取消缩放和裁剪
+            track.enc_settings["scale_enabled"] = False
+            track.enc_settings["crop_enabled"] = False
+            # 如果轨道对象有同步属性，也更新（可选）
+            # track.scale_enabled = False  # 若存在此类属性
+            # track.crop_enabled = False
+            modified += 1
+    
+        if modified:
+            self.app.merge_update_track_list()
+            self.app.merge_update_command_preview()
+            self.app._append_info_ui(f"[取消子视频滤镜] 已取消 {modified} 个子视频的缩放和裁剪")
+        else:
+            self.app._append_info_ui("[取消子视频滤镜] 没有需要修改的子视频")
+
 
     def get_settings(self):
         if self.mode == 'sub':
@@ -4523,7 +4656,7 @@ class FFmpegBatchGUI:
         """延迟初始化完成后的 UI 更新"""
         self.load_preset_list()
         self._refresh_cmd_preset_list()
-        self.update_player_status()
+        self.update_player_status()      # 延迟显示状态检测信息
         self._initialized = True
 #        self._append_info_ui("预设和快速命令模板已就绪")
 
@@ -5452,13 +5585,21 @@ class FFmpegBatchGUI:
     
             # 构建子视频滤镜串
             if use_loop:
-                # 始终无限循环（loop=-1），显示时间由 enable 控制
                 loop_param = "-1"
-                vf_parts = [
-                    f"trim=start={start_sec}:end={end_sec}",
-                    "setpts=PTS-STARTPTS",
-                    f"loop=loop={loop_param}:size={size}:start=0"
-                ]
+                # 动态构建 trim 参数
+                trim_parts = []
+                if start_sec is not None:
+                    trim_parts.append(f"start={start_sec}")
+                if end_sec is not None:
+                    trim_parts.append(f"end={end_sec}")
+                trim_str = f"trim={':'.join(trim_parts)}" if trim_parts else ""
+            
+                vf_parts = []
+                if trim_str:
+                    vf_parts.append(trim_str)
+                vf_parts.append("setpts=PTS-STARTPTS")
+                vf_parts.append(f"loop=loop={loop_param}:size={size}:start=0")
+
                 if base_vf:
                     vf_parts.append(base_vf)
                 vf_parts.append("format=rgba")
@@ -8577,6 +8718,157 @@ class FFmpegBatchGUI:
 
         self.pip_enabled.trace_add('write', self._on_pip_toggle)
         self.concat_enabled.trace_add('write', self._on_concat_toggle)
+
+
+    def merge_smart_tile(self, main_track_idx, pad_enabled_var=None, pad_width_var=None, pad_height_var=None,
+                         items_per_row=4, items_per_col=4, orientation='auto'):
+        """
+        智能平铺：所有视频（主视频+子视频）统一按行列排列。
+        :param items_per_row: 横向优先时，每行视频数
+        :param items_per_col: 纵向优先时，每列视频数
+        :param orientation: 'auto' / 'horizontal' / 'vertical'
+        """
+        if main_track_idx is None or main_track_idx >= len(self.merge_tracks):
+            messagebox.showerror("错误", "无效的主视频轨道索引")
+            return
+    
+        main_track = self.merge_tracks[main_track_idx]
+        if main_track.type != "video":
+            messagebox.showerror("错误", "选中的不是视频轨道")
+            return
+    
+        # 获取所有启用的视频轨道（排除主视频自身）
+        sub_tracks = [t for t in self.merge_tracks if t.type == "video" and t.enabled and t != main_track]
+        # 强制启用所有子视频的叠加
+        for t in sub_tracks:
+            t.enc_settings['overlay_enabled'] = True
+            t.overlay_enabled = True
+    
+        # 构建总视频列表：主视频 + 子视频
+        all_tracks = [main_track] + sub_tracks
+        n = len(all_tracks)
+        if n == 1:
+            messagebox.showinfo("提示", "没有可用于平铺的视频（至少需要一个子视频）")
+            return
+    
+        # 获取所有视频的渲染尺寸
+        infos = []
+        for t in all_tracks:
+            w, h = self._get_video_render_size(t)
+            if w is None or h is None:
+                orig_w, orig_h = get_video_dimensions(self.ffprobe_cmd, t.file_path)
+                if orig_w and orig_h:
+                    w, h = compute_rendered_size(orig_w, orig_h, t.enc_settings)
+                else:
+                    w, h = 320, 240
+            infos.append((w, h, t))
+    
+        # ---- 方向决策 ----
+        if orientation == 'auto':
+            total_w = sum(w for w, h, t in infos[1:])  # 只考虑子视频
+            total_h = sum(h for w, h, t in infos[1:])
+            if total_h == 0:
+                total_h = 1
+            horizontal_priority = (total_w / total_h) >= 1.0
+        elif orientation == 'horizontal':
+            horizontal_priority = True
+        else:
+            horizontal_priority = False
+    
+        # ---- 按方向排列 ----
+        if horizontal_priority:
+            cols = items_per_row
+            rows = (n + cols - 1) // cols
+            # 按行顺序填充（从左到右，从上到下）
+            # 直接按顺序分配行号
+            row_groups = []
+            for r in range(rows):
+                start = r * cols
+                end = min(start + cols, n)
+                row_groups.append(infos[start:end])
+        else:
+            rows = items_per_col
+            cols = (n + rows - 1) // rows
+            # 按列顺序填充（从上到下，从左到右）
+            # 先按列分组：每列 rows 个
+            col_groups = []
+            for c in range(cols):
+                start = c * rows
+                end = min(start + rows, n)
+                col_groups.append(infos[start:end])
+            # 转置为行组（因为最终画布是按行排列的）
+            row_groups = []
+            for r in range(rows):
+                row_items = []
+                for c in range(cols):
+                    if r < len(col_groups[c]):
+                        row_items.append(col_groups[c][r])
+                if row_items:
+                    row_groups.append(row_items)
+    
+        # ---- 计算每行高度和总宽度 ----
+        row_heights = []
+        row_widths = []
+        for row in row_groups:
+            if row:
+                row_h = max(h for w, h, t in row)
+                row_w = sum(w for w, h, t in row)
+            else:
+                row_h = 0
+                row_w = 0
+            row_heights.append(row_h)
+            row_widths.append(row_w)
+    
+        canvas_w = max(row_widths) if row_widths else 0
+        canvas_h = sum(row_heights)
+    
+        if canvas_w == 0 or canvas_h == 0:
+            messagebox.showerror("错误", "计算画布尺寸失败")
+            return
+    
+        # ---- 更新主视频的 pad 设置 ----
+        main_track.enc_settings['pad_enabled'] = True
+        main_track.enc_settings['pad_width'] = str(canvas_w)
+        main_track.enc_settings['pad_height'] = str(canvas_h)
+        main_track.enc_settings['offset_x'] = "0"
+        main_track.enc_settings['offset_y'] = "0"
+        main_track.pad_enabled = True
+        main_track.pad_width = str(canvas_w)
+        main_track.pad_height = str(canvas_h)
+        main_track.offset_x = "0"
+        main_track.offset_y = "0"
+        if pad_enabled_var is not None:
+            pad_enabled_var.set(True)
+        if pad_width_var is not None:
+            pad_width_var.set(str(canvas_w))
+        if pad_height_var is not None:
+            pad_height_var.set(str(canvas_h))
+    
+        # ---- 更新所有视频的叠加位置 ----
+        y_offset = 0
+        for row_idx, row in enumerate(row_groups):
+            x_offset = 0
+            for w, h, t in row:
+                # 如果是主视频，也更新位置（但主视频本身不叠加，但是为了统一，我们只设置子视频的位置）
+                # 主视频的位置永远在 (0,0)，所以我们跳过主视频的 overlay 设置
+                if t == main_track:
+                    # 主视频已经固定在 (0,0)（通过 pad 偏移），不需要设置 overlay
+                    pass
+                else:
+                    t.enc_settings['overlay_x'] = str(x_offset)
+                    t.enc_settings['overlay_y'] = str(y_offset)
+                    t.overlay_x = str(x_offset)
+                    t.overlay_y = str(y_offset)
+                x_offset += w
+            y_offset += row_heights[row_idx]
+    
+        # ---- 刷新界面 ----
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+        direction_str = "横向" if horizontal_priority else "纵向"
+        self._append_info_ui(f"✅ 智能平铺完成（{direction_str}优先）：画布 {canvas_w}x{canvas_h}，总视频 {n} 个")
+        messagebox.showinfo("成功", f"智能平铺完成\n方向: {direction_str}优先\n画布: {canvas_w}×{canvas_h}\n总视频数: {n}")
+    
 
 
 
@@ -12047,7 +12339,7 @@ class FFmpegBatchGUI:
         self.update_mpv_path_state()
         self.use_mpv.trace_add("write", lambda *a: self.update_player_status())
         self.mpv_path.trace_add("write", lambda *a: self.update_player_status())
- #       self.update_player_status()
+ #       self.update_player_status()    #放到延迟里运行
 
 
     def _update_preview_edit_state(self):
