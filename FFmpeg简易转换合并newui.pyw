@@ -463,7 +463,8 @@ def time_to_seconds(timestr: str) -> Optional[float]:
 
 # ================== 滤镜链构建 ==================
 def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = True, include_speed: bool = True,
-                              include_trim: bool = True, include_format: bool = True, enhance_settings=None, reverse=False) -> str:
+                              include_trim: bool = True, include_format: bool = True, include_scale: bool = True,
+                              enhance_settings=None, reverse=False) -> str:
     """
     从设置字典构建视频滤镜链。
     include_subtitle: 是否包含字幕滤镜
@@ -516,7 +517,7 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
         filters.append("hflip")
 
     # ----- 缩放 -----
-    if settings.get("scale_enabled", False):
+    if include_scale and settings.get("scale_enabled", False):
         method = settings.get("scale_method", "width")
         w = settings.get("scale_width", "").strip()
         h = settings.get("scale_height", "").strip()
@@ -5426,7 +5427,14 @@ class FFmpegBatchGUI:
 
 
 
-
+    def _get_video_pix_fmt(self, file_path: str, stream_index: int = 0) -> Optional[str]:
+        """获取视频流的像素格式，失败返回None"""
+        info = ffprobe_json(self.ffprobe_cmd, file_path)
+        if info:
+            for s in info.get('streams', []):
+                if s.get('codec_type') == 'video':
+                    return s.get('pix_fmt')
+        return None
 
     def _get_video_framerate(self, file_path: str) -> Optional[float]:
         """获取视频文件的平均帧率（fps），失败返回 None"""
@@ -10733,115 +10741,198 @@ class FFmpegBatchGUI:
 
     def _build_concat_reencode_mode(self, cmd, video_tracks, audio_tracks, main_video, output_norm):
         """
-        重新编码模式 - 使用 filter_complex concat，支持每个视频独立音频源，
-        并统一应用主视频设置的视频滤镜（裁剪、缩放、旋转、颜色校正等）和音频滤镜（音量、变速、倒放）。
+        重新编码模式 - 使用 filter_complex concat。
+        支持每个视频独立裁剪/旋转/翻转。
+        强制统一分辨率、像素格式、帧率、SAR（以主视频为准）。
+        全局应用增强、变速、倒放、字幕烧录（视频）和音量/变速/倒放（音频）。
         """
-        # 为每个视频轨道单独添加 -i（允许重复文件）
+        # ----- 1. 计算主视频最终输出规格 -----
+        main_orig_w, main_orig_h = get_video_dimensions(self.ffprobe_cmd, main_video.file_path)
+        if main_orig_w is None or main_orig_h is None:
+            main_orig_w, main_orig_h = 1280, 720
+    
+        main_target_w, main_target_h = self.compute_final_size_with_order(
+            main_orig_w, main_orig_h, main_video.enc_settings
+        )
+        if main_target_w <= 0 or main_target_h <= 0:
+            main_target_w, main_target_h = main_orig_w, main_orig_h
+    
+        # 目标像素格式
+        if main_video.enc_settings.get("pix_fmt_enabled", True):
+            target_pix_fmt = main_video.enc_settings.get("pix_fmt", "yuv420p")
+        else:
+            target_pix_fmt = self._get_stream_pix_fmt(main_video.file_path, 0) or "yuv420p"
+    
+        # 目标帧率
+        if main_video.enc_settings.get("frame_rate_type") == "custom":
+            try:
+                target_fps = float(main_video.enc_settings.get("frame_rate_custom", "30"))
+            except:
+                target_fps = 30.0
+        else:
+            raw_fps = self._get_video_framerate(main_video.file_path)
+            target_fps = raw_fps if raw_fps is not None else 30.0
+    
+        # ----- 2. 添加输入文件 -----
         for track in video_tracks:
             cmd.extend(["-i", normalize_path(track.file_path)])
     
+        # ----- 3. 构建 filter_complex -----
         n = len(video_tracks)
         filter_parts = []
+        v_labels = []
+        a_labels = []
     
-        # 获取主视频设置中的增强参数
-        enhance_settings = main_video.enc_settings.get("enhance", {})
-        reverse_flag = main_video.enc_settings.get("reverse_enabled", False)
-    
-        # ---- 构建每个片段的预处理（截取、设置 PTS） ----
         for i, track in enumerate(video_tracks):
-            # 视频：只设置 PTS（截取已在输入时通过 -ss/-to 处理）
-            filter_parts.append(f"[{i}:v]setpts=PTS-STARTPTS[v{i}]")
+            settings = track.enc_settings.copy()
     
-            # 音频源处理
-            audio_source = track.enc_settings.get("audio_source_type", "self")
-            if audio_source == "self":
-                filter_parts.append(f"[{i}:a]asetpts=PTS-STARTPTS[a{i}]")
-            elif audio_source == "silence":
-                # 生成静音流，时长匹配视频片段
-                start_str = track.enc_settings.get("trim_start", "").strip()
-                end_str = track.enc_settings.get("trim_end", "").strip()
-                start_sec = time_to_seconds(start_str) if start_str else 0.0
-                end_sec = time_to_seconds(end_str) if end_str else None
-                total_duration = self._get_media_duration(track.file_path)
-                if end_sec is not None:
-                    duration = end_sec - start_sec
-                elif total_duration is not None:
-                    duration = total_duration - start_sec
-                else:
-                    duration = 10.0
-                duration = max(0.1, duration)
-                filter_parts.append(f"anullsrc=r=44100:cl=stereo:duration={duration}[a{i}]")
+            # 独立视频滤镜：仅允许裁剪、旋转、翻转、反交错（不含 enhance、speed、reverse、subtitle、scale、format、trim）
+            video_filters = build_video_filter_chain(
+                settings,
+                include_subtitle=False,
+                include_speed=False,
+                include_trim=False,
+                include_format=False,
+                include_scale=False,
+                enhance_settings={},                 # 独立片段不应用增强
+                reverse=False
+            )
+    
+            # 强制统一滤镜（所有视频一致）
+            forced = [
+                f"scale={main_target_w}:{main_target_h}",
+                f"format={target_pix_fmt}",
+                f"fps={target_fps:.6f}".rstrip('0').rstrip('.'),
+                "setsar=1",
+                "setpts=PTS-STARTPTS"
+            ]
+    
+            if video_filters and video_filters != "null":
+                full_vf = f"{video_filters},{','.join(forced)}"
             else:
-                self._append_info_ui(f"[串联-编] 音频源类型 '{audio_source}' 未知，降级使用视频自身音频")
-                filter_parts.append(f"[{i}:a]asetpts=PTS-STARTPTS[a{i}]")
+                full_vf = ",".join(forced)
     
-        # ---- 视频 concat ----
-        v_concat = f"[{']['.join(f'v{i}' for i in range(n))}]concat=n={n}:v=1:a=0[vout]"
+            filter_parts.append(f"[{i}:v]{full_vf}[v{i}]")
+            v_labels.append(f"[v{i}]")
+    
+            # ----- 音频处理（独立选择） -----
+            audio_type = track.enc_settings.get("audio_source_type", "self")
+            if audio_type == "silence":
+                effective_duration = self._get_effective_duration(settings, input_path=track.file_path)
+                if effective_duration is None or effective_duration <= 0:
+                    effective_duration = 10.0
+                filter_parts.append(f"anullsrc=r=44100:cl=stereo:duration={effective_duration:.3f}[a{i}]")
+                a_labels.append(f"[a{i}]")
+            else:
+                filter_parts.append(f"[{i}:a]asetpts=PTS-STARTPTS[a{i}]")
+                a_labels.append(f"[a{i}]")
+    
+        # ----- 4. 视频拼接 -----
+        v_concat = f"{''.join(v_labels)}concat=n={n}:v=1:a=0[vout]"
         filter_parts.append(v_concat)
     
-        # ---- 音频 concat ----
-        a_concat = f"[{']['.join(f'a{i}' for i in range(n))}]concat=n={n}:v=0:a=1[aout]"
-        filter_parts.append(a_concat)
+        # ----- 5. 视频全局滤镜（增强、变速、倒放、字幕）-----
+        global_video_filters = []
     
-        # ---- 应用视频滤镜到合并后的视频流 ----
-        video_filters = build_video_filter_chain(
-            main_video.enc_settings,
-            include_subtitle=False,
-            include_speed=True,          # 变速会影响时长，但会在 concat 之后应用，普通模式也如此
-            include_trim=False,          # 已截取
-            include_format=True,         # 像素格式
-            enhance_settings=enhance_settings,
-            reverse=reverse_flag
-        )
+        # 增强（单次应用）
+        enhance = main_video.enc_settings.get("enhance", {})
+        if enhance:
+            temp_settings = {
+                "crop_enabled": False,
+                "scale_enabled": False,
+                "rotate": "none",
+                "vflip": False,
+                "hflip": False,
+                "speed_enabled": False,
+                "deinterlace_filter": "none",
+                "pix_fmt_enabled": False,
+                "subtitle_enabled": False,
+                "reverse_enabled": False,
+                "enhance": enhance,
+            }
+            enhance_filter = build_video_filter_chain(
+                temp_settings,
+                include_subtitle=False,
+                include_speed=False,
+                include_trim=False,
+                include_format=False,
+                include_scale=False,
+                enhance_settings=enhance,
+                reverse=False
+            )
+            if enhance_filter and enhance_filter != "null":
+                global_video_filters.append(enhance_filter)
     
-        if video_filters and video_filters != "null":
-            filter_parts.append(f"[vout]{video_filters}[vfinal]")
+        # 倒放（先处理）
+        if main_video.enc_settings.get("reverse_enabled", False):
+            global_video_filters.append("reverse")
+    
+        # 变速（后处理）
+        if main_video.enc_settings.get("speed_enabled", False):
+            try:
+                factor = float(main_video.enc_settings.get("speed_factor", "1.0"))
+                if factor > 0 and factor != 1.0:
+                    global_video_filters.append(f"setpts={1.0/factor}*PTS")
+            except ValueError:
+                pass
+    
+        # 字幕烧录（使用 filename 选项）
+        if main_video.enc_settings.get("subtitle_enabled", False):
+            sub_path = main_video.enc_settings.get("subtitle_path", "").strip()
+            if sub_path:
+                safe_sub_path = sub_path.replace("'", "\\'")
+                global_video_filters.append(f"subtitles=filename='{safe_sub_path}'")
+    
+        if global_video_filters:
+            video_global_chain = ",".join(global_video_filters)
+            filter_parts.append(f"[vout]{video_global_chain}[vfinal]")
             vmap = "[vfinal]"
-            self._append_info_ui("[串联-编] 已应用视频滤镜到合并结果")
         else:
             vmap = "[vout]"
     
-        # ---- 应用音频滤镜到合并后的音频流 ----
-        audio_filters = []
+        # ----- 6. 音频拼接 -----
+        a_concat = f"{''.join(a_labels)}concat=n={n}:v=0:a=1[aout]"
+        filter_parts.append(a_concat)
+    
+        # ----- 7. 音频全局滤镜（音量、变速、倒放）-----
+        audio_global_filters = []
+    
         # 音量
         if main_video.enc_settings.get("volume_enabled", False):
             vol = main_video.enc_settings.get("volume", 1.0)
             if vol != 1.0:
-                audio_filters.append(f"volume={vol:.2f}")
-        # 变速
-        if main_video.enc_settings.get("speed_enabled", False):
-            factor = float(main_video.enc_settings.get("speed_factor", "1.0"))
-            if factor != 1.0 and factor > 0:
-                atempo = build_atempo_chain(factor)
-                if atempo:
-                    audio_filters.append(atempo)
+                audio_global_filters.append(f"volume={vol:.2f}")
+
         # 倒放
-        if reverse_flag:
-            audio_filters.append("areverse")
+        if main_video.enc_settings.get("reverse_enabled", False):
+            audio_global_filters.append("areverse")
+
+        # 变速（使用 atempo 链）
+        if main_video.enc_settings.get("speed_enabled", False):
+            try:
+                factor = float(main_video.enc_settings.get("speed_factor", "1.0"))
+                if factor != 1.0 and factor > 0:
+                    atempo_chain = build_atempo_chain(factor)
+                    if atempo_chain:
+                        audio_global_filters.append(atempo_chain)
+            except ValueError:
+                pass
     
-        if audio_filters:
-            afilter_str = ",".join(audio_filters)
-            filter_parts.append(f"[aout]{afilter_str}[afinal]")
+
+    
+        if audio_global_filters:
+            audio_global_chain = ",".join(audio_global_filters)
+            filter_parts.append(f"[aout]{audio_global_chain}[afinal]")
             amap = "[afinal]"
-            self._append_info_ui("[串联-编] 已应用音频滤镜到合并结果")
         else:
             amap = "[aout]"
     
-        # 组合 filter_complex
-        cmd.extend(["-filter_complex", ";".join(filter_parts)])
+        # ----- 8. 组合所有滤镜 -----
+        all_filters = ";".join(filter_parts)
+        cmd.extend(["-filter_complex", all_filters])
         cmd.extend(["-map", vmap, "-map", amap])
     
-        # ---- 视频编码参数 ----
-        v_settings = main_video.enc_settings.copy()
-        vcodec = v_settings.get("encoder", "libx265")
-        if vcodec == "copy":
-            self._append_info_ui("[串联-编] 重新编码模式下视频编码器自动改为 libx265")
-            vcodec = "libx265"
-            v_settings["encoder"] = "libx265"
-        strategy = get_encoder_strategy(vcodec)
-        cmd = strategy.build_params(cmd, v_settings)
-    
-        # ---- 音频编码参数 ----
+        # ----- 9. 音频编码参数 -----
         if audio_tracks:
             a_settings = audio_tracks[0].enc_settings
             enc = a_settings.get("encoder", "aac")
@@ -10856,6 +10947,17 @@ class FFmpegBatchGUI:
         else:
             cmd.extend(["-c:a", "aac", "-b:a", "128k", "-ar", "44100"])
     
+        # ----- 10. 视频编码参数 -----
+        v_settings = main_video.enc_settings.copy()
+        vcodec = v_settings.get("encoder", "libx265")
+        if vcodec == "copy":
+            self._append_info_ui("[串联-编] 重新编码模式下视频编码器自动改为 libx265")
+            vcodec = "libx265"
+            v_settings["encoder"] = "libx265"
+        strategy = get_encoder_strategy(vcodec)
+        cmd = strategy.build_params(cmd, v_settings)
+    
+        # 容器优化
         self._add_container_optimization(cmd)
         cmd.append(output_norm)
         self._append_info_ui(f"[串联-编] 使用 filter_complex 重新编码模式（{n} 个片段）")
@@ -10865,9 +10967,6 @@ class FFmpegBatchGUI:
         """
         根据当前模式生成合并/封装的 FFmpeg 命令列表。
         """
-        if any(t.enc_settings.get("_placeholder", False) for t in enabled_tracks):
-            self._append_info_ui("[封装] 存在占位轨道，命令生成被推迟")
-            return []
 
         if not self.ffmpeg_cmd:
             self._append_info_ui("未找到 ffmpeg，无法生成合并命令。")
@@ -10882,6 +10981,11 @@ class FFmpegBatchGUI:
     
         only_audio = self.merge_only_audio.get() if hasattr(self, 'merge_only_audio') else False
         enabled_tracks = [t for t in self.merge_tracks if t.enabled]
+
+        if any(t.enc_settings.get("_placeholder", False) for t in enabled_tracks):
+            self._append_info_ui("[封装] 存在占位轨道，命令生成被推迟")
+            return []
+
         if not enabled_tracks:
             self._append_info_ui("[封装] 没有启用的轨道")
             return []
