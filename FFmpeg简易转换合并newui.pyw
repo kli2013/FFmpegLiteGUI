@@ -11526,7 +11526,7 @@ class FFmpegBatchGUI:
         track = self.merge_tracks[track_idx]
         with self.SafeToplevel(self.root) as win:
             win.title(f"音频轨道设置 - {track.codec}")
-            center_window(win, 500, 540)
+            center_window(win, 500, 600)
             win.transient(self.root)
     
             main_frame = ttk.Frame(win, padding="10")
@@ -11755,6 +11755,13 @@ class FFmpegBatchGUI:
                     track.enc_settings["audio_reverse"] = audio_reverse_var.get()
                 else:
                     track.enc_settings.pop("audio_reverse", None)
+                if is_concat:
+                    # 串联模式强制禁用音量
+                    track.enc_settings["volume_enabled"] = False
+                    track.enc_settings["volume"] = 1.0
+                else:
+                    track.enc_settings["volume_enabled"] = vol_enabled_var.get()
+                    track.enc_settings["volume"] = vol_value_var.get()
     
                 track.language = lang_code
                 track.title = title_var.get().strip()
@@ -11882,20 +11889,25 @@ class FFmpegBatchGUI:
    #         self.merge_update_output_preview()
 
     def merge_add_external(self, ftype, path=None):
-        if os.path.isdir(path):
-            self._append_info_ui(f"[封装] 忽略文件夹: {os.path.basename(path)}，请选择文件")
-            return
-        if not self.merge_video.get():
-            self._append_info_ui("[封装] 请先设置主视频")
-            return
-        if not path:
+        # 1. 如果未传入有效路径，弹出文件选择对话框
+        if not path:  # 处理 None 或空字符串
             if ftype == "audio":
                 types = [("音频", "*.mp3 *.aac *.m4a *.wav *.flac *.ogg *.opus *.ac3 *.dts *.mka")]
             else:
                 types = [("字幕", "*.srt *.ass *.ssa *.vtt *.idx *.sup")]
             path = filedialog.askopenfilename(filetypes=types)
-            if not path:
+            if not path:  # 用户取消
                 return
+    
+        # 2. 现在 path 肯定是一个非空字符串，可以安全地检查是否为目录
+        if os.path.isdir(path):
+            self._append_info_ui(f"[封装] 忽略文件夹: {os.path.basename(path)}，请选择文件")
+            return
+    
+        # 3. 检查主视频是否已设置
+        if not self.merge_video.get():
+            self._append_info_ui("[封装] 请先设置主视频")
+            return
 
         info = self._get_cached_stream_info(path)
         if not info:
