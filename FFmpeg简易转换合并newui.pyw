@@ -9362,6 +9362,8 @@ class FFmpegBatchGUI:
             "tracks": []
         }
         for track in self.merge_tracks:
+            if track.enc_settings.get("_placeholder", False):
+                continue
             enc_settings_copy = track.enc_settings.copy()
             enc_settings_copy.pop("_file_path", None)  # 移除临时字段
             track_dict = {
@@ -9626,10 +9628,10 @@ class FFmpegBatchGUI:
     
     def _handle_drop_pip_mode(self, files):
         """
-        画中画模式下的拖拽处理（支持单个或多个文件）
-        - 视频：询问是否添加音频（批量时一次询问）
-        - 图片：直接添加为图片水印
-        - 音频：直接添加为独立音轨
+        画中画模式下的拖拽处理 —— 瞬间添加占位，后台解析，无卡顿。
+        - 视频文件：先添加占位轨道，后台解析后替换为真实流。
+        - 图片文件：直接添加为图片水印（无需解析，但为了统一也可占位）。
+        - 音频文件：直接添加为独立音轨（无需解析）。
         """
         if not files:
             return
@@ -9657,45 +9659,144 @@ class FFmpegBatchGUI:
             else:
                 other_files.append(f)
     
-        self._batch_update = True
+        # ---- 立即添加占位轨道（仅对视频文件） ----
+        original_batch = self._batch_update
+        self._batch_update = False
         try:
-            # 图片
+            # 图片直接添加（无需占位）
             for img in image_files:
                 self._add_pip_video_forced(img, add_audio=False)
-    
-            # 音频
+            # 音频直接添加
             for audio in audio_files:
                 self.merge_add_external("audio", audio)
-    
-            # 视频
+            # 视频：添加占位轨道
+            for vf in video_files:
+                track = Track(0, "video", "unknown", vf, True)
+                track.enc_settings["_placeholder"] = True
+                # 画中画默认启用叠加并缩放到320宽（与原有行为一致）
+                track.enc_settings["scale_enabled"] = True
+                track.enc_settings["scale_width"] = "320"
+                track.enc_settings["scale_height"] = ""
+                track.enc_settings["scale_method"] = "width"
+                track.enc_settings["overlay_enabled"] = True
+                track.enc_settings["overlay_x"] = "W-w-10"
+                track.enc_settings["overlay_y"] = "H-h-10"
+                track.overlay_enabled = True
+                self.merge_tracks.append(track)
+            # 立即刷新列表
+            self.merge_update_track_list()
             if video_files:
-                if len(video_files) > 1:
-                    add_audio = messagebox.askyesno(
-                        "添加音频",
-                        f"是否同时添加这 {len(video_files)} 个视频文件的音频流？\n选“是”将添加所有音频流，选“否”仅添加视频作为水印。"
-                    )
-                else:
-                    add_audio = messagebox.askyesno(
-                        "添加音频",
-                        f"是否同时添加文件「{os.path.basename(video_files[0])}」的音频流？\n选“是”将添加音频，选“否”仅添加视频作为水印。"
-                    )
-                for video in video_files:
-                    self._add_pip_video_forced(video, add_audio=add_audio)
-    
+                self._append_info_ui(f"[封装] 已添加 {len(video_files)} 个视频文件（正在后台解析…）")
+            if image_files:
+                self._append_info_ui(f"[封装] 已添加 {len(image_files)} 个图片水印")
+            if audio_files:
+                self._append_info_ui(f"[封装] 已添加 {len(audio_files)} 个音频轨道")
             if other_files:
                 self._append_info_ui(f"[拖拽] 忽略不支持的文件类型: {', '.join(os.path.basename(f) for f in other_files)}")
         finally:
+            self._batch_update = original_batch
+    
+        # ---- 如果有视频文件，启动后台解析 ----
+        if video_files:
+            # 询问是否添加音频（仅一次）
+            if len(video_files) > 1:
+                add_audio = messagebox.askyesno(
+                    "添加音频",
+                    f"是否同时添加这 {len(video_files)} 个视频文件的音频流？\n选“是”将添加所有音频流，选“否”仅添加视频作为水印。"
+                )
+            else:
+                add_audio = messagebox.askyesno(
+                    "添加音频",
+                    f"是否同时添加文件「{os.path.basename(video_files[0])}」的音频流？\n选“是”将添加音频，选“否”仅添加视频作为水印。"
+                )
+    
+            def parse_and_add():
+                try:
+                    self._parse_files_concurrently(video_files, description="画中画视频文件")
+                    self.root.after(0, lambda: self._finish_drop_pip(video_files, add_audio))
+                except Exception as e:
+                    self.root.after(0, lambda: self._append_info_ui(f"[封装] 解析异常: {e}"))
+    
+            threading.Thread(target=parse_and_add, daemon=True).start()
+    
+    def _finish_drop_pip(self, video_files, add_audio):
+        """
+        画中画模式后台解析完成后的回调：删除视频占位轨道，添加真实视频流，并根据 add_audio 添加音频。
+        增强：错误处理、路径规范化、错误标记。
+        """
+        self._batch_update = True
+        try:
+            # 1. 删除本次添加的视频占位轨道（使用规范化路径比较）
+            normalized_video_files = [normalize_path(f) for f in video_files]
+            to_remove = []
+            for idx, track in enumerate(self.merge_tracks):
+                if (normalize_path(track.file_path) in normalized_video_files and 
+                    track.enc_settings.get("_placeholder", False)):
+                    to_remove.append(idx)
+            for idx in reversed(to_remove):
+                del self.merge_tracks[idx]
+    
+            # 2. 添加真实视频流和（可选）音频流
+            for vf in video_files:
+                info = self._get_cached_stream_info(vf)
+                if not info:
+                    # 解析失败：添加错误标记轨道
+                    error_track = Track(0, "video", "error", vf, True)
+                    error_track.enc_settings["_error"] = "解析失败"
+                    self.merge_tracks.append(error_track)
+                    self._append_info_ui(f"[封装] 文件 {os.path.basename(vf)} 解析失败，已标记为错误")
+                    continue
+    
+                # 添加视频流（取第一个视频流）
+                video_streams = [s for s in info['streams'] if s.get('codec_type') == 'video']
+                if video_streams:
+                    s = video_streams[0]
+                    track = Track(s['index'], "video", s.get('codec_name', 'unknown'), vf, True)
+                    # 保留画中画默认设置（与占位一致）
+                    track.enc_settings["scale_enabled"] = True
+                    track.enc_settings["scale_width"] = "320"
+                    track.enc_settings["scale_height"] = ""
+                    track.enc_settings["scale_method"] = "width"
+                    track.enc_settings["overlay_enabled"] = True
+                    track.enc_settings["overlay_x"] = "W-w-10"
+                    track.enc_settings["overlay_y"] = "H-h-10"
+                    track.overlay_enabled = True
+                    # 检查是否已存在相同视频轨道（去重）
+                    exists = any(t.file_path == vf and t.index == s['index'] and t.type == 'video' for t in self.merge_tracks)
+                    if not exists:
+                        self.merge_tracks.append(track)
+                        self._append_info_ui(f"[封装] 已解析并添加画中画视频: {os.path.basename(vf)}")
+                    else:
+                        self._append_info_ui(f"[封装] 视频流已存在，跳过: {os.path.basename(vf)}")
+                else:
+                    self._append_info_ui(f"[封装] {os.path.basename(vf)} 不包含视频流，跳过")
+    
+                # 如果需要添加音频
+                if add_audio:
+                    audio_streams = [s for s in info['streams'] if s.get('codec_type') == 'audio']
+                    for s_audio in audio_streams:
+                        # 检查是否已存在相同音频轨道（避免重复）
+                        exists = any(t.file_path == vf and t.index == s_audio['index'] and t.type == 'audio' for t in self.merge_tracks)
+                        if not exists:
+                            audio_track = Track(s_audio['index'], "audio", s_audio.get('codec_name', 'unknown'), vf, True)
+                            self.merge_tracks.append(audio_track)
+                            self._append_info_ui(f"[封装] 已添加音频流: {s_audio.get('codec_name', 'unknown')}")
+    
+        finally:
             self._batch_update = False
+            # 刷新列表和预览
             self.merge_update_track_list()
             self.merge_auto_recommend_container()
             self._ensure_main_video(disable_scale=True)
             self.merge_update_output_preview()
+            self.merge_update_command_preview()
+            self._append_info_ui("[封装] 画中画文件解析完成，轨道列表已更新")
             
 
     
     def _handle_drop_concat_mode(self, files):
         """
-        串行合并模式下的拖拽处理（优化：并发解析视频文件）
+        串行合并模式拖拽 —— 瞬间添加占位，后台解析，无卡顿。
         """
         if not files:
             return
@@ -9716,47 +9817,127 @@ class FFmpegBatchGUI:
             else:
                 other_files.append(f)
     
-        # ---- 并发解析视频文件 ----
-        if video_files:
-            self._parse_files_concurrently(video_files, description="串联视频文件")
+        if not video_files:
+            self._append_info_ui("[封装] 未检测到视频文件")
+            return
     
-        # ---- 添加所有轨道（批量） ----
+        # ========== 关键修改：强制立即刷新 ==========
+        # 保存原有批处理标志，临时关闭以确保立即刷新
+        original_batch = self._batch_update
+        self._batch_update = False
+        try:
+            for vf in video_files:
+                track = Track(0, "video", "unknown", vf, True)
+                track.enc_settings["_placeholder"] = True
+                self.merge_tracks.append(track)
+            # 立即刷新列表（此时会显示“解析中…”）
+            self.merge_update_track_list()
+            self._append_info_ui(f"[封装] 已添加 {len(video_files)} 个视频文件（正在后台解析…）")
+        finally:
+            self._batch_update = original_batch
+    
+        # ========== 后台解析线程 ==========
+        def parse_and_add():
+            try:
+                self._parse_files_concurrently(video_files, description="串联视频文件")
+                self.root.after(0, lambda: self._finish_drop_concat(video_files, other_files))
+            except Exception as e:
+                self.root.after(0, lambda: self._append_info_ui(f"[封装] 解析异常: {e}"))
+    
+        threading.Thread(target=parse_and_add, daemon=True).start()
+    
+    
+    def _finish_drop_concat(self, video_files, other_files):
+        """
+        串联模式后台解析完成后的回调：删除占位，添加真实流，处理错误。
+        """
+        audio_exts = ('.mp3', '.aac', '.m4a', '.wav', '.flac', '.ogg', '.opus', '.ac3', '.dts')
+        subtitle_exts = ('.srt', '.ass', '.ssa', '.vtt', '.idx', '.sup')
+    
         self._batch_update = True
         try:
-            # 从缓存中添加视频及其所有音频/字幕流
+            # 1. 删除占位轨道（使用规范化路径比较）
+            normalized_video_files = [normalize_path(f) for f in video_files]
+            to_remove = []
+            for idx, track in enumerate(self.merge_tracks):
+                if normalize_path(track.file_path) in normalized_video_files and track.enc_settings.get("_placeholder", False):
+                    to_remove.append(idx)
+            for idx in reversed(to_remove):
+                del self.merge_tracks[idx]
+    
+            # 2. 添加真实流（视频、音频、字幕）
             for vf in video_files:
                 info = self._get_cached_stream_info(vf)
                 if not info:
-                    self._append_info_ui(f"[封装] 无法获取 {os.path.basename(vf)} 的媒体信息，跳过")
+                    # 解析失败：添加错误标记轨道
+                    error_track = Track(0, "video", "error", vf, True)
+                    error_track.enc_settings["_error"] = "解析失败"
+                    self.merge_tracks.append(error_track)
+                    self._append_info_ui(f"[封装] 文件 {os.path.basename(vf)} 解析失败，已标记为错误")
                     continue
+    
                 streams = info.get('streams', [])
                 for s in streams:
                     st = s.get('codec_type')
                     if st not in ('video', 'audio', 'subtitle'):
                         continue
-                    # 检查是否已存在相同轨道（避免重复）
+                    # 检查是否已存在相同轨道（去重）
                     exists = any(t.file_path == vf and t.index == s['index'] for t in self.merge_tracks)
                     if exists:
                         continue
                     track = Track(s['index'], st, s.get('codec_name', 'unknown'), vf, True)
                     self.merge_tracks.append(track)
-                self._append_info_ui(f"[封装] 已添加串联视频: {os.path.basename(vf)}")
+                self._append_info_ui(f"[封装] 已解析并添加串联视频: {os.path.basename(vf)}")
     
-            # 处理其他文件（音频/字幕）
+            # 3. 处理其他文件（音频/字幕）
             for f in other_files:
                 ext = os.path.splitext(f)[1].lower()
                 if ext in audio_exts:
-                    self.merge_add_external("audio", f)
+                    self._add_external_streams_silent(f, "audio")
                 elif ext in subtitle_exts:
-                    self.merge_add_external("subtitle", f)
+                    self._add_external_streams_silent(f, "subtitle")
                 else:
                     self._append_info_ui(f"[拖拽] 忽略不支持的文件: {os.path.basename(f)}")
+    
         finally:
             self._batch_update = False
+            # 刷新列表
             self.merge_update_track_list()
             self.merge_auto_recommend_container()
             self._ensure_main_video()
             self.merge_update_output_preview()
+            self.merge_update_command_preview()
+            self._append_info_ui("[封装] 所有文件解析完成，轨道列表已更新")
+    
+    
+    def _add_external_streams_silent(self, file_path, stream_type):
+        """
+        静默添加外部音频/字幕流（不触发刷新）。
+        """
+        info = self._get_cached_stream_info(file_path)
+        if not info:
+            self._append_info_ui(f"[封装] 无法解析外部文件: {os.path.basename(file_path)}")
+            return
+        added = 0
+        for s in info.get('streams', []):
+            if s.get('codec_type') != stream_type:
+                continue
+            exists = any(t.file_path == file_path and t.index == s['index'] for t in self.merge_tracks)
+            if exists:
+                continue
+            track = Track(s['index'], stream_type, s.get('codec_name', 'unknown'), file_path, True)
+            self.merge_tracks.append(track)
+            added += 1
+        if added:
+            self._append_info_ui(f"[封装] 已添加 {added} 条{stream_type}轨道: {os.path.basename(file_path)}")
+        else:
+            self._append_info_ui(f"[封装] 未添加新轨道: {os.path.basename(file_path)}")
+    
+    
+
+    
+    
+
 
 
 
@@ -10684,6 +10865,9 @@ class FFmpegBatchGUI:
         """
         根据当前模式生成合并/封装的 FFmpeg 命令列表。
         """
+        if any(t.enc_settings.get("_placeholder", False) for t in enabled_tracks):
+            self._append_info_ui("[封装] 存在占位轨道，命令生成被推迟")
+            return []
 
         if not self.ffmpeg_cmd:
             self._append_info_ui("未找到 ffmpeg，无法生成合并命令。")
@@ -10868,6 +11052,20 @@ class FFmpegBatchGUI:
         if self._batch_update:
             return
 
+        # ===== 检测是否有占位轨道 =====
+        has_placeholder = any(
+            t.enc_settings.get("_placeholder", False)
+            for t in self.merge_tracks
+            if t.type == "video"
+        )
+        if has_placeholder:
+            current_state = self.merge_cmd_preview.cget('state')
+            self.merge_cmd_preview.config(state='normal')
+            self.merge_cmd_preview.delete(1.0, tk.END)
+            self.merge_cmd_preview.insert(tk.END, "正在解析文件信息，命令预览将在解析完成后生成...")
+            self.merge_cmd_preview.config(state=current_state)
+            return
+
         # 临时启用以便更新内容
         current_state = self.merge_cmd_preview.cget('state')
         self.merge_cmd_preview.config(state='normal')
@@ -11009,32 +11207,37 @@ class FFmpegBatchGUI:
     
             # ---- 规格 ----
             if track.type == "video":
-                orig_w, orig_h = self._get_video_dimensions_cached(track.file_path)
-                if orig_w and orig_h:
-                    if track.enc_settings.get("scale_enabled", False):
-                        method = track.enc_settings.get("scale_method", "width")
-                        sw = track.enc_settings.get("scale_width", "").strip()
-                        sh = track.enc_settings.get("scale_height", "").strip()
-                        if method == "width" and sw:
-                            scale_str = f"{sw}x-2"
-                        elif method == "height" and sh:
-                            scale_str = f"-2x{sh}"
-                        elif method == "exact" and sw and sh:
-                            scale_str = f"{sw}x{sh}"
-                        else:
-                            scale_str = ""
-                        if scale_str:
-                            detail = f"{orig_w}x{orig_h} → {scale_str}"
+                if track.enc_settings.get("_placeholder", False):
+                    detail = "解析中…"
+                elif track.enc_settings.get("_error"):
+                    detail = "❌ 解析失败"
+                else:
+                    orig_w, orig_h = self._get_video_dimensions_cached(track.file_path)
+                    if orig_w and orig_h:
+                        if track.enc_settings.get("scale_enabled", False):
+                            method = track.enc_settings.get("scale_method", "width")
+                            sw = track.enc_settings.get("scale_width", "").strip()
+                            sh = track.enc_settings.get("scale_height", "").strip()
+                            if method == "width" and sw:
+                                scale_str = f"{sw}x-2"
+                            elif method == "height" and sh:
+                                scale_str = f"-2x{sh}"
+                            elif method == "exact" and sw and sh:
+                                scale_str = f"{sw}x{sh}"
+                            else:
+                                scale_str = ""
+                            if scale_str:
+                                detail = f"{orig_w}x{orig_h} → {scale_str}"
+                            else:
+                                detail = f"{orig_w}x{orig_h}"
                         else:
                             detail = f"{orig_w}x{orig_h}"
                     else:
-                        detail = f"{orig_w}x{orig_h}"
-                else:
-                    detail = "未知"
-                # 追加时长
-                dur = self._get_media_duration(track.file_path)
-                if dur is not None:
-                    detail += f" ({seconds_to_time(dur)})"
+                        detail = "未知"
+                    # 追加时长
+                    dur = self._get_media_duration(track.file_path)
+                    if dur is not None:
+                        detail += f" ({seconds_to_time(dur)})"
             elif track.type == "audio":
                 info = self._get_cached_stream_info(track.file_path)
                 if info:
@@ -11061,7 +11264,6 @@ class FFmpegBatchGUI:
                                 if channels:
                                     parts.append(f"{channels}ch")
                                 detail = " ".join(parts) if parts else "-"
-                            # 追加时长
                             dur = self._get_media_duration(track.file_path)
                             if dur is not None:
                                 detail += f" ({seconds_to_time(dur)})"
@@ -11083,7 +11285,7 @@ class FFmpegBatchGUI:
                 detail = f"{lang}" if lang else "-"
             else:
                 detail = "-"
-            
+    
             values = (
                 i + 1,
                 enabled_text,
@@ -12300,6 +12502,9 @@ class FFmpegBatchGUI:
             self.merge_update_command_preview()
 
     def merge_start(self):
+        if any(t.enc_settings.get("_placeholder", False) for t in self.merge_tracks if t.enabled):
+            messagebox.showwarning("提示", "仍有文件正在解析，请稍候再开始合并。")
+            return
         if not self.merge_video.get() or not self.merge_output.get():
             messagebox.showerror("错误", "请选择主视频和输出路径")
             return
