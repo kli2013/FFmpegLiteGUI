@@ -369,7 +369,7 @@ class PresetManager:
             return {}
 
     def save_preset(self, name: str, settings: Dict[str, Any]):
-        """保存预设，保留已有的播放器设置"""
+        """保存预设，保留已有的播放器设置，采用原子写入防止文件损坏"""
         data = self.load_all()
         player_cfg = {}
         if os.path.exists(self.preset_path):
@@ -381,26 +381,49 @@ class PresetManager:
                 pass
         data[name] = settings
         data["player_settings"] = player_cfg
-        with open(self.preset_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-
+    
+        # 原子写入：先写入临时文件，再替换原文件
+        dir_name = os.path.dirname(self.preset_path)
+        try:
+            with tempfile.NamedTemporaryFile('w', dir=dir_name, delete=False, encoding='utf-8') as tf:
+                json.dump(data, tf, indent=4, ensure_ascii=False)
+                temp_name = tf.name
+            os.replace(temp_name, self.preset_path)  # 原子替换
+        except Exception as e:
+            # 如果发生错误，尝试删除临时文件
+            if 'temp_name' in locals() and os.path.exists(temp_name):
+                os.unlink(temp_name)
+            raise e
+     
     def delete_preset(self, name: str) -> bool:
-        data = self.load_all()
-        if name not in data:
-            return False
-        del data[name]
-        player_cfg = {}
-        if os.path.exists(self.preset_path):
-            try:
-                with open(self.preset_path, 'r', encoding='utf-8') as f:
-                    full = json.load(f)
-                player_cfg = full.get("player_settings", {})
-            except:
-                pass
-        data["player_settings"] = player_cfg
-        with open(self.preset_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-        return True
+       """删除预设，采用原子写入防止文件损坏"""
+       data = self.load_all()
+       if name not in data:
+           return False
+       del data[name]
+       player_cfg = {}
+       if os.path.exists(self.preset_path):
+           try:
+               with open(self.preset_path, 'r', encoding='utf-8') as f:
+                   full = json.load(f)
+               player_cfg = full.get("player_settings", {})
+           except:
+               pass
+       data["player_settings"] = player_cfg
+   
+       # 原子写入
+       dir_name = os.path.dirname(self.preset_path)
+       try:
+           with tempfile.NamedTemporaryFile('w', dir=dir_name, delete=False, encoding='utf-8') as tf:
+               json.dump(data, tf, indent=4, ensure_ascii=False)
+               temp_name = tf.name
+           os.replace(temp_name, self.preset_path)
+           return True
+       except Exception as e:
+           if 'temp_name' in locals() and os.path.exists(temp_name):
+               os.unlink(temp_name)
+           raise e
+
 
     def load_player_settings(self) -> Dict[str, Any]:
         if not os.path.exists(self.preset_path):
@@ -684,6 +707,11 @@ def get_video_rotated_dimensions(ffprobe_cmd: str, file_path: str, settings: Dic
 def compute_rendered_size(original_w: int, original_h: int, settings: Dict[str, Any]) -> Tuple[int, int]:
     """根据设置（裁剪、缩放）计算最终渲染尺寸"""
     w, h = original_w, original_h
+
+    # --- 防御性检查，避免除零 ---
+    if w == 0 or h == 0:
+        return 0, 0
+
     # 裁剪
     if settings.get("crop_enabled", False):
         crop_w = settings.get("crop_width", "").strip()
@@ -693,7 +721,6 @@ def compute_rendered_size(original_w: int, original_h: int, settings: Dict[str, 
                 if not expr:
                     return None
                 expr2 = expr.replace('iw', str(w)).replace('ih', str(h))
-                # 使用安全表达式求值
                 result = safe_eval_expr(expr2, {})
                 return result if result is not None else None
             cw = eval_crop(crop_w)
@@ -1604,6 +1631,7 @@ class VideoEncoderFrame(ttk.LabelFrame):
         elif rc == "cq":
             if current not in ("h264_nvenc", "hevc_nvenc", "av1_nvenc"):
                 self.vcodec.set("hevc_nvenc")
+                self.preset.set("p4")
         elif rc == "global_quality":
             if current not in ("h264_qsv", "hevc_qsv", "av1_qsv"):
                 self.vcodec.set("hevc_qsv")
@@ -1651,7 +1679,7 @@ class VideoEncoderFrame(ttk.LabelFrame):
         self._suppress_update = True
         self._suppress_copy_hint = True
         try:
-            # 处理 preset（兼容旧预设）
+            # 安全获取 preset，若缺失则根据码率控制类型推断默认值
             preset_val = settings.get("preset")
             if preset_val is None or preset_val == "":
                 rc = settings.get("rate_control_type", "crf")
@@ -1662,7 +1690,7 @@ class VideoEncoderFrame(ttk.LabelFrame):
                 else:
                     preset_val = "medium"
             self.preset.set(preset_val)
-            
+    
             self.vcodec.set(settings.get("encoder", "libx265"))
             self._update_profile_options()
             self._update_preset_options()
@@ -1671,23 +1699,21 @@ class VideoEncoderFrame(ttk.LabelFrame):
             self.cq_value.set(settings.get("cq_value", 35))
             self.global_quality.set(settings.get("global_quality", 26))
             self.bitrate_video.set(settings.get("bitrate_video", "1900k"))
-            # GIF 参数...
-            if "gif_loop" in settings:
-                self.gif_loop.set(settings["gif_loop"])
-            if "gif_dither" in settings:
-                self.gif_dither.set(settings["gif_dither"])
-            if "gif_bayer_scale" in settings:
-                self.gif_bayer_scale.set(settings["gif_bayer_scale"])
-            if "gif_max_colors" in settings:
-                self.gif_max_colors.set(settings["gif_max_colors"])
+    
+            # GIF 参数
+            self.gif_loop.set(settings.get("gif_loop", 0))
+            self.gif_dither.set(settings.get("gif_dither", "bayer"))
+            self.gif_bayer_scale.set(settings.get("gif_bayer_scale", 2))
+            self.gif_max_colors.set(settings.get("gif_max_colors", 256))
             self._on_gif_codec_toggle()
-
-
+    
+            # 高级参数
             self.tune_var.set(settings.get("tune", "无") or "无")
             self.profile_var.set(settings.get("profile", "无") or "无")
             self.level_var.set(settings.get("level", "无") or "无")
             self.maxrate_var.set(settings.get("maxrate", ""))
             self.bufsize_var.set(settings.get("bufsize", ""))
+    
         finally:
             self._suppress_update = False
             self._suppress_copy_hint = False
@@ -1716,6 +1742,10 @@ class VideoFilterFrame(ttk.LabelFrame):
         self._preview_callback = preview_callback
         self._visual_crop_start_time = None
         self.create_widgets()
+
+        # 用于控制裁剪提取线程的取消
+        self._crop_extract_thread = None
+        self._crop_cancel_event = threading.Event()
 
         self.enhance_settings = {
             "denoise_enabled": False,
@@ -2313,7 +2343,7 @@ class VideoFilterFrame(ttk.LabelFrame):
         # ----- 坐标缩放因子（用于坐标系转换） -----
         scale_x = orig_w / disp_w
         scale_y = orig_h / disp_h
-    
+
         # ----- 初始化闭包变量（必须在嵌套函数之前定义） -----
         scaled_temp_path = None   # 当前显示的临时文件路径
         img = None                # Tkinter 图像对象
@@ -2322,6 +2352,17 @@ class VideoFilterFrame(ttk.LabelFrame):
         drag_rect_id = None       # 拖拽辅助矩形 ID
         drag_start_display = None # 拖拽起始点（显示坐标）
         img_w, img_h = disp_w, disp_h   # 图像实际尺寸（通常与 disp 一致）
+    
+        # ----- 临时文件管理 -----
+        temp_file_info = {"path": None}
+    
+        def cleanup_temp_file():
+            if temp_file_info["path"] and os.path.exists(temp_file_info["path"]):
+                try:
+                    os.unlink(temp_file_info["path"])
+                except Exception:
+                    pass
+                temp_file_info["path"] = None
     
         # ----- 窗口布局 -----
         canvas_w = disp_w + PADDING * 2
@@ -2338,13 +2379,11 @@ class VideoFilterFrame(ttk.LabelFrame):
             win.transient(self.app.root)
             center_window(win, total_w, total_h, offset_y=15)
     
-            def cleanup_scaled_file(event=None):
-                if scaled_temp_path and os.path.exists(scaled_temp_path):
-                    try:
-                        os.unlink(scaled_temp_path)
-                    except:
-                        pass
-            win.bind("<Destroy>", cleanup_scaled_file)
+            # 窗口关闭时清理临时文件
+            def on_window_close():
+                cleanup_temp_file()
+                win.destroy()
+            win.protocol("WM_DELETE_WINDOW", on_window_close)
     
             main_pane = ttk.Frame(win)
             main_pane.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -2480,7 +2519,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                 if w <= 0 or h <= 0:
                     messagebox.showerror("错误", "矩形尺寸无效")
                     return
-                # 保证偶数（兼容编码器）
+                # 保证偶数
                 if w % 2:
                     if x + w + 1 <= orig_w:
                         w += 1
@@ -2559,6 +2598,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             def on_refresh_click():
                 nonlocal current_time, img, scaled_temp_path, img_w, img_h
                 nonlocal points, rect_id, drag_start_display, drag_rect_id
+            
                 time_str = time_var.get().strip()
                 if not time_str:
                     messagebox.showwarning("提示", "请输入时间")
@@ -2572,33 +2612,55 @@ class VideoFilterFrame(ttk.LabelFrame):
                     messagebox.showwarning("警告", f"输入时间 {sec:.2f}s 超过视频总时长 {total_duration:.2f}s，将跳转到末尾")
                     sec = total_duration
                 current_time = sec
-    
+            
                 refresh_btn.config(state=tk.DISABLED, text="提取中...")
                 info_var.set("⏳ 正在提取画面，请稍候...")
                 win.update_idletasks()
-    
+            
+                # --- 取消旧线程 ---
+                if self._crop_extract_thread and self._crop_extract_thread.is_alive():
+                    self._crop_cancel_event.set()
+                    self._crop_extract_thread.join(timeout=0.5)
+                self._crop_cancel_event.clear()
+            
+                # 定义提取线程
                 def extract_thread():
-                    nonlocal scaled_temp_path, img
                     fd_new, new_png = tempfile.mkstemp(suffix='.png', prefix='ffgui_crop_')
                     os.close(fd_new)
+            
+                    # 如果取消标志被设置，则清理并返回
+                    if self._crop_cancel_event.is_set():
+                        if os.path.exists(new_png):
+                            os.unlink(new_png)
+                        return
+            
                     try:
-                        # 调用 PNG 提取函数（需确保已实现）
                         w, h = self.extract_video_frame_scaled(
                             input_file, new_png,
                             frame_sec=sec,
                             target_width=disp_w,
                             target_height=disp_h
                         )
+                        # 再次检查取消标志
+                        if self._crop_cancel_event.is_set():
+                            if os.path.exists(new_png):
+                                os.unlink(new_png)
+                            return
+            
                         if w is None or h is None:
+                            if os.path.exists(new_png):
+                                os.unlink(new_png)
                             self.app.root.after(0, lambda: on_extract_failed("提取帧失败，请检查文件是否支持"))
                             return
-                        # 成功，传递路径和实际尺寸
                         self.app.root.after(0, lambda: on_extract_success(new_png, w, h))
                     except Exception as e:
+                        if os.path.exists(new_png):
+                            os.unlink(new_png)
                         self.app.root.after(0, lambda: on_extract_failed(f"提取异常: {e}"))
-                    finally:
-                        # 不要删除 new_png，它会在成功回调中处理
-                        pass
+            
+                # 启动新线程
+                self._crop_extract_thread = threading.Thread(target=extract_thread, daemon=True)
+                self._crop_extract_thread.start()
     
                 def on_extract_success(new_scaled_path, new_orig_w, new_orig_h):
                     nonlocal img, scaled_temp_path, img_w, img_h
@@ -2606,37 +2668,25 @@ class VideoFilterFrame(ttk.LabelFrame):
                     try:
                         new_img = tk.PhotoImage(file=new_scaled_path)
                     except Exception as e:
+                        # 加载失败，删除临时文件
+                        if os.path.exists(new_scaled_path):
+                            os.unlink(new_scaled_path)
                         on_extract_failed(f"加载缩放后的图像失败: {e}")
                         return
     
                     # 删除旧临时文件
-                    if scaled_temp_path and os.path.exists(scaled_temp_path):
+                    if temp_file_info["path"] and os.path.exists(temp_file_info["path"]):
                         try:
-                            os.unlink(scaled_temp_path)
-                        except:
+                            os.unlink(temp_file_info["path"])
+                        except Exception:
                             pass
-    
-                    scaled_temp_path = new_scaled_path
+                    temp_file_info["path"] = new_scaled_path  # 保存新路径
     
                     # 更新图像
                     canvas.delete("bg_img")
                     canvas.create_image(PADDING, PADDING, anchor=tk.NW, image=new_img, tags="bg_img")
                     canvas.image = new_img
                     img = new_img
-    
-                    # 更新图像尺寸（如果与预期不符，更新并调整缩放因子）
-                    actual_w = new_img.width()
-                    actual_h = new_img.height()
-                    if actual_w != disp_w or actual_h != disp_h:
-                        self.app._append_info_ui(f"[裁剪] PNG 实际尺寸 {actual_w}x{actual_h} 与预期 {disp_w}x{disp_h} 不符，已自动调整")
-                        # 更新显示尺寸和缩放因子
-                        nonlocal scale_x, scale_y  # 需要允许修改外部 scale_x/scale_y
-                        # 但 scale_x 是在外层定义的，需要声明 nonlocal
-                        # 由于 scale_x 在 open_crop_editor 的作用域，但不在 on_extract_success 所在层级？实际上 scale_x 是在 open_crop_editor 中定义的，属于闭包。
-                        # 我们需要在 open_crop_editor 中将 scale_x/scale_y 定义为变量，并在 on_extract_success 中声明 nonlocal。
-                        # 但当前我们尚未声明，所以需要先声明。
-                        # 这里为了简单，我们忽略此情况（因为 FFmpeg 应该准确输出），或者稍后补充。
-                        pass
     
                     # 重置选择状态
                     if rect_id:
@@ -2653,6 +2703,8 @@ class VideoFilterFrame(ttk.LabelFrame):
                     refresh_btn.config(state=tk.NORMAL, text="重新获取画面")
     
                 def on_extract_failed(err_msg):
+                    # 清理可能残留的临时文件
+                    cleanup_temp_file()
                     info_var.set(f"❌ {err_msg}")
                     self.app._append_info_ui(f"[裁剪] 提取失败: {err_msg}")
                     refresh_btn.config(state=tk.NORMAL, text="重新获取画面")
@@ -2692,7 +2744,7 @@ class VideoFilterFrame(ttk.LabelFrame):
     
             ttk.Button(btn_frame, text="清除矩形", command=clear_rect).pack(fill=tk.X, pady=2)
             ttk.Button(btn_frame, text="保存并应用裁剪", command=apply_crop).pack(fill=tk.X, pady=2)
-            ttk.Button(btn_frame, text="取消", command=win.destroy).pack(fill=tk.X, pady=2)
+            ttk.Button(btn_frame, text="取消", command=on_window_close).pack(fill=tk.X, pady=2)
     
             tip = "按住左键拖拽绘制矩形（可从边缘外开始），松开确定。黄色虚线为辅助，红色为最终选区。"
             ttk.Label(right_frame, text=tip, foreground="gray", wraplength=RIGHT_PANEL_WIDTH - 20).pack(pady=10)
@@ -2717,9 +2769,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                     pass
     
             # ----- 初始加载图像 -----
-            # 调用提取函数初始化画面
             def initial_load():
-                # 直接在当前线程执行，避免阻塞
                 fd, png_path = tempfile.mkstemp(suffix='.png', prefix='ffgui_crop_')
                 os.close(fd)
                 try:
@@ -2730,6 +2780,9 @@ class VideoFilterFrame(ttk.LabelFrame):
                         target_height=disp_h
                     )
                     if w is None or h is None:
+                        # 失败，删除临时文件
+                        if os.path.exists(png_path):
+                            os.unlink(png_path)
                         messagebox.showerror("错误", "无法提取初始帧")
                         win.destroy()
                         return
@@ -2739,8 +2792,10 @@ class VideoFilterFrame(ttk.LabelFrame):
                     canvas.image = img_obj
                     nonlocal img, scaled_temp_path
                     img = img_obj
-                    scaled_temp_path = png_path
+                    temp_file_info["path"] = png_path  # 保存路径以便清理
                 except Exception as e:
+                    if os.path.exists(png_path):
+                        os.unlink(png_path)
                     messagebox.showerror("错误", f"加载初始帧失败: {e}")
                     win.destroy()
     
@@ -3697,7 +3752,7 @@ class OverlayPositionFrame(ttk.LabelFrame):
                     self.pad_height,
                     self.offset_x,
                     self.offset_y,
-                    live_filt_frame=None,
+                    live_filt_frame=self.filt_frame, 
                     parent=parent_win
                 )
             else:
@@ -3710,18 +3765,77 @@ class OverlayPositionFrame(ttk.LabelFrame):
         right_frame = ttk.Frame(main_container)
         right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(10, 0))
     
-        # 第一行：取消子视频缩放/裁剪
+
+        row1 = ttk.Frame(right_frame)
+        row1.pack(anchor=tk.W, fill=tk.X, pady=(0, 5))
+        
+        # --- 取消子视频缩放/裁剪 ---
         btn_reset_sub = ttk.Button(
-            right_frame,
+            row1,
             text="取消子视频缩放/裁剪",
             command=self._reset_sub_video_filters,
-            width=22
+            width=18
         )
-        btn_reset_sub.pack(anchor=tk.W, pady=(0, 10))
+        btn_reset_sub.pack(side=tk.LEFT, padx=(0, 5))
         ToolTip(btn_reset_sub,
                 "将所有子视频（非主视频）的「启用缩放」和「启用裁剪」复选框取消勾选，\n"
                 "恢复子视频为原始尺寸。")
+
+        row2 = ttk.Frame(right_frame)
+        row2.pack(anchor=tk.W, fill=tk.X, pady=(0, 5))
+
+        # --- 统一高度 ---
+        self.unify_height_var = tk.StringVar(value="")
+        btn_unify_h = ttk.Button(
+            row2,
+            text="统一高度",
+            command=self._apply_unified_height,
+            width=10
+        )
+        btn_unify_h.pack(side=tk.LEFT)
+        spin_h = ttk.Spinbox(row2, from_=1, to=9999, width=6, textvariable=self.unify_height_var)
+        spin_h.pack(side=tk.LEFT, padx=2)
+        
+        # --- 统一宽度 ---
+        self.unify_width_var = tk.StringVar(value="")
+        btn_unify_w = ttk.Button(
+            row2,
+            text="统一宽度",
+            command=self._apply_unified_width,
+            width=10
+        )
+        btn_unify_w.pack(side=tk.LEFT, padx=2)
+        spin_w = ttk.Spinbox(row2, from_=1, to=9999, width=6, textvariable=self.unify_width_var)
+        spin_w.pack(side=tk.LEFT, padx=2)
     
+
+        # ---- 修改子视频编码 ----
+        row3 = ttk.Frame(right_frame)
+        row3.pack(anchor=tk.W, fill=tk.X, pady=(0, 5))
+        btn_set_sub_encoder = ttk.Button(
+            row3,
+            text="修改子视频编码",
+            command=self._set_sub_video_encoder,
+            width=18
+        )
+        btn_set_sub_encoder.pack(side=tk.LEFT, padx=(0,5))
+        ToolTip(btn_set_sub_encoder,
+                "将所有子视频（非主视频）的编码器统一设置为 libx264 (H.264)。\n"
+                "此操作仅修改轨道设置，消除日志的copy自动转libx265提示。\n"
+                "提示：画中画模式中，子视频的编码无意义，最终编码只和主视频选择有关。")
+        
+        btn_reset_copy = ttk.Button(
+            row3,
+            text="恢复为copy",
+            command=self._reset_sub_encoder_to_copy,
+            width=14
+        )
+        btn_reset_copy.pack(side=tk.LEFT, padx=5)
+        ToolTip(btn_reset_copy,
+                "将所有子视频（非主视频）的编码器恢复为「copy」（流复制）。\n"
+                "注意：恢复 copy 是为了给串行模式使用，如果你要更改模式的话。")
+
+
         def smart_tile():
             if self.track_idx is not None:
                 orient_map = {
@@ -3737,13 +3851,14 @@ class OverlayPositionFrame(ttk.LabelFrame):
                     pad_height_var=self.pad_height,
                     items_per_row=self.tile_cols.get(),
                     items_per_col=self.tile_rows.get(),
-                    orientation=orientation
+                    orientation=orientation,
+                    filt_frame=self.filt_frame
                 )
             else:
                 messagebox.showinfo("提示", "无法获取主视频轨道索引")
-        
+
         tile_btn = ttk.Button(right_frame, text="计算平铺", command=smart_tile, width=8)
-        tile_btn.pack(anchor=tk.W, pady=(0, 5))
+        tile_btn.pack(anchor=tk.W)
         ToolTip(tile_btn,
                 "画中画模式下，拖入的子视频默认会缩放到320宽（便于快速预览）。\n"
                 "提示：若视频尺寸一致且希望以原始大小排列，\n"
@@ -3763,7 +3878,7 @@ class OverlayPositionFrame(ttk.LabelFrame):
 
 
 
-        # 第三行：参数（每行、每列、方向）水平排列
+
         param_row = ttk.Frame(right_frame)
         param_row.pack(anchor=tk.W, fill=tk.X, pady=5)
         
@@ -3775,21 +3890,181 @@ class OverlayPositionFrame(ttk.LabelFrame):
         self.tile_rows = tk.IntVar(value=4)
         ttk.Spinbox(param_row, from_=1, to=10, width=3, textvariable=self.tile_rows).pack(side=tk.LEFT, padx=2)
 
-
-        aspect_row = ttk.Frame(right_frame)
-        aspect_row.pack(anchor=tk.W, fill=tk.X, pady=5)
-
-        ttk.Label(aspect_row, text="方向:").pack(side=tk.LEFT)
+        ttk.Label(param_row, text="方向:").pack(side=tk.LEFT)
         self.tile_orientation = tk.StringVar(value="自动")
-        orientation_combo = ttk.Combobox(aspect_row, textvariable=self.tile_orientation,
+        orientation_combo = ttk.Combobox(param_row, textvariable=self.tile_orientation,
                                          values=["自动", "横排优先", "竖排优先"],
                                          state="readonly", width=8)
         orientation_combo.pack(side=tk.LEFT, padx=2)
         
-        # 第四行：小提示（左对齐）
-        tip_label = ttk.Label(right_frame, text="先取消缩放/裁剪，再平铺，效果更佳",
-                              foreground="gray", font=("", 8))
-        tip_label.pack(anchor=tk.W, pady=(5,0))
+#         # 第四行：小提示（左对齐）
+#         tip_label = ttk.Label(right_frame, text="先取消缩放/裁剪，再平铺，效果更佳",
+#                               foreground="gray", font=("", 8))
+#         tip_label.pack(anchor=tk.W, pady=(5,0))
+
+
+    def _apply_unified_height(self):
+        val_str = self.unify_height_var.get().strip()
+        if not val_str:
+            messagebox.showwarning("提示", "请先输入要统一的高度数值")
+            return
+        try:
+            target = int(val_str)
+            if target <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("错误", "请输入有效的正整数作为高度值")
+            return
+        self._apply_unified_dimension('height', target)
+    
+    def _apply_unified_width(self):
+        val_str = self.unify_width_var.get().strip()
+        if not val_str:
+            messagebox.showwarning("提示", "请先输入要统一的宽度数值")
+            return
+        try:
+            target = int(val_str)
+            if target <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("错误", "请输入有效的正整数作为宽度值")
+            return
+        self._apply_unified_dimension('width', target)
+    
+    def _apply_unified_dimension(self, mode, target):
+        """
+        统一设置所有视频轨道的高度或宽度，并同步更新主视频的编辑对话框控件。
+        :param mode: 'height' 或 'width'
+        :param target: 目标像素值
+        """
+        if not self.app:
+            return
+        tracks = self.app.merge_tracks
+        if not tracks:
+            return
+    
+        # 确认操作
+        if not messagebox.askyesno(
+            "确认统一尺寸",
+            f"此操作将把所有视频轨道（包括主视频）的{mode}统一设置为 {target}px，\n"
+            "宽度或高度将按原比例自动缩放。\n\n"
+            "确定继续吗？"
+        ):
+            return
+    
+        # 确定主视频索引（用于判断当前编辑的是否为主视频）
+        main_idx = self.track_idx
+        if main_idx is None:
+            for i, t in enumerate(tracks):
+                if t.type == "video" and t.enabled:
+                    main_idx = i
+                    break
+    
+        modified = 0
+        for i, track in enumerate(tracks):
+            if track.type != "video" or not track.enabled:
+                continue
+            # 获取原始尺寸
+            orig_w, orig_h = get_video_dimensions(self.app.ffprobe_cmd, track.file_path)
+            if orig_w is None or orig_h is None:
+                continue  # 无法获取尺寸，跳过
+            # 启用缩放
+            track.enc_settings["scale_enabled"] = True
+            if mode == 'height':
+                track.enc_settings["scale_method"] = "height"
+                track.enc_settings["scale_height"] = str(target)
+                track.enc_settings["scale_width"] = ""
+            else:  # width
+                track.enc_settings["scale_method"] = "width"
+                track.enc_settings["scale_width"] = str(target)
+                track.enc_settings["scale_height"] = ""
+            modified += 1
+    
+            # ---- 同步编辑对话框控件（如果当前编辑的是主视频） ----
+            if (self.filt_frame is not None and main_idx is not None and i == main_idx):
+                self.filt_frame.scale_enabled.set(True)
+                self.filt_frame.scale_method.set(mode)
+                if mode == 'height':
+                    self.filt_frame.scale_height.set(str(target))
+                    self.filt_frame.scale_width.set("")
+                else:
+                    self.filt_frame.scale_width.set(str(target))
+                    self.filt_frame.scale_height.set("")
+                # 触发编辑对话框的预览刷新（如果存在）
+                if hasattr(self.filt_frame, '_preview_callback') and self.filt_frame._preview_callback:
+                    self.filt_frame._preview_callback()
+    
+        if modified:
+            self.app.merge_update_track_list()
+            self.app.merge_update_command_preview()
+            self.app._append_info_ui(f"[统一尺寸] 已将 {modified} 个视频的{mode}统一设为 {target}px")
+        else:
+            self.app._append_info_ui("[统一尺寸] 没有可修改的视频轨道")
+
+    def _reset_sub_encoder_to_copy(self):
+        """将所有子视频（非主视频）的编码器恢复为 copy（流复制）"""
+        self._set_sub_video_encoder(encoder="copy", force_clear=True)
+    
+    def _set_sub_video_encoder(self, encoder="libx264", force_clear=False):
+        """
+        将所有子视频（非主视频）的编码器设置为指定编码器。
+        :param encoder: 编码器名称，默认 libx264
+        :param force_clear: 若为 True，则清除可能冲突的质量参数（用于 copy）
+        """
+        if not self.app:
+            return
+        tracks = self.app.merge_tracks
+        if not tracks:
+            return
+    
+        # 二次确认（仅当 encoder 不是 copy 时提示，或者统一提示）
+        if not messagebox.askyesno(
+            "确认修改编码",
+            f"此操作将所有子视频（非主视频）的编码器统一设置为 {encoder}。\n"
+            f"确定要继续吗？"
+        ):
+            return
+    
+        # 确定主视频轨道
+        main_idx = self.track_idx
+        if main_idx is None:
+            for i, t in enumerate(tracks):
+                if t.type == "video" and t.enabled:
+                    main_idx = i
+                    break
+        if main_idx is None:
+            self.app._append_info_ui("[子视频编码] 未找到主视频轨道")
+            return
+    
+        modified = 0
+        for i, track in enumerate(tracks):
+            if i == main_idx:
+                continue
+            if track.type != "video" or not track.enabled:
+                continue
+            # 修改编码器
+            track.enc_settings["encoder"] = encoder
+            # 如果是 copy，清除质量相关参数，避免冲突
+            if encoder.lower() == "copy":
+                track.enc_settings.pop("crf_value", None)
+                track.enc_settings.pop("cq_value", None)
+                track.enc_settings.pop("global_quality", None)
+                track.enc_settings.pop("bitrate_video", None)
+                track.enc_settings.pop("rate_control_type", None)
+            else:
+                # 非 copy，设置合理的默认值
+                if track.enc_settings.get("rate_control_type") not in ("crf", "bitrate"):
+                    track.enc_settings["rate_control_type"] = "crf"
+                if "crf_value" not in track.enc_settings:
+                    track.enc_settings["crf_value"] = 23
+            modified += 1
+    
+        if modified:
+            self.app.merge_update_track_list()
+            self.app.merge_update_command_preview()
+            self.app._append_info_ui(f"[子视频编码] 已将 {modified} 个子视频的编码器设为 {encoder}")
+        else:
+            self.app._append_info_ui("[子视频编码] 没有需要修改的子视频")
 
     def _reset_sub_video_filters(self):
         """取消所有子视频（非主视频）的缩放和裁剪勾选"""
@@ -5404,6 +5679,12 @@ class FFmpegBatchGUI:
         self._add_hwaccel_params(cmd, settings)
     
         cmd.extend(["-i", input_path])
+
+        # ----- 检测输入文件是否包含音频流  -----
+        has_input_audio = False
+        info = ffprobe_json(self.ffprobe_cmd, input_path)
+        if info:
+            has_input_audio = any(s.get("codec_type") == "audio" for s in info.get("streams", []))
     
         # ----- 构建 filter_complex -----
         n = len(segments)
@@ -5431,8 +5712,8 @@ class FFmpegBatchGUI:
             if not only_audio:
                 v_filters.append(f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS{flip_filter}[v{i}]")
     
-            # 音频trim（除非完全禁用音频）
-            if not disable_audio:
+            # 音频trim（除非完全禁用音频 且 源文件有音频）
+            if not disable_audio and has_input_audio:
                 a_filters.append(f"[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a{i}]")
     
         filter_parts = []
@@ -5446,7 +5727,7 @@ class FFmpegBatchGUI:
             # ----- 全局视频滤镜（缩放、裁剪、旋转、翻转、帧率、像素格式、增强） -----
             global_filters = []
     
-        # 缩放
+            # 缩放
             if settings.get("scale_enabled", False):
                 method = settings.get("scale_method", "width")
                 w = settings.get("scale_width", "").strip()
@@ -5458,7 +5739,7 @@ class FFmpegBatchGUI:
                 elif method == "exact" and w and h:
                     global_filters.append(f"scale={w}:{h}")
     
-        # 裁剪
+            # 裁剪
             if settings.get("crop_enabled", False):
                 cw = settings.get("crop_width", "").strip()
                 ch = settings.get("crop_height", "").strip()
@@ -5467,7 +5748,7 @@ class FFmpegBatchGUI:
                 if cw and ch:
                     global_filters.append(f"crop={cw}:{ch}:{cx}:{cy}")
     
-        # 旋转
+            # 旋转
             rotate = settings.get("rotate", "none")
             if rotate == "90":
                 global_filters.append("transpose=1")
@@ -5476,19 +5757,19 @@ class FFmpegBatchGUI:
             elif rotate == "270":
                 global_filters.append("transpose=2")
     
-        # 翻转（全局）
+            # 翻转（全局）
             if settings.get("vflip", False):
                 global_filters.append("vflip")
             if settings.get("hflip", False):
                 global_filters.append("hflip")
     
-        # 帧率
+            # 帧率
             if settings.get("frame_rate_type") == "custom":
                 fps = settings.get("frame_rate_custom", "").strip()
                 if fps:
                     global_filters.append(f"fps={fps}")
     
-        # 像素格式
+            # 像素格式
             if settings.get("pix_fmt_enabled", True):
                 pix = settings.get("pix_fmt", "yuv420p")
                 if pix:
@@ -6107,6 +6388,12 @@ class FFmpegBatchGUI:
 
 
     # ---------- 输出路径生成与命令构建 ----------
+    def _sanitize_filename(self, filename: str) -> str:
+        """移除 Windows 非法字符，替换为下划线"""
+        # Windows 非法字符: \ / : * ? " < > |
+        illegal_chars = r'[\\/:*?"<>|]'
+        return re.sub(illegal_chars, '_', filename)
+    
     def generate_output_path(self, input_path, settings):
         dir_path = settings.get("output_dir") or os.path.dirname(input_path)
         dir_path = normalize_path(dir_path)
@@ -6119,6 +6406,8 @@ class FFmpegBatchGUI:
         custom_name = settings.get("custom_output_name", "").strip()
         if custom_name:
             custom_name = os.path.basename(custom_name)
+            # --- 清理非法字符 ---
+            custom_name = self._sanitize_filename(custom_name)
             forbidden = {'.', '..', 'CON', 'PRN', 'AUX', 'NUL',
                          'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
                          'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'}
@@ -6139,7 +6428,6 @@ class FFmpegBatchGUI:
 
         # GIF 强制扩展名
         if settings.get("encoder") == "gif":
-            # 确保文件名以 .gif 结尾
             base, ext = os.path.splitext(out_name)
             if ext.lower() != ".gif":
                 out_name = base + ".gif"
@@ -6425,6 +6713,24 @@ class FFmpegBatchGUI:
     
         # ---------- 强制精准截取（水印模式） ----------
         settings["precise_trim"] = True
+        
+        # --- 检测源文件是否有音频流 ---
+        has_input_audio = False
+        info = ffprobe_json(self.ffprobe_cmd, input_path)
+        if info:
+            has_input_audio = any(s.get("codec_type") == "audio" for s in info.get("streams", []))
+        
+        # --- 强制音频编码 ---
+        if settings.get("audio_enabled", True):
+            if settings.get("audio_codec") == "copy":
+                if has_input_audio:
+                    settings["audio_codec"] = "aac"
+                    self._append_info_ui("水印模式下为确保同步，音频编码器已自动设为 aac")
+                else:
+                    # 源文件无音频，禁用音频
+                    settings["audio_enabled"] = False
+                    self._append_info_ui("源文件无音频流，已自动禁用音频输出")
+        
         self._enforce_reencode_for_precise_trim(settings, only_audio=False)
     
 
@@ -7196,10 +7502,27 @@ class FFmpegBatchGUI:
         main_track = enabled_videos[0]
         sub_tracks = enabled_videos[1:]
     
-        main_render_w, main_render_h = self._get_video_render_size(main_track, live_filt_frame)
-        if main_render_w is None:
-            messagebox.showerror("错误", "无法获取主视频渲染尺寸")
-            return
+        # ---- 主视频渲染尺寸：优先使用 live_filt_frame 的实时值 ----
+        if live_filt_frame is not None:
+            main_settings = {
+                "crop_enabled": live_filt_frame.crop_enabled.get(),
+                "crop_width": live_filt_frame.crop_width.get(),
+                "crop_height": live_filt_frame.crop_height.get(),
+                "scale_enabled": live_filt_frame.scale_enabled.get(),
+                "scale_method": live_filt_frame.scale_method.get(),
+                "scale_width": live_filt_frame.scale_width.get(),
+                "scale_height": live_filt_frame.scale_height.get(),
+                "rotate": live_filt_frame.rotate.get()
+            }
+            orig_w, orig_h = get_video_dimensions(self.ffprobe_cmd, main_track.file_path)
+            if orig_w is None or orig_h is None:
+                orig_w, orig_h = 1280, 720
+            main_render_w, main_render_h = self.compute_final_size_with_order(orig_w, orig_h, main_settings)
+        else:
+            main_render_w, main_render_h = self._get_video_render_size(main_track)
+            if main_render_w is None:
+                messagebox.showerror("错误", "无法获取主视频渲染尺寸")
+                return
     
         # 获取当前画布尺寸
         try:
@@ -7314,7 +7637,9 @@ class FFmpegBatchGUI:
             self._append_info_ui(f"[可视化-水] 已保存位置: ({new_x}, {new_y}) 尺寸: {new_w}x{new_h}")
     
         title = "可视化编辑水印位置及大小"
-        aspect = wm_w / wm_h if wm_h != 0 else None
+        aspect = None
+        if wm_h and wm_h > 0:
+            aspect = wm_w / wm_h
         self._generic_overlay_editor(parent or self.root, canvas_w, canvas_h,
                                      rect_x, rect_y, wm_w, wm_h,
                                      on_apply, title, aspect, bg_draw_func=None,rect_label='水印',
@@ -7399,7 +7724,9 @@ class FFmpegBatchGUI:
                                   offset_x, offset_y, main_render_size, current_edit_track=track, tag="bg")
     
         title = f"可视化编辑叠加位置 - {os.path.basename(track.file_path)}"
-        aspect = curr_w / curr_h if curr_h != 0 else None
+        aspect = None
+        if curr_w and curr_h > 0:
+            aspect = curr_w / curr_h
         self._generic_overlay_editor(
             parent or self.root,
             canvas_w, canvas_h,
@@ -8819,12 +9146,13 @@ class FFmpegBatchGUI:
 
 
     def merge_smart_tile(self, main_track_idx, pad_enabled_var=None, pad_width_var=None, pad_height_var=None,
-                         items_per_row=4, items_per_col=4, orientation='auto'):
+                         items_per_row=4, items_per_col=4, orientation='auto', filt_frame=None):
         """
         智能平铺：所有视频（主视频+子视频）统一按行列排列。
         :param items_per_row: 横向优先时，每行视频数
         :param items_per_col: 纵向优先时，每列视频数
         :param orientation: 'auto' / 'horizontal' / 'vertical'
+        :param filt_frame: 可选，主视频的 VideoFilterFrame 控件，用于读取未保存的缩放/裁剪设置
         """
         if main_track_idx is None or main_track_idx >= len(self.merge_tracks):
             messagebox.showerror("错误", "无效的主视频轨道索引")
@@ -8849,9 +9177,30 @@ class FFmpegBatchGUI:
             messagebox.showinfo("提示", "没有可用于平铺的视频（至少需要一个子视频）")
             return
     
-        # 获取所有视频的渲染尺寸
-        infos = []
-        for t in all_tracks:
+        # ---- 获取主视频渲染尺寸：优先从 filt_frame 读取实时值 ----
+        if filt_frame is not None:
+            main_settings = {
+                "crop_enabled": filt_frame.crop_enabled.get(),
+                "crop_width": filt_frame.crop_width.get(),
+                "crop_height": filt_frame.crop_height.get(),
+                "scale_enabled": filt_frame.scale_enabled.get(),
+                "scale_method": filt_frame.scale_method.get(),
+                "scale_width": filt_frame.scale_width.get(),
+                "scale_height": filt_frame.scale_height.get(),
+                "rotate": filt_frame.rotate.get()
+            }
+            orig_w, orig_h = get_video_dimensions(self.ffprobe_cmd, main_track.file_path)
+            if orig_w is None or orig_h is None:
+                orig_w, orig_h = 1280, 720
+            main_w, main_h = self.compute_final_size_with_order(orig_w, orig_h, main_settings)
+        else:
+            main_w, main_h = self._get_video_render_size(main_track)
+            if main_w is None or main_h is None:
+                main_w, main_h = 1280, 720
+    
+        # ---- 获取所有子视频的渲染尺寸（仍从 enc_settings 读取） ----
+        infos = [(main_w, main_h, main_track)]
+        for t in sub_tracks:
             w, h = self._get_video_render_size(t)
             if w is None or h is None:
                 orig_w, orig_h = get_video_dimensions(self.ffprobe_cmd, t.file_path)
@@ -8889,26 +9238,19 @@ class FFmpegBatchGUI:
                             row_items.append(col_groups[c][r])
                     if row_items:
                         row_groups.append(row_items)
-            
             # 计算该布局下的画布真实宽高
             c_w = max(sum(w for w, h, t in row) for row in row_groups) if row_groups else 0
             c_h = sum(max(h for w, h, t in row) for row in row_groups) if row_groups else 0
             return row_groups, c_w, c_h
-
+    
         if orientation == 'auto':
-            # 1. 模拟横向优先
             h_groups, h_w, h_h = calculate_layout(True)
             h_ratio = h_w / h_h if h_h > 0 else float('inf')
-            
-            # 2. 模拟纵向优先
             v_groups, v_w, v_h = calculate_layout(False)
             v_ratio = v_w / v_h if v_h > 0 else float('inf')
-            
-            # 3. 智能选择：哪种布局的宽高比更接近 16:9 (1.777)？
-            target_ratio = 16 / 9 
+            target_ratio = 16 / 9
             h_diff = abs(h_ratio - target_ratio)
             v_diff = abs(v_ratio - target_ratio)
-            
             if h_diff <= v_diff:
                 horizontal_priority = True
                 row_groups, canvas_w, canvas_h = h_groups, h_w, h_h
@@ -8918,29 +9260,19 @@ class FFmpegBatchGUI:
         else:
             horizontal_priority = (orientation == 'horizontal')
             row_groups, canvas_w, canvas_h = calculate_layout(horizontal_priority)
-
-        # 如果画布尺寸计算失败，直接报错返回
+    
         if canvas_w == 0 or canvas_h == 0:
             messagebox.showerror("错误", "计算画布尺寸失败")
             return
 
-        # 精确计算每行的高度和宽度（用于后续偏移量计算）
-        row_heights = []
-        row_widths = []
-        for row in row_groups:
-            if row:
-                row_h = max(h for w, h, t in row)
-                row_w = sum(w for w, h, t in row)
-            else:
-                row_h = 0
-                row_w = 0
-            row_heights.append(row_h)
-            row_widths.append(row_w)
-        
-        # 用精确计算的 canvas_w 覆盖（防止浮点数或边缘情况误差）
-        canvas_w = max(row_widths) if row_widths else 0
-        canvas_h = sum(row_heights)
-
+        # 偶数保险：向下取整为偶数
+        if canvas_w % 2 != 0:
+            canvas_w -= 1
+        if canvas_h % 2 != 0:
+            canvas_h -= 1
+        canvas_w = max(2, canvas_w)
+        canvas_h = max(2, canvas_h)
+    
         # ---- 更新主视频的 pad 设置 ----
         main_track.enc_settings['pad_enabled'] = True
         main_track.enc_settings['pad_width'] = str(canvas_w)
@@ -8959,19 +9291,27 @@ class FFmpegBatchGUI:
         if pad_height_var is not None:
             pad_height_var.set(str(canvas_h))
     
+        # ---- 计算每行的高度（用于垂直偏移） ----
+        row_heights = []
+        for row in row_groups:
+            if row:
+                row_heights.append(max(h for w, h, t in row))
+            else:
+                row_heights.append(0)
+    
         # ---- 更新所有视频的叠加位置 ----
         y_offset = 0
         for row_idx, row in enumerate(row_groups):
             x_offset = 0
+            row_h = row_heights[row_idx]
             for w, h, t in row:
-                # 主视频已经固定在 (0,0)（通过 pad 偏移），不需要设置 overlay
                 if t != main_track:
                     t.enc_settings['overlay_x'] = str(x_offset)
                     t.enc_settings['overlay_y'] = str(y_offset)
                     t.overlay_x = str(x_offset)
                     t.overlay_y = str(y_offset)
                 x_offset += w
-            y_offset += row_heights[row_idx]
+            y_offset += row_h
     
         # ---- 刷新界面 ----
         self.merge_update_track_list()
@@ -11711,24 +12051,6 @@ class FFmpegBatchGUI:
     
             # ---- 保存按钮 ----
             def save():
-                # 获取语言：优先手动输入，其次下拉框
-                lang_code = custom_lang_entry.get().strip()
-                if not lang_code:
-                    # 从下拉框获取显示名，转为代码
-                    display = lang_display_var.get().strip()
-                    if display:
-                        for d, code in self.COMMON_LANGUAGES:
-                            if d == display:
-                                lang_code = code
-                                break
-                    else:
-                        lang_code = ""
-                # 映射标准化
-                if lang_code:
-                    lang_code = self.LANGUAGE_MAP.get(lang_code.lower(), lang_code)
-                else:
-                    lang_code = ""
-    
                 enc = encoder_var.get()
                 # 如果截取启用且编码器为 copy，强制改 aac
                 if trim_enabled_var.get() and enc == "copy":
@@ -11762,7 +12084,26 @@ class FFmpegBatchGUI:
                 else:
                     track.enc_settings["volume_enabled"] = vol_enabled_var.get()
                     track.enc_settings["volume"] = vol_value_var.get()
-    
+
+
+                # 获取语言：优先手动输入，其次下拉框
+                lang_code = custom_lang_entry.get().strip()
+                if not lang_code:
+                    # 从下拉框获取显示名，转为代码
+                    display = lang_display_var.get().strip()
+                    if display:
+                        for d, code in self.COMMON_LANGUAGES:
+                            if d == display:
+                                lang_code = code
+                                break
+                    else:
+                        lang_code = ""
+                # 映射标准化
+                if lang_code:
+                    lang_code = self.LANGUAGE_MAP.get(lang_code.lower(), lang_code)
+                else:
+                    lang_code = ""
+
                 track.language = lang_code
                 track.title = title_var.get().strip()
                 track.enc_settings["language"] = track.language
