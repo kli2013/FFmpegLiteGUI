@@ -1,0 +1,193 @@
+name: : Build FFmpeggui 2in1 x64 and two x86
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release 版本号（例如 v1.0.0），不填则自动生成'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # 优化 1: 添加 fail-fast: false，确保某个架构失败不会取消其他架构的构建
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            python-version: '3.x'          # 高版本 64 位
+            build-label: '_x64'
+          - arch: x86
+            python-version: '3.8.10'          # 低版本 32 位（支持 Win7）
+            build-label: '_forwin7_orX86'
+          - arch: x86
+            python-version: '3.x'          # 高版本 32 位
+            build-label: '_x86'
+
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: 设置 Python (${{ matrix.build-label }})
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: ${{ matrix.arch }}
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install tkinterdnd2
+
+      # ========== 获取版本号 ==========
+      - name: 获取版本号
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.event.inputs.version }}" -ne "") {
+            $VER = "${{ github.event.inputs.version }}"
+          } else {
+            $VER = git describe --tags --always --dirty 2>$null
+            if (-not $VER) { $VER = "continuous-${{ github.run_number }}" }
+          }
+          echo "VERSION=$VER" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "版本号: $VER"
+
+      # ========== 更新主程序 version.txt ==========
+      - name: 动态更新主程序版本信息 (version.txt)
+        shell: pwsh
+        run: |
+          if (Test-Path version.txt) {
+            $cleanVer = "${{ env.VERSION }}".TrimStart('v')
+            if ($cleanVer -match '^\d+\.\d+\.\d+') {
+              $verParts = $cleanVer.Split('.')
+              $verTuple = ($verParts[0..2] | ForEach-Object { $_ }) -join ','
+              $verTuple += ",0"
+            } else {
+              $verTuple = "1,0,0,0"
+              $cleanVer = "1.0.0"
+            }
+            (Get-Content version.txt -Raw) -replace 'filevers=\(.*?\)', "filevers=($verTuple)" | Set-Content version.txt -NoNewline
+            (Get-Content version.txt -Raw) -replace "u'FileVersion', u'.*?'", "u'FileVersion', u'$cleanVer'" | Set-Content version.txt -NoNewline
+            (Get-Content version.txt -Raw) -replace "u'ProductVersion', u'.*?'", "u'ProductVersion', u'$cleanVer'" | Set-Content version.txt -NoNewline
+          }
+
+      # ========== 编译主程序（文件夹版，名称含 build-label） ==========
+      - name: 构建主程序 (文件夹版)
+        shell: pwsh
+        run: |
+          $mainName = "FFmpeg简易转换合并_newui_folder_${{ env.VERSION }}_${{ matrix.build-label }}"
+          pyinstaller -D -w --name $mainName --icon 35.ico --add-data "ffmpeg_presets.json;." --add-data "35.ico;." --version-file version.txt "FFmpeg简易转换合并newui.pyw"
+          echo "MAIN_EXE_DIR=dist\$mainName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # ========== 更新附属程序 version1.txt ==========
+      - name: 动态更新附属程序版本信息 (version1.txt)
+        shell: pwsh
+        run: |
+          if (Test-Path version1.txt) {
+            $cleanVer = "${{ env.VERSION }}".TrimStart('v')
+            if ($cleanVer -match '^\d+\.\d+\.\d+') {
+              $verParts = $cleanVer.Split('.')
+              $verTuple = ($verParts[0..2] | ForEach-Object { $_ }) -join ','
+              $verTuple += ",0"
+            } else {
+              $verTuple = "1,0,0,0"
+              $cleanVer = "1.0.0"
+            }
+            (Get-Content version1.txt -Raw) -replace 'filevers=\(.*?\)', "filevers=($verTuple)" | Set-Content version1.txt -NoNewline
+            (Get-Content version1.txt -Raw) -replace "u'FileVersion', u'.*?'", "u'FileVersion', u'$cleanVer'" | Set-Content version1.txt -NoNewline
+            (Get-Content version1.txt -Raw) -replace "u'ProductVersion', u'.*?'", "u'ProductVersion', u'$cleanVer'" | Set-Content version1.txt -NoNewline
+          }
+
+      # ========== 编译附属程序（名称含 build-label） ==========
+      - name: 构建附属程序 (文件夹版)
+        shell: pwsh
+        run: |
+          $subName = "水印轨迹编排器_多轨道_folder_${{ env.VERSION }}_${{ matrix.build-label }}"
+          pyinstaller -D -w --name $subName --icon 35.ico --version-file version1.txt "水印轨迹编排器 多轨道.pyw"
+          echo "SUB_EXE_DIR=dist\$subName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # ========== 复制附属程序到主程序目录 ==========
+      - name: 合并产物
+        shell: pwsh
+        run: |
+          Write-Host "正在将附属程序复制到主程序目录..."
+          $subExe = Get-ChildItem -Path $env:SUB_EXE_DIR -Filter "*.exe" | Select-Object -First 1
+          if (-not $subExe) {
+            Write-Error "未找到附属程序的 exe 文件！"
+            exit 1
+          }
+          Copy-Item -Path $subExe.FullName -Destination $env:MAIN_EXE_DIR -Force
+          Write-Host "复制完成: $($subExe.Name) -> $env:MAIN_EXE_DIR"
+
+      # ========== 打包最终产物 ==========
+      - name: 打包最终产物
+        shell: pwsh
+        run: |
+          mkdir upload_files -ErrorAction SilentlyContinue
+          $mainDirName = Split-Path $env:MAIN_EXE_DIR -Leaf
+          Compress-Archive -Path "$env:MAIN_EXE_DIR\*" -DestinationPath "upload_files\$mainDirName.zip" -Force
+          Write-Host "打包完成: upload_files\$mainDirName.zip"
+
+      # ========== 上传各架构的打包文件作为 Artifact ==========
+      - name: 上传 Artifact (${{ matrix.build-label }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.build-label }}
+          path: upload_files/*.zip
+
+  # ========== 发布 Job：合并所有 Artifact 并创建 Release ==========
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6 # 优化 2: 必须 checkout 才能在 release job 中使用 git describe
+
+      - name: 下载所有构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: all_artifacts
+
+      - name: 列出下载的文件（调试）
+        run: ls -R all_artifacts
+
+      # 优化 3: 统一使用 pwsh 获取版本号，确保与 build job 逻辑完全一致
+      - name: 获取版本号
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.event.inputs.version }}" -ne "") {
+            $VER = "${{ github.event.inputs.version }}"
+          } else {
+            $VER = git describe --tags --always --dirty 2>$null
+            if (-not $VER) { $VER = "continuous-${{ github.run_number }}" }
+          }
+          echo "VERSION=$VER" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "版本号: $VER"
+
+      - name: 创建 Release 并上传所有 zip
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: "Release ${{ env.VERSION }}"
+          body: |
+            自动构建版本 ${{ env.VERSION }}
+            
+            - 包含 **FFmpeg简易转换合并newui** (文件夹便携版)
+            - 内置 **水印轨迹编排器 多轨道** 可执行文件
+            - 统一使用 35.ico 图标
+            - **提供三个版本**：
+              - `x64`（高版本 Python 3.x）
+              - `x86`（高版本 Python 3.x）
+              - `x86-py38`（低版本 Python 3.8，兼容 Windows 7，⚠️ 列表自定义颜色有bug）
+            请根据系统环境选择合适的压缩包。
+          files: all_artifacts/**/*.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
