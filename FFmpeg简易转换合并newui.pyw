@@ -8970,7 +8970,8 @@ class FFmpegBatchGUI:
                 "启用后，所有视频流将强制重新编码（无法使用 copy），\n"
                 "    输出时长默认由主视频决定，您也可以开启「手动时长」精确控制。\n\n"
                 "提示：每个视频轨道都可独立设置位置、大小、透明度、绿幕抠像等。\n"
-                "    画中画模式每个音频的倒放是独立的。\n",
+                "    画中画模式每个音频的倒放是独立的。\n\n"
+                "该模式下的主视频偏移页有友好操作按钮，可自动计算平铺，\n方便用户把多个视频左右或上下平铺拼接等。",
                 wraplength=700)
 
         self.concat_enabled = tk.BooleanVar(value=False)
@@ -8993,7 +8994,8 @@ class FFmpegBatchGUI:
                 "【重新编码模式（编码器 ≠ copy）】\n"
                 "• 系统会对所有视频进行重新编码，强制统一参数，拼接后播放流畅。\n"
                 "• 为提高兼容性，建议所有源文件分辨率保持一致；若不同，系统会自动尝试缩放，但可能影响画质。\n"
-                "• 该模式下，您也可以额外应用滤镜（如裁剪、缩放、旋转等）到整个拼接结果。\n\n"
+                "• 子视频可单独裁剪、翻转、反交错、旋转（但是因为子视频会强制按主视频缩放，\n    所以呈现的画面会是旋转后拉伸的怪诞景象）\n"
+                "• 该模式下，您也可以额外应用滤镜(按主视频的参数选择)到整个拼接结果。\n\n"
                 "• 若文件数量众多，重新编码会消耗较多时间，建议预先用 FFmpeg 统一转码后再使用流复制模式。",
                 wraplength=700)
 
@@ -9735,7 +9737,7 @@ class FFmpegBatchGUI:
     def _finish_drop_pip(self, video_files, add_audio):
         """
         画中画模式后台解析完成后的回调：删除视频占位轨道，添加真实视频流，并根据 add_audio 添加音频。
-        增强：错误处理、路径规范化、错误标记。
+        允许重复添加（不去重）。
         """
         self._batch_update = True
         try:
@@ -9749,7 +9751,7 @@ class FFmpegBatchGUI:
             for idx in reversed(to_remove):
                 del self.merge_tracks[idx]
     
-            # 2. 添加真实视频流和（可选）音频流
+            # 2. 添加真实视频流和（可选）音频流（不去重）
             for vf in video_files:
                 info = self._get_cached_stream_info(vf)
                 if not info:
@@ -9765,7 +9767,7 @@ class FFmpegBatchGUI:
                 if video_streams:
                     s = video_streams[0]
                     track = Track(s['index'], "video", s.get('codec_name', 'unknown'), vf, True)
-                    # 保留画中画默认设置（与占位一致）
+                    # 保留画中画默认设置
                     track.enc_settings["scale_enabled"] = True
                     track.enc_settings["scale_width"] = "320"
                     track.enc_settings["scale_height"] = ""
@@ -9774,30 +9776,22 @@ class FFmpegBatchGUI:
                     track.enc_settings["overlay_x"] = "W-w-10"
                     track.enc_settings["overlay_y"] = "H-h-10"
                     track.overlay_enabled = True
-                    # 检查是否已存在相同视频轨道（去重）
-                    exists = any(t.file_path == vf and t.index == s['index'] and t.type == 'video' for t in self.merge_tracks)
-                    if not exists:
-                        self.merge_tracks.append(track)
-                        self._append_info_ui(f"[封装] 已解析并添加画中画视频: {os.path.basename(vf)}")
-                    else:
-                        self._append_info_ui(f"[封装] 视频流已存在，跳过: {os.path.basename(vf)}")
+                    # 直接添加，不再检查重复
+                    self.merge_tracks.append(track)
+                    self._append_info_ui(f"[封装] 已解析并添加画中画视频: {os.path.basename(vf)}")
                 else:
                     self._append_info_ui(f"[封装] {os.path.basename(vf)} 不包含视频流，跳过")
     
-                # 如果需要添加音频
+                # 如果需要添加音频（不去重）
                 if add_audio:
                     audio_streams = [s for s in info['streams'] if s.get('codec_type') == 'audio']
                     for s_audio in audio_streams:
-                        # 检查是否已存在相同音频轨道（避免重复）
-                        exists = any(t.file_path == vf and t.index == s_audio['index'] and t.type == 'audio' for t in self.merge_tracks)
-                        if not exists:
-                            audio_track = Track(s_audio['index'], "audio", s_audio.get('codec_name', 'unknown'), vf, True)
-                            self.merge_tracks.append(audio_track)
-                            self._append_info_ui(f"[封装] 已添加音频流: {s_audio.get('codec_name', 'unknown')}")
+                        audio_track = Track(s_audio['index'], "audio", s_audio.get('codec_name', 'unknown'), vf, True)
+                        self.merge_tracks.append(audio_track)
+                        self._append_info_ui(f"[封装] 已添加音频流: {s_audio.get('codec_name', 'unknown')}")
     
         finally:
             self._batch_update = False
-            # 刷新列表和预览
             self.merge_update_track_list()
             self.merge_auto_recommend_container()
             self._ensure_main_video(disable_scale=True)
@@ -9863,6 +9857,7 @@ class FFmpegBatchGUI:
     def _finish_drop_concat(self, video_files, other_files):
         """
         串联模式后台解析完成后的回调：删除占位，添加真实流，处理错误。
+        允许重复添加（不去重）。
         """
         audio_exts = ('.mp3', '.aac', '.m4a', '.wav', '.flac', '.ogg', '.opus', '.ac3', '.dts')
         subtitle_exts = ('.srt', '.ass', '.ssa', '.vtt', '.idx', '.sup')
@@ -9878,11 +9873,10 @@ class FFmpegBatchGUI:
             for idx in reversed(to_remove):
                 del self.merge_tracks[idx]
     
-            # 2. 添加真实流（视频、音频、字幕）
+            # 2. 添加真实流（视频、音频、字幕）（不去重）
             for vf in video_files:
                 info = self._get_cached_stream_info(vf)
                 if not info:
-                    # 解析失败：添加错误标记轨道
                     error_track = Track(0, "video", "error", vf, True)
                     error_track.enc_settings["_error"] = "解析失败"
                     self.merge_tracks.append(error_track)
@@ -9894,15 +9888,11 @@ class FFmpegBatchGUI:
                     st = s.get('codec_type')
                     if st not in ('video', 'audio', 'subtitle'):
                         continue
-                    # 检查是否已存在相同轨道（去重）
-                    exists = any(t.file_path == vf and t.index == s['index'] for t in self.merge_tracks)
-                    if exists:
-                        continue
                     track = Track(s['index'], st, s.get('codec_name', 'unknown'), vf, True)
                     self.merge_tracks.append(track)
                 self._append_info_ui(f"[封装] 已解析并添加串联视频: {os.path.basename(vf)}")
     
-            # 3. 处理其他文件（音频/字幕）
+            # 3. 处理其他文件（音频/字幕）（不去重）
             for f in other_files:
                 ext = os.path.splitext(f)[1].lower()
                 if ext in audio_exts:
@@ -9914,7 +9904,6 @@ class FFmpegBatchGUI:
     
         finally:
             self._batch_update = False
-            # 刷新列表
             self.merge_update_track_list()
             self.merge_auto_recommend_container()
             self._ensure_main_video()
@@ -9925,7 +9914,7 @@ class FFmpegBatchGUI:
     
     def _add_external_streams_silent(self, file_path, stream_type):
         """
-        静默添加外部音频/字幕流（不触发刷新）。
+        静默添加外部音频/字幕流（不触发刷新），允许重复添加。
         """
         info = self._get_cached_stream_info(file_path)
         if not info:
@@ -9934,9 +9923,6 @@ class FFmpegBatchGUI:
         added = 0
         for s in info.get('streams', []):
             if s.get('codec_type') != stream_type:
-                continue
-            exists = any(t.file_path == file_path and t.index == s['index'] for t in self.merge_tracks)
-            if exists:
                 continue
             track = Track(s['index'], stream_type, s.get('codec_name', 'unknown'), file_path, True)
             self.merge_tracks.append(track)
@@ -10747,11 +10733,11 @@ class FFmpegBatchGUI:
     def _build_concat_reencode_mode(self, cmd, video_tracks, audio_tracks, main_video, output_norm):
         """
         重新编码模式 - 使用 filter_complex concat。
-        支持每个视频独立裁剪/旋转/翻转。
-        强制统一分辨率、像素格式、帧率、SAR（以主视频为准）。
-        全局应用增强、变速、倒放、字幕烧录（视频）和音量/变速/倒放（音频）。
+        每个片段独立控制：裁剪、旋转、翻转、反交错、截取、倒放、增强、变速。
+        强制统一分辨率、像素格式、帧率、SAR。
+        全局阶段仅应用：视频字幕烧录；音频音量调整。
         """
-        # ----- 1. 计算主视频最终输出规格 -----
+        # ----- 1. 计算主视频最终输出规格（用于强制统一） -----
         main_orig_w, main_orig_h = get_video_dimensions(self.ffprobe_cmd, main_video.file_path)
         if main_orig_w is None or main_orig_h is None:
             main_orig_w, main_orig_h = 1280, 720
@@ -10791,16 +10777,16 @@ class FFmpegBatchGUI:
         for i, track in enumerate(video_tracks):
             settings = track.enc_settings.copy()
     
-            # 独立视频滤镜：仅允许裁剪、旋转、翻转、反交错（不含 enhance、speed、reverse、subtitle、scale、format、trim）
+            # ----- 视频部分（所有滤镜独立） -----
             video_filters = build_video_filter_chain(
                 settings,
                 include_subtitle=False,
-                include_speed=False,
-                include_trim=False,
-                include_format=False,
-                include_scale=False,
-                enhance_settings={},                 # 独立片段不应用增强
-                reverse=False
+                include_speed=True,                  # 变速独立
+                include_trim=True,                   # 截取独立
+                include_format=False,                # 格式由强制统一覆盖
+                include_scale=False,                 # 缩放由强制统一覆盖
+                enhance_settings=settings.get("enhance", {}),  # 增强独立
+                reverse=settings.get("reverse_enabled", False) # 倒放独立
             )
     
             # 强制统一滤镜（所有视频一致）
@@ -10820,68 +10806,68 @@ class FFmpegBatchGUI:
             filter_parts.append(f"[{i}:v]{full_vf}[v{i}]")
             v_labels.append(f"[v{i}]")
     
-            # ----- 音频处理（独立选择） -----
-            audio_type = track.enc_settings.get("audio_source_type", "self")
-            if audio_type == "silence":
-                effective_duration = self._get_effective_duration(settings, input_path=track.file_path)
-                if effective_duration is None or effective_duration <= 0:
-                    effective_duration = 10.0
+            # ----- 音频部分（独立截取、倒放、变速） -----
+            # 获取音频源类型
+            audio_type = settings.get("audio_source_type", "self")
+            effective_duration = self._get_effective_duration(settings, input_path=track.file_path)
+            if effective_duration is None or effective_duration <= 0:
+                effective_duration = 10.0  # 降级
+    
+            # 检测该文件是否有音频流
+            has_audio = False
+            info = self._get_cached_stream_info(track.file_path)
+            if info:
+                has_audio = any(s.get('codec_type') == 'audio' for s in info.get('streams', []))
+    
+            if audio_type == "silence" or not has_audio:
+                # 静音生成，时长取 effective_duration
                 filter_parts.append(f"anullsrc=r=44100:cl=stereo:duration={effective_duration:.3f}[a{i}]")
-                a_labels.append(f"[a{i}]")
             else:
-                filter_parts.append(f"[{i}:a]asetpts=PTS-STARTPTS[a{i}]")
-                a_labels.append(f"[a{i}]")
+                # 使用自身音频流，构建独立音频滤镜
+                audio_filters = []
+    
+                # 截取（若启用）
+                if settings.get("trim_enabled", False):
+                    start = settings.get("trim_start", "").strip()
+                    end = settings.get("trim_end", "").strip()
+                    start_sec = time_to_seconds(start) if start else 0.0
+                    if effective_duration > 0:
+                        audio_filters.append(f"atrim=start={start_sec:.3f}:duration={effective_duration:.3f}")
+                        audio_filters.append("asetpts=PTS-STARTPTS")
+                    else:
+                        # 若无有效时长，不截取
+                        pass
+    
+                # 倒放（若启用）
+                if settings.get("reverse_enabled", False):
+                    audio_filters.append("areverse")
+    
+                # 变速（若启用）
+                if settings.get("speed_enabled", False):
+                    try:
+                        factor = float(settings.get("speed_factor", "1.0"))
+                        if factor != 1.0 and factor > 0:
+                            atempo_chain = build_atempo_chain(factor)
+                            if atempo_chain:
+                                audio_filters.append(atempo_chain)
+                    except ValueError:
+                        pass
+    
+                # 如果没有滤镜，至少重置时间戳
+                if not audio_filters:
+                    audio_filters.append("asetpts=PTS-STARTPTS")
+    
+                audio_chain = ",".join(audio_filters)
+                filter_parts.append(f"[{i}:a]{audio_chain}[a{i}]")
+    
+            a_labels.append(f"[a{i}]")
     
         # ----- 4. 视频拼接 -----
         v_concat = f"{''.join(v_labels)}concat=n={n}:v=1:a=0[vout]"
         filter_parts.append(v_concat)
     
-        # ----- 5. 视频全局滤镜（增强、变速、倒放、字幕）-----
+        # ----- 5. 视频全局滤镜：仅字幕 -----
         global_video_filters = []
-    
-        # 增强（单次应用）
-        enhance = main_video.enc_settings.get("enhance", {})
-        if enhance:
-            temp_settings = {
-                "crop_enabled": False,
-                "scale_enabled": False,
-                "rotate": "none",
-                "vflip": False,
-                "hflip": False,
-                "speed_enabled": False,
-                "deinterlace_filter": "none",
-                "pix_fmt_enabled": False,
-                "subtitle_enabled": False,
-                "reverse_enabled": False,
-                "enhance": enhance,
-            }
-            enhance_filter = build_video_filter_chain(
-                temp_settings,
-                include_subtitle=False,
-                include_speed=False,
-                include_trim=False,
-                include_format=False,
-                include_scale=False,
-                enhance_settings=enhance,
-                reverse=False
-            )
-            if enhance_filter and enhance_filter != "null":
-                global_video_filters.append(enhance_filter)
-    
-        # 倒放（先处理）
-        if main_video.enc_settings.get("reverse_enabled", False):
-            global_video_filters.append("reverse")
-    
-        # 变速（后处理）
-        if main_video.enc_settings.get("speed_enabled", False):
-            try:
-                factor = float(main_video.enc_settings.get("speed_factor", "1.0"))
-                if factor > 0 and factor != 1.0:
-                    global_video_filters.append(f"setpts={1.0/factor}*PTS")
-            except ValueError:
-                pass
-    
-        # 字幕烧录（使用 filename 选项）
         if main_video.enc_settings.get("subtitle_enabled", False):
             sub_path = main_video.enc_settings.get("subtitle_path", "").strip()
             if sub_path:
@@ -10899,31 +10885,12 @@ class FFmpegBatchGUI:
         a_concat = f"{''.join(a_labels)}concat=n={n}:v=0:a=1[aout]"
         filter_parts.append(a_concat)
     
-        # ----- 7. 音频全局滤镜（音量、变速、倒放）-----
+        # ----- 7. 音频全局滤镜：仅音量 -----
         audio_global_filters = []
-    
-        # 音量
         if main_video.enc_settings.get("volume_enabled", False):
             vol = main_video.enc_settings.get("volume", 1.0)
             if vol != 1.0:
                 audio_global_filters.append(f"volume={vol:.2f}")
-
-        # 倒放
-        if main_video.enc_settings.get("reverse_enabled", False):
-            audio_global_filters.append("areverse")
-
-        # 变速（使用 atempo 链）
-        if main_video.enc_settings.get("speed_enabled", False):
-            try:
-                factor = float(main_video.enc_settings.get("speed_factor", "1.0"))
-                if factor != 1.0 and factor > 0:
-                    atempo_chain = build_atempo_chain(factor)
-                    if atempo_chain:
-                        audio_global_filters.append(atempo_chain)
-            except ValueError:
-                pass
-    
-
     
         if audio_global_filters:
             audio_global_chain = ",".join(audio_global_filters)
@@ -12096,8 +12063,8 @@ class FFmpegBatchGUI:
         enabled_videos = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
         is_main = (enabled_videos and enabled_videos[0] == track)
         overlay_mode = 'main' if is_main else 'sub'
-        # 主视频不显示循环/绿幕
-        show_loop = not is_main
+        # 仅在画中画模式且不是主视频时显示循环/绿幕控制
+        show_loop = self.pip_enabled.get() and not is_main
 
         initial_settings = track.enc_settings.copy()
         if "enhance" not in initial_settings:
@@ -12542,25 +12509,23 @@ class FFmpegBatchGUI:
 
     def merge_add_external(self, ftype, path=None):
         # 1. 如果未传入有效路径，弹出文件选择对话框
-        if not path:  # 处理 None 或空字符串
+        if not path:
             if ftype == "audio":
                 types = [("音频", "*.mp3 *.aac *.m4a *.wav *.flac *.ogg *.opus *.ac3 *.dts *.mka")]
             else:
                 types = [("字幕", "*.srt *.ass *.ssa *.vtt *.idx *.sup")]
             path = filedialog.askopenfilename(filetypes=types)
-            if not path:  # 用户取消
+            if not path:
                 return
     
-        # 2. 现在 path 肯定是一个非空字符串，可以安全地检查是否为目录
         if os.path.isdir(path):
             self._append_info_ui(f"[封装] 忽略文件夹: {os.path.basename(path)}，请选择文件")
             return
     
-        # 3. 检查主视频是否已设置
         if not self.merge_video.get():
             self._append_info_ui("[封装] 请先设置主视频")
             return
-
+    
         info = self._get_cached_stream_info(path)
         if not info:
             self._append_info_ui(f"[封装] 无法解析: {path}")
@@ -12570,10 +12535,6 @@ class FFmpegBatchGUI:
             added = 0
             for s in info["streams"]:
                 if s.get("codec_type") != expected:
-                    continue
-                exists = any(t.file_path == path and t.index == s["index"] for t in self.merge_tracks)
-                if exists:
-                    self._append_info_ui(f"[封装] 跳过重复轨道: {os.path.basename(path)} 流 #{s['index']} ({expected})")
                     continue
                 track = Track(s["index"], expected, s.get("codec_name","unknown"), path, True)
                 self.merge_tracks.append(track)
