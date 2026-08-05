@@ -8919,7 +8919,12 @@ class FFmpegBatchGUI:
         merge_style = ttk.Style()
         merge_style.configure("Merge.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0", rowheight=int(22 * self.scaling))
         merge_style.configure("Merge.Treeview.Heading", background="#d9d9d9")
-    
+
+        merge_style.map("Merge.Treeview",
+                        background=[('selected', '#3475b5')],
+                        foreground=[('selected', 'white')],
+                        fieldbackground=[('selected', '#3475b5')])
+
         # 创建 Treeview（只一次）
         columns = ("序号", "启用", "类型", "规格", "编码", "来源", "编码设置 双击编辑")
         self.merge_tree = ttk.Treeview(list_container, columns=columns, show="headings",
@@ -13675,7 +13680,12 @@ class FFmpegBatchGUI:
         extract_style = ttk.Style()
         extract_style.configure("Extract.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0", rowheight=int(22 * self.scaling))
         extract_style.configure("Extract.Treeview.Heading", background="#d9d9d9")
-    
+
+        extract_style.map("Extract.Treeview",
+                          background=[('selected', '#3475b5')],
+                          foreground=[('selected', 'white')],
+                          fieldbackground=[('selected', '#3475b5')])
+
         columns = ("文件名", "完整路径")
         self.extract_tree = ttk.Treeview(list_container, columns=columns, show="headings",
                                          height=8, style="Extract.Treeview")
@@ -14730,7 +14740,12 @@ class FFmpegBatchGUI:
         Batch_style = ttk.Style()
         Batch_style.configure("Batch.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0", rowheight=int(22 * self.scaling))
         Batch_style.configure("Batch.Treeview.Heading", background="#d9d9d9")
-    
+
+        Batch_style.map("Batch.Treeview",
+                        background=[('selected', '#3475b5')],
+                        foreground=[('selected', 'white')],
+                        fieldbackground=[('selected', '#3475b5')])
+
         columns = ("序号", "文件名", "输出路径", "命令 (简洁) 双击编辑", "状态", "错误信息")
         self.task_tree = ttk.Treeview(list_container, columns=columns, show="headings",
                                        height=8, style="Batch.Treeview")
