@@ -4857,6 +4857,8 @@ class FFmpegBatchGUI:
         self._concat_params_cache = {}
         
         self._merge_preview_after_id = None   # 合并命令预览防抖 ID
+        
+        self._clipboard_filter_params = None   # 存储复制的参数字典
 
 
         # ffprobe 并发数量计算
@@ -4998,6 +5000,38 @@ class FFmpegBatchGUI:
         self.root.deiconify()
 
 
+
+
+    def _get_filter_param_keys(self, track_type):
+        """返回需要复制/粘贴的滤镜参数键列表"""
+        if track_type == "video":
+            return [
+                "crop_enabled", "crop_left", "crop_top", "crop_width", "crop_height",
+                "scale_enabled", "scale_width", "scale_height", "scale_method",
+                "rotate", "vflip", "hflip",
+                "deinterlace_filter",
+                "speed_enabled", "speed_factor",
+                "reverse_enabled",
+                "trim_enabled", "trim_start", "trim_end", "precise_trim",
+                # 画中画特有（但复制无害）
+                "overlay_enabled", "overlay_x", "overlay_y",
+                "pad_enabled", "pad_width", "pad_height", "offset_x", "offset_y",
+                "loop_enabled", "loop_mode", "loop_count",
+                "chroma_enabled", "chroma_color", "chroma_similarity", "chroma_blend",
+                "alpha_enabled", "alpha_value", "chroma_filter_type",
+                "enhance",  # 整个字典
+                "audio_source_type",  # 音频源选择（视频轨道也有）
+            ]
+        elif track_type == "audio":
+            return [
+                "trim_enabled", "trim_start", "trim_end", "precise_trim",
+                "reverse_enabled",  # 音频独立倒放
+                "speed_enabled", "speed_factor",
+                "volume_enabled", "volume",
+                "mix_enabled",
+                "audio_reverse",  # 如果有独立音频倒放
+            ]
+        return []
 
     def _delayed_init(self):
         """在后台线程中释放预设文件和命令模板，避免阻塞 UI"""
@@ -8887,9 +8921,9 @@ class FFmpegBatchGUI:
         ttk.Button(f1, text="浏览", command=self.merge_select_video).pack(side=tk.RIGHT, padx=(2,15))
     
         if DND_AVAILABLE:
-            label_text = "轨道列表（可双击编辑单独设置编码参数，支持批量拖拽添加文件）"
+            label_text = "轨道列表（支持批量拖拽添加文件）"
         else:
-            label_text = "轨道列表（可双击编辑单独设置编码参数）"
+            label_text = "轨道列表"
         ttk.Label(parent, text=label_text).pack(anchor=tk.W, pady=(0,2))
     
         # 轨道列表（Treeview）
@@ -8910,8 +8944,8 @@ class FFmpegBatchGUI:
         ttk.Button(tool_frame, text="删除", command=self.merge_delete_selected, width=8).pack(side=tk.LEFT, padx=2)
         ttk.Button(tool_frame, text="清空", command=self.merge_clear_tracks, width=8).pack(side=tk.LEFT, padx=2)
         ttk.Button(tool_frame, text="恢复列宽", command=self.merge_reset_column_widths, width=8).pack(side=tk.LEFT, padx=2)
-        ttk.Button(tool_frame, text="按文件名排序", command=self.merge_sort_by_filename).pack(side=tk.LEFT, padx=2)
-        ttk.Button(tool_frame, text="按修改时间排序", command=self.merge_sort_by_mtime).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text="排序", command=self._merge_sort_ask, width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text="更多 ▼", command=self._merge_popup_more_menu).pack(side=tk.LEFT, padx=2)
         ttk.Button(tool_frame, text="💾 保存项目", command=self.save_merge_project).pack(side=tk.LEFT, padx=2)
         ttk.Button(tool_frame, text="📂 加载项目", command=self.load_merge_project).pack(side=tk.LEFT, padx=2)
     
@@ -8926,7 +8960,7 @@ class FFmpegBatchGUI:
                         fieldbackground=[('selected', '#3475b5')])
 
         # 创建 Treeview（只一次）
-        columns = ("序号", "启用", "类型", "规格", "编码", "来源", "编码设置 双击编辑")
+        columns = ("序号", "启用", "类型", "规格", "编码", "来源 - 双击编辑 右键更多", "编码设置")
         self.merge_tree = ttk.Treeview(list_container, columns=columns, show="headings",
                                        height=8, style="Merge.Treeview")
         self.merge_tree.heading("序号", text="序号")
@@ -8934,15 +8968,15 @@ class FFmpegBatchGUI:
         self.merge_tree.heading("类型", text="类型")
         self.merge_tree.heading("规格", text="规格")
         self.merge_tree.heading("编码", text="编码")
-        self.merge_tree.heading("来源", text="来源")
-        self.merge_tree.heading("编码设置 双击编辑", text="编码设置 双击编辑")
-        self.merge_tree.column("序号", width=5, anchor="center")
+        self.merge_tree.heading("来源 - 双击编辑 右键更多", text="来源 - 双击编辑 右键更多")
+        self.merge_tree.heading("编码设置", text="编码设置")
+        self.merge_tree.column("序号", width=10, anchor="center")
         self.merge_tree.column("启用", width=5, anchor="center")
-        self.merge_tree.column("类型", width=20)
-        self.merge_tree.column("规格", width=100)
+        self.merge_tree.column("类型", width=30)
+        self.merge_tree.column("规格", width=120)
         self.merge_tree.column("编码", width=20)
-        self.merge_tree.column("来源", width=495)
-        self.merge_tree.column("编码设置 双击编辑", width=80)
+        self.merge_tree.column("来源 - 双击编辑 右键更多", width=480)
+        self.merge_tree.column("编码设置", width=60)
         self.merge_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     
         # 滚动条
@@ -8952,6 +8986,7 @@ class FFmpegBatchGUI:
     
         # 绑定双击编辑
         self.merge_tree.bind("<Double-1>", self.merge_on_tree_double_click)
+        self.merge_tree.bind("<Button-3>", self._show_merge_tree_context_menu)
     
 
         btn_frame = ttk.Frame(parent)
@@ -8971,7 +9006,8 @@ class FFmpegBatchGUI:
                 "    输出时长默认由主视频决定，您也可以开启「手动时长」精确控制。\n\n"
                 "提示：每个视频轨道都可独立设置位置、大小、透明度、绿幕抠像等。\n"
                 "    画中画模式每个音频的倒放是独立的。\n\n"
-                "该模式下的主视频偏移页有友好操作按钮，可自动计算平铺，\n方便用户把多个视频左右或上下平铺拼接等。",
+                "该模式下的主视频偏移页有友好操作按钮，可自动计算平铺，\n方便用户把多个视频左右或上下平铺拼接等。\n\n"
+                "提示2：画中画拖拽额外支持文件夹解析。",
                 wraplength=700)
 
         self.concat_enabled = tk.BooleanVar(value=False)
@@ -8992,11 +9028,11 @@ class FFmpegBatchGUI:
                 "  - 同一个视频文件的循环拼接（如片头/背景）\n"
                 "• 建议：若不确定文件参数是否一致，或者串接后不满意，请使用【重新编码模式】。\n\n"
                 "【重新编码模式（编码器 ≠ copy）】\n"
-                "• 系统会对所有视频进行重新编码，强制统一参数，拼接后播放流畅。\n"
-                "• 为提高兼容性，建议所有源文件分辨率保持一致；若不同，系统会自动尝试缩放，但可能影响画质。\n"
-                "• 子视频可单独裁剪、翻转、反交错、旋转（但是因为子视频会强制按主视频缩放，\n    所以呈现的画面会是旋转后拉伸的怪诞景象）\n"
-                "• 该模式下，您也可以额外应用滤镜(按主视频的参数选择)到整个拼接结果。\n\n"
-                "• 若文件数量众多，重新编码会消耗较多时间，建议预先用 FFmpeg 统一转码后再使用流复制模式。",
+                "• 为提高兼容性，建议所有源文件分辨率保持一致；若不同，系统会自动统一为主视频缩放尺寸，但可能影响画质。\n"
+                "• 子视频可单独应用所有滤镜(除了字幕)\n"
+                "• 音频的变速、倒放、截取跟随视频参数。\n\n"
+                "• 若文件数量众多，重新编码会消耗较多时间，也可预先用 FFmpeg 统一转码后再使用流复制模式。\n\n"
+                "提示：串行合并拖拽额外支持文件夹解析。",
                 wraplength=700)
 
         ttk.Button(btn_frame, text="添加外部视频（画中画/串行）", 
@@ -9158,6 +9194,203 @@ class FFmpegBatchGUI:
 
         self.pip_enabled.trace_add('write', self._on_pip_toggle)
         self.concat_enabled.trace_add('write', self._on_concat_toggle)
+
+
+    def _merge_sort_ask(self):
+        """弹出询问框，选择排序方式（仅在串行合并模式下可用）"""
+        if not self.concat_enabled.get():
+            messagebox.showinfo("提示", "排序功能仅在「串行合并（首尾拼接）」模式下可用。\n请先勾选「串行合并（首尾拼接）」选项。")
+            return
+        result = messagebox.askyesno("排序方式", "按文件名排序？\n（选“是”按文件名，选“否”按修改时间）")
+        if result:
+            self.merge_sort_by_filename()
+        else:
+            self.merge_sort_by_mtime()
+
+
+    def _show_merge_tree_context_menu(self, event):
+        """右键事件触发，显示菜单"""
+        item = self.merge_tree.identify_row(event.y)
+        if not item:
+            return
+        if item not in self.merge_tree.selection():
+            self.merge_tree.selection_set(item)
+        self._popup_merge_tree_menu(event.x_root, event.y_root)
+    
+    def _popup_merge_tree_menu(self, x, y):
+        """在指定位置弹出轨道菜单（复用于按钮）"""
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="复制滤镜设置", command=self._copy_filter_from_selected)
+        if self._clipboard_filter_params is not None:
+            menu.add_command(label="粘贴滤镜设置", command=self._paste_filter_to_selected)
+        else:
+            menu.add_command(label="粘贴滤镜设置", state="disabled")
+        menu.add_separator()
+        menu.add_command(label="还原滤镜设置", command=self._reset_filter_settings)
+        menu.add_separator()
+        menu.add_command(label="编辑轨道", command=self.merge_edit_selected)
+        menu.add_command(label="预览轨道", command=self.merge_preview_selected)
+        menu.add_command(label="启用/禁用", command=self.merge_toggle_selected)
+        menu.add_command(label="删除轨道", command=self.merge_delete_selected)
+        menu.add_separator()
+        menu.add_command(label="恢复列宽", command=self.merge_reset_column_widths)
+        menu.post(x, y)
+    
+    def _merge_popup_more_menu(self):
+        x = self.root.winfo_pointerx()
+        y = self.root.winfo_pointery()
+        self._popup_merge_tree_menu(x, y)
+
+    def _copy_filter_from_selected(self):
+        """从选中的第一个轨道复制滤镜参数（仅复制非 None 的键）"""
+        selected = self.merge_tree.selection()
+        if not selected:
+            return
+        idx = int(selected[0].split('_')[1])
+        if idx >= len(self.merge_tracks):
+            return
+        track = self.merge_tracks[idx]
+        track_type = track.type
+        keys = self._get_filter_param_keys(track_type)
+        
+        params = {}
+        for key in keys:
+            val = track.enc_settings.get(key)
+            # 只复制非 None 的值
+            if val is not None:
+                if key == "enhance":
+                    params[key] = copy.deepcopy(val)  # 深拷贝增强字典
+                else:
+                    params[key] = val
+        
+        self._clipboard_filter_params = {
+            "type": track_type,
+            "params": params
+        }
+        self._append_info_ui(f"已复制 {track_type} 滤镜设置: {os.path.basename(track.file_path)}")
+    
+    def _paste_filter_to_selected(self):
+        """将剪贴板中的滤镜参数粘贴到选中的轨道（跳过 None 值）"""
+        if self._clipboard_filter_params is None:
+            return
+        selected = self.merge_tree.selection()
+        if not selected:
+            messagebox.showinfo("提示", "请先选择要应用滤镜的目标轨道")
+            return
+        
+        clip_type = self._clipboard_filter_params["type"]
+        clip_params = self._clipboard_filter_params["params"]
+        
+        applied_count = 0
+        for iid in selected:
+            idx = int(iid.split('_')[1])
+            if idx >= len(self.merge_tracks):
+                continue
+            track = self.merge_tracks[idx]
+            if track.type != clip_type:
+                self._append_info_ui(f"跳过 {track.type} 轨道（类型不匹配）")
+                continue
+            
+            # 应用参数，跳过 None
+            for key, value in clip_params.items():
+                if value is None:
+                    continue  # 跳过 None，保留目标原有值
+                if key == "enhance":
+                    track.enc_settings[key] = copy.deepcopy(value)
+                else:
+                    track.enc_settings[key] = value
+            
+            # 同步视频轨道的独立属性
+            if track.type == "video":
+                track.overlay_enabled = track.enc_settings.get("overlay_enabled", False)
+                track.overlay_x = track.enc_settings.get("overlay_x", "W-w-10")
+                track.overlay_y = track.enc_settings.get("overlay_y", "H-h-10")
+                track.pad_enabled = track.enc_settings.get("pad_enabled", False)
+                track.pad_width = track.enc_settings.get("pad_width", "")
+                track.pad_height = track.enc_settings.get("pad_height", "")
+                track.offset_x = track.enc_settings.get("offset_x", "0")
+                track.offset_y = track.enc_settings.get("offset_y", "0")
+            
+            applied_count += 1
+        
+        if applied_count:
+            self._append_info_ui(f"已将滤镜设置应用到 {applied_count} 个轨道")
+            self.merge_update_track_list()
+            self.merge_update_command_preview()
+        else:
+            self._append_info_ui("没有可应用的轨道（类型不匹配或已跳过）")
+
+    def _reset_filter_settings(self):
+        """将选中的轨道滤镜设置重置为默认状态（清空所有滤镜）"""
+        selected = self.merge_tree.selection()
+        if not selected:
+            return
+        
+        if not messagebox.askyesno("确认还原", "将清除选中轨道的所有滤镜设置（裁剪、缩放、旋转、增强、截取、变速、倒放等），确定继续吗？"):
+            return
+        
+        # 定义各类轨道的默认值
+        video_defaults = {
+            "crop_enabled": False, "crop_left": "0", "crop_top": "0", "crop_width": "iw/2", "crop_height": "ih",
+            "scale_enabled": False, "scale_width": "", "scale_height": "", "scale_method": "width",
+            "rotate": "none", "vflip": False, "hflip": False,
+            "deinterlace_filter": "none",
+            "speed_enabled": False, "speed_factor": "1.0",
+            "reverse_enabled": False,
+            "trim_enabled": False, "trim_start": "0", "trim_end": "", "precise_trim": False,
+            "overlay_enabled": True, "overlay_x": "W-w-10", "overlay_y": "H-h-10",
+            "pad_enabled": False, "pad_width": "", "pad_height": "", "offset_x": "0", "offset_y": "0",
+            "loop_enabled": False, "loop_mode": "infinite", "loop_count": 3,
+            "chroma_enabled": False, "chroma_color": "#3fff08", "chroma_similarity": 0.3, "chroma_blend": 0.1,
+            "alpha_enabled": False, "alpha_value": 1.0, "chroma_filter_type": "chromakey",
+            "enhance": {},
+            "audio_source_type": "self",
+        }
+        audio_defaults = {
+            "trim_enabled": False, "trim_start": "0", "trim_end": "", "precise_trim": False,
+            "audio_reverse": False,
+            "speed_enabled": False, "speed_factor": "1.0",
+            "volume_enabled": False, "volume": 1.0,
+            "mix_enabled": False,
+        }
+        # 如果音频还有 reverse_enabled 字段（兼容），一并清除
+        audio_defaults["reverse_enabled"] = False
+        
+        applied_count = 0
+        for iid in selected:
+            idx = int(iid.split('_')[1])
+            if idx >= len(self.merge_tracks):
+                continue
+            track = self.merge_tracks[idx]
+            if track.type == "video":
+                # 重置视频轨道
+                for key, value in video_defaults.items():
+                    track.enc_settings[key] = value
+                # 同步独立属性
+                track.overlay_enabled = True
+                track.overlay_x = "W-w-10"
+                track.overlay_y = "H-h-10"
+                track.pad_enabled = False
+                track.pad_width = ""
+                track.pad_height = ""
+                track.offset_x = "0"
+                track.offset_y = "0"
+            elif track.type == "audio":
+                # 重置音频轨道
+                for key, value in audio_defaults.items():
+                    track.enc_settings[key] = value
+            else:
+                self._append_info_ui(f"跳过 {track.type} 轨道（不支持还原）")
+                continue
+            applied_count += 1
+        
+        if applied_count:
+            self._append_info_ui(f"已还原 {applied_count} 个轨道的滤镜设置")
+            self.merge_update_track_list()
+            self.merge_update_command_preview()
+        else:
+            self._append_info_ui("没有可还原的轨道")
+
 
 
     def merge_smart_tile(self, main_track_idx, pad_enabled_var=None, pad_width_var=None, pad_height_var=None,
@@ -9500,9 +9733,6 @@ class FFmpegBatchGUI:
     
     def merge_sort_by_filename(self):
         """按文件名自然排序（仅在串联模式下可用）"""
-        if not self.concat_enabled.get():
-            messagebox.showinfo("提示", "排序功能仅在「串行合并（首尾拼接）」模式下可用。\n请先勾选「串行合并（首尾拼接）」选项。")
-            return
     
         def natural_key(text):
             parts = [p for p in re.split(r'(\d+)', text) if p]  # 过滤空字符串
@@ -9514,9 +9744,6 @@ class FFmpegBatchGUI:
     
     def merge_sort_by_mtime(self):
         """按修改时间排序（仅在串联模式下可用）"""
-        if not self.concat_enabled.get():
-            messagebox.showinfo("提示", "排序功能仅在「串行合并（首尾拼接）」模式下可用。\n请先勾选「串行合并（首尾拼接）」选项。")
-            return
         def get_mtime(p):
             try:
                 return os.path.getmtime(p)
@@ -9639,8 +9866,24 @@ class FFmpegBatchGUI:
             sub_track = Track(s_sub["index"], "subtitle", s_sub.get("codec_name", "unknown"), path, True)
             self.merge_tracks.append(sub_track)
             self._append_info_ui(f"[封装] 已添加字幕流: {s_sub.get('codec_name', 'unknown')}")
-    
-    
+
+    def _expand_files_and_folders(self, file_paths):
+        """
+        将文件路径列表中的文件夹递归展开为所有文件路径。
+        只返回文件，不返回文件夹本身。
+        """
+        expanded = []
+        for item in file_paths:
+            if os.path.isdir(item):
+                # 递归遍历文件夹
+                for root, dirs, files in os.walk(item):
+                    for f in files:
+                        expanded.append(os.path.join(root, f))
+            else:
+                expanded.append(item)
+        return expanded
+
+
     def _handle_drop_pip_mode(self, files):
         """
         画中画模式下的拖拽处理 —— 瞬间添加占位，后台解析，无卡顿。
@@ -9648,10 +9891,17 @@ class FFmpegBatchGUI:
         - 图片文件：直接添加为图片水印（无需解析，但为了统一也可占位）。
         - 音频文件：直接添加为独立音轨（无需解析）。
         """
+
         if not files:
             return
     
-        # 分离文件类型
+        # 展开文件夹
+        all_files = self._expand_files_and_folders(files)
+        if not all_files:
+            self._append_info_ui("[封装] 拖拽内容中未找到任何文件")
+            return
+    
+        # 分类（不再判断 isdir，因为 all_files 已是文件列表）
         video_files = []
         audio_files = []
         image_files = []
@@ -9660,10 +9910,7 @@ class FFmpegBatchGUI:
         img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
         audio_exts = ('.mp3', '.aac', '.m4a', '.wav', '.flac', '.ogg', '.opus', '.ac3', '.dts')
     
-        for f in files:
-            if os.path.isdir(f):
-                self._append_info_ui(f"[封装] 忽略文件夹: {os.path.basename(f)}，请选择文件")
-                continue
+        for f in all_files:  # 注意：使用 all_files，而不是 files
             ext = os.path.splitext(f)[1].lower()
             if ext in video_exts:
                 video_files.append(f)
@@ -9808,21 +10055,24 @@ class FFmpegBatchGUI:
         if not files:
             return
     
+        all_files = self._expand_files_and_folders(files)
+        if not all_files:
+            self._append_info_ui("[封装] 拖拽内容中未找到任何文件")
+            return
+    
+        # 分类（使用 all_files）
         video_exts = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.ts', '.webm')
         audio_exts = ('.mp3', '.aac', '.m4a', '.wav', '.flac', '.ogg', '.opus', '.ac3', '.dts')
         subtitle_exts = ('.srt', '.ass', '.ssa', '.vtt', '.idx', '.sup')
     
         video_files = []
         other_files = []
-        for f in files:
-            if os.path.isdir(f):
-                self._append_info_ui(f"[封装] 忽略文件夹: {os.path.basename(f)}，请选择文件")
-                continue
+        for f in all_files:
             ext = os.path.splitext(f)[1].lower()
             if ext in video_exts:
                 video_files.append(f)
             else:
-                other_files.append(f)
+                other_files.append(f)  # 音频/字幕稍后处理
     
         if not video_files:
             self._append_info_ui("[封装] 未检测到视频文件")
@@ -11223,6 +11473,7 @@ class FFmpegBatchGUI:
             self.merge_update_command_preview()  # 最终统一刷新一次
 
     def merge_update_track_list(self):
+        """刷新轨道列表，显示分组编号（同一文件的音频/字幕共享组号）"""
         if self._batch_update:
             return
     
@@ -11249,8 +11500,61 @@ class FFmpegBatchGUI:
         enabled_video_tracks = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
         main_video = enabled_video_tracks[0] if enabled_video_tracks else None
     
+        # ----- 分组编号 -----
+        # 为每个不同的 file_path 分配组编号（忽略空路径）
+        file_to_group = {}
+        next_group = 1
+        for track in self.merge_tracks:
+            file_path = track.file_path
+            if file_path and file_path not in file_to_group:
+                file_to_group[file_path] = next_group
+                next_group += 1
+    
+        # 初始化每个组的各类型计数器
+        group_counters = {}
+        for group in file_to_group.values():
+            group_counters[group] = {'video': 0, 'audio': 0, 'subtitle': 0}
+        # 用于无文件路径的轨道（回退序号）
+        fallback_counter = 0
+    
         for i, track in enumerate(self.merge_tracks):
-            # 根据轨道类型和模式确定标签
+            # ----- 生成序号（单条时不添加后缀） -----
+            file_path = track.file_path
+            group = file_to_group.get(file_path)
+            if group is not None:
+                # 有文件路径，使用分组编号
+                if track.type == 'video':
+                    group_counters[group]['video'] += 1
+                    cnt = group_counters[group]['video']
+                    # 如果该组视频只有1条，不加后缀
+                    if cnt == 1:
+                        seq = f"V{group}"
+                    else:
+                        seq = f"V{group}-{cnt}"
+                elif track.type == 'audio':
+                    group_counters[group]['audio'] += 1
+                    cnt = group_counters[group]['audio']
+                    if cnt == 1:
+                        seq = f"A{group}"
+                    else:
+                        seq = f"A{group}-{cnt}"
+                elif track.type == 'subtitle':
+                    group_counters[group]['subtitle'] += 1
+                    cnt = group_counters[group]['subtitle']
+                    if cnt == 1:
+                        seq = f"S{group}"
+                    else:
+                        seq = f"S{group}-{cnt}"
+                else:
+                    fallback_counter += 1
+                    seq = str(fallback_counter)
+            else:
+                # 无文件路径（如静音轨道），使用回退序号
+                fallback_counter += 1
+                seq = str(fallback_counter)
+
+    
+            # 确定标签
             if track.type == "video":
                 if track == main_video:
                     tag = 'even_main' if i % 2 == 0 else 'odd_main'
@@ -11265,7 +11569,7 @@ class FFmpegBatchGUI:
             elif track.type == "subtitle":
                 tag = 'even_subtitle' if i % 2 == 0 else 'odd_subtitle'
             else:
-                tag = 'even' if i % 2 == 0 else 'odd'  # fallback
+                tag = 'even' if i % 2 == 0 else 'odd'
     
             # 显示内容
             enabled_text = "✓" if track.enabled else "✗"
@@ -11310,7 +11614,6 @@ class FFmpegBatchGUI:
                             detail = f"{orig_w}x{orig_h}"
                     else:
                         detail = "未知"
-                    # 追加时长
                     dur = self._get_media_duration(track.file_path)
                     if dur is not None:
                         detail += f" ({seconds_to_time(dur)})"
@@ -11363,7 +11666,7 @@ class FFmpegBatchGUI:
                 detail = "-"
     
             values = (
-                i + 1,
+                seq,
                 enabled_text,
                 display_type,
                 detail,
@@ -11518,13 +11821,13 @@ class FFmpegBatchGUI:
     def merge_reset_column_widths(self):
         """恢复合并页面 Treeview 各列的默认宽度"""
         # 原创建时的列宽设置
-        self.merge_tree.column("序号", width=5)
+        self.merge_tree.column("序号", width=10)
         self.merge_tree.column("启用", width=5)
-        self.merge_tree.column("类型", width=20)
-        self.merge_tree.column("规格", width=100)
+        self.merge_tree.column("类型", width=30)
+        self.merge_tree.column("规格", width=120)
         self.merge_tree.column("编码", width=20)
-        self.merge_tree.column("来源", width=495)
-        self.merge_tree.column("编码设置 双击编辑", width=80)
+        self.merge_tree.column("来源 - 双击编辑 右键更多", width=480)
+        self.merge_tree.column("编码设置", width=60)
         self._append_info_ui("[布局] 已恢复合并列表的列宽")
 
 
@@ -14484,6 +14787,132 @@ class FFmpegBatchGUI:
         self.extract_preview_text.insert(tk.END, cmd_str)
     
 
+    def _show_task_context_menu(self, event):
+        """显示任务列表的右键菜单"""
+        # 获取点击位置的行
+        item = self.task_tree.identify_row(event.y)
+        if not item:
+            return
+        
+        # 如果点击的行未被选中，则选中它（支持多选，但点击时通常只选一个）
+        if item not in self.task_tree.selection():
+            self.task_tree.selection_set(item)
+        
+        # 创建菜单
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="用命令模板参数更新", command=self._sync_tasks_from_current_settings)
+        menu.add_separator()
+        menu.add_command(label="移除选中任务", command=self.remove_selected_tasks)
+        menu.add_command(label="清空全部任务", command=self.clear_all_tasks)
+        menu.add_command(label="清空已完成/失败任务", command=self.clear_finished_tasks)
+        menu.add_separator()
+        menu.add_command(label="恢复列宽", command=self.reset_task_tree_columns)
+
+
+
+        # 弹出菜单
+        menu.post(event.x_root, event.y_root)
+    
+    def _sync_tasks_from_current_settings(self):
+        """将选中任务的设置同步为当前界面参数（保留或更新输出目录）"""
+        selected = self.task_tree.selection()
+        if not selected:
+            messagebox.showinfo("提示", "请先选中要更新的任务")
+            return
+    
+        # 获取当前界面完整设置（作为模板）
+        template_settings = self.get_current_settings()
+        new_output_dir = template_settings.get("output_dir", "")
+        
+        # 检查是否有自定义任务（跳过）
+        custom_tasks = [int(iid) for iid in selected if int(iid) < len(self.tasks) and self.tasks[int(iid)].is_custom]
+        if custom_tasks:
+            if not messagebox.askyesno(
+                "自定义任务",
+                f"选中的任务中有 {len(custom_tasks)} 个是流提取生成的自定义任务，它们不支持同步参数。\n是否跳过这些任务继续？"
+            ):
+                return
+            # 从选中列表中移除自定义任务
+            selected = [iid for iid in selected if int(iid) not in custom_tasks]
+            if not selected:
+                return
+    
+        # 获取所有任务当前的输出目录
+        old_output_dirs = set()
+        for iid in selected:
+            idx = int(iid)
+            if idx < len(self.tasks):
+                task = self.tasks[idx]
+                old_output_dirs.add(os.path.dirname(task.output))
+        
+        # 如果所有任务输出目录相同且与当前界面目录不同，询问是否统一更新
+        update_output_dir = False
+        if len(old_output_dirs) == 1:
+            old_dir = old_output_dirs.pop()
+            if old_dir and new_output_dir and old_dir != new_output_dir:
+                if messagebox.askyesno(
+                    "更新输出目录",
+                    f"当前界面输出目录为：{new_output_dir}\n"
+                    f"选中任务的输出目录为：{old_dir}\n"
+                    "是否将所有任务的输出目录更新为当前界面目录？\n\n"
+                    "（选“是”将一起更新，选“否”保留原路径）"
+                ):
+                    update_output_dir = True
+    
+        # 开始同步
+        updated_count = 0
+        for iid in selected:
+            idx = int(iid)
+            if idx >= len(self.tasks):
+                continue
+            task = self.tasks[idx]
+            if task.is_custom:
+                continue  # 已跳过
+    
+            input_path = task.input
+            old_output_path = task.output
+    
+            # 用当前界面设置替换（深拷贝）
+            new_settings = copy.deepcopy(template_settings)
+    
+            # 确定最终输出路径
+            if update_output_dir:
+                # 重新生成输出路径（使用新目录和界面设置）
+                new_output_path = self.generate_output_path(input_path, new_settings)
+                # 处理冲突（根据策略）
+                final_output = self._resolve_path_conflict(new_output_path, show_dialog=True)
+                if final_output is None:
+                    # 用户取消，跳过此任务
+                    continue
+                # 更新任务的输出路径
+                task.output = final_output
+                # 更新设置中的输出目录
+                new_settings["output_dir"] = os.path.dirname(final_output)
+            else:
+                # 保留原输出路径，但需要确保 output_dir 设置正确
+                final_output = old_output_path
+                new_settings["output_dir"] = os.path.dirname(final_output)
+    
+            # 更新任务设置
+            task.settings = new_settings
+    
+            # 重新生成命令
+            try:
+                new_cmd = self.generate_ffmpeg_command(input_path, final_output, task.settings)
+                task.cmd = new_cmd
+                task.status = "等待"
+                task.error_msg = ""
+                updated_count += 1
+            except Exception as e:
+                self._append_info_ui(f"更新任务 {os.path.basename(input_path)} 失败: {e}")
+    
+        if updated_count:
+            self._append_info_ui(f"✅ 已同步 {updated_count} 个任务的参数")
+            self.update_task_list()
+            self.update_command_preview()
+        else:
+            self._append_info_ui("没有任务被更新")
+
 
     # -------------------- 界面创建 --------------------
     def create_widgets(self):
@@ -14731,6 +15160,7 @@ class FFmpegBatchGUI:
         self.task_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     
         self.task_tree.bind("<Double-1>", self.on_task_double_click)
+        self.task_tree.bind("<Button-3>", self._show_task_context_menu)
     
         # ---- 合并标签页 ----
         merge_tab = ttk.Frame(self.notebook)
@@ -14965,7 +15395,7 @@ class SegmentEditor:
         for col in columns:
             self.tree.heading(col, text=col)
             self.tree.column(col, width=100, minwidth=60)
-        self.tree.column("序号", width=50)
+        self.tree.column("序号", width=100)
         self.tree.column("翻转", width=100)
 
         vbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
