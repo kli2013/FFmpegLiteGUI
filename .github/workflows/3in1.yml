@@ -1,4 +1,4 @@
-name: : Build FFmpeggui 2in1 x64 and two x86
+name: Build FFmpeggui 2in1 x64 and two x86
 
 on:
   workflow_dispatch:
