@@ -19,6 +19,7 @@ import tempfile
 
 
 
+
 # --- 依赖检测 ---
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
@@ -4155,7 +4156,7 @@ class AdvancedFrame(ttk.LabelFrame):
         self.wm_preset_var = tk.StringVar()
         self.wm_templates = {}  # 缓存所有水印模板
         # 获取主预设目录（与主预设 ffmpeg_presets.json 同目录）
-        if self.app and hasattr(self.app, 'preset_file_path'):
+        if self.app is not None and hasattr(self.app, 'preset_file_path'):
             preset_dir = os.path.dirname(self.app.preset_file_path)
         else:
             # 极罕见情况：回退到用户目录
@@ -4517,6 +4518,7 @@ class Task:
         self._task_list_update_after = None   # 任务列表刷新去抖 ID
         self.stopped_by_user = False
         self.is_custom = False
+        self.temp_files = []
 
     def get_short_cmd(self):
         """生成简短显示命令（隐藏路径细节）"""
@@ -4859,6 +4861,8 @@ class FFmpegBatchGUI:
         self._merge_preview_after_id = None   # 合并命令预览防抖 ID
         
         self._clipboard_filter_params = None   # 存储复制的参数字典
+
+        self._global_temp_files = []
 
 
         # ffprobe 并发数量计算
@@ -6559,10 +6563,67 @@ class FFmpegBatchGUI:
     
         # 输出文件
         cmd_list.append(output_path)
-    
+
         return cmd_list
 
-    def generate_ffmpeg_command(self, input_path: str, output_path: str, settings: dict) -> List[str]:
+
+
+
+    def _safe_delete_file(self, path: str):
+        """安全删除文件"""
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+        except Exception:
+            pass
+
+    def _write_temp_script(self, content: str) -> str:
+        fd, path = tempfile.mkstemp(suffix='.txt', prefix='ffscript_', text=True)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return path
+    
+    def _shorten_long_filters(self, cmd_list: List[str], threshold: int = 25000, force: bool = False):
+#        print(f"[DEBUG] _shorten_long_filters called, force={force}, cmd_list length={len(cmd_list)}")
+        # 打印所有参数，看看是否有 -filter_complex
+#         for idx, arg in enumerate(cmd_list):
+#             if arg in ("-vf", "-af", "-filter_complex"):
+#                print(f"[DEBUG] Found {arg} at index {idx}, value length: {len(cmd_list[idx+1]) if idx+1 < len(cmd_list) else 'missing'}")
+
+        script_map = {
+            "-vf": "-vf_script",
+            "-af": "-af_script",
+            "-filter_complex": "-filter_complex_script",
+        }
+        new_cmd = []
+        temp_files = []
+        i = 0
+        while i < len(cmd_list):
+            arg = cmd_list[i]
+            if arg in script_map and i + 1 < len(cmd_list):
+                filter_str = cmd_list[i + 1]
+                if force or len(filter_str) > threshold:
+                    script_path = self._write_temp_script(filter_str)
+                    temp_files.append(script_path)
+                    new_cmd.append(script_map[arg])
+                    new_cmd.append(script_path)
+                    i += 2
+                    continue
+            new_cmd.append(arg)
+            i += 1
+        return new_cmd, temp_files
+    
+    def _cleanup_temp_files(self, file_list):
+        for f in file_list:
+            try:
+                if os.path.exists(f):
+                    os.unlink(f)
+            except Exception:
+                pass
+
+
+
+    def generate_ffmpeg_command(self, input_path: str, output_path: str, settings: dict, task=None, preview=False) -> List[str]:
         if settings.get("segment_enabled", False) and settings.get("segments", []):
             return self._generate_segment_concat_command(input_path, output_path, settings)
         if not self.ffmpeg_cmd:
@@ -6594,7 +6655,6 @@ class FFmpegBatchGUI:
         enhance_settings = settings.get("enhance", {})
         if enhance_settings.get("ivtc_enabled", False) and settings.get("deinterlace_filter", "none") != "none":
             self._append_info_ui("已启用 IVTC，反交错滤镜将被忽略（IVTC 本身包含反交错功能）。")
-
     
         # ---------- 检查水印 ----------
         wm_settings = settings.get("watermark", {})
@@ -6604,11 +6664,35 @@ class FFmpegBatchGUI:
         if wm_file and not only_audio:
             # 水印模式强制禁用组合跳转
             settings["combo_seek"] = False
-            return self._generate_command_with_watermark(input_path, output_path, settings, wm_settings)
+            cmd_list = self._generate_command_with_watermark(input_path, output_path, settings, wm_settings)
+            # 统一处理长滤镜
+            if not preview:
+                total_len = len(' '.join(cmd_list))
+                if total_len > 25000:
+                    cmd_list, temp_files = self._shorten_long_filters(cmd_list, force=True)
+                else:
+                    cmd_list, temp_files = self._shorten_long_filters(cmd_list)
+                if task is not None:
+                    if not hasattr(task, 'temp_files'):
+                        task.temp_files = []
+                    task.temp_files.extend(temp_files)
+            return cmd_list
     
         # 检查是否 GIF 编码（且非仅音频）
         if settings.get("encoder") == "gif" and not only_audio:
-            return self._generate_gif_command(input_path, output_path, settings)
+            cmd_list = self._generate_gif_command(input_path, output_path, settings)
+            # 统一处理长滤镜
+            if not preview:
+                total_len = len(' '.join(cmd_list))
+                if total_len > 25000:
+                    cmd_list, temp_files = self._shorten_long_filters(cmd_list, force=True)
+                else:
+                    cmd_list, temp_files = self._shorten_long_filters(cmd_list)
+                if task is not None:
+                    if not hasattr(task, 'temp_files'):
+                        task.temp_files = []
+                    task.temp_files.extend(temp_files)
+            return cmd_list
     
         # ---------- 普通模式（无复杂水印） ----------
         cmd_list = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
@@ -6644,10 +6728,10 @@ class FFmpegBatchGUI:
             # 快速模式（非精准）才在命令行添加 -ss/-to
             if not precise_trim:
                 self._add_trim_params(cmd_list, settings)
-    
+
             if not only_audio:
                 self._add_hwaccel_params(cmd_list, settings)
-    
+
             cmd_list.extend(["-i", input_path])
     
         # ----- 视频处理 -----
@@ -6671,7 +6755,7 @@ class FFmpegBatchGUI:
                 )
                 if vf != "null":
                     cmd_list.extend(["-vf", vf])
-    
+
                 cmd_list = self._build_video_encoding_params(cmd_list, settings)
     
         # ----- 音频处理 -----
@@ -6699,6 +6783,18 @@ class FFmpegBatchGUI:
                 cmd_list.extend(["-movflags", "+faststart"])
     
         cmd_list.append(output_path)
+
+        # 普通模式处理长滤镜
+        if not preview:
+            total_len = len(' '.join(cmd_list))
+            if total_len > 25000:
+                cmd_list, temp_files = self._shorten_long_filters(cmd_list, force=True)
+            else:
+                cmd_list, temp_files = self._shorten_long_filters(cmd_list)
+            if task is not None:
+                if not hasattr(task, 'temp_files'):
+                    task.temp_files = []
+                task.temp_files.extend(temp_files)
         return cmd_list
 
 
@@ -6918,6 +7014,7 @@ class FFmpegBatchGUI:
                 self._append_info_ui("[水印] 警告：无法计算主视频时长，使用 -shortest 控制输出。")
     
         cmd_list.append(output_path)
+
         return cmd_list
 
 
@@ -7987,6 +8084,8 @@ class FFmpegBatchGUI:
 
     def _do_update_command_preview(self):
         """实际执行命令刷新的函数"""
+        if not hasattr(self, 'watermark_settings'):
+            return
         self._preview_after_id = None
         if getattr(self, '_loading_preset', False):
             return
@@ -8011,11 +8110,11 @@ class FFmpegBatchGUI:
             input_file = self.input_file.get()
             try:
                 if not input_file:
-                    cmd_list = self.generate_ffmpeg_command("{input}", "{output}", self.get_current_settings())
+                    cmd_list = self.generate_ffmpeg_command("{input}", "{output}", self.get_current_settings(), preview=True)
                 else:
                     settings = self.get_current_settings()
                     output_path = self.generate_output_path(input_file, settings)
-                    cmd_list = self.generate_ffmpeg_command(input_file, output_path, settings)
+                    cmd_list = self.generate_ffmpeg_command(input_file, output_path, settings, preview=True)
                 cmd_str = format_cmd_for_display(cmd_list)
             except Exception as e:
                 cmd_str = f"生成命令时出错: {e}"
@@ -8132,7 +8231,8 @@ class FFmpegBatchGUI:
             return False
     
         try:
-            cmd_list = self.generate_ffmpeg_command(input_path, output_path, settings)
+            task = Task(input_path, output_path, settings, [])
+            cmd_list = self.generate_ffmpeg_command(input_path, output_path, settings, task)
             self._append_info_ui(f"命令生成成功，参数个数: {len(cmd_list)}")
         except Exception as e:
             err_msg = f"命令生成错误: {e}"
@@ -8142,7 +8242,7 @@ class FFmpegBatchGUI:
             messagebox.showerror("命令生成错误", err_msg)
             return False
     
-        task = Task(input_path, output_path, settings, cmd_list)
+
         self.tasks.append(task)
         self.update_task_list()
         self._append_info_ui(f"✅ 已添加任务: {os.path.basename(input_path)} -> {output_path}")
@@ -8377,6 +8477,9 @@ class FFmpegBatchGUI:
                     self.running_procs.remove(proc)
                 self._running_tasks = [(p, t) for (p, t) in self._running_tasks if p != proc]
             self.update_progress(current=0, total=0, task=task, log_progress=False)
+            if hasattr(task, 'temp_files'):
+                self._cleanup_temp_files(task.temp_files)
+                task.temp_files = []
         return task
 
     def _on_task_done(self, future):
@@ -8432,12 +8535,13 @@ class FFmpegBatchGUI:
         # ---- 新增：处理冲突 ----
         output_file = self._resolve_path_conflict(output_file)
         self.ensure_output_dir(output_file)
+        task = Task(input_file, output_file, settings, [])  # 临时
         try:
-            cmd_list = self.generate_ffmpeg_command(input_file, output_file, settings)
+            cmd_list = self.generate_ffmpeg_command(input_file, output_file, settings, task)
         except ValueError as e:
             messagebox.showerror("命令生成错误", str(e))
             return
-        threading.Thread(target=self._run_single_transcode, args=(cmd_list, input_file, settings), daemon=True).start()
+        threading.Thread(target=self._run_single_transcode, args=(cmd_list, input_file, settings, task), daemon=True).start()
 
     def refresh_with_reset(self):
         """点击刷新按钮时：先重置列宽，再刷新命令预览"""
@@ -8450,11 +8554,11 @@ class FFmpegBatchGUI:
             self.task_tree.column("序号", width=25)
             self.task_tree.column("文件名", width=75)
             self.task_tree.column("输出路径", width=100)
-            self.task_tree.column("命令 (简洁) 双击编辑", width=410)
+            self.task_tree.column("命令 (简洁) 双击编辑 右键更新", width=410)
             self.task_tree.column("状态", width=52)
             self.task_tree.column("错误信息", width=30)
 
-    def _run_single_transcode(self, cmd_list, input_name, settings):
+    def _run_single_transcode(self, cmd_list, input_name, settings, task=None):
         """单文件转码（非队列）"""
         self._append_info_ui(f"\n========== 当前选择转码: {os.path.basename(input_name)} ==========")
         cmd_str = format_cmd_for_display(cmd_list)
@@ -8512,6 +8616,9 @@ class FFmpegBatchGUI:
                 if proc in self.running_procs:
                     self.running_procs.remove(proc)
             self.update_progress(current=0, total=0, task=None, log_progress=True)
+            if task is not None and hasattr(task, 'temp_files'):
+                self._cleanup_temp_files(task.temp_files)
+                task.temp_files = []
 
     def ensure_output_dir(self, output_path):
         dirname = os.path.dirname(output_path)
@@ -8779,7 +8886,7 @@ class FFmpegBatchGUI:
                 new_settings["segments"] = copy.deepcopy(seg_list)
               #  print(f"[edit_task update_preview] 获取到 enhance = {new_settings['enhance']}")
                 try:
-                    new_cmd_list = self.generate_ffmpeg_command(task.input, new_out, new_settings)
+                    new_cmd_list = self.generate_ffmpeg_command(task.input, new_out, new_settings, preview=True)
                     new_cmd_str = format_cmd_for_display(new_cmd_list)
                 except ValueError as e:
                     new_cmd_str = f"参数错误: {e}"
@@ -8877,7 +8984,7 @@ class FFmpegBatchGUI:
                 new_settings["segment_enabled"] = seg_enabled_var.get()
                 new_settings["segments"] = copy.deepcopy(seg_list)
                 try:
-                    new_cmd_list = self.generate_ffmpeg_command(task.input, new_output, new_settings)
+                    new_cmd_list = self.generate_ffmpeg_command(task.input, new_output, new_settings, task)
                 except ValueError as e:
                     messagebox.showerror("参数错误", str(e))
                     return
@@ -11264,7 +11371,19 @@ class FFmpegBatchGUI:
                     cmd_list = new_cmd
                 else:
                     self._append_info_ui("警告：手动时长格式无效，已忽略")
-    
+
+
+
+        if not preview:
+            total_len = len(' '.join(cmd_list))
+            if total_len > 25000:
+                cmd_list, temp_files = self._shorten_long_filters(cmd_list, force=True)
+            else:
+                cmd_list, temp_files = self._shorten_long_filters(cmd_list)
+            if temp_files:
+                if not hasattr(self, '_merge_temp_files'):
+                    self._merge_temp_files = []
+                self._merge_temp_files.extend(temp_files)
         return cmd_list
     
     
@@ -12972,6 +13091,10 @@ class FFmpegBatchGUI:
             # 重置进度（转码结束或失败）
             self.update_progress(current=0, total=0, task=None, log_progress=True)
             self.root.after(0, lambda: self.merge_btn.config(state="normal"))
+            if hasattr(self, '_merge_temp_files'):
+                self._cleanup_temp_files(self._merge_temp_files)
+                self._merge_temp_files = []
+
 
     def _confirm_delete_sources(self, source_files, output_file):
         if not messagebox.askyesno("确认删除", f"是否确定删除 {len(source_files)} 个源文件？\n此操作不可恢复！"):
@@ -13033,7 +13156,7 @@ class FFmpegBatchGUI:
         if current_tab == 0:
             # 转码标签页：添加到任务队列
             # 定义视频扩展名列表
-            video_exts = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.ts', '.webm', '.m2ts', '.mpg', '.mpeg', '.wmv', '.3gp')
+            video_exts = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.ts', '.webm', '.m2ts', '.mpg', '.mpeg', '.wmv', '.3gp', '.webp', '.gif')
             for item in files:
                 if os.path.isfile(item):
                     # 如果是视频文件，直接添加
@@ -14800,7 +14923,7 @@ class FFmpegBatchGUI:
         
         # 创建菜单
         menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label="用命令模板参数更新", command=self._sync_tasks_from_current_settings)
+        menu.add_command(label="用命令模板更新任务", command=self._sync_tasks_from_current_settings)
         menu.add_separator()
         menu.add_command(label="移除选中任务", command=self.remove_selected_tasks)
         menu.add_command(label="清空全部任务", command=self.clear_all_tasks)
@@ -15136,19 +15259,19 @@ class FFmpegBatchGUI:
                         foreground=[('selected', 'white')],
                         fieldbackground=[('selected', '#3475b5')])
 
-        columns = ("序号", "文件名", "输出路径", "命令 (简洁) 双击编辑", "状态", "错误信息")
+        columns = ("序号", "文件名", "输出路径", "命令 (简洁) 双击编辑 右键更新", "状态", "错误信息")
         self.task_tree = ttk.Treeview(list_container, columns=columns, show="headings",
                                        height=8, style="Batch.Treeview")
         self.task_tree.heading("序号", text="序号")
         self.task_tree.heading("文件名", text="文件名")
         self.task_tree.heading("输出路径", text="输出路径")
-        self.task_tree.heading("命令 (简洁) 双击编辑", text="命令 (简洁) 双击编辑")
+        self.task_tree.heading("命令 (简洁) 双击编辑 右键更新", text="命令 (简洁) 双击编辑 右键更新")
         self.task_tree.heading("状态", text="状态")
         self.task_tree.heading("错误信息", text="错误信息")
         self.task_tree.column("序号", width=25, minwidth=20)
         self.task_tree.column("文件名", width=75, minwidth=20)
         self.task_tree.column("输出路径", width=100, minwidth=20)
-        self.task_tree.column("命令 (简洁) 双击编辑", width=410, minwidth=20)
+        self.task_tree.column("命令 (简洁) 双击编辑 右键更新", width=410, minwidth=20)
         self.task_tree.column("状态", width=72, minwidth=20)
         self.task_tree.column("错误信息", width=30, minwidth=20)
         self.task_tree.tag_configure('odd', background='#e8e8e8')
@@ -15710,7 +15833,7 @@ class SegmentEditor:
             out_path = os.path.join(output_dir, out_name)
     
             try:
-                cmd_list = self.app.generate_ffmpeg_command(input_file, out_path, settings)
+                cmd_list = self.app.generate_ffmpeg_command(input_file, out_path, settings, preview=True)
                 cmd_str = format_cmd_for_display(cmd_list)
             except Exception as e:
                 cmd_str = f"# 错误：{e}"
