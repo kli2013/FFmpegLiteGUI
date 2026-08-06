@@ -8233,6 +8233,7 @@ class FFmpegBatchGUI:
         try:
             task = Task(input_path, output_path, settings, [])
             cmd_list = self.generate_ffmpeg_command(input_path, output_path, settings, task)
+            task.cmd = cmd_list
             self._append_info_ui(f"命令生成成功，参数个数: {len(cmd_list)}")
         except Exception as e:
             err_msg = f"命令生成错误: {e}"
@@ -8538,6 +8539,7 @@ class FFmpegBatchGUI:
         task = Task(input_file, output_file, settings, [])  # 临时
         try:
             cmd_list = self.generate_ffmpeg_command(input_file, output_file, settings, task)
+            task.cmd = cmd_list
         except ValueError as e:
             messagebox.showerror("命令生成错误", str(e))
             return
