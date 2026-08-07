@@ -16,7 +16,7 @@ import concurrent.futures
 from typing import List, Tuple, Optional, Dict, Any, Callable
 import shlex
 import tempfile
-
+import time
 
 
 
@@ -177,17 +177,25 @@ def is_valid_timestamp(ts: str) -> bool:
         return False
     return False
 
-def seconds_to_time(sec):
-    """秒数转 HH:MM:SS.ms"""
+def seconds_to_time(sec, short=True):
+    """
+    秒数转时间字符串。
+    short=True 时：<1小时 → MM:SS.ms，>=1小时 → H:MM:SS.ms
+    short=False 时：始终 HH:MM:SS.ms
+    """
     if sec is None:
         return ""
+    sec = float(sec)
     h = int(sec // 3600)
     m = int((sec % 3600) // 60)
     s = sec % 60
-    if h > 0:
-        return f"{h:02d}:{m:02d}:{s:06.3f}"
+    if short:
+        if h > 0:
+            return f"{h:01d}:{m:02d}:{s:06.3f}"
+        else:
+            return f"{m:02d}:{s:06.3f}"
     else:
-        return f"{m:02d}:{s:06.3f}"
+        return f"{h:02d}:{m:02d}:{s:06.3f}"
 
 
 
@@ -4520,6 +4528,10 @@ class Task:
         self.is_custom = False
         self.temp_files = []
 
+        self.start_time = None      # 任务开始时间（time.time()）
+        self.elapsed_time = None    # 任务最终耗时（秒）
+        self.is_finished = False    # 标记任务是否已完成
+
     def get_short_cmd(self):
         """生成简短显示命令（隐藏路径细节）"""
         if not self.cmd:
@@ -5148,41 +5160,40 @@ class FFmpegBatchGUI:
 
 
     def update_progress(self, current=0, total=0, task=None, log_progress=True):
-        """
-        更新转码进度。
-        - task: 队列任务对象（用于更新任务列表）
-        - log_progress: 是否在日志中输出进度（单文件/合并使用）
-        """
-        # 重置
         if total == 0:
             if task is not None:
                 task.progress = 0
                 self._schedule_task_list_update()
             if log_progress:
-#                self._update_log_progress("转码结束")
-#            self.root.title("FFmpeg 多功能工具")
-                pass   #  上面2句注释空了 所以需要pass占位
+                if task and task.start_time and task.elapsed_time is not None:
+                    elapsed = seconds_to_time(task.elapsed_time, short=True)
+                    self._update_log_progress(f"转码结束 耗时 {elapsed}")
+                else:
+    #                self._update_log_progress("转码结束")
+#                self.root.title("FFmpeg 多功能工具")
+                    pass   #  上面2句注释空了 所以需要pass占位
             self._last_logged_percent = -1
             return
     
         percent = int(100 * current / total)
     
-        # 更新任务列表（队列任务）
         if task is not None:
             task.progress = percent
             task.current_sec = current
             task.total_sec = total
             self._schedule_task_list_update()
     
-        # 更新日志和标题（单文件/合并）
         if log_progress:
-            # 每5%更新一次（0%, 5%, 10%, ... 100%）
             if not hasattr(self, '_last_logged_percent'):
                 self._last_logged_percent = -1
             if percent == 0 or percent == 100 or (percent - self._last_logged_percent >= 5):
                 self._last_logged_percent = percent
-#                self.root.title(f"FFmpeg 多功能工具 - 转码中 {percent}%")
-                self._update_log_progress(f"{percent}% ({current}/{total} 秒)")
+                progress_str = f"{percent}% ({int(current)}/{int(total)} 秒)"
+                elapsed_str = ""
+                if task and task.start_time:
+                    elapsed = time.time() - task.start_time
+                    elapsed_str = f" 耗时 {seconds_to_time(elapsed, short=True)}"
+                self._update_log_progress(f"{progress_str}{elapsed_str}")
     
     def _schedule_task_list_update(self):
         """去抖刷新任务列表"""
@@ -5536,6 +5547,65 @@ class FFmpegBatchGUI:
         if w is not None and h is not None:
             self._dimension_cache[cache_key] = (w, h)
         return w, h
+
+    def _get_video_size_chain(self, track):
+        """
+        获取视频轨道的尺寸变化链（原始 → 裁剪 → 旋转 → 缩放）。
+        返回一个字符串列表，每个元素如 "1920x1080" 或 "裁剪 960x540"。
+        若无法获取原始尺寸，返回 None。
+        """
+        orig_w, orig_h = self._get_video_dimensions_cached(track.file_path)
+        if orig_w is None or orig_h is None:
+            return None
+    
+        steps = []
+        steps.append(f"{orig_w}x{orig_h}")
+        w, h = orig_w, orig_h
+    
+        # ----- 裁剪 -----
+        if track.enc_settings.get("crop_enabled", False):
+            crop_w = track.enc_settings.get("crop_width", "").strip()
+            crop_h = track.enc_settings.get("crop_height", "").strip()
+            crop_left = track.enc_settings.get("crop_left", "0").strip()
+            crop_top = track.enc_settings.get("crop_top", "0").strip()
+            if crop_w and crop_h:
+                # 计算表达式，支持 iw/ih
+                cw = safe_eval_expr(crop_w, {"iw": orig_w, "ih": orig_h})
+                ch = safe_eval_expr(crop_h, {"iw": orig_w, "ih": orig_h})
+                if cw and ch and cw > 0 and ch > 0:
+                    w, h = cw, ch
+                    steps.append(f"裁剪 {w}x{h}")
+                else:
+                    # 表达式无效，保留原尺寸（但注明裁剪无效）
+                    steps.append("裁剪(无效)")
+    
+        # ----- 旋转（交换宽高） -----
+        rotate = track.enc_settings.get("rotate", "none")
+        if rotate in ("90", "270"):
+            w, h = h, w
+            steps.append(f"旋转 {w}x{h}")
+    
+        # ----- 缩放 -----
+        if track.enc_settings.get("scale_enabled", False):
+            method = track.enc_settings.get("scale_method", "width")
+            sw = track.enc_settings.get("scale_width", "").strip()
+            sh = track.enc_settings.get("scale_height", "").strip()
+            try:
+                if method == "width" and sw:
+                    target_w = int(float(sw))
+                    target_h = int(round(target_w * h / w))
+                    w, h = target_w, target_h
+                elif method == "height" and sh:
+                    target_h = int(float(sh))
+                    target_w = int(round(target_h * w / h))
+                    w, h = target_w, target_h
+                elif method == "exact" and sw and sh:
+                    w, h = int(float(sw)), int(float(sh))
+                steps.append(f"缩放 {w}x{h}")
+            except (ValueError, ZeroDivisionError):
+                steps.append("缩放(无效)")
+    
+        return steps
 
 
     def _build_video_encoding_params(self, cmd_list: List[str], settings: dict) -> List[str]:
@@ -7125,7 +7195,7 @@ class FFmpegBatchGUI:
             except:
                 pass
     
-        return w, h
+        return max(1, w), max(1, h)
     
     def _get_canvas_size(self, main_track):
         """
@@ -7172,8 +7242,8 @@ class FFmpegBatchGUI:
     
         # 获取原始尺寸（不含任何旋转，直接从 ffprobe 获取）
         w, h = get_video_dimensions(self.ffprobe_cmd, track.file_path)
-        if w is None:
-            return None, None
+        if w is None or h is None:
+            return 320, 240  # 返回安全默认值
     
         # 使用统一顺序计算（crop -> rotate -> scale）
         return self.compute_final_size_with_order(w, h, settings)
@@ -8257,22 +8327,30 @@ class FFmpegBatchGUI:
         self.add_task(input_path)
 
     def update_task_list(self):
-        """刷新任务列表，状态列显示进度（转码中时）"""
-        # 清空现有列表
         for item in self.task_tree.get_children():
             self.task_tree.delete(item)
     
         for i, task in enumerate(self.tasks):
             seq = i + 1
             tag = 'odd' if i % 2 == 0 else 'even'
-            # 状态显示：转码中显示进度百分比
+            
+            # 构建耗时字符串
+            elapsed_str = ""
+            if task.start_time and not task.is_finished:
+                # 正在转码，实时计算
+                elapsed = time.time() - task.start_time
+                elapsed_str = f" 耗时 {seconds_to_time(elapsed, short=True)}"
+            elif task.elapsed_time is not None:
+                # 已完成或失败
+                elapsed_str = f" 耗时 {seconds_to_time(task.elapsed_time, short=True)}"
+    
             if task.status == "转码中":
                 if task.total_sec > 0:
-                    status_display = f"转码中 {task.progress}% ({task.current_sec}/{task.total_sec} 秒)"
+                    status_display = f"转码中 {task.progress}% ({task.current_sec}/{task.total_sec} 秒){elapsed_str}"
                 else:
-                    status_display = f"转码中 {task.progress}%"
+                    status_display = f"转码中 {task.progress}%{elapsed_str}"
             else:
-                status_display = task.status
+                status_display = f"{task.status}{elapsed_str}"
     
             self.task_tree.insert("", tk.END, iid=str(i), values=(
                 seq,
@@ -8400,6 +8478,7 @@ class FFmpegBatchGUI:
     def _process_single_task(self, task):
         """处理单个任务（队列模式）"""
         task.status = "转码中"
+        task.start_time = time.time()
         self._update_task_list_ui()
         self._append_info_ui(f"\n========== 开始转码: {os.path.basename(task.input)} ==========")
         cmd_str = format_cmd_for_display(task.cmd)
@@ -8473,6 +8552,9 @@ class FFmpegBatchGUI:
             task.error_msg = str(e)
             self._update_task_list_ui()
         finally:
+            task.is_finished = True
+            if task.start_time is not None:
+                task.elapsed_time = time.time() - task.start_time
             with self._proc_lock:
                 if proc in self.running_procs:
                     self.running_procs.remove(proc)
@@ -8556,12 +8638,13 @@ class FFmpegBatchGUI:
             self.task_tree.column("序号", width=25)
             self.task_tree.column("文件名", width=75)
             self.task_tree.column("输出路径", width=100)
-            self.task_tree.column("命令 (简洁) 双击编辑 右键更新", width=410)
-            self.task_tree.column("状态", width=52)
+            self.task_tree.column("命令 (简洁) 双击编辑 右键更新", width=310)
+            self.task_tree.column("状态", width=152)
             self.task_tree.column("错误信息", width=30)
 
     def _run_single_transcode(self, cmd_list, input_name, settings, task=None):
         """单文件转码（非队列）"""
+        task.start_time = time.time()
         self._append_info_ui(f"\n========== 当前选择转码: {os.path.basename(input_name)} ==========")
         cmd_str = format_cmd_for_display(cmd_list)
         self._append_info_ui(f">>> {cmd_str}")
@@ -8603,7 +8686,7 @@ class FFmpegBatchGUI:
                         if match:
                             h, m, s = match.groups()
                             current_sec = int(h) * 3600 + int(m) * 60 + float(s)
-                            self.update_progress(current=int(current_sec), total=int(total_duration), task=None, log_progress=True)
+                            self.update_progress(current=int(current_sec), total=int(total_duration), task=task, log_progress=True)
     
             retcode = proc.wait()
             if retcode == 0:
@@ -8614,10 +8697,13 @@ class FFmpegBatchGUI:
         except Exception as e:
             self._append_info_ui(f"转码异常: {e}")
         finally:
+            task.is_finished = True
+            if task.start_time is not None:
+                task.elapsed_time = time.time() - task.start_time
             with self._proc_lock:
                 if proc in self.running_procs:
                     self.running_procs.remove(proc)
-            self.update_progress(current=0, total=0, task=None, log_progress=True)
+            self.update_progress(current=0, total=0, task=task, log_progress=True)
             if task is not None and hasattr(task, 'temp_files'):
                 self._cleanup_temp_files(task.temp_files)
                 task.temp_files = []
@@ -9082,9 +9168,9 @@ class FFmpegBatchGUI:
         self.merge_tree.column("序号", width=10, anchor="center")
         self.merge_tree.column("启用", width=5, anchor="center")
         self.merge_tree.column("类型", width=30)
-        self.merge_tree.column("规格", width=120)
+        self.merge_tree.column("规格", width=220)
         self.merge_tree.column("编码", width=20)
-        self.merge_tree.column("来源 - 双击编辑 右键更多", width=480)
+        self.merge_tree.column("来源 - 双击编辑 右键更多", width=380)
         self.merge_tree.column("编码设置", width=60)
         self.merge_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     
@@ -9243,7 +9329,7 @@ class FFmpegBatchGUI:
             self.only_audio_checkbox,
             "仅音频（简易实现）：输出纯音频文件（无视频流）。\n\n"
             "核心目的：将多个音频轨道进行混合（amix），各轨道仍可单独调节音量、截取或倒放。\n"
-            "    若只需提取单音轨，请使用转码页面的仅音频功能。\n\n"
+            "    若只需提取单音轨，请优先使用转码页面的仅音频功能。\n\n"
             "使用说明：\n"
             "• 本功能依赖「主视频」作为参数占位（简易实现，未完全重构生成逻辑），\n"
             "  您可随意拖入一个视频文件作为占位，并删除或禁用其音频轨道，\n"
@@ -9334,13 +9420,18 @@ class FFmpegBatchGUI:
             menu.add_command(label="粘贴滤镜设置", command=self._paste_filter_to_selected)
         else:
             menu.add_command(label="粘贴滤镜设置", state="disabled")
-        menu.add_separator()
         menu.add_command(label="还原滤镜设置", command=self._reset_filter_settings)
         menu.add_separator()
+        menu.add_command(label="启用/禁用", command=self.merge_toggle_selected)
         menu.add_command(label="编辑轨道", command=self.merge_edit_selected)
         menu.add_command(label="预览轨道", command=self.merge_preview_selected)
-        menu.add_command(label="启用/禁用", command=self.merge_toggle_selected)
+        menu.add_command(label="上移轨道", command=self.merge_move_up_selected)
+        menu.add_command(label="下移轨道", command=self.merge_move_down_selected)
         menu.add_command(label="删除轨道", command=self.merge_delete_selected)
+#        menu.add_command(label="清空轨道", command=self.merge_clear_tracks)
+#        menu.add_command(label="串行合并排序", command=self._merge_sort_ask)
+#        menu.add_command(label="保存项目", command=self.save_merge_project)
+#        menu.add_command(label="加载项目", command=self.load_merge_project)
         menu.add_separator()
         menu.add_command(label="恢复列宽", command=self.merge_reset_column_widths)
         menu.post(x, y)
@@ -11713,28 +11804,12 @@ class FFmpegBatchGUI:
                 elif track.enc_settings.get("_error"):
                     detail = "❌ 解析失败"
                 else:
-                    orig_w, orig_h = self._get_video_dimensions_cached(track.file_path)
-                    if orig_w and orig_h:
-                        if track.enc_settings.get("scale_enabled", False):
-                            method = track.enc_settings.get("scale_method", "width")
-                            sw = track.enc_settings.get("scale_width", "").strip()
-                            sh = track.enc_settings.get("scale_height", "").strip()
-                            if method == "width" and sw:
-                                scale_str = f"{sw}x-2"
-                            elif method == "height" and sh:
-                                scale_str = f"-2x{sh}"
-                            elif method == "exact" and sw and sh:
-                                scale_str = f"{sw}x{sh}"
-                            else:
-                                scale_str = ""
-                            if scale_str:
-                                detail = f"{orig_w}x{orig_h} → {scale_str}"
-                            else:
-                                detail = f"{orig_w}x{orig_h}"
-                        else:
-                            detail = f"{orig_w}x{orig_h}"
+                    chain = self._get_video_size_chain(track)
+                    if chain:
+                        detail = " → ".join(chain)
                     else:
                         detail = "未知"
+                    # 附上时长
                     dur = self._get_media_duration(track.file_path)
                     if dur is not None:
                         detail += f" ({seconds_to_time(dur)})"
@@ -11945,9 +12020,9 @@ class FFmpegBatchGUI:
         self.merge_tree.column("序号", width=10)
         self.merge_tree.column("启用", width=5)
         self.merge_tree.column("类型", width=30)
-        self.merge_tree.column("规格", width=120)
+        self.merge_tree.column("规格", width=220)
         self.merge_tree.column("编码", width=20)
-        self.merge_tree.column("来源 - 双击编辑 右键更多", width=480)
+        self.merge_tree.column("来源 - 双击编辑 右键更多", width=380)
         self.merge_tree.column("编码设置", width=60)
         self._append_info_ui("[布局] 已恢复合并列表的列宽")
 
@@ -13024,12 +13099,16 @@ class FFmpegBatchGUI:
     
     def merge_do_merge(self, cmd_list, final_output):
         """
-        执行合并/转码命令，并实时显示进度。
+        执行合并/转码命令，并实时显示进度（含耗时）。
         """
         if not cmd_list:
             self._append_info_ui("[封装] 命令列表为空，无法执行")
             self.root.after(0, lambda: self.merge_btn.config(state="normal"))
             return
+    
+        # ----- 创建临时 task 用于记录耗时 -----
+        merge_task = Task("", "", {}, [])
+        merge_task.start_time = time.time()
     
         self._append_info_ui("[封装] 开始合并/转码...")
         output_file = final_output
@@ -13068,7 +13147,8 @@ class FFmpegBatchGUI:
                     if match:
                         h, m, s = match.groups()
                         current_sec = int(h) * 3600 + int(m) * 60 + float(s)
-                        self.update_progress(current=int(current_sec), total=int(total_duration), task=None, log_progress=True)
+			# 传入 merge_task，让进度更新包含耗时
+                        self.update_progress(current=int(current_sec), total=int(total_duration), task=merge_task, log_progress=True)
     
             ret = proc.wait()
             if ret == 0:
@@ -13090,8 +13170,12 @@ class FFmpegBatchGUI:
             with self._proc_lock:
                 if proc in self.running_procs:
                     self.running_procs.remove(proc)
-            # 重置进度（转码结束或失败）
-            self.update_progress(current=0, total=0, task=None, log_progress=True)
+            # 标记任务完成并计算耗时
+            merge_task.is_finished = True
+            if merge_task.start_time is not None:
+                merge_task.elapsed_time = time.time() - merge_task.start_time
+            # 重置进度（转码结束或失败），传入 merge_task 以显示耗时
+            self.update_progress(current=0, total=0, task=merge_task, log_progress=True)
             self.root.after(0, lambda: self.merge_btn.config(state="normal"))
             if hasattr(self, '_merge_temp_files'):
                 self._cleanup_temp_files(self._merge_temp_files)
@@ -14930,6 +15014,8 @@ class FFmpegBatchGUI:
         menu.add_command(label="移除选中任务", command=self.remove_selected_tasks)
         menu.add_command(label="清空全部任务", command=self.clear_all_tasks)
         menu.add_command(label="清空已完成/失败任务", command=self.clear_finished_tasks)
+        menu.add_command(label="停止队列", command=self.stop_queue)
+        menu.add_command(label="预览选中任务", command=self.preview_selected_task)
         menu.add_separator()
         menu.add_command(label="恢复列宽", command=self.reset_task_tree_columns)
 
@@ -15273,8 +15359,8 @@ class FFmpegBatchGUI:
         self.task_tree.column("序号", width=25, minwidth=20)
         self.task_tree.column("文件名", width=75, minwidth=20)
         self.task_tree.column("输出路径", width=100, minwidth=20)
-        self.task_tree.column("命令 (简洁) 双击编辑 右键更新", width=410, minwidth=20)
-        self.task_tree.column("状态", width=72, minwidth=20)
+        self.task_tree.column("命令 (简洁) 双击编辑 右键更新", width=310, minwidth=20)
+        self.task_tree.column("状态", width=152, minwidth=20)
         self.task_tree.column("错误信息", width=30, minwidth=20)
         self.task_tree.tag_configure('odd', background='#e8e8e8')
         self.task_tree.tag_configure('even', background='#ffffff')
