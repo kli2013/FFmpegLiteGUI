@@ -640,14 +640,14 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
         decoder = settings.get("hwaccel_decoder", "")
         if any(kw in decoder for kw in ("cuda", "cuvid")):
             if filter_chain != "null":
-                filter_chain = f"hwdownload,format=nv12,{filter_chain},hwupload_cuda,format=nv12"
+                filter_chain = f"hwdownload,format=nv12,{filter_chain},hwupload_cuda"
     
     # AMD 包裹（也依赖硬件解码，与 NVIDIA 逻辑一致）
     if wrap_amd and settings.get("hwaccel_enabled", False):
         decoder = settings.get("hwaccel_decoder", "")
         if any(kw in decoder for kw in ("amf",)):  # amf, h264_amf, hevc_amf, av1_amf
             if filter_chain != "null":
-                filter_chain = f"hwdownload_ama,format=nv12,{filter_chain},hwupload_ama,format=nv12"
+                filter_chain = f"hwdownload_ama,format=nv12,{filter_chain},hwupload_ama"
     
     return filter_chain
 
