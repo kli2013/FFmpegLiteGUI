@@ -486,7 +486,7 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
     去块滤波 → 降噪 → 锐化 → 色彩空间转换 → 颜色校正+色相 → 像素格式 → 变速 → 倒放
     """
     filters = []
-    
+
     # ----- 精准截取（trim + setpts）-----
     if include_trim and settings.get("precise_trim", False) and settings.get("trim_enabled", False):
         start = settings.get("trim_start", "").strip()
@@ -630,7 +630,26 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
     if reverse:
         filters.append("reverse")
 
-    return ",".join(filters) if filters else "null"
+    filter_chain = ",".join(filters) if filters else "null"
+    
+    wrap_nvidia = settings.get("wrap_cpu_nvidia", False)
+    wrap_amd = settings.get("wrap_cpu_amd", False)
+    
+    # NVIDIA 包裹（依赖硬件解码）
+    if wrap_nvidia and settings.get("hwaccel_enabled", False):
+        decoder = settings.get("hwaccel_decoder", "")
+        if any(kw in decoder for kw in ("cuda", "cuvid")):
+            if filter_chain != "null":
+                filter_chain = f"hwdownload,format=nv12,{filter_chain},hwupload_cuda,format=nv12"
+    
+    # AMD 包裹（也依赖硬件解码，与 NVIDIA 逻辑一致）
+    if wrap_amd and settings.get("hwaccel_enabled", False):
+        decoder = settings.get("hwaccel_decoder", "")
+        if any(kw in decoder for kw in ("amf",)):  # amf, h264_amf, hevc_amf, av1_amf
+            if filter_chain != "null":
+                filter_chain = f"hwdownload_ama,format=nv12,{filter_chain},hwupload_ama,format=nv12"
+    
+    return filter_chain
 
 def build_preview_filter_chain(settings: Dict[str, Any], target_height: int = 960, reverse: bool = False) -> str:
     """生成预览用的滤镜链，强制缩放到指定高度"""
@@ -885,6 +904,11 @@ HARDWARE_DECODER_OPTIONS = [
     "hevc_cuvid (NVIDIA HEVC)",
     "vp9_cuvid (NVIDIA VP9)",
     "av1_cuvid (NVIDIA AV1)",
+    # ----- AMD AMF (FFmpeg 8.0+) -----
+    "amf (AMD通用)",
+    "h264_amf (AMD H.264)",
+    "hevc_amf (AMD HEVC)",
+    "av1_amf (AMD AV1)",
     "qsv (Intel通用)",
     "h264_qsv (Intel H.264)",
     "hevc_qsv (Intel HEVC)",
@@ -899,6 +923,11 @@ DECODER_MAP = {
     "hevc_cuvid (NVIDIA HEVC)": "hevc_cuvid",
     "vp9_cuvid (NVIDIA VP9)": "vp9_cuvid",
     "av1_cuvid (NVIDIA AV1)": "av1_cuvid",
+    # ----- AMD AMF (FFmpeg 8.0+) -----
+    "amf (AMD通用)": "amf",
+    "h264_amf (AMD H.264)": "h264_amf",
+    "hevc_amf (AMD HEVC)": "hevc_amf",
+    "av1_amf (AMD AV1)": "av1_amf",
     "qsv (Intel通用)": "qsv",
     "h264_qsv (Intel H.264)": "h264_qsv",
     "hevc_qsv (Intel HEVC)": "hevc_qsv",
@@ -4190,14 +4219,87 @@ class AdvancedFrame(ttk.LabelFrame):
                                    command=self._on_hw_toggle)
         hw_check.pack(side=tk.LEFT)
         ToolTip(hw_check,
-            "【NVIDIA推荐】\n1.cuda（首选）：自动识别H264/HEVC/AV1，支持全程显存加速。\n2.auto：传统模式，兼容性好但效率略低。\n\n【Intel推荐】\n3.qsv：Intel通用模式，自动适配格式并直通显存。\n\n【手动指定】\n仅在全自动失败时使用。HEVC即H.265，AV1需新显卡支持。",
+            "【NVIDIA推荐】\n1.cuda（首选）：自动识别H264/HEVC/AV1，支持全程显存加速。\n2.auto：传统模式，兼容性好但效率略低。\n\n【AMD推荐 (FFmpeg 8.0+)】\namf（首选）：AMD通用硬件解码，支持H.264/HEVC/AV1。\n\n【Intel推荐】\n3.qsv：Intel通用模式，自动适配格式并直通显存。\n\n【手动指定】\n仅在全自动失败时使用。HEVC即H.265，AV1需新显卡支持。",
             offset_x=0, offset_y=0, wraplength=500)
         self.hwaccel_decoder = tk.StringVar(value="无")
         self.decoder_combo = ttk.Combobox(hw_frame, textvariable=self.hwaccel_decoder,
                                           values=HARDWARE_DECODER_OPTIONS,
                                           state="readonly", width=22)
         self.decoder_combo.pack(side=tk.LEFT, padx=5)
-        self.decoder_combo.bind("<<ComboboxSelected>>", lambda e: self._trigger_update())
+        self.decoder_combo.bind("<<ComboboxSelected>>", lambda e: self._on_hw_toggle())
+
+
+        # ---- 软件滤镜兼容模式（NVIDIA + AMD） ----
+        ttk.Label(hw_frame, text="软件滤镜兼容:").pack(side=tk.LEFT, padx=(10, 0))
+        
+        # NVIDIA CUDA 复选框
+        self.wrap_cpu_nvidia_var = tk.BooleanVar(value=False)
+        self.wrap_cpu_nvidia_check = ttk.Checkbutton(
+            hw_frame,
+            text="NVIDIA CUDA",
+            variable=self.wrap_cpu_nvidia_var,
+            state=tk.DISABLED,
+            command=self._on_nvidia_toggle
+        )
+        self.wrap_cpu_nvidia_check.pack(side=tk.LEFT, padx=2)
+        
+        ToolTip(
+            self.wrap_cpu_nvidia_check,
+            "【软件滤镜 CUDA 兼容模式】\n\n"
+            "此功能专门为 NVIDIA CUDA 硬件加速设计，需要同时满足：\n"
+            "✅ 编码器选择为 xxx_nvenc（如 hevc_nvenc）\n"
+            "✅ 解码器选择为 NVIDIA CUDA 相关（cuda / h264_cuvid / hevc_cuvid 等）\n\n"
+            "勾选后，所有常规软件滤镜（裁剪/缩放/旋转/降噪/锐化等）\n"
+            "会自动被 hwdownload + hwupload_cuda 包裹，\n"
+            "使得硬件解码 + 硬件编码通道中也能正常使用软件滤镜。\n\n"
+            "⚠️ 性能代价：\n"
+            "数据会在 GPU 和 CPU 之间额外拷贝一次，速度比纯硬件通道慢，\n"
+            "（注：目前 FFmpeg 的纯硬件滤镜仅有 scale_cuda、transpose_cuda 等少数几个，\n"
+            "此模式是兼顾硬件加速与丰富滤镜效果的最佳方案）\n\n"
+            "💡 新手用户：直接无脑全包裹，不单独配置硬件滤镜。\n"
+            "💡 进阶用户：\n"
+            "如果您熟悉 FFmpeg，并且当前任务只需要硬件滤镜，\n"
+            "可在「自定义参数」中直接使用硬件加速滤镜：\n"
+            "scale_cuda, transpose_cuda, flip_cuda 等，\n"
+            "然后用自定义参数覆盖 -vf，可获得最高性能。\n\n"
+            "注意：此功能仅对 NVIDIA GPU 有效，非 NVIDIA 显卡请勿勾选。",
+            wraplength=500
+        )
+        
+        # AMD AMF 复选框
+        self.wrap_cpu_amd_var = tk.BooleanVar(value=False)
+        self.wrap_cpu_amd_check = ttk.Checkbutton(
+            hw_frame,
+            text="AMD AMF",
+            variable=self.wrap_cpu_amd_var,
+            state=tk.DISABLED,
+            command=self._on_amd_toggle
+        )
+        self.wrap_cpu_amd_check.pack(side=tk.LEFT, padx=2)
+        
+        ToolTip(
+            self.wrap_cpu_amd_check,
+            "【AMD AMF 软件滤镜兼容模式】\n\n"
+            "此功能专门为 AMD 硬件加速设计，需要同时满足：\n"
+            "✅ 编码器选择为 xxx_amf（如 hevc_amf）\n"
+            "✅ 解码器选择为 xxx_amf（如 h264_amf / hevc_amf / av1_amf）\n\n"
+            "其他同NVIDIA\n\n"
+            "AMD AMF 提供以下硬件加速滤镜（需 FFmpeg 9.0+）：\n\n"
+            "• scale_amf / vpp_amf（硬件加速缩放 + 色彩空间转换）\n"
+            "• sr_amf 超分辨率缩放\n"
+            "• vf_frc_amf（帧率转换（插帧））\n"
+            "• vf_vqe_amf（视频质量增强（降噪、去块等））\n\n"
+            "裁剪（crop）和旋转（transpose）暂无 AMD 硬件版本\n"
+            "所以 AMD 最好就直接全把软件滤镜包裹使用算了。\n"
+            "注意：此功能为实验性集成，由于缺乏 AMD 硬件测试环境，\n"
+            "    实际效果以您的测试为准。",
+            wraplength=500
+        )
+        
+        # 绑定变量变化触发刷新（可选，因为 command 已经触发刷新）
+        self.wrap_cpu_nvidia_var.trace_add("write", lambda *a: self._trigger_update())
+        self.wrap_cpu_amd_var.trace_add("write", lambda *a: self._trigger_update())
+
 
         # 自定义参数
         custom_frame = ttk.Frame(self)
@@ -4305,6 +4407,18 @@ class AdvancedFrame(ttk.LabelFrame):
         self._refresh_wm_preset_list()
 
 
+    def _on_nvidia_toggle(self):
+        """勾选 NVIDIA 时，取消 AMD"""
+        if self.wrap_cpu_nvidia_var.get():
+            self.wrap_cpu_amd_var.set(False)
+        self._trigger_update()
+    
+    def _on_amd_toggle(self):
+        """勾选 AMD 时，取消 NVIDIA"""
+        if self.wrap_cpu_amd_var.get():
+            self.wrap_cpu_nvidia_var.set(False)
+        self._trigger_update()
+
 
     def _on_wm_path_changed(self, *args):
         path = self.wm_path_var.get().strip()
@@ -4333,8 +4447,26 @@ class AdvancedFrame(ttk.LabelFrame):
 
 
     def _on_hw_toggle(self):
-        if self.hwaccel_enabled.get() and self.hwaccel_decoder.get() == "无":
-            self.hwaccel_decoder.set("auto (自动通用)")
+        """硬件解码开关变化时，更新包裹滤镜复选框的状态"""
+        decoder = self.hwaccel_decoder.get()
+        enabled = self.hwaccel_enabled.get()
+        
+        # ---- NVIDIA CUDA 状态 ----
+        is_cuda = enabled and any(kw in decoder for kw in ("cuda", "cuvid"))
+        if is_cuda:
+            self.wrap_cpu_nvidia_check.config(state=tk.NORMAL)
+        else:
+            self.wrap_cpu_nvidia_var.set(False)
+            self.wrap_cpu_nvidia_check.config(state=tk.DISABLED)
+        
+        # ---- AMD AMF 状态（与 NVIDIA 逻辑一致，检测解码器） ----
+        is_amf = enabled and any(kw in decoder for kw in ("amf",))
+        if is_amf:
+            self.wrap_cpu_amd_check.config(state=tk.NORMAL)
+        else:
+            self.wrap_cpu_amd_var.set(False)
+            self.wrap_cpu_amd_check.config(state=tk.DISABLED)
+        
         self._trigger_update()
 
     def _trigger_update(self):
@@ -4498,7 +4630,9 @@ class AdvancedFrame(ttk.LabelFrame):
         return {
             "hwaccel_enabled": self.hwaccel_enabled.get(),
             "hwaccel_decoder": self.hwaccel_decoder.get(),
-            "custom_args": self.custom_args.get()
+            "custom_args": self.custom_args.get(),
+            "wrap_cpu_nvidia": self.wrap_cpu_nvidia_var.get(),
+            "wrap_cpu_amd": self.wrap_cpu_amd_var.get(),
         }
 
     def set_settings(self, settings):
@@ -4507,6 +4641,8 @@ class AdvancedFrame(ttk.LabelFrame):
         self.custom_args.set(settings.get("custom_args", ""))
         if hasattr(self, 'adaptive_var'):
             self.adaptive_var.set(self.watermark_dict.get("adaptive", False))
+        self.wrap_cpu_nvidia_var.set(settings.get("wrap_cpu_nvidia", False))
+        self.wrap_cpu_amd_var.set(settings.get("wrap_cpu_amd", False))
         self._on_hw_toggle()
 
 
@@ -5418,7 +5554,7 @@ class FFmpegBatchGUI:
     
         # 专用解码器（如 h264_cuvid）
         if decoder_key in ("h264_cuvid", "hevc_cuvid", "vp9_cuvid", "av1_cuvid",
-                           "h264_qsv", "hevc_qsv"):
+                           "h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf", "av1_amf"):
             cmd_list.extend(["-c:v", decoder_key])
         # 通用硬件加速
         elif decoder_key in ("auto", "cuda", "qsv", "vaapi", "videotoolbox"):
@@ -5426,6 +5562,8 @@ class FFmpegBatchGUI:
                 cmd_list.extend(["-hwaccel", "auto"])
             elif decoder_key == "cuda":
                 cmd_list.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
+            elif decoder_key == "amf":  # AMD 通用
+                cmd_list.extend(["-hwaccel", "amf", "-hwaccel_output_format", "amf"])
             elif decoder_key == "qsv":
                 cmd_list.extend(["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"])
             elif decoder_key == "vaapi":
@@ -15253,6 +15391,7 @@ class FFmpegBatchGUI:
         param_notebook.add(adv_page, text="高级选项")
         self.adv_frame = AdvancedFrame(adv_page, update_callback=self.update_command_preview, app=self)
         self.adv_frame.pack(fill=tk.X, padx=5, pady=5)
+
     
         # 底部按钮
         bottom_btn_frame = ttk.Frame(settings_frame)
