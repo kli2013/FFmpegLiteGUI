@@ -2184,6 +2184,7 @@ class VideoFilterFrame(ttk.LabelFrame):
 
     def open_enhance_window(self):
         win = tk.Toplevel(self)
+        win.withdraw()
         win.title("高级增强滤镜")
         win.transient(self)
         win.grab_set()
@@ -3078,6 +3079,7 @@ class BlurFilterDialog(tk.Toplevel):
     """去水印/模糊设置窗口 - 支持从裁剪复制坐标"""
     def __init__(self, parent, filter_frame):
         super().__init__(parent)
+        self.withdraw()
         self.filter_frame = filter_frame
         self.title("去水印 / 模糊设置")
         self.transient(parent)
@@ -5775,8 +5777,8 @@ class FFmpegBatchGUI:
             "提取指定时间帧 (需改 -ss)": 'ffmpeg -y -i "{input}" -ss 00:00:05 -vframes 1 "{output_dir}thumb.jpg"',
             "【硬件滤镜片段】缩放 (scale_cuda)": '-vf scale_cuda={scale_w}:{scale_h}',
             "【硬件滤镜片段】旋转 (transpose_cuda)": '-vf transpose_cuda={transpose_val}',
-            "【区域模糊】boxblur": '-filter_complex \"[0:v]crop={crop_w}:{crop_h}:{crop_x}:{crop_y},boxblur=11[fg]; [0:v][fg]overlay={crop_x}:{crop_y}[v]\" -map \"[v]\" -map 0:a? -c:a copy',
-            "【区域模糊】gblur": '-filter_complex \"[0:v]crop={crop_w}:{crop_h}:{crop_x}:{crop_y},gblur=sigma=2.0[fg]; [0:v][fg]overlay={crop_x}:{crop_y}[v]\" -map \"[v]\" -map 0:a? -c:a copy',
+            "【区域模糊】boxblur": '-filter_complex \"[0:v]crop={crop_w}:{crop_h}:{crop_x}:{crop_y},boxblur=11[fg];[0:v][fg]overlay={crop_x}:{crop_y}[v]\" -map \"[v]\" -map 0:a? -c:a copy',
+            "【区域模糊】gblur": '-filter_complex \"[0:v]crop={crop_w}:{crop_h}:{crop_x}:{crop_y},gblur=sigma=2.0[fg];[0:v][fg]overlay={crop_x}:{crop_y}[v]\" -map \"[v]\" -map 0:a? -c:a copy',
 
         }
     
