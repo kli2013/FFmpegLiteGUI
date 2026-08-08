@@ -4254,15 +4254,18 @@ class AdvancedFrame(ttk.LabelFrame):
             "使得硬件解码 + 硬件编码通道中也能正常使用软件滤镜。\n\n"
             "⚠️ 性能代价：\n"
             "数据会在 GPU 和 CPU 之间额外拷贝一次，速度比纯硬件通道慢，\n"
-            "（注：目前 FFmpeg 的纯硬件滤镜仅有 scale_cuda、transpose_cuda 等少数几个，\n"
-            "此模式是兼顾硬件加速与丰富滤镜效果的最佳方案）\n\n"
+            "（注：目前 FFmpeg 的纯硬件滤镜有 scale_cuda, transpose_cuda, overlay_cuda, hstack_cuda, vstack_cuda, chromakey_cuda, "
+            "bwdif_cuda, yadif_cuda, pad_cuda, colorspace_cuda, thumbnail_cuda 等）\n"
+            "自定义测试了几个，成功激活的少，感觉限制条件很多，每个人的配置结果都不同。\n\n"
             "💡 新手用户：直接无脑全包裹，不单独配置硬件滤镜。\n"
             "💡 进阶用户：\n"
             "如果您熟悉 FFmpeg，并且当前任务只需要硬件滤镜，\n"
             "可在「自定义参数」中直接使用硬件加速滤镜：\n"
-            "scale_cuda, transpose_cuda, flip_cuda 等，\n"
-            "然后用自定义参数覆盖 -vf，可获得最高性能。\n\n"
-            "注意：此功能仅对 NVIDIA GPU 有效，非 NVIDIA 显卡请勿勾选。",
+            "scale_cuda, transpose_cuda, .... 等，\n"
+            "然后用自定义参数覆盖 -vf，可获得最高性能，但也可能失败，最好选择*cuda (NVIDIA通用)*。\n\n"
+            "注意：此功能仅对 NVIDIA GPU 有效，非 NVIDIA 显卡请勿勾选。\n"
+            "当前为简易偷懒实现，速度不保证，以后可能把相关滤镜设置为可下拉选择。\n"
+            "如果滤镜过多速度不理想，还是直接用常规软件编码libx吧。",
             wraplength=500
         )
         
