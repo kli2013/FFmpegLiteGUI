@@ -502,7 +502,24 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
             if trim_parts:
                 filters.append(f"trim={':'.join(trim_parts)}")
                 filters.append("setpts=PTS-STARTPTS")
-    
+
+    # ----- 去水印/模糊 -----
+    if settings.get("blur_enabled", False):
+        blur_type = settings.get("blur_type", "delogo")
+        x = settings.get("blur_x", "0")
+        y = settings.get("blur_y", "0")
+        w = settings.get("blur_w", "100")
+        h = settings.get("blur_h", "100")
+        strength = settings.get("blur_strength", "5")
+
+        if blur_type == "delogo":
+            filters.append(f"delogo=x={x}:y={y}:w={w}:h={h}")
+        elif blur_type == "boxblur":
+            filters.append(f"boxblur={strength}:{strength}")
+        elif blur_type == "gblur":
+            filters.append(f"gblur=sigma={strength}")
+
+
     # ----- 裁剪 -----
     if settings.get("crop_enabled", False):
         w = settings.get("crop_width", "").strip()
@@ -1786,6 +1803,17 @@ class VideoFilterFrame(ttk.LabelFrame):
         self._crop_extract_thread = None
         self._crop_cancel_event = threading.Event()
 
+
+
+        # 去水印/模糊设置
+        self._blur_enabled = tk.BooleanVar(value=False)
+        self._blur_type = tk.StringVar(value="delogo")
+        self._blur_strength = tk.StringVar(value="5")
+        self._blur_x = tk.StringVar(value="0")
+        self._blur_y = tk.StringVar(value="0")
+        self._blur_w = tk.StringVar(value="100")
+        self._blur_h = tk.StringVar(value="100")
+
         self.enhance_settings = {
             "denoise_enabled": False,
             "denoise_spatial": 4.0,
@@ -1960,12 +1988,17 @@ class VideoFilterFrame(ttk.LabelFrame):
 
         self.vflip = tk.BooleanVar(value=False)
         self.hflip = tk.BooleanVar(value=False)
-        ttk.Checkbutton(rot_frame, text="上下翻转", variable=self.vflip).pack(side=tk.LEFT, padx=(40,0))
+        ttk.Checkbutton(rot_frame, text="上下翻转", variable=self.vflip).pack(side=tk.LEFT, padx=(20,0))
         ttk.Checkbutton(rot_frame, text="左右翻转", variable=self.hflip).pack(side=tk.LEFT, padx=5)
+
+        # 在高级增强按钮左侧添加
+        self.blur_btn = ttk.Button(rot_frame, text="去水印/模糊", 
+                                   command=self.open_blur_dialog, width=10)
+        self.blur_btn.pack(side=tk.LEFT, padx=(10, 0))
 
 
         self.enhance_btn = ttk.Button(rot_frame, text="高级增强", 
-                                      command=self.open_enhance_window, width=10)
+                                      command=self.open_enhance_window, width=8)
         self.enhance_btn.pack(side=tk.LEFT, padx=(20,0))
 
 
@@ -2024,6 +2057,10 @@ class VideoFilterFrame(ttk.LabelFrame):
         self.pix_fmt_combo.pack(side=tk.LEFT, padx=5)
         
         self.pix_fmt_enabled.trace_add("write", self._on_pix_fmt_changed)
+
+
+    def open_blur_dialog(self):
+        BlurFilterDialog(self, self)
 
     def _on_pix_fmt_changed(self, *args):
         if getattr(self, '_loading_settings', False):
@@ -2995,6 +3032,13 @@ class VideoFilterFrame(ttk.LabelFrame):
             "subtitle_enabled": self.subtitle_enabled.get(),
             "subtitle_path": self.subtitle_path.get(),
             "reverse_enabled": self.reverse_enabled.get(),
+            "blur_enabled": self._blur_enabled.get(),
+            "blur_type": self._blur_type.get(),
+            "blur_strength": self._blur_strength.get(),
+            "blur_x": self._blur_x.get(),
+            "blur_y": self._blur_y.get(),
+            "blur_w": self._blur_w.get(),
+            "blur_h": self._blur_h.get(),
         }
 
     def set_settings(self, settings):
@@ -3021,6 +3065,215 @@ class VideoFilterFrame(ttk.LabelFrame):
         self.subtitle_path.set(settings.get("subtitle_path", ""))
         self.toggle_subtitle()
         self.reverse_enabled.set(settings.get("reverse_enabled", False))
+        self._blur_enabled.set(settings.get("blur_enabled", False))
+        self._blur_type.set(settings.get("blur_type", "delogo"))
+        self._blur_strength.set(settings.get("blur_strength", "5"))
+        self._blur_x.set(settings.get("blur_x", "0"))
+        self._blur_y.set(settings.get("blur_y", "0"))
+        self._blur_w.set(settings.get("blur_w", "100"))
+        self._blur_h.set(settings.get("blur_h", "100"))
+
+
+class BlurFilterDialog(tk.Toplevel):
+    """去水印/模糊设置窗口 - 支持从裁剪复制坐标"""
+    def __init__(self, parent, filter_frame):
+        super().__init__(parent)
+        self.filter_frame = filter_frame
+        self.title("去水印 / 模糊设置")
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(False, False)
+        
+        width, height = 380, 300
+        center_window(self, width, height)
+        
+        self.create_widgets()
+        self.load_settings()
+    
+    def create_widgets(self):
+        main = ttk.Frame(self, padding="10")
+        main.pack(fill=tk.BOTH, expand=True)
+        
+        # ---- 启用 ----
+        self.enabled_var = tk.BooleanVar(value=self.filter_frame._blur_enabled.get())
+        chk = ttk.Checkbutton(main, text="启用去水印/模糊", variable=self.enabled_var)
+        chk.grid(row=0, column=0, columnspan=3, sticky="w", pady=5)
+        ToolTip(chk, "勾选后将在视频滤镜链中插入去水印或模糊滤镜")
+        
+        # ---- 滤镜类型 ----
+        ttk.Label(main, text="滤镜类型:").grid(row=1, column=0, sticky="w", pady=5)
+        self.type_var = tk.StringVar(value=self.filter_frame._blur_type.get())
+        type_combo = ttk.Combobox(main, textvariable=self.type_var,
+                                  values=["delogo", "boxblur", "gblur"],
+                                  state="readonly", width=12)
+        type_combo.grid(row=1, column=1, sticky="w", padx=5)
+        type_combo.bind("<<ComboboxSelected>>", self.on_type_change)
+        ToolTip(type_combo, 
+                "delogo：去水印（需指定区域坐标，仅处理该区域，用周围像素智能填充）\n"
+                "boxblur：盒式模糊（全局模糊整个画面，不指定坐标）\n"
+                "gblur：高斯模糊（全局模糊整个画面，不指定坐标）\n"
+                "仅当滤镜类型为 delogo 时需填写坐标，boxblur 和 gblur 为全画面滤镜，坐标将被忽略。\n"
+                "若需要 boxblur 或 gblur 进行局部模糊，请先裁剪出该区域，应用模糊，\n"
+                "再通过叠加/画中画方式合成，但当前版本未内置此流程。")
+        
+        # ---- 强度参数 ----
+        self.strength_frame = ttk.Frame(main)
+        self.strength_frame.grid(row=2, column=0, columnspan=3, sticky="w", pady=5)
+        self.strength_label = ttk.Label(self.strength_frame, text="强度/半径:")
+        self.strength_label.pack(side=tk.LEFT)
+        self.strength_var = tk.StringVar(value=self.filter_frame._blur_strength.get())
+        self.strength_entry = ttk.Entry(self.strength_frame, textvariable=self.strength_var, width=8)
+        self.strength_entry.pack(side=tk.LEFT, padx=5)
+        ToolTip(self.strength_entry, 
+                "boxblur：半径（整数，默认5）\n"
+                "gblur：sigma（浮点数，默认2.0）\n"
+                "delogo：此参数无效")
+        self.update_strength_state()  # 初始化状态
+        
+        # ---- 坐标区域 ----
+        coord_frame = ttk.LabelFrame(main, text="区域坐标 (仅 delogo 有效)", padding="5")
+        coord_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=5)
+
+        
+        # 坐标输入行
+        row1 = ttk.Frame(coord_frame)
+        row1.pack(fill=tk.X, pady=2)
+        ttk.Label(row1, text="X:").pack(side=tk.LEFT)
+        self.x_var = tk.StringVar(value=self.filter_frame._blur_x.get())
+        x_entry = ttk.Entry(row1, textvariable=self.x_var, width=6)
+        x_entry.pack(side=tk.LEFT, padx=2)
+    
+        ttk.Label(row1, text="Y:").pack(side=tk.LEFT, padx=(10,0))
+        self.y_var = tk.StringVar(value=self.filter_frame._blur_y.get())
+        y_entry = ttk.Entry(row1, textvariable=self.y_var, width=6)
+        y_entry.pack(side=tk.LEFT, padx=2)
+ 
+        ttk.Label(row1, text="宽度:").pack(side=tk.LEFT, padx=(10,0))
+        self.w_var = tk.StringVar(value=self.filter_frame._blur_w.get())
+        w_entry = ttk.Entry(row1, textvariable=self.w_var, width=6)
+        w_entry.pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(row1, text="高度:").pack(side=tk.LEFT, padx=(10,0))
+        self.h_var = tk.StringVar(value=self.filter_frame._blur_h.get())
+        h_entry = ttk.Entry(row1, textvariable=self.h_var, width=6)
+        h_entry.pack(side=tk.LEFT, padx=2)
+
+        # 复制裁剪坐标按钮
+        btn_copy = ttk.Button(coord_frame, text="📋 从裁剪复制坐标", 
+                              command=self.copy_from_crop)
+        btn_copy.pack(pady=5)
+        ToolTip(btn_copy, 
+                "点击后将直接复制裁剪设置中的坐标（左、上、宽、高），并自动将滤镜类型切换为 delogo，\n使用前请先通过可视化裁剪工具获取目标区域的精确坐标。")
+        
+        # ---- 操作按钮 ----
+        btn_frame = ttk.Frame(main)
+        btn_frame.grid(row=4, column=0, columnspan=3, pady=15)
+        ttk.Button(btn_frame, text="应用", command=self.apply).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=self.destroy).pack(side=tk.LEFT, padx=5)
+        
+        self.update_coord_state()
+    
+    def update_strength_state(self):
+        ftype = self.type_var.get()
+        if ftype == "delogo":
+            self.strength_label.config(text="参数:")
+            self.strength_entry.config(state="disabled")
+            self.strength_var.set("")  # 清空值
+        elif ftype == "boxblur":
+            self.strength_label.config(text="半径:")
+            self.strength_entry.config(state="normal")
+            self.strength_var.set("5")
+        elif ftype == "gblur":
+            self.strength_label.config(text="sigma:")
+            self.strength_entry.config(state="normal")
+            self.strength_var.set("2.0")
+    
+    def update_coord_state(self):
+        state = "normal" if self.type_var.get() == "delogo" else "disabled"
+        for child in self.winfo_children():
+            if isinstance(child, ttk.LabelFrame) and "区域坐标" in child.cget("text"):
+                for sub in child.winfo_children():
+                    if isinstance(sub, ttk.Entry):
+                        sub.config(state=state)
+                break
+    
+    def on_type_change(self, event=None):
+        # 先更新输入框状态（启用/禁用）
+        self.update_strength_state()
+        # 更新坐标状态
+        self.update_coord_state()
+        # 根据类型设置默认强度值
+        ftype = self.type_var.get()
+        if ftype == "delogo":
+            # delogo 不需要强度参数，清空
+            self.strength_var.set("")
+        elif ftype in ("boxblur", "gblur"):
+            # 如果当前值为空，则填入默认值
+            if not self.strength_var.get().strip():
+                default_map = {"boxblur": "5", "gblur": "2.0"}
+                self.strength_var.set(default_map.get(ftype, "5"))
+    
+    def copy_from_crop(self):
+        crop_w = self.filter_frame.crop_width.get().strip()
+        crop_h = self.filter_frame.crop_height.get().strip()
+        crop_x = self.filter_frame.crop_left.get().strip()
+        crop_y = self.filter_frame.crop_top.get().strip()
+        if not crop_w or not crop_h:
+            messagebox.showwarning("提示", "裁剪未启用或参数为空，请先在「视频滤镜」中启用裁剪并设置区域。")
+            return
+        self.x_var.set(crop_x)
+        self.y_var.set(crop_y)
+        self.w_var.set(crop_w)
+        self.h_var.set(crop_h)
+        if not self.enabled_var.get():
+            self.enabled_var.set(True)
+        if self.type_var.get() != "delogo":
+            self.type_var.set("delogo")
+            self.on_type_change()
+        if self.filter_frame.app:
+            self.filter_frame.app._append_info_ui("已从裁剪复制坐标，并自动切换到 delogo 模式")
+    
+    def load_settings(self):
+        self.enabled_var.set(self.filter_frame._blur_enabled.get())
+        self.type_var.set(self.filter_frame._blur_type.get())
+        # 如果类型是 delogo，不恢复强度值（保持空）
+        if self.type_var.get() == "delogo":
+            self.strength_var.set("")
+        else:
+            self.strength_var.set(self.filter_frame._blur_strength.get())
+        self.x_var.set(self.filter_frame._blur_x.get())
+        self.y_var.set(self.filter_frame._blur_y.get())
+        self.w_var.set(self.filter_frame._blur_w.get())
+        self.h_var.set(self.filter_frame._blur_h.get())
+        self.update_strength_state()
+        self.update_coord_state()
+    
+    def apply(self):
+        if self.type_var.get() == "delogo":
+            try:
+                for var, name in [(self.x_var, "X"), (self.y_var, "Y"), 
+                                  (self.w_var, "宽度"), (self.h_var, "高度")]:
+                    val = var.get().strip()
+                    if not val:
+                        raise ValueError(f"{name} 不能为空")
+            except ValueError as e:
+                messagebox.showerror("错误", str(e))
+                return
+        else:
+            # 对于 boxblur 或 gblur，如果强度为空则填入默认值
+            if not self.strength_var.get().strip():
+                default_map = {"boxblur": "5", "gblur": "2.0"}
+                self.strength_var.set(default_map.get(self.type_var.get(), "5"))
+        self.filter_frame._blur_enabled.set(self.enabled_var.get())
+        self.filter_frame._blur_type.set(self.type_var.get())
+        self.filter_frame._blur_strength.set(self.strength_var.get())
+        self.filter_frame._blur_x.set(self.x_var.get())
+        self.filter_frame._blur_y.set(self.y_var.get())
+        self.filter_frame._blur_w.set(self.w_var.get())
+        self.filter_frame._blur_h.set(self.h_var.get())
+        if hasattr(self.filter_frame, 'app') and self.filter_frame.app:
+            self.filter_frame.app.update_command_preview()
+        self.destroy()
 
 
 # ================== 音频组件 ==================
@@ -4254,7 +4507,7 @@ class AdvancedFrame(ttk.LabelFrame):
             "使得硬件解码 + 硬件编码通道中也能正常使用软件滤镜。\n\n"
             "⚠️ 性能代价：\n"
             "数据会在 GPU 和 CPU 之间额外拷贝一次，速度比纯硬件通道慢，\n"
-            "（注：目前 FFmpeg 的纯硬件滤镜有 scale_cuda, transpose_cuda, overlay_cuda, hstack_cuda, vstack_cuda, chromakey_cuda, "
+            "（注：目前 NVIDIA 的纯硬件滤镜有 scale_cuda, transpose_cuda, overlay_cuda, hstack_cuda, vstack_cuda, chromakey_cuda, "
             "bwdif_cuda, yadif_cuda, pad_cuda, colorspace_cuda, thumbnail_cuda 等）\n"
             "自定义测试了几个，成功激活的少，感觉限制条件很多，每个人的配置结果都不同。\n\n"
             "💡 新手用户：直接无脑全包裹，不单独配置硬件滤镜。\n"
@@ -4262,7 +4515,7 @@ class AdvancedFrame(ttk.LabelFrame):
             "如果您熟悉 FFmpeg，并且当前任务只需要硬件滤镜，\n"
             "可在「自定义参数」中直接使用硬件加速滤镜：\n"
             "scale_cuda, transpose_cuda, .... 等，\n"
-            "然后用自定义参数覆盖 -vf，可获得最高性能，但也可能失败，最好选择*cuda (NVIDIA通用)*。\n\n"
+            "然后用自定义参数覆盖 -vf，可获得最高性能，但也可能失败，解码最好选择*cuda (NVIDIA通用)*。\n\n"
             "注意：此功能仅对 NVIDIA GPU 有效，非 NVIDIA 显卡请勿勾选。\n"
             "当前为简易偷懒实现，速度不保证，以后可能把相关滤镜设置为可下拉选择。\n"
             "如果滤镜过多速度不理想，还是直接用常规软件编码libx吧。",
@@ -5520,8 +5773,10 @@ class FFmpegBatchGUI:
             "提取内置封面 (cover art)": 'ffmpeg -y -i "{input}" -map 0:v:0? -c:v copy "{output_dir}cover.jpg"',
             "提取第一帧截图": 'ffmpeg -y -i "{input}" -vframes 1 "{output_dir}thumb.jpg"',
             "提取指定时间帧 (需改 -ss)": 'ffmpeg -y -i "{input}" -ss 00:00:05 -vframes 1 "{output_dir}thumb.jpg"',
-
-
+            "【硬件滤镜片段】缩放 (scale_cuda)": '-vf scale_cuda={scale_w}:{scale_h}',
+            "【硬件滤镜片段】旋转 (transpose_cuda)": '-vf transpose_cuda={transpose_val}',
+            "【区域模糊】boxblur": '-filter_complex \"[0:v]crop={crop_w}:{crop_h}:{crop_x}:{crop_y},boxblur=11[fg]; [0:v][fg]overlay={crop_x}:{crop_y}[v]\" -map \"[v]\" -map 0:a? -c:a copy',
+            "【区域模糊】gblur": '-filter_complex \"[0:v]crop={crop_w}:{crop_h}:{crop_x}:{crop_y},gblur=sigma=2.0[fg]; [0:v][fg]overlay={crop_x}:{crop_y}[v]\" -map \"[v]\" -map 0:a? -c:a copy',
 
         }
     
@@ -13958,25 +14213,63 @@ class FFmpegBatchGUI:
             self.save_player_settings()
     
     
+    def _get_current_filter_vars(self):
+        # 读取当前缩放值（若为空，则用 "-2" 表示自动）
+        scale_w = self.video_filter.scale_width.get().strip()
+        scale_h = self.video_filter.scale_height.get().strip()
+        if not scale_w:
+            scale_w = "-2"
+        if not scale_h:
+            scale_h = "-2"
+    
+        # 读取裁剪值（若为空，用 "iw" 等默认）
+        crop_w = self.video_filter.crop_width.get().strip() or "iw"
+        crop_h = self.video_filter.crop_height.get().strip() or "ih"
+        crop_x = self.video_filter.crop_left.get().strip() or "0"
+        crop_y = self.video_filter.crop_top.get().strip() or "0"
+    
+        # 旋转映射
+        rotate_val = self.video_filter.rotate.get()
+        transpose_map = {"90": "1", "180": "3", "270": "2", "none": ""}
+        transpose_val = transpose_map.get(rotate_val, "")
+    
+        return {
+            "scale_w": scale_w,
+            "scale_h": scale_h,
+            "crop_w": crop_w,
+            "crop_h": crop_h,
+            "crop_x": crop_x,
+            "crop_y": crop_y,
+            "transpose_val": transpose_val,
+        }
+    
     def _on_preset_selected(self, event=None):
         preset_name = self.cmd_preset_var.get()
-        if preset_name not in self.cmd_templates:
+        template = self.cmd_templates.get(preset_name, "")
+        if not template:
             return
     
-        template = self.cmd_templates[preset_name]
-        input_file = self.input_file.get().strip()
-        if not input_file:
-            input_file = "input.mp4"
+        # 如果是硬件滤镜片段，从界面读取参数替换占位符
+        if preset_name.startswith("【硬件滤镜片段】") or preset_name.startswith("【区域模糊】"):
+            vars = self._get_current_filter_vars()
+            try:
+                filled = template.format(**vars)
+            except KeyError as e:
+                messagebox.showerror("占位符错误", f"模板中使用了未定义的键: {e}")
+                return
+            self.cmd_input.delete(1.0, tk.END)
+            self.cmd_input.insert(tk.END, filled)
+            self._append_info_ui(f"已生成滤镜片段: {filled}")
+            return
     
+        # 原有的完整命令模板（无特殊前缀）
+        input_file = self.input_file.get().strip() or "input.mp4"
         output_dir = self.cmd_output_path.get().strip()
         if output_dir:
-            # 规范化路径，去除尾部斜杠，添加一个 / 作为分隔符
             output_dir = normalize_path(output_dir).rstrip('/') + "/"
         else:
-            output_dir = ""   # 空字符串，文件将生成在当前工作目录
-    
+            output_dir = ""
         cmd = template.replace("{input}", input_file).replace("{output_dir}", output_dir)
-    
         self.cmd_input.delete(1.0, tk.END)
         self.cmd_input.insert(tk.END, cmd)
 
