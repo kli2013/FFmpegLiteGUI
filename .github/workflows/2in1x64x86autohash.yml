@@ -1,4 +1,4 @@
-name: Build FFmpeggui 2in1 x64 and x86
+name: Build FFmpeggui 2in1 x64 and x86 auto hash
 
 on:
   workflow_dispatch:
