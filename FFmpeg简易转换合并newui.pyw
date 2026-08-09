@@ -3110,13 +3110,18 @@ class BlurFilterDialog(tk.Toplevel):
                                   state="readonly", width=12)
         type_combo.grid(row=1, column=1, sticky="w", padx=5)
         type_combo.bind("<<ComboboxSelected>>", self.on_type_change)
-        ToolTip(type_combo, 
-                "delogo：去水印（需指定区域坐标，仅处理该区域，用周围像素智能填充）\n"
-                "boxblur：盒式模糊（全局模糊整个画面，不指定坐标）\n"
-                "gblur：高斯模糊（全局模糊整个画面，不指定坐标）\n"
-                "仅当滤镜类型为 delogo 时需填写坐标，boxblur 和 gblur 为全画面滤镜，坐标将被忽略。\n"
-                "若需要 boxblur 或 gblur 进行局部模糊，请先裁剪出该区域，应用模糊，\n"
-                "再通过叠加/画中画方式合成，但当前版本未内置此流程。")
+        ToolTip(type_combo,
+            "【滤镜类型说明】\n"
+            "• delogo：智能去水印滤镜，需指定区域坐标（用周围像素填充），仅作用于选定区域。\n"
+            "• boxblur / gblur：全局模糊滤镜，作用于整个画面，不需要坐标。\n\n"
+            "【如何实现局部模糊】\n"
+            "当前界面未直接支持 boxblur/gblur 的区域模糊，但您可通过以下方式变通：\n"
+            "1. 使用「视频滤镜」中的可视化裁剪工具，获取目标区域的坐标（宽、高、左、上）。\n"
+            "2. 在「信息与播放器」→「快速命令工具」下拉框中，选择「区域模糊 boxblur」或「区域模糊 gblur」。\n"
+            "3. 系统会自动根据裁剪坐标生成完整的 -filter_complex 局部模糊滤镜链。\n"
+            "4. 复制生成的命令，粘贴到「高级选项」→「自定义参数」框中即可。\n"
+            "⚠️ 使用前请先关闭已启用的 -vf 滤镜，或将 -vf 内容合并到该命令中，避免冲突。"
+        )
         
         # ---- 强度参数 ----
         self.strength_frame = ttk.Frame(main)
@@ -14252,7 +14257,7 @@ class FFmpegBatchGUI:
             return
     
         # 如果是硬件滤镜片段，从界面读取参数替换占位符
-        if preset_name.startswith("【硬件滤镜片段】") or preset_name.startswith("【区域模糊】"):
+        if preset_name.startswith("【区域模糊】") or preset_name.startswith("【硬件滤镜片段】"):
             vars = self._get_current_filter_vars()
             try:
                 filled = template.format(**vars)
@@ -14261,7 +14266,15 @@ class FFmpegBatchGUI:
                 return
             self.cmd_input.delete(1.0, tk.END)
             self.cmd_input.insert(tk.END, filled)
-            self._append_info_ui(f"已生成滤镜片段: {filled}")
+            # 根据类型给出不同提示
+            if preset_name.startswith("【区域模糊】"):
+                self._append_info_ui(
+                    f"已生成区域模糊命令: {filled}\n"
+                    "请复制后粘贴到「高级选项」的「自定义参数」框中。"
+                    "注意：若当前已使用 `-vf` 滤镜，请先移除它们，或将 `-vf` 的内容手动合并到本命令中，避免冲突。"
+                )
+            else:
+                self._append_info_ui(f"已生成硬件滤镜片段: {filled}，请复制后粘贴到「高级选项」的「自定义参数」框中。")
             return
     
         # 原有的完整命令模板（无特殊前缀）
