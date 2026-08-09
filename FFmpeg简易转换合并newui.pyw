@@ -5780,10 +5780,21 @@ class FFmpegBatchGUI:
             "提取内置封面 (cover art)": 'ffmpeg -y -i "{input}" -map 0:v:0? -c:v copy "{output_dir}cover.jpg"',
             "提取第一帧截图": 'ffmpeg -y -i "{input}" -vframes 1 "{output_dir}thumb.jpg"',
             "提取指定时间帧 (需改 -ss)": 'ffmpeg -y -i "{input}" -ss 00:00:05 -vframes 1 "{output_dir}thumb.jpg"',
-            "【硬件滤镜片段】缩放 (scale_cuda)": '-vf scale_cuda={scale_w}:{scale_h}',
-            "【硬件滤镜片段】旋转 (transpose_cuda)": '-vf transpose_cuda={transpose_val}',
+            "【硬件滤镜片段】CUDA 缩放": '-vf scale_cuda={scale_w}:{scale_h}',
+            "【硬件滤镜片段】CUDA 旋转": '-vf transpose_cuda={transpose_val}',
             "【区域模糊】boxblur": '-filter_complex \"[0:v]crop={crop_w}:{crop_h}:{crop_x}:{crop_y},boxblur=11[fg];[0:v][fg]overlay={crop_x}:{crop_y}[v]\" -map \"[v]\" -map 0:a? -c:a copy',
             "【区域模糊】gblur": '-filter_complex \"[0:v]crop={crop_w}:{crop_h}:{crop_x}:{crop_y},gblur=sigma=2.0[fg];[0:v][fg]overlay={crop_x}:{crop_y}[v]\" -map \"[v]\" -map 0:a? -c:a copy',
+            "【硬件滤镜片段】QSV 缩放": '-vf \"vpp_qsv=width={scale_w}:height={scale_h}\"',
+            "【硬件滤镜片段】QSV 裁剪": '-vf \"vpp_qsv=cw={crop_w}:ch={crop_h}:cx={crop_x}:cy={crop_y}\"',
+            "【硬件滤镜片段】QSV 裁剪+缩放组合": '-vf \"vpp_qsv=cw={crop_w}:ch={crop_h}:cx={crop_x}:cy={crop_y}:width={scale_w}:height={scale_h}\"',
+            "【硬件滤镜片段】QSV 旋转": '-vf \"vpp_qsv=transpose=1\"',
+            "【硬件滤镜片段】QSV 反交错": '-vf \"vpp_qsv=deinterlace=1\"',
+            "【硬件滤镜片段】QSV 降噪": '-vf \"vpp_qsv=denoise=3\"',
+            "【硬件滤镜片段】QSV 细节增强": '-vf \"vpp_qsv=detail=0.5\"',
+            "【硬件滤镜片段】QSV 色彩校正": '-vf \"vpp_qsv=procamp=1.0:contrast=1.0:brightness=0.0\"',
+            "【硬件滤镜片段】QSV 像素格式": '-vf \"vpp_qsv=format=nv12\"',
+            "【硬件滤镜片段】QSV 帧率": '-vf \"vpp_qsv=framerate=30\"',
+
 
         }
     
