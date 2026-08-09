@@ -288,6 +288,7 @@ FFmpeg 内置的 `delogo` 滤镜专为去除 logo 或水印设计，它通过**�
 > **注意**：此功能为简化实现，仅对 NVIDIA 和 AMD 平台提供支持。若您追求极致性能，建议使用硬件支持的滤镜（如 `scale_cuda`、`transpose_cuda` 等）并在自定义参数中覆盖 `-vf`，但风险和失败几率较高，仅推荐进阶用户尝试。
 AMD的包裹参数不知道是否正确，有人能反馈一下就好了...
 
+[[附录](docs/transcode.md#intel-qsvnvidia-nvenccuda-%E5%92%8C-amd-vaapiamf-%E5%9C%A8-ffmpeg-%E4%B8%AD%E7%9A%84%E7%A1%AC%E4%BB%B6%E5%8A%A0%E9%80%9F%E5%8F%82%E6%95%B0%E5%AF%B9%E7%85%A7%E8%A1%A8%E5%A6%82%E4%B8%8B)]
 
 #### 水印设置
 水印功能可将图片或视频叠加在主视频之上。 操作同画中画子视频。
@@ -361,3 +362,40 @@ AMD的包裹参数不知道是否正确，有人能反馈一下就好了...
 ---
 
 视频转码页面通过模块化的参数组织、实时预览、任务队列和批量处理能力，让用户能够灵活且高效地完成从简单转换到复杂滤镜合成的各类视频处理任务。
+
+
+
+## Intel (QSV)、NVIDIA (NVENC/CUDA) 和 AMD (VAAPI/AMF) 在 FFmpeg 中的硬件加速参数对照表如下。
+
+### 1. 硬件设备初始化与解码
+| 环节 | Intel (QSV) | NVIDIA (NVENC/CUDA) | AMD (VAAPI/AMF) |
+| :--- | :--- | :--- | :--- |
+| **初始化虚拟设备** | `-init_hw_device qsv=hw` | `-init_hw_device cuda=cu` *(可选)* | `-init_hw_device vaapi=amd:/dev/dri/renderD128` *(Linux必加)* |
+| **指定硬件解码** | `-hwaccel qsv -hwaccel_device hw` | `-hwaccel cuda` *(或 nvdec)* | `-hwaccel vaapi -hwaccel_device amd` |
+| **解码输出格式** | `-hwaccel_output_format qsv` | `-hwaccel_output_format cuda` | `-hwaccel_output_format vaapi` |
+
+### 2. 滤镜链：硬件与软件切换
+| 场景 | Intel (QSV) | NVIDIA (NVENC/CUDA) | AMD (VAAPI/AMF) |
+| :--- | :--- | :--- | :--- |
+| **硬件 -> 软件** | `hwdownload,format=nv12` | `hwdownload,format=nv12` | `hwdownload,format=nv12` |
+| **软件 -> 硬件** | `hwupload=qsv` | `hwupload_cuda` *(或 `hwupload`)* | `hwupload` |
+| **纯硬件缩放** | `scale_qsv=w=1280:h=720`或者`vpp_qsv=w=1280:h=720` | `scale_cuda=w=1280:h=720` | `scale_vaapi=w=1280:h=720` |
+| **纯硬件旋转/后处理** | `vpp_qsv=transpose=1` | *(无专属，需回退软件)* | *(无专属，需回退软件)* |
+| **纯硬件裁剪** | `vpp_qsv=cw=1280:ch=720:cx=0:cy=0` | *(无专属，需回退软件)* | *(无专属，需回退软件)* |
+
+### 3. 硬件编码器及常用参数
+| 环节 | Intel (QSV) | NVIDIA (NVENC) | AMD (AMF/VAAPI) |
+| :--- | :--- | :--- | :--- |
+| **H.264 编码器** | `-c:v h264_qsv` | `-c:v h264_nvenc` | `-c:v h264_amf` *(或 `h264_vaapi`)* |
+| **HEVC 编码器** | `-c:v hevc_qsv` | `-c:v hevc_nvenc` | `-c:v hevc_amf` *(或 `hevc_vaapi`)* |
+| **画质控制参数** | `-global_quality 26` | `-cq 26` *(或 `-rc constqp -qp 26`)* | `-rc_mode CQP -qp 26` *(VAAPI)* |
+| **预设参数** | `-preset medium` | `-preset p4` *(或 `medium`)* | `-quality balanced` |
+
+### 💡 核心总结与避坑指南
+1. **纯硬件链路**：如果全程使用硬件滤镜（如 Intel 的 `vpp_qsv`），数据全程在显存中流转，性能最高，**不需要**加 `hwdownload` 和 `hwupload`。
+2. **软硬混合链路**：一旦使用了软件滤镜（如普通的 `transpose`、`crop`、`drawtext`），必须使用 `hwdownload` 拉回内存，处理完后必须用对应的 `hwupload` 传回显存。
+3. **NVIDIA 的 `hwupload`**：在纯 CUDA 滤镜链中，使用通用的 `hwupload` 即可；但如果涉及跨 API（例如从 OpenCL 转回 CUDA），则必须显式使用 `hwupload_cuda`。
+4. **AMD 的设备绑定**：在 Linux 环境下，AMD 的 VAAPI 极容易因为找不到设备而报错，务必养成加 `-init_hw_device vaapi=...` 的习惯。
+
+---
+
