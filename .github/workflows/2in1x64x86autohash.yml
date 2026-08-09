@@ -1,4 +1,4 @@
-name: Build FFmpeggui 2in1 x64 and x86 auto hash
+name: Build FFmpeggui 2in1 x64 and x86
 
 on:
   workflow_dispatch:
@@ -259,25 +259,46 @@ jobs:
           }
           echo "VERSION=$VER" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      # ----- 新增：仅针对主脚本和附属脚本生成 commit 哈希列表 -----
+      # ----- 生成仅针对脚本文件的 commit 哈希列表（基于上一个 release tag） -----
       - name: 生成 Commit 哈希列表（仅脚本修改）
         shell: pwsh
         run: |
-          # 指定要跟踪的脚本文件（主程序和附属程序）
-          $files = @("FFmpeg简易转换合并newui.pyw", "水印轨迹编排器 多轨道.pyw")
+          # 指定要跟踪的脚本文件（使用双引号包裹含空格的文件名）
+          $file1 = "FFmpeg简易转换合并newui.pyw"
+          $file2 = "水印轨迹编排器 多轨道.pyw"
+
+          # 获取最近的 tag（即上一次 release 的 tag）
           $prevTag = git describe --tags --abbrev=0 2>$null
+          Write-Host "上一个 tag：$prevTag"
+
           if ($prevTag) {
-              # 获取从上一个 tag 到 HEAD 之间修改过这些文件的提交（按新→旧）
-              $commits = git log --pretty=format:"%h" $prevTag..HEAD -- $files
+              # 检查当前 HEAD 是否就是该 tag（无新提交）
+              $headCommit = git rev-parse HEAD
+              $tagCommit = git rev-parse "$prevTag^{commit}" 2>$null
+              if ($headCommit -eq $tagCommit) {
+                  Write-Host "当前 HEAD 与 tag $prevTag 相同，无新提交。"
+                  $commits = @()
+              } else {
+                  # 获取从 prevTag 到 HEAD 之间修改过指定文件的提交（按时间从新到旧）
+                  $commits = git log --pretty=format:"%h" "$prevTag..HEAD" -- "$file1" "$file2"
+              }
           } else {
-              # 如果没有 tag，则列出所有修改过这些文件的提交
-              $commits = git log --pretty=format:"%h" -- $files
+              Write-Host "未找到任何 tag，将列出所有修改过脚本的提交。"
+              $commits = git log --pretty=format:"%h" -- "$file1" "$file2"
           }
+
+          # 处理结果
           if ($commits) {
-              $commitList = ($commits -join " ← ")
+              $commitArray = @($commits)
+              $count = $commitArray.Count
+              Write-Host "找到 $count 个相关 commit："
+              $commitArray | ForEach-Object { Write-Host "  $_" }
+              $commitList = ($commitArray -join " ← ")
           } else {
               $commitList = "（无脚本修改）"
+              Write-Host "未找到相关 commit。"
           }
+
           echo "COMMIT_LIST=$commitList" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: 创建 Release 并上传附件
