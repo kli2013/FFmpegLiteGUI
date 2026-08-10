@@ -298,7 +298,7 @@ FFmpeg 内置的 `delogo` 滤镜专为去除 logo 或水印设计，它通过**�
 
 > **说明**：只要「滤镜加速」选了 CUDA / QSV / VAAPI，程序就会注入对应的 `-init_hw_device`（无需设备框非空）。预览、画中画、GIF 等内部路径会强制回退软件滤镜，避免硬件滤镜与外部播放器/`overlay`/`filter_complex` 混用出错。
 
-[[附录](docs/transcode.md#intel-qsvnvidia-nvenccuda-%E5%92%8C-amd-vaapiamf-%E5%9C%A8-ffmpeg-%E4%B8%AD%E7%9A%84%E7%A1%AC%E4%BB%B6%E5%8A%A0%E9%80%9F%E5%8F%82%E6%95%B0%E5%AF%B9%E7%85%A7%E8%A1%A8%E5%A6%82%E4%B8%8B)]
+[[附录](transcode.md#intel-qsvnvidia-nvenccuda-%E5%92%8C-amd-vaapiamf-%E5%9C%A8-ffmpeg-%E4%B8%AD%E7%9A%84%E7%A1%AC%E4%BB%B6%E5%8A%A0%E9%80%9F%E5%8F%82%E6%95%B0%E5%AF%B9%E7%85%A7%E8%A1%A8%E5%A6%82%E4%B8%8B)]
 
 #### 水印设置
 水印功能可将图片或视频叠加在主视频之上。 操作同画中画子视频。
