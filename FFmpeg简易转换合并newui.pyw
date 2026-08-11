@@ -1451,6 +1451,11 @@ class QSVEncoderStrategy(EncoderStrategy):
 class OtherEncoderStrategy(EncoderStrategy):
     def build_params(self, cmd_list: List[str], settings: Dict[str, Any]) -> List[str]:
         vcodec = settings["encoder"]
+        # JPEG 2000 (libopenjpeg)：用压缩级别控制质量，不使用比特率
+        if vcodec == "libopenjpeg":
+            cl = settings.get("compression_level", 20)
+            cmd_list.extend(["-c:v", "libopenjpeg", "-compression_level", str(cl)])
+            return cmd_list
         bitrate = fix_bitrate_value(settings["bitrate_video"])
         cmd_list.extend(["-c:v", vcodec, "-b:v", bitrate or '1000k'])
         
@@ -1608,6 +1613,8 @@ class VideoEncoderFrame(ttk.LabelFrame):
                 "• 其他硬件: h264_vaapi, hevc_vaapi (Linux VAAPI),\n"
                 "  h264_videotoolbox, hevc_videotoolbox (macOS)\n"
                 "• 专业/无损格式: prores_ks, prores_aw, dnxhdenc, ffv1, libopenjpeg\n"
+                "  libopenjpeg=JPEG 2000 编码：输出容器请选 jp2(单图) 或 mj2(视频)，\n"
+                "  仅支持 J2K 的软件(ffplay/mpv/专业工具)可查看，普通播放器大多不支持\n"
                 "• 图片/动图: gif, libwebp\n"
                 "提示: 硬件编码速度快但画质可能略逊，软件编码兼容性最佳。\n"
                 "• 硬件编码还需要 FFmpeg 版本和显卡 API 对应。\n",
@@ -1645,9 +1652,21 @@ class VideoEncoderFrame(ttk.LabelFrame):
         rc_frame = ttk.Frame(self)
         rc_frame.grid(row=2, column=1, columnspan=2, sticky="w", padx=5, pady=2)
         for text, val in [("CRF (CPU编码)", "crf"), ("CQ (NVENC)", "cq"),
-                          ("Global Quality (QSV)", "global_quality"), ("固定比特率", "bitrate")]:
-            ttk.Radiobutton(rc_frame, text=text, variable=self.rate_control_type,
-                            value=val).pack(side=tk.LEFT, padx=2)
+                          ("Global Quality (QSV)", "global_quality"), ("固定比特率", "bitrate"),
+                          ("压缩级别 (J2K)", "compression")]:
+            rb = ttk.Radiobutton(rc_frame, text=text, variable=self.rate_control_type,
+                                 value=val)
+            rb.pack(side=tk.LEFT, padx=2)
+            if val == "compression":
+                ToolTip(rb,
+                        "JPEG 2000（.jp2 单图 / .mj2 视频）专用的质量控制方式。\n"
+                        "该格式基于小波变换（而非普通 JPEG 的离散余弦变换），支持无损压缩与超高分辨率，\n"
+                        "一般用于：数字电影发行母版（DCI）、医学影像（DICOM）、专业无损归档、广播级制作。\n\n"
+                        "普通播放器大多不支持此格式，需用 ffplay / mpv 或专业软件查看。\n"
+                        "压缩级别 1~100，数值越大压缩越强、文件越小（质量越低）。\n\n"
+                        "输出容器请选 jp2（单张静帧）或 mj2（视频流）；视频转码一般用 mj2，\n"
+                        "可在上方「输出容器」下拉中找到这两项。",
+                        wraplength=520)
 
         self.dynamic_frame = ttk.Frame(self)
         self.dynamic_frame.grid(row=3, column=0, columnspan=3, sticky="we", pady=0, padx=5)
@@ -1656,6 +1675,7 @@ class VideoEncoderFrame(ttk.LabelFrame):
         self.cq_value = tk.IntVar(value=35)
         self.global_quality = tk.IntVar(value=28)
         self.bitrate_video = tk.StringVar(value="1900k")
+        self.compression_level = tk.IntVar(value=20)
 
         self.update_dynamic_controls()
 
@@ -1963,6 +1983,15 @@ class VideoEncoderFrame(ttk.LabelFrame):
             self.bitrate_entry = ttk.Entry(frame, textvariable=self.bitrate_video, width=12)
             self.bitrate_entry.pack(side=tk.LEFT, padx=5)
             self.bitrate_entry.bind("<FocusOut>", self.fix_bitrate_value)
+        elif rc == "compression":
+            frame = ttk.Frame(self.dynamic_frame)
+            frame.pack(fill=tk.X, expand=True)
+            ttk.Label(frame, text="压缩级别 (1~100，越大压缩越强):").pack(side=tk.LEFT)
+            self.comp_slider = ttk.Scale(frame, from_=1, to=100, variable=self.compression_level, orient=tk.HORIZONTAL)
+            self.comp_slider.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+            self.comp_label = ttk.Label(frame, text=str(self.compression_level.get()), width=4)
+            self.comp_label.pack(side=tk.LEFT)
+            self.comp_slider.configure(command=lambda v: self.comp_label.config(text=str(int(float(v)))))
 
     def fix_bitrate_value(self, event=None):
         val = self.bitrate_video.get().strip()
@@ -2006,6 +2035,9 @@ class VideoEncoderFrame(ttk.LabelFrame):
         elif rc == "global_quality":
             if current not in ("h264_qsv", "hevc_qsv", "av1_qsv"):
                 self.vcodec.set("hevc_qsv")
+        elif rc == "compression":
+            if current != "libopenjpeg":
+                self.vcodec.set("libopenjpeg")
 
     def auto_set_rate_control_by_codec(self, *args):
         codec = self.vcodec.get()
@@ -2019,8 +2051,10 @@ class VideoEncoderFrame(ttk.LabelFrame):
             new_rc = "global_quality"
         elif codec in ("h264_amf", "hevc_amf", "av1_amf", "h264_vaapi", "hevc_vaapi",
                        "h264_videotoolbox", "hevc_videotoolbox", "prores_ks", "prores_aw",
-                       "dnxhdenc", "ffv1", "libopenjpeg", "gif"):
+                       "dnxhdenc", "ffv1", "gif"):
             new_rc = "bitrate"
+        elif codec == "libopenjpeg":
+            new_rc = "compression"
         if new_rc and new_rc != old_rc:
             self.rate_control_type.set(new_rc)
 
@@ -2033,6 +2067,7 @@ class VideoEncoderFrame(ttk.LabelFrame):
             "cq_value": self.cq_value.get(),
             "global_quality": self.global_quality.get(),
             "bitrate_video": self.bitrate_video.get(),
+            "compression_level": self.compression_level.get(),
             # GIF 参数
             "gif_loop": self.gif_loop.get(),
             "gif_dither": self.gif_dither.get(),
@@ -2070,6 +2105,7 @@ class VideoEncoderFrame(ttk.LabelFrame):
             self.cq_value.set(settings.get("cq_value", 35))
             self.global_quality.set(settings.get("global_quality", 26))
             self.bitrate_video.set(settings.get("bitrate_video", "1900k"))
+            self.compression_level.set(settings.get("compression_level", 20))
     
             # GIF 参数
             self.gif_loop.set(settings.get("gif_loop", 0))
@@ -2830,6 +2866,60 @@ class VideoFilterFrame(ttk.LabelFrame):
                                  "👉 可继续拖拽新矩形覆盖")
                 else:
                     info_var.set("👉 在图像上按住左键拖拽（可从边缘外开始）以绘制裁剪矩形")
+
+            def redraw_crop_rect():
+                """删除旧矩形，按 points 重建画布矩形并更新信息"""
+                nonlocal rect_id
+                if rect_id:
+                    canvas.delete(rect_id)
+                    rect_id = None
+                if len(points) == 2:
+                    x1, y1 = points[0]
+                    x2, y2 = points[1]
+                    dx1, dy1 = original_to_display(x1, y1)
+                    dx2, dy2 = original_to_display(x2, y2)
+                    rect_id = canvas.create_rectangle(
+                        dx1 + PADDING, dy1 + PADDING,
+                        dx2 + PADDING, dy2 + PADDING,
+                        outline='red', width=2
+                    )
+                update_info()
+
+            def edge_adjust(edge, delta):
+                """收缩边界: edge='top'|'bottom'|'left'|'right', delta=像素数(正=收缩)"""
+                if len(points) != 2:
+                    return
+                x1, y1 = points[0]; x2, y2 = points[1]
+                l = min(x1, x2); r = max(x1, x2)
+                t = min(y1, y2); b = max(y1, y2)
+                if edge == 'left':   l += delta
+                elif edge == 'right': r -= delta
+                elif edge == 'top':    t += delta
+                elif edge == 'bottom': b -= delta
+                l = max(0, l); t = max(0, t)
+                r = min(orig_w, r); b = min(orig_h, b)
+                if r <= l or b <= t:
+                    return
+                points[0] = (l, t); points[1] = (r, b)
+                redraw_crop_rect()
+
+            def shift_adjust(direction, delta):
+                """平移矩形: direction='up'|'down'|'left'|'right'"""
+                if len(points) != 2:
+                    return
+                x1, y1 = points[0]; x2, y2 = points[1]
+                l = min(x1, x2); r = max(x1, x2)
+                t = min(y1, y2); b = max(y1, y2)
+                if direction == 'left':   l -= delta; r -= delta
+                elif direction == 'right': l += delta; r += delta
+                elif direction == 'up':    t -= delta; b -= delta
+                elif direction == 'down':  t += delta; b += delta
+                l = max(0, l); t = max(0, t)
+                r = min(orig_w, r); b = min(orig_h, b)
+                if r <= l or b <= t:
+                    return
+                points[0] = (l, t); points[1] = (r, b)
+                redraw_crop_rect()
     
             # ----- 拖拽事件 -----
             def on_drag_start(event):
@@ -3121,7 +3211,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             btn_frame.pack(fill=tk.X, pady=5)
     
             ttk.Button(btn_frame, text="自动检测黑边", command=auto_detect).pack(fill=tk.X, pady=2)
-    
+
             param_frame = ttk.Frame(btn_frame)
             param_frame.pack(fill=tk.X, pady=5)
             row = ttk.Frame(param_frame)
@@ -3140,7 +3230,34 @@ class VideoFilterFrame(ttk.LabelFrame):
             round_var = tk.StringVar(value=self.crop_detect_round.get())
             ttk.Spinbox(round_container, from_=1, to=16, width=5, textvariable=round_var, state="normal").pack(side=tk.LEFT, padx=5)
             round_var.trace_add("write", lambda *a: self.crop_detect_round.set(round_var.get()))
-    
+
+            # ----- 边缘/平移微调按钮 -----
+            # 边界收缩行（上减/下减/左减/右减 + 独立步进）
+            edge_row = ttk.Frame(btn_frame)
+            edge_row.pack(fill=tk.X, pady=1)
+            edge_step = tk.StringVar(value="1")
+            for label, edge in [("上减", "top"), ("下减", "bottom"), ("左减", "left"), ("右减", "right")]:
+                ttk.Button(edge_row, text=label, width=4,
+                           command=lambda e=edge: edge_adjust(e, _get_step(edge_step))).pack(side=tk.LEFT, padx=1)
+            ttk.Label(edge_row, text="步进:").pack(side=tk.LEFT, padx=(8, 2))
+            ttk.Spinbox(edge_row, textvariable=edge_step, from_=1, to=999, width=4).pack(side=tk.LEFT)
+
+            # 平移行（上移/下移/左移/右移 + 独立步进）
+            shift_row = ttk.Frame(btn_frame)
+            shift_row.pack(fill=tk.X, pady=1)
+            shift_step = tk.StringVar(value="1")
+            for label, direction in [("上移", "up"), ("下移", "down"), ("左移", "left"), ("右移", "right")]:
+                ttk.Button(shift_row, text=label, width=4,
+                           command=lambda d=direction: shift_adjust(d, _get_step(shift_step))).pack(side=tk.LEFT, padx=1)
+            ttk.Label(shift_row, text="步进:").pack(side=tk.LEFT, padx=(8, 2))
+            ttk.Spinbox(shift_row, textvariable=shift_step, from_=1, to=999, width=4).pack(side=tk.LEFT)
+
+            def _get_step(sv):
+                try:
+                    return int(sv.get())
+                except ValueError:
+                    return 1
+
             ttk.Button(btn_frame, text="清除矩形", command=clear_rect).pack(fill=tk.X, pady=2)
             ttk.Button(btn_frame, text="保存并应用裁剪", command=apply_crop).pack(fill=tk.X, pady=2)
             ttk.Button(btn_frame, text="取消", command=on_window_close).pack(fill=tk.X, pady=2)
@@ -5333,17 +5450,21 @@ class AdvancedFrame(ttk.LabelFrame):
         custom_frame = ttk.Frame(self)
         custom_frame.pack(fill=tk.X, pady=5)
 
-        label = ttk.Label(custom_frame, text="自定义FFmpeg参数 (追加到命令末尾，会覆盖界面生成的对应设置):")
+        label = ttk.Label(custom_frame, text="自定义FFmpeg参数 (滤镜自动合并，其余参数追加到命令末尾):")
         label.pack(anchor=tk.W)
         ToolTip(label, 
-                "可直接添加 FFmpeg 命令行参数，它们会追加到命令末尾。\n\n"
-                "【注意】\n"
-                "• 如果添加了 -vf / -filter_complex / -af / -map 等，会覆盖界面生成的对应设置（滤镜、音频滤镜、流映射）。\n"
-                "  如需保留界面生成的滤镜链，请在自定义参数中复制完整的 -vf 链（可从预览区复制）并扩展。\n\n"
+                "可直接添加 FFmpeg 命令行参数。\n\n"
+                "【滤镜智能合并】\n"
+                "• 直接输入裸滤镜串（如 drawtext=text='hello':x=10:y=10），会自动识别为视频/音频滤镜，\n"
+                "  按滤镜类型自动替换或插入到界面生成的 -vf/-af 链的正确位置。\n"
+                "• 使用 -vf / -af / -filter_complex 前缀的滤镜串同样会智能合并，而不是覆盖。\n"
+                "• 同名滤镜默认替换（如 scale=1920:-2 会替换界面生成的 scale=1280:-2），\n"
+                "  drawtext / subtitles / overlay 除外——这些会叠加保留，允许多个文字水印共存。\n\n"
+                "【其余参数】\n"
+                "• 非滤镜参数（如 -x264-params、-bsf、-t、-map 等）原样追加到命令末尾。\n"
                 "• 界面上已单独提供的参数（如 tune、profile、level、maxrate、bufsize）请勿重复添加，以免冲突。\n\n"
                 "• 追加自定义 -t 时间 可作为应急措施，强制限制输出时长，防止因滤镜循环或参数不当导致输出无限延长（主水印模式）。\n"
                 "   或者手动 -t 10 输出10秒片段查看结果，程序的预览命令功能不一定传递了所有滤镜，特别是水印只有占位框。\n\n"
-                "• 新手建议：仅添加界面未提供的高级选项（如 -x264-params、-bsf 等），避免覆盖关键设置。\n"
                 "• 参数 setsar=1 强制覆盖 SAR 比例1:1，配合正方形缩放：比如400x400 可以正确压缩 16:9 画面",
                 wraplength=800)
         self.custom_args = tk.StringVar(value="")
@@ -6299,7 +6420,9 @@ class FFmpegBatchGUI:
         self.auto_match_audio_ext = tk.BooleanVar(value=True)
         self.extract_keep_chapters = tk.BooleanVar(value=True)
         self.extract_clear_metadata = tk.BooleanVar(value=False)
+        self.extract_attachments = tk.BooleanVar(value=False)  # 提取附件（字体/封面）
         self.extract_file_list = []
+        self._extract_stream_selection = {}  # {file_path: {'video': set, 'audio': set, 'subtitle': set}} 右键选择的特定轨道
         self._suppress_save = False
 
         self._stream_info_cache = {}
@@ -6321,6 +6444,7 @@ class FFmpegBatchGUI:
         else:
             default_parallel = 16
         self.ffprobe_parallel = tk.IntVar(value=default_parallel)
+        self.ffprobe_parallel.trace_add('write', lambda *a: self.save_player_settings())
 
         # 流提取相关
         self.extract_parser_executor = concurrent.futures.ThreadPoolExecutor(
@@ -6599,6 +6723,11 @@ class FFmpegBatchGUI:
                     pass   #  上面2句注释空了 所以需要pass占位
             self._last_logged_percent = -1
             return
+    
+        # 动态修正：若 ffmpeg 输出的 time= 超过预估 total，自动拉高
+        # 防止变速/截取等误算导致进度条永远到不了100%
+        if current > total:
+            total = int(current * 1.05) + 1
     
         percent = int(100 * current / total)
     
@@ -7631,13 +7760,9 @@ class FFmpegBatchGUI:
         else:
             cmd.append("-an")
     
-        # 自定义参数
+        # 自定义参数（含滤镜智能合并）
         custom = settings.get("custom_args", "").strip()
-        if custom:
-            try:
-                cmd.extend(shlex.split(custom))
-            except ValueError:
-                self._append_info_ui(f"警告：自定义参数格式错误，已忽略：{custom}")
+        self._merge_custom_filters_into_cmd(cmd, custom)
     
         # 容器优化
         container = settings.get("output_container", "mp4").lower()
@@ -7926,7 +8051,7 @@ class FFmpegBatchGUI:
 
     def _get_effective_duration(self, settings: dict, raw_duration: Optional[float] = None, input_path: str = None) -> Optional[float]:
         """
-        计算有效时长（考虑截取设置）。
+        计算有效时长（考虑截取和变速设置）。
         若传入 raw_duration 则直接使用，否则从 input_path 获取。
         返回秒数，失败返回 None。
         """
@@ -7936,23 +8061,32 @@ class FFmpegBatchGUI:
         if raw_duration is None:
             return None
     
-        if not settings.get("trim_enabled", False):
-            return raw_duration
+        # 1. 截取
+        if settings.get("trim_enabled", False):
+            start_str = settings.get("trim_start", "").strip()
+            end_str = settings.get("trim_end", "").strip()
+            start_sec = time_to_seconds(start_str) if start_str else 0.0
+            end_sec = time_to_seconds(end_str) if end_str else None
+            if end_sec is not None and end_sec > start_sec:
+                raw_duration = end_sec - start_sec
+            else:
+                raw_duration = raw_duration - start_sec
+
+        # 2. 变速调整：输出时长 = 原时长 / speed_factor
+        # 例如 2x 快放 → 时长减半；0.5x 慢放 → 时长翻倍
+        # 独立于截取，二者可叠加
+        if settings.get("speed_enabled", False):
+            try:
+                sf = float(settings.get("speed_factor", "1.0"))
+                if sf > 0 and sf != 1.0:
+                    raw_duration /= sf
+            except (ValueError, TypeError):
+                pass
     
-        start_str = settings.get("trim_start", "").strip()
-        end_str = settings.get("trim_end", "").strip()
-        start_sec = time_to_seconds(start_str) if start_str else 0.0
-        end_sec = time_to_seconds(end_str) if end_str else None
-    
-        if end_sec is not None and end_sec > start_sec:
-            effective = end_sec - start_sec
-        else:
-            effective = raw_duration - start_sec
-    
-        return effective if effective > 0 else None
+        return raw_duration if raw_duration > 0 else None
 
     def _calc_segments_total_duration(self, settings: dict) -> float:
-        """计算分段拼接模式下所有片段的总时长（秒）"""
+        """计算分段拼接模式下所有片段的总时长（含逐段变速，秒）"""
         segments = settings.get("segments", [])
         if not segments:
             return 0.0
@@ -7961,7 +8095,16 @@ class FFmpegBatchGUI:
             start = time_to_seconds(seg.get("start", ""))
             end = time_to_seconds(seg.get("end", ""))
             if start is not None and end is not None and end > start:
-                total += (end - start)
+                seg_dur = end - start
+                # 逐段变速：输出时长 = 原片段时长 / speed
+                speed_val = seg.get("speed", "1.0").strip()
+                try:
+                    sf = float(speed_val)
+                    if sf > 0 and sf != 1.0:
+                        seg_dur /= sf
+                except (ValueError, TypeError):
+                    pass
+                total += seg_dur
             else:
                 # 如果某个片段时间无效，返回0（后续会回退到原始逻辑）
                 return 0.0
@@ -7972,21 +8115,11 @@ class FFmpegBatchGUI:
         if not loop_enabled:
             return "1"
     
-        # 使用公共方法获取有效时长
+        # 使用公共方法获取有效时长（已含截取+变速）
         effective_duration = self._get_effective_duration(enc_settings, duration)
         if effective_duration is None:
             # 无法计算有效时长时，降级为原始总时长或无限
             effective_duration = duration
-    
-        # ----- 变速调整：子视频速度变化后，有效显示时长相应缩放 -----
-        # 例如 2x 快放 → 时长减半；0.5x 慢放 → 时长翻倍
-        if enc_settings.get("speed_enabled", False):
-            try:
-                sf = float(enc_settings.get("speed_factor", "1.0"))
-                if sf > 0 and sf != 1.0 and effective_duration is not None:
-                    effective_duration = effective_duration / sf
-            except (ValueError, TypeError):
-                pass
     
         loop_mode = enc_settings.get("loop_mode", "infinite")
         loop_count = enc_settings.get("loop_count", 3)
@@ -8042,6 +8175,7 @@ class FFmpegBatchGUI:
             self.auto_match_audio_ext.set(settings.get("auto_match_audio_ext", True))
             self.extract_keep_chapters.set(settings.get("extract_keep_chapters", True))
             self.extract_clear_metadata.set(settings.get("extract_clear_metadata", False))
+            self.extract_attachments.set(settings.get("extract_attachments", False))
     
     
             parallel = settings.get("ffprobe_parallel")
@@ -8076,6 +8210,9 @@ class FFmpegBatchGUI:
             "extract_output_dir": self.extract_output_dir.get().strip(),
             "auto_match_audio_ext": self.auto_match_audio_ext.get(),
             "auto_match_subtitle_ext": self.auto_match_subtitle_ext.get(),
+            "extract_keep_chapters": self.extract_keep_chapters.get(),
+            "extract_clear_metadata": self.extract_clear_metadata.get(),
+            "extract_attachments": self.extract_attachments.get(),
 
             "ffprobe_parallel": self.ffprobe_parallel.get(),
         })
@@ -8516,6 +8653,203 @@ class FFmpegBatchGUI:
 
 
 
+    # ========== 自定义滤镜自动合并系统 ==========
+    # 视频滤镜优先级表（数值越小越靠前，与 build_video_filter_chain 顺序一致）
+    _VF_PRIORITY = {
+        "trim": 1, "delogo": 2, "boxblur": 2, "gblur": 2,
+        "crop": 3, "transpose": 4, "vflip": 4, "hflip": 4,
+        "scale": 5, "fieldmatch": 6, "decimate": 6,
+        "yadif": 7, "bwdif": 7, "deblock": 8, "hqdn3d": 9,
+        "unsharp": 10, "colormatrix": 11, "eq": 12, "hue": 12,
+        "fps": 13, "format": 14,
+        "subtitles": 16, "drawtext": 16, "overlay": 16,
+        "reverse": 17,
+    }
+    # 允许叠加的滤镜（不会替换已有同类型，而是追加）
+    _VF_CUMULATIVE = {"subtitles", "drawtext", "overlay"}
+    # 音频滤镜优先级表（与 _build_audio_encoding_params 顺序一致）
+    _AF_PRIORITY = {
+        "volume": 1, "atempo": 2, "afftdn": 3, "loudnorm": 4,
+        "pan": 5, "bass": 6, "equalizer": 6, "treble": 6,
+        "afade": 7, "areverse": 8,
+    }
+
+    @staticmethod
+    def _parse_filter_list(filter_str):
+        """智能拆分逗号分隔的滤镜链，正确处理引号和括号内的逗号。
+        含 ';' 的子图块整体保留为一个元素。返回滤镜字符串列表。"""
+        if not filter_str or filter_str == "null":
+            return []
+        if ";" in filter_str:
+            return [filter_str]
+        filters = []
+        current = []
+        depth = 0
+        in_single = False
+        in_double = False
+        for ch in filter_str:
+            if ch == "'" and not in_double:
+                in_single = not in_single
+                current.append(ch)
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+                current.append(ch)
+            elif ch == "(" and not in_single and not in_double:
+                depth += 1
+                current.append(ch)
+            elif ch == ")" and not in_single and not in_double:
+                depth -= 1
+                current.append(ch)
+            elif ch == "," and depth == 0 and not in_single and not in_double:
+                f = "".join(current).strip()
+                if f:
+                    filters.append(f)
+                current = []
+            else:
+                current.append(ch)
+        f = "".join(current).strip()
+        if f:
+            filters.append(f)
+        return filters
+
+    @staticmethod
+    def _get_filter_name(filter_str):
+        """提取滤镜基名。如 'scale=1280:-2' → 'scale'"""
+        if not filter_str:
+            return ""
+        eq_idx = filter_str.find("=")
+        return filter_str[:eq_idx] if eq_idx >= 0 else filter_str
+
+    def _get_vf_priority(self, filter_str):
+        """获取视频滤镜优先级。setpts 含 STARTPTS→1(截取)，否则→15(变速)。"""
+        name = self._get_filter_name(filter_str)
+        if name == "setpts":
+            return 1 if "STARTPTS" in filter_str else 15
+        return self._VF_PRIORITY.get(name, 50)
+
+    def _get_af_priority(self, filter_str):
+        """获取音频滤镜优先级。"""
+        name = self._get_filter_name(filter_str)
+        return self._AF_PRIORITY.get(name, 50)
+
+    def _merge_filter_chains(self, existing_str, new_filters, is_audio=False):
+        """将 new_filters 合并到 existing_str 滤镜链中。
+        同名滤镜默认替换（叠加白名单除外），不同名按优先级插入。"""
+        existing = self._parse_filter_list(existing_str)
+        if not existing:
+            return ",".join(new_filters)
+        if ";" in existing_str:
+            return existing_str + ("," + ",".join(new_filters) if new_filters else "")
+
+        for nf in new_filters:
+            nf_name = self._get_filter_name(nf)
+            nf_pri = self._get_af_priority(nf) if is_audio else self._get_vf_priority(nf)
+            cumulative = self._VF_CUMULATIVE if not is_audio else set()
+
+            replaced = False
+            if nf_name and nf_name not in cumulative:
+                for idx, ef in enumerate(existing):
+                    if self._get_filter_name(ef) == nf_name:
+                        existing[idx] = nf
+                        replaced = True
+                        break
+
+            if not replaced:
+                insert_idx = len(existing)
+                for idx, ef in enumerate(existing):
+                    ep = self._get_af_priority(ef) if is_audio else self._get_vf_priority(ef)
+                    if ep > nf_pri:
+                        insert_idx = idx
+                        break
+                existing.insert(insert_idx, nf)
+
+        return ",".join(existing) if existing else "null"
+
+    def _replace_cmd_flag(self, cmd_list, flag, new_value):
+        """在 cmd_list 中查找 flag 并替换其后一个参数的值。不存在则追加。"""
+        for j, arg in enumerate(cmd_list):
+            if arg == flag and j + 1 < len(cmd_list):
+                cmd_list[j + 1] = new_value
+                return
+        cmd_list.extend([flag, new_value])
+
+    def _merge_vf_into_cmd(self, cmd_list, new_filters):
+        """找到 cmd_list 中的 -vf/-filter_complex 并合并 new_filters 进去。
+        优先合并到 -vf；若只有 -filter_complex，追加到 filter_complex 最后。"""
+        for j, arg in enumerate(cmd_list):
+            if arg == "-vf" and j + 1 < len(cmd_list):
+                existing = cmd_list[j + 1]
+                cmd_list[j + 1] = self._merge_filter_chains(existing, new_filters, is_audio=False)
+                return
+        # 回退：如果有 -filter_complex ，追加到末尾（仅单路简单链）
+        for j, arg in enumerate(cmd_list):
+            if arg == "-filter_complex" and j + 1 < len(cmd_list):
+                merged = ",".join(new_filters)
+                if cmd_list[j + 1]:
+                    cmd_list[j + 1] = cmd_list[j + 1] + "," + merged
+                else:
+                    cmd_list[j + 1] = merged
+                return
+        cmd_list.extend(["-vf", ",".join(new_filters)])
+
+    def _merge_af_into_cmd(self, cmd_list, new_filters):
+        """找到 cmd_list 中的 -af 并合并 new_filters 进去。"""
+        for j, arg in enumerate(cmd_list):
+            if arg == "-af" and j + 1 < len(cmd_list):
+                existing = cmd_list[j + 1]
+                cmd_list[j + 1] = self._merge_filter_chains(existing, new_filters, is_audio=True)
+                return
+        cmd_list.extend(["-af", ",".join(new_filters)])
+
+    def _merge_custom_filters_into_cmd(self, cmd_list, custom_str):
+        """解析 custom_args 中的滤镜指令，智能合并到现有命令的 -vf/-af 中。
+        识别：裸滤镜串（自动判断视频/音频）、-vf X、-af X、-filter_complex X（整体替换）。"""
+        if not custom_str:
+            return cmd_list
+        try:
+            tokens = shlex.split(custom_str)
+        except ValueError as e:
+            self._append_info_ui(f"警告：自定义参数格式错误，已忽略：{e}")
+            return cmd_list
+
+        custom_vf = []
+        custom_af = []
+        fc_replace = None
+        remaining = []
+
+        i = 0
+        while i < len(tokens):
+            t = tokens[i]
+            if t == "-vf" and i + 1 < len(tokens):
+                custom_vf.extend(self._parse_filter_list(tokens[i + 1]))
+                i += 2
+            elif t == "-af" and i + 1 < len(tokens):
+                custom_af.extend(self._parse_filter_list(tokens[i + 1]))
+                i += 2
+            elif t == "-filter_complex" and i + 1 < len(tokens):
+                fc_replace = tokens[i + 1]
+                i += 2
+            elif not t.startswith("-") and "=" in t:
+                fname = self._get_filter_name(t)
+                if fname in self._AF_PRIORITY:
+                    custom_af.append(t)
+                else:
+                    custom_vf.append(t)
+                i += 1
+            else:
+                remaining.append(t)
+                i += 1
+
+        if fc_replace is not None:
+            self._replace_cmd_flag(cmd_list, "-filter_complex", fc_replace)
+        if custom_vf:
+            self._merge_vf_into_cmd(cmd_list, custom_vf)
+        if custom_af:
+            self._merge_af_into_cmd(cmd_list, custom_af)
+        if remaining:
+            cmd_list.extend(remaining)
+        return cmd_list
+
     def generate_ffmpeg_command(self, input_path: str, output_path: str, settings: dict, task=None, preview=False) -> List[str]:
         if settings.get("segment_enabled", False) and settings.get("segments", []):
             return self._generate_segment_concat_command(input_path, output_path, settings)
@@ -8673,11 +9007,7 @@ class FFmpegBatchGUI:
             cmd_list.append("-an")
     
         custom = settings.get("custom_args", "").strip()
-        if custom:
-            try:
-                cmd_list.extend(shlex.split(custom))
-            except ValueError:
-                self._append_info_ui(f"警告：自定义参数格式错误，已忽略：{custom}")
+        self._merge_custom_filters_into_cmd(cmd_list, custom)
     
         if not only_audio:
             container = settings.get("output_container", "mp4").lower()
@@ -8877,13 +9207,9 @@ class FFmpegBatchGUI:
         else:
             cmd_list.append("-an")
     
-        # ---- 自定义参数与容器优化 ----
+        # ---- 自定义参数（含滤镜智能合并） ----
         custom = settings.get("custom_args", "").strip()
-        if custom:
-            try:
-                cmd_list.extend(shlex.split(custom))
-            except ValueError:
-                self._append_info_ui(f"警告：自定义参数格式错误，已忽略：{custom}")
+        self._merge_custom_filters_into_cmd(cmd_list, custom)
     
         container = settings.get("output_container", "mp4").lower()
         if container in ("mp4", "mov"):
@@ -9192,6 +9518,7 @@ class FFmpegBatchGUI:
         current_canvas_w, current_canvas_h = canvas_w, canvas_h
         rect_id = None
         text_id = None
+        coord_disp_id = None
         draw_rect_temp = None
         draw_start = None
         draw_mode_active = False
@@ -9226,13 +9553,18 @@ class FFmpegBatchGUI:
                 current_h = min(current_h, current_canvas_h)
     
         def create_rect():
-            nonlocal rect_id, text_id
+            nonlocal rect_id, text_id, coord_disp_id
             cx1, cy1 = to_canvas(current_x, current_y)
             cx2, cy2 = to_canvas(current_x + current_w, current_y + current_h)
             rid = canvas.create_rectangle(cx1, cy1, cx2, cy2, outline=rect_color, width=2,
                                           fill=rect_color, stipple="gray50", tags="rect")
             tid = canvas.create_text(cx1 + 5, cy1 + 5, anchor="nw", text=rect_label,
                                      fill="white", font=("Arial", 9), tags="rect")
+            # 浮动坐标显示（矩形上方居中）→ P2 改进
+            coord_disp_id = canvas.create_text((cx1 + cx2) // 2, cy1 - 10, anchor="s",
+                                                text=f"({current_x}, {current_y})",
+                                                fill="#00ff00", font=("Arial", 8),
+                                                tags="coord_disp")
             return rid, tid
     
         def update_rect_position():
@@ -9240,6 +9572,13 @@ class FFmpegBatchGUI:
             cx2, cy2 = to_canvas(current_x + current_w, current_y + current_h)
             canvas.coords(rect_id, cx1, cy1, cx2, cy2)
             canvas.coords(text_id, cx1 + 5, cy1 + 5)
+            # 浮动坐标（矩形上方居中；贴顶时放下方）
+            if coord_disp_id:
+                if cy1 > 20:
+                    canvas.coords(coord_disp_id, (cx1 + cx2) // 2, cy1 - 10)
+                else:
+                    canvas.coords(coord_disp_id, (cx1 + cx2) // 2, cy2 + 14)
+                canvas.itemconfig(coord_disp_id, text=f"({current_x}, {current_y})")
             update_coord_display()
     
         def update_coord_display():
@@ -9285,6 +9624,7 @@ class FFmpegBatchGUI:
             nonlocal drag_start_x, drag_start_y, drag_mouse_start, dragging
             if draw_mode_active:
                 return
+            canvas.focus_set()
             cx, cy = event.x, event.y
             bbox = canvas.bbox(rect_id)
             if bbox and bbox[0] <= cx <= bbox[2] and bbox[1] <= cy <= bbox[3]:
@@ -9391,6 +9731,7 @@ class FFmpegBatchGUI:
                         clamp_rect()  # 应用边界限制（根据 allow_negative_offset 和 min_visible_pixels）
                         canvas.delete(rect_id)
                         canvas.delete(text_id)
+                        canvas.delete(coord_disp_id)
                         rect_id, text_id = create_rect()
                         update_coord_display()
                         status_var.set("新矩形已创建，可拖拽移动或应用")
@@ -9510,6 +9851,29 @@ class FFmpegBatchGUI:
         canvas.bind("<Button-1>", start_draw, add=True)
         canvas.bind("<B1-Motion>", on_draw_move, add=True)
         canvas.bind("<ButtonRelease-1>", end_draw, add=True)
+
+        # 方向键微调（点击矩形后可用，每次 1px）
+        def arrow_move(event):
+            nonlocal current_x, current_y
+            if draw_mode_active:
+                return
+            if event.keysym == 'Left':
+                current_x -= 1
+            elif event.keysym == 'Right':
+                current_x += 1
+            elif event.keysym == 'Up':
+                current_y -= 1
+            elif event.keysym == 'Down':
+                current_y += 1
+            else:
+                return
+            clamp_rect()
+            update_rect_position()
+            status_var.set(f"方向键微调: ({current_x}, {current_y})  [可用 ↑↓←→ 继续调整]")
+        canvas.bind("<Left>", arrow_move)
+        canvas.bind("<Right>", arrow_move)
+        canvas.bind("<Up>", arrow_move)
+        canvas.bind("<Down>", arrow_move)
     
         # 初始化
         clamp_rect()
@@ -10320,14 +10684,8 @@ class FFmpegBatchGUI:
         # 获取视频总时长用于进度
         total_duration = 0
         if task.settings.get("segment_enabled", False) and task.settings.get("segments"):
-            # 分段拼接模式：计算所有片段时长之和
-            segments = task.settings.get("segments", [])
-            total_duration = 0.0
-            for seg in segments:
-                start = time_to_seconds(seg.get("start", "0"))
-                end = time_to_seconds(seg.get("end", "0"))
-                if start is not None and end is not None and end > start:
-                    total_duration += (end - start)
+            # 分段拼接模式：计算所有片段时长之和（含逐段变速）
+            total_duration = self._calc_segments_total_duration(task.settings)
             # 如果片段总时长计算失败，回退到原始方式
             if total_duration <= 0:
                 raw_duration = self._get_media_duration(task.input)
@@ -10487,7 +10845,7 @@ class FFmpegBatchGUI:
             if total_duration <= 0:
                 raw_duration = self._get_media_duration(input_name)
                 if raw_duration is not None:
-                    total_duration = raw_duration
+                    total_duration = self._get_effective_duration(settings, raw_duration) or 0
         else:
             raw_duration = self._get_media_duration(input_name)
             total_duration = self._get_effective_duration(settings, raw_duration) if raw_duration is not None else 0
@@ -10607,7 +10965,7 @@ class FFmpegBatchGUI:
             ttk.Label(page_io, text="自定义完整名称:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
             ttk.Entry(page_io, textvariable=custom_var, width=60).grid(row=2, column=1, padx=5)
             ttk.Label(page_io, text="输出容器:").grid(row=3, column=0, sticky="w", padx=5, pady=5)
-            ttk.Combobox(page_io, textvariable=container_var, values=["mp4","mkv","mov","avi","webm","gif","webp"], state="readonly", width=8).grid(row=3, column=1, sticky="w", padx=5)
+            ttk.Combobox(page_io, textvariable=container_var, values=["mp4","mkv","mov","avi","webm","gif","webp","jp2","mj2"], state="readonly", width=8).grid(row=3, column=1, sticky="w", padx=5)
     
             # 视频编码页面
             page_enc = ttk.Frame(notebook)
@@ -15525,9 +15883,28 @@ class FFmpegBatchGUI:
             if t.enabled and t.file_path not in source_files:
                 source_files.add(t.file_path)
     
-        # 获取主视频总时长用于进度
-        main_video = self.merge_video.get().strip()
-        total_duration = self._get_media_duration(main_video) if main_video else 0
+        # 根据模式计算总时长（含截取+变速），用于进度条
+        concat_mode = self.concat_enabled.get()
+        pip_mode = self.pip_enabled.get()
+        if concat_mode:
+            # 串行合并：累加所有视频轨道的有效时长
+            total_duration = 0.0
+            for t in self.merge_tracks:
+                if t.enabled and t.type == "video":
+                    dur = self._get_media_duration(t.file_path)
+                    if dur is not None:
+                        eff = self._get_effective_duration(t.enc_settings, dur)
+                        if eff is not None and eff > 0:
+                            total_duration += eff
+        else:
+            # 普通封装 / 画中画：取主视频轨道的有效时长
+            video_tracks = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
+            if video_tracks:
+                main_track = video_tracks[0]
+                raw_dur = self._get_media_duration(main_track.file_path)
+                total_duration = self._get_effective_duration(main_track.enc_settings, raw_dur) if raw_dur else 0
+            else:
+                total_duration = 0
         if total_duration is None:
             total_duration = 0
     
@@ -16134,12 +16511,24 @@ class FFmpegBatchGUI:
             font=("", 10, "bold")
         )
         stop_btn.pack(side=tk.LEFT, padx=5)
-        
-        ttk.Label(
-            stop_frame,
-            text="（向所有正在运行的 FFmpeg 进程发送停止信号，主要用于紧急停止因水印/画中画循环参数截断失效而无限延伸的转码，无需手动去任务管理器结束进程）",
-            foreground="gray"
-        ).pack(side=tk.LEFT, padx=10)
+        ToolTip(stop_btn,
+                "向所有正在运行的 FFmpeg 进程发送停止信号。\n"
+                "主要用于紧急停止因水印/画中画循环参数截断失效而无限延伸的转码，\n"
+                "无需手动去任务管理器结束进程。")
+
+        # ffprobe 并发数（信息页，远离主工作流）
+        lbl_parallel = ttk.Label(stop_frame, text="解析并发:")
+        lbl_parallel.pack(side=tk.LEFT, padx=(100, 2))
+        ToolTip(lbl_parallel,
+                f"拖入文件时同时用 ffprobe 解析的线程数（当前默认: {self.ffprobe_parallel.get()}）。\n\n"
+                "默认为 CPU 核心数 − 4（上限 16），大多数情况不需要修改。\n"
+                "设置过高可能导致大量文件拖入时 UI 短暂冻结；\n"
+                "设置过低则拖入大量文件后解析更慢。\n\n"
+                "如需还原默认值，手动输入 cpu核心数−4（不超过 16）即可。",
+                wraplength=450)
+        spin_parallel = ttk.Spinbox(stop_frame, textvariable=self.ffprobe_parallel,
+                                    from_=1, to=32, width=4)
+        spin_parallel.pack(side=tk.LEFT)
 
 
 
@@ -16185,6 +16574,7 @@ class FFmpegBatchGUI:
         ttk.Button(top_frame, text="重载", command=self._reload_cmd_templates, width=4).pack(side=tk.LEFT, padx=2)
         ttk.Button(top_frame, text="清空", command=self._clear_cmd_input, width=4).pack(side=tk.LEFT, padx=5)
         ttk.Button(top_frame, text="获取", command=self._fetch_cmd_from_preview, width=4).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top_frame, text="重置", command=self._reset_cmd_templates, width=4).pack(side=tk.LEFT, padx=2)
 
         # 输出目录（与当前工作目录结合）
         output_frame = ttk.Frame(top_frame)
@@ -16281,6 +16671,15 @@ class FFmpegBatchGUI:
         """重新加载命令模板（用户编辑 JSON 后调用）"""
         self._load_cmd_templates()
         self._append_info_ui("✅ 已重新加载快速命令模板")
+
+    def _reset_cmd_templates(self):
+        """从内部默认模板重建 quick_cmds.json（免去手动删文件+重启）"""
+        if not messagebox.askyesno("确认重置", "将用内置默认模板覆盖当前快速命令预设，\n你的自定义命令会丢失。确定要重置吗？"):
+            return
+        self.cmd_templates = self._get_default_cmd_templates()
+        self._save_cmd_templates()
+        self._refresh_cmd_preset_list()
+        self._append_info_ui("✅ 已用默认模板重建快速命令预设")
 
     def _browse_ffmpeg_dir(self):
         path = filedialog.askdirectory(title="选择 FFmpeg 所在目录")
@@ -16694,13 +17093,15 @@ class FFmpegBatchGUI:
                           foreground=[('selected', 'white')],
                           fieldbackground=[('selected', '#3475b5')])
 
-        columns = ("文件名", "完整路径")
+        columns = ("文件名", "流信息", "完整路径")
         self.extract_tree = ttk.Treeview(list_container, columns=columns, show="headings",
                                          height=8, style="Extract.Treeview")
         self.extract_tree.heading("文件名", text="文件名")
+        self.extract_tree.heading("流信息", text="流信息")
         self.extract_tree.heading("完整路径", text="完整路径")
         self.extract_tree.column("文件名", width=200, minwidth=100)
-        self.extract_tree.column("完整路径", width=400, minwidth=200)
+        self.extract_tree.column("流信息", width=110, minwidth=80, anchor=tk.CENTER)
+        self.extract_tree.column("完整路径", width=350, minwidth=200)
         self.extract_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     
         vbar = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=self.extract_tree.yview)
@@ -16709,6 +17110,9 @@ class FFmpegBatchGUI:
     
         # 双击预览
         self.extract_tree.bind("<Double-1>", self.extract_on_tree_double_click)
+
+        # 右键菜单：选择提取轨道
+        self.extract_tree.bind("<Button-3>", self._extract_on_right_click)
     
         # ---- 拖拽绑定（确保只在此页面生效） ----
         if DND_AVAILABLE:
@@ -16780,24 +17184,38 @@ class FFmpegBatchGUI:
         # 第四行：仅第一轨、分文件夹
         chk_only_first = ttk.Checkbutton(opt_frame, text="仅提取第一轨（取消则提取全部匹配轨）",
                                          variable=self.extract_only_first)
-        chk_only_first.grid(row=3, column=0, sticky="w", padx=10, pady=5)
+        chk_only_first.grid(row=3, column=0, sticky="w", padx=10)
         ToolTip(chk_only_first,
                 "勾选后，每种流类型仅提取第一个轨道（如第一条音频、第一条字幕）。\n"
                 "取消勾选则提取该类型的所有轨道。\n\n"
-                "如需更精确的选择（如提取第三条字幕），请先将任务添加到队列，然后在任务列表中手动删除不需要的任务。\n\n"
-                "每种类型流从 0 开始计算，所以对应需要 -1，比如第三音频轨会是 audio_2 那一条任务。\n\n"
-                "或者直接在预览区复制想单独提取那一条的命令手动运行。",
+                "如需更精确地选择特定几条轨道（而不只是「全部」或「第一轨」）：\n"
+                "右键点击文件列表中的文件 →「选择要提取的轨道…」→ 在弹窗中勾选需要的轨道即可。\n"
+                "或者在预览区复制想要的单条轨道命令手动运行。\n"
+                "每种类型流从 0 开始计数（第一条=索引 0）。",
                 wraplength=700)
     
         ttk.Checkbutton(opt_frame, text="按流类型分文件夹存放（video/audio/subtitle）",
-                        variable=self.extract_subfolders).grid(row=3, column=1, columnspan=2, sticky="w", padx=10, pady=5)
+                        variable=self.extract_subfolders).grid(row=3, column=1, columnspan=2, sticky="w", padx=10)
 
         chk_metadata = ttk.Checkbutton(opt_frame, text="清除元数据", variable=self.extract_clear_metadata)
-        chk_metadata.grid(row=3, column=3, sticky="w", padx=10, pady=5)
+        chk_metadata.grid(row=3, column=3, sticky="w", padx=10)
         ToolTip(chk_metadata, "勾选后，输出文件将不包含任何元数据（如作者、专辑等），适用于铃声或素材提取。")
 
 
         self.extract_clear_metadata.trace_add('write', lambda *a: self.save_player_settings())
+
+        # 第五行：提取附件
+        chk_attach = ttk.Checkbutton(opt_frame, text="提取附件（字体/封面图）",
+                                     variable=self.extract_attachments)
+        chk_attach.grid(row=4, column=0, sticky="w", padx=10)
+        ToolTip(chk_attach,
+                "勾选后，额外提取文件中的附件流（attachment）。\n\n"
+                "适用场景：\n"
+                "• MKV 内嵌字体（.ttf / .otf）— 提取后可用于 ASS 字幕渲染\n"
+                "• 音频封面图（mjpeg / png）— 提取内嵌封面为图片\n\n"
+                "附件提取为单独任务，不影响视频/音频/字幕的提取。\n"
+                "字体文件名取自附件原始文件名，封面图输出为 .jpg/.png。")
+        self.extract_attachments.trace_add('write', lambda *a: (self.save_player_settings(), self._on_extract_option_changed()))
 
         # 初始化自动匹配状态
         self._suppress_save = True
@@ -16878,18 +17296,30 @@ class FFmpegBatchGUI:
             self._append_info_ui(f"[流提取] 已删除: {os.path.basename(file_path)}")
 
     def _refresh_extract_file_list(self):
-        """刷新流提取文件列表（Treeview），交替行颜色"""
+        """刷新流提取文件列表（Treeview），交替行颜色，显示流信息摘要"""
         for item in self.extract_tree.get_children():
             self.extract_tree.delete(item)
-    
+
         # 配置交替行标签（不会影响其他 Treeview）
         self.extract_tree.tag_configure('odd', background='#D9F0D9')
         self.extract_tree.tag_configure('even', background='#FDEBD0')
-    
+
         for i, path in enumerate(self.extract_file_list):
             tag = 'odd' if i % 2 == 0 else 'even'
+            si = self.extract_get_stream_indices(path)
+            v_cnt = len(si.get('video', []))
+            a_cnt = len(si.get('audio', []))
+            s_cnt = len(si.get('subtitle', []))
+            parts = []
+            if v_cnt:
+                parts.append(f"{v_cnt}V")
+            if a_cnt:
+                parts.append(f"{a_cnt}A")
+            if s_cnt:
+                parts.append(f"{s_cnt}S")
+            stream_info = " ".join(parts) if parts else "无"
             self.extract_tree.insert("", tk.END, iid=f"file_{i}",
-                                     values=(os.path.basename(path), path),
+                                     values=(os.path.basename(path), stream_info, path),
                                      tags=(tag,))
     
         # 自动预览第一个文件
@@ -16970,6 +17400,7 @@ class FFmpegBatchGUI:
             'auto_match_audio': self.auto_match_audio_ext.get(),
             'keep_chapters': self.extract_keep_chapters.get(),
             'clear_metadata': self.extract_clear_metadata.get(),
+            'extract_attachments': self.extract_attachments.get(),
         }
     
         if self.extract_custom_dir.get() and self.extract_output_dir.get().strip():
@@ -16982,7 +17413,7 @@ class FFmpegBatchGUI:
     
         # ---- 视频流 ----
         if options['video'] and stream_indices['video']:
-            indices = stream_indices['video'][:1] if options['only_first'] else stream_indices['video']
+            indices = self._get_extract_indices(file_path, 'video', stream_indices['video'], options)
             for idx in indices:
                 tags = self._get_stream_tags(file_path, 'video', idx)
                 lang = tags.get('language', '')
@@ -17010,7 +17441,7 @@ class FFmpegBatchGUI:
     
         # ---- 音频流 ----
         if options['audio'] and stream_indices['audio']:
-            indices = stream_indices['audio'][:1] if options['only_first'] else stream_indices['audio']
+            indices = self._get_extract_indices(file_path, 'audio', stream_indices['audio'], options)
             for idx in indices:
                 tags = self._get_stream_tags(file_path, 'audio', idx)
                 lang = tags.get('language', '')
@@ -17044,18 +17475,19 @@ class FFmpegBatchGUI:
     
         # ---- 字幕流 ----
         if options['subtitle'] and stream_indices['subtitle']:
-            indices = stream_indices['subtitle'][:1] if options['only_first'] else stream_indices['subtitle']
+            indices = self._get_extract_indices(file_path, 'subtitle', stream_indices['subtitle'], options)
             for idx in indices:
                 tags = self._get_stream_tags(file_path, 'subtitle', idx)
                 lang = tags.get('language', '')
                 title = tags.get('title', '')
+                sub_codec = self._get_stream_codec(file_path, 'subtitle', idx)
                 if options['auto_match']:
-                    codec = self._get_stream_codec(file_path, 'subtitle', idx)
-                    ext = self._map_codec_to_ext(codec)
+                    ext = self._map_codec_to_ext(sub_codec)
                 else:
                     ext = options['subtitle_format']
                 if not ext:
                     ext = 'srt'
+                sub_enc = self._get_subtitle_codec_arg(sub_codec, ext)
                 name_suffix = f"_{idx}" if len(indices) > 1 else ""
                 if lang:
                     name_suffix += f"_{lang}"
@@ -17063,7 +17495,7 @@ class FFmpegBatchGUI:
                 out_dir = os.path.join(base_output_dir, subdir) if subdir else base_output_dir
                 out_path = normalize_path(os.path.join(out_dir, f"{base}_sub{name_suffix}.{ext}"))
                 cmd = [self.ffmpeg_cmd, "-y", "-i", file_path,
-                       "-map", f"0:s:{idx}?", "-c:s", "copy"]
+                       "-map", f"0:s:{idx}?", "-c:s", sub_enc]
                 # 字幕通常不保留章节，但保留元数据清除
                 if options.get('clear_metadata', False):
                     cmd.extend(["-map_metadata", "-1"])
@@ -17074,6 +17506,30 @@ class FFmpegBatchGUI:
                         cmd.extend(["-metadata:s:0", f"title={title}"])
                 cmd.append(out_path)
                 cmd_list_lines.append(format_cmd_for_display(cmd))
+    
+        # ---- 附件/封面 ----
+        if options.get('extract_attachments', False):
+            attachments = self._get_attachment_streams(file_path)
+            for a in attachments:
+                if a['type'] == 'attachment':
+                    fname = a['filename'] or f"attachment_{a['index']}"
+                    subdir = "attachments" if options['subfolders'] else ""
+                    out_dir = os.path.join(base_output_dir, subdir) if subdir else base_output_dir
+                    out_path = normalize_path(os.path.join(out_dir, fname))
+                    cmd = [self.ffmpeg_cmd, "-y", "-i", file_path,
+                           "-map", f"0:t:{a['index']}?", "-c", "copy"]
+                    cmd.append(out_path)
+                    cmd_list_lines.append(format_cmd_for_display(cmd))
+                elif a['type'] == 'cover':
+                    codec_ext = self._map_cover_codec_to_ext(a['codec'])
+                    name_suffix = f"_cover_{a['index']}"
+                    subdir = "attachments" if options['subfolders'] else ""
+                    out_dir = os.path.join(base_output_dir, subdir) if subdir else base_output_dir
+                    out_path = normalize_path(os.path.join(out_dir, f"{base}{name_suffix}.{codec_ext}"))
+                    cmd = [self.ffmpeg_cmd, "-y", "-i", file_path,
+                           "-map", f"0:v:{a['index']}?", "-an", "-c:v", "copy"]
+                    cmd.append(out_path)
+                    cmd_list_lines.append(format_cmd_for_display(cmd))
     
         self.extract_preview_text.delete(1.0, tk.END)
         if not cmd_list_lines:
@@ -17121,6 +17577,252 @@ class FFmpegBatchGUI:
         # 保存设置（使状态持久化）
         self.save_player_settings()
         self._on_extract_option_changed()
+
+    # ---------- 右键轨道选择 ----------
+    def _extract_on_right_click(self, event):
+        """右键点击文件行 → 选中该行并弹出上下文菜单"""
+        row_id = self.extract_tree.identify_row(event.y)
+        if not row_id:
+            return
+        self.extract_tree.selection_set(row_id)
+        self.extract_tree.focus(row_id)
+
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="选择提取轨道...", command=self._open_stream_selection)
+        menu.add_command(label="重置为默认（取消手动选择）", command=self._reset_stream_selection)
+        menu.add_separator()
+        menu.add_command(label="预览此文件", command=self.extract_preview_selected)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _get_selected_extract_file(self):
+        """获取当前在 extract_tree 中选中的文件路径"""
+        sel = self.extract_tree.selection()
+        if not sel:
+            return None
+        values = self.extract_tree.item(sel[0], 'values')
+        if values and len(values) >= 3:
+            return values[2]  # 完整路径列
+        return None
+
+    def _reset_stream_selection(self):
+        """取消某文件的手动轨道选择，恢复默认行为"""
+        fp = self._get_selected_extract_file()
+        if not fp:
+            return
+        if fp in self._extract_stream_selection:
+            del self._extract_stream_selection[fp]
+            self._append_info_ui(f"[流提取] 已重置 {os.path.basename(fp)} 的轨道选择为默认")
+        self._on_extract_option_changed()
+
+    def _open_stream_selection(self):
+        """打开轨道选择对话框，列出所有流并允许勾选"""
+        fp = self._get_selected_extract_file()
+        if not fp:
+            return
+        data = self._get_stream_data(fp)
+        if not data:
+            messagebox.showwarning("提示", f"无法读取文件信息:\n{fp}")
+            return
+        streams = data.get('streams', [])
+        if not streams:
+            messagebox.showinfo("提示", "该文件不包含任何流")
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"选择提取轨道 - {os.path.basename(fp)}")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="勾选需要提取的轨道（取消勾选的轨道将被跳过）").pack(padx=10, pady=(8, 4))
+
+        scroll = ttk.Frame(dlg)
+        scroll.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        canvas = tk.Canvas(scroll, highlightthickness=0)
+        sb = ttk.Scrollbar(scroll, orient=tk.VERTICAL, command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window(0, 0, window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        headers = ttk.Frame(inner)
+        headers.pack(fill=tk.X, padx=4, pady=2)
+        ttk.Label(headers, text="  ", width=3).pack(side=tk.LEFT)
+        ttk.Label(headers, text="类型", width=6).pack(side=tk.LEFT, padx=4)
+        ttk.Label(headers, text="索引", width=4).pack(side=tk.LEFT, padx=4)
+        ttk.Label(headers, text="编码", width=14).pack(side=tk.LEFT, padx=4)
+        ttk.Label(headers, text="语言", width=8).pack(side=tk.LEFT, padx=4)
+        ttk.Label(headers, text="标题", width=24).pack(side=tk.LEFT, padx=4)
+
+        prev_sel = self._extract_stream_selection.get(fp)
+        check_vars = {}
+        v_cnt = a_cnt = s_cnt = 0
+        for s in streams:
+            typ = s.get('codec_type', '')
+            if typ not in ('video', 'audio', 'subtitle'):
+                continue
+            if typ == 'video':
+                idx = v_cnt; v_cnt += 1
+            elif typ == 'audio':
+                idx = a_cnt; a_cnt += 1
+            else:
+                idx = s_cnt; s_cnt += 1
+            codec = s.get('codec_name', '?')
+            tags = s.get('tags', {})
+            raw_lang = tags.get('language', '')
+            if raw_lang:
+                raw_lang = raw_lang.lower().strip()
+                lang = self.LANGUAGE_MAP.get(raw_lang, raw_lang)
+            else:
+                lang = ''
+            title = tags.get('title', '')
+            extra = ''
+            if typ == 'video':
+                w = s.get('width', 0)
+                h = s.get('height', 0)
+                if w and h:
+                    extra = f" {w}x{h}"
+            elif typ == 'audio':
+                ch = s.get('channels', 0)
+                if ch:
+                    ch_map = {1: '单声道', 2: '立体声', 6: '5.1', 8: '7.1'}
+                    extra = f" {ch_map.get(ch, f'{ch}ch')}"
+            label_text = f"{codec}{extra}"
+
+            default_checked = True
+            if prev_sel is not None:
+                default_checked = idx in prev_sel.get(typ, set())
+
+            row = ttk.Frame(inner)
+            row.pack(fill=tk.X, padx=4, pady=1)
+            var = tk.BooleanVar(value=default_checked)
+            ttk.Checkbutton(row, variable=var).pack(side=tk.LEFT)
+            ttk.Label(row, text=typ, width=6).pack(side=tk.LEFT, padx=4)
+            ttk.Label(row, text=str(idx), width=4).pack(side=tk.LEFT, padx=4)
+            ttk.Label(row, text=label_text, width=14).pack(side=tk.LEFT, padx=4)
+            ttk.Label(row, text=lang, width=8).pack(side=tk.LEFT, padx=4)
+            ttk.Label(row, text=title, width=24).pack(side=tk.LEFT, padx=4)
+            check_vars[(typ, idx)] = var
+
+        btn_frame = ttk.Frame(dlg)
+        btn_frame.pack(fill=tk.X, padx=10, pady=8)
+
+        def select_all():
+            for v in check_vars.values():
+                v.set(True)
+        def select_none():
+            for v in check_vars.values():
+                v.set(False)
+        def select_first_only():
+            seen = set()
+            for (typ, idx), v in check_vars.items():
+                key = typ
+                if key not in seen and idx == 0:
+                    v.set(True)
+                    seen.add(key)
+                else:
+                    v.set(False)
+
+        ttk.Button(btn_frame, text="全选", command=select_all).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="全不选", command=select_none).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="仅第一轨", command=select_first_only).pack(side=tk.LEFT, padx=4)
+
+        def on_ok():
+            sel = {'video': set(), 'audio': set(), 'subtitle': set()}
+            for (typ, idx), v in check_vars.items():
+                if v.get():
+                    sel[typ].add(idx)
+            if all(len(sel[k]) == 0 for k in sel):
+                if fp in self._extract_stream_selection:
+                    del self._extract_stream_selection[fp]
+            else:
+                self._extract_stream_selection[fp] = sel
+            dlg.destroy()
+            self._on_extract_option_changed()
+            self._append_info_ui(f"[流提取] 已更新 {os.path.basename(fp)} 的轨道选择")
+
+        def on_cancel():
+            dlg.destroy()
+
+        ttk.Button(btn_frame, text="确定", command=on_ok).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btn_frame, text="取消", command=on_cancel).pack(side=tk.RIGHT, padx=4)
+
+        dlg.update_idletasks()
+        w = dlg.winfo_width()
+        h = min(dlg.winfo_reqheight(), 500)
+        x = self.root.winfo_x() + (self.root.winfo_width() - w) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - h) // 2
+        dlg.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _get_extract_indices(self, file_path, stream_type, all_indices, options):
+        """获取要提取的流索引列表。如果文件有手动选择则用选择，否则用默认 only_first/all 逻辑。"""
+        sel = self._extract_stream_selection.get(file_path)
+        if sel is not None:
+            selected = sel.get(stream_type, set())
+            return [i for i in all_indices if i in selected]
+        if options.get('only_first'):
+            return all_indices[:1]
+        return all_indices
+
+    def _get_attachment_streams(self, file_path: str) -> list:
+        """获取文件中所有附件流和封面流信息。
+        返回: [{'type': 'attachment'|'cover', 'index': int, 'codec': str, 'filename': str}, ...]
+        attachment = MKV 内嵌字体等（codec_type=attachment）
+        cover = 音频内嵌封面图（video 流但编码为 mjpeg/png/bmp 等图片编码）
+        """
+        data = self._get_stream_data(file_path)
+        if not data:
+            return []
+        streams = data.get('streams', [])
+        result = []
+        attach_idx = 0
+        cover_idx = 0
+        cover_codecs = {'mjpeg', 'png', 'bmp', 'gif', 'webp', 'jpeg', 'mjpeg2', 'jpegls'}
+        has_real_video = False
+        video_codec_list = []
+        for s in streams:
+            if s.get('codec_type') == 'video':
+                vc = s.get('codec_name', '')
+                video_codec_list.append(vc)
+                if vc not in cover_codecs:
+                    has_real_video = True
+
+        for s in streams:
+            ct = s.get('codec_type', '')
+            if ct == 'attachment':
+                codec = s.get('codec_name', '')
+                tags = s.get('tags', {})
+                filename = tags.get('filename', '')
+                result.append({
+                    'type': 'attachment',
+                    'index': attach_idx,
+                    'codec': codec,
+                    'filename': filename,
+                })
+                attach_idx += 1
+            elif ct == 'video' and not has_real_video:
+                vc = s.get('codec_name', '')
+                if vc in cover_codecs:
+                    result.append({
+                        'type': 'cover',
+                        'index': cover_idx,
+                        'codec': vc,
+                        'filename': '',
+                    })
+                    cover_idx += 1
+        return result
+
+    def _map_cover_codec_to_ext(self, codec: str) -> str:
+        m = {
+            'mjpeg': 'jpg', 'mjpeg2': 'jpg', 'jpeg': 'jpg',
+            'png': 'png', 'bmp': 'bmp', 'gif': 'gif', 'webp': 'webp',
+            'jpegls': 'jpg',
+        }
+        return m.get(codec, 'jpg')
 
 
 
@@ -17274,6 +17976,24 @@ class FFmpegBatchGUI:
         }
         return mapping.get(codec_name, 'srt')
 
+    def _get_subtitle_codec_arg(self, source_codec: Optional[str], target_ext: str) -> str:
+        """根据源编码和目标扩展名决定 -c:s 参数：匹配则 copy，不匹配则转码。
+        返回 'copy' 或编码器名（如 'srt', 'ass', 'webvtt', 'mov_text'）。
+        """
+        native_ext = self._map_codec_to_ext(source_codec)
+        if native_ext == target_ext:
+            return "copy"
+        ext_to_encoder = {
+            'srt': 'srt',
+            'ass': 'ass',
+            'vtt': 'webvtt',
+            'mov_text': 'mov_text',
+        }
+        encoder = ext_to_encoder.get(target_ext)
+        if encoder:
+            return encoder
+        return "copy"
+
     def _map_audio_codec_to_ext(self, codec_name: Optional[str]) -> str:
         if not codec_name:
             return 'mka'
@@ -17309,8 +18029,8 @@ class FFmpegBatchGUI:
         """
         if not file_list:
             return
-        if not self.extract_video.get() and not self.extract_audio.get() and not self.extract_subtitle.get():
-            messagebox.showwarning("提示", "请至少勾选一种流类型")
+        if not self.extract_video.get() and not self.extract_audio.get() and not self.extract_subtitle.get() and not self.extract_attachments.get():
+            messagebox.showwarning("提示", "请至少勾选一种流类型（视频/音频/字幕/附件）")
             return
     
         single_mode = len(file_list) == 1
@@ -17332,6 +18052,7 @@ class FFmpegBatchGUI:
             'auto_match_audio': self.auto_match_audio_ext.get(),
             'keep_chapters': self.extract_keep_chapters.get(),
             'clear_metadata': self.extract_clear_metadata.get(),
+            'extract_attachments': self.extract_attachments.get(),
         }
     
         total_count = 0
@@ -17345,7 +18066,7 @@ class FFmpegBatchGUI:
     
             # ---- 视频流 ----
             if options['video'] and stream_indices['video']:
-                indices = stream_indices['video'][:1] if options['only_first'] else stream_indices['video']
+                indices = self._get_extract_indices(path, 'video', stream_indices['video'], options)
                 for idx in indices:
                     tags = self._get_stream_tags(path, 'video', idx)
                     lang = tags.get('language', '')
@@ -17374,7 +18095,7 @@ class FFmpegBatchGUI:
     
             # ---- 音频流 ----
             if options['audio'] and stream_indices['audio']:
-                indices = stream_indices['audio'][:1] if options['only_first'] else stream_indices['audio']
+                indices = self._get_extract_indices(path, 'audio', stream_indices['audio'], options)
                 for idx in indices:
                     tags = self._get_stream_tags(path, 'audio', idx)
                     lang = tags.get('language', '')
@@ -17409,18 +18130,19 @@ class FFmpegBatchGUI:
     
             # ---- 字幕流 ----
             if options['subtitle'] and stream_indices['subtitle']:
-                indices = stream_indices['subtitle'][:1] if options['only_first'] else stream_indices['subtitle']
+                indices = self._get_extract_indices(path, 'subtitle', stream_indices['subtitle'], options)
                 for idx in indices:
                     tags = self._get_stream_tags(path, 'subtitle', idx)
                     lang = tags.get('language', '')
                     title = tags.get('title', '')
+                    sub_codec = self._get_stream_codec(path, 'subtitle', idx)
                     if options['auto_match']:
-                        codec = self._get_stream_codec(path, 'subtitle', idx)
-                        ext = self._map_codec_to_ext(codec)
+                        ext = self._map_codec_to_ext(sub_codec)
                     else:
                         ext = options['subtitle_format']
                     if not ext:
                         ext = 'srt'
+                    sub_enc = self._get_subtitle_codec_arg(sub_codec, ext)
                     name_suffix = f"_{idx}" if len(indices) > 1 else ""
                     if lang:
                         name_suffix += f"_{lang}"
@@ -17428,7 +18150,7 @@ class FFmpegBatchGUI:
                     out_dir = os.path.join(base_output_dir, subdir) if subdir else base_output_dir
                     out_path = normalize_path(os.path.join(out_dir, f"{base}_sub{name_suffix}.{ext}"))
                     cmd = [self.ffmpeg_cmd, "-y", "-i", path,
-                           "-map", f"0:s:{idx}?", "-c:s", "copy"]
+                           "-map", f"0:s:{idx}?", "-c:s", sub_enc]
                     if options.get('clear_metadata', False):
                         cmd.extend(["-map_metadata", "-1"])
                     else:
@@ -17439,6 +18161,32 @@ class FFmpegBatchGUI:
                     cmd.append(out_path)
                     self.add_custom_task(path, out_path, cmd)
                     total_count += 1
+    
+            # ---- 附件/封面 ----
+            if options.get('extract_attachments', False):
+                attachments = self._get_attachment_streams(path)
+                for a in attachments:
+                    if a['type'] == 'attachment':
+                        fname = a['filename'] or f"attachment_{a['index']}"
+                        subdir = "attachments" if options['subfolders'] else ""
+                        out_dir = os.path.join(base_output_dir, subdir) if subdir else base_output_dir
+                        out_path = normalize_path(os.path.join(out_dir, fname))
+                        cmd = [self.ffmpeg_cmd, "-y", "-i", path,
+                               "-map", f"0:t:{a['index']}?", "-c", "copy"]
+                        cmd.append(out_path)
+                        self.add_custom_task(path, out_path, cmd)
+                        total_count += 1
+                    elif a['type'] == 'cover':
+                        codec_ext = self._map_cover_codec_to_ext(a['codec'])
+                        name_suffix = f"_cover_{a['index']}"
+                        subdir = "attachments" if options['subfolders'] else ""
+                        out_dir = os.path.join(base_output_dir, subdir) if subdir else base_output_dir
+                        out_path = normalize_path(os.path.join(out_dir, f"{base}{name_suffix}.{codec_ext}"))
+                        cmd = [self.ffmpeg_cmd, "-y", "-i", path,
+                               "-map", f"0:v:{a['index']}?", "-an", "-c:v", "copy"]
+                        cmd.append(out_path)
+                        self.add_custom_task(path, out_path, cmd)
+                        total_count += 1
     
         if total_count == 0:
             if single_mode:
