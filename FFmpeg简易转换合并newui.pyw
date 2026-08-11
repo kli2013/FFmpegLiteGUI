@@ -2327,14 +2327,19 @@ class VideoFilterFrame(ttk.LabelFrame):
         speed_check = ttk.Checkbutton(hybrid_frame, text="启用变速", variable=self.speed_enabled)
         speed_check.pack(side=tk.LEFT)
         ToolTip(speed_check, 
-            "启用变速后，可自定义速度倍数（支持任意正数，例如 0.5x 慢放、2.0x 快放）。\n"
-            "注意：过高（>10）或过低（<0.1）的倍数会串联多个 atempo 音频滤镜计算，可能加重解码负担。\n"
+            "视频变速（setpts 滤镜），仅作用于视频轨道，与音频无关。\n"
+            "可自定义速度倍数（支持任意正数，例如 0.5x 慢放、2.0x 快放）。\n"
+            "注意：过低（<0.5）的倍数会串联多个 setpts 计算；音频变速请在音频设置中单独设置，两者互不影响。\n"
             "推荐范围：0.1 ~ 10 倍，一般使用 0.25 ~ 4.0 已足够。")
         ttk.Entry(hybrid_frame, textvariable=self.speed_factor, width=6).pack(side=tk.LEFT, padx=5)
 
 
         self.reverse_enabled = tk.BooleanVar(value=False)
-        ttk.Checkbutton(hybrid_frame, text="启用倒放", variable=self.reverse_enabled).pack(side=tk.LEFT, padx=(10, 0))
+        reverse_check = ttk.Checkbutton(hybrid_frame, text="启用倒放", variable=self.reverse_enabled)
+        reverse_check.pack(side=tk.LEFT, padx=(10, 0))
+        ToolTip(reverse_check,
+                "视频倒放（reverse 滤镜），仅作用于视频轨道，与音频无关。\n"
+                "音频如需倒放，请在音频设置中单独勾选「音频倒放（独立于视频）」，两者互不影响。")
 
 
         deint_label = ttk.Label(hybrid_frame, text="反交错:")
@@ -3874,6 +3879,21 @@ class AudioFrame(ttk.LabelFrame):
         self.only_audio_cb = ttk.Checkbutton(top_row, text="仅提取音频", variable=self.only_audio)
         self.only_audio_cb.pack(side=tk.LEFT, padx=(50,2))
 
+        # "仅提取音频" ↔ "保留音频" 联动：勾选仅音频时强制保留音频，取消时恢复
+        self._prev_only_audio = False
+        self._saved_audio_enabled = True  # 记录勾选"仅音频"前的状态
+        def _on_only_audio_changed(*args):
+            curr = self.only_audio.get()
+            if curr and not self._prev_only_audio:
+                # 勾上"仅音频" → 保存旧状态并强制保留音频
+                self._saved_audio_enabled = self.audio_enabled.get()
+                self.audio_enabled.set(True)
+            elif not curr and self._prev_only_audio:
+                # 取消"仅音频" → 恢复原来的保留音频状态
+                self.audio_enabled.set(self._saved_audio_enabled)
+            self._prev_only_audio = curr
+        self.only_audio.trace_add("write", _on_only_audio_changed)
+
         ttk.Label(top_row, text="输出容器:").pack(side=tk.LEFT, padx=(12,2))
         self.audio_format = tk.StringVar(value="m4a")
         audio_format_combo = ttk.Combobox(top_row, textvariable=self.audio_format,
@@ -5378,10 +5398,9 @@ class AdvancedFrame(ttk.LabelFrame):
             "打开独立窗口配置水印（支持缩放、裁剪、旋转、绿幕抠像、透明度、位置调整等）。\n\n"
             "注意：\n"
             "• 水印会叠加在主视频之上，水印自身的音频将被忽略。\n"
-            "• 水印不支持变速功能（为避免时长计算混乱），如需变速请先单独预处理水印文件。\n"
+            "• 水印支持变速（在「视频滤镜」页面设置），变速后循环时长会自动按比例调整。\n"
             "• 循环控制通过启用截取并设置循环次数实现，可用于视频水印的重复播放。\n"
-            "• 勾选「自适应」可根据主视频尺寸自动缩放水印大小和位置。\n"
-            "• 此变速限制同样适用于画中画（子视频）模式，若子视频需变速，请先预处理。",
+            "• 勾选「自适应」可根据主视频尺寸自动缩放水印大小和位置。",
             wraplength=500
         )
         
@@ -5510,8 +5529,8 @@ class AdvancedFrame(ttk.LabelFrame):
     def open_watermark_editor(self):
         """打开图片/视频水印的参数编辑窗口（缩放、裁剪、旋转、位置等）。
 
-        文字水印的位置请在其专属设置窗口（「文字水印」→「打开位置编辑器」）中调整。
-	"""
+        文字水印的位置请在其专属设置窗口（「文字水印」→「打开位置编辑器」）中调整，
+        此处只负责图片/视频水印，不再关联文字水印。"""
         if self.app is None:
             return
         file_path = self.watermark_dict.get("file_path", "")
@@ -6243,6 +6262,7 @@ class FFmpegBatchGUI:
 
         self.copy_chapters = tk.BooleanVar(value=True)
         self.chapter_file = tk.StringVar(value="")
+        self.generate_chapters = tk.BooleanVar(value=False)
 
         self.use_mpv = tk.BooleanVar(value=False)
         self.mpv_path = tk.StringVar(value="mpv")
@@ -6265,7 +6285,6 @@ class FFmpegBatchGUI:
         self._watermark_precise_hint_shown = False
         self._preview_after_id = None   # after 回调 ID
         self._preview_pending = False   # 是否有待处理的刷新
-        self._pip_reverse_audio_hint_shown = False
         self.pix_fmt_enabled_default = tk.BooleanVar(value=True)
         
 
@@ -6914,18 +6933,36 @@ class FFmpegBatchGUI:
 
 
     def _get_video_pix_fmt(self, file_path: str, stream_index: int = 0) -> Optional[str]:
-        """获取视频流的像素格式，失败返回None"""
-        info = ffprobe_json(self.ffprobe_cmd, file_path)
+        """获取视频流的像素格式，优先读解析缓存，失败返回None"""
+        info = self._get_cached_stream_info(file_path)
         if info:
             for s in info.get('streams', []):
                 if s.get('codec_type') == 'video':
-                    return s.get('pix_fmt')
+                    pf = s.get('pix_fmt')
+                    if pf:
+                        return pf
+                    break
         return None
 
     def _get_video_framerate(self, file_path: str) -> Optional[float]:
-        """获取视频文件的平均帧率（fps），失败返回 None"""
+        """获取视频文件的平均帧率（fps），优先读解析缓存，失败返回 None"""
         if not self.ffprobe_cmd or not os.path.exists(file_path):
             return None
+        # 优先读解析缓存（拖入文件时已填充）
+        info = self._get_cached_stream_info(file_path)
+        if info:
+            for s in info.get("streams", []):
+                if s.get("codec_type") == "video":
+                    fr = s.get("avg_frame_rate")
+                    if fr:
+                        try:
+                            num, den = str(fr).split('/')
+                            val = float(num) / float(den) if float(den) != 0 else None
+                            if val:
+                                return val
+                        except (ValueError, ZeroDivisionError):
+                            pass
+                    break
         cmd = [self.ffprobe_cmd, "-v", "error", "-select_streams", "v:0",
                "-show_entries", "stream=avg_frame_rate", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
         try:
@@ -7266,11 +7303,16 @@ class FFmpegBatchGUI:
         return cmd_list
 
 
-    def _adapt_sub_settings(self, sub_settings, current_w, current_h):
+    def _adapt_sub_settings(self, sub_settings, current_w, current_h, wm_orig_w=None, wm_orig_h=None):
         """
         根据当前视频尺寸，从基准尺寸缩放位置和大小。
         返回新的设置字典（含 base_width/height 和缩放后的像素值）。
         基准尺寸从 sub_settings 中读取，若不存在则用当前尺寸初始化。
+
+        支持表达式（如 W-w-10、iw/2）自动求值为具体数值：
+        - scale_width/scale_height 表达式：用 iw/ih（水印原始尺寸）求值
+        - overlay_x/overlay_y 表达式：用 W/H（主视频） + w/h（水印渲染后尺寸）求值
+        原表达式保存在 _orig_* 键中。
         """
         if not sub_settings:
             return {}
@@ -7286,51 +7328,73 @@ class FFmpegBatchGUI:
             base_h = current_h
             new_settings["base_width"] = base_w
             new_settings["base_height"] = base_h
-            # 基准就是当前尺寸，缩放比例为1，所以无需改变数值
-            # 但为了统一，仍然保留原有数值（可能都是数字）
             return new_settings
     
         # 计算缩放比例
         scale_w = current_w / base_w
         scale_h = current_h / base_h
-    
-        # 处理位置坐标（必须是纯数字）
-        for field in ['overlay_x', 'overlay_y']:
-            val = new_settings.get(field, '').strip()
-            if val:
-                try:
-                    num = float(val)
-                    if field == 'overlay_x':
-                        new_val = int(round(num * scale_w))
-                    else:
-                        new_val = int(round(num * scale_h))
-                    new_settings[field] = str(new_val)
-                except ValueError:
-                    # 非纯数字（如表达式）保持不变，但建议只使用数字
-                    pass
-    
-        # 处理缩放尺寸（scale_width / scale_height）
+
+        # ---- 2.1 先求值 scale_width/scale_height 表达式（需要水印原始尺寸） ----
         for field in ['scale_width', 'scale_height']:
             val = new_settings.get(field, '').strip()
-            if val:
-                try:
-                    num = float(val)
-                    if field == 'scale_width':
-                        new_val = int(round(num * scale_w))
-                    else:
-                        new_val = int(round(num * scale_h))
-                    new_settings[field] = str(new_val)
-                except ValueError:
-                    # 非纯数字（如 "iw/2"）保持不变，建议用户使用数字
-                    pass
-    
+            if not val:
+                continue
+            try:
+                num = float(val)
+                # 纯数字，等比缩放
+                if field == 'scale_width':
+                    new_settings[field] = str(int(round(num * scale_w)))
+                else:
+                    new_settings[field] = str(int(round(num * scale_h)))
+            except ValueError:
+                # 表达式，求值（用 iw/ih = 水印原始尺寸）
+                if wm_orig_w is not None and wm_orig_h is not None:
+                    ctx = {'iw': wm_orig_w, 'ih': wm_orig_h, 'in_w': wm_orig_w, 'in_h': wm_orig_h,
+                           'W': current_w, 'H': current_h}
+                    result = safe_eval_expr(val, ctx)
+                    if result is not None and result > 0:
+                        new_settings['_orig_' + field] = val  # 备份原表达式
+                        if field == 'scale_width':
+                            new_settings[field] = str(int(round(result * scale_w)))
+                        else:
+                            new_settings[field] = str(int(round(result * scale_h)))
+
+        # ---- 2.2 计算水印渲染后尺寸（用于 overlay 表达式求值） ----
+        if wm_orig_w is not None and wm_orig_h is not None:
+            rendered_w, rendered_h = compute_rendered_size(wm_orig_w, wm_orig_h, new_settings)
+        else:
+            rendered_w, rendered_h = 0, 0
+
+        # ---- 2.3 求值 overlay_x/overlay_y 表达式 ----
+        for field in ['overlay_x', 'overlay_y']:
+            val = new_settings.get(field, '').strip()
+            if not val:
+                continue
+            try:
+                num = float(val)
+                # 纯数字，等比缩放
+                if field == 'overlay_x':
+                    new_settings[field] = str(int(round(num * scale_w)))
+                else:
+                    new_settings[field] = str(int(round(num * scale_h)))
+            except ValueError:
+                # 表达式，求值（用 W/H = 主视频尺寸，w/h = 水印渲染尺寸）
+                ctx = {'W': current_w, 'H': current_h,
+                       'main_w': current_w, 'main_h': current_h,
+                       'w': rendered_w, 'h': rendered_h,
+                       'n': 0, 't': 0}
+                result = safe_eval_expr(val, ctx)
+                if result is not None:
+                    new_settings['_orig_' + field] = val  # 备份原表达式
+                    new_settings[field] = str(int(round(result)))
+
         return new_settings
 
     def _generate_segment_concat_command(self, input_path: str, output_path: str, settings: dict) -> List[str]:
         """
         生成分段拼接的 FFmpeg 命令，支持仅音频、硬件解码、增强滤镜等。
         视频变速和倒放现在独立处理，不再依赖增强开关。
-        音频变速和倒放自动跟随视频的对应设置。
+        音频变速和倒放现为独立控制（音频有自己的「变速」「音频倒放」开关，不再跟随视频设置）。
         """
         segments = settings.get("segments", [])
         if not segments:
@@ -7360,18 +7424,8 @@ class FFmpegBatchGUI:
         v_filters = []
         a_filters = []
     
-        # 读取变速设置（音频和视频共用）
-        speed_enabled = settings.get("speed_enabled", False)
-        speed_factor = 1.0
-        if speed_enabled:
-            try:
-                speed_factor = float(settings.get("speed_factor", "1.0"))
-                if speed_factor <= 0:
-                    speed_enabled = False
-            except ValueError:
-                speed_enabled = False
-    
-        reverse_enabled = settings.get("reverse_enabled", False)
+        # 变速和倒放已改为逐段独立控制，不再读取全局设置
+        # 见下方 per-segment loop 中的 seg.get("speed") / seg.get("reverse")
     
         for i, seg in enumerate(segments):
             start = time_to_seconds(seg["start"])
@@ -7389,24 +7443,41 @@ class FFmpegBatchGUI:
                 flip_filter = ",vflip"
             elif flip == "水平+垂直":
                 flip_filter = ",hflip,vflip"
-    
-            # 视频trim（仅非仅音频模式）
+
+            # 逐段变速和倒放（每个片段独立控制）
+            seg_speed_factor = 1.0
+            seg_speed_raw = seg.get("speed", "1.0").strip()
+            if seg_speed_raw:
+                try:
+                    seg_speed_factor = float(seg_speed_raw)
+                    if seg_speed_factor <= 0:
+                        seg_speed_factor = 1.0
+                except ValueError:
+                    seg_speed_factor = 1.0
+            seg_reverse = seg.get("reverse", False)
+
+            # 视频trim（仅非仅音频模式） + 逐段变速/倒放
             if not only_audio:
-                v_filters.append(f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS{flip_filter}[v{i}]")
+                seg_video_chain = f"trim=start={start}:end={end},setpts=PTS-STARTPTS{flip_filter}"
+                if seg_speed_factor != 1.0:
+                    seg_video_chain += f",setpts={1.0/seg_speed_factor}*PTS"
+                if seg_reverse:
+                    seg_video_chain += ",reverse"
+                v_filters.append(f"[0:v]{seg_video_chain}[v{i}]")
     
             # 音频trim（除非完全禁用音频 且 源文件有音频）
             if not disable_audio and has_input_audio:
-                # 构建音频滤镜链：atrim + asetpts + 变速（如果启用）+ 倒放（如果启用）
                 audio_filter_parts = [
                     f"atrim=start={start}:end={end}",
                     "asetpts=PTS-STARTPTS"
                 ]
-                if speed_enabled and speed_factor != 1.0:
-                    atempo_chain = build_atempo_chain(speed_factor)
+                # 逐段音频变速（不再使用全局变速）
+                if seg_speed_factor != 1.0:
+                    atempo_chain = build_atempo_chain(seg_speed_factor)
                     if atempo_chain:
                         audio_filter_parts.append(atempo_chain)
-                # 音频倒放独立控制（不再跟随视频倒放）
-                if settings.get('audio_reverse', False):
+                # 逐段音频倒放（不再使用全局倒放）
+                if seg_reverse:
                     audio_filter_parts.append("areverse")
                 a_filters.append(f"[0:a]{','.join(audio_filter_parts)}[a{i}]")
     
@@ -7468,15 +7539,9 @@ class FFmpegBatchGUI:
                 pix = settings.get("pix_fmt", "yuv420p")
                 if pix:
                     global_filters.append(f"format={pix}")
-    
-            # ========== 视频变速（独立于增强） ==========
-            if speed_enabled and speed_factor != 1.0:
-                global_filters.append(f"setpts={1.0/speed_factor}*PTS")
-    
-            # ========== 视频倒放（独立于增强） ==========
-            if reverse_enabled:
-                global_filters.append("reverse")
-    
+
+            # 变速和倒放已改为逐段独立控制，不再在此添加全局滤镜
+
             # ========== 增强滤镜（降噪、锐化、色彩校正等） ==========
             enhance_settings = settings.get("enhance", {})
             if enhance_settings:
@@ -7913,6 +7978,16 @@ class FFmpegBatchGUI:
             # 无法计算有效时长时，降级为原始总时长或无限
             effective_duration = duration
     
+        # ----- 变速调整：子视频速度变化后，有效显示时长相应缩放 -----
+        # 例如 2x 快放 → 时长减半；0.5x 慢放 → 时长翻倍
+        if enc_settings.get("speed_enabled", False):
+            try:
+                sf = float(enc_settings.get("speed_factor", "1.0"))
+                if sf > 0 and sf != 1.0 and effective_duration is not None:
+                    effective_duration = effective_duration / sf
+            except (ValueError, TypeError):
+                pass
+    
         loop_mode = enc_settings.get("loop_mode", "infinite")
         loop_count = enc_settings.get("loop_count", 3)
     
@@ -8117,10 +8192,13 @@ class FFmpegBatchGUI:
             if main_w is None or main_h is None:
                 self._append_info_ui("[预览] 无法获取视频尺寸，跳过水印虚拟框")
             else:
+                # 提前探测水印原始尺寸（自适应表达式求值需要，用原始设置）
+                wm_orig_w, wm_orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, wm_file, wm_settings)
                 if wm_settings.get("adaptive", False):
-                    adapted_wm = self._adapt_sub_settings(wm_settings, main_w, main_h)
+                    adapted_wm = self._adapt_sub_settings(wm_settings, main_w, main_h, wm_orig_w, wm_orig_h)
                 else:
                     adapted_wm = wm_settings
+                # 注意：自适应后尺寸可能变了，重新探测（带旋转）
                 orig_w, orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, wm_file, adapted_wm)
                 if orig_w is None or orig_h is None:
                     orig_w, orig_h = 320, 240
@@ -8655,9 +8733,14 @@ class FFmpegBatchGUI:
         if vcodec == "copy":
             settings["encoder"] = "libx265"
             self._append_info_ui("水印模式必须重新编码，已将编码器自动改为 libx265。")
+        # 提前探测水印原始尺寸（自适应表达式求值需要）
+        wm_file_raw = wm_settings.get("file_path", "").strip()
+        wm_orig_w, wm_orig_h = None, None
+        if wm_file_raw and os.path.exists(wm_file_raw):
+            wm_orig_w, wm_orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, wm_file_raw, wm_settings)
         if main_w is not None and main_h is not None:
             if wm_settings.get("adaptive", False):
-                adapted_wm = self._adapt_sub_settings(wm_settings, main_w, main_h)
+                adapted_wm = self._adapt_sub_settings(wm_settings, main_w, main_h, wm_orig_w, wm_orig_h)
             else:
                 adapted_wm = wm_settings.copy()
         else:
@@ -8962,7 +9045,7 @@ class FFmpegBatchGUI:
     
         # 未启用 pad 或 pad 尺寸无效，使用主视频实际渲染尺寸（按正确顺序计算）
         # 先获取原始尺寸（不含旋转）
-        w, h = get_video_dimensions(self.ffprobe_cmd, main_track.file_path)
+        w, h = self._cached_video_dimensions(main_track.file_path)
         if w is None or h is None:
             w, h = 1280, 720  # 降级默认值
     
@@ -8989,7 +9072,7 @@ class FFmpegBatchGUI:
             settings = track.enc_settings
     
         # 获取原始尺寸（不含任何旋转，直接从 ffprobe 获取）
-        w, h = get_video_dimensions(self.ffprobe_cmd, track.file_path)
+        w, h = self._cached_video_dimensions(track.file_path)
         if w is None or h is None:
             return 320, 240  # 返回安全默认值
     
@@ -9471,7 +9554,7 @@ class FFmpegBatchGUI:
                 "scale_height": live_filt_frame.scale_height.get(),
                 "rotate": live_filt_frame.rotate.get()
             }
-            orig_w, orig_h = get_video_dimensions(self.ffprobe_cmd, main_track.file_path)
+            orig_w, orig_h = self._cached_video_dimensions(main_track.file_path)
             if orig_w is None or orig_h is None:
                 orig_w, orig_h = 1280, 720
             main_render_w, main_render_h = self.compute_final_size_with_order(orig_w, orig_h, main_settings)
@@ -11006,7 +11089,7 @@ class FFmpegBatchGUI:
                 "【重新编码模式（编码器 ≠ copy）】\n"
                 "• 为提高兼容性，建议所有源文件分辨率保持一致；若不同，系统会自动统一为主视频缩放尺寸，但可能影响画质。\n"
                 "• 子视频可单独应用所有滤镜(除了字幕)\n"
-                "• 音频的变速、倒放、截取跟随视频参数。\n\n"
+                "• 音频的变速、倒放均为独立控制，每轨单独设置，不再跟随视频参数；截取由各音频轨道单独控制。\n\n"
                 "• 若文件数量众多，重新编码会消耗较多时间，也可预先用 FFmpeg 统一转码后再使用流复制模式。\n\n"
                 "提示：串行合并拖拽额外支持文件夹解析。",
                 wraplength=700)
@@ -11051,13 +11134,43 @@ class FFmpegBatchGUI:
         chapter_frame.pack(fill=tk.X, pady=5)
         chapter_row = ttk.Frame(chapter_frame)
         chapter_row.pack(fill=tk.X, padx=5, pady=(0,2))
-        ttk.Checkbutton(
-            chapter_row, text="从源文件复制章节 (map_chapters)", 
+        copy_chapters_cb = ttk.Checkbutton(
+            chapter_row, text="从源文件复制章节",
             variable=self.copy_chapters
-        ).pack(side=tk.LEFT, padx=(0, 15))
+        )
+        copy_chapters_cb.pack(side=tk.LEFT, padx=(0, 12))
+        ToolTip(copy_chapters_cb,
+                "从源文件复制章节 (map_chapters):\n"
+                "将第一个输入源文件的章节标记原样复制到输出文件。\n"
+                "适用于源文件已有章节信息的场景。",
+                wraplength=380)
+        # "生成章节" 复选框（仅串行模式可用）
+        gen_chapters_cb = ttk.Checkbutton(
+            chapter_row, text="生成章节",
+            variable=self.generate_chapters
+        )
+        gen_chapters_cb.pack(side=tk.LEFT, padx=(0, 12))
+        self._gen_chapters_cb = gen_chapters_cb  # 保存引用以便 concat toggle 控制
+        ToolTip(gen_chapters_cb,
+                "自动生成章节 (generate chapters):\n"
+                "串行合并模式下，根据每个视频轨道的「章节标签」自动生成章节标记。\n"
+                "需先在对应视频/音频轨道的元数据中设置「章节标签」。不写会自动写作片段。\n"
+                "章节起始时间自动累加计算，无需手动编写 FFmetadata 文件。",
+                wraplength=380)
+        # 初始状态：非串行模式灰色
+        if not self.concat_enabled.get():
+            gen_chapters_cb.config(state='disabled')
         right_area = ttk.Frame(chapter_row)
         right_area.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Label(right_area, text="导入外部章节文件 (FFmetadata):").pack(side=tk.LEFT)
+        import_label = ttk.Label(right_area, text="导入外部章节:")
+        import_label.pack(side=tk.LEFT)
+        ToolTip(import_label,
+                "导入外部章节 (FFmetadata):\n"
+                "从外部 FFmetadata 格式文件导入章节标记。\n"
+                "与「从源文件复制章节」互斥：选择文件后自动取消复制。\n"
+                "FFmetadata 格式示例：\n"
+                ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=5000\ntitle=第一章",
+                wraplength=380)
         chapter_entry = ttk.Entry(right_area, textvariable=self.chapter_file)
         chapter_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         ttk.Button(
@@ -11167,6 +11280,7 @@ class FFmpegBatchGUI:
         self.merge_output.trace_add("write", lambda *a: self.merge_update_command_preview())
         self.copy_chapters.trace_add("write", lambda *a: self.merge_update_command_preview())
         self.chapter_file.trace_add("write", lambda *a: self.merge_update_command_preview())
+        self.generate_chapters.trace_add("write", lambda *a: self.merge_update_command_preview())
 
         self.pip_enabled.trace_add('write', self._on_pip_toggle)
         self.concat_enabled.trace_add('write', self._on_concat_toggle)
@@ -11424,7 +11538,7 @@ class FFmpegBatchGUI:
                 "scale_height": filt_frame.scale_height.get(),
                 "rotate": filt_frame.rotate.get()
             }
-            orig_w, orig_h = get_video_dimensions(self.ffprobe_cmd, main_track.file_path)
+            orig_w, orig_h = self._cached_video_dimensions(main_track.file_path)
             if orig_w is None or orig_h is None:
                 orig_w, orig_h = 1280, 720
             main_w, main_h = self.compute_final_size_with_order(orig_w, orig_h, main_settings)
@@ -11438,7 +11552,7 @@ class FFmpegBatchGUI:
         for t in sub_tracks:
             w, h = self._get_video_render_size(t)
             if w is None or h is None:
-                orig_w, orig_h = get_video_dimensions(self.ffprobe_cmd, t.file_path)
+                orig_w, orig_h = self._cached_video_dimensions(t.file_path)
                 if orig_w and orig_h:
                     w, h = compute_rendered_size(orig_w, orig_h, t.enc_settings)
                 else:
@@ -11587,6 +11701,7 @@ class FFmpegBatchGUI:
             "merge_manual_duration": self.merge_manual_duration.get(),
             "copy_chapters": self.copy_chapters.get(),
             "chapter_file": self.chapter_file.get(),
+            "generate_chapters": self.generate_chapters.get(),
             "merge_verify": self.merge_verify.get(),
             "merge_delete_source": self.merge_delete_source.get(),
             "tracks": []
@@ -11650,6 +11765,7 @@ class FFmpegBatchGUI:
             self.merge_manual_duration.set(state.get("merge_manual_duration", ""))
             self.copy_chapters.set(state.get("copy_chapters", True))
             self.chapter_file.set(state.get("chapter_file", ""))
+            self.generate_chapters.set(state.get("generate_chapters", False))
             self.merge_verify.set(state.get("merge_verify", True))
             self.merge_delete_source.set(state.get("merge_delete_source", False))
     
@@ -11740,7 +11856,6 @@ class FFmpegBatchGUI:
         # 当画中画被禁用时（切回普通模式），重置水印提示
         if not self.pip_enabled.get():
             self._trim_precise_hint_shown = False
-            self._pip_reverse_audio_hint_shown = False
         self.merge_update_command_preview()
         self.merge_update_track_list()
 
@@ -11749,7 +11864,12 @@ class FFmpegBatchGUI:
             self.pip_enabled.set(False)
         if not self.concat_enabled.get():
             self._trim_precise_hint_shown = False
-            self._pip_reverse_audio_hint_shown = False
+        # 控制"生成章节"复选框状态
+        if hasattr(self, '_gen_chapters_cb'):
+            state = 'normal' if self.concat_enabled.get() else 'disabled'
+            self._gen_chapters_cb.config(state=state)
+            if not self.concat_enabled.get():
+                self.generate_chapters.set(False)
         self.merge_update_command_preview()
         self.merge_update_track_list()
 
@@ -12222,6 +12342,7 @@ class FFmpegBatchGUI:
         # 统一更新界面
         self.merge_update_track_list()
         self.merge_auto_recommend_container()
+        self._ensure_main_video(disable_scale=True)
         self.merge_update_output_preview()
 
     
@@ -12246,6 +12367,7 @@ class FFmpegBatchGUI:
         # 统一更新界面
         self.merge_update_track_list()
         self.merge_auto_recommend_container()
+        self._ensure_main_video()
         self.merge_update_output_preview()
 
 
@@ -12961,6 +13083,69 @@ class FFmpegBatchGUI:
         cmd.append(output_norm)
         return cmd
 
+    def _generate_concat_chapters(self, video_tracks):
+        """为串行合并生成 FFmetadata 临时文件，返回 (path, cleanup_list)。
+        根据每个视频轨道的 chapter_label 和时长自动创建章节条目。"""
+        import tempfile
+        if not video_tracks:
+            return None, []
+        
+        fd, meta_path = tempfile.mkstemp(suffix='.txt', prefix='chapters_', text=True)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write(";FFMETADATA1\n")
+                cumulative_ms = 0
+                for i, track in enumerate(video_tracks):
+                    label = track.enc_settings.get("chapter_label", "").strip()
+                    # 计算该片段的实际时长（秒）
+                    settings = track.enc_settings
+                    effective_dur = self._get_effective_duration(settings, input_path=track.file_path)
+                    if effective_dur is None or effective_dur <= 0:
+                        effective_dur = 0.0
+                    dur_ms = int(effective_dur * 1000)
+                    
+                    title = label if label else f"片段 {i+1}"
+                    end_ms = cumulative_ms + dur_ms
+                    f.write("[CHAPTER]\n")
+                    f.write("TIMEBASE=1/1000\n")
+                    f.write(f"START={cumulative_ms}\n")
+                    f.write(f"END={end_ms}\n")
+                    f.write(f"title={title}\n")
+                    cumulative_ms = end_ms
+        except Exception as e:
+            try:
+                os.unlink(meta_path)
+            except OSError:
+                pass
+            self._append_info_ui(f"[章节] 生成 FFmetadata 失败: {e}")
+            return None, []
+        
+        cleanup_list = [meta_path]
+        self._append_info_ui(f"[章节] 已生成 {len(video_tracks)} 个章节标记 ({os.path.basename(meta_path)})")
+        return meta_path, cleanup_list
+
+    def _inject_chapters_into_cmd(self, cmd_list, meta_path):
+        """将 FFmetadata 章节文件注入到已构建的命令中。"""
+        if not cmd_list:
+            return cmd_list
+        
+        # 统计现有输入文件数（以 -i 计数）
+        input_count = sum(1 for a in cmd_list if a == "-i")
+        
+        # 找到最后一个输入文件后的位置，在 -filter_complex / -map 之前插入
+        insert_pos = len(cmd_list) - 1  # 默认在输出文件前
+        # 倒找最后一个输出文件（以最后一个非选项参数为输出，通常是扩展名结尾）
+        # 更可靠的做法：在 -filter_complex 或 -map 之前插入 metadata 输入
+        for idx, arg in enumerate(cmd_list):
+            if arg in ("-filter_complex", "-map", "-c:v", "-c:a", "-vn", "-an"):
+                insert_pos = idx
+                break
+        
+        # 在当前 insert_pos 处插入 -i meta_path -map_chapters N
+        inject = ["-i", normalize_path(meta_path), "-map_chapters", str(input_count)]
+        new_cmd = cmd_list[:insert_pos] + inject + cmd_list[insert_pos:]
+        return new_cmd
+
 
 
     def _build_concat_cmd(self, enabled_tracks, output_norm, preview=False):
@@ -13001,9 +13186,19 @@ class FFmpegBatchGUI:
                 use_copy_mode = False
         
         if use_copy_mode:
-            return self._build_concat_copy_mode(cmd, video_tracks, audio_tracks, output_norm, preview=preview)
+            cmd_list = self._build_concat_copy_mode(cmd, video_tracks, audio_tracks, output_norm, preview=preview)
         else:
-            return self._build_concat_reencode_mode(cmd, video_tracks, audio_tracks, main_video, output_norm)
+            cmd_list = self._build_concat_reencode_mode(cmd, video_tracks, audio_tracks, main_video, output_norm)
+
+        # 生成章节：如果勾选了"生成章节"，注入 FFmetadata 文件（跳过预览模式）
+        if self.generate_chapters.get() and not preview:
+            meta_path, cleanup = self._generate_concat_chapters(video_tracks)
+            if meta_path:
+                cmd_list = self._inject_chapters_into_cmd(cmd_list, meta_path)
+                if not hasattr(self, '_temp_concat_lists'):
+                    self._temp_concat_lists = []
+                self._temp_concat_lists.extend(cleanup)
+        return cmd_list
 
 
     def _build_concat_copy_mode(self, cmd, video_tracks, audio_tracks, output_norm, preview=False):
@@ -13057,7 +13252,7 @@ class FFmpegBatchGUI:
         全局阶段仅应用：视频字幕烧录；音频音量调整。
         """
         # ----- 1. 计算主视频最终输出规格（用于强制统一） -----
-        main_orig_w, main_orig_h = get_video_dimensions(self.ffprobe_cmd, main_video.file_path)
+        main_orig_w, main_orig_h = self._cached_video_dimensions(main_video.file_path)
         if main_orig_w is None or main_orig_h is None:
             main_orig_w, main_orig_h = 1280, 720
     
@@ -13511,6 +13706,55 @@ class FFmpegBatchGUI:
     def merge_get_media_info(self, path):
         return self._get_cached_stream_info(path)
 
+    def _cached_video_dimensions(self, file_path):
+        """
+        获取视频原始宽高（不考虑旋转），优先读解析缓存（拖入文件时已填充 _stream_info_cache），
+        未命中回退懒尺寸缓存，再回退未缓存 ffprobe。供构建命令复用，避免对大量文件重复探帧。
+        """
+        if not file_path or not os.path.exists(file_path):
+            return None, None
+        # 1) 解析缓存（命中即 0 次 ffprobe）
+        info = self._get_cached_stream_info(file_path)
+        if info:
+            for s in info.get("streams", []):
+                if s.get("codec_type") == "video":
+                    w = s.get("width")
+                    h = s.get("height")
+                    if w and h:
+                        return int(w), int(h)
+        # 2) 懒尺寸缓存
+        w, h = self._get_video_dimensions_cached(file_path)
+        if w is not None and h is not None:
+            return w, h
+        # 3) 终极回退（未缓存）
+        return get_video_dimensions(self.ffprobe_cmd, file_path)
+
+    def _cached_video_rotated_dimensions(self, file_path, settings):
+        """
+        获取考虑元数据旋转与用户旋转后的尺寸，优先读解析缓存。
+        缓存未命中时回退现有未缓存实现（保持原始行为完全一致）。
+        """
+        w, h = self._cached_video_dimensions(file_path)
+        if w is None:
+            return get_video_rotated_dimensions(self.ffprobe_cmd, file_path, settings)
+        # 应用元数据旋转（从缓存读取 side_data_list）
+        info = self._get_cached_stream_info(file_path)
+        if info:
+            for s in info.get("streams", []):
+                if s.get("codec_type") == "video":
+                    for sd in s.get("side_data_list", []):
+                        rot = sd.get("rotation")
+                        if rot is not None:
+                            if int(rot) % 180 == 90:
+                                w, h = h, w
+                            break
+                    break
+        # 用户旋转
+        rotate = (settings or {}).get("rotate", "none")
+        if rotate in ("90", "270"):
+            w, h = h, w
+        return w, h
+
     def merge_load_video_info(self):
         if self._suppress_main_video_trace:
             return
@@ -13929,7 +14173,7 @@ class FFmpegBatchGUI:
         return safe_eval_expr(expr, {"W": main_w, "H": main_h, "w": box_w, "h": box_h})
 
     def get_rendered_size(self, track):
-        w, h = get_video_rotated_dimensions(self.ffprobe_cmd, track.file_path, track.enc_settings)
+        w, h = self._cached_video_rotated_dimensions(track.file_path, track.enc_settings)
         if w is None:
             return None
         return compute_rendered_size(w, h, track.enc_settings)
@@ -14008,7 +14252,7 @@ class FFmpegBatchGUI:
                         filters = dt
 
             # ---- 自适应缩放（固定边距） ----
-            orig_w, orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, track.file_path, track.enc_settings)
+            orig_w, orig_h = self._cached_video_rotated_dimensions(track.file_path, track.enc_settings)
             if orig_w is None or orig_h is None:
                 orig_w, orig_h = 1280, 720
             final_w, final_h = compute_rendered_size(orig_w, orig_h, track.enc_settings)
@@ -14229,8 +14473,12 @@ class FFmpegBatchGUI:
         main_settings["hw_filter_mode"] = "cpu"
 
         main_w, main_h = self._get_video_dimensions_cached(file_path)
+        # 提前探测水印原始尺寸（自适应表达式求值需要，用原始设置）
+        wm_orig_w, wm_orig_h = None, None
+        if wm_file and os.path.exists(wm_file):
+            wm_orig_w, wm_orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, wm_file, wm_settings)
         if wm_settings.get("adaptive", False):
-            adapted_wm = self._adapt_sub_settings(wm_settings, main_w or 1280, main_h or 720)
+            adapted_wm = self._adapt_sub_settings(wm_settings, main_w or 1280, main_h or 720, wm_orig_w, wm_orig_h)
         else:
             adapted_wm = dict(wm_settings)
         adapted_wm["hw_filter_mode"] = "cpu"
@@ -14420,7 +14668,7 @@ class FFmpegBatchGUI:
                                 "scale_height": filt_frame.scale_height.get(),
                                 "rotate": filt_frame.rotate.get()
                             }
-                            orig_w, orig_h = get_video_dimensions(self.ffprobe_cmd, main_file)
+                            orig_w, orig_h = self._cached_video_dimensions(main_file)
                             if orig_w is None or orig_h is None:
                                 orig_w, orig_h = 1280, 720
                             main_w, main_h = self.compute_final_size_with_order(orig_w, orig_h, main_settings)
@@ -14446,7 +14694,7 @@ class FFmpegBatchGUI:
                             # 其他增强滤镜不影响尺寸，不需要
                         }
                     
-                        orig_w, orig_h = get_video_dimensions(self.ffprobe_cmd, wm_file)
+                        orig_w, orig_h = self._cached_video_dimensions(wm_file)
                         if orig_w is None or orig_h is None:
                             orig_w, orig_h = 320, 240
                     
@@ -14528,10 +14776,18 @@ class FFmpegBatchGUI:
                 title_var = tk.StringVar(value=track_obj.title)
                 title_entry = ttk.Entry(meta_frame, textvariable=title_var, width=30)
                 title_entry.grid(row=1, column=1, columnspan=3, padx=5, pady=5, sticky="w")
-            
+
+                # 章节标签（仅串行模式）
+                chapter_label_var = tk.StringVar(value="")
+                if is_concat_mode:
+                    ttk.Label(meta_frame, text="章节标签:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+                    chapter_label_var.set(track_obj.enc_settings.get("chapter_label", ""))
+                    chapter_label_entry = ttk.Entry(meta_frame, textvariable=chapter_label_var, width=30)
+                    chapter_label_entry.grid(row=2, column=1, columnspan=3, padx=5, pady=5, sticky="w")
+
                 # 提示信息
                 ttk.Label(meta_frame, text="从下拉框选择常用语言，或直接输入 ISO 639-2/B 代码（如 cmn、yue）",
-                          foreground="gray").grid(row=2, column=0, columnspan=4, sticky="w", padx=5, pady=2)
+                          foreground="gray").grid(row=3, column=0, columnspan=4, sticky="w", padx=5, pady=2)
 
             # ================== 页面7：音频绑定 ==================
             # 仅在串接模式下显示此页（水印无音频绑定需求）
@@ -14626,6 +14882,9 @@ class FFmpegBatchGUI:
                         else:
                             new_settings["language"] = ""
                         new_settings["title"] = title_var.get().strip()
+                        # 章节标签（仅串行模式）
+                        if is_concat_mode:
+                            new_settings["chapter_label"] = chapter_label_var.get().strip()
 
                     on_save(new_settings)
                 except Exception as e:
@@ -14691,18 +14950,6 @@ class FFmpegBatchGUI:
         # 更新字幕元数据
         track.language = new_settings.get("language", "")
         track.title = new_settings.get("title", "")
-
-        # 画中画模式下，视频倒放时提示音频倒放为独立的
-        if self.pip_enabled.get() and new_settings.get("reverse_enabled", False) and not self._pip_reverse_audio_hint_shown:
-            self._pip_reverse_audio_hint_shown = True
-            messagebox.showinfo(
-                "音频倒放独立控制",
-                "您已为当前视频轨道启用倒放。\n\n"
-                "在画中画模式下，视频倒放与音频倒放是独立的。\n"
-                "若需要此视频的音频也倒放，请单独编辑对应的音频轨道，\n"
-                "在音频设置中勾选「音频倒放（独立于视频）」。"
-            )
-            self._append_info_ui("[提示] 画中画模式下音频倒放独立，请至音频轨道单独设置。")
 
         if "enhance" in new_settings:
             track.enc_settings["enhance"] = new_settings["enhance"]
@@ -14828,6 +15075,16 @@ class FFmpegBatchGUI:
             title_var = tk.StringVar(value=track.title)
             title_entry = ttk.Entry(title_row, textvariable=title_var, width=40)
             title_entry.pack(side=tk.LEFT, padx=5)
+
+            # 章节标签（仅串行模式）
+            chapter_label_var = tk.StringVar(value="")
+            if is_concat:
+                cl_row = ttk.Frame(meta_frame)
+                cl_row.pack(fill=tk.X, pady=2)
+                ttk.Label(cl_row, text="章节标签:").pack(side=tk.LEFT, padx=5)
+                chapter_label_var.set(track.enc_settings.get("chapter_label", ""))
+                chapter_label_entry = ttk.Entry(cl_row, textvariable=chapter_label_var, width=40)
+                chapter_label_entry.pack(side=tk.LEFT, padx=5)
     
             # 获取模式标志
             is_pip = self.pip_enabled.get()
@@ -15028,6 +15285,9 @@ class FFmpegBatchGUI:
                 track.title = title_var.get().strip()
                 track.enc_settings["language"] = track.language
                 track.enc_settings["title"] = track.title
+                # 章节标签（仅串行模式）
+                if is_concat:
+                    track.enc_settings["chapter_label"] = chapter_label_var.get().strip()
     
                 self.merge_update_track_list()
                 self.merge_update_command_preview()
@@ -15480,10 +15740,11 @@ class FFmpegBatchGUI:
                     self.merge_add_external("subtitle", path)
         self.root.after(0, process)
 
-    def _parse_files_concurrently(self, file_paths, max_workers=4, description="文件"):
+    def _parse_files_concurrently(self, file_paths, max_workers=None, description="文件"):
         """
         并发解析文件，结果自动存入 _stream_info_cache（通过 merge_get_media_info）。
         返回成功解析的文件路径列表。
+        并发数默认回落到 self.ffprobe_parallel（即探测到的 CPU 数量 - 4，见初始化逻辑）。
         """
         if max_workers is None:
             max_workers = self.ffprobe_parallel.get()
@@ -15491,7 +15752,10 @@ class FFmpegBatchGUI:
             max_workers = 1
         if not file_paths:
             return []
+        total = len(file_paths)
+        done = 0
         successful = []
+        self.root.after(0, self._update_log_progress, f"解析{description}: 0 / {total}")
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_path = {executor.submit(self.merge_get_media_info, f): f for f in file_paths}
             for future in concurrent.futures.as_completed(future_to_path):
@@ -15501,9 +15765,13 @@ class FFmpegBatchGUI:
                     if info:
                         successful.append(f)
                     else:
-                        self._append_info_ui(f"[封装] 无法解析{description}: {os.path.basename(f)}")
+                        self.root.after(0, self._append_info_ui,
+                                       f"[封装] 无法解析{description}: {os.path.basename(f)}")
                 except Exception as e:
-                    self._append_info_ui(f"[封装] 解析{description} {os.path.basename(f)} 异常: {e}")
+                    self.root.after(0, self._append_info_ui,
+                                   f"[封装] 解析{description} {os.path.basename(f)} 异常: {e}")
+                done += 1
+                self.root.after(0, self._update_log_progress, f"解析{description}: {done} / {total}")
         return successful
     
     def _add_tracks_from_cache(self, file_paths, track_types=('audio', 'subtitle')):
@@ -15529,6 +15797,18 @@ class FFmpegBatchGUI:
                 self.merge_tracks.append(track)
                 added += 1
         return added
+
+    def _remove_placeholder_tracks(self, file_paths):
+        """删除本次拖入添加的占位轨道（按规范化路径 + _placeholder 标记）。
+        用于普通模式与画中画/串行模式统一：先占位、解析完再替换为真实轨道。"""
+        normalized = [normalize_path(f) for f in file_paths]
+        to_remove = [
+            idx for idx, t in enumerate(self.merge_tracks)
+            if normalize_path(t.file_path) in normalized
+            and t.enc_settings.get("_placeholder", False)
+        ]
+        for idx in reversed(to_remove):
+            del self.merge_tracks[idx]
 
     def merge_handle_batch_dropped(self, files):
         """
@@ -15584,11 +15864,24 @@ class FFmpegBatchGUI:
 #                 self._append_info_ui("[封装] 用户取消批量添加，请切换到串行或画中画模式重试。")
 #                 return
     
-        # 后台解析视频文件
+        # ---- 立即占位：与画中画/串行模式统一（先占位、后台解析、解析完再替换） ----
+        original_batch = self._batch_update
+        self._batch_update = False
+        try:
+            for vf in video_files:
+                track = Track(0, "video", "unknown", vf, True)
+                track.enc_settings["_placeholder"] = True
+                self.merge_tracks.append(track)
+            self.merge_update_track_list()
+            self._append_info_ui(f"[封装] 已添加 {len(video_files)} 个视频文件（正在后台解析…）")
+        finally:
+            self._batch_update = original_batch
+
+        # 后台解析视频文件，完成后弹出选择主视频对话框
         def run_in_thread():
             self._parse_files_concurrently(video_files, description="视频文件")
             self.root.after(0, self._show_main_video_selection_dialog, video_files, other_files)
-    
+
         threading.Thread(target=run_in_thread, daemon=True).start()
     
     def _show_main_video_selection_dialog(self, video_files, other_files):
@@ -15598,13 +15891,14 @@ class FFmpegBatchGUI:
         root_tk = self.root
         dialog = tk.Toplevel(root_tk)
         dialog.title("批量处理选项")
-        height = min(350 + len(video_files) * 25, 600) + 40
-        center_window(dialog, 600, height)
+        center_window(dialog, 640, 520)
         dialog.transient(root_tk)
         dialog.grab_set()
     
         has_main = bool(self.merge_video.get().strip())
-        info_text = "请选择操作：\n\n• [All] 按钮：仅添加音频（不改变主视频）\n• 点击下方视频按钮：设为主视频，其余添加音频"
+        info_text = ("请选择操作：\n\n"
+                     "• [All] 按钮：仅添加音频（不改变主视频）\n"
+                     "• 选中下方视频后点「设为主视频」或双击：设为主视频，其余添加音频")
         tk.Label(dialog, text=info_text, justify=tk.LEFT).pack(pady=10, padx=10)
     
         def all_action():
@@ -15618,6 +15912,8 @@ class FFmpegBatchGUI:
                         start_idx = 1
                     else:
                         start_idx = 0
+                    # 移除本次添加的占位轨道
+                    self._remove_placeholder_tracks(video_files)
                     # 添加除主视频外的其他视频的音频/字幕
                     self._add_tracks_from_cache(video_files[start_idx:])
                     # 处理其他文件（音频/字幕）
@@ -15636,19 +15932,39 @@ class FFmpegBatchGUI:
                             bg="#4CAF50", fg="white", width=22, wraplength=300)
         btn_all.pack(pady=5, padx=10)
     
-        # 视频选择列表
-        canvas_frame = ttk.Frame(dialog)
-        canvas_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        canvas = tk.Canvas(canvas_frame, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-    
+        # 视频选择虚拟列表（ttk.Treeview，仅渲染可见行，200+ 视频也不卡）
+        # 自定义样式：修复 Python 3.8 下 Treeview 行背景色不生效的颜色 bug
+        # 必须设置 fieldbackground 并配合 .map 选中态（照抄合并列表 / 批量列表的做法）
+        list_style = ttk.Style()
+        list_style.configure("MainSelect.Treeview", background="#f0f0f0",
+                             fieldbackground="#f0f0f0", rowheight=int(22 * self.scaling))
+        list_style.configure("MainSelect.Treeview.Heading", background="#d9d9d9")
+        list_style.map("MainSelect.Treeview",
+                       background=[('selected', '#3475b5')],
+                       foreground=[('selected', 'white')],
+                       fieldbackground=[('selected', '#3475b5')])
+
+        list_frame = ttk.Frame(dialog)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        tree = ttk.Treeview(list_frame, columns=("idx", "name"), show="headings",
+                            selectmode="browse", style="MainSelect.Treeview")
+        tree.heading("idx", text="序号")
+        tree.heading("name", text="文件名")
+        tree.column("idx", width=60, stretch=False)
+        tree.column("name", width=480, stretch=True)
+        vsb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 交替行颜色（灰色，与合并列表"其他队列"一致）：偶数 #f0f0f0 / 奇数 #e0e0e0
+        tree.tag_configure('odd', background='#f0f0f0')
+        tree.tag_configure('even', background='#e0e0e0')
+
+        for i, vf in enumerate(video_files):
+            tag = 'odd' if i % 2 == 0 else 'even'
+            tree.insert("", tk.END, iid=str(i), values=(str(i + 1), os.path.basename(vf)), tags=(tag,))
+
         def select_main_video(idx):
             def do_select():
                 self._batch_update = True
@@ -15656,6 +15972,8 @@ class FFmpegBatchGUI:
                     main = video_files[idx]
                     self.merge_video.set(normalize_path(main))
                     self._append_info_ui(f"[封装] 设置主视频为: {os.path.basename(main)}")
+                    # 移除本次添加的占位轨道
+                    self._remove_placeholder_tracks(video_files)
                     # 添加除主视频外的其他视频的音频/字幕
                     other_videos = [f for i, f in enumerate(video_files) if i != idx]
                     self._add_tracks_from_cache(other_videos)
@@ -15670,16 +15988,35 @@ class FFmpegBatchGUI:
                     self.merge_update_command_preview()
                 dialog.destroy()
             self.root.after(0, do_select)
-    
-        for i, vf in enumerate(video_files):
-            btn = tk.Button(scrollable_frame, text=f"{i+1}. {os.path.basename(vf)}",
-                            wraplength=550, anchor="w", justify=tk.LEFT,
-                            command=lambda idx=i: select_main_video(idx))
-            btn.pack(fill=tk.X, pady=2, padx=5)
-    
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        tk.Button(dialog, text="取消", command=dialog.destroy).pack(pady=10)
+
+        def on_select():
+            sel = tree.selection()
+            if not sel:
+                return
+            select_main_video(int(sel[0]))
+
+        def on_double(event):
+            sel = tree.selection()
+            if not sel:
+                return
+            select_main_video(int(sel[0]))
+
+        if video_files:
+            tree.selection_set(tree.get_children()[0])
+
+        btn_select = tk.Button(dialog, text="设为主视频", command=on_select,
+                               bg="#2196F3", fg="white", width=22)
+        btn_select.pack(pady=5, padx=10)
+        tree.bind("<Double-1>", on_double)
+
+        def cancel_action():
+            # 移除本次添加的占位轨道，恢复列表
+            self._remove_placeholder_tracks(video_files)
+            self._batch_update = False
+            self.merge_update_track_list()
+            dialog.destroy()
+
+        tk.Button(dialog, text="取消", command=cancel_action).pack(pady=10)
 
     def clear_input_output(self):
         """清空输入文件和输出目录（带确认）"""
@@ -17757,11 +18094,13 @@ class FFmpegBatchGUI:
 
 
 class EditSegmentDialog(simpledialog.Dialog):
-    """用于编辑片段的起始时间、结束时间和翻转"""
-    def __init__(self, parent, title, start, end, flip):
+    """用于编辑片段的起始时间、结束时间、翻转、变速和倒放"""
+    def __init__(self, parent, title, start, end, flip, speed="1.0", reverse=False):
         self.start = start
         self.end = end
         self.flip = flip
+        self.speed = speed
+        self.reverse = reverse
         super().__init__(parent, title=title)
 
     def body(self, master):
@@ -17782,12 +18121,22 @@ class EditSegmentDialog(simpledialog.Dialog):
                                        state="readonly", width=12)
         self.flip_combo.grid(row=2, column=1, padx=5, pady=5)
 
+        ttk.Label(master, text="变速:").grid(row=3, column=0, padx=5, pady=5, sticky="w")
+        self.speed_var = tk.StringVar(value=str(self.speed))
+        self.speed_entry = ttk.Entry(master, textvariable=self.speed_var, width=12)
+        self.speed_entry.grid(row=3, column=1, padx=5, pady=5)
+
+        self.reverse_var = tk.BooleanVar(value=self.reverse)
+        ttk.Checkbutton(master, text="倒放", variable=self.reverse_var).grid(row=4, column=1, padx=5, pady=5, sticky="w")
+
         return self.start_entry
 
     def apply(self):
         self.start = self.start_entry.get().strip()
         self.end = self.end_entry.get().strip()
         self.flip = self.flip_var.get()
+        self.speed = self.speed_var.get().strip()
+        self.reverse = self.reverse_var.get()
 
 class SegmentEditor:
     """分段拼接设置窗口"""
@@ -17845,19 +18194,35 @@ class SegmentEditor:
                                        state="readonly", width=12)
         self.flip_combo.pack(side=tk.LEFT, padx=2)
 
+        speed_label = ttk.Label(tool_frame, text="变速:")
+        speed_label.pack(side=tk.LEFT, padx=(10,0))
+        ToolTip(speed_label,
+                "此片段的播放速度倍率（1.0=原速，2.0=2倍速，0.5=半速）\n"
+                "不影响主界面「视频滤镜」中的全局变速。",
+                wraplength=300)
+        self.speed_var = tk.StringVar(value="1.0")
+        self.speed_entry = ttk.Entry(tool_frame, textvariable=self.speed_var, width=6)
+        self.speed_entry.pack(side=tk.LEFT, padx=2)
+
+        self.reverse_var = tk.BooleanVar(value=False)
+        self.reverse_check = ttk.Checkbutton(tool_frame, text="倒放", variable=self.reverse_var)
+        self.reverse_check.pack(side=tk.LEFT, padx=(2, 0))
+
         ttk.Button(tool_frame, text="添加片段", command=self.add_segment).pack(side=tk.LEFT, padx=5)
 
         # 表格
         tree_frame = ttk.Frame(left_frame)
         tree_frame.pack(fill=tk.BOTH, expand=True, pady=5)
 
-        columns = ("序号", "开始", "结束", "时长", "翻转")
+        columns = ("序号", "开始", "结束", "时长", "翻转", "倒放", "变速")
         self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=8)
         for col in columns:
             self.tree.heading(col, text=col)
             self.tree.column(col, width=100, minwidth=60)
-        self.tree.column("序号", width=100)
-        self.tree.column("翻转", width=100)
+        self.tree.column("序号", width=80)
+        self.tree.column("翻转", width=90)
+        self.tree.column("倒放", width=50)
+        self.tree.column("变速", width=60)
 
         vbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=vbar.set)
@@ -18186,7 +18551,7 @@ class SegmentEditor:
 
 
     # ---------- 片段管理核心方法（已优化浮点误差） ----------
-    def add_segment_with_time(self, start_sec, end_sec, flip="无"):
+    def add_segment_with_time(self, start_sec, end_sec, flip="无", speed="1.0", reverse=False):
         """直接使用浮点数添加片段（用于外部命令导入）"""
         if start_sec is None or end_sec is None:
             return False
@@ -18205,7 +18570,7 @@ class SegmentEditor:
 
         start_str = seconds_to_time(start_sec)
         end_str = seconds_to_time(end_sec)
-        self.segments.append({"start": start_str, "end": end_str, "flip": flip})
+        self.segments.append({"start": start_str, "end": end_str, "flip": flip, "speed": speed, "reverse": reverse})
         self.refresh_tree()
         return True
 
@@ -18263,7 +18628,9 @@ class SegmentEditor:
                         return
 
         flip_value = self.flip_combo.get()
-        self.segments.append({"start": start, "end": end, "flip": flip_value})
+        speed_value = self.speed_var.get().strip()
+        reverse_value = self.reverse_var.get()
+        self.segments.append({"start": start, "end": end, "flip": flip_value, "speed": speed_value, "reverse": reverse_value})
         self.refresh_tree()
 
     def delete_selected(self):
@@ -18309,7 +18676,9 @@ class SegmentEditor:
             end = seg["end"]
             dur = time_to_seconds(end) - time_to_seconds(start)
             dur_str = seconds_to_time(dur) if dur is not None else "?"
-            self.tree.insert("", tk.END, iid=str(i), values=(i+1, start, end, dur_str, seg["flip"]))
+            reverse_str = "是" if seg.get("reverse", False) else "否"
+            speed_str = f"{seg.get('speed', '1.0')}x"
+            self.tree.insert("", tk.END, iid=str(i), values=(i+1, start, end, dur_str, seg.get("flip", "无"), reverse_str, speed_str))
 
     # ---------- 双击编辑 ----------
     def on_tree_double_click(self, event):
@@ -18320,7 +18689,8 @@ class SegmentEditor:
         seg = self.segments[idx]
 
         dialog = EditSegmentDialog(self.window, "编辑片段",
-                                   start=seg["start"], end=seg["end"], flip=seg["flip"])
+                                   start=seg["start"], end=seg["end"], flip=seg["flip"],
+                                   speed=seg.get("speed", "1.0"), reverse=seg.get("reverse", False))
         if dialog.start is not None and dialog.end is not None:
             start_sec = time_to_seconds(dialog.start)
             end_sec = time_to_seconds(dialog.end)
@@ -18349,6 +18719,8 @@ class SegmentEditor:
             seg["start"] = dialog.start
             seg["end"] = dialog.end
             seg["flip"] = dialog.flip
+            seg["speed"] = dialog.speed
+            seg["reverse"] = dialog.reverse
             self.refresh_tree()
 
     # ---------- 外部命令导入 ----------
@@ -18420,7 +18792,7 @@ class SegmentEditor:
                 continue
     
             # 尝试添加片段（可能会检查总时长等）
-            if self.add_segment_with_time(start_sec, end_sec, flip="无"):
+            if self.add_segment_with_time(start_sec, end_sec, flip="无", speed="1.0", reverse=False):
                 parsed_count += 1
             else:
                 skipped_count += 1
