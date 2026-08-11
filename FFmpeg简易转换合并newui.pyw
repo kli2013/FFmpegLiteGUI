@@ -3,6 +3,7 @@
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
+import tkinter.font as tkFont
 import subprocess
 import os
 import threading
@@ -3528,7 +3529,7 @@ class TextWatermarkDialog(tk.Toplevel):
         self.grab_set()
         self.resizable(False, False)
 
-        width, height = 400, 500
+        width, height = 370, 500
         center_window(self, width, height)
 
         self.create_widgets()
@@ -3635,20 +3636,63 @@ class TextWatermarkDialog(tk.Toplevel):
         esh.pack(side=tk.LEFT)
         ToolTip(esh, "单次显示时长（秒）：每个循环周期内仅显示前这么多秒（enable='lt(mod(t,周期),时长)'）。")
 
+        # ---- 位置 X/Y 编辑 + 默认位置按钮（与叠加页一致的紧凑两行）----
+        # 用 live StringVar 直接绑定 text_watermark_settings 的 overlay_x/overlay_y，
+        # 预设按钮与编辑框都即时回写，无需点「确定」即可在预览中看到位置变化。
+        tw_pos = self.app.text_watermark_settings
+        self.tw_x_var = tk.StringVar(value=tw_pos.get("overlay_x", "10"))
+        self.tw_y_var = tk.StringVar(value=tw_pos.get("overlay_y", "10"))
+
+        def _tw_sync_xy(*_a):
+            tw_pos["overlay_x"] = self.tw_x_var.get().strip() or "10"
+            tw_pos["overlay_y"] = self.tw_y_var.get().strip() or "10"
+            if self.app.adv_frame and self.app.adv_frame.update_callback:
+                self.app.adv_frame.update_callback()
+
+        self.tw_x_var.trace_add("write", _tw_sync_xy)
+        self.tw_y_var.trace_add("write", _tw_sync_xy)
+
+        xy_frame = ttk.Frame(main)
+        xy_frame.grid(row=10, column=0, columnspan=5, sticky="w", pady=(10, 2))
+        x_label = ttk.Label(xy_frame, text="X位置:")
+        x_label.pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Entry(xy_frame, textvariable=self.tw_x_var, width=16).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(xy_frame, text="Y位置:").pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Entry(xy_frame, textvariable=self.tw_y_var, width=16).pack(side=tk.LEFT)
+        ToolTip(x_label, "文字水印左上角坐标，支持表达式（如 W-w-10、10、(W-w)/2）。与叠加页同义，仅 X/Y 真正生效，宽度由文字长度决定。")
+
+        presets = {
+            "左上": ("10", "10"),
+            "右上": ("W-w-10", "10"),
+            "左下": ("10", "H-h-10"),
+            "右下": ("W-w-10", "H-h-10"),
+            "居中": ("(W-w)/2", "(H-h)/2"),
+        }
+        preset_frame = ttk.Frame(main)
+        preset_frame.grid(row=11, column=0, columnspan=5, sticky="w", pady=(0, 8))
+        ttk.Label(preset_frame, text="预设位置:").pack(side=tk.LEFT, padx=(0, 4))
+        for label, (px, py) in presets.items():
+            ttk.Button(preset_frame, text=label, width=6,
+                      command=lambda x=px, y=py: (self.tw_x_var.set(x), self.tw_y_var.set(y))
+                      ).pack(side=tk.LEFT, padx=2)
+
         # ---- 位置编辑（直接在对话框内打开可视化编辑器）----
         pos_btn = ttk.Button(
             main, text="打开位置编辑器（可视化拖拽）",
             command=self._open_position_editor, width=28)
-        pos_btn.grid(row=10, column=0, columnspan=5, sticky="w", pady=10)
+        pos_btn.grid(row=12, column=0, columnspan=5, sticky="w", pady=10)
         ToolTip(
             pos_btn,
             "直接弹出可视化窗口拖拽文字水印的位置，无需关闭本窗口。\n"
-            "调整后的位置和大小会即时回写到文字水印设置，具体效果请预览后微调。",
+            "调整后的位置和大小会即时回写到文字水印设置。\n"
+            "注意：矩形框的「宽度」仅供参考——文字水印的最终渲染宽度由你输入的文字内容长度自动决定，\n"
+            "与框出来的宽度无关；因此只有「左上角坐标」和「高度(即字号)」真正生效，矩形宽度请无视。\n"
+            "具体效果请在预览中查看后再微调。",
             wraplength=400)
 
         # ---- 按钮 ----
         btn_frame = ttk.Frame(main)
-        btn_frame.grid(row=11, column=0, columnspan=5, pady=10)
+        btn_frame.grid(row=13, column=0, columnspan=5, pady=10)
         ttk.Button(btn_frame, text="确定", command=self.on_ok, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="取消", command=self.on_cancel, width=10).pack(side=tk.LEFT, padx=5)
 
@@ -3699,6 +3743,12 @@ class TextWatermarkDialog(tk.Toplevel):
             new_fs = int(self.app.text_watermark_settings.get("font_size", self.size_var.get()))
             self.size_var.set(new_fs)
         except (ValueError, TypeError):
+            pass
+        # 同步 X/Y 编辑框：可视化编辑器会把拖拽结果写回 overlay_x/overlay_y
+        try:
+            self.tw_x_var.set(str(self.app.text_watermark_settings.get("overlay_x", "10")))
+            self.tw_y_var.set(str(self.app.text_watermark_settings.get("overlay_y", "10")))
+        except Exception:
             pass
 
 class BlurFilterDialog(tk.Toplevel):
@@ -6331,6 +6381,16 @@ class FFmpegBatchGUI:
         screen_width = root.winfo_screenwidth()
         screen_height = root.winfo_screenheight()
         self.scaling = get_dpi_scaling(root)
+
+        # Treeview 行高：用真实字体 metrics 推算，避免硬编码魔法数 22。
+        # 字体 linespace 在 Windows 下已随 DPI 缩放，故无需再乘 self.scaling；
+        # 上下各留 3px 内边距（共 6px），96 DPI 下 TkDefaultFont linespace≈16 → 行高≈22，
+        # 与旧值 int(22*scaling) 在缩放 1.0 时一致，但字体变大或 DPI 升高时自动适配。
+        try:
+            _tree_font = tkFont.Font(name="TkDefaultFont", exists=True)
+            self.tree_rowheight = int(_tree_font.metrics('linespace') + 6)
+        except Exception:
+            self.tree_rowheight = int(22 * self.scaling)
 
         base_width = 1420
         base_height = 900
@@ -11368,7 +11428,7 @@ class FFmpegBatchGUI:
     
         # 自定义样式
         merge_style = ttk.Style()
-        merge_style.configure("Merge.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0", rowheight=int(22 * self.scaling))
+        merge_style.configure("Merge.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0", rowheight=self.tree_rowheight)
         merge_style.configure("Merge.Treeview.Heading", background="#d9d9d9")
 
         merge_style.map("Merge.Treeview",
@@ -15434,6 +15494,10 @@ class FFmpegBatchGUI:
             title_entry = ttk.Entry(title_row, textvariable=title_var, width=40)
             title_entry.pack(side=tk.LEFT, padx=5)
 
+            # 获取模式标志（提前到使用之前，避免 is_concat 未赋值导致 UnboundLocalError）
+            is_pip = self.pip_enabled.get()
+            is_concat = self.concat_enabled.get()
+
             # 章节标签（仅串行模式）
             chapter_label_var = tk.StringVar(value="")
             if is_concat:
@@ -15443,10 +15507,6 @@ class FFmpegBatchGUI:
                 chapter_label_var.set(track.enc_settings.get("chapter_label", ""))
                 chapter_label_entry = ttk.Entry(cl_row, textvariable=chapter_label_var, width=40)
                 chapter_label_entry.pack(side=tk.LEFT, padx=5)
-    
-            # 获取模式标志
-            is_pip = self.pip_enabled.get()
-            is_concat = self.concat_enabled.get()
 
             # ---- 音量控制（所有模式可用） ----
             volume_frame = ttk.LabelFrame(left_col, text="音量调整", padding="5")
@@ -16314,7 +16374,7 @@ class FFmpegBatchGUI:
         # 必须设置 fieldbackground 并配合 .map 选中态（照抄合并列表 / 批量列表的做法）
         list_style = ttk.Style()
         list_style.configure("MainSelect.Treeview", background="#f0f0f0",
-                             fieldbackground="#f0f0f0", rowheight=int(22 * self.scaling))
+                             fieldbackground="#f0f0f0", rowheight=self.tree_rowheight)
         list_style.configure("MainSelect.Treeview.Heading", background="#d9d9d9")
         list_style.map("MainSelect.Treeview",
                        background=[('selected', '#3475b5')],
@@ -17085,7 +17145,7 @@ class FFmpegBatchGUI:
     
         # ---- Treeview 与滚动条 ----
         extract_style = ttk.Style()
-        extract_style.configure("Extract.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0", rowheight=int(22 * self.scaling))
+        extract_style.configure("Extract.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0", rowheight=self.tree_rowheight)
         extract_style.configure("Extract.Treeview.Heading", background="#d9d9d9")
 
         extract_style.map("Extract.Treeview",
@@ -18474,7 +18534,7 @@ class FFmpegBatchGUI:
         ttk.Entry(suffix_frame, textvariable=self.custom_output_name, width=30).pack(side=tk.LEFT, padx=5)
         ttk.Label(suffix_frame, text="输出容器:").pack(side=tk.LEFT, padx=(20,0))
         container_combo = ttk.Combobox(suffix_frame, textvariable=self.output_container,
-                                       values=["mp4", "mkv", "mov", "avi", "webm","gif","webp"], state="readonly", width=6)
+                                       values=["mp4", "mkv", "mov", "avi", "webm","gif","webp","jp2","mj2"], state="readonly", width=6)
         container_combo.pack(side=tk.LEFT, padx=5)
     
         # 预设框架
@@ -18631,7 +18691,7 @@ class FFmpegBatchGUI:
         list_container.pack(fill=tk.BOTH, expand=True, padx=(5,0), pady=(0, 0))
     
         Batch_style = ttk.Style()
-        Batch_style.configure("Batch.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0", rowheight=int(22 * self.scaling))
+        Batch_style.configure("Batch.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0", rowheight=self.tree_rowheight)
         Batch_style.configure("Batch.Treeview.Heading", background="#d9d9d9")
 
         Batch_style.map("Batch.Treeview",
