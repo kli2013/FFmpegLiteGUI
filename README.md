@@ -9,6 +9,9 @@
 **功能定位**：  
 这是一个**多功能 FFmpeg 图形界面**，不仅覆盖了 HandBrake 约 90% 的转码与滤镜功能，还融合了 **mkvtoolnix 的封装能力**，并在此基础上实现了**轻量级非线性编辑**功能。
 
+本程序只是一个外壳GUI,需要FFmpeg本体 [[FFmpeg下载地址](https://github.com/BtbN/FFmpeg-Builds/releases)],推荐xxx-win64-gpl-shared 版,这个共享版解压后的总体大小比较小, 程序用了FFmpeg三件套, 如果每个都下载独立版, 那么加起来会大2倍.    
+  下载后解压到程序目录或者子目录,具体配置方法请看[[配置FFmpeg](docs/setupFFmpeg.md)]
+  
 ---
 
 ### 核心能力
