@@ -426,7 +426,7 @@ jobs:
             - 包含 **FFmpeg简易转换合并newui** (文件夹便携版)
             - 内置 **水印轨迹编排器 多轨道** 可执行文件
             - 同时提供 **forwin7_orX86** 兼容版本 (Python 3.8.10 + x86)
-            - 另含 **FFmpegLiteGUIMulti** 多语言版 (中/英) 文件夹便携版，含 x64 最新 Python 与 forwin7_orX86 (Python 3.8.10 + x86) 两种构建，不打包轨迹编辑子程序
+            - Also includes the **FFmpegLiteGUIMulti** multilingual (Chinese/English) portable folder build — available as both x64 (latest Python) and forwin7_orX86 (Python 3.8.10 + x86) variants; the trajectory-editing sub-tool is not bundled.
           files: upload_files/*.zip
           draft: false
           prerelease: false
