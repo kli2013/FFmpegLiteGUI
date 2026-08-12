@@ -6493,6 +6493,7 @@ class FFmpegBatchGUI:
         self._merge_preview_after_id = None   # 合并命令预览防抖 ID
         
         self._clipboard_filter_params = None   # 存储复制的参数字典
+        self._clipboard_va_filter = None       # V→A 专用：视频截取/变速/倒放快照（映射到音频键名）
 
         self._global_temp_files = []
 
@@ -6527,6 +6528,11 @@ class FFmpegBatchGUI:
 
         self.segment_enabled = tk.BooleanVar(value=False)
         self.segments = []
+
+        # 音频独立截取（不分段）：仅用于分段拼接模式下独立裁剪音频
+        self.audio_trim_enabled = False
+        self.audio_trim_start = ""
+        self.audio_trim_end = ""
 
         # ---------- 水印设置 ----------
         self.watermark_settings = {
@@ -7615,7 +7621,9 @@ class FFmpegBatchGUI:
     
         # 变速和倒放已改为逐段独立控制，不再读取全局设置
         # 见下方 per-segment loop 中的 seg.get("speed") / seg.get("reverse")
-    
+
+        audio_trim_enabled = settings.get("audio_trim_enabled", False)
+
         for i, seg in enumerate(segments):
             start = time_to_seconds(seg["start"])
             end = time_to_seconds(seg["end"])
@@ -7654,8 +7662,8 @@ class FFmpegBatchGUI:
                     seg_video_chain += ",reverse"
                 v_filters.append(f"[0:v]{seg_video_chain}[v{i}]")
     
-            # 音频trim（除非完全禁用音频 且 源文件有音频）
-            if not disable_audio and has_input_audio:
+            # 音频trim（除非完全禁用音频 且 源文件有音频；独立截取模式在循环后单独处理）
+            if not disable_audio and has_input_audio and not audio_trim_enabled:
                 audio_filter_parts = [
                     f"atrim=start={start}:end={end}",
                     "asetpts=PTS-STARTPTS"
@@ -7669,7 +7677,73 @@ class FFmpegBatchGUI:
                 if seg_reverse:
                     audio_filter_parts.append("areverse")
                 a_filters.append(f"[0:a]{','.join(audio_filter_parts)}[a{i}]")
-    
+
+        # 音频独立截取：不分段，单段 atrim（独立于视频片段）
+        if not disable_audio and has_input_audio and audio_trim_enabled:
+            a_start = time_to_seconds(settings.get("audio_trim_start", "0") or "0")
+            a_end_str = settings.get("audio_trim_end", "").strip()
+            a_end = time_to_seconds(a_end_str) if a_end_str else None
+
+            audio_trim_parts = []
+            if a_start is not None and a_end is not None and a_end > a_start:
+                audio_trim_parts.append(f"atrim=start={a_start}:end={a_end}")
+            elif a_start is not None and a_start > 0:
+                audio_trim_parts.append(f"atrim=start={a_start}")
+            else:
+                audio_trim_parts.append("anull")
+            audio_trim_parts.append("asetpts=PTS-STARTPTS")
+
+            # 全局音频滤镜（音量 / 变速 / 倒放 / EQ / 降噪 / 响度 / 声道 / 淡入淡出）
+            speed_factor = float(settings.get("audio_speed_factor", "1.0"))
+            if settings.get("audio_speed_enabled", False) and speed_factor != 1.0:
+                atempo_chain = build_atempo_chain(speed_factor)
+                if atempo_chain:
+                    audio_trim_parts.append(atempo_chain)
+            volume_val = settings.get("volume", 1.0)
+            if settings.get("volume_enabled", False) and volume_val != 1.0:
+                audio_trim_parts.append(f"volume={volume_val:.2f}")
+            if settings.get("audio_reverse", False):
+                audio_trim_parts.append("areverse")
+            if settings.get("denoise_enabled", False):
+                audio_trim_parts.append("afftdn=nr=12:nf=-30")
+            if settings.get("loudnorm_enabled", False):
+                audio_trim_parts.append("loudnorm=I=-23:LRA=7:TP=-2")
+            mode = settings.get("channel_mode", "stereo")
+            if mode == "mono":
+                audio_trim_parts.append("pan=mono|c0=0.5*c0+0.5*c1")
+            elif mode == "left":
+                audio_trim_parts.append("pan=mono|c0=c0")
+            elif mode == "right":
+                audio_trim_parts.append("pan=mono|c0=c1")
+            elif mode == "swap":
+                audio_trim_parts.append("pan=stereo|c0=c1|c1=c0")
+            if settings.get("eq_enabled", False):
+                try:
+                    eq_low = float(settings.get("eq_low", 0) or 0)
+                except (ValueError, TypeError):
+                    eq_low = 0.0
+                try:
+                    eq_mid = float(settings.get("eq_mid", 0) or 0)
+                except (ValueError, TypeError):
+                    eq_mid = 0.0
+                try:
+                    eq_high = float(settings.get("eq_high", 0) or 0)
+                except (ValueError, TypeError):
+                    eq_high = 0.0
+                if eq_low != 0.0 or eq_mid != 0.0 or eq_high != 0.0:
+                    audio_trim_parts.append(f"equalizer=f=100:width=200:g={eq_low},"
+                                            f"equalizer=f=1000:width=1000:g={eq_mid},"
+                                            f"equalizer=f=8000:width=4000:g={eq_high}")
+            if settings.get("fade_enabled", False):
+                fi = settings.get("fade_in", "").strip()
+                if fi:
+                    audio_trim_parts.append(f"afade=t=in:d={fi}")
+                fo = settings.get("fade_out", "").strip()
+                if fo:
+                    audio_trim_parts.append(f"afade=t=out:st={a_end - float(fo) if a_end else 0}:d={fo}")
+            # 单段音频直接输出为 [aout]（无需 concat）
+            a_filters.append(f"[0:a]{','.join(audio_trim_parts)}[aout]")
+
         filter_parts = []
     
         # 视频处理
@@ -7770,11 +7844,12 @@ class FFmpegBatchGUI:
             else:
                 map_v = "[vout]"
     
-        # 音频 concat（如果存在音频片段）
+        # 音频 concat（如果存在音频片段；独立截取模式只有 [aout] 无需 concat）
         if a_filters:
             filter_parts.extend(a_filters)
-            a_concat = f"[{']['.join(f'a{i}' for i in range(n))}]concat=n={n}:v=0:a=1[aout]"
-            filter_parts.append(a_concat)
+            if not audio_trim_enabled:
+                a_concat = f"[{']['.join(f'a{i}' for i in range(n))}]concat=n={n}:v=0:a=1[aout]"
+                filter_parts.append(a_concat)
     
         all_filters = ";".join(filter_parts)
         if all_filters:
@@ -9313,6 +9388,10 @@ class FFmpegBatchGUI:
         settings["pip_enabled"] = self.pip_enabled.get()
         settings["segment_enabled"] = self.segment_enabled.get()
         settings["segments"] = copy.deepcopy(self.segments)
+        # 音频独立截取（不分段）
+        settings["audio_trim_enabled"] = self.audio_trim_enabled
+        settings["audio_trim_start"] = self.audio_trim_start
+        settings["audio_trim_end"] = self.audio_trim_end
         # 说明：watermark / text_watermark 是「命令生成」的必需输入，必须保留在
         # settings 中；但 load_settings_into_ui 不恢复它们（水印由独立「水印预设」
         # 管理，主预设加载不覆盖水印设置）。二者职责分离，切勿因"主预设不保存
@@ -9348,6 +9427,12 @@ class FFmpegBatchGUI:
             self.trim_frame.set_settings(settings)
             self.adv_frame.set_settings(settings)
             self.pip_enabled.set(settings.get("pip_enabled", False))
+            self.segment_enabled.set(settings.get("segment_enabled", False))
+            self.segments = copy.deepcopy(settings.get("segments", []))
+            # 音频独立截取
+            self.audio_trim_enabled = settings.get("audio_trim_enabled", False)
+            self.audio_trim_start = settings.get("audio_trim_start", "")
+            self.audio_trim_end = settings.get("audio_trim_end", "")
 #             # 恢复水印设置
 #             if "watermark" in settings:
 #                 self.watermark_settings = copy.deepcopy(settings["watermark"])
@@ -10395,9 +10480,21 @@ class FFmpegBatchGUI:
         import copy
         initial_segments = copy.deepcopy(self.segments)
         editor = SegmentEditor(self.root, initial_segments, self)
+        # 恢复已保存的音频截取设置
+        editor.audio_trim_enabled = self.audio_trim_enabled
+        editor.audio_trim_start = self.audio_trim_start
+        editor.audio_trim_end = self.audio_trim_end
+        editor.audio_trim_enabled_var.set(self.audio_trim_enabled)
+        editor.audio_trim_start_var.set(self.audio_trim_start)
+        editor.audio_trim_end_var.set(self.audio_trim_end)
+        editor._on_audio_trim_toggle()
         self.root.wait_window(editor.window)
         if editor.result is not None:
             self.segments = editor.result
+            # 保存音频独立截取设置
+            self.audio_trim_enabled = editor.audio_trim_enabled
+            self.audio_trim_start = editor.audio_trim_start
+            self.audio_trim_end = editor.audio_trim_end
             self.update_command_preview()
 
 
@@ -11094,10 +11191,33 @@ class FFmpegBatchGUI:
                     return
                 # 打开编辑器，传入 seg_list 和 seg_enabled_var 的引用
                 editor = SegmentEditor(win, seg_list, self)  # 注意：这里的 self 是主程序
+                # 注入任务专用输入文件（自动补全结束时间等需要）
+                editor._custom_input_file = task.input
+                # 恢复已保存的音频截取设置
+                editor.audio_trim_enabled = task.settings.get("audio_trim_enabled", False)
+                editor.audio_trim_start = task.settings.get("audio_trim_start", "")
+                editor.audio_trim_end = task.settings.get("audio_trim_end", "")
+                editor.audio_trim_enabled_var.set(editor.audio_trim_enabled)
+                editor.audio_trim_start_var.set(editor.audio_trim_start)
+                editor.audio_trim_end_var.set(editor.audio_trim_end)
+                editor._on_audio_trim_toggle()
                 self.root.wait_window(editor.window)
                 if editor.result is not None:
                     seg_list.clear()
                     seg_list.extend(editor.result)
+                    # 保存音频独立截取设置到任务
+                    task.settings["audio_trim_enabled"] = editor.audio_trim_enabled
+                    task.settings["audio_trim_start"] = editor.audio_trim_start
+                    task.settings["audio_trim_end"] = editor.audio_trim_end
+                    # 同步更新段到 task.settings（因为 save_changes 最终会覆盖，但保证中间态正确）
+                    if "segments" in task.settings:
+                        task.settings["segments"] = copy.deepcopy(seg_list)
+                    # 立即重新生成命令（否则 task.cmd 仍是旧的）
+                    try:
+                        new_cmd = self.generate_ffmpeg_command(task.input, task.output, task.settings, task)
+                        task.cmd = new_cmd
+                    except ValueError:
+                        pass  # 生成失败时保留原命令
                     # 更新预览
                     update_preview()
             
@@ -11250,6 +11370,10 @@ class FFmpegBatchGUI:
 
                 new_settings["segment_enabled"] = seg_enabled_var.get()
                 new_settings["segments"] = copy.deepcopy(seg_list)
+                # 音频独立截取（从 task.settings 带入预览）
+                new_settings["audio_trim_enabled"] = task.settings.get("audio_trim_enabled", False)
+                new_settings["audio_trim_start"] = task.settings.get("audio_trim_start", "")
+                new_settings["audio_trim_end"] = task.settings.get("audio_trim_end", "")
               #  print(f"[edit_task update_preview] 获取到 enhance = {new_settings['enhance']}")
                 try:
                     new_cmd_list = self.generate_ffmpeg_command(task.input, new_out, new_settings, preview=True)
@@ -11293,6 +11417,7 @@ class FFmpegBatchGUI:
             filt_frame.hflip.trace_add("write", update_preview)
             filt_frame.speed_enabled.trace_add("write", update_preview)
             filt_frame.speed_factor.trace_add("write", update_preview)
+            filt_frame.reverse_enabled.trace_add("write", update_preview)
             filt_frame.deinterlace_filter.trace_add("write", update_preview)
             filt_frame.pix_fmt_enabled.trace_add("write", update_preview)
             filt_frame.pix_fmt.trace_add("write", update_preview)
@@ -11304,6 +11429,9 @@ class FFmpegBatchGUI:
             audio_frame.audio_samplerate.trace_add("write", update_preview)
             audio_frame.only_audio.trace_add("write", update_preview)
             audio_frame.audio_format.trace_add("write", update_preview)
+            audio_frame.audio_speed_enabled.trace_add("write", update_preview)
+            audio_frame.audio_speed_factor.trace_add("write", update_preview)
+            audio_frame.audio_reverse.trace_add("write", update_preview)
 
 
             trim_frame.trim_enabled.trace_add("write", update_preview)
@@ -11349,6 +11477,10 @@ class FFmpegBatchGUI:
 
                 new_settings["segment_enabled"] = seg_enabled_var.get()
                 new_settings["segments"] = copy.deepcopy(seg_list)
+                # 音频独立截取（由 SegmentEditor 写入 task.settings，需保留到 new_settings）
+                new_settings["audio_trim_enabled"] = task.settings.get("audio_trim_enabled", False)
+                new_settings["audio_trim_start"] = task.settings.get("audio_trim_start", "")
+                new_settings["audio_trim_end"] = task.settings.get("audio_trim_end", "")
                 try:
                     new_cmd_list = self.generate_ffmpeg_command(task.input, new_output, new_settings, task)
                 except ValueError as e:
@@ -11735,6 +11867,18 @@ class FFmpegBatchGUI:
             menu.add_command(label="粘贴滤镜设置", state="disabled")
         menu.add_command(label="还原滤镜设置", command=self._reset_filter_settings)
         menu.add_separator()
+        # V→A 专用：把视频轨的截取/变速/倒放一次性应用到音频轨（粘贴后可自由取消）
+        if self._has_selected_video_track():
+            menu.add_command(label="复制 截取/变速/倒放 (V→A)", command=self._copy_va_filter_from_selected)
+        else:
+            menu.add_command(label="复制 截取/变速/倒放 (V→A)", state="disabled")
+        if self._clipboard_va_filter is not None:
+            menu.add_command(label="粘贴 截取/变速/倒放 (V→A)", command=self._paste_va_filter_to_selected)
+        else:
+            menu.add_command(label="粘贴 截取/变速/倒放 (V→A)", state="disabled")
+        # 批量：选中同源音频轨（或对应视频轨）各自套用对应视频轨的截取/变速/倒放（越界自动钳制）
+        menu.add_command(label="同源音频批量套用同源视频 T S R (V → A)", command=self._batch_apply_src_video_to_audio)
+        menu.add_separator()
         menu.add_command(label="启用/禁用", command=self.merge_toggle_selected)
         menu.add_command(label="编辑轨道", command=self.merge_edit_selected)
         menu.add_command(label="预览轨道", command=self.merge_preview_selected)
@@ -11838,6 +11982,219 @@ class FFmpegBatchGUI:
             self.merge_update_command_preview()
         else:
             self._append_info_ui("没有可应用的轨道（类型不匹配或已跳过）")
+
+    def _has_selected_video_track(self):
+        """选中轨道中是否存在视频轨道（V→A 复制菜单启用判断）"""
+        for iid in self.merge_tree.selection():
+            idx = int(iid.split('_')[1])
+            if idx < len(self.merge_tracks) and self.merge_tracks[idx].type == "video":
+                return True
+        return False
+
+    def _copy_va_filter_from_selected(self):
+        """从选中的第一个视频轨道复制「截取/变速/倒放」到 V→A 专用剪贴板。
+
+        只快照三组参数（映射到音频键名），不动其它滤镜；粘贴后音频仍可自由修改。
+        """
+        selected = self.merge_tree.selection()
+        if not selected:
+            return
+        src = None
+        for iid in selected:
+            idx = int(iid.split('_')[1])
+            if idx < len(self.merge_tracks) and self.merge_tracks[idx].type == "video":
+                src = self.merge_tracks[idx]
+                break
+        if src is None:
+            self._append_info_ui("请先选择视频轨道再复制 (V→A)")
+            return
+        es = src.enc_settings
+        self._clipboard_va_filter = {
+            "trim_enabled": es.get("trim_enabled", False),
+            "trim_start": es.get("trim_start", ""),
+            "trim_end": es.get("trim_end", ""),
+            "precise_trim": es.get("precise_trim", False),
+            "speed_enabled": es.get("speed_enabled", False),
+            "speed_factor": es.get("speed_factor", "1.0"),
+            "reverse_enabled": es.get("reverse_enabled", False),
+        }
+        self._append_info_ui(f"已复制视频截取/变速/倒放 (V→A): {os.path.basename(src.file_path)}")
+
+    def _paste_va_filter_to_selected(self):
+        """把 V→A 剪贴板粘贴到选中的音频轨道。
+
+        写入明确值（等价于用户自己重新设置一次截取/变速/倒放），粘贴后可自由取消。
+        安全保护：音频源时长小于视频截取时间点时先告警，由用户决定是否仍要粘贴。
+        """
+        if self._clipboard_va_filter is None:
+            return
+        selected = self.merge_tree.selection()
+        if not selected:
+            messagebox.showinfo("提示", "请先选择要应用的目标音频轨道")
+            return
+        clip = self._clipboard_va_filter
+
+        # —— 安全保护：时长越界告警（一次确认，确定则全部粘贴，取消则中止）——
+        if clip.get("trim_enabled"):
+            bad = []
+            for iid in selected:
+                idx = int(iid.split('_')[1])
+                if idx >= len(self.merge_tracks):
+                    continue
+                t = self.merge_tracks[idx]
+                if t.type != "audio":
+                    continue
+                dur = self._get_media_duration(t.file_path)
+                if dur is None:
+                    continue
+                try:
+                    start = time_to_seconds(clip.get("trim_start", "").strip()) if clip.get("trim_start") else 0.0
+                    end = time_to_seconds(clip.get("trim_end", "").strip()) if clip.get("trim_end") else None
+                except Exception:
+                    start, end = 0.0, None
+                if end is not None and end > dur:
+                    bad.append((os.path.basename(t.file_path), dur, end))
+                elif start > dur:
+                    bad.append((os.path.basename(t.file_path), dur, start))
+            if bad:
+                fname, dur, tsec = bad[0]
+                if not messagebox.askyesno(
+                    "时长超出告警",
+                    f"音频轨 {fname} 的源时长只有 {dur:.1f} 秒，\n"
+                    f"而视频截取时间点为 {tsec:.1f} 秒，超出音频时长，\n"
+                    f"粘贴后 atrim 可能报错或产生静音。\n\n仍要粘贴吗？"):
+                    self._append_info_ui("已取消粘贴 (V→A)（音频时长不足）")
+                    return
+
+        applied_count = 0
+        for iid in selected:
+            idx = int(iid.split('_')[1])
+            if idx >= len(self.merge_tracks):
+                continue
+            track = self.merge_tracks[idx]
+            if track.type != "audio":
+                self._append_info_ui(f"跳过 {track.type} 轨道（仅音频轨可粘贴 V→A）")
+                continue
+            es = track.enc_settings
+            # 写明确值：等价于用户手动重新设置，未勾选也显式写 False，可自由取消
+            es["trim_enabled"] = clip.get("trim_enabled", False)
+            es["trim_start"] = clip.get("trim_start", "")
+            es["trim_end"] = clip.get("trim_end", "")
+            es["precise_trim"] = clip.get("precise_trim", False)
+            es["audio_speed_enabled"] = clip.get("speed_enabled", False)
+            es["audio_speed_factor"] = clip.get("speed_factor", "1.0")
+            es["audio_reverse"] = clip.get("reverse_enabled", False)
+            applied_count += 1
+
+        if applied_count:
+            self._append_info_ui(f"已将视频截取/变速/倒放应用到 {applied_count} 个音频轨道（可自由取消）")
+            self.merge_update_track_list()
+            self.merge_update_command_preview()
+        else:
+            self._append_info_ui("没有可应用的音频轨道")
+
+    def _find_src_video_track(self, audio_track):
+        """返回与音频轨同源（file_path 相同）的启用视频轨；没有则返回 None。
+
+        仅在「同源音频轨」（拖入视频文件时选添加音频的轨道）才有对应视频轨；
+        外部单独拖入的纯音频文件无对应视频轨。
+        """
+        if audio_track.type != "audio":
+            return None
+        for t in self.merge_tracks:
+            if t.type == "video" and t.enabled and t.file_path == audio_track.file_path:
+                return t
+        return None
+
+    def _batch_apply_src_video_to_audio(self):
+        """批量：把选中的同源音频轨各自套用对应视频轨的截取/变速/倒放。
+
+        仅作用于当前选中的轨道（选中音频轨取其同源视频；选中视频轨取其同源音频），
+        不影响其他未选中的轨道。写入明确值（等价于用户手动重新设置，可自由取消）。
+        安全保护：视频截取结束时间超出音频源时长时，自动钳制到音频时长，
+        结束后一次性汇总提示被钳制的轨道（不逐条弹窗）。
+        """
+        selected = self.merge_tree.selection()
+        if not selected:
+            messagebox.showinfo("提示", "请先选择要套用的同源音频轨（或对应视频轨）")
+            return
+        pairs = []
+        seen = set()
+        for iid in selected:
+            idx = int(iid.split('_')[1])
+            if idx >= len(self.merge_tracks):
+                continue
+            t = self.merge_tracks[idx]
+            if t.type == "audio":
+                src = self._find_src_video_track(t)
+                if src is not None and id(t) not in seen:
+                    pairs.append((t, src)); seen.add(id(t))
+            elif t.type == "video":
+                # 选中视频轨时，套用其同源（同 file_path）音频轨
+                for at in self.merge_tracks:
+                    if at.type == "audio" and at.file_path == t.file_path and id(at) not in seen:
+                        pairs.append((at, t)); seen.add(id(at))
+        if not pairs:
+            self._append_info_ui("所选轨道中无可套用的同源音频轨（外部音频轨请用右键『复制/粘贴 截取、变速、倒放 (V→A)』）")
+            return
+
+        clamped = []
+        for a, s in pairs:
+            ss = s.enc_settings
+            trim_enabled = ss.get("trim_enabled", False)
+            trim_start = ss.get("trim_start", "")
+            trim_end = ss.get("trim_end", "")
+            precise_trim = ss.get("precise_trim", False)
+            speed_enabled = ss.get("speed_enabled", False)
+            speed_factor = ss.get("speed_factor", "1.0")
+            reverse_enabled = ss.get("reverse_enabled", False)
+
+            # —— 越界钳制（仅处理 end 超出音频源时长的情况）——
+            if trim_enabled:
+                dur = self._get_media_duration(a.file_path)
+                if dur is not None:
+                    try:
+                        end = time_to_seconds(trim_end.strip()) if trim_end else None
+                        st = time_to_seconds(trim_start.strip()) if trim_start else 0.0
+                    except Exception:
+                        end, st = None, 0.0
+                    if end is not None and end > dur:
+                        new_end = dur
+                        new_start = "0" if st >= new_end else trim_start
+                        a.enc_settings.update({
+                            "trim_enabled": True,
+                            "trim_start": new_start,
+                            "trim_end": f"{new_end:.3f}",
+                            "precise_trim": precise_trim,
+                            "audio_speed_enabled": speed_enabled,
+                            "audio_speed_factor": str(speed_factor),
+                            "audio_reverse": reverse_enabled,
+                        })
+                        clamped.append((os.path.basename(a.file_path), end, dur))
+                        continue
+
+            # 正常套用（写明确值，可自由取消）
+            a.enc_settings.update({
+                "trim_enabled": trim_enabled,
+                "trim_start": trim_start,
+                "trim_end": trim_end,
+                "precise_trim": precise_trim,
+                "audio_speed_enabled": speed_enabled,
+                "audio_speed_factor": str(speed_factor),
+                "audio_reverse": reverse_enabled,
+            })
+
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+        if clamped:
+            lines = "\n".join(f"• {name}：原 {e:.1f}s → 钳制到 {d:.1f}s" for name, e, d in clamped)
+            messagebox.showinfo(
+                "批量套用完成（部分已钳制）",
+                f"已将 {len(pairs)} 个同源音频轨套用对应视频轨的截取/变速/倒放。\n"
+                f"其中 {len(clamped)} 个音频轨截取结束时间超出源时长，已自动钳制到音频时长：\n\n{lines}")
+            self._append_info_ui(f"批量同源套用完成：{len(pairs)} 个，其中 {len(clamped)} 个越界已钳制")
+        else:
+            self._append_info_ui(f"{len(pairs)} 个音频轨已套用同源视频（截取/变速/倒放，可自由取消）")
 
     def _reset_filter_settings(self):
         """将选中的轨道滤镜设置重置为默认状态（清空所有滤镜）"""
@@ -15395,7 +15752,7 @@ class FFmpegBatchGUI:
         track = self.merge_tracks[track_idx]
         with self.SafeToplevel(self.root) as win:
             win.title(f"音频轨道设置 - {track.codec}")
-            center_window(win, 880, 540)
+            center_window(win, 880, 550)
             win.transient(self.root)
     
             main_frame = ttk.Frame(win, padding="10")
@@ -15494,7 +15851,7 @@ class FFmpegBatchGUI:
             title_entry = ttk.Entry(title_row, textvariable=title_var, width=40)
             title_entry.pack(side=tk.LEFT, padx=5)
 
-            # 获取模式标志（提前到使用之前，避免 is_concat 未赋值导致 UnboundLocalError）
+            # 获取模式标志
             is_pip = self.pip_enabled.get()
             is_concat = self.concat_enabled.get()
 
@@ -15510,16 +15867,17 @@ class FFmpegBatchGUI:
 
             # ---- 音量控制（所有模式可用） ----
             volume_frame = ttk.LabelFrame(left_col, text="音量调整", padding="5")
-            volume_frame.pack(fill=tk.X, pady=5)
+            volume_frame.pack(fill=tk.X, pady=(5,0))
 
             vol_enabled_var = tk.BooleanVar(value=track.enc_settings.get("volume_enabled", False))
             vol_value_var = tk.DoubleVar(value=track.enc_settings.get("volume", 1.0))
 
-            vol_check = ttk.Checkbutton(volume_frame, text="启用音量调整", variable=vol_enabled_var)
-            vol_check.pack(anchor=tk.W, pady=(0,5))
-
-            vol_control_frame = ttk.Frame(volume_frame)
-            vol_control_frame.pack(fill=tk.X)
+            vol_row = ttk.Frame(volume_frame)
+            vol_row.pack(fill=tk.X, pady=(0,5))
+            vol_check = ttk.Checkbutton(vol_row, text="启用音量调整", variable=vol_enabled_var)
+            vol_check.pack(side=tk.LEFT)
+            vol_control_frame = ttk.Frame(vol_row)
+            vol_control_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10,0))
 
             ttk.Label(vol_control_frame, text="倍数:").pack(side=tk.LEFT)
             vol_slider = ttk.Scale(vol_control_frame, from_=0.1, to=3.0, variable=vol_value_var,
@@ -15534,6 +15892,73 @@ class FFmpegBatchGUI:
                 vol_slider.config(state=state)
             vol_enabled_var.trace_add("write", on_vol_enabled)
             on_vol_enabled()
+
+            # ---- 套用同源视频轨（V→A）：同源音频轨一键套用对应视频轨截取/变速/倒放（独立一行，不嵌套音量块） ----
+            src_video = self._find_src_video_track(track)
+            apply_row = ttk.Frame(left_col)
+            apply_row.pack(fill=tk.X, pady=(8,2))
+            if src_video is not None:
+                def apply_src_video_to_this():
+                    s = self._find_src_video_track(track)
+                    if s is None:
+                        return
+                    ss = s.enc_settings
+                    trim_enabled = ss.get("trim_enabled", False)
+                    trim_start = ss.get("trim_start", "")
+                    trim_end = ss.get("trim_end", "")
+                    precise_trim = ss.get("precise_trim", False)
+                    speed_enabled = ss.get("speed_enabled", False)
+                    speed_factor = ss.get("speed_factor", "1.0")
+                    reverse_enabled = ss.get("reverse_enabled", False)
+                    # 单条越界保护：弹窗问是否仍套用
+                    if trim_enabled:
+                        dur = self._get_media_duration(track.file_path)
+                        if dur is not None:
+                            try:
+                                end = time_to_seconds(trim_end.strip()) if trim_end else None
+                                start = time_to_seconds(trim_start.strip()) if trim_start else 0.0
+                            except Exception:
+                                end, start = None, 0.0
+                            over = end if (end is not None and end > dur) else (start if start > dur else None)
+                            if over is not None:
+                                if not messagebox.askyesno(
+                                    "时长超出告警",
+                                    f"音频轨源时长只有 {dur:.1f} 秒，\n"
+                                    f"而视频截取时间点为 {over:.1f} 秒，超出音频时长，\n"
+                                    f"套用后 atrim 可能报错或产生静音。\n\n仍要套用吗？"):
+                                    self._append_info_ui("已取消套用同源视频轨（音频时长不足）")
+                                    return
+                    # 写局部变量（对话框同步显示）
+                    trim_enabled_var.set(trim_enabled)
+                    trim_start_var.set(trim_start)
+                    trim_end_var.set(trim_end)
+                    precise_trim_var.set(precise_trim)
+                    speed_enabled_var.set(speed_enabled)
+                    speed_factor_var.set(str(speed_factor))
+                    audio_reverse_var.set(reverse_enabled)
+                    # 写回 track.enc_settings（供预览与保存）
+                    track.enc_settings.update({
+                        "trim_enabled": trim_enabled,
+                        "trim_start": trim_start,
+                        "trim_end": trim_end,
+                        "precise_trim": precise_trim,
+                        "audio_speed_enabled": speed_enabled,
+                        "audio_speed_factor": str(speed_factor),
+                        "audio_reverse": reverse_enabled,
+                    })
+                    self._append_info_ui(f"已套用同源视频轨 {os.path.basename(s.file_path)} 的截取/变速/倒放（可自由取消）")
+                    self.merge_update_track_list()
+                    self.merge_update_command_preview()
+
+                btn_apply_src = ttk.Button(apply_row, text="套用同源视频轨截取、变速、倒放(v→a)", command=apply_src_video_to_this)
+                btn_apply_src.pack(side=tk.LEFT)
+                ToolTip(btn_apply_src,
+                        "把来源相同的视频轨的截取/变速/倒放一键套用到本音频轨（写明确值，可自由取消）",
+                        wraplength=420)
+            else:
+                ttk.Label(apply_row,
+                          text="（本音频来自外部文件，无同源视频轨，请用右键『复制/粘贴 截取/变速/倒放 (V→A)』）",
+                          foreground="gray").pack(side=tk.LEFT)
 
             # ---- 音频混合（仅普通封装模式可用） ----
             if not is_pip and not is_concat:
@@ -15620,7 +16045,7 @@ class FFmpegBatchGUI:
 
             # ---- 截取设置 ----
             trim_frame = ttk.LabelFrame(main_frame, text="音频截取（精确到毫秒）", padding="5")
-            trim_frame.pack(fill=tk.X, pady=5)
+            trim_frame.pack(fill=tk.X, pady=(0,5))
     
             trim_enabled_var = tk.BooleanVar(value=track.enc_settings.get("trim_enabled", False))
             chk = ttk.Checkbutton(trim_frame, text="启用截取", variable=trim_enabled_var)
@@ -18954,6 +19379,14 @@ class SegmentEditor:
         self.segments = copy.deepcopy(segments)  # 深拷贝，独立修改
         self.result = None      # 返回结果
 
+        # 音频独立截取（不分段）：起止时间 + 开关
+        self.audio_trim_enabled = False
+        self.audio_trim_start = "0"
+        self.audio_trim_end = ""
+
+        # 自定义输入文件路径（批量队列等场景注入任务文件，否则用主界面 input_file）
+        self._custom_input_file = None
+
         self.window = tk.Toplevel(parent)
         self.window.title("分段拼接设置")
         self.window.transient(parent)
@@ -19076,6 +19509,42 @@ class SegmentEditor:
         cmd_btn_frame.pack(fill=tk.X, pady=2)
         ttk.Button(cmd_btn_frame, text="解析并导入所有片段", command=self.import_from_commands).pack(side=tk.LEFT, padx=2)
         ttk.Button(cmd_btn_frame, text="清空输入", command=lambda: self.cmd_input.delete(1.0, tk.END)).pack(side=tk.LEFT, padx=2)
+
+        # ---- 音频独立截取（不分段） ----
+        audio_trim_frame = ttk.LabelFrame(main, text="音频独立截取（不分段）", padding="8")
+        audio_trim_frame.pack(fill=tk.X, pady=5)
+
+        # 启用复选框 + 总时长参考
+        at_row0 = ttk.Frame(audio_trim_frame)
+        at_row0.pack(fill=tk.X, pady=(0, 3))
+        self.audio_trim_enabled_var = tk.BooleanVar(value=self.audio_trim_enabled)
+        at_chk = ttk.Checkbutton(at_row0, text="启用音频独立截取", variable=self.audio_trim_enabled_var,
+                                  command=self._on_audio_trim_toggle)
+        at_chk.pack(side=tk.LEFT)
+        self.segment_total_label = ttk.Label(at_row0, text="", foreground="blue")
+        self.segment_total_label.pack(side=tk.LEFT, padx=(20, 0))
+        ToolTip(at_chk, "仅对音频流单独截取（不分段），视频分段照旧。\n"
+                "适用场景：视频去中间、音乐只剪头尾来匹配拼接后的总长度。\n"
+                "提示：显示的分段视频总时长可作为音频截取的参考。",
+                wraplength=400)
+
+        # 输入行：起始 / 结束
+        at_row1 = ttk.Frame(audio_trim_frame)
+        at_row1.pack(fill=tk.X, pady=(2, 0))
+        ttk.Label(at_row1, text="音频起始:").pack(side=tk.LEFT)
+        self.audio_trim_start_var = tk.StringVar(value=self.audio_trim_start)
+        self.at_start_entry = ttk.Entry(at_row1, textvariable=self.audio_trim_start_var, width=12)
+        self.at_start_entry.pack(side=tk.LEFT, padx=3)
+        ToolTip(self.at_start_entry, "音频开始时间，格式：秒数 (如 0) 或 HH:MM:SS.ms")
+
+        ttk.Label(at_row1, text="音频结束:").pack(side=tk.LEFT, padx=(15, 0))
+        self.audio_trim_end_var = tk.StringVar(value=self.audio_trim_end)
+        self.at_end_entry = ttk.Entry(at_row1, textvariable=self.audio_trim_end_var, width=12)
+        self.at_end_entry.pack(side=tk.LEFT, padx=3)
+        ToolTip(self.at_end_entry, "音频结束时间，格式：秒数 或 HH:MM:SS.ms。留空=到文件末尾")
+
+        # 初始禁用状态
+        self._on_audio_trim_toggle()
 
         # ---- 底部按钮 ----
         btn_frame = ttk.Frame(main)
@@ -19367,14 +19836,14 @@ class SegmentEditor:
             return False
 
         # 检查是否超出总时长（容差 0.001 秒，自动修正）
-        if self.app and self.app.input_file.get():
-            dur = self.app._get_media_duration(self.app.input_file.get())
-            if dur is not None:
-                if abs(end_sec - dur) <= 0.001:
-                    end_sec = dur
-                if end_sec > dur + 0.001:
+        dur = self._get_input_duration()
+        if dur is not None:
+            if abs(end_sec - dur) <= 0.001:
+                end_sec = dur
+            if end_sec > dur + 0.001:
+                if self.app:
                     self.app._append_info_ui(f"[分段] 片段超出总时长，已跳过")
-                    return False
+                return False
 
         start_str = seconds_to_time(start_sec)
         end_str = seconds_to_time(end_sec)
@@ -19401,17 +19870,17 @@ class SegmentEditor:
 
         # 如果结束时间为空，自动补全为视频总时长
         if not end:
-            if self.app and self.app.input_file.get():
-                dur = self.app._get_media_duration(self.app.input_file.get())
-                if dur is not None:
-                    end_sec = dur                     # 直接使用浮点数
-                    end = seconds_to_time(dur)        # 仅用于显示
+            dur = self._get_input_duration()
+            if dur is not None:
+                end_sec = dur                     # 直接使用浮点数
+                end = seconds_to_time(dur)        # 仅用于显示
+                if self.app:
                     self.app._append_info_ui(f"[分段] 结束时间自动设为总时长: {end}")
+            else:
+                if not self._get_input_path():
+                    messagebox.showerror("错误", "未指定输入文件，无法自动获取结束时间，请手动填写")
                 else:
                     messagebox.showerror("错误", "无法获取视频总时长，请手动填写结束时间")
-                    return
-            else:
-                messagebox.showerror("错误", "未指定输入文件，无法自动获取结束时间，请手动填写")
                 return
         else:
             end_sec = time_to_seconds(end)
@@ -19425,15 +19894,15 @@ class SegmentEditor:
 
         # 仅对手动输入的结束时间进行超时检查（自动补全的已保证不超）
         if end:  # 用户手动输入
-            if self.app and self.app.input_file.get():
-                dur = self.app._get_media_duration(self.app.input_file.get())
-                if dur is not None:
-                    if abs(end_sec - dur) <= 0.001:
-                        end_sec = dur
-                        end = seconds_to_time(dur)
-                    if end_sec > dur + 0.001:
+            dur = self._get_input_duration()
+            if dur is not None:
+                if abs(end_sec - dur) <= 0.001:
+                    end_sec = dur
+                    end = seconds_to_time(dur)
+                if end_sec > dur + 0.001:
+                    if self.app:
                         self.app._append_info_ui(f"[分段] 片段超出总时长: {start}->{end}，已跳过")
-                        return
+                    return
 
         flip_value = self.flip_combo.get()
         speed_value = self.speed_var.get().strip()
@@ -19488,6 +19957,58 @@ class SegmentEditor:
             speed_str = f"{seg.get('speed', '1.0')}x"
             self.tree.insert("", tk.END, iid=str(i), values=(i+1, start, end, dur_str, seg.get("flip", "无"), reverse_str, speed_str))
 
+        # 更新音频截取参考标签（分段视频总时长）
+        self._update_segment_total_label()
+
+    def _update_segment_total_label(self):
+        """计算分段视频总时长（含逐段变速），更新显示标签。"""
+        dur = 0.0
+        for seg in self.segments:
+            start = time_to_seconds(seg.get("start", ""))
+            end = time_to_seconds(seg.get("end", ""))
+            if start is not None and end is not None and end > start:
+                d = end - start
+                speed_str = seg.get("speed", "1.0").strip()
+                try:
+                    sf = float(speed_str)
+                    if sf > 0:
+                        d /= sf
+                except (ValueError, TypeError):
+                    pass
+                dur += d
+            else:
+                self.segment_total_label.config(text="分段视频总时长: ?")
+                return
+        if dur > 0:
+            self.segment_total_label.config(
+                text=f"分段视频总时长: {dur:.1f}秒 ({seconds_to_time(dur)})")
+        else:
+            self.segment_total_label.config(text="分段视频总时长: 0秒（请添加片段）")
+
+    def _on_audio_trim_toggle(self):
+        """根据复选框状态启用/禁用起止时间输入框。"""
+        state = tk.NORMAL if self.audio_trim_enabled_var.get() else tk.DISABLED
+        self.at_start_entry.config(state=state)
+        self.at_end_entry.config(state=state)
+
+    def _get_input_path(self):
+        """返回应使用的输入文件路径（批量队列注入 > 主界面）。"""
+        path = self._custom_input_file
+        if path and os.path.exists(path):
+            return path
+        if self.app and hasattr(self.app, "input_file"):
+            return self.app.input_file.get().strip() or ""
+        return ""
+
+    def _get_input_duration(self):
+        """获取输入文件总时长（秒），失败返回 None。"""
+        path = self._get_input_path()
+        if not path:
+            return None
+        if self.app:
+            return self.app._get_media_duration(path)
+        return None
+
     # ---------- 双击编辑 ----------
     def on_tree_double_click(self, event):
         selected = self.tree.selection()
@@ -19513,15 +20034,15 @@ class SegmentEditor:
             end_display = seconds_to_time(end_sec)
 
             # 检查并修正接近总时长的时间
-            if self.app and self.app.input_file.get():
-                dur = self.app._get_media_duration(self.app.input_file.get())
-                if dur is not None:
-                    if abs(end_sec - dur) <= 0.001:
-                        end_sec = dur
-                        end_display = seconds_to_time(end_sec)
-                    if end_sec > dur + 0.001:
+            dur = self._get_input_duration()
+            if dur is not None:
+                if abs(end_sec - dur) <= 0.001:
+                    end_sec = dur
+                    end_display = seconds_to_time(end_sec)
+                if end_sec > dur + 0.001:
+                    if self.app:
                         self.app._append_info_ui(f"[分段] 片段超出总时长: {start_display}->{end_display}，已跳过")
-                        return
+                    return
 
             # 存储用户输入的原始字符串（以便显示时与输入一致）
             seg["start"] = dialog.start
@@ -19623,6 +20144,10 @@ class SegmentEditor:
     # ---------- 确定/取消 ----------
     def on_ok(self):
         self.result = self.segments
+        # 保存音频独立截取设置
+        self.audio_trim_enabled = self.audio_trim_enabled_var.get()
+        self.audio_trim_start = self.audio_trim_start_var.get().strip()
+        self.audio_trim_end = self.audio_trim_end_var.get().strip()
         self.window.destroy()
 
     def on_cancel(self):
