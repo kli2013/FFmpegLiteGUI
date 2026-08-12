@@ -1,3 +1,6 @@
+[[english](readme_en.md)]
+
+
 # FFmpegLiteGUI
 
 > **写在前面**：编译文件可能更新不及时，可以 fork 一下自行编译。我写了好几个不同的自动编译脚本，按需编译即可。
