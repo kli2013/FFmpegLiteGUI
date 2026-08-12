@@ -8391,7 +8391,7 @@ class FFmpegBatchGUI:
             log_path = settings.get("log_path", os.path.join(get_script_dir(), "editlog.txt"))
             self.log_path_var.set(normalize_path(log_path))
             self.overwrite_policy.set(settings.get("overwrite_policy", "ask"))
-            self.language_var.set(settings.get("language", "zh"))
+            self.language_var.set(settings.get("language", "en"))
             cmd_path = settings.get("cmd_output_path", "")
             if cmd_path:
                 self.cmd_output_path.set(cmd_path)
