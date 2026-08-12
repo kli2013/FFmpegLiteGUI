@@ -1,0 +1,20311 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
+import tkinter.font as tkFont
+import subprocess
+import os
+import threading
+import re
+import copy
+import json
+import sys
+import shutil
+import ctypes
+import concurrent.futures
+from typing import List, Tuple, Optional, Dict, Any, Callable
+import shlex
+import tempfile
+import time
+
+
+
+# --- 依赖检测 ---
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    DND_AVAILABLE = True
+except ImportError:
+    DND_AVAILABLE = False
+    root_temp = tk.Tk()
+    root_temp.withdraw()
+    messagebox.showwarning(_("功能受限提示"), _("未检测到 tkinterdnd2 库，当前不支持文件拖拽功能！\n\n如需使用拖拽，请在终端运行：pip install tkinterdnd2"))
+    root_temp.destroy()
+
+# ================== 多语言 (i18n) ==================
+# 设计：默认中文。TRANS 为空时 _() 直接返回原文（中文），因此未翻译/缺失项始终回退中文，
+# 绝不会出现空白或崩溃。英文等语言从 lang/<code>.json 加载，键为中文原文、值为译文。
+TRANS = {}
+_CURRENT_LANG = "zh"
+
+def _(msg):
+    """翻译函数：返回当前语言译文，缺失则回退原文（中文）。非字符串原样返回。"""
+    if not isinstance(msg, str):
+        return msg
+    return TRANS.get(msg, msg)
+
+def load_language(lang):
+    """加载语言包到全局 TRANS。lang='zh' 或文件缺失时清空（回退中文）。"""
+    global TRANS, _CURRENT_LANG
+    _CURRENT_LANG = lang or "zh"
+    TRANS = {}
+    if _CURRENT_LANG == "zh":
+        return
+    try:
+        lang_path = os.path.join(get_script_dir(), "lang", f"{_CURRENT_LANG}.json")
+        if os.path.exists(lang_path):
+            with open(lang_path, "r", encoding="utf-8") as f:
+                TRANS = json.load(f)
+    except Exception:
+        TRANS = {}
+
+def get_current_lang():
+    return _CURRENT_LANG
+
+# ================== 公共工具函数 ==================
+
+def format_cmd_for_display(cmd_list: List[str]) -> str:
+    """
+    将命令列表转换为适合显示/复制的字符串，带必要的引号。
+    Windows 使用 subprocess.list2cmdline，Unix 使用 shlex.quote 逐个转义。
+    """
+    if sys.platform == "win32":
+        return subprocess.list2cmdline(cmd_list)
+    else:
+        return ' '.join(shlex.quote(arg) for arg in cmd_list)
+
+def normalize_path(path: str) -> str:
+    """统一路径分隔符为正斜杠"""
+    return path.replace('\\', '/')
+
+def quote_path(path: str) -> str:
+    """为路径添加双引号，用于命令行（仅用于显示，实际执行使用列表）"""
+    return f'"{path}"'
+
+def get_script_dir() -> str:
+    """获取脚本所在目录（支持打包后）。
+
+    语言包 lang/ 可能位于以下任一位置，返回第一个含 lang/ 的目录：
+      1) sys._MEIPASS（PyInstaller onefile / onedir 的内容目录，常指向 _internal）
+      2) exe 同级目录（手动把 lang/ 放到 exe 旁边时）
+      3) exe 同级/_internal（手动把 lang/ 放进 _internal 时）
+    找不到时退回到 exe 同级目录，保证有返回值不崩溃。
+    """
+    if getattr(sys, 'frozen', False):
+        candidates = []
+        meipass = getattr(sys, '_MEIPASS', '')
+        if meipass:
+            candidates.append(meipass)
+        exe_dir = os.path.dirname(sys.executable)
+        candidates.append(exe_dir)
+        candidates.append(os.path.join(exe_dir, '_internal'))
+        for c in candidates:
+            if os.path.isdir(os.path.join(c, 'lang')):
+                return c
+        return exe_dir
+    else:
+        return os.path.dirname(os.path.abspath(__file__))
+
+def find_resource(filename: str) -> Optional[str]:
+    """
+    在脚本目录及其所有一级子目录中查找指定文件（不要求可执行权限）。
+    返回找到的第一个完整路径，未找到则返回 None。
+    """
+    script_dir = get_script_dir()
+    
+    # 1. 脚本目录本身
+    path = os.path.join(script_dir, filename)
+    if os.path.isfile(path):
+        return path
+
+    # 2. 脚本目录的一级子目录（无论是否打包都扫描）
+    try:
+        for entry in os.listdir(script_dir):
+            sub_dir = os.path.join(script_dir, entry)
+            if os.path.isdir(sub_dir):
+                candidate = os.path.join(sub_dir, filename)
+                if os.path.isfile(candidate):
+                    return candidate
+    except OSError:
+        pass
+
+    # 3. PyInstaller one-file 模式下的临时解压目录 (_MEIPASS)
+    if getattr(sys, 'frozen', False):
+        meipass = getattr(sys, '_MEIPASS', None)
+        if meipass:
+            candidate = os.path.join(meipass, filename)
+            if os.path.isfile(candidate):
+                return candidate
+
+    return None
+
+
+def find_executable(name: str) -> Optional[str]:
+    candidate = find_resource(name)
+    if candidate and os.access(candidate, os.X_OK):
+        return candidate
+    # 未在脚本目录找到，回退到系统 PATH
+    return shutil.which(name)
+
+def get_dpi_scaling(root: tk.Tk) -> float:
+    """获取系统 DPI 缩放因子"""
+    try:
+        return root.winfo_fpixels('1i') / 96.0
+    except:
+        return 1.0
+
+def center_window(win: tk.Toplevel, width: int, height: int, offset_y: int = 0):
+    """
+    在屏幕中央显示窗口（忽略父窗口），避免闪烁。
+    前提：窗口创建后已调用 withdraw()，此处只负责定位和显示。
+    """
+    # 强制更新布局，确保几何信息准确
+    win.update_idletasks()
+    win.update()
+
+    screen_width = win.winfo_screenwidth()
+    screen_height = win.winfo_screenheight()
+    x = (screen_width - width) // 2
+    y = (screen_height - height) // 2 - offset_y
+    x = max(0, x)
+    y = max(0, y)
+
+    win.geometry(f"{width}x{height}+{x}+{y}")
+    win.deiconify()   # 显示窗口
+    win.lift()
+    win.focus_force()
+    win.update_idletasks()
+
+
+def safe_eval_expr(expr: str, context: Dict[str, int]) -> Optional[int]:
+    """
+    安全计算数学表达式，支持 + - * / ( ) 以及 context 中的变量。
+    使用严格白名单防止注入，返回整数，失败返回 None。
+    """
+    if not expr:
+        return None
+    expr = expr.strip()
+    # 只允许数字、运算符、括号、空格、小数点、变量名（字母数字下划线）
+    if not re.match(r'^[0-9+\-*/()\.\sA-Za-z_]+$', expr):
+        return None
+    # 禁止幂运算（** 会造成指数爆炸导致 GUI 卡死）
+    if "**" in expr:
+        return None
+    # 替换变量（完整单词）
+    for var, val in context.items():
+        expr = re.sub(r'\b' + re.escape(var) + r'\b', str(val), expr)
+    # 禁止下标、属性访问、字符串字面量（小数点 . 仍允许，用于小数）
+    if re.search(r'[\[\]"\']', expr):
+        return None
+    try:
+        # 编译后检查引用的名称是否只包含上下文变量
+        code = compile(expr, "<string>", "eval")
+        for name in code.co_names:
+            if name not in context and name not in ("abs", "round"):
+                return None
+        # 提供仅含 abs/round 的安全 builtins；变量在 context 中
+        return int(round(eval(code, {"__builtins__": {"abs": abs, "round": round}}, context)))
+    except Exception:
+        return None
+
+def fix_bitrate_value(bitrate_str: str) -> str:
+    """将纯数字比特率转换为数字+k 格式"""
+    val = bitrate_str.strip()
+    if not val:
+        return "1000k"
+    if re.match(r'^\d+$', val):
+        return val + "k"
+    return val
+
+def is_valid_timestamp(ts: str) -> bool:
+    """验证时间戳格式 (HH:MM:SS[.mmm] 或 数字)"""
+    if not ts:
+        return True
+    pattern = r'^(\d{1,2}:)?\d{1,2}:\d{1,2}(\.\d{1,3})?$'
+    if re.match(pattern, ts):
+        return True
+    if ts.replace('.', '', 1).isdigit():
+        return False
+    return False
+
+def seconds_to_time(sec, short=True):
+    """
+    秒数转时间字符串。
+    short=True 时：<1小时 → MM:SS.ms，>=1小时 → H:MM:SS.ms
+    short=False 时：始终 HH:MM:SS.ms
+    """
+    if sec is None:
+        return ""
+    sec = float(sec)
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = sec % 60
+    if short:
+        if h > 0:
+            return f"{h:01d}:{m:02d}:{s:06.3f}"
+        else:
+            return f"{m:02d}:{s:06.3f}"
+    else:
+        return f"{h:02d}:{m:02d}:{s:06.3f}"
+
+
+
+
+# ================== 预设管理 ==================
+class PresetManager:
+    # 默认预设模板（精简版）
+    DEFAULT_PRESET_TEMPLATE = {
+        "TEST 裁一半保留右边": {
+            "vcodec": "libx265",
+            "rate_control_type": "crf",
+            "crf_value": 25,
+            "frame_rate_type": "keep",
+            "frame_rate_custom": "24",
+            "crop_enabled": True,
+            "crop_left": "iw/2",
+            "crop_top": "0",
+            "crop_width": "iw/2",
+            "crop_height": "ih",
+        },
+        "TEST 裁一半保留左边": {
+            "vcodec": "libx265",
+            "rate_control_type": "crf",
+            "crf_value": 25,
+            "frame_rate_type": "keep",
+            "frame_rate_custom": "24",
+            "crop_enabled": True,
+            "crop_left": "0",
+            "crop_top": "0",
+            "crop_width": "iw/2",
+            "crop_height": "ih",
+        },
+        "TEST 缩放 600宽": {
+            "vcodec": "libx265",
+            "rate_control_type": "crf",
+            "crf_value": 25,
+            "frame_rate_type": "keep",
+            "frame_rate_custom": "24",
+            "scale_enabled": True,
+            "scale_width": "600",
+            "scale_height": "",
+            "scale_method": "width",
+        },
+        "TEST 横1920": {
+            "vcodec": "libx265",
+            "rate_control_type": "crf",
+            "crf_value": 25,
+            "frame_rate_type": "custom",
+            "frame_rate_custom": "30",
+            "scale_enabled": True,
+            "scale_width": "1920",
+            "scale_height": "-2",
+            "scale_method": "width",
+        },
+        "TEST 竖1920": {
+            "vcodec": "libx265",
+            "rate_control_type": "crf",
+            "crf_value": 25,
+            "frame_rate_type": "custom",
+            "frame_rate_custom": "30",
+            "scale_enabled": True,
+            "scale_width": "-2",
+            "scale_height": "1920",
+            "scale_method": "height",
+        },
+        "无损复制流": {
+            "encoder": "copy",
+            "audio_codec": "copy",
+        },
+        "H264 Fast 1080p30 (通用高清)": {
+            "encoder": "libx264",
+            "preset": "fast",
+            "rate_control_type": "crf",
+            "crf_value": 23,
+            "frame_rate_type": "custom",
+            "frame_rate_custom": "30",
+            "scale_enabled": True,
+            "scale_width": "1920",
+            "scale_height": "1080",
+            "scale_method": "exact",
+        },
+        "H264 Fast 720p30 (通用标清)": {
+            "encoder": "libx264",
+            "preset": "fast",
+            "rate_control_type": "crf",
+            "crf_value": 23,
+            "frame_rate_type": "custom",
+            "frame_rate_custom": "30",
+            "scale_enabled": True,
+            "scale_width": "1280",
+            "scale_height": "720",
+            "scale_method": "exact",
+        },
+        "H264 Very Fast 1080p30 (极速高清)": {
+            "encoder": "libx264",
+            "preset": "veryfast",
+            "rate_control_type": "crf",
+            "crf_value": 23,
+            "frame_rate_type": "custom",
+            "frame_rate_custom": "30",
+            "scale_enabled": True,
+            "scale_width": "1920",
+            "scale_height": "1080",
+            "scale_method": "exact",
+        },
+        "H264 HQ 1080p30 (高质量)": {
+            "encoder": "libx264",
+            "preset": "slow",
+            "rate_control_type": "crf",
+            "crf_value": 20,
+            "frame_rate_type": "custom",
+            "frame_rate_custom": "30",
+            "scale_enabled": True,
+            "scale_width": "1920",
+            "scale_height": "1080",
+            "scale_method": "exact",
+        },
+        "H265 HEVC 1080p (高效压缩)": {
+            "encoder": "libx265",
+            "preset": "medium",
+            "rate_control_type": "crf",
+            "crf_value": 24,
+            "frame_rate_type": "keep",
+            "frame_rate_custom": "30",
+            "scale_enabled": True,
+            "scale_width": "1920",
+            "scale_height": "1080",
+            "scale_method": "exact",
+        },
+        "H265 HEVC 4K (高质量)": {
+            "encoder": "libx265",
+            "preset": "slow",
+            "rate_control_type": "crf",
+            "crf_value": 22,
+            "frame_rate_type": "keep",
+            "frame_rate_custom": "30",
+            "scale_enabled": True,
+            "scale_width": "3840",
+            "scale_height": "2160",
+            "scale_method": "exact",
+        }
+    }
+    def __init__(self, preset_path: str, app_name: str = "FFLiteGUI"):
+        self.preset_path = preset_path
+        self.user_data_dir = os.path.join(os.path.expanduser("~"), f".{app_name}")
+        os.makedirs(self.user_data_dir, exist_ok=True)
+#        self._ensure_default_preset()
+
+    def _ensure_default_preset(self):
+        if os.path.exists(self.preset_path):
+            return
+    
+        # 尝试从内置资源复制
+        bundled = find_resource("ffmpeg_presets.json")
+        if bundled:
+            try:
+                shutil.copy2(bundled, self.preset_path)
+                print(_("首次运行，已从内部释放默认配置到：{0}".format(self.preset_path)))
+                return
+            except Exception as e:
+                print(_("释放配置文件失败: {0}".format(e)))
+    
+        # 没有内置预设，写入精简默认模板
+        try:
+            with open(self.preset_path, 'w', encoding='utf-8') as f:
+                json.dump(self.DEFAULT_PRESET_TEMPLATE, f, indent=4, ensure_ascii=False)
+            print(_("首次运行，已创建精简预设模板：{0}".format(self.preset_path)))
+        except Exception as e:
+            print(_("创建预设文件失败: {0}".format(e)))
+
+    def load_all(self) -> Dict[str, Any]:
+        """加载所有预设，返回字典 {预设名: 设置字典}，不含播放器设置"""
+        if not os.path.exists(self.preset_path):
+            return {}
+        try:
+            with open(self.preset_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return {k: v for k, v in data.items() if k != "player_settings"}
+        except:
+            return {}
+
+    def save_preset(self, name: str, settings: Dict[str, Any]):
+        """保存预设，保留已有的播放器设置，采用原子写入防止文件损坏"""
+        data = self.load_all()
+        player_cfg = {}
+        if os.path.exists(self.preset_path):
+            try:
+                with open(self.preset_path, 'r', encoding='utf-8') as f:
+                    full = json.load(f)
+                player_cfg = full.get("player_settings", {})
+            except:
+                pass
+        data[name] = settings
+        data["player_settings"] = player_cfg
+    
+        # 原子写入：先写入临时文件，再替换原文件
+        dir_name = os.path.dirname(self.preset_path)
+        try:
+            with tempfile.NamedTemporaryFile('w', dir=dir_name, delete=False, encoding='utf-8') as tf:
+                json.dump(data, tf, indent=4, ensure_ascii=False)
+                temp_name = tf.name
+            os.replace(temp_name, self.preset_path)  # 原子替换
+        except Exception as e:
+            # 如果发生错误，尝试删除临时文件
+            if 'temp_name' in locals() and os.path.exists(temp_name):
+                os.unlink(temp_name)
+            raise e
+     
+    def delete_preset(self, name: str) -> bool:
+       """删除预设，采用原子写入防止文件损坏"""
+       data = self.load_all()
+       if name not in data:
+           return False
+       del data[name]
+       player_cfg = {}
+       if os.path.exists(self.preset_path):
+           try:
+               with open(self.preset_path, 'r', encoding='utf-8') as f:
+                   full = json.load(f)
+               player_cfg = full.get("player_settings", {})
+           except:
+               pass
+       data["player_settings"] = player_cfg
+   
+       # 原子写入
+       dir_name = os.path.dirname(self.preset_path)
+       try:
+           with tempfile.NamedTemporaryFile('w', dir=dir_name, delete=False, encoding='utf-8') as tf:
+               json.dump(data, tf, indent=4, ensure_ascii=False)
+               temp_name = tf.name
+           os.replace(temp_name, self.preset_path)
+           return True
+       except Exception as e:
+           if 'temp_name' in locals() and os.path.exists(temp_name):
+               os.unlink(temp_name)
+           raise e
+
+
+    def load_player_settings(self) -> Dict[str, Any]:
+        if not os.path.exists(self.preset_path):
+            return {}
+        try:
+            with open(self.preset_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data.get("player_settings", {})
+        except:
+            return {}
+
+    def save_player_settings(self, settings: Dict[str, Any]):
+        data = self.load_all()
+        data["player_settings"] = settings
+        with open(self.preset_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+
+
+
+def time_to_seconds(timestr: str) -> Optional[float]:
+    """将 HH:MM:SS[.mmm] 或 MM:SS[.mmm] 或纯数字转换为秒数"""
+    if not timestr:
+        return None
+    timestr = timestr.strip()
+    parts = timestr.split(':')
+    try:
+        if len(parts) == 3:
+            h, m, s = parts
+            return int(h) * 3600 + int(m) * 60 + float(s)
+        elif len(parts) == 2:
+            m, s = parts
+            return int(m) * 60 + float(s)
+        else:
+            return float(timestr)
+    except ValueError:
+        return None
+
+# ================== 滤镜链构建 ==================
+def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = True, include_speed: bool = True,
+                              include_trim: bool = True, include_format: bool = True, include_scale: bool = True,
+                              enhance_settings=None, reverse=False, graph_id: str = "") -> str:
+    """
+    从设置字典构建视频滤镜链。
+    include_subtitle: 是否包含字幕滤镜
+    include_speed: 是否包含变速滤镜
+    include_trim: 是否包含精准截取（trim+setpts）滤镜
+    include_format: 是否包含像素格式转换（format）滤镜
+    enhance_settings:高级一点的滤镜
+    graph_id: 当本滤镜链会被拼进同一个 filter_complex（画中画/串联合并等多路场景）时，
+              调用方传入唯一标识，用于给「局部模糊」等带标签的子图生成互不冲突的标签名。
+    顺序优化：
+    精准截取 → 局部模糊/去水印 → 裁剪 → 旋转/翻转 → 缩放 → IVTC（反胶卷过带） → 反交错 →
+    去块滤波 → 降噪 → 锐化 → 色彩空间转换 → 颜色校正+色相 → 像素格式 → 变速 → 倒放
+
+    注意：「局部模糊」会生成带标签的分支子图（split/overlay），返回值可能是包含 ';' 的
+    完整 filtergraph，而不再是单纯的逗号串。-vf 与 filter_complex 均支持该语法。
+    """
+    filters = []
+
+    # 提前确定硬件滤镜模式与「帧是否已在显存」（供像素格式处理使用）
+    _filter_mode = settings.get("hw_filter_mode")
+    if not _filter_mode:
+        if settings.get("wrap_cpu_nvidia"):
+            _filter_mode = "cuda"
+        elif settings.get("wrap_cpu_amd"):
+            _filter_mode = "vaapi"
+        else:
+            _filter_mode = "cpu"
+    _hw_active = _filter_mode in ("cuda", "qsv", "vaapi")
+    _native = _hw_active and settings.get("hwaccel_enabled", False) and _decoder_matches_api(settings.get("hwaccel_decoder", ""), _filter_mode)
+
+    # ----- 精准截取（trim + setpts）-----
+    if include_trim and settings.get("precise_trim", False) and settings.get("trim_enabled", False):
+        start = settings.get("trim_start", "").strip()
+        end = settings.get("trim_end", "").strip()
+        start_sec = time_to_seconds(start) if start else None
+        end_sec = time_to_seconds(end) if end else None
+        if start_sec is not None or end_sec is not None:
+            trim_parts = []
+            if start_sec is not None:
+                trim_parts.append(f"start={start_sec}")
+            if end_sec is not None:
+                trim_parts.append(f"end={end_sec}")
+            if trim_parts:
+                filters.append(f"trim={':'.join(trim_parts)}")
+                filters.append("setpts=PTS-STARTPTS")
+
+    # ----- 去水印/模糊（必须排在裁剪/旋转/缩放之前，坐标才与原始帧一致）-----
+    if settings.get("blur_enabled", False):
+        blur_type = settings.get("blur_type", "delogo")
+        x = str(settings.get("blur_x", "0")).strip()
+        y = str(settings.get("blur_y", "0")).strip()
+        w = str(settings.get("blur_w", "100")).strip()
+        h = str(settings.get("blur_h", "100")).strip()
+        strength = settings.get("blur_strength", "5")
+        region_only = settings.get("blur_region_only", False)
+
+        if blur_type == "delogo":
+            filters.append(f"delogo=x={x}:y={y}:w={w}:h={h}")
+        elif blur_type in ("boxblur", "gblur"):
+            if blur_type == "boxblur":
+                _blur_f = f"boxblur={strength}:{strength}"
+            else:
+                _blur_f = f"gblur=sigma={strength}"
+            if region_only and w and h:
+                # 局部模糊：把原帧一分为二，一路裁出目标区域做模糊，再叠回原位。
+                # 生成的是带标签的分支子图，因此本函数返回值可能含 ';'。
+                _sfx = graph_id or ""
+                _bg, _fg, _bl = f"rb{_sfx}bg", f"rb{_sfx}fg", f"rb{_sfx}bl"
+                filters.append(
+                    f"split=2[{_bg}][{_fg}];"
+                    f"[{_fg}]crop={w}:{h}:{x}:{y},{_blur_f}[{_bl}];"
+                    f"[{_bg}][{_bl}]overlay={x}:{y}"
+                )
+            else:
+                filters.append(_blur_f)
+
+
+    # ----- 裁剪 -----
+    if settings.get("crop_enabled", False):
+        w = settings.get("crop_width", "").strip()
+        h = settings.get("crop_height", "").strip()
+        left = settings.get("crop_left", "0").strip()
+        top = settings.get("crop_top", "0").strip()
+        if w and h:
+            filters.append(f"crop={w}:{h}:{left}:{top}")
+
+    # ----- 旋转/翻转 -----
+    rot = settings.get("rotate", "none")
+    if rot == "90":
+        filters.append("transpose=1")
+    elif rot == "180":
+        filters.append("transpose=2,transpose=2")
+    elif rot == "270":
+        filters.append("transpose=2")
+    if settings.get("vflip", False):
+        filters.append("vflip")
+    if settings.get("hflip", False):
+        filters.append("hflip")
+
+    # ----- 缩放 -----
+    if include_scale and settings.get("scale_enabled", False):
+        method = settings.get("scale_method", "width")
+        w = settings.get("scale_width", "").strip()
+        h = settings.get("scale_height", "").strip()
+        if method == "width" and w:
+            filters.append(f"scale={w}:-2")
+        elif method == "height" and h:
+            filters.append(f"scale=-2:{h}")
+        elif method == "exact" and w and h:
+            filters.append(f"scale={w}:{h}")
+    
+    # ----- IVTC（反胶卷过带）----- 
+    ivtc_enabled = enhance_settings and enhance_settings.get("ivtc_enabled", False)
+    if ivtc_enabled:
+        filters.append("fieldmatch,decimate")
+    
+    # ----- 反交错（仅当 IVTC 未启用时执行） -----
+    if not ivtc_enabled:  # 添加条件
+        deint = settings.get("deinterlace_filter", "none")
+        if deint != "none":
+            filters.append(deint)
+    
+    # ----- 去块滤波 -----
+    if enhance_settings and enhance_settings.get("deblock_enabled", False):
+        strength = enhance_settings.get("deblock_strength", 4)
+        filters.append(f"deblock=filter=weak:block={strength}")
+    
+    # ----- 降噪 -----
+    if enhance_settings and enhance_settings.get("denoise_enabled", False):
+        spatial = enhance_settings.get("denoise_spatial", 4.0)
+        temporal = enhance_settings.get("denoise_temporal", 3.0)
+        # hqdn3d 参数：空间亮度, 空间色度, 时间亮度, 时间色度
+        filters.append(f"hqdn3d={spatial:.1f}:{spatial*0.75:.1f}:{temporal:.1f}:{temporal*0.75:.1f}")
+    
+    # ----- 锐化 -----
+    if enhance_settings and enhance_settings.get("sharpen_enabled", False):
+        strength = enhance_settings.get("sharpen_strength", 1.0)
+        # unsharp 参数：luma_msize_x:luma_msize_y:luma_amount:chroma_msize_x:chroma_msize_y:chroma_amount
+        filters.append(f"unsharp=5:5:{strength:.2f}:5:5:{strength*0.5:.2f}")
+    
+
+    
+    # ----- 色彩空间转换 -----
+    if enhance_settings and enhance_settings.get("colorspace_enabled", False):
+        matrix = enhance_settings.get("colorspace_matrix", "bt709:bt2020")
+        filters.append(f"colormatrix={matrix}")
+
+    # ----- 颜色校正（eq）-----
+    if enhance_settings:
+        eq_parts = []
+        b = enhance_settings.get("eq_brightness", 0.0)
+        if b != 0.0:
+            eq_parts.append(f"brightness={b:.2f}")
+        c = enhance_settings.get("eq_contrast", 1.0)
+        if c != 1.0:
+            eq_parts.append(f"contrast={c:.2f}")
+        s = enhance_settings.get("eq_saturation", 1.0)
+        if s != 1.0:
+            eq_parts.append(f"saturation={s:.2f}")
+        g = enhance_settings.get("eq_gamma", 1.0)
+        if g != 1.0:
+            eq_parts.append(f"gamma={g:.2f}")
+        if eq_parts:
+            filters.append(f"eq={':'.join(eq_parts)}")
+
+    # ----- 色相调整（hue）-----
+    if enhance_settings:
+        hue_parts = []
+        h_angle = enhance_settings.get("hue_angle", 0.0)
+        if h_angle != 0.0:
+            hue_parts.append(f"H={h_angle:.1f}")
+        h_sat = enhance_settings.get("hue_saturation", 0.0)
+        if h_sat != 0.0:
+            hue_parts.append(f"s={h_sat:.2f}")
+        if hue_parts:
+            filters.append(f"hue={':'.join(hue_parts)}")
+
+
+    # ----- 像素格式 -----
+    if include_format and settings.get("pix_fmt_enabled", True):
+        # 硬件滤镜模式下，纯硬件/混合链路在边界统一处理像素格式，不在中间插入软件 format
+        if not _hw_active or not _native:
+            filters.append(f"format={settings.get('pix_fmt', 'yuv420p')}")
+    
+    # ----- 变速 -----
+    if include_speed and settings.get("speed_enabled", False):
+        try:
+            factor = float(settings.get("speed_factor", "1.0"))
+            if factor > 0 and factor != 1.0:
+                filters.append(f"setpts={1.0/factor}*PTS")
+        except ValueError:
+            pass
+    
+    # ----- 字幕烧录 -----
+    if include_subtitle and settings.get("subtitle_enabled", False):
+        sub_path = settings.get("subtitle_path", "").strip()
+        if sub_path:
+            sub_path = sub_path.replace('\\', '/')
+            sub_path = sub_path.replace(':', '\\:')
+            sub_path = sub_path.replace("'", "\\'")
+            filters.append(f"subtitles='{sub_path}'")
+
+    # ----- 倒放 -----
+    if reverse:
+        filters.append("reverse")
+
+    filter_chain = ",".join(filters) if filters else "null"
+    
+    # ---------- 滤镜硬件加速（软件 / NVIDIA / Intel QSV / AMD） ----------
+    filter_mode = settings.get("hw_filter_mode")
+    if not filter_mode:
+        # 向后兼容：旧版用 wrap_cpu_nvidia / wrap_cpu_amd 标记
+        if settings.get("wrap_cpu_nvidia"):
+            filter_mode = "cuda"
+        elif settings.get("wrap_cpu_amd"):
+            filter_mode = "vaapi"
+        else:
+            filter_mode = "cpu"
+
+    if filter_mode in ("cuda", "qsv", "vaapi"):
+        device = (settings.get("hw_filter_device") or "").strip()
+        # 1) 尝试把软件滤镜替换为对应硬件滤镜
+        hw_filters = []
+        has_software_only = False
+        for f in filters:
+            hf = _map_software_to_hw_filter(f, filter_mode)
+            if hf is None:
+                has_software_only = True
+                hw_filters.append(f)
+            else:
+                hw_filters.append(hf)
+        # 合并相邻的 vpp_qsv 滤镜为单个 VPP 实例：更高效，且确保 denoise 与 procamp 等
+        # 处于同一会话（分散到多个 vpp_qsv 实例虽不报错，但 procamp 开关易失效）。
+        merged = []
+        for f in hw_filters:
+            if merged and merged[-1].startswith("vpp_qsv=") and f.startswith("vpp_qsv="):
+                merged[-1] = merged[-1] + ":" + f[len("vpp_qsv="):]
+            else:
+                merged.append(f)
+        hw_filters = merged
+        # 2) 帧是否已在显存（需开启硬件解码且解码器与该 API 匹配）
+        decoder = settings.get("hwaccel_decoder", "")
+        native = settings.get("hwaccel_enabled", False) and _decoder_matches_api(decoder, filter_mode)
+        enc_gpu = _is_gpu_encoder(settings.get("encoder", ""))
+        if native and not has_software_only and hw_filters:
+            # 纯硬件链路：数据全程在显存，无需 hwdownload / hwupload
+            chain = ",".join(hw_filters)
+            if not enc_gpu:
+                pix = settings.get("pix_fmt", "yuv420p") if settings.get("pix_fmt_enabled", True) else "nv12"
+                chain = f"{chain},hwdownload,format={pix}"
+            return chain
+        if not native:
+            # 没有硬件解码 -> 帧在内存，无法 hwdownload，退回纯软件滤镜链
+            return filter_chain
+        # 3) 混合链路：软件滤镜用 hwdownload 拉回内存处理，再 hwupload 回显存
+        sw_chain = ",".join(filters)
+        if not sw_chain or sw_chain == "null":
+            # 没有软件滤镜时不生成空白包裹（hwdownload,format=nv12,,hwupload=...）
+            return "null"
+        up = _hwupload_token(filter_mode, device)
+        if enc_gpu:
+            return f"hwdownload,format=nv12,{sw_chain},{up}"
+        # CPU 编码器：处理完直接留在内存，并显式指定输出像素格式
+        pix = settings.get("pix_fmt", "yuv420p") if settings.get("pix_fmt_enabled", True) else "nv12"
+        return f"hwdownload,format=nv12,{sw_chain},format={pix}"
+
+    return filter_chain
+
+
+def _map_software_to_hw_filter(f: str, api: str):
+    """把单个软件滤镜字符串映射为硬件滤镜；无解返回 None（表示仍需软件处理）。"""
+    if f.startswith("scale="):
+        suffix = {"cuda": "scale_cuda", "qsv": "scale_qsv", "vaapi": "scale_vaapi"}.get(api)
+        if not suffix:
+            return None
+        body = f[len("scale="):]
+        # 硬件缩放滤镜不支持 -2（软件 scale 的「强制偶数」语法），统一换成 -1。
+        # -1 = 按宽高比自动计算另一维；因旋转在缩放之前执行，此时帧已是旋转后尺寸，
+        # 所以 -1 自动按当前 iw/ih 计算，天然兼容旋转（无需手动算 540/1706）。
+        body = body.replace("-2", "-1")
+        # 转成 w=/h= 形式以兼容硬件滤镜（如 scale_cuda=w=1280:h=720）
+        if "=" not in body:
+            w, h = body.split(":")
+            return f"{suffix}=w={w}:h={h}"
+        return f"{suffix}={body}"
+    if api == "qsv":
+        # 旋转/翻转：vpp_qsv 的 transpose 用字符串枚举，不是软件滤镜的数字
+        # 软件 transpose=1=90°顺时针 → vpp_qsv transpose=clock
+        # 软件 transpose=2=90°逆时针 → vpp_qsv transpose=cclock
+        # 软件 180°(transpose=2,transpose=2) → vpp_qsv transpose=reversal
+        if f == "transpose=1":
+            return "vpp_qsv=transpose=clock"
+        if f == "transpose=2":
+            return "vpp_qsv=transpose=cclock"
+        if f == "transpose=2,transpose=2":
+            return "vpp_qsv=transpose=reversal"
+        # 翻转（用户实测 qsv 有翻转滤镜，无需走软件包裹）
+        if f == "vflip":
+            return "vpp_qsv=transpose=vflip"
+        if f == "hflip":
+            return "vpp_qsv=transpose=hflip"
+        if f.startswith("crop="):
+            # crop=w:h:left:top -> vpp_qsv=cw=w:ch=h:cx=left:cy=top
+            parts = f[len("crop="):].split(":")
+            if len(parts) == 4:
+                w, h, x, y = parts
+                return f"vpp_qsv=cw={w}:ch={h}:cx={x}:cy={y}"
+        if f.startswith("yadif") or f.startswith("bwdif"):
+            # 反交错 → vpp_qsv deinterlace（1=Bob, 2=advanced；这里用 1）
+            return "vpp_qsv=deinterlace=1"
+        if f.startswith("hqdn3d"):
+            # 降噪 → vpp_qsv denoise（取空间亮度等级，0..100）
+            try:
+                lvl = float(f[len("hqdn3d="):].split(":")[0])
+            except ValueError:
+                lvl = 0.0
+            if lvl <= 0:
+                return None
+            return f"vpp_qsv=denoise={lvl:.0f}"
+        if f.startswith("eq="):
+            # 颜色校正 → vpp_qsv procamp（无 gamma；brightness 范围 -1..1 需换算成 -100..100）
+            pp = []
+            for kv in f[len("eq="):].split(":"):
+                if "=" not in kv:
+                    continue
+                k, v = kv.split("=", 1)
+                if k == "brightness":
+                    try:
+                        pp.append(f"brightness={float(v) * 100:.0f}")
+                    except ValueError:
+                        pass
+                elif k in ("contrast", "saturation"):
+                    pp.append(f"{k}={v}")
+                # gamma 在 vpp_qsv 无对应项，丢弃
+            if pp:
+                # 关键：vpp_qsv 的亮度/对比度/饱和度都属于 ProcAmp，总开关 procamp 默认 0（关闭），
+                # 不显式写 procamp=1 则这些参数被静默忽略（表现为「不报错但无变化」）。
+                return "vpp_qsv=procamp=1:" + ":".join(pp)
+            return None
+    return None
+
+
+def _decoder_matches_api(decoder: str, api: str) -> bool:
+    """判断硬件解码器是否与目标滤镜 API 匹配（帧能否直接在对应显存中）。"""
+    decoder = (decoder or "").lower()
+    if api == "cuda":
+        return ("cuda" in decoder) or ("cuvid" in decoder)
+    if api == "qsv":
+        return "qsv" in decoder
+    if api == "vaapi":
+        return ("vaapi" in decoder) or ("amf" in decoder)
+    return False
+
+
+def _is_gpu_encoder(encoder: str) -> bool:
+    """判断编码器是否为硬件编码器（输出帧需在显存）。"""
+    if not encoder:
+        return False
+    if encoder in ("nvenc", "qsv", "amf", "vaapi", "videotoolbox"):
+        return True
+    suffixes = ("_nvenc", "_qsv", "_amf", "_vaapi", "_videotoolbox",
+                "_mediacodec", "_omx", "_mfx")
+    return any(encoder.endswith(s) for s in suffixes)
+
+
+def _hwupload_token(api: str, device: str) -> str:
+    """返回软件->硬件的上传滤镜；device 非空时显式绑定显卡设备。"""
+    if api == "cuda":
+        return f"hwupload_cuda=device=cu" if device else "hwupload_cuda"
+    if api == "qsv":
+        # QSV 上传：derive_device=qsv 显式派生 QSV 设备（等价于用户实测可用的 hwupload=qsv）。
+        # extra_hw_frames=64 不能放在这里，必须放在 -init_hw_device qsv=hw,extra_hw_frames=64 中。
+        return "hwupload=derive_device=qsv"
+    if api == "vaapi":
+        return "hwupload=extra_hw_frames=64"
+    return "hwupload"
+
+def build_preview_filter_chain(settings: Dict[str, Any], target_height: int = 960, reverse: bool = False) -> str:
+    """生成预览用的滤镜链，强制缩放到指定高度"""
+    enhance_settings = settings.get("enhance", {})
+    preview_settings = dict(settings)
+    preview_settings["hw_filter_mode"] = "cpu"  # 预览/外部播放器强制软件滤镜，避免硬件滤镜冲突
+    vf = build_video_filter_chain(
+        preview_settings,
+        include_subtitle=True,
+        include_speed=True,
+        enhance_settings=enhance_settings,
+        reverse=reverse
+    )
+    # 追加文字水印 drawtext
+    dt = build_drawtext_filter(settings.get("text_watermark", {}))
+    if dt:
+        vf = f"{vf},{dt}" if vf != "null" else dt
+    if vf != "null":
+        return f"{vf},scale=-2:{target_height}"
+    else:
+        return f"scale=-2:{target_height}"
+
+def build_atempo_chain(factor: float) -> str:
+    """构建音频变速滤镜链，支持大于2倍或小于0.5倍的场景"""
+    if factor <= 0 or factor == 1.0:
+        return ""
+    chain = []
+    r = factor
+    while r > 2.0:
+        chain.append(2.0)
+        r /= 2.0
+    while r < 0.5:
+        chain.append(0.5)
+        r /= 0.5
+    if abs(r - 1.0) > 1e-6:
+        chain.append(r)
+    if not chain:
+        return ""
+    atempo_filters = [f"atempo={v:.10f}".rstrip('0').rstrip('.') for v in chain]
+    return ",".join(atempo_filters)
+
+# ================== 文字水印 drawtext 辅助 ==================
+
+# 常见中文字体名称 → Windows Fonts 目录下的文件名映射
+CN_FONT_MAP = {
+    "微软雅黑": "msyh.ttc",
+    "微软雅黑 Bold": "msyhbd.ttc",
+    "宋体": "simsun.ttc",
+    "黑体": "simhei.ttf",
+    "楷体": "simkai.ttf",
+    "仿宋": "simfang.ttf",
+}
+
+def resolve_cn_font_path(font_name: str) -> str:
+    """将中文字体名解析为系统字体文件完整路径，找不到返回空串。"""
+    fname = CN_FONT_MAP.get(font_name, "")
+    if not fname:
+        return ""
+    fonts_dir = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+    return os.path.join(fonts_dir, fname)
+
+def escape_drawtext_text(text: str) -> str:
+    """转义 drawtext 的 text 参数中的特殊字符（: \\ ' , %）。
+    不使用单引号包裹，纯靠 \\ 转义，FFmpeg filtergraph 和 mpv 都能正确解析。"""
+    text = text.replace("\\", "\\\\")
+    text = text.replace(":", "\\:")
+    text = text.replace("'", "\\'")
+    text = text.replace(",", "\\,")
+    text = text.replace("%", "\\%")
+    return text
+
+def escape_drawtext_path(path: str) -> str:
+    """
+    转义 fontfile 路径中的特殊字符。
+    - 统一为正斜杠。
+    - 将冒号转义
+    """
+    path = path.replace("\\", "/")
+    path = path.replace(":", "\\\\:")   # 双反斜杠 + 冒号，经测试 ffplay 和 mpv 均有效
+    return path
+
+def _build_drawtext_enable(s: dict) -> str:
+    """
+    根据文字水印的显示时段 / 循环设置构建 drawtext 的 enable 表达式。
+    返回空字符串表示始终显示。
+    """
+    def _f(v):
+        v = (v or "").strip()
+        if v == "":
+            return None
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return None
+    start = _f(s.get("enable_start"))
+    end = _f(s.get("enable_end"))
+    cycle = _f(s.get("enable_cycle"))
+    show = _f(s.get("enable_show"))
+    if start is not None and end is not None and end > start:
+        return f"between(t,{start:.3f},{end:.3f})"
+    if cycle is not None and show is not None and cycle > 0 and show > 0:
+        return f"lt(mod(t,{cycle:.3f}),{show:.3f})"
+    if start is not None:
+        return f"gte(t,{start:.3f})"
+    if end is not None:
+        return f"lte(t,{end:.3f})"
+    return ""
+
+def build_drawtext_filter(tw_settings: dict) -> str:
+    """
+    根据文字水印设置构建 drawtext 滤镜字符串。
+    返回空字符串表示无需添加。
+    """
+    if not tw_settings or not tw_settings.get("enabled", False):
+        return ""
+    text = tw_settings.get("text", "").strip()
+    if not text:
+        return ""
+    font_name = tw_settings.get("font_name", "微软雅黑")
+    font_path = tw_settings.get("font_path", "") or resolve_cn_font_path(font_name)
+    if not font_path or not os.path.exists(font_path):
+        return ""
+    try:
+        font_size = int(tw_settings.get("font_size", 48))
+    except (ValueError, TypeError):
+        font_size = 48
+    color = tw_settings.get("font_color", "#FFFFFF")
+    try:
+        opacity = float(tw_settings.get("opacity", 1.0))
+    except (ValueError, TypeError):
+        opacity = 1.0
+    opacity = max(0.0, min(1.0, opacity))
+    x_expr = tw_settings.get("overlay_x", "10").strip() or "10"
+    y_expr = tw_settings.get("overlay_y", "10").strip() or "10"
+    try:
+        border_w = int(tw_settings.get("border_w", 0))
+    except (ValueError, TypeError):
+        border_w = 0
+    border_color = tw_settings.get("border_color", "#000000")
+
+    fc = color.lstrip("#")
+    fontcolor = f"0x{fc}@{opacity:.2f}"
+
+    parts = [
+        f"fontfile={escape_drawtext_path(font_path)}",
+        f"text={escape_drawtext_text(text)}",
+        f"fontsize={font_size}",
+        f"fontcolor={fontcolor}",
+        f"x={x_expr}",
+        f"y={y_expr}",
+    ]
+    if border_w > 0:
+        bc = border_color.lstrip("#")
+        parts.append(f"borderw={border_w}")
+        parts.append(f"bordercolor=0x{bc}@{opacity:.2f}")
+    # 显示时段 / 循环控制 (enable 表达式)
+    enable_expr = _build_drawtext_enable(tw_settings)
+    if enable_expr:
+        parts.append(f"enable='{enable_expr}'")
+    return "drawtext=" + ":".join(parts)
+
+
+# ================== 视频尺寸计算 ==================
+def get_video_dimensions(ffprobe_cmd: str, file_path: str) -> Tuple[Optional[int], Optional[int]]:
+    """获取视频原始宽高（不考虑旋转）"""
+    if not ffprobe_cmd or not os.path.exists(file_path):
+        return None, None
+    cmd = [ffprobe_cmd, "-v", "error", "-select_streams", "v:0",
+           "-show_entries", "stream=width,height", "-of", "csv=p=0", file_path]
+    try:
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, creationflags=flags)
+        if result.returncode == 0 and ',' in result.stdout.strip():
+            w_str, h_str = result.stdout.strip().split(',')
+            return int(w_str), int(h_str)
+    except:
+        pass
+    return None, None
+
+def get_video_rotated_dimensions(ffprobe_cmd: str, file_path: str, settings: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+    """获取考虑元数据旋转和用户旋转后的尺寸"""
+    w, h = get_video_dimensions(ffprobe_cmd, file_path)
+    if w is None:
+        return None, None
+    # 检测元数据旋转
+    if ffprobe_cmd:
+        cmd = [ffprobe_cmd, "-v", "error", "-select_streams", "v:0",
+               "-show_entries", "stream=side_data_list", "-of", "json", file_path]
+        try:
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, creationflags=flags)
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                streams = data.get("streams", [])
+                if streams:
+                    side_data = streams[0].get("side_data_list", [])
+                    for sd in side_data:
+                        if sd.get("rotation") is not None:
+                            rot = int(sd.get("rotation"))
+                            if rot % 180 == 90:
+                                w, h = h, w
+                            break
+        except:
+            pass
+    # 用户旋转
+    rotate = settings.get("rotate", "none")
+    if rotate in ("90", "270"):
+        w, h = h, w
+    return w, h
+
+def compute_rendered_size(original_w: int, original_h: int, settings: Dict[str, Any]) -> Tuple[int, int]:
+    """根据设置（裁剪、缩放）计算最终渲染尺寸"""
+    w, h = original_w, original_h
+
+    # --- 防御性检查，避免除零 ---
+    if w == 0 or h == 0:
+        return 0, 0
+
+    # 裁剪
+    if settings.get("crop_enabled", False):
+        crop_w = settings.get("crop_width", "").strip()
+        crop_h = settings.get("crop_height", "").strip()
+        if crop_w and crop_h:
+            def eval_crop(expr):
+                if not expr:
+                    return None
+                expr2 = expr.replace('iw', str(w)).replace('ih', str(h))
+                result = safe_eval_expr(expr2, {})
+                return result if result is not None else None
+            cw = eval_crop(crop_w)
+            ch = eval_crop(crop_h)
+            if cw and ch and cw > 0 and ch > 0:
+                w, h = cw, ch
+    # 缩放
+    if settings.get("scale_enabled", False):
+        method = settings.get("scale_method", "width")
+        sw = settings.get("scale_width", "").strip()
+        sh = settings.get("scale_height", "").strip()
+        try:
+            if method == "width" and sw:
+                target_w = int(float(sw))
+                target_h = int(round(target_w * h / w))
+                w, h = target_w, target_h
+            elif method == "height" and sh:
+                target_h = int(float(sh))
+                target_w = int(round(target_h * w / h))
+                w, h = target_w, target_h
+            elif method == "exact" and sw and sh:
+                w, h = int(float(sw)), int(float(sh))
+        except:
+            pass
+    return w, h
+
+# ================== 子进程执行封装 ==================
+def run_ffmpeg_command(cmd: List[str], on_output_line: Optional[Callable] = None, timeout: Optional[float] = None) -> Tuple[int, str]:
+    """
+    执行 FFmpeg 命令，实时输出行。返回 (返回码, 完整stderr文本)
+    cmd: 列表形式的命令参数
+    """
+    full_output = []
+    try:
+        proc = subprocess.Popen(cmd, shell=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, encoding='utf-8', errors='replace',
+                                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        for line in proc.stdout:
+            full_output.append(line)
+            if on_output_line:
+                on_output_line(line)
+        proc.wait(timeout=timeout)
+        return proc.returncode, "".join(full_output)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return -1, "进程超时被终止"
+    except Exception as e:
+        return -1, str(e)
+
+def ffprobe_json(ffprobe_cmd: str, file_path: str) -> Optional[Dict[str, Any]]:
+    """调用 ffprobe 获取媒体信息的 JSON 格式"""
+    if not ffprobe_cmd or not os.path.exists(file_path):
+        return None
+    cmd = [ffprobe_cmd, "-v", "error", "-print_format", "json", "-show_streams", file_path]
+    try:
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        res = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', creationflags=flags, timeout=10)
+        if res.returncode != 0:
+            return None
+        data = json.loads(res.stdout)
+        if "streams" not in data:
+            return None
+        return data
+    except:
+        return None
+
+def detect_crop(ffmpeg_cmd: str, input_file: str, timeout: float = 15) -> Optional[Tuple[int, int, int, int]]:
+    """自动检测黑边，返回 (w, h, x, y) 或 None"""
+    if not ffmpeg_cmd or not os.path.exists(input_file):
+        return None
+    cmd = [
+        ffmpeg_cmd, "-i", input_file,
+        "-t", "5",
+        "-vf", "cropdetect=limit=0.1:round=2",
+        "-f", "null", "-"
+    ]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding='utf-8', errors='replace',
+                                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        _, stderr = proc.communicate(timeout=timeout)
+        pattern = re.compile(r'crop=(\d+):(\d+):(\d+):(\d+)')
+        matches = pattern.findall(stderr)
+        if not matches:
+            return None
+        w, h, x, y = map(int, matches[-1])
+        return w, h, x, y
+    except:
+        return None
+
+# ================== 播放器预览 ==================
+def launch_player(file_path: str, filters: str = "", audio_only: bool = False, volume: int = 10,
+                  extra_args: Optional[List[str]] = None,
+                  use_mpv: bool = False, mpv_path: str = "mpv", ffplay_path: Optional[str] = None):
+    """安全启动播放器预览，列表模式 + 等号参数（兼容 mpv）"""
+    file_path = normalize_path(file_path)
+    extra_args = extra_args or []
+
+    if audio_only:
+        if use_mpv:
+            player = mpv_path.strip() or "mpv"
+            cmd = [player, file_path]
+        else:
+            if not ffplay_path:
+                return
+            cmd = [ffplay_path, "-nodisp", "-autoexit", "-volume", str(volume), file_path]
+    else:
+        if use_mpv:
+            player = mpv_path.strip() or "mpv"
+            cmd = [player, file_path]
+            if filters and filters.strip():
+                # 与预览分支一致：mpv 用 lavfi=[...] 解析 libavfilter 滤镜图，不再用 lavfi=graph 或裸 --vf
+                cmd.append(f"--vf=lavfi=[{filters}]")
+            if extra_args:
+                cmd.extend(extra_args)
+        else:
+            if not ffplay_path:
+                return
+            cmd = [ffplay_path, "-i", file_path]
+            if filters and filters.strip():
+                cmd.extend(["-vf", filters])
+            cmd.extend(["-volume", str(volume)])
+            if extra_args:
+                cmd.extend(extra_args)
+            if "-window_title" not in cmd:
+                cmd.extend(["-window_title", f"预览: {os.path.basename(file_path)}"])
+
+    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
+    except Exception as e:
+        print(_("预览失败: {0}".format(e)))
+
+# ================== FFmpeg 编码器选项 ==================
+ALL_VIDEO_ENCODERS = [
+    "copy", "libx264", "libx265", "libvpx-vp9", "libsvtav1", "mpeg4", "libxvid", "libtheora",
+    "h264_nvenc", "hevc_nvenc", "av1_nvenc",
+    "h264_qsv", "hevc_qsv", "av1_qsv",
+    "h264_amf", "hevc_amf", "av1_amf",
+    "h264_vaapi", "hevc_vaapi",
+    "h264_videotoolbox", "hevc_videotoolbox",
+    "prores_ks", "prores_aw", "dnxhdenc", "ffv1", "libopenjpeg", "gif", "libwebp"
+]
+
+ALL_AUDIO_ENCODERS = ["copy", "aac", "libmp3lame", "opus", "ac3", "eac3",
+                      "flac", "alac", "pcm_s16le", "libfdk_aac"]
+
+HARDWARE_DECODER_OPTIONS = [
+    "无",
+    "cuda (NVIDIA通用)",
+    "qsv (Intel通用)",
+    "vaapi (Linux VAAPI)",
+    "amf (AMD通用)",
+    "videotoolbox (macOS)"
+]
+
+DECODER_MAP = {
+    "cuda (NVIDIA通用)": "cuda",
+    "qsv (Intel通用)": "qsv",
+    "vaapi (Linux VAAPI)": "vaapi",
+    "amf (AMD通用)": "amf",
+    "videotoolbox (macOS)": "videotoolbox",
+    "无": "none"
+}
+
+# ----- 滤镜硬件加速模式（软件 / NVIDIA / Intel QSV / AMD） -----
+HW_FILTER_MODE_OPTIONS = ["软件 (CPU)", "NVIDIA CUDA", "Intel QSV", "AMD VAAPI/AMF"]
+HW_FILTER_MODE_MAP = {
+    "软件 (CPU)": "cpu",
+    "NVIDIA CUDA": "cuda",
+    "Intel QSV": "qsv",
+    "AMD VAAPI/AMF": "vaapi",
+}
+
+# 片段/剪辑翻转下拉的固定命令值（显示文本经 _() 翻译，但内部值保持中文以匹配命令构建）
+FLIP_CMD_VALUES = ["无", "水平翻转", "垂直翻转", "水平+垂直"]
+
+# ----- 下拉框「无 / None」哨兵：显示文本经 _() 翻译，命令值恒为 "none" -----
+def _disp_to_cmd(v):
+    """下拉显示值 -> FFmpeg 命令值。仅哨兵「无 / None」需映射，其余（已是命令 token）原样返回。"""
+    if v is None:
+        return "none"
+    if v in ("无", "None"):
+        return "none"
+    return v
+
+def _cmd_to_disp(v):
+    """FFmpeg 命令值 -> 当前语言显示。none / 无 -> 无 / None，其余原样返回。"""
+    if v is None or v in ("none", "无"):
+        return _("无")
+    return v
+
+# 硬件解码下拉：显示文本（哨兵与描述均经 _() 翻译）与命令值一一对应
+HW_DECODER_CMD = ["none", "cuda", "qsv", "vaapi", "amf", "videotoolbox"]
+HW_DECODER_DISPLAY = [_("无"), _("cuda (NVIDIA通用)"), _("qsv (Intel通用)"),
+                      _("vaapi (Linux VAAPI)"), _("amf (AMD通用)"), _("videotoolbox (macOS)")]
+
+def _hwaccel_disp_to_cmd(disp):
+    """硬件解码显示值 -> 命令值；旧预设的「cuda (NVIDIA通用)」等经 DECODER_MAP 兜底。"""
+    try:
+        return HW_DECODER_CMD[HW_DECODER_DISPLAY.index(disp)]
+    except ValueError:
+        return DECODER_MAP.get(disp, _disp_to_cmd(disp))
+
+def _hwaccel_cmd_to_disp(cmd):
+    """硬件解码命令值 -> 当前语言显示（精确匹配下拉项）。"""
+    try:
+        return HW_DECODER_DISPLAY[HW_DECODER_CMD.index(cmd)]
+    except ValueError:
+        return _cmd_to_disp(cmd)
+
+# 滤镜加速模式 -> 切换时自动匹配的解码器命令值（经 _cmd_to_disp 翻译为显示）
+HW_MODE_DECODER = {
+    "cuda": "cuda",
+    "qsv": "qsv",
+    "vaapi": "amf",
+}
+HW_MODE_ENCODER = {
+    "cuda": "hevc_nvenc",
+    "qsv": "hevc_qsv",
+    "vaapi": "hevc_amf",
+}
+
+# ----- 提示类 -----
+class ToolTip:
+    def __init__(self, widget, text, offset_x=15, offset_y=15, wraplength=400):
+        self.widget = widget
+        self.text = text
+        self.offset_x = offset_x
+        self.offset_y = offset_y
+        self.wraplength = wraplength
+        self.tip_window = None
+        widget.bind('<Enter>', self.show_tip)
+        widget.bind('<Leave>', self.hide_tip)
+
+    def show_tip(self, event=None):
+        if self.tip_window:
+            self.hide_tip()
+        mouse_x = self.widget.winfo_pointerx()
+        mouse_y = self.widget.winfo_pointery()
+        ideal_x = mouse_x + self.offset_x
+        ideal_y = mouse_y + self.offset_y
+        self.tip_window = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{ideal_x}+{ideal_y}")
+        label = tk.Label(tw, text=self.text, justify=tk.LEFT,
+                         background="#ffffe0", relief=tk.SOLID, borderwidth=1,
+                         wraplength=self.wraplength)
+        label.pack()
+        tw.update_idletasks()
+        win_width = tw.winfo_width()
+        win_height = tw.winfo_height()
+        screen_width = tw.winfo_screenwidth()
+        screen_height = tw.winfo_screenheight()
+        x = max(0, min(ideal_x, screen_width - win_width))
+        y = max(0, min(ideal_y, screen_height - win_height))
+        if x <= mouse_x <= x + win_width and y <= mouse_y <= y + win_height:
+            dx = 10 if ideal_x < screen_width // 2 else -10
+            dy = 10 if ideal_y < screen_height // 2 else -10
+            x = max(0, min(ideal_x + dx, screen_width - win_width))
+            y = max(0, min(ideal_y + dy, screen_height - win_height))
+        tw.wm_geometry(f"+{x}+{y}")
+
+    def hide_tip(self, event=None):
+        if self.tip_window:
+            self.tip_window.destroy()
+            self.tip_window = None
+
+
+
+
+# ================== 参数校验器 ==================
+class ParamValidator:
+    @staticmethod
+    def validate_crf(value, encoder):
+        if encoder in ("libx264", "libx265", "libvpx-vp9", "libsvtav1", "mpeg4", "libxvid"):
+            if not 0 <= value <= 51:
+                return False, "CRF 值必须在 0~51 之间"
+        return True, ""
+
+    @staticmethod
+    def validate_cq(value):
+        if not 0 <= value <= 51:
+            return False, "CQ 值必须在 0~51 之间"
+        return True, ""
+
+    @staticmethod
+    def validate_global_quality(value):
+        if not 1 <= value <= 51:
+            return False, "Global Quality 值必须在 1~51 之间"
+        return True, ""
+
+    @staticmethod
+    def validate_bitrate(value):
+        s = value.strip().lower()
+        if s.endswith('k'):
+            s = s[:-1]
+        if s.isdigit():
+            return True, ""
+        return False, "比特率格式应为纯数字或数字+k，例如 1900 或 1900k"
+
+    @staticmethod
+    def validate_settings(settings):
+        errors = []
+        rc = settings.get("rate_control_type")
+        encoder = settings.get("encoder")
+        if rc == "crf":
+            ok, msg = ParamValidator.validate_crf(settings.get("crf_value", 25), encoder)
+            if not ok: errors.append(msg)
+        elif rc == "cq":
+            ok, msg = ParamValidator.validate_cq(settings.get("cq_value", 35))
+            if not ok: errors.append(msg)
+        elif rc == "global_quality":
+            ok, msg = ParamValidator.validate_global_quality(settings.get("global_quality", 28))
+            if not ok: errors.append(msg)
+        elif rc == "bitrate":
+            ok, msg = ParamValidator.validate_bitrate(settings.get("bitrate_video", "1900k"))
+            if not ok: errors.append(msg)
+        audio_bitrate = settings.get("audio_bitrate", "")
+        if audio_bitrate:
+            ok, msg = ParamValidator.validate_bitrate(audio_bitrate)
+            if not ok:
+                errors.append(f"音频比特率: {msg}")
+        return errors
+
+# ================== 编码器策略 ==================
+class EncoderStrategy:
+    def build_params(self, cmd_list: List[str], settings: Dict[str, Any]) -> List[str]:
+        raise NotImplementedError
+
+class SoftwareEncoderStrategy(EncoderStrategy):
+    def build_params(self, cmd_list: List[str], settings: Dict[str, Any]) -> List[str]:
+        vcodec = settings["encoder"]
+        rc = settings["rate_control_type"]
+        preset = settings.get("preset", "medium")
+        cmd_list.extend(["-c:v", vcodec, "-preset", preset])
+        
+        # 高级参数（settings 中 tune/profile/level 已为命令值，哨兵为 "none"）
+        tune = settings.get("tune", "").strip()
+        if tune and tune != "none":
+            cmd_list.extend(["-tune", tune])
+
+        profile = settings.get("profile", "").strip()
+        if profile and profile != "none":
+            cmd_list.extend(["-profile:v", profile])
+
+        level = settings.get("level", "").strip()
+        if level and level != "none":
+            cmd_list.extend(["-level:v", level])
+
+        maxrate = settings.get("maxrate", "").strip()
+        if maxrate:
+            cmd_list.extend(["-maxrate", maxrate + "k"])
+        bufsize = settings.get("bufsize", "").strip()
+        if bufsize:
+            cmd_list.extend(["-bufsize", bufsize + "k"])
+        
+        if rc == "crf":
+            cmd_list.extend(["-crf", str(settings['crf_value'])])
+        elif rc == "bitrate":
+            bitrate = fix_bitrate_value(settings["bitrate_video"])
+            cmd_list.extend(["-b:v", bitrate or '1000k'])
+        return cmd_list
+
+class NVENCEncoderStrategy(EncoderStrategy):
+    def build_params(self, cmd_list: List[str], settings: Dict[str, Any]) -> List[str]:
+        vcodec = settings["encoder"]
+        preset = settings.get("preset", "p4")
+        rc = settings["rate_control_type"]
+        cmd_list.extend(["-c:v", vcodec, "-preset", preset])
+        if rc == "cq":
+            cmd_list.extend(["-cq", str(settings['cq_value'])])
+        elif rc == "bitrate":
+            bitrate = fix_bitrate_value(settings["bitrate_video"])
+            cmd_list.extend(["-b:v", bitrate or '1000k'])
+        
+
+        maxrate = settings.get("maxrate", "").strip()
+        if maxrate:
+            cmd_list.extend(["-maxrate", maxrate + "k"])
+        bufsize = settings.get("bufsize", "").strip()
+        if bufsize:
+            cmd_list.extend(["-bufsize", bufsize + "k"])
+        return cmd_list
+
+class QSVEncoderStrategy(EncoderStrategy):
+    def build_params(self, cmd_list: List[str], settings: Dict[str, Any]) -> List[str]:
+        vcodec = settings["encoder"]
+        preset = settings.get("preset", "p4")
+        rc = settings["rate_control_type"]
+        cmd_list.extend(["-c:v", vcodec, "-preset", preset])
+        if rc == "global_quality":
+            cmd_list.extend(["-global_quality", str(settings['global_quality'])])
+        elif rc == "bitrate":
+            bitrate = fix_bitrate_value(settings["bitrate_video"])
+            cmd_list.extend(["-b:v", bitrate or '1000k'])
+        
+        maxrate = settings.get("maxrate", "").strip()
+        if maxrate:
+            cmd_list.extend(["-maxrate", maxrate + "k"])
+        bufsize = settings.get("bufsize", "").strip()
+        if bufsize:
+            cmd_list.extend(["-bufsize", bufsize + "k"])
+        return cmd_list
+
+class OtherEncoderStrategy(EncoderStrategy):
+    def build_params(self, cmd_list: List[str], settings: Dict[str, Any]) -> List[str]:
+        vcodec = settings["encoder"]
+        # JPEG 2000 (libopenjpeg)：用压缩级别控制质量，不使用比特率
+        if vcodec == "libopenjpeg":
+            cl = settings.get("compression_level", 20)
+            cmd_list.extend(["-c:v", "libopenjpeg", "-compression_level", str(cl)])
+            return cmd_list
+        bitrate = fix_bitrate_value(settings["bitrate_video"])
+        cmd_list.extend(["-c:v", vcodec, "-b:v", bitrate or '1000k'])
+        
+        # 预设参数（不同编码器不同）
+        preset = settings.get("preset", "").strip()
+        if preset:
+            if vcodec in ("h264_amf", "hevc_amf", "av1_amf"):
+                cmd_list.extend(["-quality", preset])
+            elif vcodec in ("h264_vaapi", "hevc_vaapi"):
+                cmd_list.extend(["-compression_level", preset])
+            elif vcodec in ("h264_videotoolbox", "hevc_videotoolbox"):
+                cmd_list.extend(["-quality", preset])
+            elif vcodec in ("prores_ks", "prores_aw"):
+                pass
+            else:
+                cmd_list.extend(["-preset", preset])
+        
+
+        maxrate = settings.get("maxrate", "").strip()
+        if maxrate:
+            cmd_list.extend(["-maxrate", maxrate + "k"])
+        bufsize = settings.get("bufsize", "").strip()
+        if bufsize:
+            cmd_list.extend(["-bufsize", bufsize + "k"])
+        return cmd_list
+
+def get_encoder_strategy(encoder: str) -> EncoderStrategy:
+    if encoder in ("libx264", "libx265", "libvpx-vp9", "libsvtav1", "mpeg4", "libxvid", "libtheora"):
+        return SoftwareEncoderStrategy()
+    elif encoder in ("h264_nvenc", "hevc_nvenc", "av1_nvenc"):
+        return NVENCEncoderStrategy()
+    elif encoder in ("h264_qsv", "hevc_qsv", "av1_qsv"):
+        return QSVEncoderStrategy()
+    else:
+        return OtherEncoderStrategy()
+
+# ================== 视频编码与质量组件 ==================
+class VideoEncoderFrame(ttk.LabelFrame):
+
+    ENCODER_PROFILES = {
+        # 软件编码
+        "libx264":    ["无", "baseline", "main", "high", "high10", "high422", "high444"],
+        "libx265":    ["无", "main", "main10", "main422-10", "main444-8", "main444-10"],
+        "libvpx-vp9": ["无", "0", "1", "2", "3"],
+        "libsvtav1":  ["无", "main", "high", "professional"],
+        "mpeg4":      ["无"],
+        "libxvid":    ["无"],
+        "libtheora":  ["无"],
+
+        # NVIDIA NVENC
+        "h264_nvenc": ["无", "baseline", "main", "high"],
+        "hevc_nvenc": ["无", "main", "main10"],
+        "av1_nvenc":  ["无", "main", "high", "professional"],
+
+        # Intel QSV
+        "h264_qsv":   ["无", "baseline", "main", "high"],
+        "hevc_qsv":   ["无", "main", "main10"],
+        "av1_qsv":    ["无", "main", "high", "professional"],
+
+        # AMD AMF
+        "h264_amf":   ["无", "baseline", "main", "high"],
+        "hevc_amf":   ["无", "main", "main10"],
+        "av1_amf":    ["无", "main", "high", "professional"],
+
+        # VAAPI
+        "h264_vaapi": ["无", "baseline", "main", "high"],
+        "hevc_vaapi": ["无", "main", "main10"],
+
+        # VideoToolbox
+        "h264_videotoolbox": ["无", "baseline", "main", "high"],
+        "hevc_videotoolbox": ["无", "main", "main10"],
+
+        # 专业格式
+        "prores_ks":  ["无", "proxy", "lt", "standard", "hq", "4444", "4444xq"],
+        "prores_aw":  ["无", "standard", "hq", "4444"],
+        "dnxhdenc":   ["无"],
+        "ffv1":       ["无"],
+        "libopenjpeg":["无"],
+
+        # 图片/动图
+        "gif":        ["无"],
+        "libwebp":    ["无"],
+    }
+    DEFAULT_PROFILES = ["无"]
+
+    ENCODER_PRESETS = {
+        # 软件编码（libx264/libx265 等）
+        "libx264":    ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"],
+        "libx265":    ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"],
+        "libvpx-vp9": ["good", "best", "rt"],   # VP9 的预设
+        "libsvtav1":  ["0", "1", "2", "3", "4", "5", "6", "7", "8"],   # SVT-AV1 预设 0~8，速度从快到慢
+        "mpeg4":      ["medium"],
+        "libxvid":    ["medium"],
+        "libtheora":  ["medium"],
+
+        # NVENC
+        "h264_nvenc": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
+        "hevc_nvenc": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
+        "av1_nvenc":  ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
+
+        # Intel QSV
+        "h264_qsv":   ["veryfast", "faster", "fast", "medium", "slow", "slower"],
+        "hevc_qsv":   ["veryfast", "faster", "fast", "medium", "slow", "slower"],
+        "av1_qsv":    ["veryfast", "faster", "fast", "medium", "slow", "slower"],
+
+        # AMD AMF (常用)
+        "h264_amf":   ["quality", "speed", "balanced"],
+        "hevc_amf":   ["quality", "speed", "balanced"],
+        "av1_amf":    ["quality", "speed", "balanced"],
+
+        # VAAPI (Linux)
+        "h264_vaapi": ["7", "1"],
+        "hevc_vaapi": ["7", "1"],
+
+        # VideoToolbox (macOS)
+        "h264_videotoolbox": ["default", "quality", "speed"],
+        "hevc_videotoolbox": ["default", "quality", "speed"],
+
+        # 专业格式/无损（一般无预设或只支持默认）
+        "prores_ks":  ["standard", "hq", "4444", "4444xq"],
+        "prores_aw":  ["standard", "hq", "4444"],
+        "dnxhdenc":   ["medium"],
+        "ffv1":       ["medium"],
+        "libopenjpeg":["medium"],
+        "gif":        ["medium"],
+        "libwebp":    ["default", "photo", "picture", "drawing", "icon", "text"],
+    }
+    DEFAULT_PRESETS = ["medium"]   # 未知编码器 fallback
+
+
+    def __init__(self, parent, app, refresh_callback=None, **kwargs):
+        super().__init__(parent, text=_("视频编码与质量"), padding="5", **kwargs)
+        self.app = app                     # 保存主界面引用
+        self.refresh_callback = refresh_callback
+        self._suppress_update = False
+        self._last_encoder = None          # 用于记录上次编码器
+        self._suppress_copy_hint = False   # 加载预设时禁止提示
+        self.create_widgets()
+        self.setup_bindings()
+
+    def create_widgets(self):
+        self.encoder_label = ttk.Label(self, text=_("编码器:"))
+        self.encoder_label.grid(row=0, column=0, sticky="w", padx=5, pady=2)
+        ToolTip(self.encoder_label,
+                _("【编码器分类说明】\n"
+                "• 流复制: copy (直接复制流，不重新编码)\n"
+                "• 软件编码: libx264, libx265, libvpx-vp9, libsvtav1, mpeg4, libxvid, libtheora\n"
+                "  兼容性好，画质优，适合通用场景\n"
+                "• NVIDIA NVENC: h264_nvenc, hevc_nvenc, av1_nvenc\n"
+                "  硬件加速，编码速度快，适合实时处理\n"
+                "• Intel QSV: h264_qsv, hevc_qsv, av1_qsv\n"
+                "  Intel 集显硬件加速，低功耗\n"
+                "• AMD AMF: h264_amf, hevc_amf, av1_amf\n"
+                "  AMD 显卡硬件加速\n"
+                "• 其他硬件: h264_vaapi, hevc_vaapi (Linux VAAPI),\n"
+                "  h264_videotoolbox, hevc_videotoolbox (macOS)\n"
+                "• 专业/无损格式: prores_ks, prores_aw, dnxhdenc, ffv1, libopenjpeg\n"
+                "  libopenjpeg=JPEG 2000 编码：输出容器请选 jp2(单图) 或 mj2(视频)，\n"
+                "  仅支持 J2K 的软件(ffplay/mpv/专业工具)可查看，普通播放器大多不支持\n"
+                "• 图片/动图: gif, libwebp\n"
+                "提示: 硬件编码速度快但画质可能略逊，软件编码兼容性最佳。\n"
+                "• 硬件编码还需要 FFmpeg 版本和显卡 API 对应。\n"),
+                wraplength=600)
+
+        self.vcodec = tk.StringVar(value="libx265")
+        self.vcodec_combo = ttk.Combobox(self, textvariable=self.vcodec,
+                                         values=ALL_VIDEO_ENCODERS, state="readonly", width=18)
+        self.vcodec_combo.grid(row=0, column=1, sticky="w", padx=5, pady=2)
+        # 记录用户当前的软件编码器，切换硬件滤镜模式时保护，恢复 CPU 时还原
+        self._saved_software_encoder = self.vcodec.get() if not _is_gpu_encoder(self.vcodec.get()) else "libx265"
+
+        preset_frame = ttk.Frame(self)
+        preset_frame.grid(row=0, column=2, sticky="w", padx=5, pady=2)
+        preset_label = ttk.Label(preset_frame, text=_("编码预设:"))
+        preset_label.pack(side=tk.LEFT, padx=(0,5))
+        ToolTip(preset_label,
+                _("编码预设控制速度与压缩效率的平衡，推荐保持默认 medium。\n\n"
+                "• 软件编码器：ultrafast ~ veryslow（速度递减，画质/压缩率递增）\n"
+                "• NVENC 硬件：p1 ~ p7（p1 最快，p7 画质最好）\n"
+                "• QSV 硬件：veryfast ~ slower（类似软件预设）\n"
+                "• AMF 硬件：quality / speed / balanced\n"
+                "• 其他编码器请参考 FFmpeg 文档"),
+                wraplength=500)
+
+        self.preset = tk.StringVar(value="medium")
+        self.preset_combo = ttk.Combobox(preset_frame, textvariable=self.preset,
+                                         values=[],          # ← 初始为空
+                                         state="readonly", width=12)
+        self.preset_combo.pack(side=tk.LEFT)
+
+
+        ttk.Label(self, text=_("码率控制:")).grid(row=2, column=0, sticky="w", padx=5, pady=2)
+        self.rate_control_type = tk.StringVar(value="crf")
+        rc_frame = ttk.Frame(self)
+        rc_frame.grid(row=2, column=1, columnspan=2, sticky="w", padx=5, pady=2)
+        for text, val in [(_("CRF (CPU)"), "crf"), (_("CQ (NVENC)"), "cq"),
+                          (_("Global Quality (QSV)"), "global_quality"), (_("固定比特率"), "bitrate"),
+                          (_("压缩级别 (J2K)"), "compression")]:
+            rb = ttk.Radiobutton(rc_frame, text=text, variable=self.rate_control_type,
+                                 value=val)
+            rb.pack(side=tk.LEFT, padx=2)
+            if val == "compression":
+                ToolTip(rb,
+                        _("JPEG 2000（.jp2 单图 / .mj2 视频）专用的质量控制方式。\n"
+                        "该格式基于小波变换（而非普通 JPEG 的离散余弦变换），支持无损压缩与超高分辨率，\n"
+                        "一般用于：数字电影发行母版（DCI）、医学影像（DICOM）、专业无损归档、广播级制作。\n\n"
+                        "普通播放器大多不支持此格式，需用 ffplay / mpv 或专业软件查看。\n"
+                        "压缩级别 1~100，数值越大压缩越强、文件越小（质量越低）。\n\n"
+                        "输出容器请选 jp2（单张静帧）或 mj2（视频流）；视频转码一般用 mj2，\n"
+                        "可在上方「输出容器」下拉中找到这两项。"),
+                        wraplength=520)
+
+        self.dynamic_frame = ttk.Frame(self)
+        self.dynamic_frame.grid(row=3, column=0, columnspan=3, sticky="we", pady=0, padx=5)
+
+        self.crf_value = tk.IntVar(value=25)
+        self.cq_value = tk.IntVar(value=35)
+        self.global_quality = tk.IntVar(value=28)
+        self.bitrate_video = tk.StringVar(value="1900k")
+        self.compression_level = tk.IntVar(value=20)
+
+        self.update_dynamic_controls()
+
+        # GIF 选项按钮（初始隐藏）
+        self.gif_btn_frame = ttk.Frame(self)
+        self.gif_btn_frame.grid(row=4, column=0, columnspan=3, sticky="we", pady=5, padx=5)
+        self.gif_btn_frame.grid_remove()  # 默认隐藏
+        
+        self.gif_options_btn = ttk.Button(self.gif_btn_frame, text=_("GIF 输出选项..."), command=self.open_gif_options)
+        self.gif_options_btn.pack(side=tk.LEFT)
+
+        # 高级选项面板
+        self.advanced_frame = ttk.Frame(self)
+        self.advanced_frame.grid(row=4, column=0, columnspan=3, sticky="we", pady=5, padx=5)
+        # 默认隐藏
+        self.advanced_frame.grid_remove()
+
+        # 在 advanced_frame 中添加控件
+        row1 = ttk.Frame(self.advanced_frame)
+        row1.pack(fill=tk.X, pady=2)
+        
+        # tune
+        tune_label = ttk.Label(row1, text="tune:")
+        tune_label.pack(side=tk.LEFT)
+        ToolTip(tune_label,
+                _("针对特定内容类型优化编码参数（主要适用于软件编码器）：\n"
+                "• film: 高画质电影/真人视频 (H.264)\n"
+                "• animation: 卡通/动画 (H.264)\n"
+                "• grain: 保留胶片颗粒感 (H.264/H.265)\n"
+                "• stillimage: 幻灯片/静态画面 (H.264)\n"
+                "• psnr: 优化 PSNR 指标 (H.264/H.265)\n"
+                "• ssim: 优化 SSIM 指标 (H.264/H.265)\n"
+                "• fastdecode: 加速解码 (H.264/H.265)\n"
+                "• zerolatency: 最低延迟 (H.264/H.265)\n"
+                "• vmaf: 优化 VMAF 分数 (H.264)\n"
+                "• screen: 屏幕内容/录屏优化 (H.264)\n"
+                "提示：硬件编码器及 AV1 通常不支持 tune，请保持默认。"),
+                wraplength=500)
+        self.tune_var = tk.StringVar(value=_("无"))
+        tune_combo = ttk.Combobox(row1, textvariable=self.tune_var,
+                                  values=[_("无"), "film","animation","grain","stillimage","psnr","ssim","fastdecode","zerolatency","vmaf", "screen"],
+                                  state="readonly", width=10)
+        tune_combo.pack(side=tk.LEFT, padx=5)
+
+        
+        # profile
+        profile_label = ttk.Label(row1, text="profile:")
+        profile_label.pack(side=tk.LEFT, padx=(10,0))
+        ToolTip(profile_label,
+                _("如无特殊兼容性要求，建议保持默认（无）。\n\n"
+                "H.264 配置文件：\n"
+                "• baseline: 最广兼容（移动设备）\n"
+                "• main: 主流（电视/广播）\n"
+                "• high: 高清/蓝光（最佳画质）\n"
+                "• high10/high422/high444: 专业/高色深\n\n"
+                "HEVC (H.265) 配置文件：\n"
+                "• main10：10-bit 色深，HDR 视频常用\n"
+                "• main422-10：4:2:2 色度采样，10-bit，专业制作\n"
+                "• main444-8：4:4:4 色度采样，8-bit，无损或高质量\n"
+                "• main444-10：4:4:4 色度采样，10-bit，最高质量\n\n"
+                "AV1 配置文件：\n"
+                "• main: 基本兼容\n"
+                "• high: 支持更高色深和色度采样\n"
+                "• professional: 支持最高质量（10-bit/4:4:4）\n\n"
+                "提示：请根据所选编码器选择对应的 Profile，否则可能报错。"),
+                wraplength=500)
+        self.profile_var = tk.StringVar(value=_("无"))
+        self.profile_combo = ttk.Combobox(
+            row1,
+            textvariable=self.profile_var,
+            values=[],   # 初始为空，由更新函数填充
+            state="readonly",
+            width=10
+        )
+        self.profile_combo.pack(side=tk.LEFT, padx=5)
+
+        
+        # level
+        level_label = ttk.Label(row1, text="level:")
+        level_label.pack(side=tk.LEFT, padx=(10,0))
+        ToolTip(level_label,
+                _("必须配合 Profile 使用！不确定请保持「无」让系统自动匹配。\n\n"
+                "H.264 级别（限制码率、分辨率、帧率）：\n"
+                "• 3.0 ~ 4.2: 720p/1080p 常用\n"
+                "• 5.0 ~ 5.2: 4K 或高码率\n"
+                "• 6.0+: 8K/超高码率\n"
+                "选择过高可能导致设备不兼容，\n"
+                "选择过低可能无法播放高分辨率视频。\n\n"
+                "不同编码格式（H.265/AV1 等）级别规则有所差异，请参考 FFmpeg 文档"),
+                wraplength=500)
+        self.level_var = tk.StringVar(value=_("无"))
+        level_combo = ttk.Combobox(row1, textvariable=self.level_var,
+                                   values=[_("无"), "1.0","1b","1.1","1.2","1.3","2.0","2.1","2.2",
+                                           "3.0","3.1","3.2","4.0","4.1","4.2",
+                                           "5.0","5.1","5.2","6.0","6.1","6.2"],
+                                   state="readonly", width=6)
+        level_combo.pack(side=tk.LEFT, padx=5)
+
+        
+        # 第二行：maxrate, bufsize
+        row2 = ttk.Frame(self.advanced_frame)
+        row2.pack(fill=tk.X, pady=2)
+        maxrate_label = ttk.Label(row2, text=_("最大比特率 (kbps):"))
+        maxrate_label.pack(side=tk.LEFT)
+        ToolTip(maxrate_label,
+                _("设置最大比特率（kbps），用于限制峰值码率。\n"
+                "适用于流媒体或网络传输，避免瞬间码率过高。"),
+                wraplength=400)
+        self.maxrate_var = tk.StringVar(value="")
+        maxrate_entry = ttk.Entry(row2, textvariable=self.maxrate_var, width=8)
+        maxrate_entry.pack(side=tk.LEFT, padx=5)
+
+        
+        bufsize_label = ttk.Label(row2, text=_("缓冲区大小 (kbps):"))
+        bufsize_label.pack(side=tk.LEFT, padx=(10,0))
+        ToolTip(bufsize_label,
+                _("编码器缓冲区大小（kbps）。\n"
+                "通常设为最大比特率的 2 倍左右，\n"
+                "用于控制码率波动的平滑度。"),
+                wraplength=400)
+        self.bufsize_var = tk.StringVar(value="")
+        bufsize_entry = ttk.Entry(row2, textvariable=self.bufsize_var, width=8)
+        bufsize_entry.pack(side=tk.LEFT, padx=5)
+
+
+        # GIF 参数变量（存储实际值）
+        self.gif_loop = tk.IntVar(value=0)
+        self.gif_dither = tk.StringVar(value="bayer")
+        self.gif_bayer_scale = tk.IntVar(value=2)
+        self.gif_max_colors = tk.IntVar(value=256)
+        
+        self._on_gif_codec_toggle()
+        self._update_profile_options()
+        self._update_preset_options()
+
+
+    def _update_preset_options(self, *args):
+        """根据当前编码器动态更新 preset 下拉选项"""
+        encoder = self.vcodec.get()
+        presets = self.ENCODER_PRESETS.get(encoder, self.DEFAULT_PRESETS)
+        self.preset_combo['values'] = presets
+    
+        # 如果当前选中的值不在新列表中，自动设为列表第一个
+        current = self.preset.get()
+        if current not in presets:
+            self.preset.set(presets[0] if presets else "medium")
+
+    def _update_profile_options(self, *args):
+        """根据当前编码器动态更新 profile 下拉选项"""
+        encoder = self.vcodec.get()
+        profiles = self.ENCODER_PROFILES.get(encoder, self.DEFAULT_PROFILES)
+        # 显示文本经 _cmd_to_disp 翻译（哨兵「无」-> 无/None，其余命令 token 不变），避免重复哨兵
+        self.profile_combo['values'] = [_cmd_to_disp(p) for p in profiles]
+
+        # 如果当前选中的值不在新列表中，自动设为 "无"
+        current = self.profile_var.get()
+        if current not in self.profile_combo['values']:
+            self.profile_var.set(_("无"))
+
+    def _on_gif_codec_toggle(self, *args):
+        if self.vcodec.get() == "gif":
+            self.gif_btn_frame.grid()
+            self.advanced_frame.grid_remove()
+        else:
+            self.gif_btn_frame.grid_remove()
+            self.advanced_frame.grid()
+
+    def setup_bindings(self):
+        self.vcodec.trace_add("write", self.auto_set_rate_control_by_codec)
+        self.rate_control_type.trace_add("write", self.on_rate_control_change)
+        self.vcodec.trace_add("write", self._on_gif_codec_toggle)
+        self.vcodec.trace_add("write", self._update_profile_options)
+        self.vcodec.trace_add("write", self._update_preset_options)
+        self.vcodec.trace_add("write", self._on_encoder_changed_for_copy_hint)
+
+
+    def _on_encoder_changed_for_copy_hint(self, *args):
+        """当编码器发生变化时，检测是否切换为 copy，仅在用户交互时提示"""
+        if self._suppress_copy_hint:
+            self._suppress_copy_hint = False
+            return
+    
+        new_encoder = self.vcodec.get()
+        old_encoder = getattr(self, '_last_encoder', None)
+        if old_encoder is None:
+            self._last_encoder = new_encoder
+            return
+    
+        if new_encoder == "copy" and old_encoder != "copy":
+            self._show_copy_hint()
+        self._last_encoder = new_encoder
+    
+    def _show_copy_hint(self):
+        """输出 copy 提示到主界面日志"""
+        if self.app:
+            self.app._append_info_ui(_("当前编码器为 copy，视频滤镜、帧率、像素格式等设置将被忽略。"))
+
+    def open_gif_options(self):
+        win = tk.Toplevel(self)
+        win.title(_("GIF 输出选项"))
+        win.transient(self)
+        win.grab_set()
+        win.withdraw()
+        width, height = 380, 230  # 高度缩小（去掉一行）
+        center_window(win, width, height)
+    
+        main = ttk.Frame(win, padding="10")
+        main.pack(fill=tk.BOTH, expand=True)
+    
+        # 循环次数
+        row1 = ttk.Frame(main)
+        row1.pack(fill=tk.X, pady=5)
+        ttk.Label(row1, text=_("循环次数 (0=无限):")).pack(side=tk.LEFT)
+        loop_var = tk.IntVar(value=self.gif_loop.get())
+        ttk.Spinbox(row1, from_=0, to=1000, width=6, textvariable=loop_var).pack(side=tk.LEFT, padx=5)
+    
+        # 抖动算法 + bayer_scale
+        row2 = ttk.Frame(main)
+        row2.pack(fill=tk.X, pady=5)
+        ttk.Label(row2, text=_("抖动算法:")).pack(side=tk.LEFT)
+        dither_var = tk.StringVar(value=self.gif_dither.get())
+        dither_combo = ttk.Combobox(row2, textvariable=dither_var,
+                                    values=["none", "bayer", "floyd_steinberg", "sierra2_4a"],
+                                    state="readonly", width=15)
+        dither_combo.pack(side=tk.LEFT, padx=5)
+    
+        bayer_frame = ttk.Frame(row2)
+        bayer_frame.pack(side=tk.LEFT, padx=5)
+        ttk.Label(bayer_frame, text="Bayer Scale:").pack(side=tk.LEFT)
+        bayer_scale_var = tk.IntVar(value=self.gif_bayer_scale.get())
+        bayer_spin = ttk.Spinbox(bayer_frame, from_=0, to=5, width=4, textvariable=bayer_scale_var)
+        bayer_spin.pack(side=tk.LEFT, padx=2)
+    
+        def on_dither_change(*args):
+            if dither_var.get() == "bayer":
+                bayer_frame.pack(side=tk.LEFT, padx=5)
+            else:
+                bayer_frame.pack_forget()
+        dither_var.trace_add("write", on_dither_change)
+        on_dither_change()
+    
+        # 调色板大小
+        row3 = ttk.Frame(main)
+        row3.pack(fill=tk.X, pady=5)
+        ttk.Label(row3, text=_("调色板大小 (max_colors):")).pack(side=tk.LEFT)
+        max_colors_var = tk.IntVar(value=self.gif_max_colors.get())
+        ttk.Spinbox(row3, from_=2, to=256, width=6, textvariable=max_colors_var).pack(side=tk.LEFT, padx=5)
+    
+        # 提示信息
+        info_label = ttk.Label(main, text=_("提示：GIF 速度和大小由「视频滤镜」中的帧率控制。"), foreground="gray")
+        info_label.pack(pady=5)
+    
+        # 按钮
+        btn_frame = ttk.Frame(main)
+        btn_frame.pack(fill=tk.X, pady=10)
+        def save():
+            self.gif_loop.set(loop_var.get())
+            self.gif_dither.set(dither_var.get())
+            self.gif_bayer_scale.set(bayer_scale_var.get())
+            self.gif_max_colors.set(max_colors_var.get())
+            if self.refresh_callback:
+                self.refresh_callback()
+            win.destroy()
+        def cancel():
+            win.destroy()
+        ttk.Button(btn_frame, text=_("保存"), command=save).pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text=_("取消"), command=cancel).pack(side=tk.LEFT, padx=10)
+        win.wait_window()
+
+
+    def update_dynamic_controls(self):
+        for widget in self.dynamic_frame.winfo_children():
+            widget.destroy()
+        rc = self.rate_control_type.get()
+        if rc == "crf":
+            frame = ttk.Frame(self.dynamic_frame)
+            frame.pack(fill=tk.X, expand=True)
+            ttk.Label(frame, text=_("CRF (0~51，越小质量越好):")).pack(side=tk.LEFT)
+            self.crf_slider = ttk.Scale(frame, from_=0, to=51, variable=self.crf_value, orient=tk.HORIZONTAL)
+            self.crf_slider.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+            self.crf_label = ttk.Label(frame, text=str(self.crf_value.get()), width=4)
+            self.crf_label.pack(side=tk.LEFT)
+            self.crf_slider.configure(command=lambda v: self.crf_label.config(text=str(int(float(v)))))
+        elif rc == "cq":
+            frame = ttk.Frame(self.dynamic_frame)
+            frame.pack(fill=tk.X, expand=True)
+            ttk.Label(frame, text=_("CQ (0~51，越小质量越好，NVENC):")).pack(side=tk.LEFT)
+            self.cq_slider = ttk.Scale(frame, from_=0, to=51, variable=self.cq_value, orient=tk.HORIZONTAL)
+            self.cq_slider.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+            self.cq_label = ttk.Label(frame, text=str(self.cq_value.get()), width=4)
+            self.cq_label.pack(side=tk.LEFT)
+            self.cq_slider.configure(command=lambda v: self.cq_label.config(text=str(int(float(v)))))
+        elif rc == "global_quality":
+            frame = ttk.Frame(self.dynamic_frame)
+            frame.pack(fill=tk.X, expand=True)
+            ttk.Label(frame, text=_("Global Quality (1~51，越小质量越好，QSV):")).pack(side=tk.LEFT)
+            self.gq_slider = ttk.Scale(frame, from_=1, to=51, variable=self.global_quality, orient=tk.HORIZONTAL)
+            self.gq_slider.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+            self.gq_label = ttk.Label(frame, text=str(self.global_quality.get()), width=4)
+            self.gq_label.pack(side=tk.LEFT)
+            self.gq_slider.configure(command=lambda v: self.gq_label.config(text=str(int(float(v)))))
+        elif rc == "bitrate":
+            frame = ttk.Frame(self.dynamic_frame)
+            frame.pack(fill=tk.X, expand=True)
+            ttk.Label(frame, text=_("固定比特率:")).pack(side=tk.LEFT)
+            self.bitrate_entry = ttk.Entry(frame, textvariable=self.bitrate_video, width=12)
+            self.bitrate_entry.pack(side=tk.LEFT, padx=5)
+            self.bitrate_entry.bind("<FocusOut>", self.fix_bitrate_value)
+        elif rc == "compression":
+            frame = ttk.Frame(self.dynamic_frame)
+            frame.pack(fill=tk.X, expand=True)
+            ttk.Label(frame, text=_("压缩级别 (1~100，越大压缩越强):")).pack(side=tk.LEFT)
+            self.comp_slider = ttk.Scale(frame, from_=1, to=100, variable=self.compression_level, orient=tk.HORIZONTAL)
+            self.comp_slider.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+            self.comp_label = ttk.Label(frame, text=str(self.compression_level.get()), width=4)
+            self.comp_label.pack(side=tk.LEFT)
+            self.comp_slider.configure(command=lambda v: self.comp_label.config(text=str(int(float(v)))))
+
+    def fix_bitrate_value(self, event=None):
+        val = self.bitrate_video.get().strip()
+        if not val:
+            self.bitrate_video.set("1000k")
+        elif re.match(r'^\d+$', val):
+            self.bitrate_video.set(val + "k")
+
+    def on_rate_control_change(self, *args):
+        if getattr(self, '_suppress_update', False):
+            return
+        self.update_dynamic_controls()
+        self.auto_set_codec_by_rate_control()
+        rc = self.rate_control_type.get()
+        # 根据码率控制类型推荐预设，但需检查是否存在
+        if rc in ("crf", "global_quality"):
+            recommended = "medium"
+        elif rc == "cq":
+            recommended = "p4"
+        else:
+            recommended = "medium"
+        # 获取当前预设列表，若推荐值不在列表中，则设为列表第一个
+        available = self.preset_combo['values']
+        if available and recommended in available:
+            self.preset.set(recommended)
+        elif available:
+            self.preset.set(available[0])
+
+    def auto_set_codec_by_rate_control(self):
+        current = self.vcodec.get()
+        if current == "copy":
+            return  # 不要自动改变 copy
+        rc = self.rate_control_type.get()
+        if rc == "crf":
+            if current not in ("libx264", "libx265", "libvpx-vp9", "libsvtav1", "mpeg4", "libxvid"):
+                self.vcodec.set("libx265")
+        elif rc == "cq":
+            if current not in ("h264_nvenc", "hevc_nvenc", "av1_nvenc"):
+                self.vcodec.set("hevc_nvenc")
+                self.preset.set("p4")
+        elif rc == "global_quality":
+            if current not in ("h264_qsv", "hevc_qsv", "av1_qsv"):
+                self.vcodec.set("hevc_qsv")
+        elif rc == "compression":
+            if current != "libopenjpeg":
+                self.vcodec.set("libopenjpeg")
+
+    def auto_set_rate_control_by_codec(self, *args):
+        codec = self.vcodec.get()
+        old_rc = self.rate_control_type.get()
+        new_rc = None
+        if codec in ("libx264", "libx265", "libvpx-vp9", "libsvtav1", "mpeg4", "libxvid", "libtheora"):
+            new_rc = "crf"
+        elif codec in ("h264_nvenc", "hevc_nvenc", "av1_nvenc"):
+            new_rc = "cq"
+        elif codec in ("h264_qsv", "hevc_qsv", "av1_qsv"):
+            new_rc = "global_quality"
+        elif codec in ("h264_amf", "hevc_amf", "av1_amf", "h264_vaapi", "hevc_vaapi",
+                       "h264_videotoolbox", "hevc_videotoolbox", "prores_ks", "prores_aw",
+                       "dnxhdenc", "ffv1", "gif"):
+            new_rc = "bitrate"
+        elif codec == "libopenjpeg":
+            new_rc = "compression"
+        if new_rc and new_rc != old_rc:
+            self.rate_control_type.set(new_rc)
+
+    def get_settings(self):
+        return {
+            "encoder": self.vcodec.get(),
+            "preset": self.preset.get(),
+            "rate_control_type": self.rate_control_type.get(),
+            "crf_value": self.crf_value.get(),
+            "cq_value": self.cq_value.get(),
+            "global_quality": self.global_quality.get(),
+            "bitrate_video": self.bitrate_video.get(),
+            "compression_level": self.compression_level.get(),
+            # GIF 参数
+            "gif_loop": self.gif_loop.get(),
+            "gif_dither": self.gif_dither.get(),
+            "gif_bayer_scale": self.gif_bayer_scale.get(),
+            "gif_max_colors": self.gif_max_colors.get(),
+
+            # 下拉显示值 -> 命令值（哨兵「无/None」-> "none"），保证预设与命令语言无关
+            "tune": _disp_to_cmd(self.tune_var.get()),
+            "profile": _disp_to_cmd(self.profile_var.get()),
+            "level": _disp_to_cmd(self.level_var.get()),
+            "maxrate": self.maxrate_var.get(),
+            "bufsize": self.bufsize_var.get(),
+        }
+
+    def set_settings(self, settings):
+        self._suppress_update = True
+        self._suppress_copy_hint = True
+        try:
+            # 安全获取 preset，若缺失则根据码率控制类型推断默认值
+            preset_val = settings.get("preset")
+            if preset_val is None or preset_val == "":
+                rc = settings.get("rate_control_type", "crf")
+                if rc == "cq":
+                    preset_val = "p4"
+                elif rc == "global_quality":
+                    preset_val = "medium"
+                else:
+                    preset_val = "medium"
+            self.preset.set(preset_val)
+    
+            self.vcodec.set(settings.get("encoder", "libx265"))
+            self._update_profile_options()
+            self._update_preset_options()
+            self.rate_control_type.set(settings.get("rate_control_type", "crf"))
+            self.crf_value.set(settings.get("crf_value", 26))
+            self.cq_value.set(settings.get("cq_value", 35))
+            self.global_quality.set(settings.get("global_quality", 26))
+            self.bitrate_video.set(settings.get("bitrate_video", "1900k"))
+            self.compression_level.set(settings.get("compression_level", 20))
+    
+            # GIF 参数
+            self.gif_loop.set(settings.get("gif_loop", 0))
+            self.gif_dither.set(settings.get("gif_dither", "bayer"))
+            self.gif_bayer_scale.set(settings.get("gif_bayer_scale", 2))
+            self.gif_max_colors.set(settings.get("gif_max_colors", 256))
+            self._on_gif_codec_toggle()
+    
+            # 高级参数（命令值 -> 当前语言显示；旧预设的 "无" 也兼容）
+            self.tune_var.set(_cmd_to_disp(settings.get("tune", "none")))
+            self.profile_var.set(_cmd_to_disp(settings.get("profile", "none")))
+            self.level_var.set(_cmd_to_disp(settings.get("level", "none")))
+            self.maxrate_var.set(settings.get("maxrate", ""))
+            self.bufsize_var.set(settings.get("bufsize", ""))
+    
+        finally:
+            self._suppress_update = False
+            self._suppress_copy_hint = False
+            self._last_encoder = self.vcodec.get()
+            self.update_dynamic_controls()
+
+# ================== 视频滤镜组件 ==================
+class VideoFilterFrame(ttk.LabelFrame):
+    PIX_FMTS = [
+        "yuv420p", "yuv422p", "yuv444p",
+        "yuv420p10le", "yuv422p10le", "yuv444p10le",
+        "p010le", "p016le", "nv12", "nv16",
+        "gbrp", "gbrp10le", "gray", "gray10le", "ya8", "yuva420p"
+    ]
+
+
+
+
+    def __init__(self, parent, app, preview_callback=None, **kwargs):
+        super().__init__(parent, text=_("视频滤镜 (裁剪/旋转/缩放/反交错/像素格式/变速/倒放)"), padding="5", **kwargs)
+        self.app = app
+        self.current_file = None
+        self.current_track = None
+        self.override_settings = None
+        self.get_trim_settings_callback = None
+        self._preview_callback = preview_callback
+        self._visual_crop_start_time = None
+        self.create_widgets()
+
+        # 用于控制裁剪提取线程的取消
+        self._crop_extract_thread = None
+        self._crop_cancel_event = threading.Event()
+
+
+
+        # 去水印/模糊设置
+        self._blur_enabled = tk.BooleanVar(value=False)
+        self._blur_type = tk.StringVar(value="delogo")
+        self._blur_strength = tk.StringVar(value="5")
+        self._blur_x = tk.StringVar(value="0")
+        self._blur_y = tk.StringVar(value="0")
+        self._blur_w = tk.StringVar(value="100")
+        self._blur_h = tk.StringVar(value="100")
+        # 局部模糊：boxblur/gblur 只作用于上面的坐标区域（自动生成 split/overlay 滤镜图）
+        self._blur_region_only = tk.BooleanVar(value=False)
+
+        self.enhance_settings = {
+            "denoise_enabled": False,
+            "denoise_spatial": 4.0,
+            "denoise_temporal": 3.0,
+            "sharpen_enabled": False,
+            "sharpen_strength": 1.0,
+            "ivtc_enabled": False,
+            "deblock_enabled": False,
+            "deblock_strength": 4,
+            "colorspace_enabled": False,
+            "colorspace_matrix": "bt709:bt2020",
+            "eq_brightness": 0.0,
+            "eq_contrast": 1.0,
+            "eq_saturation": 1.0,
+            "eq_gamma": 1.0,
+            "hue_angle": 0.0,
+            "hue_saturation": 0.0,
+        }
+
+
+    def create_widgets(self):
+        main_pane = ttk.Frame(self)
+        main_pane.pack(fill=tk.BOTH, expand=True)
+    
+        left_frame = ttk.Frame(main_pane)
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0,5))
+    
+        # 帧率行
+        line1 = ttk.Frame(left_frame)
+        line1.pack(fill=tk.X, pady=2)
+        ttk.Label(line1, text=_("帧率:")).pack(side=tk.LEFT)
+        self.frame_rate_type = tk.StringVar(value="keep")
+        self.frame_rate_custom = tk.StringVar(value="30")
+        ttk.Radiobutton(line1, text=_("保持源"), variable=self.frame_rate_type,
+                        value="keep").pack(side=tk.LEFT, padx=(5, 0))
+        ttk.Radiobutton(line1, text=_("指定"), variable=self.frame_rate_type,
+                        value="custom").pack(side=tk.LEFT, padx=5)
+        self.fps_combo = ttk.Combobox(
+            line1,
+            textvariable=self.frame_rate_custom,
+            width=9,
+            values=["30", "29.970030", "23.976024", "24", "25", "48", "59.940060", "60", "50", "10", "12"]
+        )
+        self.fps_combo.pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Label(line1, text="fps").pack(side=tk.LEFT, padx=(0, 10))
+    
+        self.subtitle_enabled = tk.BooleanVar(value=False)
+        self.subtitle_path = tk.StringVar()
+
+        subtitle_label = ttk.Label(line1, text=_("烧录字幕:"))
+        subtitle_label.pack(side=tk.LEFT, padx=(2, 5))
+        ToolTip(subtitle_label, 
+                _("将字幕永久嵌入视频画面（硬烧录），需重新编码。\n"
+                "若希望保留独立字幕轨道（流复制），请在「封装/合并」页面添加外部字幕。"))
+        self.subtitle_entry = ttk.Entry(line1, textvariable=self.subtitle_path,
+                                        width=30, state="disabled")
+        self.subtitle_entry.pack(side=tk.LEFT, padx=5)
+        self.browse_subtitle_btn = ttk.Button(line1, text=_("浏览字幕"),
+                                              command=self.browse_subtitle, width=9)
+        self.browse_subtitle_btn.pack(side=tk.LEFT)
+        if not self.subtitle_enabled.get():
+            self.subtitle_entry.config(state="disabled")
+            self.browse_subtitle_btn.config(state="disabled")
+    
+        scale_frame = ttk.Frame(left_frame)
+        scale_frame.pack(fill=tk.X, pady=2)
+        self.scale_enabled = tk.BooleanVar(value=False)
+        self.scale_width = tk.StringVar(value="")
+        self.scale_height = tk.StringVar(value="")
+        self.scale_method = tk.StringVar(value="width")
+        scale_check = ttk.Checkbutton(scale_frame, text=_("启用缩放"), variable=self.scale_enabled)
+        scale_check.pack(side=tk.LEFT)
+        ToolTip(scale_check,
+                _("启用视频缩放功能。\n"
+                "• 宽度(高度自动)：指定宽度，高度按比例自动计算。\n"
+                "• 高度(宽度自动)：指定高度，宽度按比例自动计算。\n"
+                "• 精确宽×高：自定义宽度和高度，可能拉伸画面。\n"
+                "提示：缩放会重新编码视频，编码器为 copy 时无效。"),
+                wraplength=400)
+        ttk.Radiobutton(scale_frame, text=_("宽度(高度自动)"), variable=self.scale_method, value="width").pack(side=tk.LEFT, padx=(10,0))
+        ttk.Entry(scale_frame, textvariable=self.scale_width, width=6).pack(side=tk.LEFT)
+
+        ttk.Radiobutton(scale_frame, text=_("高度(宽度自动)"), variable=self.scale_method, value="height").pack(side=tk.LEFT, padx=10)
+        ttk.Entry(scale_frame, textvariable=self.scale_height, width=6).pack(side=tk.LEFT)
+
+        ttk.Radiobutton(scale_frame, text=_("精确宽×高"), variable=self.scale_method, value="exact").pack(side=tk.LEFT, padx=10)
+        ttk.Entry(scale_frame, textvariable=self.scale_width, width=6).pack(side=tk.LEFT)
+        ttk.Label(scale_frame, text="×").pack(side=tk.LEFT)
+        ttk.Entry(scale_frame, textvariable=self.scale_height, width=6).pack(side=tk.LEFT)
+        ttk.Button(scale_frame, text="⇄", command=self._swap_width_height, width=3).pack(side=tk.LEFT, padx=2)
+    
+        crop_frame = ttk.Frame(left_frame)
+        crop_frame.pack(fill=tk.X, pady=2)
+        self.crop_enabled = tk.BooleanVar(value=False)
+        self.crop_left = tk.StringVar(value="0")
+        self.crop_top = tk.StringVar(value="0")
+        self.crop_width = tk.StringVar(value="iw/2")
+        self.crop_height = tk.StringVar(value="ih")
+        crop_check = ttk.Checkbutton(crop_frame, text=_("启用裁剪"), variable=self.crop_enabled)
+        crop_check.pack(side=tk.LEFT)
+        ToolTip(crop_check, 
+                _("裁剪滤镜 (crop) 使用说明：\n"
+                "格式：crop=宽:高:左:上\n"
+                "支持表达式：iw(原宽), ih(原高), 算术运算(如 iw/2, ih-100)\n"
+                "\n"
+                "注意事项：\n"
+                "• 宽和高 必须为正整数或运算结果为正数！\n"
+                "• 宽/高 不能为 0 或负数，也不支持 -2 自动计算（与 scale 不同）\n"
+                "• 左/上 可以为 0 或正整数，超出视频边缘会报错\n"
+                "• 例如裁剪右半部分：宽=iw/2, 左=iw/2, 高=ih, 上=0\n"
+                "• 例如裁剪上半部分：宽=iw, 高=ih/2, 左=0, 上=0\n"
+                "• 如果宽高为奇数，FFmpeg 会自动向下取整，一般不影响播放"),
+                wraplength=400)
+        ttk.Label(crop_frame, text=_("宽:")).pack(side=tk.LEFT)
+        ttk.Entry(crop_frame, textvariable=self.crop_width, width=6).pack(side=tk.LEFT)
+        ttk.Label(crop_frame, text=_("高:")).pack(side=tk.LEFT)
+        ttk.Entry(crop_frame, textvariable=self.crop_height, width=6).pack(side=tk.LEFT)
+        ttk.Label(crop_frame, text=_("左:")).pack(side=tk.LEFT, padx=(10,0))
+        ttk.Entry(crop_frame, textvariable=self.crop_left, width=6).pack(side=tk.LEFT)
+        ttk.Label(crop_frame, text=_("上:")).pack(side=tk.LEFT)
+        ttk.Entry(crop_frame, textvariable=self.crop_top, width=6).pack(side=tk.LEFT)
+
+        # 自动检测黑边按钮
+        auto_crop_btn = ttk.Button(crop_frame, text=_("自动去黑边"),
+                                   command=self.auto_detect_crop, width=9)
+        auto_crop_btn.pack(side=tk.LEFT, padx=(10,0))
+        ToolTip(auto_crop_btn,
+                _("自动分析当前输入文件，获取裁剪参数（去除四周黑边）。\n"
+                "参数说明：\n"
+                "• 分析帧数：检测多少帧画面（默认10帧）。帧数越多越准确，但耗时稍长；\n"
+                "• round：裁剪宽/高对齐数值（默认2，保证偶数）。设为16可满足旧编码器兼容性；\n"
+                "• 检测从第1帧开始（skip=0）。若第一帧为黑屏，请手动增加分析帧数或跳过片头。\n"
+                "可根据截取起始时间或者可视化窗口内自定义时间获取需要片段的黑边参数。\n"
+                "检测仅需约0.5秒，可快速尝试调整参数。"),
+                wraplength=600)
+
+        # 增加分析帧数和round设置
+        ttk.Label(crop_frame, text=_("帧:")).pack(side=tk.LEFT, padx=(5,0))
+        self.crop_detect_frames = tk.StringVar(value="10")
+        frames_spin = ttk.Spinbox(crop_frame, from_=1, to=100, width=3, textvariable=self.crop_detect_frames)
+        frames_spin.pack(side=tk.LEFT, padx=2)
+        ttk.Label(crop_frame, text="Rd:").pack(side=tk.LEFT, padx=(5,0))
+        self.crop_detect_round = tk.StringVar(value="2")
+        round_spin = ttk.Spinbox(crop_frame, from_=1, to=16, width=3, textvariable=self.crop_detect_round)
+        round_spin.pack(side=tk.LEFT, padx=2)
+
+        crop_edit_btn = ttk.Button(crop_frame, text=_("可视化"),
+                                   command=self.open_crop_editor, width=7)
+        crop_edit_btn.pack(side=tk.LEFT, padx=(10,0))
+        ToolTip(crop_edit_btn,
+                _("打开可视化裁剪窗口：\n"
+                "• 显示视频首帧画面，可用鼠标拖拽绘制矩形选区\n"
+                "• 选区参数会回填到「启用裁剪」的各项输入框中\n"
+                "• 仍保留「自动检测黑边」功能，可辅助定位"),
+                wraplength=500)
+
+        rot_frame = ttk.Frame(left_frame)
+        rot_frame.pack(fill=tk.X, pady=2)
+        rot_label = ttk.Label(rot_frame, text=_("旋转:"))
+        rot_label.pack(side=tk.LEFT)
+        ToolTip(rot_label,
+                _("旋转画面方向（90°/180°/270°）。\n"
+                "上下/左右翻转可镜像画面。\n"
+                "提示：旋转和翻转需重新编码视频，编码器为 copy 时无效。"
+                "    当前旋转是实体旋转，不是元数据旋转。"),
+                wraplength=500)
+        self.rotate = tk.StringVar(value="none")
+        for text, val in [(_("无"), "none"), (_("90°顺时针"), "90"), (_("180°"), "180"), (_("90°逆时针"), "270")]:
+            ttk.Radiobutton(rot_frame, text=text, variable=self.rotate, value=val).pack(side=tk.LEFT, padx=2)
+
+
+
+        self.vflip = tk.BooleanVar(value=False)
+        self.hflip = tk.BooleanVar(value=False)
+        ttk.Checkbutton(rot_frame, text=_("上下翻转"), variable=self.vflip).pack(side=tk.LEFT, padx=(20,0))
+        ttk.Checkbutton(rot_frame, text=_("左右翻转"), variable=self.hflip).pack(side=tk.LEFT, padx=5)
+
+        # 在高级增强按钮左侧添加
+        self.blur_btn = ttk.Button(rot_frame, text=_("去水印/模糊"), 
+                                   command=self.open_blur_dialog, width=10)
+        self.blur_btn.pack(side=tk.LEFT, padx=(10, 0))
+
+
+        self.enhance_btn = ttk.Button(rot_frame, text=_("高级增强"), 
+                                      command=self.open_enhance_window, width=8)
+        self.enhance_btn.pack(side=tk.LEFT, padx=(20,0))
+
+
+
+        hybrid_frame = ttk.Frame(left_frame)
+        hybrid_frame.pack(fill=tk.X, pady=2)
+        self.speed_enabled = tk.BooleanVar(value=False)
+        self.speed_factor = tk.StringVar(value="1.0")
+        speed_check = ttk.Checkbutton(hybrid_frame, text=_("启用变速"), variable=self.speed_enabled)
+        speed_check.pack(side=tk.LEFT)
+        ToolTip(speed_check, 
+            _("视频变速（setpts 滤镜），仅作用于视频轨道，与音频无关。\n"
+            "可自定义速度倍数（支持任意正数，例如 0.5x 慢放、2.0x 快放）。\n"
+            "注意：过低（<0.5）的倍数会串联多个 setpts 计算；音频变速请在音频设置中单独设置，两者互不影响。\n"
+            "推荐范围：0.1 ~ 10 倍，一般使用 0.25 ~ 4.0 已足够。"))
+        ttk.Entry(hybrid_frame, textvariable=self.speed_factor, width=6).pack(side=tk.LEFT, padx=5)
+
+
+        self.reverse_enabled = tk.BooleanVar(value=False)
+        reverse_check = ttk.Checkbutton(hybrid_frame, text=_("启用倒放"), variable=self.reverse_enabled)
+        reverse_check.pack(side=tk.LEFT, padx=(10, 0))
+        ToolTip(reverse_check,
+                _("视频倒放（reverse 滤镜），仅作用于视频轨道，与音频无关。\n"
+                "音频如需倒放，请在音频设置中单独勾选「音频倒放（独立于视频）」，两者互不影响。"))
+
+
+        deint_label = ttk.Label(hybrid_frame, text=_("反交错:"))
+        deint_label.pack(side=tk.LEFT, padx=(10,0))
+        ToolTip(deint_label, 
+                _("反交错滤镜选项：\n"
+                "yadif - 常用反交错，适合大多数隔行扫描内容\n"
+                "bwdif - 运动自适应，比yadif更锐利\n"
+                "kerndeint - 基于内核，适合电影模式\n"
+                "pp=lb - 行混合，柔和去拉丝\n"
+                "fieldorder - 仅调整场序，不反交错"),
+                wraplength=400)
+        self.deinterlace_filter = tk.StringVar(value="none")
+        deinterlace_combo = ttk.Combobox(hybrid_frame, textvariable=self.deinterlace_filter,
+                                         values=["none", "bwdif", "yadif", "kerndeint", "pp=lb", "fieldorder"],
+                                         state="readonly", width=10)
+        deinterlace_combo.pack(side=tk.LEFT, padx=2)
+    
+        self.pix_fmt_enabled = tk.BooleanVar(value=self.app.pix_fmt_enabled_default.get())
+        self.pix_fmt = tk.StringVar(value="yuv420p")
+        pix_label = ttk.Label(hybrid_frame, text=_("像素格式:"))
+        pix_label.pack(side=tk.LEFT, padx=(20,0))
+        ToolTip(pix_label,
+            _("像素格式决定视频的色彩采样和位深。\n\n"
+            "• yuv420p：最通用，兼容所有设备和播放器，文件小。\n"
+            "• yuv422p：色度采样更高，适合专业剪辑，兼容性稍差。\n"
+            "• yuv444p：无色彩压缩，画质最高，兼容性最差，文件大。\n"
+            "• yuv420p10le：10-bit 色深，HDR 视频常用，需 HEVC/AV1 编码。\n"
+            "• p010le：10-bit YUV 4:2:0，硬件解码友好（NVIDIA/Intel）。\n"
+            "• nv12：4:2:0 平面交错，硬件编码常用格式。\n\n"
+            "一般视频推荐保持默认 yuv420p 以保证最佳兼容性。"),
+            wraplength=400)
+        
+        ttk.Checkbutton(hybrid_frame, text=_("指定"), variable=self.pix_fmt_enabled).pack(side=tk.LEFT)
+        self.pix_fmt_combo = ttk.Combobox(hybrid_frame, textvariable=self.pix_fmt, 
+                                          values=self.PIX_FMTS, width=12, state="normal")
+        self.pix_fmt_combo.pack(side=tk.LEFT, padx=5)
+        
+        self.pix_fmt_enabled.trace_add("write", self._on_pix_fmt_changed)
+
+
+    def open_blur_dialog(self):
+        BlurFilterDialog(self, self)
+
+    def _on_pix_fmt_changed(self, *args):
+        if getattr(self, '_loading_settings', False):
+            return
+        self.app.pix_fmt_enabled_default.set(self.pix_fmt_enabled.get())
+        self.app.save_player_settings()
+
+
+    def _swap_width_height(self):
+        """交换宽度和高度数值"""
+        w = self.scale_width.get().strip()
+        h = self.scale_height.get().strip()
+        self.scale_width.set(h)
+        self.scale_height.set(w)
+
+    def extract_video_frame_scaled(self, input_file, output_png_path, frame_sec=0.0,
+                                    target_width=None, target_height=None):
+        """
+        使用 FFmpeg 提取视频帧，并缩放到目标尺寸，输出为 PNG。
+        若 target_width 或 target_height 为 None，则保持原始比例（自动计算）。
+        返回 (实际宽度, 实际高度) 或 (None, None) 若失败。
+        """
+        if not self.app.ffmpeg_cmd:
+            return None, None
+    
+        # 构建 scale 滤镜
+        scale_filter = ""
+        if target_width is not None and target_height is not None:
+            scale_filter = f"scale={target_width}:{target_height}"
+        elif target_width is not None:
+            scale_filter = f"scale={target_width}:-2"
+        elif target_height is not None:
+            scale_filter = f"scale=-2:{target_height}"
+        # 若两者都为 None，则不加 scale（输出原始尺寸）
+    
+        cmd = [
+            self.app.ffmpeg_cmd,
+            "-ss", str(frame_sec),
+            "-i", input_file,
+            "-vframes", "1",
+            "-f", "image2pipe",
+            "-vcodec", "png",
+            "-y",
+            output_png_path
+        ]
+        # 如果 scale_filter 非空，插入 -vf 参数（放在 -i 之后，-vframes 之前）
+        if scale_filter:
+            # 找到 -vframes 的位置并插入
+            vframes_idx = cmd.index("-vframes")
+            cmd.insert(vframes_idx, "-vf")
+            cmd.insert(vframes_idx + 1, scale_filter)
+    
+        try:
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            subprocess.run(cmd, check=True, capture_output=True, creationflags=flags, timeout=10)
+
+#             if os.path.exists(output_png_path):
+#                 size_kb = os.path.getsize(output_png_path) / 1024
+#                 self.app._append_info_ui(f"[裁剪] PNG临时文件大小: {size_kb:.1f} KB")
+            # 读取 PNG 获取尺寸（使用内置函数解析头）
+            w, h = self._get_png_dimensions(output_png_path)
+            return w, h
+        except Exception as e:
+            self.app._append_info_ui(_("[裁剪辅助] 提取缩放帧失败: {0}".format(e)))
+            return None, None
+    
+    
+    def _get_png_dimensions(self, png_path):
+        """读取 PNG 文件头获取宽高（无依赖）"""
+        import struct
+        try:
+            with open(png_path, 'rb') as f:
+                # 检查 PNG 签名
+                if f.read(8) != b'\x89PNG\r\n\x1a\n':
+                    return None, None
+                # 寻找 IHDR 块
+                while True:
+                    length_data = f.read(4)
+                    if len(length_data) < 4:
+                        break
+                    length = struct.unpack('>I', length_data)[0]
+                    chunk_type = f.read(4)
+                    if chunk_type == b'IHDR':
+                        data = f.read(length)
+                        if len(data) >= 8:
+                            width, height = struct.unpack('>II', data[:8])
+                            return width, height
+                        else:
+                            return None, None
+                    else:
+                        # 跳过数据 + CRC
+                        f.seek(length + 4, os.SEEK_CUR)
+                return None, None
+        except Exception:
+            return None, None
+
+
+
+    def set_track(self, track):
+        """设置当前编辑的轨道，用于获取截取设置"""
+        self.current_track = track
+        if track:
+            self.current_file = track.file_path
+
+    def set_override_settings(self, settings):
+        """设置外部传入的设置字典，用于读取截取起始时间"""
+        self.override_settings = settings
+
+    def set_get_trim_settings_callback(self, callback):
+        """设置一个回调函数，用于获取当前的截取设置（由编辑窗口提供）"""
+        self.get_trim_settings_callback = callback
+
+    def get_enhance_settings(self):
+     #   print(f"[get_enhance_settings] 返回 = {self.enhance_settings}")
+        return self.enhance_settings.copy()
+    
+    def set_enhance_settings(self, settings):
+        self.enhance_settings.update(settings)
+        # 如果当前有打开增强窗口，可以更新控件，但为了简单，仅更新存储
+
+
+    def open_enhance_window(self):
+        win = tk.Toplevel(self)
+        win.withdraw()
+        win.title(_("高级增强滤镜"))
+        win.transient(self)
+        win.grab_set()
+        center_window(win, 650, 430)  # 宽度稍宽，高度降低
+    
+        main = ttk.Frame(win, padding="10")
+        main.pack(fill=tk.BOTH, expand=True)
+    
+        # ---- 左右分栏 ----
+        paned = ttk.PanedWindow(main, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True)
+    
+        # ---- 左栏：画质修复 ----
+        left_frame = ttk.Frame(paned)
+        paned.add(left_frame, weight=1)
+    
+        # 降噪
+        denoise_frame = ttk.LabelFrame(left_frame, text=_("降噪 (hqdn3d)"), padding="5")
+        denoise_frame.pack(fill=tk.X, pady=5)
+        self.denoise_enabled = tk.BooleanVar(value=self.enhance_settings.get("denoise_enabled", False))
+        ttk.Checkbutton(denoise_frame, text=_("启用降噪"), variable=self.denoise_enabled).pack(anchor=tk.W)
+        row1 = ttk.Frame(denoise_frame); row1.pack(fill=tk.X, pady=2)
+        ttk.Label(row1, text=_("空间强度 (0~10):")).pack(side=tk.LEFT)
+        self.denoise_spatial = tk.DoubleVar(value=self.enhance_settings.get("denoise_spatial", 4.0))
+        ttk.Scale(row1, from_=0, to=10, variable=self.denoise_spatial, orient=tk.HORIZONTAL, length=150).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row1, textvariable=self.denoise_spatial, width=4).pack(side=tk.LEFT)
+        row2 = ttk.Frame(denoise_frame); row2.pack(fill=tk.X, pady=2)
+        ttk.Label(row2, text=_("时间强度 (0~10):")).pack(side=tk.LEFT)
+        self.denoise_temporal = tk.DoubleVar(value=self.enhance_settings.get("denoise_temporal", 3.0))
+        ttk.Scale(row2, from_=0, to=10, variable=self.denoise_temporal, orient=tk.HORIZONTAL, length=150).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row2, textvariable=self.denoise_temporal, width=4).pack(side=tk.LEFT)
+    
+        # 锐化
+        sharpen_frame = ttk.LabelFrame(left_frame, text=_("锐化 (unsharp)"), padding="5")
+        sharpen_frame.pack(fill=tk.X, pady=5)
+        self.sharpen_enabled = tk.BooleanVar(value=self.enhance_settings.get("sharpen_enabled", False))
+        ttk.Checkbutton(sharpen_frame, text=_("启用锐化"), variable=self.sharpen_enabled).pack(anchor=tk.W)
+        row3 = ttk.Frame(sharpen_frame); row3.pack(fill=tk.X, pady=2)
+        ttk.Label(row3, text=_("锐化强度 (0~5):")).pack(side=tk.LEFT)
+        self.sharpen_strength = tk.DoubleVar(value=self.enhance_settings.get("sharpen_strength", 1.0))
+        ttk.Scale(row3, from_=0, to=5, variable=self.sharpen_strength, orient=tk.HORIZONTAL, length=150).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row3, textvariable=self.sharpen_strength, width=4).pack(side=tk.LEFT)
+    
+        # IVTC（反胶卷过带）
+        ivtc_frame = ttk.LabelFrame(left_frame, text=_("反胶卷过带 (IVTC)"), padding="5")
+        ivtc_frame.pack(fill=tk.X, pady=5)
+        self.ivtc_enabled = tk.BooleanVar(value=self.enhance_settings.get("ivtc_enabled", False))
+        chk_ivtc = ttk.Checkbutton(ivtc_frame, text=_("启用 IVTC (适用于 60i -> 24p)"), variable=self.ivtc_enabled)
+        chk_ivtc.pack(anchor=tk.W)
+
+    
+        # 去块滤波
+        deblock_frame = ttk.LabelFrame(left_frame, text=_("去块滤波 (deblock)"), padding="5")
+        deblock_frame.pack(fill=tk.X, pady=5)
+        self.deblock_enabled = tk.BooleanVar(value=self.enhance_settings.get("deblock_enabled", False))
+        ttk.Checkbutton(deblock_frame, text=_("启用去块"), variable=self.deblock_enabled).pack(anchor=tk.W)
+        row4 = ttk.Frame(deblock_frame); row4.pack(fill=tk.X, pady=2)
+        ttk.Label(row4, text=_("强度 (1~8):")).pack(side=tk.LEFT)
+        self.deblock_strength = tk.IntVar(value=self.enhance_settings.get("deblock_strength", 4))
+        ttk.Scale(row4, from_=1, to=8, variable=self.deblock_strength, orient=tk.HORIZONTAL, length=150).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row4, textvariable=self.deblock_strength, width=4).pack(side=tk.LEFT)
+    
+        # ---- 右栏：色彩调整 ----
+        right_frame = ttk.Frame(paned)
+        paned.add(right_frame, weight=1)
+    
+        # 色彩空间转换
+        colorspace_frame = ttk.LabelFrame(right_frame, text=_("色彩空间转换"), padding="5")
+        colorspace_frame.pack(fill=tk.X, pady=5)
+        self.colorspace_enabled = tk.BooleanVar(value=self.enhance_settings.get("colorspace_enabled", False))
+        ttk.Checkbutton(colorspace_frame, text=_("启用转换"), variable=self.colorspace_enabled).pack(anchor=tk.W)
+        row5 = ttk.Frame(colorspace_frame); row5.pack(fill=tk.X, pady=2)
+        ttk.Label(row5, text=_("目标色彩矩阵:")).pack(side=tk.LEFT)
+        self.colorspace_matrix = tk.StringVar(value=self.enhance_settings.get("colorspace_matrix", "bt709:bt2020"))
+        ttk.Combobox(row5, textvariable=self.colorspace_matrix,
+                     values=["bt709:bt2020", "bt2020:bt709", "bt601:bt709", "bt709:bt601"],
+                     state="readonly", width=15).pack(side=tk.LEFT, padx=5)
+    
+        # 颜色校正（eq + hue）
+        color_frame = ttk.LabelFrame(right_frame, text=_("颜色校正 (eq / hue)"), padding="5")
+        color_frame.pack(fill=tk.X, pady=5)
+    
+        eq_brightness_var = tk.DoubleVar(value=self.enhance_settings.get("eq_brightness", 0.0))
+        eq_contrast_var = tk.DoubleVar(value=self.enhance_settings.get("eq_contrast", 1.0))
+        eq_saturation_var = tk.DoubleVar(value=self.enhance_settings.get("eq_saturation", 1.0))
+        eq_gamma_var = tk.DoubleVar(value=self.enhance_settings.get("eq_gamma", 1.0))
+        hue_angle_var = tk.DoubleVar(value=self.enhance_settings.get("hue_angle", 0.0))
+        hue_saturation_var = tk.DoubleVar(value=self.enhance_settings.get("hue_saturation", 0.0))
+    
+        def make_slider_row(parent, label, var, from_, to, resolution, fmt="{:.2f}"):
+            row = ttk.Frame(parent)
+            row.pack(fill=tk.X, pady=1)
+            ttk.Label(row, text=label, width=10).pack(side=tk.LEFT)
+            slider = ttk.Scale(row, from_=from_, to=to, variable=var,
+                               orient=tk.HORIZONTAL, length=150)
+            slider.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+            val_label = ttk.Label(row, text=fmt.format(var.get()), width=6)
+            val_label.pack(side=tk.LEFT)
+            def update_label(*args):
+                val_label.config(text=fmt.format(var.get()))
+            var.trace_add("write", update_label)
+            return row
+    
+        make_slider_row(color_frame, "亮度", eq_brightness_var, -1.0, 1.0, 0.01)
+        make_slider_row(color_frame, "对比度", eq_contrast_var, -2.0, 2.0, 0.01)
+        make_slider_row(color_frame, "饱和度", eq_saturation_var, 0.0, 3.0, 0.01)
+        make_slider_row(color_frame, "伽马", eq_gamma_var, 0.1, 10.0, 0.01)
+        make_slider_row(color_frame, "色相", hue_angle_var, -180, 180, 1, fmt="{:.0f}")
+        make_slider_row(color_frame, "色饱和度", hue_saturation_var, -1.0, 1.0, 0.01)
+    
+        reset_btn = ttk.Button(color_frame, text=_("重置默认值"),
+                               command=lambda: [eq_brightness_var.set(0.0), eq_contrast_var.set(1.0),
+                                                eq_saturation_var.set(1.0), eq_gamma_var.set(1.0),
+                                                hue_angle_var.set(0.0), hue_saturation_var.set(0.0)])
+        reset_btn.pack(pady=5)
+    
+        # ---- 底部按钮 ----
+        btn_frame = ttk.Frame(main)
+        btn_frame.pack(fill=tk.X, pady=(5,10))
+    
+        def save_and_close():
+            self.enhance_settings.update({
+                "denoise_enabled": self.denoise_enabled.get(),
+                "denoise_spatial": self.denoise_spatial.get(),
+                "denoise_temporal": self.denoise_temporal.get(),
+                "sharpen_enabled": self.sharpen_enabled.get(),
+                "sharpen_strength": self.sharpen_strength.get(),
+                "ivtc_enabled": self.ivtc_enabled.get(),
+                "deblock_enabled": self.deblock_enabled.get(),
+                "deblock_strength": self.deblock_strength.get(),
+                "colorspace_enabled": self.colorspace_enabled.get(),
+                "colorspace_matrix": self.colorspace_matrix.get(),
+                "eq_brightness": eq_brightness_var.get(),
+                "eq_contrast": eq_contrast_var.get(),
+                "eq_saturation": eq_saturation_var.get(),
+                "eq_gamma": eq_gamma_var.get(),
+                "hue_angle": hue_angle_var.get(),
+                "hue_saturation": hue_saturation_var.get(),
+            })
+            if self.app:
+                self.app.update_command_preview()
+            if hasattr(self, '_preview_callback') and self._preview_callback:
+                self._preview_callback()
+            win.destroy()
+    
+        ttk.Button(btn_frame, text=_("保存并关闭"), command=save_and_close).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text=_("取消"), command=win.destroy).pack(side=tk.LEFT, padx=5)
+
+
+
+
+    def open_crop_editor(self):
+        """可视化裁剪窗口 - 拖拽绘制矩形，支持时间跳转重新取帧，初始时间自动从主界面或者当前编辑窗口的截取起始时间获取"""
+        input_file = getattr(self, 'current_file', None)
+        if not input_file or not os.path.exists(input_file):
+            input_file = self.app.input_file.get().strip()
+        if not input_file or not os.path.exists(input_file):
+            messagebox.showerror(_("错误"), _("请先选择一个有效的输入文件"))
+            return
+    
+        ffmpeg = self.app.ffmpeg_cmd
+        if not ffmpeg:
+            messagebox.showerror(_("错误"), _("未找到 ffmpeg，无法提取视频帧"))
+            return
+    
+        # ----- 从当前轨道或主界面获取截取起始时间 未启用则为0秒 -----
+        initial_time = 0.0
+        if hasattr(self, 'get_trim_settings_callback') and self.get_trim_settings_callback is not None:
+            trim_settings = self.get_trim_settings_callback()
+            if trim_settings.get("trim_enabled", False):
+                start_str = trim_settings.get("trim_start", "").strip()
+                if start_str:
+                    sec = time_to_seconds(start_str)
+                    if sec is not None and sec >= 0:
+                        initial_time = sec
+                        self.app._append_info_ui(_("[裁剪] 使用当前编辑窗口的截取起始时间: {0:.2f}s".format(sec)))
+        elif self.override_settings is not None:
+            if self.override_settings.get("trim_enabled", False):
+                start_str = self.override_settings.get("trim_start", "").strip()
+                if start_str:
+                    sec = time_to_seconds(start_str)
+                    if sec is not None and sec >= 0:
+                        initial_time = sec
+                        self.app._append_info_ui(_("[裁剪] 使用外部设置的截取起始时间: {0:.2f}s".format(sec)))
+        elif self.current_track is not None:
+            enc = self.current_track.enc_settings
+            if enc.get("trim_enabled", False):
+                start_str = enc.get("trim_start", "").strip()
+                if start_str:
+                    sec = time_to_seconds(start_str)
+                    if sec is not None and sec >= 0:
+                        initial_time = sec
+                        self.app._append_info_ui(_("[裁剪] 使用轨道截取起始时间: {0:.2f}s".format(sec)))
+        else:
+            if self.app.trim_frame.trim_enabled.get():
+                start_str = self.app.trim_frame.trim_start.get().strip()
+                if start_str:
+                    sec = time_to_seconds(start_str)
+                    if sec is not None and sec >= 0:
+                        initial_time = sec
+                        self.app._append_info_ui(_("[裁剪] 使用主界面截取起始时间: {0:.2f}s".format(sec)))
+    
+        current_time = initial_time
+    
+        # ----- 获取原始视频尺寸（用于计算显示比例） -----
+        orig_w, orig_h = self.app._get_video_dimensions_cached(input_file)
+        if orig_w is None or orig_h is None:
+            # 降级：使用固定默认值
+            orig_w, orig_h = 1920, 1080
+            self.app._append_info_ui(_("[裁剪] 无法获取原始尺寸，使用默认值"))
+    
+        # ----- 计算显示尺寸 -----
+        screen_w = self.app.root.winfo_screenwidth()
+        screen_h = self.app.root.winfo_screenheight()
+        max_w = int(screen_w * 0.9)
+        max_h = int(screen_h * 0.9)
+        RIGHT_PANEL_WIDTH = 280
+        EXTRA_HEIGHT = 10
+        PADDING = 10           # 图片外边距
+        WINDOW_MARGIN = 20     # 右边菜单控件和图片区的间隔
+        avail_w = max_w - RIGHT_PANEL_WIDTH - WINDOW_MARGIN - PADDING * 2
+        avail_h = max_h - EXTRA_HEIGHT - PADDING * 2
+    
+        scale = min(1.0, avail_w / orig_w, avail_h / orig_h)
+        disp_w = int(orig_w * scale)
+        disp_h = int(orig_h * scale)
+        if disp_w < 1:
+            disp_w = 1
+        if disp_h < 1:
+            disp_h = 1
+        self.app._append_info_ui(_("[裁剪] 原始尺寸: {0}x{1}, 显示尺寸: {2}x{3}".format(orig_w, orig_h, disp_w, disp_h)))
+    
+        # ----- 坐标缩放因子（用于坐标系转换） -----
+        scale_x = orig_w / disp_w
+        scale_y = orig_h / disp_h
+
+        # ----- 初始化闭包变量（必须在嵌套函数之前定义） -----
+        scaled_temp_path = None   # 当前显示的临时文件路径
+        img = None                # Tkinter 图像对象
+        points = []               # 矩形坐标（原始坐标）
+        rect_id = None            # 矩形画布 ID
+        drag_rect_id = None       # 拖拽辅助矩形 ID
+        drag_start_display = None # 拖拽起始点（显示坐标）
+        img_w, img_h = disp_w, disp_h   # 图像实际尺寸（通常与 disp 一致）
+    
+        # ----- 临时文件管理 -----
+        temp_file_info = {"path": None}
+    
+        def cleanup_temp_file():
+            if temp_file_info["path"] and os.path.exists(temp_file_info["path"]):
+                try:
+                    os.unlink(temp_file_info["path"])
+                except Exception:
+                    pass
+                temp_file_info["path"] = None
+    
+        # ----- 窗口布局 -----
+        canvas_w = disp_w + PADDING * 2
+        canvas_h = disp_h + PADDING * 2
+        total_w = canvas_w + RIGHT_PANEL_WIDTH + WINDOW_MARGIN
+        total_h = canvas_h + EXTRA_HEIGHT
+        total_w = min(total_w, max_w)
+        total_h = min(total_h, max_h)
+        if total_w < 400:
+            total_w = 400
+    
+        with self.app.SafeToplevel(self.app.root) as win:
+            win.title(f"可视化裁剪 - 拖拽绘制矩形 (显示 {disp_w}x{disp_h}, 原始 {orig_w}x{orig_h})")
+            win.transient(self.app.root)
+            center_window(win, total_w, total_h, offset_y=15)
+    
+            # 窗口关闭时清理临时文件
+            def on_window_close():
+                cleanup_temp_file()
+                win.destroy()
+            win.protocol("WM_DELETE_WINDOW", on_window_close)
+    
+            main_pane = ttk.Frame(win)
+            main_pane.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+    
+            right_frame = ttk.Frame(main_pane, width=RIGHT_PANEL_WIDTH)
+            right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
+            right_frame.pack_propagate(False)
+    
+            canvas_frame = ttk.Frame(main_pane)
+            canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    
+            canvas = tk.Canvas(canvas_frame, bg='gray', width=canvas_w, height=canvas_h,
+                               highlightthickness=0)
+            canvas.pack(fill=tk.BOTH, expand=True)
+            canvas.config(scrollregion=(0, 0, canvas_w, canvas_h))
+    
+            # ----- 坐标转换函数 -----
+            def canvas_to_display(cx, cy):
+                x = canvas.canvasx(cx) - PADDING
+                y = canvas.canvasy(cy) - PADDING
+                return max(0, min(x, disp_w)), max(0, min(y, disp_h))
+    
+            def display_to_original(dx, dy):
+                return int(dx * scale_x), int(dy * scale_y)
+    
+            def original_to_display(ox, oy):
+                return ox / scale_x, oy / scale_y
+    
+            # ----- 信息显示 -----
+            info_var = tk.StringVar(value=_("👉 在图像上按住左键拖拽（可从边缘外开始）以绘制裁剪矩形"))
+            info_label = tk.Label(right_frame, textvariable=info_var, wraplength=RIGHT_PANEL_WIDTH - 20,
+                                  justify=tk.LEFT, bg="#FFFFCC", relief=tk.SUNKEN, padx=5, pady=5)
+            info_label.pack(pady=5, fill=tk.X)
+    
+            def update_info():
+                if len(points) == 2:
+                    x1, y1 = points[0]
+                    x2, y2 = points[1]
+                    x = min(x1, x2)
+                    y = min(y1, y2)
+                    w = abs(x2 - x1)
+                    h = abs(y2 - y1)
+                    info_var.set(_("✅ 矩形已确定\n左上: ({x}, {y}) 宽: {w} 高: {h}\n"
+                                 "裁剪参数: crop={w}:{h}:{x}:{y}\n"
+                                 "👉 可继续拖拽新矩形覆盖").format(x=x, y=y, w=w, h=h))
+                else:
+                    info_var.set(_("👉 在图像上按住左键拖拽（可从边缘外开始）以绘制裁剪矩形"))
+
+            def redraw_crop_rect():
+                """删除旧矩形，按 points 重建画布矩形并更新信息"""
+                nonlocal rect_id
+                if rect_id:
+                    canvas.delete(rect_id)
+                    rect_id = None
+                if len(points) == 2:
+                    x1, y1 = points[0]
+                    x2, y2 = points[1]
+                    dx1, dy1 = original_to_display(x1, y1)
+                    dx2, dy2 = original_to_display(x2, y2)
+                    rect_id = canvas.create_rectangle(
+                        dx1 + PADDING, dy1 + PADDING,
+                        dx2 + PADDING, dy2 + PADDING,
+                        outline='red', width=2
+                    )
+                update_info()
+
+            def edge_adjust(edge, delta):
+                """收缩边界: edge='top'|'bottom'|'left'|'right', delta=像素数(正=收缩)"""
+                if len(points) != 2:
+                    return
+                x1, y1 = points[0]; x2, y2 = points[1]
+                l = min(x1, x2); r = max(x1, x2)
+                t = min(y1, y2); b = max(y1, y2)
+                if edge == 'left':   l += delta
+                elif edge == 'right': r -= delta
+                elif edge == 'top':    t += delta
+                elif edge == 'bottom': b -= delta
+                l = max(0, l); t = max(0, t)
+                r = min(orig_w, r); b = min(orig_h, b)
+                if r <= l or b <= t:
+                    return
+                points[0] = (l, t); points[1] = (r, b)
+                redraw_crop_rect()
+
+            def shift_adjust(direction, delta):
+                """平移矩形: direction='up'|'down'|'left'|'right'"""
+                if len(points) != 2:
+                    return
+                x1, y1 = points[0]; x2, y2 = points[1]
+                l = min(x1, x2); r = max(x1, x2)
+                t = min(y1, y2); b = max(y1, y2)
+                if direction == 'left':   l -= delta; r -= delta
+                elif direction == 'right': l += delta; r += delta
+                elif direction == 'up':    t -= delta; b -= delta
+                elif direction == 'down':  t += delta; b += delta
+                l = max(0, l); t = max(0, t)
+                r = min(orig_w, r); b = min(orig_h, b)
+                if r <= l or b <= t:
+                    return
+                points[0] = (l, t); points[1] = (r, b)
+                redraw_crop_rect()
+    
+            # ----- 拖拽事件 -----
+            def on_drag_start(event):
+                nonlocal drag_start_display, drag_rect_id
+                dx, dy = canvas_to_display(event.x, event.y)
+                drag_start_display = (dx, dy)
+                if drag_rect_id:
+                    canvas.delete(drag_rect_id)
+                    drag_rect_id = None
+                if rect_id:
+                    canvas.delete(rect_id)
+    
+            def on_drag_motion(event):
+                nonlocal drag_start_display, drag_rect_id
+                if drag_start_display is None:
+                    return
+                cur_dx, cur_dy = canvas_to_display(event.x, event.y)
+                if drag_rect_id:
+                    canvas.delete(drag_rect_id)
+                sx, sy = drag_start_display
+                drag_rect_id = canvas.create_rectangle(
+                    sx + PADDING, sy + PADDING,
+                    cur_dx + PADDING, cur_dy + PADDING,
+                    outline='yellow', width=2, dash=(4, 2)
+                )
+    
+            def on_drag_end(event):
+                nonlocal drag_start_display, drag_rect_id, points, rect_id
+                if drag_start_display is None:
+                    return
+                ex, ey = canvas_to_display(event.x, event.y)
+                sx, sy = drag_start_display
+                ox1, oy1 = display_to_original(sx, sy)
+                ox2, oy2 = display_to_original(ex, ey)
+                if abs(ox2 - ox1) > 0 and abs(oy2 - oy1) > 0:
+                    points = [(ox1, oy1), (ox2, oy2)]
+                    if rect_id:
+                        canvas.delete(rect_id)
+                    dx1, dy1 = original_to_display(ox1, oy1)
+                    dx2, dy2 = original_to_display(ox2, oy2)
+                    rect_id = canvas.create_rectangle(
+                        dx1 + PADDING, dy1 + PADDING,
+                        dx2 + PADDING, dy2 + PADDING,
+                        outline='red', width=2
+                    )
+                    update_info()
+                else:
+                    if rect_id:
+                        canvas.delete(rect_id)
+                        rect_id = None
+                    points = []
+                    update_info()
+                if drag_rect_id:
+                    canvas.delete(drag_rect_id)
+                    drag_rect_id = None
+                drag_start_display = None
+    
+            canvas.bind("<ButtonPress-1>", on_drag_start)
+            canvas.bind("<B1-Motion>", on_drag_motion)
+            canvas.bind("<ButtonRelease-1>", on_drag_end)
+    
+            # ----- 清除矩形 -----
+            def clear_rect():
+                nonlocal points, rect_id, drag_start_display, drag_rect_id
+                points = []
+                if rect_id:
+                    canvas.delete(rect_id)
+                    rect_id = None
+                if drag_rect_id:
+                    canvas.delete(drag_rect_id)
+                    drag_rect_id = None
+                drag_start_display = None
+                update_info()
+    
+            # ----- 应用裁剪 -----
+            def apply_crop():
+                if len(points) != 2:
+                    messagebox.showwarning(_("提示"), _("请先拖拽绘制一个裁剪矩形"))
+                    return
+                x1, y1 = points[0]
+                x2, y2 = points[1]
+                x = min(x1, x2)
+                y = min(y1, y2)
+                w = abs(x2 - x1)
+                h = abs(y2 - y1)
+                if w <= 0 or h <= 0:
+                    messagebox.showerror(_("错误"), _("矩形尺寸无效"))
+                    return
+                # 保证偶数
+                if w % 2:
+                    if x + w + 1 <= orig_w:
+                        w += 1
+                    else:
+                        w -= 1
+                if h % 2:
+                    if y + h + 1 <= orig_h:
+                        h += 1
+                    else:
+                        h -= 1
+                if x + w > orig_w:
+                    w = orig_w - x
+                if y + h > orig_h:
+                    h = orig_h - y
+                if w <= 0 or h <= 0:
+                    messagebox.showerror(_("错误"), _("修正后矩形无效"))
+                    return
+                self.crop_enabled.set(True)
+                self.crop_width.set(str(int(w)))
+                self.crop_height.set(str(int(h)))
+                self.crop_left.set(str(int(x)))
+                self.crop_top.set(str(int(y)))
+                self.app._append_info_ui(_("[裁剪] 应用 crop={0}:{1}:{2}:{3}".format(int(w), int(h), int(x), int(y))))
+                win.destroy()
+    
+            # ----- 自动检测黑边 -----
+            def auto_detect():
+                # ---- 获取当前时间输入框的值 ----
+                time_str = time_var.get().strip()
+                if time_str:
+                    sec = parse_time_str(time_str)
+                    if sec is not None:
+                        self._visual_crop_start_time = sec
+                    else:
+                        self._visual_crop_start_time = 0.0
+                else:
+                    self._visual_crop_start_time = 0.0
+    
+                self.crop_detect_frames.set(frames_var.get())
+                self.crop_detect_round.set(round_var.get())
+                old = self.current_file
+                self.current_file = input_file
+                try:
+                    self.auto_detect_crop()
+                finally:
+                    self.current_file = old
+                if self.crop_enabled.get():
+                    try:
+                        w = int(self.crop_width.get())
+                        h = int(self.crop_height.get())
+                        x = int(self.crop_left.get())
+                        y = int(self.crop_top.get())
+                        nonlocal points, rect_id
+                        if rect_id:
+                            canvas.delete(rect_id)
+                        points = [(x, y), (x + w, y + h)]
+                        dx1, dy1 = original_to_display(x, y)
+                        dx2, dy2 = original_to_display(x + w, y + h)
+                        rect_id = canvas.create_rectangle(
+                            dx1 + PADDING, dy1 + PADDING,
+                            dx2 + PADDING, dy2 + PADDING,
+                            outline='red', width=2
+                        )
+                        update_info()
+                    except:
+                        pass
+    
+            # ----- 时间跳转和重新获取画面 -----
+            time_var = tk.StringVar(value=str(initial_time))
+            time_entry = ttk.Entry(right_frame, textvariable=time_var, width=12)
+            time_entry.pack(pady=(10, 2), fill=tk.X)
+    
+            def parse_time_str(s):
+                return time_to_seconds(s)
+    
+            def on_refresh_click():
+                nonlocal current_time, img, scaled_temp_path, img_w, img_h
+                nonlocal points, rect_id, drag_start_display, drag_rect_id
+            
+                time_str = time_var.get().strip()
+                if not time_str:
+                    messagebox.showwarning(_("提示"), _("请输入时间"))
+                    return
+                sec = parse_time_str(time_str)
+                if sec is None:
+                    messagebox.showerror(_("错误"), _("无效的时间格式: {0}\n支持格式: 秒数 (如 10.5) 或 HH:MM:SS[.mmm]".format(time_str)))
+                    return
+                total_duration = self.app._get_media_duration(input_file)
+                if total_duration is not None and sec > total_duration:
+                    messagebox.showwarning(_("警告"), _("输入时间 {0:.2f}s 超过视频总时长 {1:.2f}s，将跳转到末尾".format(sec, total_duration)))
+                    sec = total_duration
+                current_time = sec
+            
+                refresh_btn.config(state=tk.DISABLED, text=_("提取中..."))
+                info_var.set("⏳ 正在提取画面，请稍候...")
+                win.update_idletasks()
+            
+                # --- 取消旧线程 ---
+                if self._crop_extract_thread and self._crop_extract_thread.is_alive():
+                    self._crop_cancel_event.set()
+                    self._crop_extract_thread.join(timeout=0.5)
+                self._crop_cancel_event.clear()
+            
+                # 定义提取线程
+                def extract_thread():
+                    fd_new, new_png = tempfile.mkstemp(suffix='.png', prefix='ffgui_crop_')
+                    os.close(fd_new)
+            
+                    # 如果取消标志被设置，则清理并返回
+                    if self._crop_cancel_event.is_set():
+                        if os.path.exists(new_png):
+                            os.unlink(new_png)
+                        return
+            
+                    try:
+                        w, h = self.extract_video_frame_scaled(
+                            input_file, new_png,
+                            frame_sec=sec,
+                            target_width=disp_w,
+                            target_height=disp_h
+                        )
+                        # 再次检查取消标志
+                        if self._crop_cancel_event.is_set():
+                            if os.path.exists(new_png):
+                                os.unlink(new_png)
+                            return
+            
+                        if w is None or h is None:
+                            if os.path.exists(new_png):
+                                os.unlink(new_png)
+                            self.app.root.after(0, lambda: on_extract_failed("提取帧失败，请检查文件是否支持"))
+                            return
+                        self.app.root.after(0, lambda: on_extract_success(new_png, w, h))
+                    except Exception as e:
+                        if os.path.exists(new_png):
+                            os.unlink(new_png)
+                        self.app.root.after(0, lambda e=e: on_extract_failed(f"提取异常: {e}"))
+            
+                # 启动新线程
+                self._crop_extract_thread = threading.Thread(target=extract_thread, daemon=True)
+                self._crop_extract_thread.start()
+    
+                def on_extract_success(new_scaled_path, new_orig_w, new_orig_h):
+                    nonlocal img, scaled_temp_path, img_w, img_h
+                    nonlocal points, rect_id, drag_start_display, drag_rect_id
+                    try:
+                        new_img = tk.PhotoImage(file=new_scaled_path)
+                    except Exception as e:
+                        # 加载失败，删除临时文件
+                        if os.path.exists(new_scaled_path):
+                            os.unlink(new_scaled_path)
+                        on_extract_failed(f"加载缩放后的图像失败: {e}")
+                        return
+    
+                    # 删除旧临时文件
+                    if temp_file_info["path"] and os.path.exists(temp_file_info["path"]):
+                        try:
+                            os.unlink(temp_file_info["path"])
+                        except Exception:
+                            pass
+                    temp_file_info["path"] = new_scaled_path  # 保存新路径
+    
+                    # 更新图像
+                    canvas.delete("bg_img")
+                    canvas.create_image(PADDING, PADDING, anchor=tk.NW, image=new_img, tags="bg_img")
+                    canvas.image = new_img
+                    img = new_img
+    
+                    # 重置选择状态
+                    if rect_id:
+                        canvas.delete(rect_id)
+                        rect_id = None
+                    if drag_rect_id:
+                        canvas.delete(drag_rect_id)
+                        drag_rect_id = None
+                    points = []
+                    drag_start_display = None
+                    update_info()
+                    info_var.set(f"✅ 已更新画面 (时间: {current_time:.2f}s) 请重新拖拽裁剪")
+                    self.app._append_info_ui(_("[裁剪] 跳转到 {0:.2f}s，原始尺寸 {1}x{2}，显示尺寸 {3}x{4}".format(current_time, orig_w, orig_h, disp_w, disp_h)))
+                    refresh_btn.config(state=tk.NORMAL, text=_("重新获取画面"))
+    
+                def on_extract_failed(err_msg):
+                    # 清理可能残留的临时文件
+                    cleanup_temp_file()
+                    info_var.set(f"❌ {err_msg}")
+                    self.app._append_info_ui(_("[裁剪] 提取失败: {0}".format(err_msg)))
+                    refresh_btn.config(state=tk.NORMAL, text=_("重新获取画面"))
+    
+                threading.Thread(target=extract_thread, daemon=True).start()
+    
+            refresh_btn = ttk.Button(right_frame, text=_("重新获取画面"), command=on_refresh_click)
+            refresh_btn.pack(pady=2, fill=tk.X)
+    
+            ttk.Label(right_frame, text=_("支持格式: 秒数 (如 10.5) 或 HH:MM:SS[.mmm]"), foreground="gray",
+                      wraplength=RIGHT_PANEL_WIDTH - 20).pack(pady=(2, 10))
+    
+            # ----- 其他按钮 -----
+            btn_frame = ttk.Frame(right_frame)
+            btn_frame.pack(fill=tk.X, pady=5)
+    
+            ttk.Button(btn_frame, text=_("自动检测黑边"), command=auto_detect).pack(fill=tk.X, pady=2)
+
+            param_frame = ttk.Frame(btn_frame)
+            param_frame.pack(fill=tk.X, pady=5)
+            row = ttk.Frame(param_frame)
+            row.pack(fill=tk.X)
+    
+            frames_container = ttk.Frame(row)
+            frames_container.pack(side=tk.LEFT, padx=(0, 10))
+            ttk.Label(frames_container, text=_("分析帧数:")).pack(side=tk.LEFT)
+            frames_var = tk.StringVar(value=self.crop_detect_frames.get())
+            ttk.Spinbox(frames_container, from_=1, to=100, width=5, textvariable=frames_var, state="normal").pack(side=tk.LEFT, padx=5)
+            frames_var.trace_add("write", lambda *a: self.crop_detect_frames.set(frames_var.get()))
+    
+            round_container = ttk.Frame(row)
+            round_container.pack(side=tk.LEFT)
+            ttk.Label(round_container, text="round:").pack(side=tk.LEFT)
+            round_var = tk.StringVar(value=self.crop_detect_round.get())
+            ttk.Spinbox(round_container, from_=1, to=16, width=5, textvariable=round_var, state="normal").pack(side=tk.LEFT, padx=5)
+            round_var.trace_add("write", lambda *a: self.crop_detect_round.set(round_var.get()))
+
+            # ----- 边缘/平移微调按钮 -----
+            # 边界收缩行（上减/下减/左减/右减 + 独立步进）
+            edge_row = ttk.Frame(btn_frame)
+            edge_row.pack(fill=tk.X, pady=1)
+            edge_step = tk.StringVar(value="1")
+            for label, edge in [(_("上减"), "top"), (_("下减"), "bottom"), (_("左减"), "left"), (_("右减"), "right")]:
+                ttk.Button(edge_row, text=label, width=4,
+                           command=lambda e=edge: edge_adjust(e, _get_step(edge_step))).pack(side=tk.LEFT, padx=1)
+            ttk.Label(edge_row, text=_("步进:")).pack(side=tk.LEFT, padx=(8, 2))
+            ttk.Spinbox(edge_row, textvariable=edge_step, from_=1, to=999, width=4).pack(side=tk.LEFT)
+
+            # 平移行（上移/下移/左移/右移 + 独立步进）
+            shift_row = ttk.Frame(btn_frame)
+            shift_row.pack(fill=tk.X, pady=1)
+            shift_step = tk.StringVar(value="1")
+            for label, direction in [(_("上移"), "up"), (_("下移"), "down"), (_("左移"), "left"), (_("右移"), "right")]:
+                ttk.Button(shift_row, text=label, width=4,
+                           command=lambda d=direction: shift_adjust(d, _get_step(shift_step))).pack(side=tk.LEFT, padx=1)
+            ttk.Label(shift_row, text=_("步进:")).pack(side=tk.LEFT, padx=(8, 2))
+            ttk.Spinbox(shift_row, textvariable=shift_step, from_=1, to=999, width=4).pack(side=tk.LEFT)
+
+            def _get_step(sv):
+                try:
+                    return int(sv.get())
+                except ValueError:
+                    return 1
+
+            ttk.Button(btn_frame, text=_("清除矩形"), command=clear_rect).pack(fill=tk.X, pady=2)
+            ttk.Button(btn_frame, text=_("保存并应用裁剪"), command=apply_crop).pack(fill=tk.X, pady=2)
+            ttk.Button(btn_frame, text=_("取消"), command=on_window_close).pack(fill=tk.X, pady=2)
+    
+            tip = _("按住左键拖拽绘制矩形（可从边缘外开始），松开确定。黄色虚线为辅助，红色为最终选区。")
+            ttk.Label(right_frame, text=tip, foreground="gray", wraplength=RIGHT_PANEL_WIDTH - 20).pack(pady=10)
+    
+            # ----- 若已有裁剪参数，自动加载矩形 -----
+            if self.crop_enabled.get():
+                try:
+                    w = int(self.crop_width.get())
+                    h = int(self.crop_height.get())
+                    x = int(self.crop_left.get())
+                    y = int(self.crop_top.get())
+                    points = [(x, y), (x + w, y + h)]
+                    dx1, dy1 = original_to_display(x, y)
+                    dx2, dy2 = original_to_display(x + w, y + h)
+                    rect_id = canvas.create_rectangle(
+                        dx1 + PADDING, dy1 + PADDING,
+                        dx2 + PADDING, dy2 + PADDING,
+                        outline='red', width=2
+                    )
+                    update_info()
+                except:
+                    pass
+    
+            # ----- 初始加载图像 -----
+            def initial_load():
+                fd, png_path = tempfile.mkstemp(suffix='.png', prefix='ffgui_crop_')
+                os.close(fd)
+                try:
+                    w, h = self.extract_video_frame_scaled(
+                        input_file, png_path,
+                        frame_sec=initial_time,
+                        target_width=disp_w,
+                        target_height=disp_h
+                    )
+                    if w is None or h is None:
+                        # 失败，删除临时文件
+                        if os.path.exists(png_path):
+                            os.unlink(png_path)
+                        messagebox.showerror(_("错误"), _("无法提取初始帧"))
+                        win.destroy()
+                        return
+                    # 加载图像
+                    img_obj = tk.PhotoImage(file=png_path)
+                    canvas.create_image(PADDING, PADDING, anchor=tk.NW, image=img_obj, tags="bg_img")
+                    canvas.image = img_obj
+                    nonlocal img, scaled_temp_path
+                    img = img_obj
+                    temp_file_info["path"] = png_path  # 保存路径以便清理
+                except Exception as e:
+                    if os.path.exists(png_path):
+                        os.unlink(png_path)
+                    messagebox.showerror(_("错误"), _("加载初始帧失败: {0}".format(e)))
+                    win.destroy()
+    
+            # 调用初始加载
+            initial_load()
+    
+            # 等待窗口关闭
+            win.wait_window()
+
+    def auto_detect_crop(self):
+        input_file = getattr(self, 'current_file', None)
+        if not input_file or not os.path.exists(input_file):
+            input_file = self.app.input_file.get().strip()
+        if not input_file or not os.path.exists(input_file):
+            messagebox.showerror(_("错误"), _("请先选择一个有效的输入文件"))
+            return
+    
+        ffmpeg = self.app.ffmpeg_cmd
+        if not ffmpeg:
+            messagebox.showerror(_("错误"), _("未找到 ffmpeg，无法检测黑边"))
+            return
+    
+        try:
+            frames = int(self.crop_detect_frames.get())
+            round_val = int(self.crop_detect_round.get())
+        except ValueError:
+            messagebox.showerror(_("错误"), _("分析帧数和 round 必须为整数"))
+            return
+    
+        # ---- 获取截取起始时间 ----
+        start_sec = 0.0
+        # 优先使用可视化裁剪窗口传入的时间
+        if hasattr(self, '_visual_crop_start_time') and self._visual_crop_start_time is not None:
+            start_sec = self._visual_crop_start_time
+            # 用完即清理，避免影响其他调用
+            self._visual_crop_start_time = None
+        else:
+            # 原有的优先级逻辑（回调 -> 覆盖设置 -> 轨道 -> 主界面）
+            if self.get_trim_settings_callback is not None:
+                trim_settings = self.get_trim_settings_callback()
+                if trim_settings.get("trim_enabled", False):
+                    start_str = trim_settings.get("trim_start", "").strip()
+                    if start_str:
+                        sec = time_to_seconds(start_str)
+                        if sec is not None:
+                            start_sec = sec
+            elif self.override_settings is not None:
+                if self.override_settings.get("trim_enabled", False):
+                    start_str = self.override_settings.get("trim_start", "").strip()
+                    if start_str:
+                        sec = time_to_seconds(start_str)
+                        if sec is not None:
+                            start_sec = sec
+            elif self.current_track is not None:
+                enc = self.current_track.enc_settings
+                if enc.get("trim_enabled", False):
+                    start_str = enc.get("trim_start", "").strip()
+                    if start_str:
+                        sec = time_to_seconds(start_str)
+                        if sec is not None:
+                            start_sec = sec
+            else:
+                if self.app.trim_frame.trim_enabled.get():
+                    start_str = self.app.trim_frame.trim_start.get().strip()
+                    if start_str:
+                        sec = time_to_seconds(start_str)
+                        if sec is not None:
+                            start_sec = sec
+    
+        # 禁用按钮防止重复点击
+        for child in self.winfo_children():
+            if isinstance(child, ttk.Button) and "自动检测黑边" in child.cget("text"):
+                child.config(state=tk.DISABLED)
+                break
+    
+        def detect():
+            try:
+                cmd = [ffmpeg, "-i", input_file]
+                # 如果起始时间 > 0，添加 -ss 快速跳转
+                if start_sec > 0:
+                    cmd.insert(1, "-ss")
+                    cmd.insert(2, f"{start_sec:.3f}")
+                # 添加 cropdetect 参数
+                cmd.extend([
+                    "-vframes", str(frames),
+                    "-vf", f"cropdetect=limit=0.1:round={round_val}:skip=0",  # skip=0 因为已用 -ss 跳转
+                    "-f", "null", "-"
+                ])
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, encoding='utf-8', errors='replace',
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                )
+                _, stderr = proc.communicate(timeout=15)
+    
+                pattern = re.compile(r'crop=(\d+):(\d+):(\d+):(\d+)')
+                matches = pattern.findall(stderr)
+                if not matches:
+                    self.app._append_info_ui(_("[黑边检测] 未检测到明显的黑边，请手动调整。"))
+                    return
+    
+                w, h, x, y = matches[-1]
+                self.app.root.after(0, lambda: self.crop_width.set(w))
+                self.app.root.after(0, lambda: self.crop_height.set(h))
+                self.app.root.after(0, lambda: self.crop_left.set(x))
+                self.app.root.after(0, lambda: self.crop_top.set(y))
+                self.app.root.after(0, lambda: self.crop_enabled.set(True))
+                self.app._append_info_ui(_("[黑边检测] 推荐裁剪参数: crop={0}:{1}:{2}:{3}，已自动填入并启用裁剪。".format(w, h, x, y)))
+            except subprocess.TimeoutExpired:
+                self.app._append_info_ui(_("[黑边检测] 检测超时，请检查 ffmpeg 是否正常。"))
+            except Exception as e:
+                self.app._append_info_ui(_("[黑边检测] 出错: {0}".format(e)))
+            finally:
+                def enable_btn():
+                    for child in self.winfo_children():
+                        if isinstance(child, ttk.Button) and "自动检测黑边" in child.cget("text"):
+                            child.config(state=tk.NORMAL)
+                            break
+                self.app.root.after(0, enable_btn)
+    
+        threading.Thread(target=detect, daemon=True).start()
+
+    def toggle_subtitle(self):
+        enabled = self.subtitle_enabled.get()
+        state = tk.NORMAL if enabled else tk.DISABLED
+        self.subtitle_entry.config(state=state)
+        self.browse_subtitle_btn.config(state=state)
+
+    def browse_subtitle(self):
+        if not self.subtitle_enabled.get():
+            self.subtitle_enabled.set(True)
+            self.toggle_subtitle()
+        path = filedialog.askopenfilename(title="选择字幕文件", filetypes=[("字幕文件", "*.srt *.ass *.ssa *.vtt")])
+        if path:
+            self.subtitle_path.set(normalize_path(path))
+
+    def get_settings(self):
+        return {
+            "frame_rate_type": self.frame_rate_type.get(),
+            "frame_rate_custom": self.frame_rate_custom.get(),
+            "scale_enabled": self.scale_enabled.get(),
+            "scale_width": self.scale_width.get(),
+            "scale_height": self.scale_height.get(),
+            "scale_method": self.scale_method.get(),
+            "crop_enabled": self.crop_enabled.get(),
+            "crop_left": self.crop_left.get(),
+            "crop_top": self.crop_top.get(),
+            "crop_width": self.crop_width.get(),
+            "crop_height": self.crop_height.get(),
+            "rotate": self.rotate.get(),
+            "vflip": self.vflip.get(),
+            "hflip": self.hflip.get(),
+            "speed_enabled": self.speed_enabled.get(),
+            "speed_factor": self.speed_factor.get(),
+            "deinterlace_filter": self.deinterlace_filter.get(),
+            "pix_fmt_enabled": self.pix_fmt_enabled.get(),
+            "pix_fmt": self.pix_fmt.get(),
+            "subtitle_enabled": self.subtitle_enabled.get(),
+            "subtitle_path": self.subtitle_path.get(),
+            "reverse_enabled": self.reverse_enabled.get(),
+            "blur_enabled": self._blur_enabled.get(),
+            "blur_type": self._blur_type.get(),
+            "blur_strength": self._blur_strength.get(),
+            "blur_x": self._blur_x.get(),
+            "blur_y": self._blur_y.get(),
+            "blur_w": self._blur_w.get(),
+            "blur_h": self._blur_h.get(),
+            "blur_region_only": self._blur_region_only.get(),
+        }
+
+    def set_settings(self, settings):
+        self.frame_rate_type.set(settings.get("frame_rate_type", "keep"))
+        self.frame_rate_custom.set(settings.get("frame_rate_custom", "30"))
+        self.scale_enabled.set(settings.get("scale_enabled", False))
+        self.scale_width.set(settings.get("scale_width", ""))
+        self.scale_height.set(settings.get("scale_height", ""))
+        self.scale_method.set(settings.get("scale_method", "width"))
+        self.crop_enabled.set(settings.get("crop_enabled", False))
+        self.crop_left.set(settings.get("crop_left", "0"))
+        self.crop_top.set(settings.get("crop_top", "0"))
+        self.crop_width.set(settings.get("crop_width", "iw/2"))
+        self.crop_height.set(settings.get("crop_height", "ih"))
+        self.rotate.set(settings.get("rotate", "none"))
+        self.vflip.set(settings.get("vflip", False))
+        self.hflip.set(settings.get("hflip", False))
+        self.speed_enabled.set(settings.get("speed_enabled", False))
+        self.speed_factor.set(settings.get("speed_factor", "1.0"))
+        self.deinterlace_filter.set(settings.get("deinterlace_filter", "none"))
+        self.pix_fmt_enabled.set(settings.get("pix_fmt_enabled", True))
+        self.pix_fmt.set(settings.get("pix_fmt", "yuv420p"))
+        self.subtitle_enabled.set(settings.get("subtitle_enabled", False))
+        self.subtitle_path.set(settings.get("subtitle_path", ""))
+        self.toggle_subtitle()
+        self.reverse_enabled.set(settings.get("reverse_enabled", False))
+        self._blur_enabled.set(settings.get("blur_enabled", False))
+        self._blur_type.set(settings.get("blur_type", "delogo"))
+        self._blur_strength.set(settings.get("blur_strength", "5"))
+        self._blur_x.set(settings.get("blur_x", "0"))
+        self._blur_y.set(settings.get("blur_y", "0"))
+        self._blur_w.set(settings.get("blur_w", "100"))
+        self._blur_h.set(settings.get("blur_h", "100"))
+        self._blur_region_only.set(settings.get("blur_region_only", False))
+
+
+class TextWatermarkDialog(tk.Toplevel):
+    """文字水印设置窗口（drawtext）"""
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.withdraw()
+        self.app = app
+        self.parent = parent
+        self.title(_("文字水印"))
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(False, False)
+
+        width, height = 370, 500
+        center_window(self, width, height)
+
+        self.create_widgets()
+        self.deiconify()
+
+    def create_widgets(self):
+        from tkinter.colorchooser import askcolor
+        main = ttk.Frame(self, padding="10")
+        main.pack(fill=tk.BOTH, expand=True)
+
+        s = self.app.text_watermark_settings
+
+        # ---- 启用 ----
+        self.enabled_var = tk.BooleanVar(value=s.get("enabled", False))
+        ttk.Checkbutton(main, text=_("启用文字水印"), variable=self.enabled_var).grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=5)
+
+        # ---- 文字内容 ----
+        ttk.Label(main, text=_("文字内容:")).grid(row=1, column=0, sticky="nw", pady=5)
+        self.text_var = tk.StringVar(value=s.get("text", ""))
+        text_entry = ttk.Entry(main, textvariable=self.text_var, width=28)
+        text_entry.grid(row=1, column=1, columnspan=2, sticky="w", pady=5, padx=5)
+
+        # ---- 字体 ----
+        ttk.Label(main, text=_("中文字体:")).grid(row=2, column=0, sticky="w", pady=5)
+        self.font_var = tk.StringVar(value=s.get("font_name", "微软雅黑"))
+        font_combo = ttk.Combobox(main, textvariable=self.font_var, state="readonly",
+                                  values=list(CN_FONT_MAP.keys()), width=18)
+        font_combo.grid(row=2, column=1, columnspan=2, sticky="w", pady=5, padx=5)
+
+        # ---- 字号 ----
+        ttk.Label(main, text=_("字号:")).grid(row=3, column=0, sticky="w", pady=5)
+        self.size_var = tk.IntVar(value=s.get("font_size", 48))
+        ttk.Spinbox(main, from_=8, to=200, textvariable=self.size_var, width=10).grid(
+            row=3, column=1, sticky="w", pady=5, padx=5)
+
+        # ---- 颜色 ----
+        ttk.Label(main, text=_("颜色:")).grid(row=4, column=0, sticky="w", pady=5)
+        self.color_var = tk.StringVar(value=s.get("font_color", "#FFFFFF"))
+        color_entry = ttk.Entry(main, textvariable=self.color_var, width=12)
+        color_entry.grid(row=4, column=1, sticky="w", pady=5, padx=5)
+        def pick_color():
+            c = askcolor(self.color_var.get() or "#FFFFFF", parent=self)
+            if c and c[1]:
+                self.color_var.set(c[1].upper())
+        ttk.Button(main, text=_("选色"), command=pick_color, width=5).grid(
+            row=4, column=2, pady=5)
+
+        # ---- 透明度 ----
+        ttk.Label(main, text=_("透明度:")).grid(row=5, column=0, sticky="w", pady=5)
+        opacity_frame = ttk.Frame(main)
+        opacity_frame.grid(row=5, column=1, columnspan=2, sticky="w", pady=5, padx=5)
+        self.opacity_var = tk.IntVar(value=int(s.get("opacity", 1.0) * 100))
+        self.opacity_label = ttk.Label(opacity_frame, text=f"{self.opacity_var.get()}%", width=5)
+        self.opacity_label.pack(side=tk.LEFT, padx=(0, 5))
+        opacity_scale = ttk.Scale(opacity_frame, from_=0, to=100, variable=self.opacity_var, orient=tk.HORIZONTAL,
+                                  length=150, command=lambda v: self.opacity_label.config(text=f"{int(float(v))}%"))
+        opacity_scale.pack(side=tk.LEFT)
+
+        # ---- 描边 ----
+        ttk.Label(main, text=_("描边粗细:")).grid(row=6, column=0, sticky="w", pady=5)
+        self.border_w_var = tk.IntVar(value=s.get("border_w", 0))
+        ttk.Spinbox(main, from_=0, to=20, textvariable=self.border_w_var, width=10).grid(
+            row=6, column=1, sticky="w", pady=5, padx=5)
+
+        ttk.Label(main, text=_("描边颜色:")).grid(row=7, column=0, sticky="w", pady=5)
+        self.border_color_var = tk.StringVar(value=s.get("border_color", "#000000"))
+        bc_entry = ttk.Entry(main, textvariable=self.border_color_var, width=12)
+        bc_entry.grid(row=7, column=1, sticky="w", pady=5, padx=5)
+        def pick_border_color():
+            c = askcolor(self.border_color_var.get() or "#000000", parent=self)
+            if c and c[1]:
+                self.border_color_var.set(c[1].upper())
+        ttk.Button(main, text=_("选色"), command=pick_border_color, width=5).grid(
+            row=7, column=2, pady=5)
+
+        # ---- 显示时段 / 循环 (enable 控制) ----
+        # 用 pack 子框架排列，间隔完全由 padx 控制，避免 grid 列宽撑大间距
+        seg_frame = ttk.Frame(main)
+        seg_frame.grid(row=8, column=0, columnspan=5, sticky="w", pady=(10,2))
+        ttk.Label(seg_frame, text=_("显示时段(秒):")).pack(side=tk.LEFT, padx=(0,8))
+        ttk.Label(seg_frame, text=_("起始:")).pack(side=tk.LEFT, padx=(0,2))
+        self.enable_start_var = tk.StringVar(value=s.get("enable_start", ""))
+        self.enable_end_var = tk.StringVar(value=s.get("enable_end", ""))
+        es = ttk.Entry(seg_frame, textvariable=self.enable_start_var, width=8)
+        es.pack(side=tk.LEFT, padx=(0,8))
+        ToolTip(es, _("文字水印开始显示的时间（秒），留空表示从头显示。与结束时间组合成 between(t,start,end)。"))
+        ttk.Label(seg_frame, text=_("结束:")).pack(side=tk.LEFT, padx=(0,2))
+        ee = ttk.Entry(seg_frame, textvariable=self.enable_end_var, width=8)
+        ee.pack(side=tk.LEFT)
+        ToolTip(ee, _("文字水印结束显示的时间（秒），留空表示显示到结尾。与开始时间组合为显示区间。"))
+
+        cyc_frame = ttk.Frame(main)
+        cyc_frame.grid(row=9, column=0, columnspan=5, sticky="w", pady=2)
+        ttk.Label(cyc_frame, text=_("循环显示(秒):")).pack(side=tk.LEFT, padx=(0,8))
+        ttk.Label(cyc_frame, text=_("周期:")).pack(side=tk.LEFT, padx=(0,2))
+        self.enable_cycle_var = tk.StringVar(value=s.get("enable_cycle", ""))
+        self.enable_show_var = tk.StringVar(value=s.get("enable_show", ""))
+        ec = ttk.Entry(cyc_frame, textvariable=self.enable_cycle_var, width=8)
+        ec.pack(side=tk.LEFT, padx=(0,8))
+        ToolTip(ec, _("循环周期（秒）：每隔该时长重复一次显示。需配合『单次』使用。\n注意：周期不能比『单次』时长短，否则文字将一直连续显示（enable 永不关闭）。"))
+        ttk.Label(cyc_frame, text=_("单次:")).pack(side=tk.LEFT, padx=(0,2))
+        esh = ttk.Entry(cyc_frame, textvariable=self.enable_show_var, width=8)
+        esh.pack(side=tk.LEFT)
+        ToolTip(esh, _("单次显示时长（秒）：每个循环周期内仅显示前这么多秒（enable='lt(mod(t,周期),时长)'）。"))
+
+        # ---- 位置 X/Y 编辑 + 默认位置按钮（与叠加页一致的紧凑两行）----
+        # 用 live StringVar 直接绑定 text_watermark_settings 的 overlay_x/overlay_y，
+        # 预设按钮与编辑框都即时回写，无需点「确定」即可在预览中看到位置变化。
+        tw_pos = self.app.text_watermark_settings
+        self.tw_x_var = tk.StringVar(value=tw_pos.get("overlay_x", "10"))
+        self.tw_y_var = tk.StringVar(value=tw_pos.get("overlay_y", "10"))
+
+        def _tw_sync_xy(*_a):
+            tw_pos["overlay_x"] = self.tw_x_var.get().strip() or "10"
+            tw_pos["overlay_y"] = self.tw_y_var.get().strip() or "10"
+            if self.app.adv_frame and self.app.adv_frame.update_callback:
+                self.app.adv_frame.update_callback()
+
+        self.tw_x_var.trace_add("write", _tw_sync_xy)
+        self.tw_y_var.trace_add("write", _tw_sync_xy)
+
+        xy_frame = ttk.Frame(main)
+        xy_frame.grid(row=10, column=0, columnspan=5, sticky="w", pady=(10, 2))
+        x_label = ttk.Label(xy_frame, text=_("X位置:"))
+        x_label.pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Entry(xy_frame, textvariable=self.tw_x_var, width=16).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(xy_frame, text=_("Y位置:")).pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Entry(xy_frame, textvariable=self.tw_y_var, width=16).pack(side=tk.LEFT)
+        ToolTip(x_label, _("文字水印左上角坐标，支持表达式（如 W-w-10、10、(W-w)/2）。与叠加页同义，仅 X/Y 真正生效，宽度由文字长度决定。"))
+
+        presets = {
+            "左上": ("10", "10"),
+            "右上": ("W-w-10", "10"),
+            "左下": ("10", "H-h-10"),
+            "右下": ("W-w-10", "H-h-10"),
+            "居中": ("(W-w)/2", "(H-h)/2"),
+        }
+        preset_frame = ttk.Frame(main)
+        preset_frame.grid(row=11, column=0, columnspan=5, sticky="w", pady=(0, 8))
+        ttk.Label(preset_frame, text=_("预设位置:")).pack(side=tk.LEFT, padx=(0, 4))
+        for label, (px, py) in presets.items():
+            ttk.Button(preset_frame, text=_(label), width=6,
+                      command=lambda x=px, y=py: (self.tw_x_var.set(x), self.tw_y_var.set(y))
+                      ).pack(side=tk.LEFT, padx=2)
+
+        # ---- 位置编辑（直接在对话框内打开可视化编辑器）----
+        pos_btn = ttk.Button(
+            main, text=_("打开位置编辑器（可视化拖拽）"),
+            command=self._open_position_editor)
+        pos_btn.grid(row=12, column=0, columnspan=5, sticky="w", pady=10)
+        ToolTip(
+            pos_btn,
+            _("直接弹出可视化窗口拖拽文字水印的位置，无需关闭本窗口。\n"
+            "调整后的位置和大小会即时回写到文字水印设置。\n"
+            "注意：矩形框的「宽度」仅供参考——文字水印的最终渲染宽度由你输入的文字内容长度自动决定，\n"
+            "与框出来的宽度无关；因此只有「左上角坐标」和「高度(即字号)」真正生效，矩形宽度请无视。\n"
+            "具体效果请在预览中查看后再微调。"),
+            wraplength=400)
+
+        # ---- 按钮 ----
+        btn_frame = ttk.Frame(main)
+        btn_frame.grid(row=13, column=0, columnspan=5, pady=10)
+        ttk.Button(btn_frame, text=_("确定"), command=self.on_ok, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text=_("取消"), command=self.on_cancel, width=10).pack(side=tk.LEFT, padx=5)
+
+    def on_ok(self):
+        s = self.app.text_watermark_settings
+        s["enabled"] = self.enabled_var.get()
+        s["text"] = self.text_var.get().strip()
+        s["font_name"] = self.font_var.get()
+        s["font_path"] = resolve_cn_font_path(self.font_var.get())
+        s["font_size"] = self.size_var.get()
+        s["font_color"] = self.color_var.get().strip() or "#FFFFFF"
+        s["opacity"] = self.opacity_var.get() / 100.0
+        s["border_w"] = self.border_w_var.get()
+        s["border_color"] = self.border_color_var.get().strip() or "#000000"
+        s["enable_start"] = self.enable_start_var.get().strip()
+        s["enable_end"] = self.enable_end_var.get().strip()
+        s["enable_cycle"] = self.enable_cycle_var.get().strip()
+        s["enable_show"] = self.enable_show_var.get().strip()
+        # 触发命令预览更新
+        if self.app.adv_frame and self.app.adv_frame.update_callback:
+            self.app.adv_frame.update_callback()
+        self.destroy()
+
+    def on_cancel(self):
+        self.destroy()
+
+    def _open_position_editor(self):
+        """直接在对话框内打开文字水印可视化位置编辑器（无需关闭本窗口）。
+
+        位置编辑器本身是模态的（会接管输入），这里先释放本对话框的模态 grab，
+        待编辑器关闭后再恢复，避免两个模态窗口抢夺输入焦点。
+        """
+        if not hasattr(self.parent, "_open_text_wm_position_editor"):
+            return
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.parent._open_text_wm_position_editor()
+        try:
+            self.grab_set()
+        except Exception:
+            pass
+        # 位置编辑器会把「绘制矩形的高度」反推的字体大小回写到 text_watermark_settings，
+        # 此处必须把本对话框的 font_size 输入框同步刷新，否则点击「确定」时 on_ok 会用
+        # 旧的 size_var 把回写值覆盖掉，导致「绘制矩形→回写字体大小」看起来像没生效。
+        try:
+            new_fs = int(self.app.text_watermark_settings.get("font_size", self.size_var.get()))
+            self.size_var.set(new_fs)
+        except (ValueError, TypeError):
+            pass
+        # 同步 X/Y 编辑框：可视化编辑器会把拖拽结果写回 overlay_x/overlay_y
+        try:
+            self.tw_x_var.set(str(self.app.text_watermark_settings.get("overlay_x", "10")))
+            self.tw_y_var.set(str(self.app.text_watermark_settings.get("overlay_y", "10")))
+        except Exception:
+            pass
+
+class BlurFilterDialog(tk.Toplevel):
+    """去水印/模糊设置窗口 - 支持从裁剪复制坐标"""
+    def __init__(self, parent, filter_frame):
+        super().__init__(parent)
+        self.withdraw()
+        self.filter_frame = filter_frame
+        self.title(_("去水印 / 模糊设置"))
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(False, False)
+        
+        width, height = 430, 370
+        center_window(self, width, height)
+        
+        self.create_widgets()
+        self.load_settings()
+    
+    def create_widgets(self):
+        main = ttk.Frame(self, padding="10")
+        main.pack(fill=tk.BOTH, expand=True)
+        
+        # ---- 启用 ----
+        self.enabled_var = tk.BooleanVar(value=self.filter_frame._blur_enabled.get())
+        chk = ttk.Checkbutton(main, text=_("启用去水印/模糊"), variable=self.enabled_var)
+        chk.grid(row=0, column=0, columnspan=3, sticky="w", pady=5)
+        ToolTip(chk, _("勾选后将在视频滤镜链中插入去水印或模糊滤镜"))
+        
+        # ---- 滤镜类型 ----
+        ttk.Label(main, text=_("滤镜类型:")).grid(row=1, column=0, sticky="w", pady=5)
+        self.type_var = tk.StringVar(value=self.filter_frame._blur_type.get())
+        type_combo = ttk.Combobox(main, textvariable=self.type_var,
+                                  values=["delogo", "boxblur", "gblur"],
+                                  state="readonly", width=12)
+        type_combo.grid(row=1, column=1, sticky="w", padx=5)
+        type_combo.bind("<<ComboboxSelected>>", self.on_type_change)
+        ToolTip(type_combo,
+            _("【滤镜类型说明】\n"
+            "• delogo：智能去水印滤镜，需指定区域坐标（用周围像素填充），本身就只作用于选定区域。\n"
+            "• boxblur / gblur：模糊滤镜，默认作用于整个画面；\n"
+            "  勾选下方「仅模糊选定区域」后即变为局部模糊，只糊坐标框内的部分。\n\n"
+            "【局部模糊如何实现】\n"
+            "程序会自动生成分支滤镜图（不再需要手写快速命令）：\n"
+            "  split=2[bg][fg];[fg]crop=宽:高:X:Y,boxblur=..[bl];[bg][bl]overlay=X:Y\n"
+            "该子图会被放在滤镜链最前面，先于裁剪 / 旋转 / 缩放 / 亮度等滤镜执行，\n"
+            "因此这里填的坐标始终以【原始画面】为准，不会被后续裁剪或缩放带偏。")
+        )
+
+        # 一键切换到局部模糊
+        btn_region = ttk.Button(main, text=_("🎯 局部模糊"), command=self.quick_region_blur)
+        btn_region.grid(row=1, column=2, sticky="w", padx=5)
+        ToolTip(btn_region,
+            _("一键配置局部模糊：\n"
+            "1. 勾选「启用去水印/模糊」；\n"
+            "2. 若当前是 delogo，自动切换为 boxblur；\n"
+            "3. 勾选「仅模糊选定区域」并解锁坐标框；\n"
+            "4. 坐标为空时自动从「裁剪」设置带入。\n\n"
+            "应用后命令里的 -vf 会自动变成带分支的滤镜图，\n"
+            "局部模糊排在最前，其余滤镜（裁剪/亮度等）在其之后执行。"))
+
+        # ---- 强度参数 + 局部模糊开关 ----
+        self.strength_frame = ttk.Frame(main)
+        self.strength_frame.grid(row=2, column=0, columnspan=3, sticky="w", pady=5)
+        self.strength_label = ttk.Label(self.strength_frame, text=_("强度/半径:"))
+        self.strength_label.pack(side=tk.LEFT)
+        self.strength_var = tk.StringVar(value=self.filter_frame._blur_strength.get())
+        self.strength_entry = ttk.Entry(self.strength_frame, textvariable=self.strength_var, width=8)
+        self.strength_entry.pack(side=tk.LEFT, padx=5)
+        ToolTip(self.strength_entry, 
+                _("boxblur：半径（整数，默认5）\n"
+                "gblur：sigma（浮点数，默认2.0）\n"
+                "delogo：此参数无效"))
+
+        self.region_var = tk.BooleanVar(value=self.filter_frame._blur_region_only.get())
+        self.region_chk = ttk.Checkbutton(self.strength_frame, text=_("仅模糊选定区域（局部模糊）"),
+                                          variable=self.region_var, command=self.on_region_toggle)
+        self.region_chk.pack(side=tk.LEFT, padx=(15, 0))
+        ToolTip(self.region_chk,
+            _("勾选后 boxblur / gblur 只作用于下方坐标框圈定的区域，\n"
+            "程序会自动生成 split → crop → 模糊 → overlay 的分支滤镜图。\n"
+            "该子图永远排在裁剪 / 旋转 / 缩放 / 亮度等滤镜之前，坐标以原始画面为准。\n\n"
+            "delogo 本身就是区域滤镜，无需勾选（此时该项不可用）。"))
+
+        self.update_strength_state()  # 初始化状态
+        
+        # ---- 坐标区域 ----
+        coord_frame = ttk.LabelFrame(main, text=_("区域坐标 (delogo / 局部模糊 有效)"), padding="5")
+        coord_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=5)
+
+        
+        # 坐标输入行
+        row1 = ttk.Frame(coord_frame)
+        row1.pack(fill=tk.X, pady=2)
+        ttk.Label(row1, text="X:").pack(side=tk.LEFT)
+        self.x_var = tk.StringVar(value=self.filter_frame._blur_x.get())
+        x_entry = ttk.Entry(row1, textvariable=self.x_var, width=6)
+        x_entry.pack(side=tk.LEFT, padx=2)
+    
+        ttk.Label(row1, text="Y:").pack(side=tk.LEFT, padx=(10,0))
+        self.y_var = tk.StringVar(value=self.filter_frame._blur_y.get())
+        y_entry = ttk.Entry(row1, textvariable=self.y_var, width=6)
+        y_entry.pack(side=tk.LEFT, padx=2)
+ 
+        ttk.Label(row1, text=_("宽度:")).pack(side=tk.LEFT, padx=(10,0))
+        self.w_var = tk.StringVar(value=self.filter_frame._blur_w.get())
+        w_entry = ttk.Entry(row1, textvariable=self.w_var, width=6)
+        w_entry.pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(row1, text=_("高度:")).pack(side=tk.LEFT, padx=(10,0))
+        self.h_var = tk.StringVar(value=self.filter_frame._blur_h.get())
+        h_entry = ttk.Entry(row1, textvariable=self.h_var, width=6)
+        h_entry.pack(side=tk.LEFT, padx=2)
+
+        # 记录坐标输入框，供启用/禁用状态切换使用
+        # （旧实现遍历 self.winfo_children() 查找 LabelFrame，但坐标框实际挂在 main 下，
+        #   导致永远找不到、状态从未真正切换过，这里改为直接持有引用。）
+        self._coord_entries = [x_entry, y_entry, w_entry, h_entry]
+
+        # 复制裁剪坐标按钮
+        btn_copy = ttk.Button(coord_frame, text=_("📋 从裁剪复制坐标"), 
+                              command=self.copy_from_crop)
+        btn_copy.pack(pady=5)
+        ToolTip(btn_copy, 
+                _("点击后将直接复制裁剪设置中的坐标（左、上、宽、高）。\n"
+                "若当前不是 delogo 也未开启局部模糊，会自动切换为 delogo；\n"
+                "已开启局部模糊时则保持当前模糊类型不变。\n"
+                "使用前请先通过可视化裁剪工具获取目标区域的精确坐标。"))
+        
+        # ---- 操作按钮 ----
+        btn_frame = ttk.Frame(main)
+        btn_frame.grid(row=4, column=0, columnspan=3, pady=15)
+        ttk.Button(btn_frame, text=_("应用"), command=self.apply).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text=_("取消"), command=self.destroy).pack(side=tk.LEFT, padx=5)
+        
+        self.update_coord_state()
+    
+    def _is_region_blur(self) -> bool:
+        """当前是否处于「局部模糊」状态（仅 boxblur/gblur 有意义）"""
+        return bool(self.region_var.get()) and self.type_var.get() in ("boxblur", "gblur")
+
+    def update_strength_state(self):
+        """仅更新标签文字与可编辑状态，不改动用户已填的数值。"""
+        ftype = self.type_var.get()
+        if ftype == "delogo":
+            self.strength_label.config(text=_("参数:"))
+            self.strength_entry.config(state="disabled")
+        elif ftype == "boxblur":
+            self.strength_label.config(text=_("半径:"))
+            self.strength_entry.config(state="normal")
+        elif ftype == "gblur":
+            self.strength_label.config(text="sigma:")
+            self.strength_entry.config(state="normal")
+    
+    def update_coord_state(self):
+        # delogo 需要坐标；boxblur/gblur 只有开启局部模糊时才需要坐标
+        need_coord = (self.type_var.get() == "delogo") or self._is_region_blur()
+        state = "normal" if need_coord else "disabled"
+        for entry in getattr(self, "_coord_entries", []):
+            entry.config(state=state)
+        # delogo 本身就是区域滤镜，局部模糊开关对它无意义
+        if hasattr(self, "region_chk"):
+            self.region_chk.config(state="disabled" if self.type_var.get() == "delogo" else "normal")
+    
+    def on_type_change(self, event=None):
+        ftype = self.type_var.get()
+        if ftype == "delogo":
+            # delogo 不需要强度参数，清空；也不适用局部模糊开关
+            self.strength_var.set("")
+            self.region_var.set(False)
+        elif ftype in ("boxblur", "gblur"):
+            # 切换类型时始终填入该类型的默认值，保证下拉选项与强度值联动
+            default_map = {"boxblur": "5", "gblur": "2.0"}
+            self.strength_var.set(default_map.get(ftype, "5"))
+        self.update_strength_state()
+        self.update_coord_state()
+
+    def on_region_toggle(self):
+        self.update_coord_state()
+
+    def quick_region_blur(self):
+        """一键切换到「局部模糊」：启用 + boxblur + 区域模式 + 自动补坐标"""
+        self.enabled_var.set(True)
+        if self.type_var.get() == "delogo":
+            self.type_var.set("boxblur")
+            self.strength_var.set("5")
+        self.region_var.set(True)
+        # 坐标缺失时尝试从「裁剪」设置带入
+        if not (self.w_var.get().strip() and self.h_var.get().strip()):
+            self.copy_from_crop(silent=True)
+        if not self.strength_var.get().strip():
+            self.strength_var.set("5" if self.type_var.get() == "boxblur" else "2.0")
+        self.update_strength_state()
+        self.update_coord_state()
+        if getattr(self.filter_frame, "app", None):
+            self.filter_frame.app._append_info_ui(
+                _("已切换为局部模糊：应用后 -vf 将自动生成 split→crop→模糊→overlay 滤镜图，"
+                "并排在裁剪/旋转/缩放/亮度等滤镜之前（坐标以原始画面为准）"))
+    
+    def copy_from_crop(self, silent: bool = False):
+        crop_w = self.filter_frame.crop_width.get().strip()
+        crop_h = self.filter_frame.crop_height.get().strip()
+        crop_x = self.filter_frame.crop_left.get().strip()
+        crop_y = self.filter_frame.crop_top.get().strip()
+        if not crop_w or not crop_h:
+            if not silent:
+                messagebox.showwarning(_("提示"), _("裁剪未启用或参数为空，请先在「视频滤镜」中启用裁剪并设置区域。"))
+            return
+        self.x_var.set(crop_x)
+        self.y_var.set(crop_y)
+        self.w_var.set(crop_w)
+        self.h_var.set(crop_h)
+        if not self.enabled_var.get():
+            self.enabled_var.set(True)
+        # 已开启局部模糊时保持当前模糊类型，不再强制切回 delogo
+        switched = False
+        if self.type_var.get() != "delogo" and not self.region_var.get():
+            self.type_var.set("delogo")
+            self.on_type_change()
+            switched = True
+        else:
+            self.update_coord_state()
+        if not silent and getattr(self.filter_frame, "app", None):
+            self.filter_frame.app._append_info_ui(
+                _("已从裁剪复制坐标，并自动切换到 delogo 模式") if switched else "已从裁剪复制坐标")
+    
+    def load_settings(self):
+        self.enabled_var.set(self.filter_frame._blur_enabled.get())
+        self.type_var.set(self.filter_frame._blur_type.get())
+        # 如果类型是 delogo，不恢复强度值（保持空）
+        if self.type_var.get() == "delogo":
+            self.strength_var.set("")
+        else:
+            self.strength_var.set(self.filter_frame._blur_strength.get())
+        self.x_var.set(self.filter_frame._blur_x.get())
+        self.y_var.set(self.filter_frame._blur_y.get())
+        self.w_var.set(self.filter_frame._blur_w.get())
+        self.h_var.set(self.filter_frame._blur_h.get())
+        self.region_var.set(self.filter_frame._blur_region_only.get())
+        self.update_strength_state()
+        self.update_coord_state()
+    
+    def apply(self):
+        ftype = self.type_var.get()
+        region = self._is_region_blur()
+        if ftype == "delogo" or region:
+            label = _("局部模糊") if region else "delogo"
+            for var, name in [(self.x_var, "X"), (self.y_var, "Y"),
+                              (self.w_var, "宽度"), (self.h_var, "高度")]:
+                if not var.get().strip():
+                    messagebox.showerror(_("错误"), _("{0} 需要完整的区域坐标，{1} 不能为空".format(label, name)))
+                    return
+        if ftype in ("boxblur", "gblur"):
+            # 对于 boxblur 或 gblur，如果强度为空则填入默认值
+            if not self.strength_var.get().strip():
+                default_map = {"boxblur": "5", "gblur": "2.0"}
+                self.strength_var.set(default_map.get(ftype, "5"))
+        self.filter_frame._blur_enabled.set(self.enabled_var.get())
+        self.filter_frame._blur_type.set(ftype)
+        self.filter_frame._blur_strength.set(self.strength_var.get())
+        self.filter_frame._blur_x.set(self.x_var.get())
+        self.filter_frame._blur_y.set(self.y_var.get())
+        self.filter_frame._blur_w.set(self.w_var.get())
+        self.filter_frame._blur_h.set(self.h_var.get())
+        self.filter_frame._blur_region_only.set(region)
+        if self.enabled_var.get() and region and getattr(self.filter_frame, "app", None):
+            self.filter_frame.app._append_info_ui(
+                _("[局部模糊] 已启用：区域 {0}x{1} @ ({2},{3})，滤镜图排在其他滤镜之前".format(self.w_var.get(), self.h_var.get(), self.x_var.get(), self.y_var.get())))
+        if hasattr(self.filter_frame, 'app') and self.filter_frame.app:
+            self.filter_frame.app.update_command_preview()
+        self.destroy()
+
+
+# ================== 音频组件 ==================
+class AudioFrame(ttk.LabelFrame):
+    def __init__(self, parent, enable_checkbox=False, **kwargs):
+        super().__init__(parent, text=_("音频"), padding="5", **kwargs)
+        self.enable_checkbox = enable_checkbox
+        self.create_widgets()
+
+    def create_widgets(self):
+        inner = ttk.Frame(self)
+        inner.pack(fill=tk.X, expand=True)
+    
+        top_row = ttk.Frame(inner)
+        top_row.pack(fill=tk.X, pady=(0,5))
+
+        if self.enable_checkbox:
+            self.audio_enabled = tk.BooleanVar(value=True)
+            chk = ttk.Checkbutton(top_row, text=_("保留音频"), variable=self.audio_enabled)
+            chk.pack(side=tk.LEFT)
+
+        self.only_audio = tk.BooleanVar(value=False)
+        self.only_audio_cb = ttk.Checkbutton(top_row, text=_("仅提取音频"), variable=self.only_audio)
+        self.only_audio_cb.pack(side=tk.LEFT, padx=(50,2))
+
+        # "仅提取音频" ↔ "保留音频" 联动：勾选仅音频时强制保留音频，取消时恢复
+        self._prev_only_audio = False
+        self._saved_audio_enabled = True  # 记录勾选"仅音频"前的状态
+        def _on_only_audio_changed(*args):
+            curr = self.only_audio.get()
+            if curr and not self._prev_only_audio:
+                # 勾上"仅音频" → 保存旧状态并强制保留音频
+                self._saved_audio_enabled = self.audio_enabled.get()
+                self.audio_enabled.set(True)
+            elif not curr and self._prev_only_audio:
+                # 取消"仅音频" → 恢复原来的保留音频状态
+                self.audio_enabled.set(self._saved_audio_enabled)
+            self._prev_only_audio = curr
+        self.only_audio.trace_add("write", _on_only_audio_changed)
+
+        ttk.Label(top_row, text=_("输出容器:")).pack(side=tk.LEFT, padx=(12,2))
+        self.audio_format = tk.StringVar(value="m4a")
+        audio_format_combo = ttk.Combobox(top_row, textvariable=self.audio_format,
+                                          values=["mp3", "aac", "m4a", "flac", "opus", "wav", "ac3"],
+                                          state="readonly", width=6)
+        audio_format_combo.pack(side=tk.LEFT, padx=2)
+        ToolTip(self.only_audio_cb, _("勾选后，将只输出音频文件（自动添加 -vn 忽略视频），\n输出容器将使用右边选择的音频格式"), wraplength=440, offset_x=0, offset_y=5)
+    
+        controls_frame = ttk.Frame(inner)
+        controls_frame.pack(fill=tk.X, expand=True, pady=(5,0))
+        ttk.Label(controls_frame, text=_("编码器:")).pack(side=tk.LEFT)
+        self.audio_codec = tk.StringVar(value="aac")
+        ttk.Combobox(controls_frame, textvariable=self.audio_codec,
+                     values=ALL_AUDIO_ENCODERS, state="readonly", width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(controls_frame, text=_("比特率:")).pack(side=tk.LEFT)
+        self.audio_bitrate = tk.StringVar(value="128k")
+        bitrate_combo = ttk.Combobox(controls_frame, textvariable=self.audio_bitrate, width=6, values=["64k","96k", "128k", "192k", "256k", "320k"], state='readonly')
+        bitrate_combo.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(controls_frame, text=_("采样率:")).pack(side=tk.LEFT)
+        self.audio_samplerate = tk.StringVar(value="44100")
+        samplerate_combo = ttk.Combobox(controls_frame, textvariable=self.audio_samplerate, width=8, values=["8000","12000","16000","22050","32000", "44100", "48000", "96000"], state='readonly')
+        samplerate_combo.pack(side=tk.LEFT, padx=5)
+
+        volume_frame = ttk.Frame(inner)
+        volume_frame.pack(fill=tk.X, pady=(2,0))
+        self.volume_enabled = tk.BooleanVar(value=False)
+        chk_volume = ttk.Checkbutton(volume_frame, text=_("启用音量"), variable=self.volume_enabled)
+        chk_volume.pack(side=tk.LEFT, padx=(0,5))
+        ToolTip(chk_volume, _("勾选后启用音量倍数调整，可拖动滑块设置倍数（0.1~3.0）\n\n1.0=原始音量"), wraplength=400)
+        ttk.Label(volume_frame, text=_("倍数:")).pack(side=tk.LEFT, padx=(5,0))
+        self.volume_value = tk.DoubleVar(value=1.0)
+        self.volume_slider = ttk.Scale(volume_frame, from_=0.1, to=3.0, variable=self.volume_value,
+                                       orient=tk.HORIZONTAL, length=110, state=tk.DISABLED)
+        self.volume_slider.pack(side=tk.LEFT, padx=5)
+        self.volume_label = ttk.Label(volume_frame, text="1.0", width=5)
+        self.volume_label.pack(side=tk.LEFT)
+        self.volume_slider.configure(command=lambda v: self.volume_label.config(text=f"{float(v):.2f}"))
+
+        def on_volume_enabled(*args):
+            state = tk.NORMAL if self.volume_enabled.get() else tk.DISABLED
+            self.volume_slider.config(state=state)
+        self.volume_enabled.trace_add("write", on_volume_enabled)
+
+        # 变速 + 高级音频弹窗
+        adv_row = ttk.Frame(inner)
+        adv_row.pack(fill=tk.X, pady=(3,0))
+        self.audio_speed_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(adv_row, text=_("变速"), variable=self.audio_speed_enabled).pack(side=tk.LEFT, padx=(0,3))
+        ttk.Label(adv_row, text=_("倍数:")).pack(side=tk.LEFT)
+        self.audio_speed_factor = tk.StringVar(value="1.0")
+        ttk.Entry(adv_row, textvariable=self.audio_speed_factor, width=7).pack(side=tk.LEFT, padx=3)
+        ToolTip(adv_row, _("音频变速（atempo），0.25~4.0，>2 自动串联多个 atempo"), wraplength=400)
+
+        # 音频倒放独立控制（不再跟随主视频倒放）
+        self.audio_reverse = tk.BooleanVar(value=False)
+        chk_reverse = ttk.Checkbutton(adv_row, text=_("音频倒放（独立于视频）"), variable=self.audio_reverse)
+        chk_reverse.pack(side=tk.LEFT, padx=(5,0))
+        ToolTip(chk_reverse, _("勾选后，音频将单独倒放，不受视频倒放影响；与上方「变速」同为独立控制。"))
+
+        ttk.Button(adv_row, text=_("高级音频…"), command=self._open_advanced_audio_dialog).pack(side=tk.LEFT, padx=(10,0))
+
+        # 高级音频设置（由弹窗修改，默认值）
+        self.fade_enabled = tk.BooleanVar(value=False)
+        self.fade_in = tk.StringVar(value="")
+        self.fade_out = tk.StringVar(value="")
+        self.loudnorm_enabled = tk.BooleanVar(value=False)
+        self.denoise_enabled = tk.BooleanVar(value=False)
+        self.channel_mode = tk.StringVar(value="stereo")
+        self.eq_enabled = tk.BooleanVar(value=False)
+        self.eq_low = tk.StringVar(value="0")
+        self.eq_mid = tk.StringVar(value="0")
+        self.eq_high = tk.StringVar(value="0")
+
+    def _open_advanced_audio_dialog(self):
+        """高级音频弹窗：淡入淡出 / 响度标准化 / 降噪 / 声道 / 均衡器（节省主区空间）。"""
+        win = tk.Toplevel(self)
+        win.title(_("高级音频处理"))
+        try:
+            center_window(win, 480, 260)
+        except Exception:
+            pass
+        win.transient(self.winfo_toplevel())
+
+        fe = tk.BooleanVar(value=self.fade_enabled.get())
+        fi = tk.StringVar(value=self.fade_in.get())
+        fo = tk.StringVar(value=self.fade_out.get())
+        le = tk.BooleanVar(value=self.loudnorm_enabled.get())
+        de = tk.BooleanVar(value=self.denoise_enabled.get())
+        cm = tk.StringVar(value=self.channel_mode.get())
+        ee = tk.BooleanVar(value=self.eq_enabled.get())
+        elo = tk.StringVar(value=self.eq_low.get())
+        emi = tk.StringVar(value=self.eq_mid.get())
+        ehi = tk.StringVar(value=self.eq_high.get())
+
+        main = ttk.Frame(win, padding="10")
+        main.pack(fill=tk.BOTH, expand=True)
+
+        row = 0
+
+        # ---- 行0：淡入淡出 ----
+        chk_fade = ttk.Checkbutton(main, text=_("淡入淡出 (afade)"), variable=fe)
+        chk_fade.grid(row=row, column=0, columnspan=2, sticky="w", padx=5, pady=4)
+        ToolTip(chk_fade, _("在音频开头和结尾添加音量渐变效果，不会改变音频总时长"))
+
+        lbl_fi = ttk.Label(main, text=_("淡入秒:"))
+        lbl_fi.grid(row=row, column=2, sticky="w", padx=(10, 2))
+        ToolTip(lbl_fi, _("淡入持续时间（秒），从 0 开始逐渐增大音量"))
+        entry_fi = ttk.Entry(main, textvariable=fi, width=6)
+        entry_fi.grid(row=row, column=3, padx=2, sticky="w")
+
+        lbl_fo = ttk.Label(main, text=_("淡出秒:"))
+        lbl_fo.grid(row=row, column=4, sticky="w", padx=(10, 2))
+        ToolTip(lbl_fo, _("淡出持续时间（秒），在音频末尾逐渐减小音量至静音"))
+        entry_fo = ttk.Entry(main, textvariable=fo, width=6)
+        entry_fo.grid(row=row, column=5, padx=2, sticky="w")
+
+        # ---- 行1：响度标准化 ----
+        row += 1
+        chk_loud = ttk.Checkbutton(main, text=_("响度标准化 (loudnorm)"), variable=le)
+        chk_loud.grid(row=row, column=0, columnspan=2, sticky="w", padx=5, pady=4)
+        ToolTip(chk_loud, _("将音频响度标准化到广播级标准（EBU R128），适合统一多段音频的音量"))
+
+        # ---- 行2：降噪 ----
+        row += 1
+        chk_denoise = ttk.Checkbutton(main, text=_("降噪 (afftdn)"), variable=de)
+        chk_denoise.grid(row=row, column=0, columnspan=2, sticky="w", padx=5, pady=4)
+        ToolTip(chk_denoise, _("使用 FFT 降噪算法减少背景噪声，适合录音降噪"))
+
+        # ---- 行3：声道 ----
+        row += 1
+        ch_frame = ttk.Frame(main)
+        ch_frame.grid(row=row, column=0, columnspan=3, sticky="w", padx=5, pady=4)
+
+        lbl_ch = ttk.Label(ch_frame, text=_("声道:"))
+        lbl_ch.pack(side=tk.LEFT)
+        ToolTip(lbl_ch, _("选择输出声道模式：\n• stereo：保持立体声\n• mono：混合为单声道\n• left：仅保留左声道\n• right：仅保留右声道\n• swap：左右交换"))
+
+        combo_ch = ttk.Combobox(ch_frame, textvariable=cm, values=["stereo", "mono", "left", "right", "swap"], state="readonly", width=12)
+        combo_ch.pack(side=tk.LEFT, padx=5)
+
+        # ---- 行4：均衡器 ----
+        row += 1
+        chk_eq = ttk.Checkbutton(main, text=_("均衡器 (EQ)"), variable=ee)
+        chk_eq.grid(row=row, column=0, columnspan=2, sticky="w", padx=5, pady=4)
+        ToolTip(chk_eq, _("分别调节低音、中音、高音的增益（单位 dB），正数增强，负数衰减"))
+
+        lbl_low = ttk.Label(main, text=_("低音 (dB):"))
+        lbl_low.grid(row=row, column=2, sticky="w", padx=(10, 2))
+        ToolTip(lbl_low, _("低音增益（通常 60-250 Hz），正数增强低音，负数减弱"))
+        entry_low = ttk.Entry(main, textvariable=elo, width=5)
+        entry_low.grid(row=row, column=3, padx=2, sticky="w")
+
+        lbl_mid = ttk.Label(main, text=_("中音 (dB):"))
+        lbl_mid.grid(row=row, column=4, sticky="w", padx=(10, 2))
+        ToolTip(lbl_mid, _("中音增益（约 1kHz），调节人声和乐器的清晰度"))
+        entry_mid = ttk.Entry(main, textvariable=emi, width=5)
+        entry_mid.grid(row=row, column=5, padx=2, sticky="w")
+
+        # ---- 行5：高音 ----
+        row += 1
+        lbl_high = ttk.Label(main, text=_("高音 (dB):"))
+        lbl_high.grid(row=row, column=2, sticky="w", padx=(10, 2))
+        ToolTip(lbl_high, _("高音增益（通常 4-8 kHz），提升细节或减少刺耳感"))
+        entry_high = ttk.Entry(main, textvariable=ehi, width=5)
+        entry_high.grid(row=row, column=3, padx=2, sticky="w")
+
+        # ---- 底部按钮 ----
+        row += 1
+        btn_frame = ttk.Frame(main)
+        btn_frame.grid(row=row, column=0, columnspan=6, pady=15)
+
+        def _save():
+            self.fade_enabled.set(fe.get())
+            self.fade_in.set(fi.get().strip())
+            self.fade_out.set(fo.get().strip())
+            self.loudnorm_enabled.set(le.get())
+            self.denoise_enabled.set(de.get())
+            self.channel_mode.set(cm.get())
+            self.eq_enabled.set(ee.get())
+            self.eq_low.set(elo.get().strip() or "0")
+            self.eq_mid.set(emi.get().strip() or "0")
+            self.eq_high.set(ehi.get().strip() or "0")
+            win.destroy()
+
+        ttk.Button(btn_frame, text=_("保存"), command=_save).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text=_("取消"), command=win.destroy).pack(side=tk.LEFT, padx=5)
+
+        win.wait_window()
+
+    def get_settings(self):
+        volume = self.volume_value.get()
+        if volume < 0.1:
+            volume = 0.1
+        elif volume > 3.0:
+            volume = 3.0
+        res = {
+            "audio_codec": self.audio_codec.get(),
+            "audio_bitrate": self.audio_bitrate.get(),
+            "audio_samplerate": self.audio_samplerate.get(),
+            "only_audio": self.only_audio.get(),
+            "audio_format": self.audio_format.get(),
+            "volume": volume,
+            "volume_enabled": self.volume_enabled.get(),
+            "audio_speed_enabled": self.audio_speed_enabled.get(),
+            "audio_speed_factor": self.audio_speed_factor.get().strip() or "1.0",
+            "audio_reverse": self.audio_reverse.get(),
+            "fade_enabled": self.fade_enabled.get(),
+            "fade_in": self.fade_in.get().strip(),
+            "fade_out": self.fade_out.get().strip(),
+            "loudnorm_enabled": self.loudnorm_enabled.get(),
+            "denoise_enabled": self.denoise_enabled.get(),
+            "channel_mode": self.channel_mode.get(),
+            "eq_enabled": self.eq_enabled.get(),
+            "eq_low": self.eq_low.get().strip() or "0",
+            "eq_mid": self.eq_mid.get().strip() or "0",
+            "eq_high": self.eq_high.get().strip() or "0"
+        }
+        if self.enable_checkbox:
+            res["audio_enabled"] = self.audio_enabled.get()
+        return res
+    
+    def set_settings(self, settings):
+        if self.enable_checkbox and "audio_enabled" in settings:
+            self.audio_enabled.set(settings["audio_enabled"])
+        self.audio_codec.set(settings.get("audio_codec", "aac"))
+        self.audio_bitrate.set(settings.get("audio_bitrate", "128k"))
+        self.audio_samplerate.set(settings.get("audio_samplerate", "44100"))
+        self.only_audio.set(settings.get("only_audio", False))
+        self.audio_format.set(settings.get("audio_format", "m4a"))
+        vol = settings.get("volume", 1.0)
+        self.volume_value.set(vol)
+        self.volume_label.config(text=f"{vol:.2f}")
+        enabled = settings.get("volume_enabled", False)
+        self.volume_enabled.set(enabled)
+        self.audio_speed_enabled.set(settings.get("audio_speed_enabled", False))
+        self.audio_speed_factor.set(settings.get("audio_speed_factor", "1.0"))
+        self.audio_reverse.set(settings.get("audio_reverse", False))
+        self.fade_enabled.set(settings.get("fade_enabled", False))
+        self.fade_in.set(settings.get("fade_in", ""))
+        self.fade_out.set(settings.get("fade_out", ""))
+        self.loudnorm_enabled.set(settings.get("loudnorm_enabled", False))
+        self.denoise_enabled.set(settings.get("denoise_enabled", False))
+        self.channel_mode.set(settings.get("channel_mode", "stereo"))
+        self.eq_enabled.set(settings.get("eq_enabled", False))
+        self.eq_low.set(settings.get("eq_low", "0"))
+        self.eq_mid.set(settings.get("eq_mid", "0"))
+        self.eq_high.set(settings.get("eq_high", "0"))
+
+
+# ================== 截取片段组件 ==================
+class TrimFrame(ttk.LabelFrame):
+    def __init__(self, parent, show_combo_seek=True, update_callback=None, **kwargs):
+        kwargs.pop('update_callback', None)
+        super().__init__(parent, text=_("截取片段"), padding="5", **kwargs)
+        self.show_combo_seek = show_combo_seek
+        self.update_callback = update_callback
+        self.combo_check = None
+        self._setting = False
+        self.create_widgets()
+
+    def create_widgets(self):
+        self.trim_enabled = tk.BooleanVar(value=False)
+        top_line = ttk.Frame(self)
+        top_line.pack(fill=tk.X, pady=(0,5))
+        
+        self.trim_check = ttk.Checkbutton(top_line, text=_("启用截取片段"), variable=self.trim_enabled,
+                                          command=self.on_trim_toggle)
+        self.trim_check.pack(side=tk.LEFT, padx=5)
+        
+        info_label = ttk.Label(top_line, text=_("示例: 01:23:45 或 01:23:45.500 (留空表示到文件末尾)"), 
+                               foreground="gray")
+        info_label.pack(side=tk.LEFT, padx=5)
+        ToolTip(self.trim_check, 
+                _("默认是 -ss 在 -i 之前的快速模式，快速无损截取请把音频视频都改为Copy\n\n"
+                "截取功能在普通转码模式下（无水印/画中画）表现稳定，支持快速截取（基于关键帧）和精准截取（基于解码帧）两种方式。\n\n"
+                "当同时启用了「水印」或「画中画（子视频）」时：\n"
+                "  主视频截取：\n"
+                "    · 推荐使用「精准截取」模式（勾选“精准到帧”），可确保水印时长精确匹配主视频截取时长。\n"
+                "    · 快速模式下因基于关键帧，结束时间可能有几帧偏差（通常可忽略）。\n\n"
+                "  子视频（水印/画中画）截取：\n"
+                "    · 子视频启用截取后，截取的片段会通过 loop 滤镜循环播放，直至主视频结束。\n"
+                "    · 若循环次数有限（自定义次数），通过 enable 表达式限制显示时间，水印会在显示指定次数后消失，主视频继续播放。\n"
+                "    · 若循环为无限或次数总时长超过主视频，水印将持续显示到视频结束。\n\n"
+                "若您不希望水印循环或需要更精细控制，建议先在「视频转码」标签页单独处理好子视频，再导入作为水印/画中画素材。"),
+                wraplength=700)
+
+        time_frame = ttk.Frame(self)
+        time_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(time_frame, text=_("开始时间 (HH:MM:SS[.mmm]):")).pack(side=tk.LEFT)
+        self.trim_start = tk.StringVar(value="0")
+        self.trim_start_entry = ttk.Entry(time_frame, textvariable=self.trim_start, width=12)
+        self.trim_start_entry.pack(side=tk.LEFT, padx=5)
+    
+        time_frame2 = ttk.Frame(self)
+        time_frame2.pack(fill=tk.X, pady=2)
+        ttk.Label(time_frame2, text=_("结束时间 (HH:MM:SS[.mmm]):")).pack(side=tk.LEFT)
+        self.trim_end = tk.StringVar(value="")
+        self.trim_end_entry = ttk.Entry(time_frame2, textvariable=self.trim_end, width=12)
+        self.trim_end_entry.pack(side=tk.LEFT, padx=5)
+    
+        # 精准到帧
+        precise_frame = ttk.Frame(self)
+        precise_frame.pack(fill=tk.X, pady=5)
+        self.precise_trim = tk.BooleanVar(value=False)
+        self.precise_check = ttk.Checkbutton(
+            precise_frame, 
+            text=_("精准到帧（需重新编码，速度慢）"), 
+            variable=self.precise_trim,
+            command=self.on_precise_toggle
+        )
+        self.precise_check.pack(side=tk.LEFT, padx=5)
+        ToolTip(self.precise_check,
+                _("勾选后，截取将精确到帧，但必须重新编码视频。\n"
+                "若编码器为「copy」将自动提示。\n"
+                "取消勾选则为快速截取（基于关键帧），可能不精确但速度快。"),
+                wraplength=400)
+
+        # ---------- 组合跳转控件（根据 show_combo_seek 决定是否显示） ----------
+        if self.show_combo_seek:
+            combo_frame = ttk.Frame(self)
+            combo_frame.pack(fill=tk.X, pady=2)
+            
+            self.combo_seek = tk.BooleanVar(value=False)
+            self.combo_threshold = tk.IntVar(value=30)
+
+            self.combo_seek.trace_add('write', self._on_combo_changed)
+            self.combo_threshold.trace_add('write', self._on_combo_changed)
+
+            self.combo_check = ttk.Checkbutton(
+                combo_frame, 
+                text=_("组合跳转（加速长视频精确截取）"), 
+                variable=self.combo_seek,
+                command=self._on_combo_toggle
+            )
+            self.combo_check.pack(side=tk.LEFT, padx=5)
+            
+            ttk.Label(combo_frame, text=_("后置微调阈值(秒):")).pack(side=tk.LEFT, padx=(10,0))
+            spin = ttk.Spinbox(combo_frame, from_=1, to=120, width=5, 
+                               textvariable=self.combo_threshold)
+            spin.pack(side=tk.LEFT, padx=2)
+            
+            ToolTip(self.combo_check,
+                _("⚡ 组合跳转模式（仅推荐用于单个纯净视频转码）\n\n"
+                "原理：先快速跳到目标时间点之前的关键帧（输入跳转），\n"
+                "      再精确解码到目标帧（输出跳转），兼顾速度与精度。\n\n"
+                "阈值含义：\n"
+                "  例如：起始时间 3600s，阈值 30s → 前置跳 3570s，后置微调 30s\n\n"
+                "适用场景：\n"
+                "  ✅ 单个视频文件，无叠加、无水印、无画中画\n"
+                "  ✅ 需要从长视频中间位置开始截取（如从1小时处开始）\n"
+                "  ✅ 编码器非 copy（必须重新编码）\n\n"
+                "何时启用：\n"
+                "  📌 当视频总时长 > 2分钟 且 截取起始时间 > 30秒 时，推荐开启此模式；\n"
+                "  📌 若视频较短（<5分钟）或起始时间非常靠前（<10秒），提升不明显，\n\n"
+                "不适用场景：\n"
+                "  ❌ 启用「水印」或「画中画」（自动禁用）\n"
+                "     原因：前后双 -ss 的后置 -ss 无法区分是针对主视频还是从视频，\n"
+                "           容易误作用于其他输入，导致截取错位。\n"
+                "  ❌ 启用「精准到帧」模式（互斥，勾选后自动取消）\n"
+                "  ❌ 仅提取音频（only_audio）\n\n"
+                "性能提升参考（2小时电影，从1小时处截取）：\n"
+                "  • 软件解码：省去约15~30分钟的解码时间\n"
+                "  • 硬件解码（cuda/qsv）：省去约5~10分钟\n"
+                "  • 精准的trim模式需要慢慢把前面的全解码在丢弃，所以慢\n\n"
+                "阈值建议：默认30秒足以覆盖绝大多数关键帧间隔（1~10秒），\n"
+                "         无需调大，调大反而增加解码耗时。\n"
+                "若起始时间小于阈值，则自动跳过前置跳转，仅执行后置微调。"),
+                wraplength=500)
+        else:
+            # 不显示组合跳转时，创建内部变量但强制为 False
+            self.combo_seek = tk.BooleanVar(value=False)
+            self.combo_threshold = tk.IntVar(value=30)
+            self.combo_check = None
+
+
+
+        self.on_trim_toggle()
+
+
+    def _on_combo_changed(self, *args):
+        """组合跳转相关控件变化时，触发外部刷新"""
+        if not self._setting and self.update_callback:
+            self.update_callback()
+
+    # ---------- 新增：组合跳转切换回调 ----------
+    def _on_combo_toggle(self):
+        if self.combo_seek.get():
+            # 启用组合跳转时，禁用精准模式（互斥）
+            self.precise_trim.set(False)
+            self.precise_check.config(state='disabled')
+        else:
+            self.precise_check.config(state='normal')
+        if not self._setting and self.update_callback:
+            self.update_callback()
+
+    # ---------- 修改：精准模式切换回调（增加互斥） ----------
+    def on_precise_toggle(self):
+        if self.precise_trim.get() and self.show_combo_seek and self.combo_seek.get():
+            # 如果精准模式被启用，但组合跳转已启用，则禁用组合跳转
+            self.combo_seek.set(False)
+            if self.combo_check:
+                self.combo_check.config(state='normal')
+        # 原有逻辑（如有）保留
+        pass
+
+    def on_trim_toggle(self):
+        state = tk.NORMAL if self.trim_enabled.get() else tk.DISABLED
+        self.trim_start_entry.config(state=state)
+        self.trim_end_entry.config(state=state)
+
+    # ---------- 修改：get_settings 增加组合跳转字段 ----------
+    def get_settings(self):
+        res = {
+            "trim_enabled": self.trim_enabled.get(),
+            "trim_start": self.trim_start.get(),
+            "trim_end": self.trim_end.get(),
+            "precise_trim": self.precise_trim.get(),
+        }
+        if self.show_combo_seek:
+            res["combo_seek"] = self.combo_seek.get()
+            res["combo_threshold"] = self.combo_threshold.get()
+        else:
+            # 在不显示的场景下强制为 False
+            res["combo_seek"] = False
+            res["combo_threshold"] = 30
+        return res
+
+    # ---------- 修改：set_settings 增加组合跳转字段 ----------
+    def set_settings(self, settings):
+        self._setting = True
+        try:
+            self.trim_enabled.set(settings.get("trim_enabled", False))
+            self.trim_start.set(settings.get("trim_start", "0"))
+            self.trim_end.set(settings.get("trim_end", ""))
+            self.precise_trim.set(settings.get("precise_trim", False))
+            if self.show_combo_seek:
+                self.combo_seek.set(settings.get("combo_seek", False))
+                self.combo_threshold.set(settings.get("combo_threshold", 30))
+                self._on_combo_toggle()
+            else:
+                self.combo_seek.set(False)
+            self.on_trim_toggle()
+        finally:
+            self._setting = False
+
+# ================== 公共组件：循环与绿幕 ==================
+class LoopChromaFrame(ttk.LabelFrame):
+    """循环播放与绿幕抠像设置组件 - 左右并排（grid布局）"""
+    def __init__(self, master, **kwargs):
+        super().__init__(master, text=_("循环/绿幕控制"), padding="5", **kwargs)
+        self._create_widgets()
+
+    def _create_widgets(self):
+        # 使用 grid 布局，将窗口分为左右两列，权重相等
+        self.columnconfigure(0, weight=1)
+        self.columnconfigure(1, weight=1)
+
+        # ----- 左侧：循环播放（列0） -----
+        loop_frame = ttk.LabelFrame(self, text=_("循环播放"), padding="5")
+        loop_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 2))
+        loop_frame.columnconfigure(0, weight=1)
+
+        self.loop_enabled = tk.BooleanVar(value=False)
+        chk = ttk.Checkbutton(loop_frame, text=_("启用循环控制 (不启用=无限循环)"), variable=self.loop_enabled)
+        chk.grid(row=0, column=0, sticky="w", pady=(0,5))
+        ToolTip(chk, 
+                _("勾选后可设置显示次数或仅显示一次。\n"
+                "注意：图片文件时长就1帧，若选择“一次”会导致瞬间消失，\n"
+                "您可复制生成的命令，手动修改 enable 表达式中的时间值以达到预期效果。"),
+                wraplength=500)
+
+        # 次数控制区域（始终显示，但默认禁用）
+        self.count_frame = ttk.Frame(loop_frame)
+        self.count_frame.grid(row=1, column=0, sticky="w", padx=10, pady=2)
+
+        ttk.Label(self.count_frame, text=_("显示次数:")).pack(side=tk.LEFT)
+        self.loop_count = tk.IntVar(value=3)
+        self.count_spinbox = ttk.Spinbox(
+            self.count_frame,
+            from_=1, to=100,
+            width=5,
+            textvariable=self.loop_count,
+            state="readonly"  # 初始为禁用（但实际禁用应设为 "disabled"）
+        )
+        # 初始禁用
+        self.count_spinbox.config(state="disabled")
+        self.count_spinbox.pack(side=tk.LEFT, padx=5)
+        ttk.Label(self.count_frame, text=_("次")).pack(side=tk.LEFT)
+
+        # 时长显示标签
+        self.duration_label = ttk.Label(loop_frame, text="", foreground="gray")
+        self.duration_label.grid(row=2, column=0, sticky="w", padx=10, pady=(5,0))
+
+        # 初始化 loop_mode
+        self.loop_mode = tk.StringVar(value="infinite")
+
+        # 绑定事件
+        def on_loop_enabled_changed(*args):
+            if self.loop_enabled.get():
+                # 启用循环 → 次数输入可修改，loop_mode 设为 count
+                self.count_spinbox.config(state="readonly")
+                self.loop_mode.set("count")
+            else:
+                # 未启用 → 次数输入禁用，loop_mode 设为 infinite
+                self.count_spinbox.config(state="disabled")
+                self.loop_mode.set("infinite")
+        self.loop_enabled.trace_add("write", on_loop_enabled_changed)
+
+        # ----- 右侧：绿幕抠像（列1） -----
+        chroma_frame = ttk.LabelFrame(self, text=_("绿幕抠像 (色度键)"), padding="5")
+        chroma_frame.grid(row=0, column=1, sticky="nsew", padx=(2, 0))
+        chroma_frame.columnconfigure(0, weight=1)
+        chroma_frame.columnconfigure(1, weight=1)
+
+        top_row = ttk.Frame(chroma_frame)
+        top_row.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+
+        self.chroma_enabled = tk.BooleanVar(value=False)
+        chk = ttk.Checkbutton(top_row, text=_("启用绿幕抠像"), variable=self.chroma_enabled)
+        chk.pack(side=tk.LEFT, padx=(0, 10))
+        ToolTip(chk,
+                _("勾选后，将使用选择的抠像算法去除纯色背景（绿幕/蓝幕/纯色）。"),
+                wraplength=400)
+
+        # 滤镜类型：chromakey 和 colorkey 单选按钮
+        self.chroma_filter_type = tk.StringVar(value="chromakey")
+        rb_chroma = ttk.Radiobutton(top_row, text="chromakey", 
+                                    variable=self.chroma_filter_type, value="chromakey")
+        rb_chroma.pack(side=tk.LEFT, padx=2)
+        ToolTip(rb_chroma,
+                _("基于色相/饱和度（HSV）抠像，适合视频绿幕/蓝幕，\n"
+                "对颜色渐变和光照变化有较好抗性。推荐用于视频素材。"),
+                wraplength=400)
+
+        rb_color = ttk.Radiobutton(top_row, text="colorkey", 
+                                   variable=self.chroma_filter_type, value="colorkey")
+        rb_color.pack(side=tk.LEFT, padx=2)
+        ToolTip(rb_color,
+                _("基于 RGB 颜色距离抠像，适合静态图片、GIF、纯色背景（白/黑），\n"
+                "对索引色（如 GIF）更稳定。若 chromakey 效果不佳可尝试此项。"),
+                wraplength=400)
+
+
+        color_row = ttk.Frame(chroma_frame)
+        color_row.grid(row=1, column=0, sticky="w", pady=2)
+
+        ttk.Label(color_row, text=_("抠除颜色:")).pack(side=tk.LEFT)
+        self.chroma_color = tk.StringVar(value="#3fff08")
+        color_combo = ttk.Combobox(color_row, textvariable=self.chroma_color,
+                                   values=["#3fff08", "#00CFFD", "black", "white"], state="readonly", width=10)
+        color_combo.pack(side=tk.LEFT, padx=5)
+        self.color_swatch = tk.Label(color_row, width=4, height=1, relief=tk.SUNKEN, bg=self.chroma_color.get())
+        self.color_swatch.pack(side=tk.LEFT, padx=5)
+        self.chroma_color.trace_add("write", lambda *a: self.color_swatch.config(bg=self.chroma_color.get()))
+
+        # 吸管取色（Windows）
+        def pick_color():
+            if sys.platform != "win32":
+                messagebox.showinfo(_("提示"), _("吸管取色仅支持 Windows"))
+                return
+            import ctypes
+            import ctypes.wintypes
+            def get_pixel_color(x, y):
+                hdc = ctypes.windll.user32.GetDC(0)
+                pixel = ctypes.windll.gdi32.GetPixel(hdc, x, y)
+                ctypes.windll.user32.ReleaseDC(0, hdc)
+                r = pixel & 0xFF
+                g = (pixel >> 8) & 0xFF
+                b = (pixel >> 16) & 0xFF
+                return f"#{r:02x}{g:02x}{b:02x}"
+            mask = tk.Toplevel(self)
+            mask.attributes('-fullscreen', True)
+            mask.attributes('-alpha', 0.3)
+            mask.configure(bg='black', cursor='crosshair')
+            mask.attributes('-topmost', True)
+            tip = tk.Label(mask, text=_("点击屏幕任意位置取色 (ESC 取消)"), font=("Microsoft YaHei", 16, "bold"),
+                           fg="white", bg="black", padx=20, pady=10)
+            tip.pack(expand=True)
+            def on_click(event):
+                mask.withdraw()
+                mask.update_idletasks()
+                hex_color = get_pixel_color(event.x_root, event.y_root)
+                mask.destroy()
+                self.chroma_color.set(hex_color)
+            def on_escape(event):
+                mask.destroy()
+            mask.bind("<Button-1>", on_click)
+            mask.bind("<Escape>", on_escape)
+            self.wait_window(mask)
+
+        ttk.Button(color_row, text=_("🔍吸取颜色"), command=pick_color).pack(side=tk.LEFT, padx=5)
+        ttk.Button(color_row, text=_("标准色盘"), command=self._pick_standard_color).pack(side=tk.LEFT, padx=5)
+
+        # 相似度
+        sim_frame = ttk.Frame(chroma_frame)
+        sim_frame.grid(row=2, column=0, sticky="we", pady=2)
+        sim_label = ttk.Label(sim_frame, text=_("相似度 (0~1):"))
+        sim_label.pack(side=tk.LEFT)
+        ToolTip(sim_label,
+                _("【绿幕/蓝幕】推荐 0.3 左右，可适当调整。\n如果觉得转换后的对象发虚透明，降低相似度重试。"),
+                wraplength=400)
+        self.chroma_similarity = tk.DoubleVar(value=0.3)
+        sim_slider = ttk.Scale(sim_frame, from_=0.0, to=1.0, variable=self.chroma_similarity,
+                               orient=tk.HORIZONTAL, length=100)
+        sim_slider.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        self.sim_entry_var = tk.StringVar(value="0.3000")
+        sim_entry = ttk.Entry(sim_frame, textvariable=self.sim_entry_var, width=8)
+        sim_entry.pack(side=tk.LEFT, padx=5)
+        def sim_slider_changed(val):
+            self.sim_entry_var.set(f"{float(val):.4f}")
+        sim_slider.configure(command=sim_slider_changed)
+        def sim_entry_changed(*args):
+            try:
+                val = float(self.sim_entry_var.get())
+                if 0.0 <= val <= 1.0:
+                    self.chroma_similarity.set(val)
+                else:
+                    raise ValueError
+            except:
+                self.sim_entry_var.set(f"{self.chroma_similarity.get():.4f}")
+        self.sim_entry_var.trace_add("write", sim_entry_changed)
+
+        # 混合度
+        blend_frame = ttk.Frame(chroma_frame)
+        blend_frame.grid(row=3, column=0, sticky="we", pady=2)
+        ttk.Label(blend_frame, text=_("混合度/平滑 (0~1):")).pack(side=tk.LEFT)
+        self.chroma_blend = tk.DoubleVar(value=0.1)
+        blend_slider = ttk.Scale(blend_frame, from_=0.0, to=1.0, variable=self.chroma_blend,
+                                 orient=tk.HORIZONTAL, length=100)
+        blend_slider.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        self.blend_entry_var = tk.StringVar(value="0.10")
+        blend_entry = ttk.Entry(blend_frame, textvariable=self.blend_entry_var, width=8)
+        blend_entry.pack(side=tk.LEFT, padx=5)
+        def blend_slider_changed(val):
+            self.blend_entry_var.set(f"{float(val):.2f}")
+        blend_slider.configure(command=blend_slider_changed)
+        def blend_entry_changed(*args):
+            try:
+                val = float(self.blend_entry_var.get())
+                if 0.0 <= val <= 1.0:
+                    self.chroma_blend.set(val)
+                else:
+                    raise ValueError
+            except:
+                self.blend_entry_var.set(f"{self.chroma_blend.get():.2f}")
+        self.blend_entry_var.trace_add("write", blend_entry_changed)
+
+        # 透明度控制（行1，横跨两列）
+        alpha_frame = ttk.Frame(self)
+        alpha_frame.grid(row=1, column=0, columnspan=2, sticky="we", pady=5)
+        
+        self.alpha_enabled = tk.BooleanVar(value=False)
+        alpha_cb = ttk.Checkbutton(alpha_frame, text=_("透明度"), variable=self.alpha_enabled)
+        alpha_cb.pack(side=tk.LEFT, padx=(0,5))
+        
+        self.alpha_value = tk.DoubleVar(value=1.0)
+        alpha_scale = ttk.Scale(alpha_frame, from_=0.0, to=1.0, variable=self.alpha_value,
+                                orient=tk.HORIZONTAL, length=100)
+        alpha_scale.pack(side=tk.LEFT, fill=tk.X, expand=False, padx=5)
+        
+        self.alpha_spinbox_var = tk.StringVar(value="1.0")
+        alpha_spin = ttk.Spinbox(alpha_frame, from_=0.0, to=1.0, increment=0.1,
+                                 textvariable=self.alpha_spinbox_var, width=6)
+        alpha_spin.pack(side=tk.LEFT, padx=5)
+        
+        # 滑块 → Spinbox 同步
+        def alpha_slider_changed(val):
+            self.alpha_spinbox_var.set(f"{float(val):.1f}")
+        alpha_scale.configure(command=alpha_slider_changed)
+        
+        # Spinbox → 滑块同步（手动输入时）
+        def alpha_spin_changed(*args):
+            try:
+                val = float(self.alpha_spinbox_var.get())
+                if 0.0 <= val <= 1.0:
+                    self.alpha_value.set(val)
+                else:
+                    raise ValueError
+            except:
+                self.alpha_spinbox_var.set(f"{self.alpha_value.get():.1f}")
+        self.alpha_spinbox_var.trace_add("write", alpha_spin_changed)
+
+
+
+    def _pick_standard_color(self):
+        from tkinter import colorchooser
+        color_code = colorchooser.askcolor(title="选择抠像颜色", parent=self, initialcolor=self.chroma_color.get())[1]
+        if color_code:
+            self.chroma_color.set(color_code)
+
+    def get_settings(self):
+        return {
+            "loop_enabled": self.loop_enabled.get(),
+            "loop_mode": self.loop_mode.get(),
+            "loop_count": self.loop_count.get(),
+            "chroma_enabled": self.chroma_enabled.get(),
+            "chroma_color": self.chroma_color.get(),
+            "chroma_similarity": self.chroma_similarity.get(),
+            "chroma_blend": self.chroma_blend.get(),
+            # 新增透明度
+            "alpha_enabled": self.alpha_enabled.get(),
+            "alpha_value": self.alpha_value.get(),
+            "chroma_filter_type": self.chroma_filter_type.get(),
+        }
+    
+    def set_settings(self, settings):
+        self.loop_enabled.set(settings.get("loop_enabled", False))
+        self.loop_mode.set(settings.get("loop_mode", "infinite"))
+        self.loop_count.set(settings.get("loop_count", 3))
+        self.chroma_enabled.set(settings.get("chroma_enabled", False))
+        self.chroma_color.set(settings.get("chroma_color", "#3fff08"))
+        sim = settings.get("chroma_similarity", 0.3)
+        if sim <= 0:
+            sim = 0.3
+        self.chroma_similarity.set(sim)
+        self.sim_entry_var.set(f"{sim:.4f}")
+        blend = settings.get("chroma_blend", 0.1)
+        self.chroma_blend.set(blend)
+        self.blend_entry_var.set(f"{blend:.2f}")
+        self.chroma_filter_type.set(settings.get("chroma_filter_type", "chromakey"))
+        self.color_swatch.config(bg=self.chroma_color.get())
+        self._update_loop_state()
+    
+        # 新增透明度恢复
+        self.alpha_enabled.set(settings.get("alpha_enabled", False))
+        val = settings.get("alpha_value", 1.0)
+        self.alpha_value.set(val)
+        self.alpha_spinbox_var.set(f"{val:.1f}")
+
+    def set_duration_info(self, duration_sec: Optional[float]):
+        """设置时长显示信息"""
+        if duration_sec is not None and duration_sec > 0:
+            # 格式化为 时:分:秒.毫秒
+            hours = int(duration_sec // 3600)
+            minutes = int((duration_sec % 3600) // 60)
+            seconds = duration_sec % 60
+            if hours > 0:
+                text = _("视频时长: {0:02d}:{1:02d}:{2:05.2f}".format(hours, minutes, seconds))
+            else:
+                text = _("视频时长: {0:02d}:{1:05.2f}".format(minutes, seconds))
+            self.duration_label.config(text=text)
+        else:
+            self.duration_label.config(text="")
+
+    def _update_loop_state(self):
+        if self.loop_enabled.get():
+            self.count_spinbox.config(state="readonly")
+            self.loop_mode.set("count")
+        else:
+            self.count_spinbox.config(state="disabled")
+            self.loop_mode.set("infinite")
+
+# ================== 公共组件：叠加位置与画布偏移（仅轨道模式） ==================
+class OverlayPositionFrame(ttk.LabelFrame):
+    """
+    叠加位置（子视频）或画布偏移（主视频）设置组件。
+    仅用于画中画或水印模式，始终显示控件。
+    """
+    def __init__(self, master, app, mode='sub', track_idx=None, track_obj=None,
+                 filt_frame=None, visual_callback=None, **kwargs):
+        super().__init__(master, **kwargs)
+        self.app = app
+        self.mode = mode
+        self.track_idx = track_idx
+        self.track_obj = track_obj
+        self.filt_frame = filt_frame
+        self.visual_callback = visual_callback
+        self._controls = []
+        self.blend_mode = tk.StringVar(value="normal")
+        self._create_controls()
+
+    def _create_controls(self):
+        if self.mode == 'sub':
+            self._create_sub_controls()
+        else:
+            self._create_main_controls()
+
+    def _create_sub_controls(self):
+        """子视频叠加位置控件"""
+        self.overlay_enabled = tk.BooleanVar(value=True)
+        top_row = ttk.Frame(self)
+        top_row.pack(anchor=tk.W, pady=(0,5))
+        cb = ttk.Checkbutton(top_row, text=_("启用叠加"), variable=self.overlay_enabled)
+        cb.pack(side=tk.LEFT)
+        self._controls.append(cb)
+        ttk.Label(top_row, text=_("混合模式:")).pack(side=tk.LEFT, padx=(40,5))
+        self._blend_display = {
+            "normal": "正常(透明叠加)",
+            "overlay": "叠加混合(blend)",
+            "screen": "滤色(screen)",
+            "multiply": "正片叠底(multiply)",
+            "darken": "变暗(darken)",
+            "lighten": "变亮(lighten)",
+            "addition": "相加(addition)",
+            "difference": "差值(difference)",
+            "softlight": "柔光(softlight)",
+            "hardlight": "强光(hardlight)",
+        }
+        blend_values = list(self._blend_display.keys())
+        blend_labels = [self._blend_display[k] for k in blend_values]
+        self.blend_mode_display = tk.StringVar(value=self._blend_display.get(self.blend_mode.get(), blend_labels[0]))
+        blend_cb = ttk.Combobox(top_row, textvariable=self.blend_mode_display, width=18,
+                               values=blend_labels, state="readonly")
+        blend_cb.pack(side=tk.LEFT, padx=(0,5))
+
+        def _on_blend_selected(evt=None):
+            sel = blend_cb.get()
+            if sel in blend_labels:
+                self.blend_mode.set(blend_values[blend_labels.index(sel)])
+        blend_cb.bind("<<ComboboxSelected>>", _on_blend_selected)
+        ToolTip(blend_cb, _("「正常(透明叠加)」=常规 overlay：子视频保留自身透明、叠在主画面上层，位置随 X/Y。其余为 Photoshop 式混合算法(blend)：子视频按 X/Y 摆放、其外部区域以该模式中性色填充后再对整帧按算法混合，与「正常」视觉完全不同。"), wraplength=440)
+        self._controls.append(top_row)
+
+        ttk.Label(self, text=_("X 位置 (支持表达式，如 W-w-10):")).pack(anchor=tk.W)
+        self.overlay_x = tk.StringVar(value="W-w-10")
+        entry = ttk.Entry(self, textvariable=self.overlay_x, width=40)
+        entry.pack(fill=tk.X, pady=2)
+        self._controls.append(entry)
+
+        ttk.Label(self, text=_("Y 位置 (支持表达式):")).pack(anchor=tk.W)
+        self.overlay_y = tk.StringVar(value="H-h-10")
+        entry = ttk.Entry(self, textvariable=self.overlay_y, width=40)
+        entry.pack(fill=tk.X, pady=2)
+        self._controls.append(entry)
+
+        # 快速预设
+        preset_frame = ttk.LabelFrame(self, text=_("快速预设"), padding="3")
+        preset_frame.pack(fill=tk.X, pady=5)
+        self._controls.append(preset_frame)
+
+        positions = {
+            "左上角": ("10", "10"),
+            "右上角": ("W-w-10", "10"),
+            "左下角": ("10", "H-h-10"),
+            "右下角": ("W-w-10", "H-h-10"),
+            "居中": ("(W-w)/2", "(H-h)/2")
+        }
+        def set_position(x_val, y_val):
+            self.overlay_x.set(x_val)
+            self.overlay_y.set(y_val)
+        for text, (x_val, y_val) in positions.items():
+            btn = ttk.Button(preset_frame, text=_(text),
+                             command=lambda x=x_val, y=y_val: set_position(x, y))
+            btn.pack(side=tk.LEFT, padx=2, pady=2)
+            self._controls.append(btn)
+
+        # 可视化编辑
+        def open_visual():
+            if not self.overlay_enabled.get():
+                messagebox.showinfo(_("提示"), _("请先勾选「启用叠加」再使用可视化编辑功能。"))
+                return
+            if self.visual_callback is not None:
+                self.visual_callback()
+            elif self.app and self.track_idx is not None:
+                parent_win = self.winfo_toplevel()
+                self.app.open_visual_overlay_editor(
+                    self.track_idx,
+                    ov_x_var=self.overlay_x,
+                    ov_y_var=self.overlay_y,
+                    filt_frame=self.filt_frame,
+                    parent=parent_win
+                )
+            else:
+                messagebox.showinfo(_("提示"), _("无法启动可视化编辑：缺少轨道索引或回调"))
+        btn = ttk.Button(preset_frame, text=_("🎨 可视化编辑坐标"), command=open_visual)
+        btn.pack(side=tk.LEFT, padx=5, pady=2)
+        self._controls.append(btn)
+
+    def _create_main_controls(self):
+        """主视频画布偏移控件 - 左右分栏（左侧偏移设置，右侧快捷操作）"""
+        # 主容器：水平分割
+        main_container = ttk.Frame(self)
+        main_container.pack(fill=tk.BOTH, expand=True)
+    
+        # ---------- 左容器：偏移设置 ----------
+        left_frame = ttk.Frame(main_container)
+        left_frame.pack(side=tk.LEFT, fill=tk.Y, expand=False)
+    
+        self.pad_enabled = tk.BooleanVar(value=False)
+        cb = ttk.Checkbutton(left_frame, text=_("启用画布偏移"), variable=self.pad_enabled)
+        cb.pack(anchor=tk.W, pady=(0,5))
+        self._controls.append(cb)
+    
+        w_frame = ttk.Frame(left_frame)
+        w_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(w_frame, text=_("画布宽度:")).pack(side=tk.LEFT)
+        self.pad_width = tk.StringVar(value="")
+        entry = ttk.Entry(w_frame, textvariable=self.pad_width, width=10)
+        entry.pack(side=tk.LEFT, padx=5)
+        self._controls.extend([w_frame, entry])
+    
+        if self.app:
+            def fetch_size():
+                main_file = self.app.merge_video.get().strip() if self.app.merge_video else ""
+                if not main_file or not os.path.exists(main_file):
+                    main_file = self.app.input_file.get().strip() if self.app.input_file else ""
+                if not main_file or not os.path.exists(main_file):
+                    messagebox.showerror(_("错误"), _("未找到主视频文件，请先设置主视频"))
+                    return
+                w, h = self.app._get_video_dimensions_cached(main_file)
+                if w is not None and h is not None:
+                    self.pad_width.set(str(w))
+                    self.pad_height.set(str(h))
+                    self.app._append_info_ui(_("[尺寸获取] 获取到主视频尺寸: {0}x{1}".format(w, h)))
+                else:
+                    messagebox.showerror(_("错误"), _("无法获取视频尺寸，请检查 ffprobe 是否可用或文件是否正常。".format()))
+            btn = ttk.Button(w_frame, text=_("获取尺寸"), command=fetch_size)
+            btn.pack(side=tk.LEFT, padx=5)
+            self._controls.append(btn)
+    
+        h_frame = ttk.Frame(left_frame)
+        h_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(h_frame, text=_("画布高度:")).pack(side=tk.LEFT)
+        self.pad_height = tk.StringVar(value="")
+        entry = ttk.Entry(h_frame, textvariable=self.pad_height, width=10)
+        entry.pack(side=tk.LEFT, padx=5)
+        self._controls.extend([h_frame, entry])
+    
+        ox_frame = ttk.Frame(left_frame)
+        ox_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(ox_frame, text=_("偏移 X:")).pack(side=tk.LEFT)
+        self.offset_x = tk.StringVar(value="0")
+        entry = ttk.Entry(ox_frame, textvariable=self.offset_x, width=10)
+        entry.pack(side=tk.LEFT, padx=5)
+        self._controls.extend([ox_frame, entry])
+    
+        oy_frame = ttk.Frame(left_frame)
+        oy_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(oy_frame, text=_("偏移 Y:")).pack(side=tk.LEFT)
+        self.offset_y = tk.StringVar(value="0")
+        entry = ttk.Entry(oy_frame, textvariable=self.offset_y, width=10)
+        entry.pack(side=tk.LEFT, padx=5)
+        self._controls.extend([oy_frame, entry])
+    
+        def open_pad_editor():
+            if not self.pad_enabled.get():
+                messagebox.showinfo(_("提示"), _("请先勾选「启用画布偏移」再使用可视化编辑功能。"))
+                return
+            if self.app and self.track_idx is not None:
+                parent_win = self.winfo_toplevel()
+                self.app.open_visual_pad_editor(
+                    self.track_idx,
+                    self.pad_width,
+                    self.pad_height,
+                    self.offset_x,
+                    self.offset_y,
+                    live_filt_frame=self.filt_frame, 
+                    parent=parent_win
+                )
+            else:
+                messagebox.showinfo(_("提示"), _("无法启动可视化编辑：缺少轨道索引"))
+        btn = ttk.Button(left_frame, text=_("🎨 可视化编辑画布偏移"), command=open_pad_editor)
+        btn.pack(anchor=tk.W, pady=5)
+        self._controls.append(btn)
+    
+        # ---------- 右容器：快捷操作 ----------
+        right_frame = ttk.Frame(main_container)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(10, 0))
+    
+
+        row1 = ttk.Frame(right_frame)
+        row1.pack(anchor=tk.W, fill=tk.X, pady=(0, 5))
+        
+        # --- 取消子视频缩放/裁剪 ---
+        btn_reset_sub = ttk.Button(
+            row1,
+            text=_("取消子视频缩放/裁剪"),
+            command=self._reset_sub_video_filters,
+            width=18
+        )
+        btn_reset_sub.pack(side=tk.LEFT, padx=(0, 5))
+        ToolTip(btn_reset_sub,
+                _("将所有子视频（非主视频）的「启用缩放」和「启用裁剪」复选框取消勾选，\n"
+                "恢复子视频为原始尺寸。"))
+
+        row2 = ttk.Frame(right_frame)
+        row2.pack(anchor=tk.W, fill=tk.X, pady=(0, 5))
+
+        # --- 统一高度 ---
+        self.unify_height_var = tk.StringVar(value="")
+        btn_unify_h = ttk.Button(
+            row2,
+            text=_("统一高度"),
+            command=self._apply_unified_height,
+            width=10
+        )
+        btn_unify_h.pack(side=tk.LEFT)
+        spin_h = ttk.Spinbox(row2, from_=1, to=9999, width=6, textvariable=self.unify_height_var)
+        spin_h.pack(side=tk.LEFT, padx=2)
+        
+        # --- 统一宽度 ---
+        self.unify_width_var = tk.StringVar(value="")
+        btn_unify_w = ttk.Button(
+            row2,
+            text=_("统一宽度"),
+            command=self._apply_unified_width,
+            width=10
+        )
+        btn_unify_w.pack(side=tk.LEFT, padx=2)
+        spin_w = ttk.Spinbox(row2, from_=1, to=9999, width=6, textvariable=self.unify_width_var)
+        spin_w.pack(side=tk.LEFT, padx=2)
+    
+
+        # ---- 修改子视频编码 ----
+        row3 = ttk.Frame(right_frame)
+        row3.pack(anchor=tk.W, fill=tk.X, pady=(0, 5))
+        btn_set_sub_encoder = ttk.Button(
+            row3,
+            text=_("修改子视频编码"),
+            command=self._set_sub_video_encoder,
+            width=18
+        )
+        btn_set_sub_encoder.pack(side=tk.LEFT, padx=(0,5))
+        ToolTip(btn_set_sub_encoder,
+                _("将所有子视频（非主视频）的编码器统一设置为 libx264 (H.264)。\n"
+                "此操作仅修改轨道设置，消除日志的copy自动转libx265提示。\n"
+                "提示：画中画模式中，子视频的编码无意义，最终编码只和主视频选择有关。"))
+        
+        btn_reset_copy = ttk.Button(
+            row3,
+            text=_("恢复为copy"),
+            command=self._reset_sub_encoder_to_copy,
+            width=14
+        )
+        btn_reset_copy.pack(side=tk.LEFT, padx=5)
+        ToolTip(btn_reset_copy,
+                _("将所有子视频（非主视频）的编码器恢复为「copy」（流复制）。\n"
+                "注意：恢复 copy 是为了给串行模式使用，如果你要更改模式的话。"))
+
+
+        def smart_tile():
+            if self.track_idx is not None:
+                orient_map = {
+                    "自动": "auto",
+                    "横排优先": "horizontal",
+                    "竖排优先": "vertical"
+                }
+                orientation = orient_map.get(self.tile_orientation.get(), "auto")
+                self.app.merge_smart_tile(
+                    self.track_idx,
+                    pad_enabled_var=self.pad_enabled,
+                    pad_width_var=self.pad_width,
+                    pad_height_var=self.pad_height,
+                    items_per_row=self.tile_cols.get(),
+                    items_per_col=self.tile_rows.get(),
+                    orientation=orientation,
+                    filt_frame=self.filt_frame
+                )
+            else:
+                messagebox.showinfo(_("提示"), _("无法获取主视频轨道索引"))
+
+        tile_btn = ttk.Button(right_frame, text=_("计算平铺"), command=smart_tile, width=8)
+        tile_btn.pack(anchor=tk.W)
+        ToolTip(tile_btn,
+                _("画中画模式下，拖入的子视频默认会缩放到320宽（便于快速预览）。\n"
+                "提示：若视频尺寸一致且希望以原始大小排列，\n"
+                "    可先使用「取消子视频缩放/裁剪」批量恢复原始尺寸，再执行平铺。\n"
+                "    或者先去每个子视频重新裁剪缩放为需要的画面，再执行平铺。\n\n"
+                "「计算平铺」会根据子视频当前的实际尺寸（包括已应用的缩放和裁剪），\n"
+                "    自动计算最佳平铺布局，将多个画面整齐排列在画布中。\n\n"
+                "支持三种排列方向：\n"
+                "• 自动：根据画面宽高比智能选择横向或纵向优先。\n"
+                "• 横排优先：按行排列，适合宽屏显示器。\n"
+                "• 竖排优先：按列排列，适合竖屏或手机视频。\n\n"
+                "典型用途：\n"
+                "• 多机位舞台合成（演唱会、访谈等）。\n"
+                "• 分屏对比（画质、色彩、动作同步）。\n"
+                "• 监控画面拼接。"),
+                wraplength=700)
+
+
+
+
+        param_row = ttk.Frame(right_frame)
+        param_row.pack(anchor=tk.W, fill=tk.X, pady=5)
+        
+        ttk.Label(param_row, text=_("每行:")).pack(side=tk.LEFT)
+        self.tile_cols = tk.IntVar(value=4)
+        ttk.Spinbox(param_row, from_=1, to=10, width=3, textvariable=self.tile_cols).pack(side=tk.LEFT, padx=2)
+        
+        ttk.Label(param_row, text=_("每列:")).pack(side=tk.LEFT, padx=(10,0))
+        self.tile_rows = tk.IntVar(value=4)
+        ttk.Spinbox(param_row, from_=1, to=10, width=3, textvariable=self.tile_rows).pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(param_row, text=_("方向:")).pack(side=tk.LEFT)
+        self.tile_orientation = tk.StringVar(value="自动")
+        orientation_combo = ttk.Combobox(param_row, textvariable=self.tile_orientation,
+                                         values=["自动", "横排优先", "竖排优先"],
+                                         state="readonly", width=8)
+        orientation_combo.pack(side=tk.LEFT, padx=2)
+        
+#         # 第四行：小提示（左对齐）
+#         tip_label = ttk.Label(right_frame, text="先取消缩放/裁剪，再平铺，效果更佳",
+#                               foreground="gray", font=("", 8))
+#         tip_label.pack(anchor=tk.W, pady=(5,0))
+
+
+    def _apply_unified_height(self):
+        val_str = self.unify_height_var.get().strip()
+        if not val_str:
+            messagebox.showwarning(_("提示"), _("请先输入要统一的高度数值"))
+            return
+        try:
+            target = int(val_str)
+            if target <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(_("错误"), _("请输入有效的正整数作为高度值"))
+            return
+        self._apply_unified_dimension('height', target)
+    
+    def _apply_unified_width(self):
+        val_str = self.unify_width_var.get().strip()
+        if not val_str:
+            messagebox.showwarning(_("提示"), _("请先输入要统一的宽度数值"))
+            return
+        try:
+            target = int(val_str)
+            if target <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(_("错误"), _("请输入有效的正整数作为宽度值"))
+            return
+        self._apply_unified_dimension('width', target)
+    
+    def _apply_unified_dimension(self, mode, target):
+        """
+        统一设置所有视频轨道的高度或宽度，并同步更新主视频的编辑对话框控件。
+        :param mode: 'height' 或 'width'
+        :param target: 目标像素值
+        """
+        if not self.app:
+            return
+        tracks = self.app.merge_tracks
+        if not tracks:
+            return
+    
+        # 确认操作
+        if not messagebox.askyesno(
+            _("确认统一尺寸"),
+            _("此操作将把所有视频轨道（包括主视频）的{0}统一设置为 {1}px，\n宽度或高度将按原比例自动缩放。\n\n确定继续吗？".format(mode, target))
+        ):
+            return
+    
+        # 确定主视频索引（用于判断当前编辑的是否为主视频）
+        main_idx = self.track_idx
+        if main_idx is None:
+            for i, t in enumerate(tracks):
+                if t.type == "video" and t.enabled:
+                    main_idx = i
+                    break
+    
+        modified = 0
+        for i, track in enumerate(tracks):
+            if track.type != "video" or not track.enabled:
+                continue
+            # 获取原始尺寸
+            orig_w, orig_h = get_video_dimensions(self.app.ffprobe_cmd, track.file_path)
+            if orig_w is None or orig_h is None:
+                continue  # 无法获取尺寸，跳过
+            # 启用缩放
+            track.enc_settings["scale_enabled"] = True
+            if mode == 'height':
+                track.enc_settings["scale_method"] = "height"
+                track.enc_settings["scale_height"] = str(target)
+                track.enc_settings["scale_width"] = ""
+            else:  # width
+                track.enc_settings["scale_method"] = "width"
+                track.enc_settings["scale_width"] = str(target)
+                track.enc_settings["scale_height"] = ""
+            modified += 1
+    
+            # ---- 同步编辑对话框控件（如果当前编辑的是主视频） ----
+            if (self.filt_frame is not None and main_idx is not None and i == main_idx):
+                self.filt_frame.scale_enabled.set(True)
+                self.filt_frame.scale_method.set(mode)
+                if mode == 'height':
+                    self.filt_frame.scale_height.set(str(target))
+                    self.filt_frame.scale_width.set("")
+                else:
+                    self.filt_frame.scale_width.set(str(target))
+                    self.filt_frame.scale_height.set("")
+                # 触发编辑对话框的预览刷新（如果存在）
+                if hasattr(self.filt_frame, '_preview_callback') and self.filt_frame._preview_callback:
+                    self.filt_frame._preview_callback()
+    
+        if modified:
+            self.app.merge_update_track_list()
+            self.app.merge_update_command_preview()
+            self.app._append_info_ui(_("[统一尺寸] 已将 {0} 个视频的{1}统一设为 {2}px".format(modified, mode, target)))
+        else:
+            self.app._append_info_ui(_("[统一尺寸] 没有可修改的视频轨道"))
+
+    def _reset_sub_encoder_to_copy(self):
+        """将所有子视频（非主视频）的编码器恢复为 copy（流复制）"""
+        self._set_sub_video_encoder(encoder="copy", force_clear=True)
+    
+    def _set_sub_video_encoder(self, encoder="libx264", force_clear=False):
+        """
+        将所有子视频（非主视频）的编码器设置为指定编码器。
+        :param encoder: 编码器名称，默认 libx264
+        :param force_clear: 若为 True，则清除可能冲突的质量参数（用于 copy）
+        """
+        if not self.app:
+            return
+        tracks = self.app.merge_tracks
+        if not tracks:
+            return
+    
+        # 二次确认（仅当 encoder 不是 copy 时提示，或者统一提示）
+        if not messagebox.askyesno(
+            _("确认修改编码"),
+            _("此操作将所有子视频（非主视频）的编码器统一设置为 {0}。\n确定要继续吗？".format(encoder))
+        ):
+            return
+    
+        # 确定主视频轨道
+        main_idx = self.track_idx
+        if main_idx is None:
+            for i, t in enumerate(tracks):
+                if t.type == "video" and t.enabled:
+                    main_idx = i
+                    break
+        if main_idx is None:
+            self.app._append_info_ui(_("[子视频编码] 未找到主视频轨道"))
+            return
+    
+        modified = 0
+        for i, track in enumerate(tracks):
+            if i == main_idx:
+                continue
+            if track.type != "video" or not track.enabled:
+                continue
+            # 修改编码器
+            track.enc_settings["encoder"] = encoder
+            # 如果是 copy，清除质量相关参数，避免冲突
+            if encoder.lower() == "copy":
+                track.enc_settings.pop("crf_value", None)
+                track.enc_settings.pop("cq_value", None)
+                track.enc_settings.pop("global_quality", None)
+                track.enc_settings.pop("bitrate_video", None)
+                track.enc_settings.pop("rate_control_type", None)
+            else:
+                # 非 copy，设置合理的默认值
+                if track.enc_settings.get("rate_control_type") not in ("crf", "bitrate"):
+                    track.enc_settings["rate_control_type"] = "crf"
+                if "crf_value" not in track.enc_settings:
+                    track.enc_settings["crf_value"] = 23
+            modified += 1
+    
+        if modified:
+            self.app.merge_update_track_list()
+            self.app.merge_update_command_preview()
+            self.app._append_info_ui(_("[子视频编码] 已将 {0} 个子视频的编码器设为 {1}".format(modified, encoder)))
+        else:
+            self.app._append_info_ui(_("[子视频编码] 没有需要修改的子视频"))
+
+    def _reset_sub_video_filters(self):
+        """取消所有子视频（非主视频）的缩放和裁剪勾选"""
+        if not self.app:
+            return
+        tracks = self.app.merge_tracks
+        if not tracks:
+            return
+    
+        # 确定主视频轨道（根据 self.track_idx 或第一个视频）
+        main_idx = self.track_idx
+        if main_idx is None:
+            # 如果 track_idx 未传入，则取第一个启用的视频作为主视频
+            for i, t in enumerate(tracks):
+                if t.type == "video" and t.enabled:
+                    main_idx = i
+                    break
+        if main_idx is None:
+            self.app._append_info_ui(_("[取消子视频滤镜] 未找到主视频轨道"))
+            return
+    
+        modified = 0
+        for i, track in enumerate(tracks):
+            if i == main_idx:
+                continue   # 跳过主视频
+            if track.type != "video" or not track.enabled:
+                continue
+            # 取消缩放和裁剪
+            track.enc_settings["scale_enabled"] = False
+            track.enc_settings["crop_enabled"] = False
+            # 如果轨道对象有同步属性，也更新（可选）
+            # track.scale_enabled = False  # 若存在此类属性
+            # track.crop_enabled = False
+            modified += 1
+
+        if modified:
+            self.app.merge_update_track_list()
+            self.app.merge_update_command_preview()
+            self.app._append_info_ui(_("[取消子视频滤镜] 已取消 {0} 个子视频的缩放和裁剪".format(modified)))
+        else:
+            self.app._append_info_ui(_("[取消子视频滤镜] 没有需要修改的子视频"))
+
+
+    def get_settings(self):
+        if self.mode == 'sub':
+            return {
+                "overlay_enabled": self.overlay_enabled.get(),
+                "overlay_x": self.overlay_x.get().strip(),
+                "overlay_y": self.overlay_y.get().strip(),
+                "blend_mode": self.blend_mode.get(),
+            }
+        else:
+            return {
+                "pad_enabled": self.pad_enabled.get(),
+                "pad_width": self.pad_width.get().strip(),
+                "pad_height": self.pad_height.get().strip(),
+                "offset_x": self.offset_x.get().strip(),
+                "offset_y": self.offset_y.get().strip(),
+            }
+
+    def set_settings(self, settings):
+        if self.mode == 'sub':
+            self.overlay_enabled.set(settings.get("overlay_enabled", True))
+            self.overlay_x.set(settings.get("overlay_x", "W-w-10"))
+            self.overlay_y.set(settings.get("overlay_y", "H-h-10"))
+            self.blend_mode.set(settings.get("blend_mode", "normal"))
+            if hasattr(self, "_blend_display"):
+                self.blend_mode_display.set(self._blend_display.get(self.blend_mode.get(), "正常(透明叠加)"))
+        else:
+            self.pad_enabled.set(settings.get("pad_enabled", False))
+            self.pad_width.set(settings.get("pad_width", ""))
+            self.pad_height.set(settings.get("pad_height", ""))
+            self.offset_x.set(settings.get("offset_x", "0"))
+            self.offset_y.set(settings.get("offset_y", "0"))
+
+
+# ================== 高级选项组件 ==================
+class AdvancedFrame(ttk.LabelFrame):
+    def __init__(self, parent, update_callback=None, app=None, show_adaptive=True, watermark_dict=None, **kwargs):
+        super().__init__(parent, text=_("高级选项 (硬件解码/自定义参数)"), padding="5", **kwargs)
+        self.update_callback = update_callback
+        self.app = app
+        self.show_adaptive = show_adaptive
+        # 设置水印字典：若传入则使用，否则使用 app 的全局设置
+        if watermark_dict is not None:
+            self.watermark_dict = watermark_dict
+        else:
+            self.watermark_dict = self.app.watermark_settings
+
+
+        self.wm_preset_var = tk.StringVar()
+        self.wm_templates = {}  # 缓存所有水印模板
+        # 获取主预设目录（与主预设 ffmpeg_presets.json 同目录）
+        if self.app is not None and hasattr(self.app, 'preset_file_path'):
+            preset_dir = os.path.dirname(self.app.preset_file_path)
+        else:
+            # 极罕见情况：回退到用户目录
+            preset_dir = os.path.join(os.path.expanduser("~"), ".FFLiteGUI")
+        
+        # 确保目录存在
+        os.makedirs(preset_dir, exist_ok=True)
+        
+        self.wm_preset_file = os.path.join(preset_dir, "watermark_templates.json")
+        self._load_wm_templates()  # 加载现有模板
+
+
+        self.create_widgets()
+
+
+
+    def create_widgets(self):
+        # 硬件解码
+        hw_frame = ttk.Frame(self)
+        hw_frame.pack(fill=tk.X, pady=2)
+        self.hwaccel_enabled = tk.BooleanVar(value=False)
+        hw_check = ttk.Checkbutton(hw_frame, text=_("启用硬件解码"), variable=self.hwaccel_enabled,
+                                   command=self._on_hw_toggle)
+        hw_check.pack(side=tk.LEFT)
+        ToolTip(hw_check,
+            _("【NVIDIA推荐】\n1.cuda（首选）：自动识别H264/HEVC/AV1，支持全程显存加速。\n2.auto：传统模式，兼容性好但效率略低。\n\n【AMD推荐 (FFmpeg 8.0+)】\namf（首选）：AMD通用硬件解码，支持H.264/HEVC/AV1。\n\n【Intel推荐】\n3.qsv：Intel通用模式，自动适配格式并直通显存。\n\n【手动指定】\n仅在全自动失败时使用。HEVC即H.265，AV1需新显卡支持。"),
+            offset_x=0, offset_y=0, wraplength=500)
+        self.hwaccel_decoder = tk.StringVar(value=_("无"))
+        self.decoder_combo = ttk.Combobox(hw_frame, textvariable=self.hwaccel_decoder,
+                                          values=HW_DECODER_DISPLAY,
+                                          state="readonly", width=22)
+        self.decoder_combo.pack(side=tk.LEFT, padx=5)
+        self.decoder_combo.bind("<<ComboboxSelected>>", lambda e: self._on_hw_toggle())
+
+
+        # ---- 滤镜硬件加速模式（软件 / NVIDIA / Intel QSV / AMD） ----
+        ttk.Label(hw_frame, text=_("滤镜加速:")).pack(side=tk.LEFT, padx=(10, 0))
+        self.hw_filter_mode_var = tk.StringVar(value="软件 (CPU)")
+        self.hw_filter_mode_disp = tk.StringVar(value=_("软件 (CPU)"))
+        self.hw_filter_mode_combo = ttk.Combobox(
+            hw_frame, textvariable=self.hw_filter_mode_disp,
+            values=[_("软件 (CPU)"), "NVIDIA CUDA", "Intel QSV", "AMD VAAPI/AMF"],
+            state="readonly", width=14
+        )
+        self.hw_filter_mode_combo.pack(side=tk.LEFT, padx=2)
+        ToolTip(
+            self.hw_filter_mode_combo,
+            _("切换滤镜运行环境：\n"
+            "• 软件 (CPU)：普通滤镜，纯 CPU 处理。\n"
+            "• NVIDIA CUDA：能纯硬件的（缩放 scale_cuda）全程显存；\n"
+            "  其余软件滤镜自动用 hwdownload→处理→hwupload_cuda 包裹。\n"
+            "• Intel QSV：缩放/旋转/翻转/裁剪/反交错/降噪/色彩校正 映射到 vpp_qsv，\n"
+            "  可全程显存（纯硬件）；其余软件滤镜自动包裹 hwdownload→…→hwupload。\n"
+            "• AMD VAAPI/AMF：缩放映射到 scale_vaapi；\n"
+            "  其余软件滤镜自动包裹 hwdownload→…→hwupload。\n\n"
+            "⚠️ 纯硬件链路需要同时开启上方「硬件解码」并选对应解码器，\n"
+            "   否则帧在内存，会自动退回纯软件滤镜。"),
+            wraplength=500
+        )
+        def _hw_mode_sel(_e):
+            _idx = self.hw_filter_mode_combo.current()
+            if 0 <= _idx < len(HW_FILTER_MODE_OPTIONS):
+                self.hw_filter_mode_var.set(HW_FILTER_MODE_OPTIONS[_idx])
+            self._on_filter_mode_change()
+        self.hw_filter_mode_combo.bind("<<ComboboxSelected>>", _hw_mode_sel)
+
+        # 显卡设备（可选，处理必须指定设备的情况）
+        ttk.Label(hw_frame, text=_("设备:")).pack(side=tk.LEFT, padx=(6, 0))
+        self.hw_filter_device_var = tk.StringVar(value="")
+        self.hw_filter_device_entry = ttk.Entry(
+            hw_frame, textvariable=self.hw_filter_device_var, width=12
+        )
+        self.hw_filter_device_entry.pack(side=tk.LEFT, padx=2)
+        ToolTip(
+            self.hw_filter_device_entry,
+            _("可选。多卡 / 必须显式绑定设备时才填；单卡几乎总是留空。\n\n"
+            "• NVIDIA 单卡：留空即可（自动 cuda=cu），无需写 0。\n"
+            "  多卡：填 GPU 编号 0 / 1 → -init_hw_device cuda=cu:0\n\n"
+            "• Intel QSV（核显）：留空即可，固定用 -init_hw_device qsv=hw,extra_hw_frames=64\n"
+            "  （FFmpeg 自动选平台设备，不要写数字，写了反而错）。\n"
+            "  多 GPU：Windows 填 DirectX 适配器号（如 1）→ qsv=hw,child_device=1\n"
+            "          Linux   填 DRM 节点（如 /dev/dri/renderD128）→ qsv=hw,child_device=/dev/dri/renderD128\n\n"
+            "• AMD VAAPI（Linux）：填 DRM 节点如 /dev/dri/renderD128 → vaapi=amd:/dev/dri/renderD128"),
+            wraplength=520
+        )
+        self.hw_filter_device_var.trace_add("write", lambda *a: self._trigger_update())
+
+
+        # 自定义参数
+        custom_frame = ttk.Frame(self)
+        custom_frame.pack(fill=tk.X, pady=5)
+
+        label = ttk.Label(custom_frame, text=_("自定义FFmpeg参数 (滤镜自动合并，其余参数追加到命令末尾):"))
+        label.pack(anchor=tk.W)
+        ToolTip(label, 
+                _("可直接添加 FFmpeg 命令行参数。\n\n"
+                "【滤镜智能合并】\n"
+                "• 直接输入裸滤镜串（如 drawtext=text='hello':x=10:y=10），会自动识别为视频/音频滤镜，\n"
+                "  按滤镜类型自动替换或插入到界面生成的 -vf/-af 链的正确位置。\n"
+                "• 使用 -vf / -af / -filter_complex 前缀的滤镜串同样会智能合并，而不是覆盖。\n"
+                "• 同名滤镜默认替换（如 scale=1920:-2 会替换界面生成的 scale=1280:-2），\n"
+                "  drawtext / subtitles / overlay 除外——这些会叠加保留，允许多个文字水印共存。\n\n"
+                "【其余参数】\n"
+                "• 非滤镜参数（如 -x264-params、-bsf、-t、-map 等）原样追加到命令末尾。\n"
+                "• 界面上已单独提供的参数（如 tune、profile、level、maxrate、bufsize）请勿重复添加，以免冲突。\n\n"
+                "• 追加自定义 -t 时间 可作为应急措施，强制限制输出时长，防止因滤镜循环或参数不当导致输出无限延长（主水印模式）。\n"
+                "   或者手动 -t 10 输出10秒片段查看结果，程序的预览命令功能不一定传递了所有滤镜，特别是水印只有占位框。\n\n"
+                "• 参数 setsar=1 强制覆盖 SAR 比例1:1，配合正方形缩放：比如400x400 可以正确压缩 16:9 画面"),
+                wraplength=800)
+        self.custom_args = tk.StringVar(value="")
+        self.custom_entry = ttk.Entry(custom_frame, textvariable=self.custom_args, width=50)
+        self.custom_entry.pack(fill=tk.X, pady=2)
+        self.custom_args.trace_add("write", lambda *a: self._trigger_update())
+
+        # ---- 水印文件选择与设置 ----
+        wm_frame = ttk.Frame(self)
+        wm_frame.pack(fill=tk.X, pady=2)
+        
+        ttk.Label(wm_frame, text=_("水印文件 (图片/视频):")).pack(side=tk.LEFT, padx=(0,5))
+        
+        self.wm_path_var = tk.StringVar(value=self.watermark_dict.get("file_path", ""))
+        wm_entry = ttk.Entry(wm_frame, textvariable=self.wm_path_var, width=40)
+        wm_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        
+        def browse_wm():
+            path = filedialog.askopenfilename(title="选择水印文件", filetypes=[("媒体", "*.png *.jpg *.jpeg *.bmp *.gif *.webp *.mp4 *.mkv *.avi *.mov")])
+            if path:
+                self.wm_path_var.set(normalize_path(path))
+        ttk.Button(wm_frame, text=_("浏览"), command=browse_wm, width=6).pack(side=tk.LEFT, padx=2)
+
+        def clear_wm():
+            self.wm_path_var.set("")
+        ttk.Button(wm_frame, text=_("清除"), command=clear_wm, width=6).pack(side=tk.LEFT, padx=2)
+        
+
+        self.adaptive_var = tk.BooleanVar(value=self.watermark_dict.get("adaptive", False))
+        chk_adaptive = ttk.Checkbutton(wm_frame, text=_("自适应"), variable=self.adaptive_var)
+        chk_adaptive.pack(side=tk.LEFT, padx=5)
+        ToolTip(
+            chk_adaptive,
+            _("勾选后，水印的大小和位置会根据当前模板里*水印和载入视频*的比例为基准。\n\n"
+            "自动在新添加视频命令里缩放大小和调整边距。\n\n"
+            "取消勾选则保持原始像素值，不进行任何缩放。\n\n"
+            "**单个任务编辑框里勾选取消是更改当前任务(主界面要有基准)**"),
+            wraplength=600
+        )
+            
+        def update_adaptive(*args):
+            self.watermark_dict["adaptive"] = self.adaptive_var.get()
+            if self.update_callback:
+                self.update_callback()
+        self.adaptive_var.trace_add("write", update_adaptive)
+        
+        # ---- 水印设置按钮 ----
+        self.watermark_btn = ttk.Button(wm_frame, text=_("水印叠加设置"), command=self.open_watermark_editor)
+        self.watermark_btn.pack(side=tk.LEFT, padx=5)
+        ToolTip(
+            self.watermark_btn,
+            _("打开独立窗口配置水印（支持缩放、裁剪、旋转、绿幕抠像、透明度、位置调整等）。\n\n"
+            "注意：\n"
+            "• 水印会叠加在主视频之上，水印自身的音频将被忽略。\n"
+            "• 水印支持变速（在「视频滤镜」页面设置），变速后循环时长会自动按比例调整。\n"
+            "• 循环控制通过启用截取并设置循环次数实现，可用于视频水印的重复播放。\n"
+            "• 勾选「自适应」可根据主视频尺寸自动缩放水印大小和位置。"),
+            wraplength=500
+        )
+        
+        # 保留探测时长按钮和时长标签变量（隐藏），以免其他代码引用报错
+        self.wm_duration_label = ttk.Label(wm_frame, text="", foreground="gray")
+        # 不pack，即不显示
+        
+        # 绑定路径变化更新
+        self.wm_path_var.trace_add("write", lambda *a: self._on_wm_path_changed())
+
+        # ---- 水印预设管理（文字水印按钮在同一行左边） ----
+        preset_row = ttk.Frame(self)
+        preset_row.pack(fill=tk.X, pady=2)
+
+        tw_btn = ttk.Button(preset_row, text=_("文字水印"), command=self.open_text_watermark_dialog)
+        tw_btn.pack(side=tk.LEFT, padx=(0, 5))
+        ToolTip(
+            tw_btn,
+            _("打开文字水印设置窗口。\n\n"
+            "文字水印使用 FFmpeg drawtext 滤镜，矢量渲染，缩放无锯齿。\n"
+            "支持中文字体、透明度、描边、显示时段/循环（enable）。\n"
+            "位置可在「文字水印」设置窗口中点击「打开位置编辑器」可视化拖拽调整。"),
+            wraplength=400
+        )
+
+        ttk.Label(preset_row, text=_("水印预设:")).pack(side=tk.LEFT, padx=(20,5))
+        self.wm_preset_combo = ttk.Combobox(
+            preset_row,
+            textvariable=self.wm_preset_var,
+            state="readonly",
+            width=20
+        )
+        self.wm_preset_combo.pack(side=tk.LEFT, padx=2)
+        # 绑定选择事件
+        self.wm_preset_combo.bind("<<ComboboxSelected>>", lambda e: self.load_wm_preset())
+        
+        ttk.Button(preset_row, text=_("保存模板"), command=self.save_wm_preset).pack(side=tk.LEFT, padx=2)
+        ttk.Button(preset_row, text=_("删除模板"), command=self.delete_wm_preset).pack(side=tk.LEFT, padx=2)
+        ttk.Button(preset_row, text=_("加载模板"), command=self.load_wm_preset).pack(side=tk.LEFT, padx=2)
+        
+        # 刷新下拉列表
+        self._refresh_wm_preset_list()
+
+
+    def _on_nvidia_toggle(self):
+        """已废弃：滤镜加速改由「滤镜加速」下拉框统一控制。保留空函数避免遗留引用。"""
+        self._trigger_update()
+
+    def _on_amd_toggle(self):
+        """已废弃：滤镜加速改由「滤镜加速」下拉框统一控制。保留空函数避免遗留引用。"""
+        self._trigger_update()
+
+
+    def _on_wm_path_changed(self, *args):
+        path = self.wm_path_var.get().strip()
+        self.watermark_dict["file_path"] = path
+        self.watermark_dict["enabled"] = bool(path)
+        if not path:
+            # 水印被清除，重置提示标志
+            self.app._watermark_precise_hint_shown = False
+        self._auto_detect_watermark_duration()
+        if self.update_callback:
+            self.update_callback()
+    
+    def _auto_detect_watermark_duration(self):
+        path = self.wm_path_var.get().strip()
+        if not path or not os.path.exists(path):
+            self.watermark_dict["duration"] = None
+            return
+        ext = os.path.splitext(path)[1].lower()
+        if ext in ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp'):
+            self.watermark_dict["duration"] = None
+            return
+        duration = self.app._get_media_duration(path)
+        self.watermark_dict["duration"] = duration if duration is not None else None
+
+
+
+
+    def _on_hw_toggle(self):
+        """硬件解码/滤镜模式变化时刷新命令预览"""
+        self._trigger_update()
+
+    def _on_filter_mode_change(self):
+        """滤镜加速下拉变化：自动把解码器、编码器下拉同步为该 API 的硬件选项，
+        并保护用户原来选择的软件编码器，待恢复成「软件 (CPU)」时还原。
+
+        注意：「启用硬件解码」复选框由用户自行决定是否勾选，这里只保证下拉项匹配，
+        不会擅自打勾（与用户约定一致）。
+        """
+        mode = HW_FILTER_MODE_MAP.get(self.hw_filter_mode_var.get(), "cpu")
+        enc_frame = getattr(self.app, "video_encoder", None) if self.app is not None else None
+
+        if mode == "cpu":
+            # 恢复：解码器下拉回「无」，编码器还原为之前保护的软件编码器
+            self.hwaccel_decoder.set(_("无"))
+            if enc_frame is not None and getattr(enc_frame, "_saved_software_encoder", None):
+                enc_frame.vcodec.set(enc_frame._saved_software_encoder)
+        else:
+            # 1) 同步解码器下拉（仅设置下拉，不打勾「启用硬件解码」）
+            dec = HW_MODE_DECODER.get(mode)
+            if dec:
+                self.hwaccel_decoder.set(_hwaccel_cmd_to_disp(dec))
+            # 2) 同步编码器下拉为对应硬件编码器（先保护当前软件编码器）
+            if enc_frame is not None:
+                enc = HW_MODE_ENCODER.get(mode)
+                if enc:
+                    cur = enc_frame.vcodec.get()
+                    # 仅在当前为软件编码器时记录，避免用硬件编码器覆盖已保护的软件选择
+                    if not _is_gpu_encoder(cur):
+                        enc_frame._saved_software_encoder = cur
+                    if cur != enc:
+                        enc_frame.vcodec.set(enc)
+        self._trigger_update()
+
+    def _trigger_update(self):
+        if self.update_callback:
+            self.update_callback()
+
+    def open_text_watermark_dialog(self):
+        """打开文字水印设置窗口"""
+        if self.app is None:
+            return
+        TextWatermarkDialog(self, self.app)
+
+    def open_watermark_editor(self):
+        """打开图片/视频水印的参数编辑窗口（缩放、裁剪、旋转、位置等）。
+
+        文字水印的位置请在其专属设置窗口（「文字水印」→「打开位置编辑器」）中调整，
+        此处只负责图片/视频水印，不再关联文字水印。"""
+        if self.app is None:
+            return
+        file_path = self.watermark_dict.get("file_path", "")
+        if not file_path or not os.path.exists(file_path):
+            messagebox.showwarning(_("提示"), _("请先选择一个有效的图片/视频水印文件"))
+            return
+
+        # 获取主界面当前完整设置（包含裁剪、旋转、缩放等）
+        main_file = self.app.input_file.get().strip()
+        main_video_size = None
+        if main_file and os.path.exists(main_file):
+            main_settings = self.app.get_current_settings()
+            # 直接获取原始尺寸（不含任何旋转）
+            orig_w, orig_h = get_video_dimensions(self.app.ffprobe_cmd, main_file)
+            if orig_w is not None and orig_h is not None:
+                # 使用新函数按实际顺序计算最终尺寸
+                main_w, main_h = self.app.compute_final_size_with_order(orig_w, orig_h, main_settings)
+                if main_w > 0 and main_h > 0:
+                    main_video_size = (main_w, main_h)
+    
+        self.app.edit_video_settings(
+            title="水印参数编辑",
+            initial_settings=self.watermark_dict.copy(),
+            on_save=lambda new: self._on_watermark_saved(new),
+            file_path=file_path,
+            is_watermark=True,
+            track_idx=None,
+            pip_enabled_var=None,
+            overlay_mode='sub',
+            parent=self,
+            track_obj=None,
+            main_video_size=main_video_size  # 传入正确的最终尺寸
+        )
+    
+    def _on_watermark_saved(self, new_settings):
+        self.watermark_dict.update(new_settings)
+        self.wm_path_var.set(self.watermark_dict.get("file_path", ""))
+        self._auto_detect_watermark_duration()
+        if self.update_callback:
+            self.update_callback()
+
+    def _open_text_wm_position_editor(self):
+        """为文字水印打开可视化位置编辑器"""
+        tw = self.app.text_watermark_settings
+        main_file = self.app.input_file.get().strip()
+        canvas_w, canvas_h = 1280, 720
+        if main_file and os.path.exists(main_file):
+            w, h = self.app._get_video_dimensions_cached(main_file)
+            if w and h:
+                canvas_w, canvas_h = w, h
+        # 估算文字尺寸
+        text = tw.get("text", "")
+        fs = tw.get("font_size", 48)
+        wm_w = max(len(text) * int(fs * 0.7), int(fs * 0.7))
+        wm_h = int(fs * 1.3)
+        x_var = tk.StringVar(value=tw.get("overlay_x", "10"))
+        y_var = tk.StringVar(value=tw.get("overlay_y", "10"))
+        def on_apply(nx, ny, nw, nh, ncw, nch):
+            x_var.set(str(nx))
+            y_var.set(str(ny))
+            tw["overlay_x"] = str(nx)
+            tw["overlay_y"] = str(ny)
+            # 矩形高度反推字体大小（wm_h = fs * 1.3 → fs = nh / 1.3）
+            if nh > 0:
+                new_fs = max(8, int(round(nh / 1.3)))
+                old_fs = int(tw.get("font_size", 48))
+                if new_fs != old_fs:
+                    tw["font_size"] = new_fs
+                    self.app._append_info_ui(_("[文字水印] 字体大小已更新: {0} → {1}".format(old_fs, new_fs)))
+            if self.update_callback:
+                self.update_callback()
+            self.app._append_info_ui(_("[文字水印] 位置已设置: ({0}, {1})".format(nx, ny)))
+        title = "可视化编辑文字水印位置"
+        self.app._generic_overlay_editor(
+            self, canvas_w, canvas_h,
+            safe_eval_expr(x_var.get(), {"W": canvas_w, "H": canvas_h, "w": wm_w, "h": wm_h}) or 10,
+            safe_eval_expr(y_var.get(), {"W": canvas_w, "H": canvas_h, "w": wm_w, "h": wm_h}) or 10,
+            wm_w, wm_h, on_apply, title, None,
+            bg_draw_func=None, rect_label='文字水印',
+            min_visible_pixels=0, show_scale_tip=False)
+
+
+    def _get_wm_templates_path(self):
+        return self.wm_preset_file
+    
+    def _load_wm_templates(self):
+        """从 JSON 文件加载所有水印模板"""
+        if os.path.exists(self.wm_preset_file):
+            try:
+                with open(self.wm_preset_file, 'r', encoding='utf-8') as f:
+                    self.wm_templates = json.load(f)
+                if not isinstance(self.wm_templates, dict):
+                    self.wm_templates = {}
+            except:
+                self.wm_templates = {}
+        else:
+            self.wm_templates = {}
+    
+    def _save_wm_templates(self):
+        """将模板字典保存到 JSON 文件"""
+        try:
+            with open(self.wm_preset_file, 'w', encoding='utf-8') as f:
+                json.dump(self.wm_templates, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            messagebox.showerror(_("保存失败"), _("无法保存水印模板: {0}".format(e)))
+    
+    def _refresh_wm_preset_list(self):
+        """刷新下拉框列表"""
+        self._load_wm_templates()
+        names = list(self.wm_templates.keys())
+        self.wm_preset_combo['values'] = names
+        if names:
+            self.wm_preset_var.set(names[0])  # 默认选中第一个
+        else:
+            self.wm_preset_var.set("")
+
+    def save_wm_preset(self):
+        """保存当前水印设置为一个新模板"""
+        # 获取当前水印设置（深拷贝，避免引用问题）
+        current = copy.deepcopy(self.watermark_dict)
+        # 移除 file_path，避免路径失效
+        current.pop("file_path", None)
+        # 移除可能存在的基准尺寸，因为模板不应该绑定特定视频尺寸
+        current.pop("base_width", None)
+        current.pop("base_height", None)
+        # 同时保存文字水印设置（与主预设一致，包含 enabled 等完整字段），
+        # 记为嵌套键 text_watermark，避免与图片/视频水印字段冲突，且旧模板无此键时向后兼容
+        if self.app is not None and hasattr(self.app, 'text_watermark_settings'):
+            current["text_watermark"] = copy.deepcopy(self.app.text_watermark_settings)
+
+        # 弹出对话框输入模板名称
+        name = simpledialog.askstring("保存水印模板", "请输入模板名称:", parent=self)
+        if not name:
+            return
+        
+        # 如果已存在同名，询问是否覆盖
+        if name in self.wm_templates:
+            if not messagebox.askyesno(_("覆盖确认"), _("模板 \"{0}\" 已存在，是否覆盖？".format(name))):
+                return
+        
+        # 保存
+        self.wm_templates[name] = current
+        self._save_wm_templates()
+        self._refresh_wm_preset_list()
+        self.app._append_info_ui(_("✅ 水印模板 '{0}' 已保存".format(name)))
+        messagebox.showinfo(_("成功"), _("水印模板 \"{0}\" 已保存".format(name)))
+    
+    def load_wm_preset(self):
+        """加载选中的模板到当前水印设置"""
+        name = self.wm_preset_var.get()
+        if not name:
+            messagebox.showinfo(_("提示"), _("请先选择一个水印模板"))
+            return
+        
+        if name not in self.wm_templates:
+            messagebox.showerror(_("错误"), _("模板 \"{0}\" 不存在".format(name)))
+            return
+        
+        template = self.wm_templates[name]
+        # 更新当前水印设置（保留 file_path，避免覆盖已有文件路径）
+        # 注意：模板中的 text_watermark 是嵌套键，单独处理，不写入 watermark_dict
+        for key, value in template.items():
+            if key == "text_watermark":
+                continue
+            self.watermark_dict[key] = value
+        # 同步界面控件
+        self.wm_path_var.set(self.watermark_dict.get("file_path", ""))
+        if hasattr(self, 'adaptive_var'):
+            self.adaptive_var.set(self.watermark_dict.get("adaptive", False))
+        # 恢复文字水印设置（若模板包含；与主预设一致，含 enabled 等完整字段）
+        tw = template.get("text_watermark")
+        if isinstance(tw, dict) and self.app is not None and hasattr(self.app, 'text_watermark_settings'):
+            self.app.text_watermark_settings.update(tw)
+        # 如果文字水印设置窗口正打开，其内部状态会在 on_ok 时读取 app.text_watermark_settings，
+        # 此处无需额外处理；更新回调已触发命令预览刷新
+        if self.update_callback:
+            self.update_callback()
+        self.app._append_info_ui(_("✅ 已加载水印模板 '{0}'".format(name)))
+        messagebox.showinfo(_("成功"), _("水印模板 \"{0}\" 已加载".format(name)))
+    
+    def delete_wm_preset(self):
+        """删除选中的模板"""
+        name = self.wm_preset_var.get()
+        if not name:
+            messagebox.showinfo(_("提示"), _("请先选择一个水印模板"))
+            return
+        if not messagebox.askyesno(_("确认删除"), _("确定要删除水印模板 \"{0}\" 吗？".format(name))):
+            return
+        if name in self.wm_templates:
+            del self.wm_templates[name]
+            self._save_wm_templates()
+            self._refresh_wm_preset_list()
+            self.app._append_info_ui(_("🗑️ 已删除水印模板 '{0}'".format(name)))
+            messagebox.showinfo(_("成功"), _("水印模板 \"{0}\" 已删除".format(name)))
+        else:
+            messagebox.showerror(_("错误"), _("模板 \"{0}\" 不存在".format(name)))
+
+
+    def get_settings(self):
+        return {
+            "hwaccel_enabled": self.hwaccel_enabled.get(),
+            # 显示值 -> 命令值（索引对应 HW_DECODER_CMD；旧预设的 "cuda (NVIDIA通用)" 经 DECODER_MAP 兜底）
+            "hwaccel_decoder": _hwaccel_disp_to_cmd(self.hwaccel_decoder.get()),
+            "custom_args": self.custom_args.get(),
+            "hw_filter_mode": HW_FILTER_MODE_MAP.get(self.hw_filter_mode_var.get(), "cpu"),
+            "hw_filter_device": self.hw_filter_device_var.get().strip(),
+        }
+
+    def set_settings(self, settings):
+        self.hwaccel_enabled.set(settings.get("hwaccel_enabled", False))
+        self.hwaccel_decoder.set(_hwaccel_cmd_to_disp(settings.get("hwaccel_decoder", "none")))
+        self.custom_args.set(settings.get("custom_args", ""))
+        if hasattr(self, 'adaptive_var'):
+            self.adaptive_var.set(self.watermark_dict.get("adaptive", False))
+        # 滤镜硬件加速模式（兼容旧版 wrap_cpu_nvidia / wrap_cpu_amd）
+        mode = settings.get("hw_filter_mode")
+        if not mode:
+            if settings.get("wrap_cpu_nvidia"):
+                mode = "cuda"
+            elif settings.get("wrap_cpu_amd"):
+                mode = "vaapi"
+            else:
+                mode = "cpu"
+        label = next((k for k, v in HW_FILTER_MODE_MAP.items() if v == mode), "软件 (CPU)")
+        self.hw_filter_mode_var.set(label)
+        _disp = [_("软件 (CPU)"), "NVIDIA CUDA", "Intel QSV", "AMD VAAPI/AMF"]
+        try:
+            if hasattr(self, "hw_filter_mode_disp"):
+                self.hw_filter_mode_disp.set(_disp[HW_FILTER_MODE_OPTIONS.index(label)])
+        except (ValueError, KeyError):
+            if hasattr(self, "hw_filter_mode_disp"):
+                self.hw_filter_mode_disp.set(_disp[0])
+        self.hw_filter_device_var.set(settings.get("hw_filter_device", ""))
+        self._on_hw_toggle()
+
+
+
+
+class Task:
+    def __init__(self, input_path, output_path, settings, cmd_list):
+        self.input = input_path
+        self.output = output_path
+        self.settings = copy.deepcopy(settings)
+        self.cmd = cmd_list
+        self.status = "等待"
+        self.error_msg = ""
+        self.progress = 0
+        self.current_sec = 0
+        self.total_sec = 0
+        self._task_list_update_after = None   # 任务列表刷新去抖 ID
+        self.stopped_by_user = False
+        self.is_custom = False
+        self.temp_files = []
+
+        self.start_time = None      # 任务开始时间（time.time()）
+        self.elapsed_time = None    # 任务最终耗时（秒）
+        self.is_finished = False    # 标记任务是否已完成
+
+    def get_short_cmd(self):
+        """生成简短显示命令（隐藏路径细节）"""
+        if not self.cmd:
+            return ""
+        full_cmd = format_cmd_for_display(self.cmd)
+        in_quoted = re.escape(self.input)
+        out_quoted = re.escape(self.output)
+        short = re.sub(rf'(["\']?){in_quoted}\1', r'{input}', full_cmd)
+        short = re.sub(rf'(["\']?){out_quoted}\1', r'{output}', short)
+        return short
+
+
+
+
+# ================== Track 类 ==================
+# ---------------------------------------------------------------------------
+# 复制滤镜时【禁止】跨轨道复制的键（集中声明，单一事实来源）。
+# 除这些结构 / 身份 / 编码器 / 运行时键之外，enc_settings 中的其它键默认都会被复制，
+# 因此新增滤镜参数（如 blend_mode、音频 EQ、淡入淡出等）无需再手工维护白名单，
+# 从根源上避免「漏复制」问题。
+# ---------------------------------------------------------------------------
+_COPY_FILTER_EXCLUDE_KEYS = frozenset({
+    # —— 轨道结构 / 运行时 / 身份（不应随滤镜复制）——
+    "_file_path", "_error", "_placeholder", "combo_seek", "language", "title",
+    # —— 编码器 / 输出参数（不属于「滤镜」范畴，各轨道通常不同）——
+    "encoder", "rate_control_type", "crf_value", "cq_value", "global_quality",
+    "bitrate_video", "bitrate", "samplerate", "frame_rate_type", "frame_rate_custom",
+    "pix_fmt_enabled", "pix_fmt", "subtitle_enabled", "subtitle_path",
+    "preset", "tune", "profile", "maxrate", "bufsize", "gop_size", "bf_frames",
+    # —— 水印自适应基准（与源视频绑定，复制无意义）——
+    "base_width", "base_height",
+    # —— 外部音轨源（与具体文件绑定）——
+    "external_audio_path", "external_audio_stream",
+})
+
+
+class Track:
+    def __init__(self, index, typ, codec, file_path, enabled=True, enc_settings=None):
+        self.index = index
+        self.type = typ
+        self.codec = codec
+        self.file_path = file_path
+        self.enabled = enabled
+        # 字幕专用字段
+        self.language = ""
+        self.title = ""
+        
+        if enc_settings is None:
+            if typ == "video":
+                # 初始化视频轨道的 enc_settings 和属性（兼容旧代码）
+                self.overlay_enabled = False
+                self.overlay_x = "W-w-10"
+                self.overlay_y = "H-h-10"
+                self.pad_enabled = False
+                self.pad_width = ""
+                self.pad_height = ""
+                self.offset_x = "0"
+                self.offset_y = "0"
+                self.enc_settings = {
+                    "encoder": "copy",
+                    "rate_control_type": "crf", "crf_value": 26, "cq_value": 35,
+                    "global_quality": 26, "bitrate_video": "1900k",
+                    "frame_rate_type": "keep", "frame_rate_custom": "30",
+                    "scale_enabled": False, "scale_width": "", "scale_height": "", "scale_method": "width",
+                    "crop_enabled": False, "crop_left": "0", "crop_top": "0", "crop_width": "iw/2", "crop_height": "ih",
+                    "rotate": "none", "vflip": False, "hflip": False,
+                    "speed_enabled": False, "speed_factor": "1.0", "deinterlace_filter": "none",
+                    "pix_fmt_enabled": True, "pix_fmt": "yuv420p",
+                    "subtitle_enabled": False, "subtitle_path": "",
+                    # 新增的叠加/偏移/循环/绿幕字段（默认值）
+                    "overlay_enabled": False,
+                    "overlay_x": "W-w-10",
+                    "overlay_y": "H-h-10",
+                    "pad_enabled": False,
+                    "pad_width": "",
+                    "pad_height": "",
+                    "offset_x": "0",
+                    "offset_y": "0",
+                    "loop_enabled": False,
+                    "loop_mode": "infinite",
+                    "loop_count": 3,
+                    "chroma_enabled": False,
+                    "chroma_color": "#3fff08",
+                    "chroma_similarity": 0.3,
+                    "chroma_blend": 0.1,
+                    "alpha_enabled": False,
+                    "chroma_filter_type": "chromakey",   # 默认 chromakey
+                    "alpha_value": 1.0,
+                    "audio_source_type": "self",      # "self" | "silence" | "external"
+                    "external_audio_path": "",
+                    "external_audio_stream": "0:a:0",
+                    "enhance": {
+                        "denoise_enabled": False,
+                        "denoise_spatial": 4.0,
+                        "denoise_temporal": 3.0,
+                        "sharpen_enabled": False,
+                        "sharpen_strength": 1.0,
+                        "ivtc_enabled": False,
+                        "deblock_enabled": False,
+                        "deblock_strength": 4,
+                        "colorspace_enabled": False,
+                        "colorspace_matrix": "bt709:bt2020",
+                    }
+                }
+            elif typ == "audio":
+                self.enc_settings = {
+                    "encoder": "copy",
+                    "bitrate": "128k",
+                    "samplerate": "44100",
+                    "trim_enabled": False,
+                    "trim_start": "",
+                    "trim_end": "",
+                    "precise_trim": False,
+                    "mix_enabled": False,
+                    "volume": 1.0,
+                }
+            else:  # subtitle
+                self.enc_settings = {"encoder": "copy"}
+        else:
+            self.enc_settings = copy.deepcopy(enc_settings)
+            # 读取字幕元数据
+            self.language = self.enc_settings.get("language", "")
+            self.title = self.enc_settings.get("title", "")
+
+            # 对于视频，从 enc_settings 恢复属性（兼容旧代码）
+            if typ == "video":
+                self.overlay_enabled = self.enc_settings.get("overlay_enabled", False)
+                self.overlay_x = self.enc_settings.get("overlay_x", "W-w-10")
+                self.overlay_y = self.enc_settings.get("overlay_y", "H-h-10")
+                self.pad_enabled = self.enc_settings.get("pad_enabled", False)
+                self.pad_width = self.enc_settings.get("pad_width", "")
+                self.pad_height = self.enc_settings.get("pad_height", "")
+                self.offset_x = self.enc_settings.get("offset_x", "0")
+                self.offset_y = self.enc_settings.get("offset_y", "0")
+            # 注意：音频轨道没有额外的叠加属性
+
+    def is_encoding(self):
+        return self.enc_settings.get("encoder") != "copy"
+
+# ================== 通用滚动容器 ==================
+class ScrolledFrame(ttk.Frame):
+    """整页滚动容器（浏览器式）：内容超高时右侧显示垂直滚动条，未溢出自动隐藏。
+
+    关键约束（修复上一版的回归）：
+      - inner 宽度【始终】= 画布宽度：内容绝不被截断，且可随父容器（PanedWindow 分隔条）自由延伸；
+      - 横向滚动被【彻底禁用】：scrollregion 的 x 永远钳制在 [0, 画布宽度] 内，绝不出现左右滚动；
+      - 内容比视口矮时整页不可滚动且底部自动填满；内容比视口高时整页可滚、顶部固定（无法下拉露顶）。
+    仅依赖画布/外层尺寸变化来重排 inner，避免绑定 inner 自身 Configure 造成的反馈循环与陈旧宽度。
+
+    用法：
+        sf = ScrolledFrame(parent, autohide=True)
+        sf.pack(fill=tk.BOTH, expand=True)
+        build_content(sf.inner)   # 把页面内容构建进 sf.inner
+        sf.bind_wheel()           # 内容构建后调用，绑定鼠标滚轮
+        sf.refresh()              # 内容构建后调用，刷新滚动区域
+    """
+
+    def __init__(self, master, autohide=True, **kw):
+        super().__init__(master, **kw)
+        self.autohide = autohide
+        self._rehint_pending = False   # 延迟二次评估标志（防止重复调度）
+        self.canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0)
+        self.canvas.configure(yscrollincrement=1)
+        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vsb.set)
+        self.inner = ttk.Frame(self.canvas)
+        # 画布背景与内容框一致，避免滚动时露出色差缝隙
+        try:
+            self.canvas.configure(bg=self.inner.cget("background") or "SystemButtonFace")
+        except Exception:
+            self.canvas.configure(bg="SystemButtonFace")
+        self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.vsb.pack(side="right", fill="y")
+        # 只依赖【画布】与【外层(ScrolledFrame 自身)】的尺寸变化来重排 inner。
+        # 不绑定 inner 的 Configure：否则 itemconfig 改尺寸会触发反馈，且容易读到“陈旧”宽度。
+        self.canvas.bind("<Configure>", self._layout_inner)
+        self.bind("<Configure>", self._layout_inner)
+        # 页签被切到 / 窗口首次显现时重算布局与 autohide（修复“首屏/切页后滚动条没隐藏”）。
+        self.bind("<Map>", lambda e: self._layout_inner())
+        # 画布/内容框背景的滚轮
+        self.canvas.bind("<MouseWheel>", self._on_wheel)
+        self.inner.bind("<MouseWheel>", self._on_wheel)
+
+    def _layout_inner(self, event=None):
+        """画布尺寸变化时：inner 宽度=画布宽度（绝不截断/可随父延伸）；高度撑满画布（内容矮时填满底部）。"""
+        try:
+            cw = self.canvas.winfo_width()
+            ch = self.canvas.winfo_height()
+        except Exception:
+            return
+        if cw <= 1 or ch <= 1:
+            return
+        try:
+            req = self.inner.winfo_reqheight()
+        except Exception:
+            req = ch
+        # 内容比画布矮 -> inner 撑满画布高度（任务列表等 expand 控件随之填满底部，杜绝露顶空白）
+        # 内容比画布高 -> 按内容高度（可滚动）
+        h = ch if req < ch else req
+        # inner 宽度严格等于画布宽度，保证内容不被钳制、可随分隔条延伸
+        self.canvas.itemconfig(self._win, width=cw, height=h)
+        self._update_scrollregion(cw, h)
+        self._update_autohide(ch, req)
+        # 画布宽度变化后，inner 内容（文字换行等）可能需要重新排版，导致 reqheight 变化。
+        # 延迟二次评估 autohide，修复窗口缩放/sash 重定位后滚动条不更新的问题。
+        if not self._rehint_pending:
+            self._rehint_pending = True
+            self.after(60, self._rehint_autohide)
+
+    def _rehint_autohide(self):
+        """延迟二次评估：内容按新宽度重新排版后 reqheight 可能已变化，重新检查 autohide。"""
+        self._rehint_pending = False
+        if not self.winfo_exists():
+            return
+        try:
+            self.update_idletasks()
+        except Exception:
+            return
+        try:
+            cw = self.canvas.winfo_width()
+            ch = self.canvas.winfo_height()
+        except Exception:
+            return
+        if cw <= 1 or ch <= 1:
+            return
+        try:
+            req = self.inner.winfo_reqheight()
+        except Exception:
+            return
+        h = ch if req < ch else req
+        self.canvas.itemconfig(self._win, width=cw, height=h)
+        self._update_scrollregion(cw, h)
+        self._update_autohide(ch, req)
+
+    def _update_scrollregion(self, cw, h):
+        # x 永远钳制在 [0, cw]：彻底禁用横向滚动（绝不出现左右滚动条/左右拖拽）
+        # y 顶部固定为 0：永远无法把页面下拉露出顶部空白
+        self.canvas.configure(scrollregion=(0, 0, cw, h))
+
+    def _update_autohide(self, ch, req):
+        if not self.autohide:
+            if not self.vsb.winfo_ismapped():
+                self.vsb.pack(side="right", fill="y")
+            return
+        # 自动隐藏：内容未超出可视高度则隐藏滚动条（大屏视觉零变化）
+        if req <= ch + 2:
+            if self.vsb.winfo_ismapped():
+                self.vsb.pack_forget()
+        else:
+            if not self.vsb.winfo_ismapped():
+                self.vsb.pack(side="right", fill="y")
+
+    def _on_wheel(self, event):
+        w = event.widget
+        # 让自身可滚动的列表类控件先处理自己的滚轮（如合并/提取的轨道列表）
+        cls = str(w.winfo_class())
+        if cls in ("Treeview", "Listbox"):
+            try:
+                if w.yview() != (0.0, 1.0):
+                    return  # 交给原生处理
+            except Exception:
+                pass
+        # 标准方向：滚轮向下(delta<0) -> 视图向下(内容上移，看到更靠下的内容)
+        if getattr(event, "delta", 0):
+            units = int(-1 * event.delta / 8)
+        else:
+            units = -1 if event.num == 5 else 1
+        if units != 0:
+            self.canvas.yview_scroll(units, "units")
+            # 兜底：顶部永远不为负（canvas 通常已夹紧，这里防止任何异常露顶）
+            if self.canvas.yview()[0] < 0:
+                self.canvas.yview_moveto(0)
+        return "break"
+
+    def bind_wheel(self):
+        """内容构建完成后调用：递归给 inner 的所有后代绑定滚轮滚动页面。"""
+        self._bind_wheel_recursive(self.inner)
+
+    def _bind_wheel_recursive(self, widget):
+        try:
+            widget.bind("<MouseWheel>", self._on_wheel)
+        except Exception:
+            pass
+        for child in widget.winfo_children():
+            self._bind_wheel_recursive(child)
+
+    def refresh(self):
+        """内容构建/变化后调用：重算滚动区域与滚动条可见性。"""
+        self.update_idletasks()
+        self._layout_inner()
+        # 窗口/页签首次完成布局后画布尺寸才真实，延迟再评估一次 autohide，
+        # 彻底修复“构造时画布高度=1 误判溢出、滚动条没默认隐藏”的问题。
+        self.after_idle(self._layout_inner)
+
+
+# ================== 主界面类 ==================
+class FFmpegBatchGUI:
+    # ---------- SafeToplevel 上下文管理器 ----------
+    class SafeToplevel:
+        """安全的 Toplevel 上下文管理器，确保异常时销毁窗口并释放 grab"""
+        def __init__(self, master, **kwargs):
+            self.master = master
+            self.kwargs = kwargs
+            self.window = None
+
+        def __enter__(self):
+            self.window = tk.Toplevel(self.master, **self.kwargs)
+            self.window.withdraw()  # 先隐藏
+            if self.master and self.master.winfo_exists():
+                self.window.transient(self.master)
+            self.window.grab_set()
+            return self.window
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            # 无论销毁是否成功，都要释放 grab
+            try:
+                if self.window and self.window.winfo_exists():
+                    self.window.destroy()
+            except Exception:
+                # 忽略销毁过程中的异常，继续清理
+                pass
+            finally:
+                if self.master:
+                    try:
+                        self.master.grab_release()
+                    except Exception:
+                        # 忽略 grab 释放时的异常（如主窗口已销毁）
+                        pass
+
+
+    
+    # ================== 语言映射 ==================
+    # ISO 639-2/B 标准三字母码映射表（短码 → 标准码）
+    LANGUAGE_MAP = {
+        # 中文
+        "zh": "chi", "zho": "chi", "chi": "chi",
+        "cn": "chi", "chs": "chi", "cht": "chi",
+        # 英语
+        "en": "eng", "eng": "eng", "en-us": "eng", "en-gb": "eng",
+        # 日语
+        "ja": "jpn", "jp": "jpn", "jpn": "jpn",
+        # 韩语
+        "ko": "kor", "kr": "kor", "kor": "kor",
+        # 法语
+        "fr": "fre", "fra": "fre", "fre": "fre",
+        # 德语
+        "de": "ger", "deu": "ger", "ger": "ger",
+        # 西班牙语
+        "es": "spa", "spa": "spa",
+        # 意大利语
+        "it": "ita", "ita": "ita",
+        # 葡萄牙语
+        "pt": "por", "por": "por",
+        # 俄语
+        "ru": "rus", "rus": "rus",
+        # 阿拉伯语
+        "ar": "ara", "ara": "ara",
+        # 印地语
+        "hi": "hin", "hin": "hin",
+        # 泰语
+        "th": "tha", "tha": "tha",
+        # 越南语
+        "vi": "vie", "vie": "vie",
+        # 印尼语
+        "id": "ind", "ind": "ind",
+        # 马来语
+        "ms": "may", "may": "may", "msa": "may",
+        # 他加禄语/菲律宾语
+        "tl": "tgl", "tgl": "tgl", "fil": "fil",
+        "nan": "chi",
+        # 其他常用
+        "nl": "dut", "nld": "dut", "dut": "dut",
+        "sv": "swe", "swe": "swe",
+        "da": "dan", "dan": "dan",
+        "fi": "fin", "fin": "fin",
+        "no": "nor", "nor": "nor",
+        "pl": "pol", "pol": "pol",
+        "tr": "tur", "tur": "tur",
+        "cs": "cze", "ces": "cze", "cze": "cze",
+        "hu": "hun", "hun": "hun",
+        "ro": "rum", "ron": "rum", "rum": "rum",
+        "el": "gre", "ell": "gre", "gre": "gre",
+        "he": "heb", "heb": "heb",
+        "uk": "ukr", "ukr": "ukr",
+        "und": "und",
+    }
+    
+    # 常用语言下拉列表（显示名, ISO码）
+    COMMON_LANGUAGES = [
+        ("粤语 (yue)",        "yue"),
+        ("普通话 (cmn)",      "cmn"),
+        ("中文 (chi)",        "chi"),
+        ("英语 (eng)",        "eng"),
+        ("日语 (jpn)",        "jpn"),
+        ("韩语 (kor)",        "kor"),
+        ("法语 (fre)",        "fre"),
+        ("德语 (ger)",        "ger"),
+        ("西班牙语 (spa)",    "spa"),
+        ("意大利语 (ita)",    "ita"),
+        ("葡萄牙语 (por)",    "por"),
+        ("俄语 (rus)",        "rus"),
+        ("阿拉伯语 (ara)",    "ara"),
+        ("印地语 (hin)",      "hin"),
+        ("泰语 (tha)",        "tha"),
+        ("越南语 (vie)",      "vie"),
+        ("印尼语 (ind)",      "ind"),
+        ("马来语 (may)",      "may"),
+        ("荷兰语 (dut)",      "dut"),
+        ("瑞典语 (swe)",      "swe"),
+        ("波兰语 (pol)",      "pol"),
+        ("土耳其语 (tur)",    "tur"),
+        ("泰米尔语 (tam)",    "tam"),
+        ("未指定 (und)",      "und"),
+    ]
+
+
+
+
+
+
+    def __init__(self, root):
+        self.root = root
+        self.root.withdraw()
+        self.root.title(_("FFmpeg 多功能工具"))
+        self._set_window_icon()
+        screen_width = root.winfo_screenwidth()
+        screen_height = root.winfo_screenheight()
+        self.scaling = get_dpi_scaling(root)
+
+        # Treeview 行高：用真实字体 metrics 推算，避免硬编码魔法数 22。
+        # 字体 linespace 在 Windows 下已随 DPI 缩放，故无需再乘 self.scaling；
+        # 上下各留 3px 内边距（共 6px），96 DPI 下 TkDefaultFont linespace≈16 → 行高≈22，
+        # 与旧值 int(22*scaling) 在缩放 1.0 时一致，但字体变大或 DPI 升高时自动适配。
+        try:
+            _tree_font = tkFont.Font(name="TkDefaultFont", exists=True)
+            self.tree_rowheight = int(_tree_font.metrics('linespace') + 6)
+        except Exception:
+            self.tree_rowheight = int(22 * self.scaling)
+
+        base_width = 1420
+        base_height = 900
+        width = min(base_width, int(screen_width * 0.95))
+        height = min(base_height, int(screen_height * 0.95))
+        x = (screen_width - width) // 2
+        y = (screen_height - height) // 2
+        root.geometry(f"{width}x{height}+{x}+{y}")
+
+        # 查找 FFmpeg 工具
+        self.ffmpeg_cmd = find_executable("ffmpeg.exe") or find_executable("ffmpeg")
+        self.ffplay_cmd = find_executable("ffplay.exe") or find_executable("ffplay")
+        self.ffprobe_cmd = find_executable("ffprobe.exe") or find_executable("ffprobe")
+
+        # 自定义 FFmpeg 目录设置
+        self.ffmpeg_dir_enabled = tk.BooleanVar(value=False)
+        self.ffmpeg_dir_path = tk.StringVar(value="")
+        # 初始化路径（需在 load_player_settings 之前调用）
+        self._update_ffmpeg_paths()
+
+
+        # 基本变量
+        self.input_file = tk.StringVar()
+        self.output_dir = tk.StringVar()
+        self.output_suffix = tk.StringVar(value="")
+        self.custom_output_name = tk.StringVar(value="")
+        self.output_container = tk.StringVar(value="mp4")
+
+        # 界面语言（zh / en），持久化于 player_settings["language"]
+        self.language_var = tk.StringVar(value="zh")
+        self.language_display_var = tk.StringVar(value="中文")
+
+        self.log_enabled_var = tk.BooleanVar(value=True)
+        default_log_path = normalize_path(os.path.join(get_script_dir(), "editlog.txt"))
+        self.log_path_var = tk.StringVar(value=default_log_path)
+
+        self.tasks = []
+        self.is_processing = False
+        self.stop_flag = False
+        self.pending_tasks = []
+        self.running_futures = set()
+        self.executor = None
+
+        self.current_hw_encoding_count = 0
+        self.max_hw_parallel = tk.IntVar(value=2)
+
+        # 合并模块变量
+        self.merge_video = tk.StringVar()
+        self.merge_tracks = []
+        self.merge_container = tk.StringVar(value="mkv")
+        self.merge_output = tk.StringVar()
+        self.merge_delete_source = tk.BooleanVar(value=False)
+        self.merge_verify = tk.BooleanVar(value=True)
+
+        self.copy_chapters = tk.BooleanVar(value=True)
+        self.chapter_file = tk.StringVar(value="")
+        self.generate_chapters = tk.BooleanVar(value=False)
+
+        self.use_mpv = tk.BooleanVar(value=False)
+        self.mpv_path = tk.StringVar(value="mpv")
+        
+        self.overwrite_policy = tk.StringVar(value='ask')    # 内部值(英文代码): 'ask', 'rename', 'overwrite'
+        # 下拉中文映射：显示中文，内部仍用英文代码，判断/保存逻辑无需改动
+        self.POLICY_DISPLAY = {"ask": _("询问"), "rename": _("自动重命名"), "overwrite": _("直接覆盖")}
+        self.overwrite_policy_display = tk.StringVar(value=self.POLICY_DISPLAY["ask"])
+        # 内部值变化时同步显示变量（覆盖初始化、加载预设等场景）
+        self.overwrite_policy.trace_add(
+            "write",
+            lambda *a, d=self.POLICY_DISPLAY, dv=self.overwrite_policy_display: dv.set(
+                d.get(self.overwrite_policy.get(), d["ask"])
+            ),
+        )
+        self._loading_preset = False      # 加载预设标志
+        self._updating_preview = False    # 防重入锁标志
+        self._batch_update = False        # 批量更新模式标志，用于抑制多次预览刷新
+        self._trim_precise_hint_shown = False
+        self._watermark_precise_hint_shown = False
+        self._preview_after_id = None   # after 回调 ID
+        self._preview_pending = False   # 是否有待处理的刷新
+        self.pix_fmt_enabled_default = tk.BooleanVar(value=True)
+        
+
+        self.preview_editable_var = tk.BooleanVar(value=False)
+
+
+
+        self.extract_custom_dir = tk.BooleanVar(value=False)   # 流提取 是否启用自定义输出目录
+        self.extract_output_dir = tk.StringVar(value="")       # 流提取 自定义输出目录路径
+        self.current_preview_file = None
+        self.auto_match_subtitle_ext = tk.BooleanVar(value=True)
+        self.auto_match_audio_ext = tk.BooleanVar(value=True)
+        self.extract_keep_chapters = tk.BooleanVar(value=True)
+        self.extract_clear_metadata = tk.BooleanVar(value=False)
+        self.extract_attachments = tk.BooleanVar(value=False)  # 提取附件（字体/封面）
+        self.extract_file_list = []
+        self._extract_stream_selection = {}  # {file_path: {'video': set, 'audio': set, 'subtitle': set}} 右键选择的特定轨道
+        self._suppress_save = False
+
+        self._stream_info_cache = {}
+        self._suppress_main_video_trace = False
+        
+        self._concat_params_cache = {}
+        
+        self._merge_preview_after_id = None   # 合并命令预览防抖 ID
+        
+        self._clipboard_filter_params = None   # 存储复制的参数字典
+        self._clipboard_va_filter = None       # V→A 专用：视频截取/变速/倒放快照（映射到音频键名）
+
+        self._global_temp_files = []
+
+
+        # ffprobe 并发数量计算
+        cpu_count = os.cpu_count() or 4
+        if cpu_count <= 16:
+            default_parallel = max(1, cpu_count - 4)
+        else:
+            default_parallel = 16
+        self.ffprobe_parallel = tk.IntVar(value=default_parallel)
+        self.ffprobe_parallel.trace_add('write', lambda *a: self.save_player_settings())
+
+        # 流提取相关
+        self.extract_parser_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.ffprobe_parallel.get()
+        )
+
+
+        self._running_tasks = []  # 存储 (proc, task)
+        
+        self.cmd_output_path = tk.StringVar(value="")
+
+        self._duration_cache = {}
+        self._dimension_cache = {}
+
+
+
+
+        self._proc_lock = threading.Lock()
+        self.running_procs = []  # 存储当前正在运行的 FFmpeg 进程对象（subprocess.Popen）
+
+        self.segment_enabled = tk.BooleanVar(value=False)
+        self.segments = []
+
+        # 音频独立截取（不分段）：仅用于分段拼接模式下独立裁剪音频
+        self.audio_trim_enabled = False
+        self.audio_trim_start = ""
+        self.audio_trim_end = ""
+
+        # ---------- 水印设置 ----------
+        self.watermark_settings = {
+            "enabled": False,
+            "file_path": "",
+            "loop_enabled": False,
+            "loop_mode": "infinite",
+            "loop_count": 3,
+            "encoder": "libx264",
+            "preset": "medium",
+            "rate_control_type": "crf",
+            "crf_value": 25,
+            "cq_value": 28,
+            "global_quality": 23,
+            "bitrate_video": "2000k",
+            "scale_enabled": False,
+            "scale_width": "",
+            "scale_height": "",
+            "scale_method": "width",
+            "crop_enabled": False,
+            "crop_left": "0",
+            "crop_top": "0",
+            "crop_width": "iw/2",
+            "crop_height": "ih",
+            "rotate": "none",
+            "vflip": False,
+            "hflip": False,
+            "deinterlace_filter": "none",
+            "pix_fmt_enabled": True,
+            "pix_fmt": "yuv420p",
+            "trim_enabled": False,
+            "trim_start": "",
+            "trim_end": "",
+            "chroma_enabled": False,
+            "chroma_color": "#3fff08",
+            "chroma_similarity": 0.3,
+            "chroma_blend": 0.1,
+            "overlay_enabled": True,
+            "overlay_x": "W-w-10",
+            "overlay_y": "H-h-10",
+            "pad_enabled": False,
+            "pad_width": "",
+            "pad_height": "",
+            "offset_x": "0",
+            "offset_y": "0",
+            "alpha_enabled": False,
+            "alpha_value": 1.0,
+            "adaptive": False,
+        }
+        # ---------------------------------
+
+        # ---------- 文字水印设置 ----------
+        self.text_watermark_settings = {
+            "enabled": False,
+            "text": "",
+            "font_name": "微软雅黑",
+            "font_path": "",
+            "font_size": 48,
+            "font_color": "#FFFFFF",
+            "opacity": 1.0,
+            "overlay_x": "10",
+            "overlay_y": "10",
+            "border_w": 0,
+            "border_color": "#000000",
+        }
+        # ---------------------------------
+
+        # 预设管理
+        local_preset = os.path.join(get_script_dir(), "ffmpeg_presets.json")
+        if os.path.exists(local_preset):
+            self.preset_file_path = local_preset
+        else:
+            user_dir = os.path.join(os.path.expanduser("~"), ".FFLiteGUI")
+            os.makedirs(user_dir, exist_ok=True)
+            self.preset_file_path = os.path.join(user_dir, "ffmpeg_presets.json")
+        self.preset_manager = PresetManager(self.preset_file_path)
+
+        self._loading_settings = True
+        self.load_player_settings()
+        self._loading_settings = False
+
+        # 根据已保存设置加载界面语言（必须在创建界面组件之前，使 _() 即时生效）
+        load_language(self.language_var.get())
+
+        # ---------- 加载快速命令模板 ----------
+        preset_dir = os.path.dirname(self.preset_file_path)          # 主预设所在目录
+        self.cmd_templates_path = os.path.join(preset_dir, "quick_cmds.json")
+        self.cmd_templates = {}
+        self._load_cmd_templates()
+        
+        self._initialized = False   # 标记 UI 已创建但未完成文件加载
+
+        # 创建界面组件
+        self.create_widgets()
+        
+        self.default_settings = self.get_current_settings()
+
+        # 启动后台初始化（文件释放和加载）
+        self.root.after(100, self._delayed_init)   # 延迟 100ms 让窗口先显示
+
+
+
+        # 处理命令行参数（支持从资源管理器“发送到”打开文件）
+        if len(sys.argv) > 1:
+            # 取第一个非脚本参数作为文件路径
+            file_path = sys.argv[1]
+            if os.path.exists(file_path):
+                self.input_file.set(normalize_path(file_path))
+                if not self.output_dir.get():
+                    self.output_dir.set(os.path.dirname(file_path))
+                self._append_info_ui(_("已从命令行加载文件: {0}".format(os.path.basename(file_path))))
+                self.update_command_preview()
+            else:
+                self._append_info_ui(_("命令行参数文件不存在: {0}".format(file_path)))
+
+        self.update_task_list()
+        self.update_command_preview()
+
+        # 拖拽支持
+        if DND_AVAILABLE:
+            self.root.drop_target_register(DND_FILES)
+            self.root.dnd_bind('<<Drop>>', self.on_files_dropped)
+
+        self.show_quick_warning()
+
+        self.root.update_idletasks()
+        self.root.deiconify()
+
+
+
+
+    # 注：原 _get_filter_param_keys 白名单已废弃，复制滤镜改由模块级
+    # _COPY_FILTER_EXCLUDE_KEYS（默认全复制 + 显式排除）驱动，新增滤镜参数自动包含。
+
+    def _delayed_init(self):
+        """在后台线程中释放预设文件和命令模板，避免阻塞 UI"""
+        def worker():
+            # 1. 确保预设文件存在
+            if not os.path.exists(self.preset_file_path):
+                self.preset_manager._ensure_default_preset()
+            
+            # 2. 确保快速命令模板文件存在且有效
+            if not os.path.exists(self.cmd_templates_path):
+                # 文件不存在，创建默认模板
+                self.cmd_templates = self._get_default_cmd_templates()
+                self._save_cmd_templates()
+            else:
+                # 文件存在，尝试加载
+                self._load_cmd_templates()
+                # 如果加载后为空（可能文件损坏），则重建
+                if not self.cmd_templates:
+                    self._append_info_ui(_("快速命令模板文件损坏或为空，将重建默认模板"))
+                    self.cmd_templates = self._get_default_cmd_templates()
+                    self._save_cmd_templates()
+                    self._load_cmd_templates()  # 重新加载
+            
+            # 3. 回到主线程更新 UI
+            self.root.after(0, self._finish_delayed_init)
+        
+        threading.Thread(target=worker, daemon=True).start()
+    
+    def _finish_delayed_init(self):
+        """延迟初始化完成后的 UI 更新"""
+        self.load_preset_list()
+        self._refresh_cmd_preset_list()
+        self.update_player_status()      # 延迟显示状态检测信息
+        self._initialized = True
+#        self._append_info_ui("预设和快速命令模板已就绪")
+
+
+    def _ensure_main_video(self, disable_scale=False):
+        """确保 self.merge_video 已设置：若未设置，则从列表中取第一个启用的视频轨道。
+        如果 disable_scale=True，则将该视频轨道的缩放禁用（仅当自动设置时）。
+        """
+        if not self.merge_video.get().strip():
+            enabled_videos = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
+            if enabled_videos:
+                # 临时禁用 trace，避免触发 merge_load_video_info
+                self._suppress_main_video_trace = True
+                self.merge_video.set(normalize_path(enabled_videos[0].file_path))
+                self._suppress_main_video_trace = False
+    
+                if disable_scale:
+                    # 禁用主视频的缩放
+                    main_track = enabled_videos[0]
+                    main_track.enc_settings["scale_enabled"] = False
+             #       main_track.enc_settings["scale_width"] = ""
+             #       main_track.enc_settings["scale_height"] = ""
+                    # 刷新列表，显示变化
+                    self.merge_update_track_list()
+    
+                self._append_info_ui(_("[自动] 主视频未设置，自动设为: {0}".format(os.path.basename(enabled_videos[0].file_path))))
+                return True
+            else:
+                self.merge_video.set("")
+                return False
+        return True
+
+
+    def _set_window_icon(self):
+        icon_path = find_resource("35.ico")
+        if icon_path:
+            try:
+                self.root.iconbitmap(default=icon_path)
+                print(_("窗口图标加载成功: {0}".format(icon_path)))
+                return
+            except Exception as e:
+                print(_("加载图标失败 {0}: {1}".format(icon_path, e)))
+        else:
+            print(_("未找到窗口图标文件 35.ico"))
+
+    # 流提取相关
+    def add_custom_task(self, input_path: str, output_path: str, cmd_list: List[str], settings: dict = None):
+        """
+        直接添加自定义命令的任务（跳过命令生成逻辑）。
+        input_path, output_path 仅用于显示和冲突检测。
+        """
+        if settings is None:
+            settings = {}
+        # 处理冲突，获得最终路径
+        final_output = self._resolve_path_conflict(output_path, show_dialog=True)
+        if final_output is None:
+            return False
+        # 更新命令列表中的输出路径（假设输出文件是最后一个参数）
+        if cmd_list and cmd_list[-1] == output_path:
+            cmd_list[-1] = final_output
+        else:
+            # 更安全的做法：若最后一个参数不是原输出路径，则尝试替换所有匹配项
+            # 但通常最后一个就是输出，这里做兼容处理
+            for i, arg in enumerate(cmd_list):
+                if arg == output_path:
+                    cmd_list[i] = final_output
+                    break
+            else:
+                # 如果没找到，直接追加到最后？但可能破坏命令结构，此处警告
+                self._append_info_ui(_("警告：未在命令中找到输出路径 {0}，已忽略路径更新".format(output_path)))
+        task = Task(input_path, final_output, settings, cmd_list)
+        task.is_custom = True
+        self.tasks.append(task)
+        self.update_task_list()
+        self._append_info_ui(_("✅ 已添加提取任务: {0} -> {1}".format(os.path.basename(input_path), final_output)))
+        return True
+
+
+    def update_progress(self, current=0, total=0, task=None, log_progress=True):
+        if total == 0:
+            if task is not None:
+                task.progress = 0
+                self._schedule_task_list_update()
+            if log_progress:
+                if task and task.start_time and task.elapsed_time is not None:
+                    elapsed = seconds_to_time(task.elapsed_time, short=True)
+                    self._update_log_progress(f"转码结束 耗时 {elapsed}")
+                else:
+    #                self._update_log_progress("转码结束")
+#                self.root.title("FFmpeg 多功能工具")
+                    pass   #  上面2句注释空了 所以需要pass占位
+            self._last_logged_percent = -1
+            return
+    
+        # 动态修正：若 ffmpeg 输出的 time= 超过预估 total，自动拉高
+        # 防止变速/截取等误算导致进度条永远到不了100%
+        if current > total:
+            total = int(current * 1.05) + 1
+    
+        percent = int(100 * current / total)
+    
+        if task is not None:
+            task.progress = percent
+            task.current_sec = current
+            task.total_sec = total
+            self._schedule_task_list_update()
+    
+        if log_progress:
+            if not hasattr(self, '_last_logged_percent'):
+                self._last_logged_percent = -1
+            if percent == 0 or percent == 100 or (percent - self._last_logged_percent >= 5):
+                self._last_logged_percent = percent
+                progress_str = f"{percent}% ({int(current)}/{int(total)} 秒)"
+                elapsed_str = ""
+                if task and task.start_time:
+                    elapsed = time.time() - task.start_time
+                    elapsed_str = f" 耗时 {seconds_to_time(elapsed, short=True)}"
+                self._update_log_progress(f"{progress_str}{elapsed_str}")
+    
+    def _schedule_task_list_update(self):
+        """去抖刷新任务列表"""
+        if hasattr(self, '_task_list_update_after') and self._task_list_update_after is not None:
+            self.root.after_cancel(self._task_list_update_after)
+        self._task_list_update_after = self.root.after(100, self._update_task_list_ui_safe)
+    
+    def _update_task_list_ui_safe(self):
+        """安全刷新任务列表"""
+        self._task_list_update_after = None
+        self.update_task_list()
+    
+    def _update_log_progress(self, text):
+        """更新日志进度行（替换最后一行）"""
+        info = self.info_text
+        try:
+            last_line_start = info.index("end-2l linestart")
+            last_line = info.get(last_line_start, "end-1c")
+            if "[进度]" in last_line:
+                info.delete(last_line_start, "end-1c")
+        except:
+            pass
+        info.insert(tk.END, f"[进度] {text}\n")
+        info.see(tk.END)
+
+    
+
+
+    # 过滤转换日志的无用信息
+    @staticmethod
+    def _is_ffmpeg_banner_line(line: str) -> bool:
+        """判断是否为 FFmpeg 启动时的编译信息行，应被忽略"""
+        line = line.strip()
+#         if line.startswith("ffmpeg version"):
+#             return True
+        if line.startswith("built with"):
+            return True
+        if line.startswith("configuration:"):
+            return True
+        if line.startswith(("libav", "libsw", "libpostproc")):
+            return True
+        if "Press [q] to stop" in line:
+            return True
+        return False
+
+    def _update_ffmpeg_paths(self):
+        """根据自定义目录设置更新 ffmpeg/ffprobe/ffplay 路径，并统一斜杠"""
+        if self.ffmpeg_dir_enabled.get() and self.ffmpeg_dir_path.get().strip():
+            base_dir = normalize_path(self.ffmpeg_dir_path.get().strip())
+            ext = ".exe" if sys.platform == "win32" else ""
+            ffmpeg = normalize_path(os.path.join(base_dir, f"ffmpeg{ext}"))
+            ffprobe = normalize_path(os.path.join(base_dir, f"ffprobe{ext}"))
+            ffplay = normalize_path(os.path.join(base_dir, f"ffplay{ext}"))
+            if os.path.exists(ffmpeg):
+                self.ffmpeg_cmd = ffmpeg
+                self.ffprobe_cmd = ffprobe if os.path.exists(ffprobe) else None
+                self.ffplay_cmd = ffplay if os.path.exists(ffplay) else None
+                if not self.ffprobe_cmd:
+                    self._append_info_ui(_("警告：指定 FFmpeg 目录下未找到 ffprobe，部分功能可能受限"))
+                if not self.ffplay_cmd:
+                    self._append_info_ui(_("警告：指定 FFmpeg 目录下未找到 ffplay，预览功能可能受限"))
+                return
+            else:
+                self._append_info_ui(_("警告：指定 FFmpeg 目录下未找到 ffmpeg，将使用系统 PATH 中的版本"))
+        # 回退到系统 PATH，并规范化路径
+        ffmpeg = find_executable("ffmpeg.exe") or find_executable("ffmpeg")
+        ffprobe = find_executable("ffprobe.exe") or find_executable("ffprobe")
+        ffplay = find_executable("ffplay.exe") or find_executable("ffplay")
+        self.ffmpeg_cmd = normalize_path(ffmpeg) if ffmpeg else None
+        self.ffprobe_cmd = normalize_path(ffprobe) if ffprobe else None
+        self.ffplay_cmd = normalize_path(ffplay) if ffplay else None
+
+    def stop_all_transcodes(self):
+        """停止所有转码进程（发送 q 信号，并标记任务为已停止）"""
+        self.stop_flag = True  # 标记全局停止，阻止新任务启动
+        with self._proc_lock:
+            # 清理已结束的进程和任务映射
+            self.running_procs = [p for p in self.running_procs if p.poll() is None]
+            self._running_tasks = [(p, t) for (p, t) in self._running_tasks if p.poll() is None]
+            if not self.running_procs:
+                self.root.after(0, lambda: messagebox.showinfo(_("提示"), _("当前没有正在运行的转码进程")))
+                return
+    
+        # 确认是否继续
+        if not messagebox.askyesno(_("确认停止"), _("将停止 {0} 个正在运行的转码进程，确定吗？".format(len(self.running_procs)))):
+            return
+    
+        # 标记任务为已停止
+        for _, task in self._running_tasks:
+            task.stopped_by_user = True
+    
+        # 发送 'q' 给每个进程
+        procs = list(self.running_procs)  # 快照
+        for proc in procs:
+            if proc.poll() is None and proc.stdin:
+                try:
+                    proc.stdin.write('q\n')
+                    proc.stdin.flush()
+                    self._append_info_ui(_("[停止] 已向进程 {0} 发送停止指令".format(proc.pid)))
+                except Exception as e:
+                    self._append_info_ui(_("[停止] 发送 q 到进程 {0} 失败: {1}".format(proc.pid, e)))
+    
+        # 3 秒后检查并强制终止
+        self.root.after(3000, lambda: self._check_and_terminate(procs))
+    
+    def _check_and_terminate(self, procs):
+        still_alive = [p for p in procs if p.poll() is None]
+        if not still_alive:
+            self._append_info_ui(_("[停止] 所有进程已正常退出"))
+            return
+    
+        for p in still_alive:
+            try:
+                p.terminate()
+                self._append_info_ui(_("[停止] 已 terminate 进程 {0}".format(p.pid)))
+            except Exception as e:
+                self._append_info_ui(_("[停止] terminate 进程 {0} 失败: {1}".format(p.pid, e)))
+    
+        # 最终 kill
+        self.root.after(3000, lambda: self._kill_remaining(still_alive))
+    
+    def _kill_remaining(self, procs):
+        for p in procs:
+            if p.poll() is None:
+                try:
+                    p.kill()
+                    self._append_info_ui(_("[停止] 已 kill 进程 {0}".format(p.pid)))
+                except Exception as e:
+                    self._append_info_ui(_("[停止] kill 进程 {0} 失败: {1}".format(p.pid, e)))
+    
+
+    def _load_cmd_templates(self):
+        """仅从文件加载快速命令模板，若文件不存在则保留空字典（不创建）"""
+        self.cmd_templates = {}
+        if os.path.exists(self.cmd_templates_path):
+            try:
+                with open(self.cmd_templates_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        self.cmd_templates = data
+            except Exception as e:
+                self._append_info_ui(_("加载快速命令模板失败: {0}".format(e)))
+        # 如果文件不存在，则 cmd_templates 保持为空字典，稍后由后台线程创建
+    
+    def _get_default_cmd_templates(self):
+        """返回默认的命令模板字典"""
+        return {
+            "生成静音音频 (anullsrc)": 'ffmpeg -y -f lavfi -i anullsrc=r=44100:cl=stereo -t 10 "{output_dir}silence.wav"',
+            "提取关键帧 (关键帧截图)": 'ffmpeg -y -i "{input}" -vf "select=eq(pict_type\\\\,I)" -vsync vfr "{output_dir}thumb_%04d.png"',
+            "查看媒体信息 (ffprobe)": 'ffprobe -v error -show_format -show_streams "{input}"',
+            "快速转码测试 (10秒)": 'ffmpeg -y -i "{input}" -c:v libx264 -preset ultrafast -t 10 "{output_dir}output_test.mp4"',
+            "生成测试视频 (彩条)": 'ffmpeg -y -f lavfi -i testsrc=duration=10:size=640x480:rate=30 -c:v libx264 "{output_dir}test.mp4"',
+            "生成测试视频 (动态)": 'ffmpeg -y -f lavfi -i testsrc2=duration=10:size=640x480:rate=30 -c:v libx264 "{output_dir}test2.mp4"',
+            "生成黑色背景视频": 'ffmpeg -y -f lavfi -i color=c=black:s=vga:r=25 -c:v libx264 -t 10 "{output_dir}out_color.mp4"',
+            "生成雪花视频": 'ffmpeg -y -f lavfi -i "nullsrc=s=640x480:r=25,geq=random(1)*255:128:128" -c:v libx264 -t 10 "{output_dir}out_snow.mp4"',
+            "生成滴一声": 'ffmpeg -y -f lavfi -i "sine=frequency=1000:duration=0.2,apad=pad_dur=0.3" "{output_dir}beep.wav"',
+            "生成滴持续": 'ffmpeg -y -f lavfi -i "sine=frequency=900:duration=10" "{output_dir}beeplong.wav"',
+            "生成分形曼德博图案": 'ffmpeg -y -f lavfi -i "mandelbrot=s=640x480:r=25" -c:v libx264 -t 10 "{output_dir}mandelbrot.mp4"',
+            "生成透明纯色视频(ProRes)": 'ffmpeg -y -f lavfi -i "color=c=#00000000:s=640x480:r=25,format=rgba" -c:v prores_ks -t 10 "{output_dir}transparent_bg.mov"',
+            "元胞自动机": 'ffmpeg -y -f lavfi -i cellauto -vf format=yuv420p -c:v libx264 -t 10 "{output_dir}cellauto.mp4"',
+            "生命活动": 'ffmpeg -y -f lavfi -i life -vf format=yuv420p -c:v libx264 -t 10 "{output_dir}life.mp4"',
+            "生成白噪音 (静电噪音)": 'ffmpeg -y -f lavfi -i "anoisesrc=duration=10:colour=white" "{output_dir}white_noise.wav"',
+            "生成粉噪音 (柔和噪声)": 'ffmpeg -y -f lavfi -i "anoisesrc=duration=10:colour=pink" "{output_dir}pink_noise.wav"',
+            "生成正弦波音频": 'ffmpeg -y -f lavfi -i "aevalsrc=sin(440*2*PI*t)" -t 5 "{output_dir}sin_noise.wav"',
+            "按帧率提取图片 (30)": 'ffmpeg -y -i "{input}" -vf "fps=30" "{output_dir}output_frame_%04d.jpg"',
+            "元数据旋转90° (仅MP4)": 'ffmpeg -y -i "{input}" -c copy -metadata:s:v rotate="90" "{output_dir}rotated.mp4"',
+            "元数据旋转180° (仅MP4)": 'ffmpeg -y -i "{input}" -c copy -metadata:s:v rotate="180" "{output_dir}rotated.mp4"',
+            "元数据旋转270° (仅MP4)": 'ffmpeg -y -i "{input}" -c copy -metadata:s:v rotate="270" "{output_dir}rotated.mp4"',
+            "音视频倒放(reverse)": 'ffmpeg -y -i "{input}" -vf reverse -af areverse "{output_dir}reverse.mp4"',
+            "视频四周加边框 (pad)": 'ffmpeg -y -i \"{input}\" -vf \"pad=iw+20:ih+20:10:10:color=red\" -c:a copy \"{output_dir}bordered.mp4\"',
+            "简易英文文字水印(drawtext)": 'ffmpeg -y -i "{input}" -vf "drawtext=text=\'Hello\':fontsize=30:fontcolor=white:x=10:y=10" -c:a copy "{output_dir}text.mp4"',
+            "绘制矩形标记 (drawbox)": 'ffmpeg -y -i "{input}" -vf "drawbox=x=10:y=10:w=100:h=100:color=red@0.5:thickness=5" -c:a copy "{output_dir}box.mp4"',
+            "简易音频降噪 (afftdn)": 'ffmpeg -y -i "{input}" -af "afftdn" -c:v copy "{output_dir}denoised.wav"',
+
+            "视频半速 + 60帧插值": 'ffmpeg -y -i \"{input}\" -filter_complex \"[0:v]setpts=2*PTS,minterpolate=\'mi_mode=mci:mc_mode=aobmc:vsbmc=1:fps=60\'[v];[0:a]atempo=0.5[a]\" -map \"[v]\" -map \"[a]\" \"{output_dir}half_speed_60fps.mp4\"',
+            "60帧插值": 'ffmpeg -y -i \"{input}\" -filter_complex \"[0:v]minterpolate=\'mi_mode=mci:mc_mode=aobmc:vsbmc=1:fps=60\'\" \"{output_dir}60fps_interpolated.mp4\"',
+            "设置画面比例": 'ffmpeg -y -i \"{input}\" -aspect 16:9 \"{output_dir}aspect_16x9.mp4\"',
+            "视频流时间戳偏移": 'ffmpeg -y -itsoffset 1 -i \"{input}\" -c copy -map 0:v -map 1:a \"{output_dir}offset_video.mp4\"',
+            "提取画面内容不同的帧(0.1-0.3)": 'ffmpeg -y -i \"{input}\" -vf \"select=gt(scene\\,0.1)\" -vsync 0 \"{output_dir}%04d.jpg\"',
+            "静态图像制作视频": 'ffmpeg -y -loop 1 -i \"{input}\" -i audio.mp3 -c:v libx264 -tune stillimage -c:a aac -shortest \"{output_dir}still_video.mp4\"',
+            "音频响度标准化": 'ffmpeg -y -i \"{input}\" -filter:a \"loudnorm=I=-23:LRA=7:TP=-2\" -c:v copy \"{output_dir}normalized.mp4\"',
+            "静音特定音频通道": 'ffmpeg -y -i \"{input}\" -af \"pan=stereo|c0=c0|c1=0*c1\" -c:v copy \"{output_dir}right_channel_muted.mp4\"',
+            "交换左右音频通道": 'ffmpeg -y -i \"{input}\" -af \"pan=stereo|c0=c1|c1=c0\" -c:v copy \"{output_dir}swapped_channels.mp4\"',
+            "合并两个音频流": 'ffmpeg -y -i \"{input}\" -i input2.mp3 -filter_complex \"[0:a][1:a]amerge=inputs=2[a]\" -map \"[a]\" \"{output_dir}merged.mp4\"',
+            "提取内置封面 (cover art)": 'ffmpeg -y -i "{input}" -map 0:v:0? -c:v copy "{output_dir}cover.jpg"',
+            "提取第一帧截图": 'ffmpeg -y -i "{input}" -vframes 1 "{output_dir}thumb.jpg"',
+            "提取指定时间帧 (需改 -ss)": 'ffmpeg -y -i "{input}" -ss 00:00:05 -vframes 1 "{output_dir}thumb.jpg"',
+            "【硬件滤镜片段】CUDA 缩放": '-vf scale_cuda={scale_w}:{scale_h}',
+            "【硬件滤镜片段】CUDA 旋转": '-vf transpose_cuda={transpose_val}',
+            "【区域模糊】boxblur": '-filter_complex \"[0:v]crop={crop_w}:{crop_h}:{crop_x}:{crop_y},boxblur=11[fg];[0:v][fg]overlay={crop_x}:{crop_y}[v]\" -map \"[v]\" -map 0:a? -c:a copy',
+            "【区域模糊】gblur": '-filter_complex \"[0:v]crop={crop_w}:{crop_h}:{crop_x}:{crop_y},gblur=sigma=2.0[fg];[0:v][fg]overlay={crop_x}:{crop_y}[v]\" -map \"[v]\" -map 0:a? -c:a copy',
+            "【硬件滤镜片段】QSV 缩放": '-vf \"vpp_qsv=width={scale_w}:height={scale_h}\"',
+            "【硬件滤镜片段】QSV 裁剪": '-vf \"vpp_qsv=cw={crop_w}:ch={crop_h}:cx={crop_x}:cy={crop_y}\"',
+            "【硬件滤镜片段】QSV 裁剪+缩放组合": '-vf \"vpp_qsv=cw={crop_w}:ch={crop_h}:cx={crop_x}:cy={crop_y}:width={scale_w}:height={scale_h}\"',
+            "【硬件滤镜片段】QSV 旋转": '-vf \"vpp_qsv=transpose=1\"',
+            "【硬件滤镜片段】QSV 反交错": '-vf \"vpp_qsv=deinterlace=1\"',
+            "【硬件滤镜片段】QSV 降噪": '-vf \"vpp_qsv=denoise=3\"',
+            "【硬件滤镜片段】QSV 细节增强": '-vf \"vpp_qsv=detail=0.5\"',
+            "【硬件滤镜片段】QSV 色彩校正": '-vf \"vpp_qsv=procamp=1.0:contrast=1.0:brightness=0.0\"',
+            "【硬件滤镜片段】QSV 像素格式": '-vf \"vpp_qsv=format=nv12\"',
+            "【硬件滤镜片段】QSV 帧率": '-vf \"vpp_qsv=framerate=30\"',
+
+
+        }
+    
+    def _save_cmd_templates(self):
+        """保存命令模板到 JSON 文件（覆盖写入）"""
+        os.makedirs(os.path.dirname(self.cmd_templates_path), exist_ok=True)
+        try:
+            with open(self.cmd_templates_path, 'w', encoding='utf-8') as f:
+                json.dump(self.cmd_templates, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            self._append_info_ui(_("保存快速命令模板失败: {0}".format(e)))
+    
+    def _refresh_cmd_preset_list(self):
+        """刷新命令预设下拉列表"""
+        if hasattr(self, 'cmd_preset_combo'):
+            names = list(self.cmd_templates.keys())
+            self.cmd_preset_combo['values'] = names
+            if names:
+                self.cmd_preset_var.set(names[0])
+            else:
+                self.cmd_preset_var.set("")
+
+
+
+    def _add_hwaccel_params(self, cmd_list: List[str], settings: dict):
+        """添加硬件解码相关参数（若启用），以及滤镜硬件加速的设备初始化。"""
+        # 滤镜硬件加速：设备初始化（单卡留空即可；多卡/必须指定设备时填「设备」框）
+        api = settings.get("hw_filter_mode", "cpu")
+        if api in ("cuda", "qsv", "vaapi"):
+            device = (settings.get("hw_filter_device") or "").strip()
+            if api == "cuda":
+                # NVIDIA 单卡无需指定；多 GPU 填 GPU 编号（0/1）→ cuda=cu:0
+                init_val = f"cuda=cu:{device}" if device else "cuda=cu"
+            elif api == "qsv":
+                # QSV 核显/单卡固定用 qsv=hw（FFmpeg 自动选平台设备，不需要也不该写数字）。
+                # extra_hw_frames=64 必须在这里指定（Intel 官方推荐），不能放到 hwupload=derive_device=qsv 后面。
+                # 多 GPU / 需指定时填 child_device 语法：
+                #   Windows 填 DirectX 适配器号（如 1）→ qsv=hw,child_device=1
+                #   Linux   填 DRM 节点（如 /dev/dri/renderD128）→ qsv=hw,child_device=/dev/dri/renderD128
+                init_val = f"qsv=hw,child_device={device},extra_hw_frames=64" if device else "qsv=hw,extra_hw_frames=64"
+            else:  # vaapi
+                if not device:
+                    init_val = "vaapi=amd"
+                elif device.startswith("vaapi:") or device.startswith("amd:"):
+                    init_val = f"vaapi={device}"
+                else:
+                    init_val = f"vaapi=amd:{device}"
+            cmd_list.extend(["-init_hw_device", init_val])
+        if not settings.get("hwaccel_enabled", False):
+            return
+        decoder_key = settings.get("hwaccel_decoder", "none")
+        if decoder_key == "none":
+            return
+
+        # 通用硬件加速（专用解码器 cuvid/qsv/amf 已移出下拉，统一用 -hwaccel + 原生解码器）
+        if decoder_key in ("cuda", "qsv", "vaapi", "amf", "videotoolbox"):
+            if decoder_key == "cuda":
+                cmd_list.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
+            elif decoder_key == "amf":  # AMD 通用
+                cmd_list.extend(["-hwaccel", "amf", "-hwaccel_output_format", "amf"])
+            elif decoder_key == "qsv":
+                cmd_list.extend(["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"])
+            elif decoder_key == "vaapi":
+                cmd_list.extend(["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"])
+            elif decoder_key == "videotoolbox":
+                cmd_list.extend(["-hwaccel", "videotoolbox"])
+
+    def _add_trim_params(self, cmd_list: List[str], settings: dict):
+        """从设置字典中添加截取参数（-ss, -to）到命令列表"""
+        if settings.get("trim_enabled", False):
+            start = settings.get("trim_start", "").strip()
+            end = settings.get("trim_end", "").strip()
+            if start:
+                cmd_list.extend(["-ss", start])
+            if end:
+                cmd_list.extend(["-to", end])
+
+
+    def _enforce_reencode_for_precise_trim(self, settings: dict, only_audio: bool = False):
+        """精准模式下强制重新编码"""
+        if settings.get("precise_trim", False) and not only_audio:
+            if settings.get("encoder") == "copy":
+                settings["encoder"] = "libx265"
+                self._append_info_ui(_("精准截取模式下，编码器不能为 copy，已自动改为 libx265。"))
+
+    def _calculate_trim_duration(self, settings: dict, input_path: str) -> Tuple[Optional[float], Optional[float]]:
+        """
+        根据设置计算精准截取的起始时间（start_sec）和输出时长（duration）。
+        :param settings: 设置字典（需包含 trim_start, trim_end, precise_trim）
+        :param input_path: 输入文件路径（用于获取总时长）
+        :return: (start_sec, duration)，若无法计算则对应为 None
+        """
+        if not settings.get("trim_enabled", False):
+            return None, None
+        start = settings.get("trim_start", "").strip()
+        end = settings.get("trim_end", "").strip()
+        start_sec = time_to_seconds(start) if start else 0.0
+        end_sec = time_to_seconds(end) if end else None
+        if start_sec is None:
+            return None, None
+        duration = None
+        total_duration = self._get_media_duration(input_path)
+        if end_sec is not None:
+            duration = end_sec - start_sec
+        elif total_duration is not None:
+            duration = total_duration - start_sec
+        return start_sec, duration
+
+
+
+    def _get_video_pix_fmt(self, file_path: str, stream_index: int = 0) -> Optional[str]:
+        """获取视频流的像素格式，优先读解析缓存，失败返回None"""
+        info = self._get_cached_stream_info(file_path)
+        if info:
+            for s in info.get('streams', []):
+                if s.get('codec_type') == 'video':
+                    pf = s.get('pix_fmt')
+                    if pf:
+                        return pf
+                    break
+        return None
+
+    def _get_video_framerate(self, file_path: str) -> Optional[float]:
+        """获取视频文件的平均帧率（fps），优先读解析缓存，失败返回 None"""
+        if not self.ffprobe_cmd or not os.path.exists(file_path):
+            return None
+        # 优先读解析缓存（拖入文件时已填充）
+        info = self._get_cached_stream_info(file_path)
+        if info:
+            for s in info.get("streams", []):
+                if s.get("codec_type") == "video":
+                    fr = s.get("avg_frame_rate")
+                    if fr:
+                        try:
+                            num, den = str(fr).split('/')
+                            val = float(num) / float(den) if float(den) != 0 else None
+                            if val:
+                                return val
+                        except (ValueError, ZeroDivisionError):
+                            pass
+                    break
+        cmd = [self.ffprobe_cmd, "-v", "error", "-select_streams", "v:0",
+               "-show_entries", "stream=avg_frame_rate", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
+        try:
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, creationflags=flags)
+            if result.returncode == 0 and result.stdout.strip():
+                num, den = result.stdout.strip().split('/')
+                return float(num) / float(den) if float(den) != 0 else None
+        except:
+            pass
+        return None
+
+    def _get_media_duration(self, file_path):
+        """获取媒体文件时长（秒），带缓存，失败返回 None"""
+        if not file_path or not os.path.exists(file_path):
+            return None
+        # 获取文件修改时间作为缓存键的一部分
+        try:
+            mtime = os.path.getmtime(file_path)
+        except OSError:
+            mtime = None
+        cache_key = (file_path, mtime)
+        if cache_key in self._duration_cache:
+            return self._duration_cache[cache_key]
+        
+        # 原有 ffprobe 调用
+        if not self.ffprobe_cmd:
+            return None
+        cmd = [self.ffprobe_cmd, "-v", "error", "-show_entries", "format=duration",
+               "-of", "default=noprint_wrappers=1:nokey=1", file_path]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5,
+                                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+            if result.returncode == 0 and result.stdout.strip():
+                duration = float(result.stdout.strip())
+                self._duration_cache[cache_key] = duration
+                return duration
+        except:
+            pass
+        return None
+    
+    
+    def _get_video_dimensions_cached(self, file_path):
+        """获取视频原始宽高（不考虑旋转），带缓存"""
+        if not file_path or not os.path.exists(file_path):
+            return None, None
+        try:
+            mtime = os.path.getmtime(file_path)
+        except OSError:
+            mtime = None
+        cache_key = (file_path, mtime)
+        if cache_key in self._dimension_cache:
+            return self._dimension_cache[cache_key]
+        
+        w, h = get_video_dimensions(self.ffprobe_cmd, file_path)
+        if w is not None and h is not None:
+            self._dimension_cache[cache_key] = (w, h)
+        return w, h
+
+    def _get_video_size_chain(self, track):
+        """
+        获取视频轨道的尺寸变化链（原始 → 裁剪 → 旋转 → 缩放）。
+        返回一个字符串列表，每个元素如 "1920x1080" 或 "裁剪 960x540"。
+        若无法获取原始尺寸，返回 None。
+        """
+        orig_w, orig_h = self._get_video_dimensions_cached(track.file_path)
+        if orig_w is None or orig_h is None:
+            return None
+    
+        steps = []
+        steps.append(f"{orig_w}x{orig_h}")
+        w, h = orig_w, orig_h
+    
+        # ----- 裁剪 -----
+        if track.enc_settings.get("crop_enabled", False):
+            crop_w = track.enc_settings.get("crop_width", "").strip()
+            crop_h = track.enc_settings.get("crop_height", "").strip()
+            crop_left = track.enc_settings.get("crop_left", "0").strip()
+            crop_top = track.enc_settings.get("crop_top", "0").strip()
+            if crop_w and crop_h:
+                # 计算表达式，支持 iw/ih
+                cw = safe_eval_expr(crop_w, {"iw": orig_w, "ih": orig_h})
+                ch = safe_eval_expr(crop_h, {"iw": orig_w, "ih": orig_h})
+                if cw and ch and cw > 0 and ch > 0:
+                    w, h = cw, ch
+                    steps.append(f"裁剪 {w}x{h}")
+                else:
+                    # 表达式无效，保留原尺寸（但注明裁剪无效）
+                    steps.append("裁剪(无效)")
+    
+        # ----- 旋转（交换宽高） -----
+        rotate = track.enc_settings.get("rotate", "none")
+        if rotate in ("90", "270"):
+            w, h = h, w
+            steps.append(f"旋转 {w}x{h}")
+    
+        # ----- 缩放 -----
+        if track.enc_settings.get("scale_enabled", False):
+            method = track.enc_settings.get("scale_method", "width")
+            sw = track.enc_settings.get("scale_width", "").strip()
+            sh = track.enc_settings.get("scale_height", "").strip()
+            try:
+                if method == "width" and sw:
+                    target_w = int(float(sw))
+                    target_h = int(round(target_w * h / w))
+                    w, h = target_w, target_h
+                elif method == "height" and sh:
+                    target_h = int(float(sh))
+                    target_w = int(round(target_h * w / h))
+                    w, h = target_w, target_h
+                elif method == "exact" and sw and sh:
+                    w, h = int(float(sw)), int(float(sh))
+                steps.append(f"缩放 {w}x{h}")
+            except (ValueError, ZeroDivisionError):
+                steps.append("缩放(无效)")
+    
+        return steps
+
+
+    def _build_video_encoding_params(self, cmd_list: List[str], settings: dict) -> List[str]:
+        vcodec = settings.get("encoder", "libx265")
+        if vcodec == "copy":
+            cmd_list.extend(["-c:v", "copy"])
+            return cmd_list
+    
+        strategy = get_encoder_strategy(vcodec)
+        cmd_list = strategy.build_params(cmd_list, settings)
+    
+        if settings.get("frame_rate_type") == "custom" and settings.get("frame_rate_custom"):
+            cmd_list.extend(["-r", settings['frame_rate_custom']])
+
+        # 为 WebP 动图默认添加无限循环
+        if vcodec == "libwebp":
+            cmd_list.extend(["-loop", "0"])
+
+        return cmd_list
+    
+    def _build_audio_encoding_params(self, cmd_list: List[str], settings: dict, input_path: str = None) -> List[str]:
+        if not settings.get("audio_enabled", True):
+            cmd_list.append("-an")
+            return cmd_list
+    
+        speed_factor = float(settings.get("audio_speed_factor", "1.0"))
+        audio_needs_speed = settings.get("audio_speed_enabled", False) and speed_factor != 1.0
+        volume = settings.get("volume", 1.0)
+        volume_enabled = settings.get("volume_enabled", False)
+        audio_needs_volume = volume_enabled and volume != 1.0
+    
+        acodec = settings.get("audio_codec", "aac")
+        audio_filters = []
+        if audio_needs_volume:
+            audio_filters.append(f"volume={volume:.2f}")
+        if audio_needs_speed:
+            atempo = build_atempo_chain(speed_factor)
+            if atempo:
+                audio_filters.append(atempo)
+
+        # 降噪
+        if settings.get("denoise_enabled", False):
+            nr = settings.get("denoise_nr", 12)
+            nf = settings.get("denoise_nf", -30)
+            audio_filters.append(f"afftdn=nr={nr}:nf={nf}")
+
+        # 响度标准化
+        if settings.get("loudnorm_enabled", False):
+            i = settings.get("loudnorm_i", -23)
+            lra = settings.get("loudnorm_lra", 7)
+            tp = settings.get("loudnorm_tp", -2)
+            audio_filters.append(f"loudnorm=I={i}:LRA={lra}:TP={tp}")
+
+        # 声道 / 单声道
+        mode = settings.get("channel_mode", "stereo")
+        if mode == "mono":
+            audio_filters.append("pan=mono|c0=0.5*c0+0.5*c1")
+        elif mode == "left":
+            audio_filters.append("pan=mono|c0=c0")
+        elif mode == "right":
+            audio_filters.append("pan=mono|c0=c1")
+        elif mode == "swap":
+            audio_filters.append("pan=stereo|c0=c1|c1=c0")
+
+        # 均衡器（EQ）：低/中/高 三段增益
+        if settings.get("eq_enabled", False):
+            try:
+                eq_low = float(settings.get("eq_low", 0) or 0)
+            except (ValueError, TypeError):
+                eq_low = 0.0
+            try:
+                eq_mid = float(settings.get("eq_mid", 0) or 0)
+            except (ValueError, TypeError):
+                eq_mid = 0.0
+            try:
+                eq_high = float(settings.get("eq_high", 0) or 0)
+            except (ValueError, TypeError):
+                eq_high = 0.0
+            if eq_low != 0:
+                audio_filters.append(f"bass=g={eq_low:.1f}")
+            if eq_mid != 0:
+                audio_filters.append(f"equalizer=f=1000:width_type=h:width=200:g={eq_mid:.1f}")
+            if eq_high != 0:
+                audio_filters.append(f"treble=g={eq_high:.1f}")
+
+        # 淡入淡出
+        if settings.get("fade_enabled", False):
+            fin = settings.get("fade_in", "")
+            fout = settings.get("fade_out", "")
+            fin_s = time_to_seconds(fin) if fin else 0.0
+            fout_s = time_to_seconds(fout) if fout else 0.0
+            if fin_s > 0:
+                audio_filters.append(f"afade=t=in:st=0:d={fin_s:.3f}")
+            if fout_s > 0:
+                total = self._get_media_duration(input_path) if input_path else None
+                if total:
+                    st = max(0.0, total - fout_s)
+                    audio_filters.append(f"afade=t=out:st={st:.3f}:d={fout_s:.3f}")
+                else:
+                    audio_filters.append(f"afade=t=out:st=0:d={fout_s:.3f}")
+    
+        need_reencode = len(audio_filters) > 0
+        if need_reencode and acodec == "copy":
+            acodec = "aac"
+            self._append_info_ui(_("[音频] 由于应用了音量/变速滤镜，编码器自动从 copy 改为 aac"))
+    
+        if acodec == "copy":
+            cmd_list.extend(["-c:a", "copy"])
+        else:
+            cmd_list.extend(["-c:a", acodec])
+            cmd_list.extend(["-b:a", settings.get("audio_bitrate", "128k")])
+            cmd_list.extend(["-ar", settings.get("audio_samplerate", "44100")])
+
+        if settings.get('audio_reverse', False):
+            audio_filters.append("areverse")
+
+        if audio_filters:
+            cmd_list.extend(["-af", ",".join(audio_filters)])
+    
+        return cmd_list
+
+    def _apply_audio_trim_and_encode(self, cmd_list: List[str], settings: dict,
+                                      input_path: str, start_sec: float, duration: float,
+                                      map_audio: bool = False) -> List[str]:
+        """
+        为音频流应用精准截取（atrim + asetpts）并设置编码参数。
+        :param cmd_list: 命令列表
+        :param settings: 设置字典（包含音频编码器、比特率、采样率等）
+        :param input_path: 音频来源文件路径（用于获取总时长，但这里我们已经传入了 duration，所以不需要）
+        :param start_sec: 起始时间（秒）
+        :param duration: 截取时长（秒）
+        :param map_audio: 是否添加 -map 0:a:0（水印模式需要）
+        :return: 修改后的 cmd_list
+        """
+        if map_audio:
+            cmd_list.extend(["-map", "0:a:0"])
+    
+        # 强制重新编码
+        acodec = settings.get("audio_codec", "aac")
+        if acodec == "copy":
+            acodec = "aac"
+            self._append_info_ui(_("音频截取启用，编码器已从 copy 改为 aac"))
+    
+        # 构建音频滤镜
+        af_filters = []
+        if start_sec is not None and duration > 0:
+            af_filters.append(f"atrim=start={start_sec:.3f}:duration={duration:.3f}")
+            af_filters.append("asetpts=PTS-STARTPTS")
+    
+        # 合并其他音频滤镜（音量、变速等）
+        speed_factor = float(settings.get("audio_speed_factor", "1.0"))
+        if settings.get("audio_speed_enabled", False) and speed_factor != 1.0:
+            atempo = build_atempo_chain(speed_factor)
+            if atempo:
+                af_filters.append(atempo)
+        volume = settings.get("volume", 1.0)
+        if settings.get("volume_enabled", False) and volume != 1.0:
+            af_filters.append(f"volume={volume:.2f}")
+
+        # 降噪 / 响度 / 声道 / 淡入淡出 / 倒放
+        if settings.get("denoise_enabled", False):
+            af_filters.append("afftdn=nr=12:nf=-30")
+        if settings.get("loudnorm_enabled", False):
+            af_filters.append("loudnorm=I=-23:LRA=7:TP=-2")
+        mode = settings.get("channel_mode", "stereo")
+        if mode == "mono":
+            af_filters.append("pan=mono|c0=0.5*c0+0.5*c1")
+        elif mode == "left":
+            af_filters.append("pan=mono|c0=c0")
+        elif mode == "right":
+            af_filters.append("pan=mono|c0=c1")
+        elif mode == "swap":
+            af_filters.append("pan=stereo|c0=c1|c1=c0")
+
+        # 均衡器（EQ）：低/中/高 三段增益
+        if settings.get("eq_enabled", False):
+            try:
+                eq_low = float(settings.get("eq_low", 0) or 0)
+            except (ValueError, TypeError):
+                eq_low = 0.0
+            try:
+                eq_mid = float(settings.get("eq_mid", 0) or 0)
+            except (ValueError, TypeError):
+                eq_mid = 0.0
+            try:
+                eq_high = float(settings.get("eq_high", 0) or 0)
+            except (ValueError, TypeError):
+                eq_high = 0.0
+            if eq_low != 0:
+                af_filters.append(f"bass=g={eq_low:.1f}")
+            if eq_mid != 0:
+                af_filters.append(f"equalizer=f=1000:width_type=h:width=200:g={eq_mid:.1f}")
+            if eq_high != 0:
+                af_filters.append(f"treble=g={eq_high:.1f}")
+
+        if settings.get("fade_enabled", False):
+            fin = settings.get("fade_in", "")
+            fout = settings.get("fade_out", "")
+            fin_s = time_to_seconds(fin) if fin else 0.0
+            fout_s = time_to_seconds(fout) if fout else 0.0
+            if fin_s > 0:
+                af_filters.append(f"afade=t=in:st=0:d={fin_s:.3f}")
+            if fout_s > 0:
+                total = self._get_media_duration(input_path) if input_path else None
+                if total:
+                    st = max(0.0, total - fout_s)
+                    af_filters.append(f"afade=t=out:st={st:.3f}:d={fout_s:.3f}")
+                else:
+                    af_filters.append(f"afade=t=out:st=0:d={fout_s:.3f}")
+        if settings.get('audio_reverse', False):
+            af_filters.append("areverse")
+    
+        if af_filters:
+            cmd_list.extend(["-af", ",".join(af_filters)])
+    
+        # 编码参数
+        cmd_list.extend(["-c:a", acodec])
+        cmd_list.extend(["-b:a", settings.get("audio_bitrate", "128k")])
+        cmd_list.extend(["-ar", settings.get("audio_samplerate", "44100")])
+    
+        return cmd_list
+
+
+    def _adapt_sub_settings(self, sub_settings, current_w, current_h, wm_orig_w=None, wm_orig_h=None):
+        """
+        根据当前视频尺寸，从基准尺寸缩放位置和大小。
+        返回新的设置字典（含 base_width/height 和缩放后的像素值）。
+        基准尺寸从 sub_settings 中读取，若不存在则用当前尺寸初始化。
+
+        支持表达式（如 W-w-10、iw/2）自动求值为具体数值：
+        - scale_width/scale_height 表达式：用 iw/ih（水印原始尺寸）求值
+        - overlay_x/overlay_y 表达式：用 W/H（主视频） + w/h（水印渲染后尺寸）求值
+        原表达式保存在 _orig_* 键中。
+        """
+        if not sub_settings:
+            return {}
+        import copy
+        new_settings = copy.deepcopy(sub_settings)
+    
+        # 获取基准尺寸
+        base_w = new_settings.get("base_width")
+        base_h = new_settings.get("base_height")
+        if base_w is None or base_h is None:
+            # 首次设置，用当前尺寸作为基准
+            base_w = current_w
+            base_h = current_h
+            new_settings["base_width"] = base_w
+            new_settings["base_height"] = base_h
+            return new_settings
+    
+        # 计算缩放比例
+        scale_w = current_w / base_w
+        scale_h = current_h / base_h
+
+        # ---- 2.1 先求值 scale_width/scale_height 表达式（需要水印原始尺寸） ----
+        for field in ['scale_width', 'scale_height']:
+            val = new_settings.get(field, '').strip()
+            if not val:
+                continue
+            try:
+                num = float(val)
+                # 纯数字，等比缩放
+                if field == 'scale_width':
+                    new_settings[field] = str(int(round(num * scale_w)))
+                else:
+                    new_settings[field] = str(int(round(num * scale_h)))
+            except ValueError:
+                # 表达式，求值（用 iw/ih = 水印原始尺寸）
+                if wm_orig_w is not None and wm_orig_h is not None:
+                    ctx = {'iw': wm_orig_w, 'ih': wm_orig_h, 'in_w': wm_orig_w, 'in_h': wm_orig_h,
+                           'W': current_w, 'H': current_h}
+                    result = safe_eval_expr(val, ctx)
+                    if result is not None and result > 0:
+                        new_settings['_orig_' + field] = val  # 备份原表达式
+                        if field == 'scale_width':
+                            new_settings[field] = str(int(round(result * scale_w)))
+                        else:
+                            new_settings[field] = str(int(round(result * scale_h)))
+
+        # ---- 2.2 计算水印渲染后尺寸（用于 overlay 表达式求值） ----
+        if wm_orig_w is not None and wm_orig_h is not None:
+            rendered_w, rendered_h = compute_rendered_size(wm_orig_w, wm_orig_h, new_settings)
+        else:
+            rendered_w, rendered_h = 0, 0
+
+        # ---- 2.3 求值 overlay_x/overlay_y 表达式 ----
+        for field in ['overlay_x', 'overlay_y']:
+            val = new_settings.get(field, '').strip()
+            if not val:
+                continue
+            try:
+                num = float(val)
+                # 纯数字，等比缩放
+                if field == 'overlay_x':
+                    new_settings[field] = str(int(round(num * scale_w)))
+                else:
+                    new_settings[field] = str(int(round(num * scale_h)))
+            except ValueError:
+                # 表达式，求值（用 W/H = 主视频尺寸，w/h = 水印渲染尺寸）
+                ctx = {'W': current_w, 'H': current_h,
+                       'main_w': current_w, 'main_h': current_h,
+                       'w': rendered_w, 'h': rendered_h,
+                       'n': 0, 't': 0}
+                result = safe_eval_expr(val, ctx)
+                if result is not None:
+                    new_settings['_orig_' + field] = val  # 备份原表达式
+                    new_settings[field] = str(int(round(result)))
+
+        return new_settings
+
+    def _generate_segment_concat_command(self, input_path: str, output_path: str, settings: dict) -> List[str]:
+        """
+        生成分段拼接的 FFmpeg 命令，支持仅音频、硬件解码、增强滤镜等。
+        视频变速和倒放现在独立处理，不再依赖增强开关。
+        音频变速和倒放现为独立控制（音频有自己的「变速」「音频倒放」开关，不再跟随视频设置）。
+        """
+        segments = settings.get("segments", [])
+        if not segments:
+            raise ValueError("片段列表为空")
+    
+        input_path = normalize_path(input_path)
+        output_path = normalize_path(output_path)
+    
+        # 检测仅音频模式
+        only_audio = settings.get("only_audio", False)
+        disable_audio = not settings.get("audio_enabled", True)
+    
+        cmd = [self.ffmpeg_cmd, "-y"]
+
+        self._add_hwaccel_params(cmd, settings)
+    
+        cmd.extend(["-i", input_path])
+
+        # ----- 检测输入文件是否包含音频流  -----
+        has_input_audio = False
+        info = ffprobe_json(self.ffprobe_cmd, input_path)
+        if info:
+            has_input_audio = any(s.get("codec_type") == "audio" for s in info.get("streams", []))
+    
+        # ----- 构建 filter_complex -----
+        n = len(segments)
+        v_filters = []
+        a_filters = []
+    
+        # 变速和倒放已改为逐段独立控制，不再读取全局设置
+        # 见下方 per-segment loop 中的 seg.get("speed") / seg.get("reverse")
+
+        audio_trim_enabled = settings.get("audio_trim_enabled", False)
+
+        for i, seg in enumerate(segments):
+            start = time_to_seconds(seg["start"])
+            end = time_to_seconds(seg["end"])
+            if start is None or end is None:
+                raise ValueError(f"片段 {i+1} 时间无效: start={seg['start']}, end={seg['end']}")
+            if start >= end:
+                raise ValueError(f"片段 {i+1} 开始时间必须小于结束时间")
+    
+            flip = seg.get("flip", "无")
+            flip_filter = ""
+            if flip == "水平翻转":
+                flip_filter = ",hflip"
+            elif flip == "垂直翻转":
+                flip_filter = ",vflip"
+            elif flip == "水平+垂直":
+                flip_filter = ",hflip,vflip"
+
+            # 逐段变速和倒放（每个片段独立控制）
+            seg_speed_factor = 1.0
+            seg_speed_raw = seg.get("speed", "1.0").strip()
+            if seg_speed_raw:
+                try:
+                    seg_speed_factor = float(seg_speed_raw)
+                    if seg_speed_factor <= 0:
+                        seg_speed_factor = 1.0
+                except ValueError:
+                    seg_speed_factor = 1.0
+            seg_reverse = seg.get("reverse", False)
+
+            # 视频trim（仅非仅音频模式） + 逐段变速/倒放
+            if not only_audio:
+                seg_video_chain = f"trim=start={start}:end={end},setpts=PTS-STARTPTS{flip_filter}"
+                if seg_speed_factor != 1.0:
+                    seg_video_chain += f",setpts={1.0/seg_speed_factor}*PTS"
+                if seg_reverse:
+                    seg_video_chain += ",reverse"
+                v_filters.append(f"[0:v]{seg_video_chain}[v{i}]")
+    
+            # 音频trim（除非完全禁用音频 且 源文件有音频；独立截取模式在循环后单独处理）
+            if not disable_audio and has_input_audio and not audio_trim_enabled:
+                audio_filter_parts = [
+                    f"atrim=start={start}:end={end}",
+                    "asetpts=PTS-STARTPTS"
+                ]
+                # 逐段音频变速（不再使用全局变速）
+                if seg_speed_factor != 1.0:
+                    atempo_chain = build_atempo_chain(seg_speed_factor)
+                    if atempo_chain:
+                        audio_filter_parts.append(atempo_chain)
+                # 逐段音频倒放（不再使用全局倒放）
+                if seg_reverse:
+                    audio_filter_parts.append("areverse")
+                a_filters.append(f"[0:a]{','.join(audio_filter_parts)}[a{i}]")
+
+        # 音频独立截取：不分段，单段 atrim（独立于视频片段）
+        if not disable_audio and has_input_audio and audio_trim_enabled:
+            a_start = time_to_seconds(settings.get("audio_trim_start", "0") or "0")
+            a_end_str = settings.get("audio_trim_end", "").strip()
+            a_end = time_to_seconds(a_end_str) if a_end_str else None
+
+            audio_trim_parts = []
+            if a_start is not None and a_end is not None and a_end > a_start:
+                audio_trim_parts.append(f"atrim=start={a_start}:end={a_end}")
+            elif a_start is not None and a_start > 0:
+                audio_trim_parts.append(f"atrim=start={a_start}")
+            else:
+                audio_trim_parts.append("anull")
+            audio_trim_parts.append("asetpts=PTS-STARTPTS")
+
+            # 全局音频滤镜（音量 / 变速 / 倒放 / EQ / 降噪 / 响度 / 声道 / 淡入淡出）
+            speed_factor = float(settings.get("audio_speed_factor", "1.0"))
+            if settings.get("audio_speed_enabled", False) and speed_factor != 1.0:
+                atempo_chain = build_atempo_chain(speed_factor)
+                if atempo_chain:
+                    audio_trim_parts.append(atempo_chain)
+            volume_val = settings.get("volume", 1.0)
+            if settings.get("volume_enabled", False) and volume_val != 1.0:
+                audio_trim_parts.append(f"volume={volume_val:.2f}")
+            if settings.get("audio_reverse", False):
+                audio_trim_parts.append("areverse")
+            if settings.get("denoise_enabled", False):
+                audio_trim_parts.append("afftdn=nr=12:nf=-30")
+            if settings.get("loudnorm_enabled", False):
+                audio_trim_parts.append("loudnorm=I=-23:LRA=7:TP=-2")
+            mode = settings.get("channel_mode", "stereo")
+            if mode == "mono":
+                audio_trim_parts.append("pan=mono|c0=0.5*c0+0.5*c1")
+            elif mode == "left":
+                audio_trim_parts.append("pan=mono|c0=c0")
+            elif mode == "right":
+                audio_trim_parts.append("pan=mono|c0=c1")
+            elif mode == "swap":
+                audio_trim_parts.append("pan=stereo|c0=c1|c1=c0")
+            if settings.get("eq_enabled", False):
+                try:
+                    eq_low = float(settings.get("eq_low", 0) or 0)
+                except (ValueError, TypeError):
+                    eq_low = 0.0
+                try:
+                    eq_mid = float(settings.get("eq_mid", 0) or 0)
+                except (ValueError, TypeError):
+                    eq_mid = 0.0
+                try:
+                    eq_high = float(settings.get("eq_high", 0) or 0)
+                except (ValueError, TypeError):
+                    eq_high = 0.0
+                if eq_low != 0.0 or eq_mid != 0.0 or eq_high != 0.0:
+                    audio_trim_parts.append(f"equalizer=f=100:width=200:g={eq_low},"
+                                            f"equalizer=f=1000:width=1000:g={eq_mid},"
+                                            f"equalizer=f=8000:width=4000:g={eq_high}")
+            if settings.get("fade_enabled", False):
+                fi = settings.get("fade_in", "").strip()
+                if fi:
+                    audio_trim_parts.append(f"afade=t=in:d={fi}")
+                fo = settings.get("fade_out", "").strip()
+                if fo:
+                    audio_trim_parts.append(f"afade=t=out:st={a_end - float(fo) if a_end else 0}:d={fo}")
+            # 单段音频直接输出为 [aout]（无需 concat）
+            a_filters.append(f"[0:a]{','.join(audio_trim_parts)}[aout]")
+
+        filter_parts = []
+    
+        # 视频处理
+        if not only_audio and v_filters:
+            filter_parts.extend(v_filters)
+            v_concat = f"[{']['.join(f'v{i}' for i in range(n))}]concat=n={n}:v=1:a=0[vout]"
+            filter_parts.append(v_concat)
+    
+            # ----- 全局视频滤镜（缩放、裁剪、旋转、翻转、帧率、像素格式、变速、倒放、增强） -----
+            global_filters = []
+    
+            # 缩放
+            if settings.get("scale_enabled", False):
+                method = settings.get("scale_method", "width")
+                w = settings.get("scale_width", "").strip()
+                h = settings.get("scale_height", "").strip()
+                if method == "width" and w:
+                    global_filters.append(f"scale={w}:-2")
+                elif method == "height" and h:
+                    global_filters.append(f"scale=-2:{h}")
+                elif method == "exact" and w and h:
+                    global_filters.append(f"scale={w}:{h}")
+    
+            # 裁剪
+            if settings.get("crop_enabled", False):
+                cw = settings.get("crop_width", "").strip()
+                ch = settings.get("crop_height", "").strip()
+                cx = settings.get("crop_left", "0").strip()
+                cy = settings.get("crop_top", "0").strip()
+                if cw and ch:
+                    global_filters.append(f"crop={cw}:{ch}:{cx}:{cy}")
+    
+            # 旋转
+            rotate = settings.get("rotate", "none")
+            if rotate == "90":
+                global_filters.append("transpose=1")
+            elif rotate == "180":
+                global_filters.append("transpose=2,transpose=2")
+            elif rotate == "270":
+                global_filters.append("transpose=2")
+    
+            # 翻转（全局）
+            if settings.get("vflip", False):
+                global_filters.append("vflip")
+            if settings.get("hflip", False):
+                global_filters.append("hflip")
+    
+            # 帧率
+            if settings.get("frame_rate_type") == "custom":
+                fps = settings.get("frame_rate_custom", "").strip()
+                if fps:
+                    global_filters.append(f"fps={fps}")
+    
+            # 像素格式
+            if settings.get("pix_fmt_enabled", True):
+                pix = settings.get("pix_fmt", "yuv420p")
+                if pix:
+                    global_filters.append(f"format={pix}")
+
+            # 变速和倒放已改为逐段独立控制，不再在此添加全局滤镜
+
+            # ========== 增强滤镜（降噪、锐化、色彩校正等） ==========
+            enhance_settings = settings.get("enhance", {})
+            if enhance_settings:
+                temp_settings = {
+                    "crop_enabled": False,
+                    "scale_enabled": False,
+                    "rotate": "none",
+                    "vflip": False,
+                    "hflip": False,
+                    "speed_enabled": False,        # 已单独处理
+                    "deinterlace_filter": "none",
+                    "pix_fmt_enabled": False,
+                    "subtitle_enabled": False,
+                    "reverse_enabled": False,       # 已单独处理
+                    "enhance": enhance_settings,
+                }
+                enhance_filter = build_video_filter_chain(
+                    temp_settings,
+                    include_subtitle=False,
+                    include_speed=False,            # 已单独处理
+                    include_trim=False,
+                    include_format=False,
+                    enhance_settings=enhance_settings
+                )
+                if enhance_filter and enhance_filter != "null":
+                    global_filters.append(enhance_filter)
+
+            # ========== 文字水印 drawtext ==========
+            dt = build_drawtext_filter(settings.get("text_watermark", {}))
+            if dt:
+                global_filters.append(dt)
+
+            if global_filters:
+                global_filter_str = ",".join(global_filters)
+                filter_parts.append(f"[vout]{global_filter_str}[final_v]")
+                map_v = "[final_v]"
+            else:
+                map_v = "[vout]"
+    
+        # 音频 concat（如果存在音频片段；独立截取模式只有 [aout] 无需 concat）
+        if a_filters:
+            filter_parts.extend(a_filters)
+            if not audio_trim_enabled:
+                a_concat = f"[{']['.join(f'a{i}' for i in range(n))}]concat=n={n}:v=0:a=1[aout]"
+                filter_parts.append(a_concat)
+    
+        all_filters = ";".join(filter_parts)
+        if all_filters:
+            cmd.extend(["-filter_complex", all_filters])
+    
+        # ----- 映射流 -----
+        if only_audio:
+            cmd.extend(["-map", "[aout]"])
+            cmd.append("-vn")
+        else:
+            if v_filters:
+                # 视频流已处理
+                cmd.extend(["-map", map_v])
+                if a_filters:
+                    cmd.extend(["-map", "[aout]"])
+            else:
+                # 不应该发生，因为至少有一个视频片段，但若没有则报错
+                raise ValueError("没有视频片段")
+            # 视频编码参数
+            vcodec = settings.get("encoder", "libx265")
+            if vcodec == "copy":
+                self._append_info_ui(_("分段拼接模式不支持 copy，自动改为 libx265"))
+                vcodec = "libx265"
+                settings["encoder"] = vcodec
+            strategy = get_encoder_strategy(vcodec)
+            cmd = strategy.build_params(cmd, settings)
+    
+        # 音频编码参数（如果启用且不是仅音频模式时，音频编码单独处理）
+        if not disable_audio:
+            if only_audio:
+                # 仅音频模式，直接输出音频
+                acodec = settings.get("audio_codec", "aac")
+                abitrate = settings.get("audio_bitrate", "128k")
+                arate = settings.get("audio_samplerate", "44100")
+                cmd.extend(["-c:a", acodec, "-b:a", abitrate, "-ar", arate])
+            else:
+                # 视频模式，音频编码（如果有音频）
+                if a_filters:
+                    acodec = settings.get("audio_codec", "aac")
+                    abitrate = settings.get("audio_bitrate", "128k")
+                    arate = settings.get("audio_samplerate", "44100")
+                    cmd.extend(["-c:a", acodec, "-b:a", abitrate, "-ar", arate])
+        else:
+            cmd.append("-an")
+    
+        # 自定义参数（含滤镜智能合并）
+        custom = settings.get("custom_args", "").strip()
+        self._merge_custom_filters_into_cmd(cmd, custom)
+    
+        # 容器优化
+        container = settings.get("output_container", "mp4").lower()
+        if container in ("mp4", "mov"):
+            cmd.extend(["-movflags", "+faststart"])
+    
+        cmd.append(output_path)
+        return cmd
+
+    def _build_overlay_filter_complex(self, main_idx: int, main_settings: dict,
+                                       sub_infos: List[Tuple[int, str, dict]],
+                                       include_subtitle_main: bool = False,
+                                       enhance_settings: Optional[dict] = None,
+                                       reverse: bool = False,
+                                       main_file_path: str = "") -> Tuple[str, str]:
+        """
+        构建主视频 + 多个子视频（画中画/水印）的 filter_complex 字符串。
+        注意：此函数不会在 overlay 中添加 shortest=1，避免子视频流结束导致输出提前截断。
+        输出结束由全局 -shortest 控制。
+        """
+        filter_parts = []
+        # ---- 多子视频混合模式保护提示（仅日志，不阻止生成） ----
+        # 混合模式（非 normal）按像素重算主+子区域，多个叠加在数学上互相干涉、
+        # 结果不可预测（部分子视频会"融"进主画面看不清）。水印/转换页只有 1 个子视频，
+        # 因此只在 len(sub_infos)>=2（画中画）且其中 >=2 个设了混合模式时才提示。
+        if len(sub_infos) >= 2:
+            blended = []
+            for _mi, _mf, _ms in sub_infos:
+                _bm = (_ms.get("blend_mode", "normal") or "normal").strip().lower()
+                if _bm and _bm != "normal":
+                    blended.append(_bm)
+            if len(blended) >= 2:
+                self._append_info_ui(
+                    _("⚠️ 多子视频混合模式干涉警告：检测到 %d 个子视频设置了混合模式(%s)。"
+                    "混合模式不是把子视频当贴纸，而是按像素重算主+子区域，多个叠加在数学上会互相干涉、"
+                    "结果不可预测（部分子视频会融进主画面看不清）。建议多个子视频统一使用"
+                    "「正常(透明叠加)」模式；混合模式更适合单个艺术化叠加。")
+                    % (len(blended), "/".join(blended))
+                )
+        # 画中画/水印走 filter_complex，强制软件滤镜避免显存/内存混用导致叠加失败
+        main_settings_sw = dict(main_settings)
+        main_settings_sw["hw_filter_mode"] = "cpu"
+        main_vf = build_video_filter_chain(
+            main_settings_sw,
+            include_subtitle=include_subtitle_main,
+            include_speed=True,
+            reverse=main_settings.get('reverse_enabled', False),
+            enhance_settings=enhance_settings,
+            graph_id=f"m{main_idx}"
+        )
+        if main_vf and main_vf != "null":
+            filter_parts.append(f"[{main_idx}:v]{main_vf}[v_main_proc]")
+            current_v = "v_main_proc"
+        else:
+            filter_parts.append(f"[{main_idx}:v]null[v_main_proc]")
+            current_v = "v_main_proc"
+    
+        # 主视频画布偏移
+        pad_enabled = main_settings.get('pad_enabled', False)
+        if pad_enabled:
+            pw = main_settings.get('pad_width', '').strip()
+            ph = main_settings.get('pad_height', '').strip()
+            if pw and ph:
+                ox = main_settings.get('offset_x', '0').strip() or '0'
+                oy = main_settings.get('offset_y', '0').strip() or '0'
+                filter_parts.append(f"color=c=black:s={pw}x{ph}[canvas]")
+                filter_parts.append(f"[canvas][{current_v}]overlay={ox}:{oy}[v_main_pad]")
+                current_v = "v_main_pad"
+    
+        # 处理每个子视频
+        for i, (sub_idx, sub_file, sub_settings) in enumerate(sub_infos):
+            # 判断是否使用 loop 滤镜：只要截取了且循环模式不是 once，就使用 loop
+            use_loop = sub_settings.get("trim_enabled", False)
+            if use_loop:
+                if sub_settings.get("loop_enabled", False) and sub_settings.get("loop_mode") == "once":
+                    use_loop = False
+    
+
+            # 获取子视频的增强设置
+            sub_enhance = sub_settings.get("enhance", {})
+        
+            # 获取基础滤镜（不含 trim 和 format）；子视频同样强制软件滤镜
+            base_vf = build_video_filter_chain(
+                {**sub_settings, "hw_filter_mode": "cpu"},
+                include_subtitle=False,
+                include_speed=True,                # 子视频变速生效（音频变速已由 _add_audio_tracks 处理）
+                include_trim=False,
+                include_format=False,
+                reverse=sub_settings.get('reverse_enabled', False),
+                enhance_settings=sub_enhance,
+                graph_id=f"s{sub_idx}"
+            )
+            if base_vf == "null":
+                base_vf = ""
+    
+            if use_loop:
+                # 获取帧率
+                fps = self._get_video_framerate(sub_file)
+                if fps is None:
+                    use_loop = False
+                else:
+                    start_str = sub_settings.get("trim_start", "0").strip()
+                    end_str = sub_settings.get("trim_end", "").strip()
+                    start_sec = time_to_seconds(start_str) if start_str else 0.0
+                    end_sec = time_to_seconds(end_str) if end_str else None
+                    if end_sec is not None and end_sec > start_sec:
+                        duration = end_sec - start_sec
+                    else:
+                        raw_duration = self._get_media_duration(sub_file)
+                        if raw_duration is not None:
+                            duration = raw_duration - start_sec
+                        else:
+                            use_loop = False
+                    if use_loop:
+                        size = int(round(duration * fps))
+                        if size <= 0:
+                            use_loop = False
+    
+            # 构建子视频滤镜串
+            if use_loop:
+                loop_param = "-1"
+                # 动态构建 trim 参数
+                trim_parts = []
+                if start_sec is not None:
+                    trim_parts.append(f"start={start_sec}")
+                if end_sec is not None:
+                    trim_parts.append(f"end={end_sec}")
+                trim_str = f"trim={':'.join(trim_parts)}" if trim_parts else ""
+            
+                vf_parts = []
+                if trim_str:
+                    vf_parts.append(trim_str)
+                vf_parts.append("setpts=PTS-STARTPTS")
+                vf_parts.append(f"loop=loop={loop_param}:size={size}:start=0")
+
+                if base_vf:
+                    vf_parts.append(base_vf)
+                vf_parts.append("format=rgba")
+                sub_vf = ",".join(vf_parts)
+                filter_parts.append(f"[{sub_idx}:v]{sub_vf}[v_temp_{i}]")
+                current_sub = f"v_temp_{i}"
+            else:
+                # 直接使用 base_vf（已含增强），然后加 format=rgba
+                if base_vf:
+                    sub_vf = f"{base_vf},format=rgba"
+                else:
+                    sub_vf = "format=rgba"
+                filter_parts.append(f"[{sub_idx}:v]{sub_vf}[v_temp_{i}]")
+                current_sub = f"v_temp_{i}"
+    
+            # 绿幕/纯色抠像
+            if sub_settings.get("chroma_enabled", False):
+                color = sub_settings.get("chroma_color", "green")
+                if color.startswith("#"):
+                    color = "0x" + color[1:].upper()
+                similarity = sub_settings.get("chroma_similarity", 0.3)
+                if similarity <= 0:
+                    similarity = 0.00001
+                blend = sub_settings.get("chroma_blend", 0.1)
+                filter_type = sub_settings.get("chroma_filter_type", "chromakey")  # 默认 chromakey
+                
+                # 强制转换格式为 rgb24 提升兼容性（两种滤镜都适用）
+                if filter_type == "colorkey":
+                    filter_parts.append(f"[{current_sub}]format=rgb24,colorkey={color}:{similarity}:{blend}[v_sub_{i}]")
+                else:
+                    # chromakey 可保持原格式，也可加上 format 以确保一致（但 chromakey 支持多种格式，可省略）
+                    filter_parts.append(f"[{current_sub}]chromakey={color}:{similarity}:{blend}[v_sub_{i}]")
+                current_sub = f"v_sub_{i}"
+            else:
+                filter_parts.append(f"[{current_sub}]null[v_sub_{i}]")
+                current_sub = f"v_sub_{i}"
+    
+            # 透明度
+            alpha_enabled = sub_settings.get("alpha_enabled", False)
+            alpha_val = sub_settings.get("alpha_value", 1.0)
+            if alpha_enabled and 0.0 <= alpha_val <= 1.0:
+                filter_parts.append(f"[{current_sub}]colorchannelmixer=aa={alpha_val:.2f}[v_alpha_{i}]")
+                current_sub = f"v_alpha_{i}"
+    
+            # 叠加（不添加 shortest=1）
+            blend_mode = (sub_settings.get('blend_mode', 'normal') or 'normal').strip().lower()
+            if sub_settings.get('overlay_enabled', True):
+                x = sub_settings.get('overlay_x', '0').strip() or '0'
+                y = sub_settings.get('overlay_y', '0').strip() or '0'
+                if blend_mode == 'normal':
+                    duration = self._get_media_duration(sub_file)
+                    enable_expr = self._calc_enable_expr(sub_settings, duration)
+                    overlay_filter = f"overlay={x}:{y}:enable='{enable_expr}'"
+                    filter_parts.append(f"[{current_v}][{current_sub}]{overlay_filter}[v_out_{i}]")
+                    current_v = f"v_out_{i}"
+                else:
+                    # 混合模式：仅在子视频所在矩形「局部区域」内做 blend，再贴回原位置。
+                    # 这样每种效果只作用于各自的子视频框内，不会铺满全屏；
+                    # 也避免了把整张主视频转 RGBA 再转回带来的全屏发绿问题。
+                    mw, mh = self._compute_output_canvas(main_settings, main_file_path)
+                    sw, sh = self._overlay_sub_size(sub_file, sub_settings)
+                    ctx = {"W": mw, "H": mh, "w": sw, "h": sh}
+                    xv = safe_eval_expr(x, ctx)
+                    yv = safe_eval_expr(y, ctx)
+                    xv = int(xv) if xv is not None else 0
+                    yv = int(yv) if yv is not None else 0
+                    # 子视频在主画布上的可见矩形（处理子视频越出画布边缘的情况）
+                    bx = xv if xv > 0 else 0
+                    by = yv if yv > 0 else 0
+                    bw = sw + (xv if xv < 0 else 0)
+                    bh = sh + (yv if yv < 0 else 0)
+                    if bx + bw > mw:
+                        bw = mw - bx
+                    if by + bh > mh:
+                        bh = mh - by
+                    # yuv420p 要求偶数尺寸与位置（对齐时只缩小，绝不增大，避免越界）
+                    if bx % 2:
+                        bx -= 1
+                    if by % 2:
+                        by -= 1
+                    if bx < 0:
+                        bx = 0
+                    if by < 0:
+                        by = 0
+                    if bw % 2:
+                        bw -= 1
+                    if bh % 2:
+                        bh -= 1
+                    # 对齐后再次夹紧到画布内
+                    if bx + bw > mw:
+                        bw = mw - bx
+                    if by + bh > mh:
+                        bh = mh - by
+                    if bw >= 2 and bh >= 2:
+                        sx = -xv if xv < 0 else 0
+                        sy = -yv if yv < 0 else 0
+                        # 1) 主视频裁出该区域并转 RGBA（保证 blend 在 RGB 空间运算，
+                        #    避免 YUV 色度分量相乘/相除导致的偏色发绿）
+                        filter_parts.append(f"[{current_v}]crop={bw}:{bh}:{bx}:{by},format=rgba[mc_{i}]")
+                        # 2) 子视频裁出对应部分（已含格式/绿幕/透明），同样转 RGBA
+                        filter_parts.append(f"[{current_sub}]crop={bw}:{bh}:{sx}:{sy},format=rgba[sc_{i}]")
+                        # 3) 仅在该矩形区域内混合（RGB 空间运算正确），混合后转回 yuv420p，不外溢全屏
+                        filter_parts.append(f"[mc_{i}][sc_{i}]blend=all_mode={blend_mode},format=yuv420p[bl_{i}]")
+                        # 4) 把混合结果贴回原位置
+                        filter_parts.append(f"[{current_v}][bl_{i}]overlay={bx}:{by}[v_out_{i}]")
+                        current_v = f"v_out_{i}"
+                    else:
+                        # 子视频完全在画布外，跳过混合（保持主画面，不报错）
+                        filter_parts.append(f"[{current_v}]null[{current_v}]")
+            else:
+                filter_parts.append(f"[{current_v}]null[{current_v}]")
+    
+        complex_filter = ";".join(filter_parts)
+        return complex_filter, f"[{current_v}]"
+
+    def _compute_output_canvas(self, main_settings, main_file_path):
+        """计算最终输出画布尺寸（优先 pad 画布，否则主视频渲染尺寸）。
+
+        供快照缩放与画布尺寸参考使用：主视频启用 pad 后，实际输出画布是
+        pad 画布（含主视频偏移），而非主视频自身的渲染尺寸。
+        """
+        pad_enabled = main_settings.get('pad_enabled', False)
+        if pad_enabled:
+            pw = (main_settings.get('pad_width', '') or '').strip()
+            ph = (main_settings.get('pad_height', '') or '').strip()
+            if pw and ph:
+                try:
+                    cw = int(float(pw)); ch = int(float(ph))
+                    if cw > 0 and ch > 0:
+                        return max(2, cw), max(2, ch)
+                except ValueError:
+                    pass
+        orig_w, orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, main_file_path, main_settings)
+        if orig_w is None or orig_h is None:
+            orig_w, orig_h = self._get_video_dimensions_cached(main_file_path)
+            if orig_w is None or orig_h is None:
+                orig_w, orig_h = 1280, 720
+        return compute_rendered_size(orig_w, orig_h, main_settings)
+
+    def _overlay_sub_size(self, sub_file, sub_settings):
+        w, h = get_video_rotated_dimensions(self.ffprobe_cmd, sub_file, sub_settings)
+        if w is None or h is None:
+            w, h = self._get_video_dimensions_cached(sub_file)
+            if w is None or h is None:
+                w, h = 320, 240
+        try:
+            w, h = compute_rendered_size(w, h, sub_settings)
+        except Exception:
+            pass
+        return max(2, int(w)), max(2, int(h))
+
+    def _get_effective_duration(self, settings: dict, raw_duration: Optional[float] = None, input_path: str = None) -> Optional[float]:
+        """
+        计算有效时长（考虑截取和变速设置）。
+        若传入 raw_duration 则直接使用，否则从 input_path 获取。
+        返回秒数，失败返回 None。
+        """
+        # 获取原始时长
+        if raw_duration is None and input_path:
+            raw_duration = self._get_media_duration(input_path)
+        if raw_duration is None:
+            return None
+    
+        # 1. 截取
+        if settings.get("trim_enabled", False):
+            start_str = settings.get("trim_start", "").strip()
+            end_str = settings.get("trim_end", "").strip()
+            start_sec = time_to_seconds(start_str) if start_str else 0.0
+            end_sec = time_to_seconds(end_str) if end_str else None
+            if end_sec is not None and end_sec > start_sec:
+                raw_duration = end_sec - start_sec
+            else:
+                raw_duration = raw_duration - start_sec
+
+        # 2. 变速调整：输出时长 = 原时长 / speed_factor
+        # 例如 2x 快放 → 时长减半；0.5x 慢放 → 时长翻倍
+        # 独立于截取，二者可叠加
+        if settings.get("speed_enabled", False):
+            try:
+                sf = float(settings.get("speed_factor", "1.0"))
+                if sf > 0 and sf != 1.0:
+                    raw_duration /= sf
+            except (ValueError, TypeError):
+                pass
+    
+        return raw_duration if raw_duration > 0 else None
+
+    def _calc_segments_total_duration(self, settings: dict) -> float:
+        """计算分段拼接模式下所有片段的总时长（含逐段变速，秒）"""
+        segments = settings.get("segments", [])
+        if not segments:
+            return 0.0
+        total = 0.0
+        for seg in segments:
+            start = time_to_seconds(seg.get("start", ""))
+            end = time_to_seconds(seg.get("end", ""))
+            if start is not None and end is not None and end > start:
+                seg_dur = end - start
+                # 逐段变速：输出时长 = 原片段时长 / speed
+                speed_val = seg.get("speed", "1.0").strip()
+                try:
+                    sf = float(speed_val)
+                    if sf > 0 and sf != 1.0:
+                        seg_dur /= sf
+                except (ValueError, TypeError):
+                    pass
+                total += seg_dur
+            else:
+                # 如果某个片段时间无效，返回0（后续会回退到原始逻辑）
+                return 0.0
+        return total
+
+    def _calc_enable_expr(self, enc_settings: dict, duration: Optional[float]) -> str:
+        loop_enabled = enc_settings.get("loop_enabled", False)
+        if not loop_enabled:
+            return "1"
+    
+        # 使用公共方法获取有效时长（已含截取+变速）
+        effective_duration = self._get_effective_duration(enc_settings, duration)
+        if effective_duration is None:
+            # 无法计算有效时长时，降级为原始总时长或无限
+            effective_duration = duration
+    
+        loop_mode = enc_settings.get("loop_mode", "infinite")
+        loop_count = enc_settings.get("loop_count", 3)
+    
+        if loop_mode == "infinite":
+            return "1"
+        elif loop_mode == "once":
+            if effective_duration is not None and effective_duration > 0:
+                return f"lte(t,{effective_duration})"
+            else:
+                self._append_info_ui(_("[循环] 无法获取视频时长，将一直显示"))
+                return "1"
+        else:  # count
+            if effective_duration is not None and effective_duration > 0:
+                total = effective_duration * max(1, loop_count)
+                return f"lte(t,{total})"
+            else:
+                self._append_info_ui(_("[循环] 无法获取视频时长，将按次数显示但无法精确"))
+                return "1"
+
+
+    # ---------- 播放器设置相关方法 ----------
+    def load_player_settings(self):
+        self._loading_settings = True
+        try:
+            settings = self.preset_manager.load_player_settings()
+            self.use_mpv.set(settings.get("use_mpv", False))
+            self.mpv_path.set(settings.get("mpv_path", "mpv"))
+            # 读取日志设置，缺失时使用默认值
+            self.log_enabled_var.set(settings.get("log_enabled", True))
+            log_path = settings.get("log_path", os.path.join(get_script_dir(), "editlog.txt"))
+            self.log_path_var.set(normalize_path(log_path))
+            self.overwrite_policy.set(settings.get("overwrite_policy", "ask"))
+            self.language_var.set(settings.get("language", "zh"))
+            cmd_path = settings.get("cmd_output_path", "")
+            if cmd_path:
+                self.cmd_output_path.set(cmd_path)
+            # 读取 FFmpeg 目录设置
+            ffmpeg_dir_enabled = settings.get("ffmpeg_dir_enabled", False)
+            ffmpeg_dir_path = settings.get("ffmpeg_dir_path", "")
+            self.ffmpeg_dir_enabled.set(ffmpeg_dir_enabled)
+            self.ffmpeg_dir_path.set(ffmpeg_dir_path)
+    
+            preview_editable = settings.get("preview_editable", False)
+            self.preview_editable_var.set(preview_editable)
+    
+            pix_fmt_default = settings.get("pix_fmt_enabled_default", False)
+            self.pix_fmt_enabled_default.set(pix_fmt_default)
+    
+            # 流提取相关
+            self.extract_custom_dir.set(settings.get("extract_custom_dir", False))
+            self.extract_output_dir.set(settings.get("extract_output_dir", ""))
+            self.auto_match_subtitle_ext.set(settings.get("auto_match_subtitle_ext", True))
+            self.auto_match_audio_ext.set(settings.get("auto_match_audio_ext", True))
+            self.extract_keep_chapters.set(settings.get("extract_keep_chapters", True))
+            self.extract_clear_metadata.set(settings.get("extract_clear_metadata", False))
+            self.extract_attachments.set(settings.get("extract_attachments", False))
+    
+    
+            parallel = settings.get("ffprobe_parallel")
+            if parallel is not None and parallel > 0:
+                self.ffprobe_parallel.set(parallel)
+            else:
+                # 如果预设中没有值，则保存当前计算值（确保预设中有记录）
+                pass
+        finally:
+            self._loading_settings = False
+
+        # 更新路径
+        self._update_ffmpeg_paths()
+
+    def save_player_settings(self):
+        if getattr(self, '_suppress_save', False) or getattr(self, '_loading_settings', False):
+            return
+        self.preset_manager.save_player_settings({
+            "use_mpv": self.use_mpv.get(),
+            "mpv_path": self.mpv_path.get(),
+            "log_enabled": self.log_enabled_var.get(),
+            "log_path": self.log_path_var.get(),
+            "overwrite_policy": self.overwrite_policy.get(),
+            "language": self.language_var.get(),
+            "cmd_output_path": self.cmd_output_path.get(),
+            "ffmpeg_dir_enabled": self.ffmpeg_dir_enabled.get(),
+            "ffmpeg_dir_path": self.ffmpeg_dir_path.get(),
+            "preview_editable": self.preview_editable_var.get(),
+            "pix_fmt_enabled_default": self.pix_fmt_enabled_default.get(),
+
+            # 流提取相关
+            "extract_custom_dir": self.extract_custom_dir.get(),
+            "extract_output_dir": self.extract_output_dir.get().strip(),
+            "auto_match_audio_ext": self.auto_match_audio_ext.get(),
+            "auto_match_subtitle_ext": self.auto_match_subtitle_ext.get(),
+            "extract_keep_chapters": self.extract_keep_chapters.get(),
+            "extract_clear_metadata": self.extract_clear_metadata.get(),
+            "extract_attachments": self.extract_attachments.get(),
+
+            "ffprobe_parallel": self.ffprobe_parallel.get(),
+        })
+
+    def preview_with_player(self, input_path, filters=None, audio_only=False, volume=10,
+                            extra_args=None, start_time=None, duration=None):
+        """
+        启动播放器预览
+        :param start_time: 起始时间（秒或时间字符串），仅 ffplay 使用，mpv 通过 extra_args 传递 --start
+        :param duration: 播放时长（秒），仅 ffplay 使用
+        """
+        file_path = normalize_path(input_path)
+        extra_args = extra_args or []
+    
+        if audio_only:
+            if self.use_mpv.get():
+                player = self.mpv_path.get().strip() or "mpv"
+                cmd = [player, file_path]
+                if start_time is not None:
+                    cmd.append(f"--start={start_time}")
+                if duration is not None:
+                    cmd.append(f"--length={duration}")
+            else:
+                if not self.ffplay_cmd:
+                    self._append_info_ui(_("未找到 ffplay，无法预览。"))
+                    return
+                cmd = [self.ffplay_cmd, "-nodisp", "-autoexit", "-volume", str(volume)]
+                if start_time is not None:
+                    cmd.extend(["-ss", str(start_time)])
+                if duration is not None:
+                    cmd.extend(["-t", str(duration)])
+                cmd.append(file_path)
+        else:
+            if self.use_mpv.get():
+                player = self.mpv_path.get().strip() or "mpv"
+                cmd = [player, file_path]
+                if filters:
+                    # 使用 lavfi=[...] 语法（mpv 官方推荐），不再需要 graph= 与额外的引号转义；
+                    # mpv 会直接解析 [...] 内的滤镜图，filters 本身无需再做 shell/转义处理。
+                    cmd.append(f"--vf=lavfi=[{filters}]")
+                if start_time is not None:
+                    cmd.append(f"--start={start_time}")
+                if duration is not None:
+                    cmd.append(f"--length={duration}")
+                if extra_args:
+                    cmd.extend(extra_args)
+            else:
+                if not self.ffplay_cmd:
+                    self._append_info_ui(_("未找到 ffplay，无法预览。"))
+                    return
+                cmd = [self.ffplay_cmd]
+                if start_time is not None:
+                    cmd.extend(["-ss", str(start_time)])
+                if duration is not None:
+                    cmd.extend(["-t", str(duration)])
+                cmd.extend(["-i", file_path])
+                if filters:
+                    cmd.extend(["-vf", filters])
+                cmd.extend(["-volume", str(volume)])
+                if extra_args:
+                    cmd.extend(extra_args)
+                if "-window_title" not in cmd:
+                    cmd.extend(["-window_title", f"预览: {os.path.basename(file_path)}"])
+    
+        self._append_info_ui(_("执行命令: ") + format_cmd_for_display(cmd))
+        try:
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
+        except Exception as e:
+            self._append_info_ui(_("预览失败: {0}".format(e)))
+    
+    def _preview_with_settings(self, file_path: str, settings: dict, with_snapshot: bool = False):
+        """
+        预览：禁用倒放，变速仅 ffplay 支持，视频自适应缩放，
+        截取通过播放器原生跳转参数（-ss/--start）实现。
+        """
+        if not file_path or not os.path.exists(file_path):
+            self._append_info_ui(_("文件不存在: {0}".format(file_path)))
+            return
+    
+        # ---- 预览强制走软件滤镜路径 ----
+        # 原先把原始 settings（可能含 hw_filter_mode=QSV/CUDA/vaapi）直接交给 build_video_filter_chain，
+        # 生成的滤镜链含有 vpp_qsv / scale_cuda 等硬件滤镜，而后面又追加一个软件 scale 做屏幕自适应，
+        # 形成「硬件滤镜 + 软件滤镜」混用却缺少 hwdownload/hwupload 包裹的非法链路（mpv/ffplay 报错）。
+        # 这里统一强制 cpu，与 build_preview_filter_chain 的设计意图一致：预览/外部播放器走软件。
+        settings = dict(settings)
+        settings["hw_filter_mode"] = "cpu"
+    
+        # ---- 禁用倒放 ----
+        reverse_enabled = settings.get('reverse_enabled', False)
+        if reverse_enabled:
+            self._append_info_ui(_("[预览] 预览不支持倒放，已忽略 reverse。"))
+            settings['reverse_enabled'] = False
+    
+        # ----- 1. 构建基础视频滤镜（不含变速、倒放） -----
+        enhance_settings = settings.get("enhance", {})
+        base_vf = build_video_filter_chain(
+            settings,
+            include_subtitle=True,
+            include_speed=False,
+            include_trim=False,
+            enhance_settings=enhance_settings,
+            reverse=False
+        )
+        filter_parts = []
+        if base_vf and base_vf != "null":
+            filter_parts.append(base_vf)
+    
+        # ----- 2. 水印虚拟框 -----
+        wm_settings = settings.get("watermark", {})
+        if wm_settings.get("enabled", False) and wm_settings.get("file_path", "").strip():
+            wm_file = wm_settings.get("file_path", "").strip()
+            main_w, main_h = self._get_video_dimensions_cached(file_path)
+            if main_w is None or main_h is None:
+                self._append_info_ui(_("[预览] 无法获取视频尺寸，跳过水印虚拟框"))
+            else:
+                # 提前探测水印原始尺寸（自适应表达式求值需要，用原始设置）
+                wm_orig_w, wm_orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, wm_file, wm_settings)
+                if wm_settings.get("adaptive", False):
+                    adapted_wm = self._adapt_sub_settings(wm_settings, main_w, main_h, wm_orig_w, wm_orig_h)
+                else:
+                    adapted_wm = wm_settings
+                # 注意：自适应后尺寸可能变了，重新探测（带旋转）
+                orig_w, orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, wm_file, adapted_wm)
+                if orig_w is None or orig_h is None:
+                    orig_w, orig_h = 320, 240
+                wm_w, wm_h = compute_rendered_size(orig_w, orig_h, adapted_wm)
+                if wm_w <= 0 or wm_h <= 0:
+                    wm_w, wm_h = orig_w, orig_h
+                ctx = {"W": main_w, "H": main_h, "w": wm_w, "h": wm_h}
+                x_expr = adapted_wm.get("overlay_x", "W-w-10")
+                y_expr = adapted_wm.get("overlay_y", "H-h-10")
+                x_val = safe_eval_expr(x_expr, ctx)
+                y_val = safe_eval_expr(y_expr, ctx)
+                if x_val is None:
+                    x_val = main_w - wm_w - 10
+                if y_val is None:
+                    y_val = main_h - wm_h - 10
+                x_val = max(0, min(x_val, main_w - wm_w))
+                y_val = max(0, min(y_val, main_h - wm_h))
+                drawbox = f"drawbox=x={x_val}:y={y_val}:w={wm_w}:h={wm_h}:color=red@0.3:t=3"
+                filter_parts.append(drawbox)
+                self._append_info_ui(_("[预览] 水印虚拟框: 位置({0}, {1}) 尺寸{2}x{3}".format(x_val, y_val, wm_w, wm_h)))
+    
+        # ----- 3. 文字水印 drawtext（必须在自适应缩放之前，坐标按原始分辨率） -----
+        dt = build_drawtext_filter(settings.get("text_watermark", {}))
+        if dt:
+            filter_parts.append(dt)
+            self._append_info_ui(_("[预览] 已添加文字水印 drawtext"))
+
+        # ----- 4. 自适应缩放（放在最后，确保 drawtext 坐标基于原始分辨率） -----
+        orig_w, orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, file_path, settings)
+        if orig_w is None or orig_h is None:
+            orig_w, orig_h = self._get_video_dimensions_cached(file_path)
+            if orig_w is None or orig_h is None:
+                orig_w, orig_h = 1280, 720
+        
+        final_w, final_h = compute_rendered_size(orig_w, orig_h, settings)
+        
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        margin = 80
+        max_w = screen_w - margin
+        max_h = screen_h - margin
+        
+        if final_w > max_w or final_h > max_h:
+            scale = min(max_w / final_w, max_h / final_h)
+            target_w = int(final_w * scale)
+            target_h = int(final_h * scale)
+            target_w = target_w if target_w % 2 == 0 else target_w - 1
+            target_h = target_h if target_h % 2 == 0 else target_h - 1
+            if target_w < 2: target_w = 2
+            if target_h < 2: target_h = 2
+            filter_parts.append(f"scale={target_w}:{target_h}")
+            self._append_info_ui(_("[预览] 视频尺寸 {0}x{1} 超出屏幕，缩放到 {2}x{3}".format(final_w, final_h, target_w, target_h)))
+        else:
+            self._append_info_ui(_("[预览] 视频尺寸 {0}x{1} 适合屏幕，保持原始".format(final_w, final_h)))
+        
+        # ----- 构建最终滤镜链（空则留空，不用 "null"） -----
+        filter_chain = ",".join(filter_parts) if filter_parts else ""
+    
+        # ----- 4. 音频滤镜（变速 / 音量 / EQ / 降噪） -----
+        extra_args = []
+        af_filters = []
+        if settings.get("audio_speed_enabled", False):
+            try:
+                factor = float(settings.get("audio_speed_factor", "1.0"))
+                if factor != 1.0 and factor > 0:
+                    atempo = build_atempo_chain(factor)
+                    if atempo:
+                        af_filters.append(atempo)
+            except ValueError:
+                pass
+        if settings.get("volume_enabled", False):
+            try:
+                vol = float(settings.get("volume", 1.0))
+                if vol != 1.0:
+                    af_filters.append(f"volume={vol:.2f}")
+            except (ValueError, TypeError):
+                pass
+        if settings.get("eq_enabled", False):
+            try:
+                eq_low = float(settings.get("eq_low", 0) or 0)
+                eq_mid = float(settings.get("eq_mid", 0) or 0)
+                eq_high = float(settings.get("eq_high", 0) or 0)
+                if eq_low != 0:
+                    af_filters.append(f"bass=g={eq_low:.1f}")
+                if eq_mid != 0:
+                    af_filters.append(f"equalizer=f=1000:width_type=h:width=200:g={eq_mid:.1f}")
+                if eq_high != 0:
+                    af_filters.append(f"treble=g={eq_high:.1f}")
+            except (ValueError, TypeError):
+                pass
+        if settings.get("denoise_enabled", False):
+            af_filters.append("afftdn=nr=12:nf=-30")
+        if af_filters:
+            af_chain = ",".join(af_filters)
+            extra_args.extend(["-af", af_chain])
+    
+        # ----- 5. 截取参数 -----
+        start_sec = None
+        duration = None
+        if settings.get("trim_enabled", False):
+            start_str = settings.get("trim_start", "").strip()
+            end_str = settings.get("trim_end", "").strip()
+            start_sec = time_to_seconds(start_str) if start_str else None
+            end_sec = time_to_seconds(end_str) if end_str else None
+            if start_sec is not None and end_sec is not None and end_sec > start_sec:
+                duration = end_sec - start_sec
+            # 只有开始时间，播放到末尾
+    
+        # ----- 6. 调用播放器 -----
+        self.preview_with_player(
+            file_path,
+            filter_chain,
+            volume=10,
+            extra_args=extra_args,
+            start_time=start_sec,
+            duration=duration
+        )
+
+        # ---- 水印真实合成快照（独立窗口，与红框占位并行；仅右键预览带快照时触发） ----
+        wm_settings = settings.get("watermark", {})
+        if with_snapshot and wm_settings.get("enabled", False) and (wm_settings.get("file_path", "") or "").strip():
+            self._show_watermark_snapshot_async(file_path, settings)
+
+
+
+
+    # ---------- 输出路径生成与命令构建 ----------
+    def _sanitize_filename(self, filename: str) -> str:
+        """移除 Windows 非法字符，替换为下划线"""
+        # Windows 非法字符: \ / : * ? " < > |
+        illegal_chars = r'[\\/:*?"<>|]'
+        return re.sub(illegal_chars, '_', filename)
+    
+    def generate_output_path(self, input_path, settings):
+        dir_path = settings.get("output_dir") or os.path.dirname(input_path)
+        dir_path = normalize_path(dir_path)
+        base_name = os.path.basename(input_path)
+        name, _ = os.path.splitext(base_name)
+        if settings.get("only_audio", False):
+            container = settings.get("audio_format", "m4a")
+        else:
+            container = settings.get("output_container", "mp4")
+        custom_name = settings.get("custom_output_name", "").strip()
+        if custom_name:
+            custom_name = os.path.basename(custom_name)
+            # --- 清理非法字符 ---
+            custom_name = self._sanitize_filename(custom_name)
+            forbidden = {'.', '..', 'CON', 'PRN', 'AUX', 'NUL',
+                         'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
+                         'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'}
+            if not custom_name or custom_name in forbidden or (sys.platform == "win32" and custom_name.upper() in forbidden):
+                self._append_info_ui(_("警告：自定义文件名无效（空或保留名），已忽略"))
+                custom_name = ""
+        if custom_name:
+            out_name = custom_name
+            if not os.path.splitext(out_name)[1]:
+                out_name += f".{container}"
+        else:
+            suffix = settings.get("output_suffix", "").strip()
+            in_dir = os.path.dirname(os.path.abspath(input_path))
+            out_dir = os.path.abspath(dir_path)
+            if not suffix and in_dir == out_dir:
+                suffix = "_new"
+            out_name = f"{name}{suffix}.{container}"
+
+        # GIF 强制扩展名
+        if settings.get("encoder") == "gif":
+            base, ext = os.path.splitext(out_name)
+            if ext.lower() != ".gif":
+                out_name = base + ".gif"
+
+        # WebP 强制扩展名
+        if settings.get("encoder") == "libwebp":
+            base, ext = os.path.splitext(out_name)
+            if ext.lower() != ".webp":
+                out_name = base + ".webp"
+
+        return os.path.join(dir_path, out_name).replace('\\', '/')
+
+    def _generate_gif_command(self, input_path, output_path, settings):
+        """
+        生成 GIF 编码的 FFmpeg 命令（使用 filter_complex）。
+        帧率控制改用 fps 滤镜，而非 -r 选项。
+        """
+        cmd_list = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
+    
+        # 快速截取（非精准）在命令行添加 -ss/-to
+        if not settings.get("precise_trim", False):
+            self._add_trim_params(cmd_list, settings)
+    
+        # 硬件解码（一般不用于 GIF，但保留）
+        self._add_hwaccel_params(cmd_list, settings)
+    
+        # 输入文件
+        cmd_list.extend(["-i", input_path])
+    
+        # ---- 读取帧率设置 ----
+        fps_type = settings.get("frame_rate_type", "keep")
+        fps_value = settings.get("frame_rate_custom", "30")
+        fps_filter = f"fps={fps_value}" if fps_type == "custom" else ""
+        enhance_settings = settings.get("enhance", {})
+    
+        # 构建预处理滤镜（不含 format 和 subtitle）；GIF 走 filter_complex，强制软件滤镜
+        gif_settings = dict(settings); gif_settings["hw_filter_mode"] = "cpu"
+        vf = build_video_filter_chain(gif_settings, include_subtitle=False, include_speed=True,reverse=settings.get('reverse_enabled', False),enhance_settings=enhance_settings)
+        if vf and vf != "null":
+            filters = [f.strip() for f in vf.split(",") if f.strip() and not f.startswith("format=")]
+            if fps_filter:
+                filters.insert(0, fps_filter)
+            pre_vf = ",".join(filters) if filters else ""
+        else:
+            pre_vf = fps_filter  # 只有帧率滤镜
+    
+        # ---- 读取 GIF 参数 ----
+        loop = settings.get("gif_loop", 0)          # 0=无限循环
+        dither = settings.get("gif_dither", "bayer")
+        bayer_scale = settings.get("gif_bayer_scale", 2)
+        max_colors = settings.get("gif_max_colors", 256)
+    
+        # 构建 dither 选项
+        if dither == "none":
+            dither_opt = "none"
+        elif dither == "bayer":
+            dither_opt = f"bayer:bayer_scale={bayer_scale}"
+        else:
+            dither_opt = dither
+    
+        # ---- 构建 filter_complex（增加 RGB 转换） ----
+        if pre_vf:
+            complex_filter = (
+                f"[0:v]{pre_vf}[v];"
+                f"[v]split[v1][v2];"
+                f"[v2]format=rgb24[v2_rgb];"
+                f"[v1]palettegen=max_colors={max_colors}[palette];"
+                f"[v2_rgb][palette]paletteuse=dither={dither_opt}[out]"
+            )
+        else:
+            complex_filter = (
+                f"[0:v]split[v1][v2];"
+                f"[v2]format=rgb24[v2_rgb];"
+                f"[v1]palettegen=max_colors={max_colors}[palette];"
+                f"[v2_rgb][palette]paletteuse=dither={dither_opt}[out]"
+            )
+    
+        cmd_list.extend(["-filter_complex", complex_filter])
+        cmd_list.extend(["-map", "[out]"])
+        cmd_list.extend(["-c:v", "gif"])
+    
+        # 循环设置（如果 loop != 0，则添加 -loop，否则默认无限循环）
+        if loop != 0:
+            cmd_list.extend(["-loop", str(loop)])
+    
+        # 忽略音频
+        cmd_list.append("-an")
+    
+        # 输出文件
+        cmd_list.append(output_path)
+
+        return cmd_list
+
+
+
+
+    def _safe_delete_file(self, path: str):
+        """安全删除文件"""
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+        except Exception:
+            pass
+
+    def _write_temp_script(self, content: str) -> str:
+        fd, path = tempfile.mkstemp(suffix='.txt', prefix='ffscript_', text=True)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return path
+    
+    def _shorten_long_filters(self, cmd_list: List[str], threshold: int = 25000, force: bool = False):
+#        print(f"[DEBUG] _shorten_long_filters called, force={force}, cmd_list length={len(cmd_list)}")
+        # 打印所有参数，看看是否有 -filter_complex
+#         for idx, arg in enumerate(cmd_list):
+#             if arg in ("-vf", "-af", "-filter_complex"):
+#                print(f"[DEBUG] Found {arg} at index {idx}, value length: {len(cmd_list[idx+1]) if idx+1 < len(cmd_list) else 'missing'}")
+
+        script_map = {
+            "-vf": "-vf_script",
+            "-af": "-af_script",
+            "-filter_complex": "-filter_complex_script",
+        }
+        new_cmd = []
+        temp_files = []
+        i = 0
+        while i < len(cmd_list):
+            arg = cmd_list[i]
+            if arg in script_map and i + 1 < len(cmd_list):
+                filter_str = cmd_list[i + 1]
+                if force or len(filter_str) > threshold:
+                    script_path = self._write_temp_script(filter_str)
+                    temp_files.append(script_path)
+                    new_cmd.append(script_map[arg])
+                    new_cmd.append(script_path)
+                    i += 2
+                    continue
+            new_cmd.append(arg)
+            i += 1
+        return new_cmd, temp_files
+    
+    def _cleanup_temp_files(self, file_list):
+        for f in file_list:
+            try:
+                if os.path.exists(f):
+                    os.unlink(f)
+            except Exception:
+                pass
+
+
+
+    # ========== 自定义滤镜自动合并系统 ==========
+    # 视频滤镜优先级表（数值越小越靠前，与 build_video_filter_chain 顺序一致）
+    _VF_PRIORITY = {
+        "trim": 1, "delogo": 2, "boxblur": 2, "gblur": 2,
+        "crop": 3, "transpose": 4, "vflip": 4, "hflip": 4,
+        "scale": 5, "fieldmatch": 6, "decimate": 6,
+        "yadif": 7, "bwdif": 7, "deblock": 8, "hqdn3d": 9,
+        "unsharp": 10, "colormatrix": 11, "eq": 12, "hue": 12,
+        "fps": 13, "format": 14,
+        "subtitles": 16, "drawtext": 16, "overlay": 16,
+        "reverse": 17,
+    }
+    # 允许叠加的滤镜（不会替换已有同类型，而是追加）
+    _VF_CUMULATIVE = {"subtitles", "drawtext", "overlay"}
+    # 音频滤镜优先级表（与 _build_audio_encoding_params 顺序一致）
+    _AF_PRIORITY = {
+        "volume": 1, "atempo": 2, "afftdn": 3, "loudnorm": 4,
+        "pan": 5, "bass": 6, "equalizer": 6, "treble": 6,
+        "afade": 7, "areverse": 8,
+    }
+
+    @staticmethod
+    def _parse_filter_list(filter_str):
+        """智能拆分逗号分隔的滤镜链，正确处理引号和括号内的逗号。
+        含 ';' 的子图块整体保留为一个元素。返回滤镜字符串列表。"""
+        if not filter_str or filter_str == "null":
+            return []
+        if ";" in filter_str:
+            return [filter_str]
+        filters = []
+        current = []
+        depth = 0
+        in_single = False
+        in_double = False
+        for ch in filter_str:
+            if ch == "'" and not in_double:
+                in_single = not in_single
+                current.append(ch)
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+                current.append(ch)
+            elif ch == "(" and not in_single and not in_double:
+                depth += 1
+                current.append(ch)
+            elif ch == ")" and not in_single and not in_double:
+                depth -= 1
+                current.append(ch)
+            elif ch == "," and depth == 0 and not in_single and not in_double:
+                f = "".join(current).strip()
+                if f:
+                    filters.append(f)
+                current = []
+            else:
+                current.append(ch)
+        f = "".join(current).strip()
+        if f:
+            filters.append(f)
+        return filters
+
+    @staticmethod
+    def _get_filter_name(filter_str):
+        """提取滤镜基名。如 'scale=1280:-2' → 'scale'"""
+        if not filter_str:
+            return ""
+        eq_idx = filter_str.find("=")
+        return filter_str[:eq_idx] if eq_idx >= 0 else filter_str
+
+    def _get_vf_priority(self, filter_str):
+        """获取视频滤镜优先级。setpts 含 STARTPTS→1(截取)，否则→15(变速)。"""
+        name = self._get_filter_name(filter_str)
+        if name == "setpts":
+            return 1 if "STARTPTS" in filter_str else 15
+        return self._VF_PRIORITY.get(name, 50)
+
+    def _get_af_priority(self, filter_str):
+        """获取音频滤镜优先级。"""
+        name = self._get_filter_name(filter_str)
+        return self._AF_PRIORITY.get(name, 50)
+
+    def _merge_filter_chains(self, existing_str, new_filters, is_audio=False):
+        """将 new_filters 合并到 existing_str 滤镜链中。
+        同名滤镜默认替换（叠加白名单除外），不同名按优先级插入。"""
+        existing = self._parse_filter_list(existing_str)
+        if not existing:
+            return ",".join(new_filters)
+        if ";" in existing_str:
+            return existing_str + ("," + ",".join(new_filters) if new_filters else "")
+
+        for nf in new_filters:
+            nf_name = self._get_filter_name(nf)
+            nf_pri = self._get_af_priority(nf) if is_audio else self._get_vf_priority(nf)
+            cumulative = self._VF_CUMULATIVE if not is_audio else set()
+
+            replaced = False
+            if nf_name and nf_name not in cumulative:
+                for idx, ef in enumerate(existing):
+                    if self._get_filter_name(ef) == nf_name:
+                        existing[idx] = nf
+                        replaced = True
+                        break
+
+            if not replaced:
+                insert_idx = len(existing)
+                for idx, ef in enumerate(existing):
+                    ep = self._get_af_priority(ef) if is_audio else self._get_vf_priority(ef)
+                    if ep > nf_pri:
+                        insert_idx = idx
+                        break
+                existing.insert(insert_idx, nf)
+
+        return ",".join(existing) if existing else "null"
+
+    def _replace_cmd_flag(self, cmd_list, flag, new_value):
+        """在 cmd_list 中查找 flag 并替换其后一个参数的值。不存在则追加。"""
+        for j, arg in enumerate(cmd_list):
+            if arg == flag and j + 1 < len(cmd_list):
+                cmd_list[j + 1] = new_value
+                return
+        cmd_list.extend([flag, new_value])
+
+    def _merge_vf_into_cmd(self, cmd_list, new_filters):
+        """找到 cmd_list 中的 -vf/-filter_complex 并合并 new_filters 进去。
+        优先合并到 -vf；若只有 -filter_complex，追加到 filter_complex 最后。"""
+        for j, arg in enumerate(cmd_list):
+            if arg == "-vf" and j + 1 < len(cmd_list):
+                existing = cmd_list[j + 1]
+                cmd_list[j + 1] = self._merge_filter_chains(existing, new_filters, is_audio=False)
+                return
+        # 回退：如果有 -filter_complex ，追加到末尾（仅单路简单链）
+        for j, arg in enumerate(cmd_list):
+            if arg == "-filter_complex" and j + 1 < len(cmd_list):
+                merged = ",".join(new_filters)
+                if cmd_list[j + 1]:
+                    cmd_list[j + 1] = cmd_list[j + 1] + "," + merged
+                else:
+                    cmd_list[j + 1] = merged
+                return
+        cmd_list.extend(["-vf", ",".join(new_filters)])
+
+    def _merge_af_into_cmd(self, cmd_list, new_filters):
+        """找到 cmd_list 中的 -af 并合并 new_filters 进去。"""
+        for j, arg in enumerate(cmd_list):
+            if arg == "-af" and j + 1 < len(cmd_list):
+                existing = cmd_list[j + 1]
+                cmd_list[j + 1] = self._merge_filter_chains(existing, new_filters, is_audio=True)
+                return
+        cmd_list.extend(["-af", ",".join(new_filters)])
+
+    def _merge_custom_filters_into_cmd(self, cmd_list, custom_str):
+        """解析 custom_args 中的滤镜指令，智能合并到现有命令的 -vf/-af 中。
+        识别：裸滤镜串（自动判断视频/音频）、-vf X、-af X、-filter_complex X（整体替换）。"""
+        if not custom_str:
+            return cmd_list
+        try:
+            tokens = shlex.split(custom_str)
+        except ValueError as e:
+            self._append_info_ui(_("警告：自定义参数格式错误，已忽略：{0}".format(e)))
+            return cmd_list
+
+        custom_vf = []
+        custom_af = []
+        fc_replace = None
+        remaining = []
+
+        i = 0
+        while i < len(tokens):
+            t = tokens[i]
+            if t == "-vf" and i + 1 < len(tokens):
+                custom_vf.extend(self._parse_filter_list(tokens[i + 1]))
+                i += 2
+            elif t == "-af" and i + 1 < len(tokens):
+                custom_af.extend(self._parse_filter_list(tokens[i + 1]))
+                i += 2
+            elif t == "-filter_complex" and i + 1 < len(tokens):
+                fc_replace = tokens[i + 1]
+                i += 2
+            elif not t.startswith("-") and "=" in t:
+                fname = self._get_filter_name(t)
+                if fname in self._AF_PRIORITY:
+                    custom_af.append(t)
+                else:
+                    custom_vf.append(t)
+                i += 1
+            else:
+                remaining.append(t)
+                i += 1
+
+        if fc_replace is not None:
+            self._replace_cmd_flag(cmd_list, "-filter_complex", fc_replace)
+        if custom_vf:
+            self._merge_vf_into_cmd(cmd_list, custom_vf)
+        if custom_af:
+            self._merge_af_into_cmd(cmd_list, custom_af)
+        if remaining:
+            cmd_list.extend(remaining)
+        return cmd_list
+
+    def generate_ffmpeg_command(self, input_path: str, output_path: str, settings: dict, task=None, preview=False) -> List[str]:
+        if settings.get("segment_enabled", False) and settings.get("segments", []):
+            return self._generate_segment_concat_command(input_path, output_path, settings)
+        if not self.ffmpeg_cmd:
+            raise ValueError("未找到 ffmpeg 可执行文件。")
+        errors = ParamValidator.validate_settings(settings)
+        if errors:
+            raise ValueError("参数错误:\n" + "\n".join(errors))
+    
+        input_path = normalize_path(input_path)
+        output_path = normalize_path(output_path)
+        only_audio = settings.get("only_audio", False)
+        precise_trim = settings.get("precise_trim", False)
+    
+        # ----- 组合跳转设置（仅用于普通视频转码，水印/GIF 单独处理） -----
+        combo_seek = False
+        combo_threshold = 30
+        if not only_audio and not settings.get("watermark", {}).get("enabled", False) and settings.get("encoder") != "gif":
+            combo_seek = settings.get("combo_seek", False)
+            combo_threshold = settings.get("combo_threshold", 30)
+            # 互斥：组合跳转时强制禁用精准模式
+            if combo_seek:
+                precise_trim = False
+                settings["precise_trim"] = False
+    
+        # 精准模式下强制重新编码（视频）
+        self._enforce_reencode_for_precise_trim(settings, only_audio)
+    
+        # ---------- IVTC 与反交错冲突检测 ----------
+        enhance_settings = settings.get("enhance", {})
+        if enhance_settings.get("ivtc_enabled", False) and settings.get("deinterlace_filter", "none") != "none":
+            self._append_info_ui(_("已启用 IVTC，反交错滤镜将被忽略（IVTC 本身包含反交错功能）。"))
+    
+        # ---------- 检查水印 ----------
+        wm_settings = settings.get("watermark", {})
+        wm_enabled = wm_settings.get("enabled", False) and wm_settings.get("file_path", "").strip()
+        wm_file = wm_settings.get("file_path", "").strip() if wm_enabled else None
+    
+        if wm_file and not only_audio:
+            # 水印模式强制禁用组合跳转
+            settings["combo_seek"] = False
+            cmd_list = self._generate_command_with_watermark(input_path, output_path, settings, wm_settings)
+            # 统一处理长滤镜
+            if not preview:
+                total_len = len(' '.join(cmd_list))
+                if total_len > 25000:
+                    cmd_list, temp_files = self._shorten_long_filters(cmd_list, force=True)
+                else:
+                    cmd_list, temp_files = self._shorten_long_filters(cmd_list)
+                if task is not None:
+                    if not hasattr(task, 'temp_files'):
+                        task.temp_files = []
+                    task.temp_files.extend(temp_files)
+            return cmd_list
+    
+        # 检查是否 GIF 编码（且非仅音频）
+        if settings.get("encoder") == "gif" and not only_audio:
+            cmd_list = self._generate_gif_command(input_path, output_path, settings)
+            # 统一处理长滤镜
+            if not preview:
+                total_len = len(' '.join(cmd_list))
+                if total_len > 25000:
+                    cmd_list, temp_files = self._shorten_long_filters(cmd_list, force=True)
+                else:
+                    cmd_list, temp_files = self._shorten_long_filters(cmd_list)
+                if task is not None:
+                    if not hasattr(task, 'temp_files'):
+                        task.temp_files = []
+                    task.temp_files.extend(temp_files)
+            return cmd_list
+    
+        # ---------- 普通模式（无复杂水印） ----------
+        cmd_list = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
+    
+        # ----- 计算截取时长（仅在精准模式或组合跳转时需要） -----
+        start_sec = None
+        duration_for_audio = None
+        if precise_trim or combo_seek:
+            start_sec, duration_for_audio = self._calculate_trim_duration(settings, input_path)
+    
+        used_combo = False
+    
+        # ---------- 组合跳转分支 ----------
+        if combo_seek and settings.get("trim_enabled", False) and start_sec is not None and start_sec > 0:
+            threshold = combo_threshold
+            pre_seek = max(0, start_sec - threshold)
+            post_seek = start_sec - pre_seek  # 即 min(start_sec, threshold)
+            # 前置跳转
+            cmd_list.extend(["-ss", f"{pre_seek:.3f}"])
+            # 硬件解码（放在 -i 之前）
+            if not only_audio:
+                self._add_hwaccel_params(cmd_list, settings)
+            # 输入文件
+            cmd_list.extend(["-i", input_path])
+            # 后置微调
+            cmd_list.extend(["-ss", f"{post_seek:.3f}"])
+            # 输出时长
+            if duration_for_audio is not None and duration_for_audio > 0:
+                cmd_list.extend(["-t", f"{duration_for_audio:.3f}"])
+            used_combo = True
+        else:
+            # ---------- 非组合跳转（正常模式） ----------
+            # 快速模式（非精准）才在命令行添加 -ss/-to
+            if not precise_trim:
+                self._add_trim_params(cmd_list, settings)
+
+            if not only_audio:
+                self._add_hwaccel_params(cmd_list, settings)
+
+            cmd_list.extend(["-i", input_path])
+    
+        # ----- 视频处理 -----
+        if only_audio:
+            cmd_list.append("-vn")
+        else:
+            vcodec = settings.get("encoder", "libx265")
+            # 文字水印需要滤镜，流复制无法支持 → 强制重编码
+            if vcodec == "copy" and settings.get("text_watermark", {}).get("enabled", False):
+                vcodec = "libx265"
+                settings["encoder"] = vcodec
+                self._append_info_ui(_("文字水印需要重新编码，已自动改为 libx265。"))
+            if vcodec == "copy" and not precise_trim and not used_combo:
+                # 纯流复制，忽略所有视频处理
+                cmd_list.extend(["-c:v", "copy"])
+            else:
+                # 构建视频滤镜（包含字幕、变速等），组合跳转时跳过 trim
+                enhance_settings = settings.get("enhance", {})
+                vf = build_video_filter_chain(
+                    settings,
+                    include_subtitle=True,
+                    include_speed=True,
+                    include_trim=(not used_combo),   # 组合跳转时不加 trim
+                    enhance_settings=enhance_settings,
+                    reverse=settings.get('reverse_enabled', False),
+                )
+                # 追加文字水印 drawtext
+                dt = build_drawtext_filter(settings.get("text_watermark", {}))
+                if dt:
+                    vf = f"{vf},{dt}" if vf != "null" else dt
+                if vf != "null":
+                    cmd_list.extend(["-vf", vf])
+
+                cmd_list = self._build_video_encoding_params(cmd_list, settings)
+    
+        # ----- 音频处理 -----
+        if settings.get("audio_enabled", True):
+            if used_combo:
+                # 组合跳转已用 -ss 截取整个流，音频直接编码（不使用 atrim）
+                cmd_list = self._build_audio_encoding_params(cmd_list, settings, input_path)
+            elif precise_trim and settings.get("trim_enabled", False) and duration_for_audio is not None and duration_for_audio > 0:
+                self._apply_audio_trim_and_encode(cmd_list, settings, input_path, start_sec, duration_for_audio, map_audio=False)
+            else:
+                cmd_list = self._build_audio_encoding_params(cmd_list, settings, input_path)
+        else:
+            cmd_list.append("-an")
+    
+        custom = settings.get("custom_args", "").strip()
+        self._merge_custom_filters_into_cmd(cmd_list, custom)
+    
+        if not only_audio:
+            container = settings.get("output_container", "mp4").lower()
+            if container in ("mp4", "mov"):
+                cmd_list.extend(["-movflags", "+faststart"])
+    
+        cmd_list.append(output_path)
+
+        # 普通模式处理长滤镜
+        if not preview:
+            total_len = len(' '.join(cmd_list))
+            if total_len > 25000:
+                cmd_list, temp_files = self._shorten_long_filters(cmd_list, force=True)
+            else:
+                cmd_list, temp_files = self._shorten_long_filters(cmd_list)
+            if task is not None:
+                if not hasattr(task, 'temp_files'):
+                    task.temp_files = []
+                task.temp_files.extend(temp_files)
+        return cmd_list
+
+
+
+    def _add_infinite_loop_params(self, cmd_list: List[str], file_path: str, is_sub_video: bool = True, framerate: str = "30"):
+        """
+        为输入文件添加无限循环参数（用于子视频/水印）。
+        视频：-stream_loop -1
+        图片：-loop 1 -framerate <fps>
+        
+        :param cmd_list: 命令列表（会被修改）
+        :param file_path: 文件路径
+        :param is_sub_video: 是否仅为子视频（True）或水印（True），实际上逻辑相同，保留参数供扩展
+        :param framerate: 图片帧率，默认30
+        """
+        ext = os.path.splitext(file_path)[1].lower()
+        is_image = ext in ('.png', '.jpg', '.jpeg', '.bmp', '.webp')   # 不包括 .gif
+        is_gif = ext == '.gif'
+        
+        if is_gif:
+            cmd_list.extend(["-stream_loop", "-1"])
+        elif is_image:
+            cmd_list.extend(["-loop", "1", "-framerate", framerate])
+        else:
+            # 普通视频
+            cmd_list.extend(["-stream_loop", "-1"])
+
+
+    def _generate_command_with_watermark(self, input_path: str, output_path: str, settings: dict, wm_settings: dict) -> List[str]:
+        main_w, main_h = self._get_video_dimensions_cached(input_path)
+        # 强制禁用组合跳转
+        settings["combo_seek"] = False
+        vcodec = settings.get("encoder", "libx265")
+        if vcodec == "copy":
+            settings["encoder"] = "libx265"
+            self._append_info_ui(_("水印模式必须重新编码，已将编码器自动改为 libx265。"))
+        # 提前探测水印原始尺寸（自适应表达式求值需要）
+        wm_file_raw = wm_settings.get("file_path", "").strip()
+        wm_orig_w, wm_orig_h = None, None
+        if wm_file_raw and os.path.exists(wm_file_raw):
+            wm_orig_w, wm_orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, wm_file_raw, wm_settings)
+        if main_w is not None and main_h is not None:
+            if wm_settings.get("adaptive", False):
+                adapted_wm = self._adapt_sub_settings(wm_settings, main_w, main_h, wm_orig_w, wm_orig_h)
+            else:
+                adapted_wm = wm_settings.copy()
+        else:
+            adapted_wm = copy.deepcopy(wm_settings)
+    
+        # ---- 开始构建命令 ----
+        cmd_list = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
+    
+        wm_file = adapted_wm.get("file_path", "").strip()
+        ext = os.path.splitext(wm_file)[1].lower()
+        is_image = ext in ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
+        loop_mode = adapted_wm.get("loop_mode", "infinite")
+        loop_count = adapted_wm.get("loop_count", 3)
+        loop_enabled = adapted_wm.get("loop_enabled", False)
+    
+        # ---------- 强制精准截取（水印模式） ----------
+        settings["precise_trim"] = True
+        
+        # --- 检测源文件是否有音频流 ---
+        has_input_audio = False
+        info = ffprobe_json(self.ffprobe_cmd, input_path)
+        if info:
+            has_input_audio = any(s.get("codec_type") == "audio" for s in info.get("streams", []))
+        
+        # --- 强制音频编码 ---
+        if settings.get("audio_enabled", True):
+            if settings.get("audio_codec") == "copy":
+                if has_input_audio:
+                    settings["audio_codec"] = "aac"
+                    self._append_info_ui(_("水印模式下为确保同步，音频编码器已自动设为 aac"))
+                else:
+                    # 源文件无音频，禁用音频
+                    settings["audio_enabled"] = False
+                    self._append_info_ui(_("源文件无音频流，已自动禁用音频输出"))
+        
+        self._enforce_reencode_for_precise_trim(settings, only_audio=False)
+    
+
+        self._add_hwaccel_params(cmd_list, settings)
+    
+        # 主视频输入
+        cmd_list.extend(["-i", input_path])
+    
+        # ----- 计算主视频有效时长（截取或总时长） -----
+        start_sec, duration_for_sub = self._calculate_trim_duration(settings, input_path)
+        main_duration = None
+        if settings.get("trim_enabled", False):
+            if settings.get("precise_trim", False):  # 强制为 True
+                main_duration = duration_for_sub if duration_for_sub is not None else None
+            else:
+                start = settings.get("trim_start", "").strip()
+                end = settings.get("trim_end", "").strip()
+                start_sec_calc = time_to_seconds(start) if start else 0.0
+                end_sec_calc = time_to_seconds(end) if end else None
+                if end_sec_calc is not None:
+                    main_duration = end_sec_calc - start_sec_calc
+                else:
+                    total_dur = self._get_media_duration(input_path)
+                    if total_dur is not None:
+                        main_duration = total_dur - start_sec_calc
+        else:
+            total_dur = self._get_media_duration(input_path)
+            if total_dur is not None:
+                main_duration = total_dur
+    
+        # ---- 水印普通截取（非精准） ----
+        # 注：水印自身的截取由 wm_trim_enabled 控制，不影响主视频
+        wm_trim_enabled = adapted_wm.get("trim_enabled", False)
+        wm_precise = adapted_wm.get("precise_trim", False)
+
+    
+        # ---- 判断是否在滤镜中使用 loop ----
+        use_loop_in_filter = wm_trim_enabled  # 只要截取了，就用 loop 滤镜
+    
+        # ---- 添加水印输入（及循环参数） ----
+        if not is_image:
+            if use_loop_in_filter:
+                # 循环由滤镜中的 loop 处理，不添加 -stream_loop
+                cmd_list.extend(["-i", wm_file])
+            else:
+                # 根据循环控制决定循环次数（不启用=无限循环）
+                if loop_enabled and str(loop_count).isdigit() and int(loop_count) > 0:
+                    cmd_list.extend(["-stream_loop", str(int(loop_count))])
+                else:
+                    cmd_list.extend(["-stream_loop", "-1"])
+                cmd_list.extend(["-i", wm_file])
+        else:
+            # 图片水印（静态图片或 GIF）
+            ext = os.path.splitext(wm_file)[1].lower()
+            if ext == '.gif':
+                # GIF 本身是动画，不能使用 -loop，用 -stream_loop -1 确保循环
+                cmd_list.extend(["-stream_loop", "-1"])
+            else:
+                fps = settings.get("frame_rate_custom", "30") if settings.get("frame_rate_type") == "custom" else "30"
+                cmd_list.extend(["-loop", "1", "-framerate", fps])
+            cmd_list.extend(["-i", wm_file])
+    
+        # ---- 构建叠加滤镜 ----
+        sub_infos = [(1, wm_file, adapted_wm)]
+        enhance_settings = settings.get("enhance", {})
+        complex_filter, final_v_label = self._build_overlay_filter_complex(
+            0, settings, sub_infos, include_subtitle_main=True,
+            enhance_settings=enhance_settings
+        )
+        # 追加文字水印 drawtext（在 overlay 之后）
+        dt = build_drawtext_filter(settings.get("text_watermark", {}))
+        if dt:
+            new_label = "[v_dtext]"
+            complex_filter = f"{complex_filter};{final_v_label}{dt}{new_label}"
+            final_v_label = new_label
+        cmd_list.extend(["-filter_complex", complex_filter])
+        cmd_list.extend(["-map", final_v_label])
+    
+        # ---- 视频编码参数 ----
+        cmd_list = self._build_video_encoding_params(cmd_list, settings)
+        cmd_list.extend(["-vsync", "cfr"])
+    
+        # ---- 音频处理 ----
+        # 使用 ffprobe_json 检测主视频是否有音频流
+        info = ffprobe_json(self.ffprobe_cmd, input_path)
+        has_audio = info and any(s.get("codec_type") == "audio" for s in info.get("streams", []))
+
+        if not has_audio:
+            if settings.get("audio_enabled", True):
+                self._append_info_ui(_("[水印] 主视频无音频流，已自动禁用音频输出。"))
+                settings["audio_enabled"] = False
+            cmd_list.append("-an")
+        elif settings.get("audio_enabled", True):
+            if settings.get("precise_trim", False) and settings.get("trim_enabled", False) and duration_for_sub is not None and duration_for_sub > 0:
+                self._apply_audio_trim_and_encode(cmd_list, settings, input_path, start_sec, duration_for_sub, map_audio=True)
+            else:
+                cmd_list.extend(["-map", "0:a:0"])
+                cmd_list = self._build_audio_encoding_params(cmd_list, settings)
+        else:
+            cmd_list.append("-an")
+    
+        # ---- 自定义参数（含滤镜智能合并） ----
+        custom = settings.get("custom_args", "").strip()
+        self._merge_custom_filters_into_cmd(cmd_list, custom)
+    
+        container = settings.get("output_container", "mp4").lower()
+        if container in ("mp4", "mov"):
+            cmd_list.extend(["-movflags", "+faststart"])
+    
+        # ---- 时长控制：有音频时用 -shortest，无音频时用 -t ----
+        # 检查主视频是否包含音频流（可复用已有的 ffprobe 信息）
+        has_audio_stream = False
+        if input_path and os.path.exists(input_path):
+            info = ffprobe_json(self.ffprobe_cmd, input_path)
+            if info and any(s.get("codec_type") == "audio" for s in info.get("streams", [])):
+                has_audio_stream = True
+    
+        if settings.get("audio_enabled", True) and has_audio_stream:
+            cmd_list.append("-shortest")
+        else:
+            if main_duration and main_duration > 0:
+                cmd_list.extend(["-t", f"{main_duration:.3f}"])
+            else:
+                cmd_list.append("-shortest")
+                self._append_info_ui(_("[水印] 警告：无法计算主视频时长，使用 -shortest 控制输出。"))
+    
+        cmd_list.append(output_path)
+
+        return cmd_list
+
+
+
+
+    def get_current_settings(self):
+        settings = {}
+        settings.update(self.video_encoder.get_settings())
+        settings.update(self.video_filter.get_settings())
+        settings.update(self.audio_frame.get_settings())
+        settings.update(self.trim_frame.get_settings())
+        settings.update(self.adv_frame.get_settings())
+        settings["output_dir"] = self.output_dir.get()
+        settings["output_suffix"] = self.output_suffix.get()
+        settings["custom_output_name"] = self.custom_output_name.get()
+        settings["output_container"] = self.output_container.get()
+        settings["pip_enabled"] = self.pip_enabled.get()
+        settings["segment_enabled"] = self.segment_enabled.get()
+        settings["segments"] = copy.deepcopy(self.segments)
+        # 音频独立截取（不分段）
+        settings["audio_trim_enabled"] = self.audio_trim_enabled
+        settings["audio_trim_start"] = self.audio_trim_start
+        settings["audio_trim_end"] = self.audio_trim_end
+        # 说明：watermark / text_watermark 是「命令生成」的必需输入，必须保留在
+        # settings 中；但 load_settings_into_ui 不恢复它们（水印由独立「水印预设」
+        # 管理，主预设加载不覆盖水印设置）。二者职责分离，切勿因"主预设不保存
+        # 水印"而删除这两个键，否则命令生成将拿不到水印导致水印整体失效。
+        # 添加水印设置（深拷贝）
+        wm = copy.deepcopy(self.watermark_settings)
+        if "adaptive" not in wm:
+            wm["adaptive"] = False
+        settings["watermark"] = wm
+        # 记录当前输入文件的尺寸作为水印基准
+        input_file = self.input_file.get().strip()
+        if input_file and os.path.exists(input_file):
+            w, h = self._get_video_dimensions_cached(input_file)
+            if w is not None and h is not None:
+                settings["watermark"]["base_width"] = w
+                settings["watermark"]["base_height"] = h
+        settings["enhance"] = self.video_filter.get_enhance_settings()
+        # 添加文字水印设置（深拷贝）
+        settings["text_watermark"] = copy.deepcopy(self.text_watermark_settings)
+        return settings
+
+
+    def load_settings_into_ui(self, settings):
+        self._loading_preset = True
+        try:
+            self.output_dir.set(settings.get("output_dir", ""))
+            self.output_suffix.set(settings.get("output_suffix", ""))
+            self.custom_output_name.set(settings.get("custom_output_name", ""))
+            self.output_container.set(settings.get("output_container", "mp4"))
+            self.video_encoder.set_settings(settings)
+            self.video_filter.set_settings(settings)
+            self.audio_frame.set_settings(settings)
+            self.trim_frame.set_settings(settings)
+            self.adv_frame.set_settings(settings)
+            self.pip_enabled.set(settings.get("pip_enabled", False))
+            self.segment_enabled.set(settings.get("segment_enabled", False))
+            self.segments = copy.deepcopy(settings.get("segments", []))
+            # 音频独立截取
+            self.audio_trim_enabled = settings.get("audio_trim_enabled", False)
+            self.audio_trim_start = settings.get("audio_trim_start", "")
+            self.audio_trim_end = settings.get("audio_trim_end", "")
+#             # 恢复水印设置
+#             if "watermark" in settings:
+#                 self.watermark_settings = copy.deepcopy(settings["watermark"])
+#             else:
+#                 # 保持默认值（已在 __init__ 中定义）
+#                 pass
+            self.toggle_only_audio_mode()
+            if "enhance" in settings:
+                self.video_filter.set_enhance_settings(settings["enhance"])
+            # 注意：水印（图片/视频、文字）由独立「水印预设」统一管理，
+            # 主预设不恢复水印，避免覆盖水印预设的当前状态。
+        finally:
+            self._loading_preset = False
+            self.update_command_preview()  # 最后统一刷新一次
+
+    # ---------- 可视化编辑器公共辅助方法（用于合并模块）----------
+    def _get_enabled_video_tracks(self):
+        return [t for t in self.merge_tracks if t.enabled and t.type == "video"]
+    
+    def compute_final_size_with_order(self, orig_w: int, orig_h: int, settings: dict) -> Tuple[int, int]:
+        """
+        按滤镜链顺序（crop -> rotate -> scale）计算最终输出尺寸。
+        orig_w, orig_h: 原始视频宽高（不含任何旋转）。
+        settings: 包含 crop、rotate、scale 等设置的字典。
+        """
+        w, h = orig_w, orig_h
+    
+        # 1. 裁剪（基于原始尺寸）
+        if settings.get("crop_enabled", False):
+            crop_w = settings.get("crop_width", "").strip()
+            crop_h = settings.get("crop_height", "").strip()
+            crop_left = settings.get("crop_left", "0").strip()
+            crop_top = settings.get("crop_top", "0").strip()
+            if crop_w and crop_h:
+                # 支持 iw/ih 表达式
+                cw = safe_eval_expr(crop_w, {"iw": w, "ih": h})
+                ch = safe_eval_expr(crop_h, {"iw": w, "ih": h})
+                if cw and ch and cw > 0 and ch > 0:
+                    w, h = cw, ch
+    
+        # 2. 用户旋转（交换宽高）
+        rotate = settings.get("rotate", "none")
+        if rotate in ("90", "270"):
+            w, h = h, w
+    
+        # 3. 缩放
+        if settings.get("scale_enabled", False):
+            method = settings.get("scale_method", "width")
+            sw = settings.get("scale_width", "").strip()
+            sh = settings.get("scale_height", "").strip()
+            try:
+                if method == "width" and sw:
+                    target_w = int(float(sw))
+                    target_h = int(round(target_w * h / w))
+                    w, h = target_w, target_h
+                elif method == "height" and sh:
+                    target_h = int(float(sh))
+                    target_w = int(round(target_h * w / h))
+                    w, h = target_w, target_h
+                elif method == "exact" and sw and sh:
+                    w, h = int(float(sw)), int(float(sh))
+            except:
+                pass
+    
+        return max(1, w), max(1, h)
+    
+    def _get_canvas_size(self, main_track):
+        """
+        获取主视频最终画布尺寸（考虑 pad 或 裁剪/旋转/缩放后的实际尺寸）。
+        """
+        # 检查是否启用画布偏移（pad）
+        pad_enabled = main_track.enc_settings.get('pad_enabled', False)
+        if pad_enabled:
+            try:
+                w = int(main_track.enc_settings.get('pad_width', '').strip())
+                h = int(main_track.enc_settings.get('pad_height', '').strip())
+                if w > 0 and h > 0:
+                    return w, h
+            except (ValueError, TypeError):
+                pass
+    
+        # 未启用 pad 或 pad 尺寸无效，使用主视频实际渲染尺寸（按正确顺序计算）
+        # 先获取原始尺寸（不含旋转）
+        w, h = self._cached_video_dimensions(main_track.file_path)
+        if w is None or h is None:
+            w, h = 1280, 720  # 降级默认值
+    
+        # 使用新函数按 crop -> rotate -> scale 顺序计算
+        return self.compute_final_size_with_order(w, h, main_track.enc_settings)
+    
+    def _get_video_render_size(self, track, filt_frame=None):
+        """
+        获取视频轨道在应用了裁剪、旋转、缩放后的最终渲染尺寸。
+        若提供了 filt_frame，则从该控件读取设置，否则从 track.enc_settings 读取。
+        """
+        if filt_frame is not None:
+            settings = {
+                "crop_enabled": filt_frame.crop_enabled.get(),
+                "crop_width": filt_frame.crop_width.get(),
+                "crop_height": filt_frame.crop_height.get(),
+                "scale_enabled": filt_frame.scale_enabled.get(),
+                "scale_method": filt_frame.scale_method.get(),
+                "scale_width": filt_frame.scale_width.get(),
+                "scale_height": filt_frame.scale_height.get(),
+                "rotate": filt_frame.rotate.get()
+            }
+        else:
+            settings = track.enc_settings
+    
+        # 获取原始尺寸（不含任何旋转，直接从 ffprobe 获取）
+        w, h = self._cached_video_dimensions(track.file_path)
+        if w is None or h is None:
+            return 320, 240  # 返回安全默认值
+    
+        # 使用统一顺序计算（crop -> rotate -> scale）
+        return self.compute_final_size_with_order(w, h, settings)
+    
+    def _to_canvas_coords(self, x, y, scale):
+        return int(x * scale), int(y * scale)
+    
+    def _to_real_coords(self, cx, cy, scale):
+        return int(round(cx / scale)), int(round(cy / scale))
+    
+    def _draw_background(self, canvas, canvas_w, canvas_h, scale, main_track, sub_tracks,
+                         offset_x, offset_y, main_render_size, current_edit_track=None, tag="bg"):
+        canvas.delete(tag)
+        if main_render_size:
+            main_w, main_h = main_render_size
+        else:
+            main_w, main_h = canvas_w, canvas_h
+        left = offset_x
+        top = offset_y
+        right = offset_x + main_w
+        bottom = offset_y + main_h
+        vis_left = max(0, left)
+        vis_top = max(0, top)
+        vis_right = min(canvas_w, right)
+        vis_bottom = min(canvas_h, bottom)
+        if vis_right > vis_left and vis_bottom > vis_top:
+            cx1, cy1 = self._to_canvas_coords(vis_left, vis_top, scale)
+            cx2, cy2 = self._to_canvas_coords(vis_right, vis_bottom, scale)
+            canvas.create_rectangle(cx1, cy1, cx2, cy2, outline="deepskyblue", width=2, dash=(4, 4), fill="", tags=tag)
+            canvas.create_text(cx1 + 5, cy1 + 5, anchor="nw", text=_("主视频"), fill="deepskyblue", font=("Arial", 9), tags=tag)
+        sub_order = {sub: idx+1 for idx, sub in enumerate(sub_tracks)}
+        for sub in sub_tracks:
+            if current_edit_track and sub == current_edit_track:
+                continue
+            # 从 enc_settings 读取 overlay 状态
+            if not sub.enc_settings.get('overlay_enabled', True):
+                continue
+            size = self.get_rendered_size(sub)
+            if not size:
+                continue
+            sw, sh = size
+            x_expr = sub.enc_settings.get('overlay_x', '0')
+            y_expr = sub.enc_settings.get('overlay_y', '0')
+            x_val = safe_eval_expr(x_expr, {"W": canvas_w, "H": canvas_h, "w": sw, "h": sh})
+            y_val = safe_eval_expr(y_expr, {"W": canvas_w, "H": canvas_h, "w": sw, "h": sh})
+            if x_val is None or y_val is None:
+                continue
+            x_val = max(0, min(x_val, canvas_w - sw))
+            y_val = max(0, min(y_val, canvas_h - sh))
+            cx1, cy1 = self._to_canvas_coords(x_val, y_val, scale)
+            cx2, cy2 = self._to_canvas_coords(x_val + sw, y_val + sh, scale)
+            canvas.create_rectangle(cx1, cy1, cx2, cy2, outline="lightgreen", width=2, dash=(4, 4), fill="", tags=tag)
+            canvas.create_text(cx1 + 5, cy1 + 5, anchor="nw", text=str(sub_order[sub]),
+                               fill="red", font=("Arial", 10, "bold"), tags=tag)
+
+
+
+
+    # ---------- 通用公共位置可视化编辑器函数 ----------
+    def _generic_overlay_editor(self, parent, canvas_w, canvas_h,
+                                rect_x, rect_y, rect_w, rect_h,
+                                on_apply, title="可视化编辑位置",
+                                aspect_ratio=None, bg_draw_func=None,
+                                allow_resize=True,
+                                show_canvas_controls=False,
+                                coord_mode='top_left',
+                                allow_negative_offset=False,
+                                rect_color='red',
+                                extra_info="",   #子视频的额外主视频偏移信息
+                                rect_label='',   # 单独的方框显示名
+                                min_visible_pixels=0,  # 主视频偏移限制 至少留10  默认传0
+                                show_scale_tip=False   # 子视频和水印的 新绘制操作提示
+                                ):
+        """
+        通用叠加/偏移可视化编辑器（核心重构函数）
+        
+        支持三种主要使用模式：
+        
+        1. 主视频画布偏移（pad）模式
+           - allow_negative_offset=True
+           - rect_color='deepskyblue'
+           - show_canvas_controls=True（允许调整画布尺寸）
+           - 允许矩形超出画布（负偏移）
+           - 用于调整主视频内容在更大画布中的位置
+        
+        2. 子视频/画中画叠加模式
+           - allow_negative_offset=False（默认）
+           - rect_color='red'
+           - allow_resize=True（支持绘制新矩形调整大小）
+           - 矩形必须限制在画布内
+           - 用于调整画中画、水印等子视频的位置和大小
+        
+        3. 水印专用模式（通过 open_watermark_overlay_editor 调用）
+           - 与子视频模式类似，但额外支持回写缩放尺寸到滤镜框架和 watermark_dict
+        
+        参数说明：
+            on_apply: 回调函数，签名 on_apply(new_x, new_y, new_w, new_h, new_canvas_w, new_canvas_h)
+            bg_draw_func: 可选，背景绘制回调，用于画其他子视频的虚线框
+            aspect_ratio: 绘制新矩形时是否强制保持宽高比（水印/叠加常用）
+            coord_mode: 'top_left'（左上角坐标）或 'offset'（偏移量）
+        """
+        max_display_w, max_display_h = 800, 600
+        scale = min(max_display_w / canvas_w, max_display_h / canvas_h, 1.0)
+        disp_w = int(canvas_w * scale)
+        disp_h = int(canvas_h * scale)
+    
+        win = tk.Toplevel(parent)
+        win.title(title)
+        win.transient(parent)
+        win.grab_set()
+        win.withdraw()
+    
+        # ---- 内部状态 ----
+        current_x, current_y, current_w, current_h = rect_x, rect_y, rect_w, rect_h
+        current_canvas_w, current_canvas_h = canvas_w, canvas_h
+        rect_id = None
+        text_id = None
+        coord_disp_id = None
+        draw_rect_temp = None
+        draw_start = None
+        draw_mode_active = False
+        dragging = False
+        drag_start_x = 0
+        drag_start_y = 0
+        drag_mouse_start = (0, 0)
+    
+        # ---- 辅助函数 ----
+        def to_canvas(ox, oy):
+            return int(ox * scale), int(oy * scale)
+    
+        def to_real(cx, cy):
+            return int(round(cx / scale)), int(round(cy / scale))
+    
+        def clamp_rect():
+            nonlocal current_x, current_y, current_w, current_h
+            if allow_negative_offset and min_visible_pixels > 0:
+                # 允许负偏移，但至少保留 min_visible_pixels 像素可见
+                current_x = max(-current_w + min_visible_pixels, 
+                                min(current_x, current_canvas_w - min_visible_pixels))
+                current_y = max(-current_h + min_visible_pixels, 
+                                min(current_y, current_canvas_h - min_visible_pixels))
+            elif allow_negative_offset:
+                # 完全放开，无任何限制
+                pass
+            else:
+                # 严格限制在画布内（子视频/水印模式）
+                current_x = max(0, min(current_x, current_canvas_w - current_w))
+                current_y = max(0, min(current_y, current_canvas_h - current_h))
+                current_w = min(current_w, current_canvas_w)
+                current_h = min(current_h, current_canvas_h)
+    
+        def create_rect():
+            nonlocal rect_id, text_id, coord_disp_id
+            cx1, cy1 = to_canvas(current_x, current_y)
+            cx2, cy2 = to_canvas(current_x + current_w, current_y + current_h)
+            rid = canvas.create_rectangle(cx1, cy1, cx2, cy2, outline=rect_color, width=2,
+                                          fill=rect_color, stipple="gray50", tags="rect")
+            tid = canvas.create_text(cx1 + 5, cy1 + 5, anchor="nw", text=rect_label,
+                                     fill="white", font=("Arial", 9), tags="rect")
+            # 浮动坐标显示（矩形上方居中）→ P2 改进
+            coord_disp_id = canvas.create_text((cx1 + cx2) // 2, cy1 - 10, anchor="s",
+                                                text=f"({current_x}, {current_y})",
+                                                fill="#00ff00", font=("Arial", 8),
+                                                tags="coord_disp")
+            return rid, tid
+    
+        def update_rect_position():
+            cx1, cy1 = to_canvas(current_x, current_y)
+            cx2, cy2 = to_canvas(current_x + current_w, current_y + current_h)
+            canvas.coords(rect_id, cx1, cy1, cx2, cy2)
+            canvas.coords(text_id, cx1 + 5, cy1 + 5)
+            # 浮动坐标（矩形上方居中；贴顶时放下方）
+            if coord_disp_id:
+                if cy1 > 20:
+                    canvas.coords(coord_disp_id, (cx1 + cx2) // 2, cy1 - 10)
+                else:
+                    canvas.coords(coord_disp_id, (cx1 + cx2) // 2, cy2 + 14)
+                canvas.itemconfig(coord_disp_id, text=f"({current_x}, {current_y})")
+            update_coord_display()
+    
+        def update_coord_display():
+            if coord_mode == 'offset':
+                coord_var.set(f"偏移: X={current_x}, Y={current_y}")
+            else:
+                coord_var.set(f"左上角: ({current_x}, {current_y})  宽: {current_w}  高: {current_h}")
+    
+        # ---- 画布尺寸应用 ----
+        def _apply_canvas_size():
+            nonlocal current_canvas_w, current_canvas_h, scale, disp_w, disp_h, rect_id, text_id
+            try:
+                new_w = int(canvas_w_var.get())
+                new_h = int(canvas_h_var.get())
+                if new_w <= 0 or new_h <= 0:
+                    raise ValueError
+                current_canvas_w, current_canvas_h = new_w, new_h
+                scale = min(max_display_w / current_canvas_w, max_display_h / current_canvas_h, 1.0)
+                disp_w = int(current_canvas_w * scale)
+                disp_h = int(current_canvas_h * scale)
+                win.geometry(f"{disp_w + 20}x{disp_h + 240}")
+                canvas.config(width=disp_w, height=disp_h)
+                canvas.delete("all")
+                if bg_draw_func:
+                    bg_draw_func(canvas, scale)
+                clamp_rect()
+                if rect_id:
+                    canvas.delete(rect_id)
+                    canvas.delete(text_id)
+                rect_id, text_id = create_rect()
+                update_coord_display()
+                status_var.set(f"画布已调整为 {current_canvas_w}x{current_canvas_h}")
+                win.update_idletasks()
+                # 重新居中窗口
+                x = self.root.winfo_x() + (self.root.winfo_width() - win.winfo_width()) // 2
+                y = self.root.winfo_y() + (self.root.winfo_height() - win.winfo_height()) // 2
+                win.geometry(f"+{x}+{y}")
+            except:
+                messagebox.showerror(_("错误"), _("画布尺寸无效"))
+    
+        # ---- 矩形拖拽事件 ----
+        def start_move(event):
+            nonlocal drag_start_x, drag_start_y, drag_mouse_start, dragging
+            if draw_mode_active:
+                return
+            canvas.focus_set()
+            cx, cy = event.x, event.y
+            bbox = canvas.bbox(rect_id)
+            if bbox and bbox[0] <= cx <= bbox[2] and bbox[1] <= cy <= bbox[3]:
+                drag_start_x = current_x
+                drag_start_y = current_y
+                drag_mouse_start = (cx, cy)
+                dragging = True
+                status_var.set("拖拽移动矩形")
+    
+        def on_move(event):
+            nonlocal current_x, current_y, dragging
+            if not dragging or draw_mode_active:
+                return
+            dx_pixel = event.x - drag_mouse_start[0]
+            dy_pixel = event.y - drag_mouse_start[1]
+            dx = dx_pixel / scale
+            dy = dy_pixel / scale
+            new_x = int(drag_start_x + dx)
+            new_y = int(drag_start_y + dy)
+            if new_x != current_x or new_y != current_y:
+                current_x, current_y = new_x, new_y
+                clamp_rect()   # 应用边界约束（根据 allow_negative_offset 和 min_visible_pixels）
+                update_rect_position()
+    
+        def stop_move(event):
+            nonlocal dragging
+            dragging = False
+            status_var.set("拖拽完成，可调整或应用")
+    
+        # ---- 绘制新矩形（仅当 allow_resize=True 时可用） ----
+        def start_draw(event):
+            nonlocal draw_start, draw_rect_temp, draw_mode_active
+            if not draw_mode_active:
+                return
+            if draw_rect_temp:
+                canvas.delete(draw_rect_temp)
+                draw_rect_temp = None
+            draw_start = to_real(event.x, event.y)
+    
+        def on_draw_move(event):
+            nonlocal draw_rect_temp, draw_start, draw_mode_active
+            if not draw_mode_active or draw_start is None:
+                return
+            cur = to_real(event.x, event.y)
+            x1 = min(draw_start[0], cur[0])
+            y1 = min(draw_start[1], cur[1])
+            x2 = max(draw_start[0], cur[0])
+            y2 = max(draw_start[1], cur[1])
+            w = x2 - x1
+            h = y2 - y1
+            if w == 0 or h == 0:
+                return
+            if aspect_ratio is not None:
+                if w / h > aspect_ratio:
+                    new_w = h * aspect_ratio
+                    x2 = x1 + new_w
+                else:
+                    new_h = w / aspect_ratio
+                    y2 = y1 + new_h
+            draw_x = x1
+            draw_y = y1
+            draw_w = x2 - x1
+            draw_h = y2 - y1
+            # 边界裁剪（保持矩形在画布内，不超出）
+            if draw_x < 0:
+                draw_w += draw_x
+                draw_x = 0
+            if draw_y < 0:
+                draw_h += draw_y
+                draw_y = 0
+            if draw_x + draw_w > current_canvas_w:
+                draw_w = current_canvas_w - draw_x
+                if aspect_ratio is not None:
+                    draw_h = draw_w / aspect_ratio
+            if draw_y + draw_h > current_canvas_h:
+                draw_h = current_canvas_h - draw_y
+                if aspect_ratio is not None:
+                    draw_w = draw_h * aspect_ratio
+            if draw_w <= 0 or draw_h <= 0:
+                return
+            cx1, cy1 = to_canvas(draw_x, draw_y)
+            cx2, cy2 = to_canvas(draw_x + draw_w, draw_y + draw_h)
+            if draw_rect_temp:
+                canvas.coords(draw_rect_temp, cx1, cy1, cx2, cy2)
+            else:
+                draw_rect_temp = canvas.create_rectangle(cx1, cy1, cx2, cy2,
+                                                         outline="yellow", width=2, dash=(2, 2))
+    
+        def end_draw(event):
+            nonlocal draw_mode_active, draw_start, draw_rect_temp, current_x, current_y, current_w, current_h, rect_id, text_id
+            if not draw_mode_active or draw_start is None:
+                return
+            if draw_rect_temp:
+                coords = canvas.coords(draw_rect_temp)
+                if len(coords) == 4:
+                    cx1, cy1, cx2, cy2 = coords
+                    x1, y1 = to_real(cx1, cy1)
+                    x2, y2 = to_real(cx2, cy2)
+                    new_w = x2 - x1
+                    new_h = y2 - y1
+                    if new_w > 0 and new_h > 0:
+                        current_x, current_y = x1, y1
+                        current_w, current_h = new_w, new_h
+                        clamp_rect()  # 应用边界限制（根据 allow_negative_offset 和 min_visible_pixels）
+                        canvas.delete(rect_id)
+                        canvas.delete(text_id)
+                        canvas.delete(coord_disp_id)
+                        rect_id, text_id = create_rect()
+                        update_coord_display()
+                        status_var.set("新矩形已创建，可拖拽移动或应用")
+                if draw_rect_temp:
+                    canvas.delete(draw_rect_temp)
+                    draw_rect_temp = None
+            draw_mode_active = False
+            if allow_resize:
+                draw_btn.config(state="normal")
+                draw_abort_btn.config(state="disabled")
+            draw_start = None
+    
+        def abort_draw():
+            nonlocal draw_mode_active, draw_rect_temp, draw_start
+            draw_mode_active = False
+            if allow_resize:
+                draw_btn.config(state="normal")
+                draw_abort_btn.config(state="disabled")
+            if draw_rect_temp:
+                canvas.delete(draw_rect_temp)
+                draw_rect_temp = None
+            draw_start = None
+            status_var.set("已取消绘制")
+    
+        def enter_draw_mode():
+            nonlocal draw_mode_active
+            if draw_mode_active:
+                return
+            draw_mode_active = True
+            draw_btn.config(state="disabled")
+            draw_abort_btn.config(state="normal")
+            status_var.set(_("绘制模式：按住左键拖拽绘制新矩形（保持宽高比），松开后自动替换"))
+    
+        # ---- 重置位置 ----
+        def reset_position():
+            nonlocal current_x, current_y
+            # 如果是主视频模式（允许负偏移且为蓝色），重置到左上角 (0,0)
+            if allow_negative_offset and rect_color == 'deepskyblue':
+                current_x = 0
+                current_y = 0
+            else:
+                # 否则（子视频/水印）重置到右下角（保留 10px 边距）
+                current_x = current_canvas_w - current_w - 10
+                current_y = current_canvas_h - current_h - 10
+            clamp_rect()
+            update_rect_position()
+            status_var.set("已重置位置")
+    
+        # ---- 应用与取消 ----
+        def apply():
+            clamp_rect()
+            on_apply(current_x, current_y, current_w, current_h,
+                     current_canvas_w, current_canvas_h)
+            win.destroy()
+    
+        def cancel():
+            win.destroy()
+    
+        # ---- 创建 GUI 控件 ----
+        canvas = tk.Canvas(win, width=disp_w, height=disp_h, bg="black", highlightthickness=1)
+        canvas.pack(pady=10)
+    
+        if bg_draw_func:
+            bg_draw_func(canvas, scale)
+    
+        status_var = tk.StringVar(value="红色矩形可拖拽移动。")
+        ttk.Label(win, textvariable=status_var, justify=tk.LEFT).pack(pady=5)
+    
+        coord_var = tk.StringVar(value="")
+        coord_label = ttk.Label(win, textvariable=coord_var, font=("", 10))
+        coord_label.pack(pady=2)
+        if extra_info:
+            extra_label = ttk.Label(win, text=extra_info, foreground="orange")
+            extra_label.pack(pady=2)
+    
+        # 画布尺寸控件（主视频模式）
+        if show_canvas_controls:
+            canvas_ctrl_frame = ttk.Frame(win)
+            canvas_ctrl_frame.pack(pady=5)
+            ttk.Label(canvas_ctrl_frame, text=_("画布宽度:")).pack(side=tk.LEFT)
+            canvas_w_var = tk.StringVar(value=str(canvas_w))
+            ttk.Entry(canvas_ctrl_frame, textvariable=canvas_w_var, width=8).pack(side=tk.LEFT, padx=5)
+            ttk.Label(canvas_ctrl_frame, text=_("画布高度:")).pack(side=tk.LEFT)
+            canvas_h_var = tk.StringVar(value=str(canvas_h))
+            ttk.Entry(canvas_ctrl_frame, textvariable=canvas_h_var, width=8).pack(side=tk.LEFT, padx=5)
+            ttk.Button(canvas_ctrl_frame, text=_("应用画布尺寸"), command=_apply_canvas_size).pack(side=tk.LEFT, padx=5)
+    
+        # 绘制矩形控件（子视频/水印模式）
+        if allow_resize:
+            draw_btn_frame = ttk.Frame(win)
+            draw_btn_frame.pack(pady=5)
+            draw_btn = ttk.Button(draw_btn_frame, text=_("绘制新矩形"), command=enter_draw_mode)
+            draw_btn.pack(side=tk.LEFT, padx=5)
+            draw_abort_btn = ttk.Button(draw_btn_frame, text=_("取消绘制"), command=abort_draw, state="disabled")
+            draw_abort_btn.pack(side=tk.LEFT, padx=5)
+    
+        # 通用操作按钮
+        action_frame = ttk.Frame(win)
+        action_frame.pack(pady=10)
+        ttk.Button(action_frame, text=_("应用"), command=apply).pack(side=tk.LEFT, padx=10)
+        ttk.Button(action_frame, text=_("取消"), command=cancel).pack(side=tk.LEFT, padx=10)
+        ttk.Button(action_frame, text=_("重置位置"), command=reset_position).pack(side=tk.LEFT, padx=10)
+
+        if show_scale_tip:
+            tip_text = "提示：重新绘制矩形时，如果比例不对，请先返回上一个界面取消「缩放」的勾选，已保存的上一次缩放会干扰裁剪属性。"
+            tip_label = ttk.Label(win, text=tip_text, foreground="gray", 
+                                  justify=tk.LEFT, wraplength=win.winfo_width() - 30)
+            tip_label.pack(fill=tk.X, padx=10, pady=5)
+            def update_wraplength(event):
+                tip_label.config(wraplength=win.winfo_width() - 30)
+            win.bind("<Configure>", update_wraplength)
+
+        # 绑定事件
+        canvas.tag_bind("rect", "<Button-1>", start_move)
+        canvas.tag_bind("rect", "<B1-Motion>", on_move)
+        canvas.tag_bind("rect", "<ButtonRelease-1>", stop_move)
+        canvas.bind("<Button-1>", start_draw, add=True)
+        canvas.bind("<B1-Motion>", on_draw_move, add=True)
+        canvas.bind("<ButtonRelease-1>", end_draw, add=True)
+
+        # 方向键微调（点击矩形后可用，每次 1px）
+        def arrow_move(event):
+            nonlocal current_x, current_y
+            if draw_mode_active:
+                return
+            if event.keysym == 'Left':
+                current_x -= 1
+            elif event.keysym == 'Right':
+                current_x += 1
+            elif event.keysym == 'Up':
+                current_y -= 1
+            elif event.keysym == 'Down':
+                current_y += 1
+            else:
+                return
+            clamp_rect()
+            update_rect_position()
+            status_var.set(f"方向键微调: ({current_x}, {current_y})  [可用 ↑↓←→ 继续调整]")
+        canvas.bind("<Left>", arrow_move)
+        canvas.bind("<Right>", arrow_move)
+        canvas.bind("<Up>", arrow_move)
+        canvas.bind("<Down>", arrow_move)
+    
+        # 初始化
+        clamp_rect()
+        rect_id, text_id = create_rect()
+        update_coord_display()
+        if rect_color == 'deepskyblue':
+            status_var.set("拖拽蓝色矩形移动，调整主视频内容在画布中的位置。")
+        else:
+            status_var.set("红色矩形可拖拽移动。")
+        if not allow_resize and 'draw_btn_frame' in locals():
+            draw_btn_frame.pack_forget()
+    
+        center_window(win, disp_w + 20, disp_h + 240)
+        win.wait_window()
+        parent.lift()
+        parent.focus_force()
+
+
+    # ---------- 主视频位置可视化编辑器 ----------
+    def open_visual_pad_editor(self, track_idx, pad_w_var, pad_h_var, off_x_var, off_y_var,
+                               live_filt_frame=None, parent=None):
+        track = self.merge_tracks[track_idx]
+        if track.type != "video":
+            return
+    
+        enabled_videos = self._get_enabled_video_tracks()
+        if not enabled_videos:
+            messagebox.showerror(_("错误"), _("没有启用的视频轨道"))
+            return
+        main_track = enabled_videos[0]
+        sub_tracks = enabled_videos[1:]
+    
+        # ---- 主视频渲染尺寸：优先使用 live_filt_frame 的实时值 ----
+        if live_filt_frame is not None:
+            main_settings = {
+                "crop_enabled": live_filt_frame.crop_enabled.get(),
+                "crop_width": live_filt_frame.crop_width.get(),
+                "crop_height": live_filt_frame.crop_height.get(),
+                "scale_enabled": live_filt_frame.scale_enabled.get(),
+                "scale_method": live_filt_frame.scale_method.get(),
+                "scale_width": live_filt_frame.scale_width.get(),
+                "scale_height": live_filt_frame.scale_height.get(),
+                "rotate": live_filt_frame.rotate.get()
+            }
+            orig_w, orig_h = self._cached_video_dimensions(main_track.file_path)
+            if orig_w is None or orig_h is None:
+                orig_w, orig_h = 1280, 720
+            main_render_w, main_render_h = self.compute_final_size_with_order(orig_w, orig_h, main_settings)
+        else:
+            main_render_w, main_render_h = self._get_video_render_size(main_track)
+            if main_render_w is None:
+                messagebox.showerror(_("错误"), _("无法获取主视频渲染尺寸"))
+                return
+    
+        # 获取当前画布尺寸
+        try:
+            canvas_w = int(pad_w_var.get().strip()) if pad_w_var.get().strip() else 0
+            canvas_h = int(pad_h_var.get().strip()) if pad_h_var.get().strip() else 0
+            if canvas_w <= 0 or canvas_h <= 0:
+                raise ValueError
+        except:
+            canvas_w, canvas_h = main_render_w, main_render_h
+            pad_w_var.set(str(canvas_w))
+            pad_h_var.set(str(canvas_h))
+    
+        # 获取当前偏移
+        try:
+            off_x = int(off_x_var.get()) if off_x_var.get().strip() else 0
+            off_y = int(off_y_var.get()) if off_y_var.get().strip() else 0
+        except:
+            off_x, off_y = 0, 0
+    
+        # 定义应用回调
+        def apply_pad(new_x, new_y, new_w, new_h, new_canvas_w, new_canvas_h):
+            # 更新轨道设置
+            track.enc_settings['pad_enabled'] = True
+            track.enc_settings['pad_width'] = str(new_canvas_w)
+            track.enc_settings['pad_height'] = str(new_canvas_h)
+            track.enc_settings['offset_x'] = str(new_x)
+            track.enc_settings['offset_y'] = str(new_y)
+            # 同步属性
+            track.pad_enabled = True
+            track.pad_width = str(new_canvas_w)
+            track.pad_height = str(new_canvas_h)
+            track.offset_x = str(new_x)
+            track.offset_y = str(new_y)
+            # 更新界面变量
+            pad_w_var.set(str(new_canvas_w))
+            pad_h_var.set(str(new_canvas_h))
+            off_x_var.set(str(new_x))
+            off_y_var.set(str(new_y))
+            self.merge_update_track_list()
+            self.merge_update_command_preview()
+            self._append_info_ui(_("[可视化-主] 已设置画布 {0}x{1}, 偏移 ({2}, {3})".format(new_canvas_w, new_canvas_h, new_x, new_y)))
+    
+        # 背景绘制函数（显示其他子视频虚线框）
+        def draw_bg(canvas, scale):
+            # 主视频内容矩形（用于绘制主视频边界）
+            main_render_size = (main_render_w, main_render_h)
+            self._draw_background(canvas, canvas_w, canvas_h, scale, main_track, sub_tracks,
+                                  off_x, off_y, main_render_size, current_edit_track=None, tag="bg")
+    
+        # 调用通用编辑器
+        self._generic_overlay_editor(
+            parent=parent or self.root,
+            canvas_w=canvas_w,
+            canvas_h=canvas_h,
+            rect_x=off_x,
+            rect_y=off_y,
+            rect_w=main_render_w,
+            rect_h=main_render_h,
+            on_apply=apply_pad,
+            title="可视化编辑画布偏移 - 拖拽蓝色矩形",
+            aspect_ratio=None,
+            bg_draw_func=draw_bg,
+            allow_resize=False,
+            show_canvas_controls=True,
+            coord_mode='offset',
+            allow_negative_offset=True,   # 允许负偏移
+            rect_color='deepskyblue',      # 蓝色
+            rect_label='主视频',
+            min_visible_pixels=10
+        )
+
+    # ---------- 水印位置可视化编辑器 ----------
+    def open_watermark_overlay_editor(self, canvas_w, canvas_h, wm_w, wm_h, x_var, y_var,
+                                      scale_enabled_var=None, scale_w_var=None, scale_h_var=None,
+                                      watermark_dict=None, filt_frame=None, parent=None):
+        """
+        水印可视化编辑器，支持回写位置和缩放尺寸，以及更新水印字典和滤镜框架。
+        """
+        # 解析当前坐标
+        rect_x = safe_eval_expr(x_var.get(), {"W": canvas_w, "H": canvas_h, "w": wm_w, "h": wm_h})
+        if rect_x is None:
+            rect_x = canvas_w - wm_w - 10
+        rect_y = safe_eval_expr(y_var.get(), {"W": canvas_w, "H": canvas_h, "w": wm_w, "h": wm_h})
+        if rect_y is None:
+            rect_y = canvas_h - wm_h - 10
+        rect_x = max(0, min(rect_x, canvas_w - wm_w))
+        rect_y = max(0, min(rect_y, canvas_h - wm_h))
+    
+        def on_apply(new_x, new_y, new_w, new_h, new_canvas_w, new_canvas_h):
+            # 更新位置变量
+            x_var.set(str(new_x))
+            y_var.set(str(new_y))
+            # 更新缩放控件
+            if scale_enabled_var is not None:
+                scale_enabled_var.set(True)
+            if scale_w_var is not None:
+                scale_w_var.set(str(new_w))
+            if scale_h_var is not None:
+                scale_h_var.set(str(new_h))
+            # 更新水印设置字典（如果提供）
+            if watermark_dict is not None:
+                watermark_dict["scale_width"] = str(new_w)
+                watermark_dict["scale_height"] = str(new_h)
+                watermark_dict["scale_method"] = "exact"
+                watermark_dict["scale_enabled"] = True
+            # 同步滤镜框架的缩放控件（如果提供）
+            if filt_frame is not None:
+                filt_frame.scale_enabled.set(True)
+                filt_frame.scale_method.set("exact")
+                filt_frame.scale_width.set(str(new_w))
+                filt_frame.scale_height.set(str(new_h))
+            self._append_info_ui(_("[可视化-水] 已保存位置: ({0}, {1}) 尺寸: {2}x{3}".format(new_x, new_y, new_w, new_h)))
+    
+        title = "可视化编辑水印位置及大小"
+        aspect = None
+        if wm_h and wm_h > 0:
+            aspect = wm_w / wm_h
+        self._generic_overlay_editor(parent or self.root, canvas_w, canvas_h,
+                                     rect_x, rect_y, wm_w, wm_h,
+                                     on_apply, title, aspect, bg_draw_func=None,rect_label='水印',
+                                     min_visible_pixels=0,show_scale_tip=True)
+    
+    # ---------- 从视频位置可视化编辑器 ----------
+    def open_visual_overlay_editor(self, track_idx, ov_x_var=None, ov_y_var=None, filt_frame=None, parent=None):
+        """
+        画中画子视频叠加位置/大小可视化编辑器（保留背景虚线框）
+        """
+        track = self.merge_tracks[track_idx]
+        if track.type != "video":
+            return
+    
+        enabled_videos = self._get_enabled_video_tracks()
+        if not enabled_videos:
+            messagebox.showerror(_("错误"), _("没有启用的视频轨道"))
+            return
+        main_track = enabled_videos[0]
+    
+        curr_w, curr_h = self._get_video_render_size(track, filt_frame)
+        if curr_w is None:
+            messagebox.showerror(_("错误"), _("无法获取视频渲染尺寸"))
+            return
+    
+        canvas_w, canvas_h = self._get_canvas_size(main_track)
+    
+        # 计算当前矩形位置
+        x_expr = track.enc_settings.get('overlay_x', '0')
+        y_expr = track.enc_settings.get('overlay_y', '0')
+        rect_x = safe_eval_expr(x_expr, {"W": canvas_w, "H": canvas_h, "w": curr_w, "h": curr_h})
+        if rect_x is None:
+            rect_x = canvas_w - curr_w - 10
+        rect_y = safe_eval_expr(y_expr, {"W": canvas_w, "H": canvas_h, "w": curr_w, "h": curr_h})
+        if rect_y is None:
+            rect_y = canvas_h - curr_h - 10
+        rect_x = max(0, min(rect_x, canvas_w - curr_w))
+        rect_y = max(0, min(rect_y, canvas_h - curr_h))
+    
+        def on_apply(new_x, new_y, new_w, new_h, new_canvas_w, new_canvas_h):
+            # 更新轨道设置
+            track.enc_settings['overlay_x'] = str(new_x)
+            track.enc_settings['overlay_y'] = str(new_y)
+            track.overlay_x = str(new_x)
+            track.overlay_y = str(new_y)
+            if ov_x_var is not None:
+                ov_x_var.set(str(new_x))
+            if ov_y_var is not None:
+                ov_y_var.set(str(new_y))
+            track.enc_settings["scale_enabled"] = True
+            track.enc_settings["scale_width"] = str(new_w)
+            track.enc_settings["scale_height"] = str(new_h)
+            track.enc_settings["scale_method"] = "exact"
+            track.overlay_enabled = True
+            if filt_frame is not None:
+                filt_frame.scale_enabled.set(True)
+                filt_frame.scale_method.set("exact")
+                filt_frame.scale_width.set(str(new_w))
+                filt_frame.scale_height.set(str(new_h))
+            self.merge_update_track_list()
+            self.merge_update_command_preview()
+            self._append_info_ui(_("[可视化-从] 已保存位置: ({0}, {1}) 大小: {2}x{3}".format(new_x, new_y, new_w, new_h)))
+    
+        main_pad_enabled = main_track.enc_settings.get('pad_enabled', False)
+        if main_pad_enabled:
+            off_x_expr = main_track.enc_settings.get('offset_x', '0')
+            off_y_expr = main_track.enc_settings.get('offset_y', '0')
+            offset_x = safe_eval_expr(off_x_expr, {"W": canvas_w, "H": canvas_h}) or 0
+            offset_y = safe_eval_expr(off_y_expr, {"W": canvas_w, "H": canvas_h}) or 0
+        else:
+            offset_x, offset_y = 0, 0
+        extra_info = f"主视频偏移: X={offset_x}, Y={offset_y}"
+
+        # ----- 定义背景绘制函数（现在内部只需使用 offset_x/offset_y 而不需定义 extra_info）-----
+        def draw_bg(canvas, scale):
+            # 获取主视频渲染尺寸
+            main_render_size = self._get_video_render_size(main_track)
+            if main_render_size is None:
+                main_render_size = (canvas_w, canvas_h)
+            sub_tracks = enabled_videos[1:]
+            self._draw_background(canvas, canvas_w, canvas_h, scale, main_track, sub_tracks,
+                                  offset_x, offset_y, main_render_size, current_edit_track=track, tag="bg")
+    
+        title = f"可视化编辑叠加位置 - {os.path.basename(track.file_path)}"
+        aspect = None
+        if curr_w and curr_h > 0:
+            aspect = curr_w / curr_h
+        self._generic_overlay_editor(
+            parent or self.root,
+            canvas_w, canvas_h,
+            rect_x, rect_y, curr_w, curr_h,
+            on_apply,
+            title,
+            aspect,
+            bg_draw_func=draw_bg,
+            extra_info=extra_info,
+            rect_label='当前子视频',
+            min_visible_pixels=0,
+            show_scale_tip=True
+        )
+
+    # ---------- 预设管理 ----------
+    def load_preset_list(self):
+        presets = self.preset_manager.load_all()
+        preset_names = list(presets.keys())
+        self.preset_combo['values'] = preset_names
+
+    def _clean_settings(self, settings: dict, defaults: dict = None) -> dict:
+        """
+        递归清洗设置字典，移除与默认值相同的字段。
+        """
+        if defaults is None:
+            defaults = self.default_settings
+        cleaned = {}
+        for key, value in settings.items():
+            if key not in defaults:
+                # 如果键不在默认字典中，保留（通常不会发生）
+                cleaned[key] = value
+                continue
+            default_value = defaults[key]
+            if isinstance(value, dict) and isinstance(default_value, dict):
+                # 递归处理子字典，并传入对应的默认值
+                sub_cleaned = self._clean_settings(value, default_value)
+                if sub_cleaned:  # 只有子字典非空才保留
+                    cleaned[key] = sub_cleaned
+            elif value != default_value:
+                cleaned[key] = value
+            # 值相同则忽略
+        return cleaned
+
+    def save_preset(self):
+        preset_name = simpledialog.askstring("保存预设", "请输入预设名称:", parent=self.root)
+        if not preset_name:
+            return
+        preset_settings = self.get_current_settings()
+
+        # ---- 移除水印设置（不保存到预设文件；水印由独立「水印预设」管理） ----
+        preset_settings.pop("watermark", None)
+        preset_settings.pop("text_watermark", None)
+        # ---- 移除分段拼接数据（如果您也不希望保存） ----
+        preset_settings.pop("segment_enabled", None)
+        preset_settings.pop("segments", None)
+        # ---- 移除截取参数 ----
+        preset_settings.pop("trim_enabled", None)
+        preset_settings.pop("trim_start", None)
+        preset_settings.pop("trim_end", None)
+        preset_settings.pop("precise_trim", None)
+        preset_settings.pop("combo_seek", None)
+        preset_settings.pop("combo_threshold", None)
+    
+        # 清洗
+#        print("原始设置:", preset_settings)
+        cleaned = self._clean_settings(preset_settings)
+ #       print("清洗后:", cleaned)
+        self.preset_manager.save_preset(preset_name, cleaned)
+        self.load_preset_list()
+        messagebox.showinfo(_("成功"), _("预设“{0}”已保存到:\n{1}".format(preset_name, self.preset_file_path)))
+
+    def load_preset(self, preset_name):
+        if not preset_name:
+            return
+        presets = self.preset_manager.load_all()
+        if preset_name not in presets:
+            return
+        self.load_settings_into_ui(presets[preset_name])
+        messagebox.showinfo(_("成功"), _("已加载预设“{0}”".format(preset_name)))
+
+    def delete_preset(self):
+        preset_name = self.preset_name.get()
+        if not preset_name:
+            messagebox.showwarning(_("警告"), _("请先选择一个预设"))
+            return
+        if not messagebox.askyesno(_("确认删除"), _("确定要删除预设“{0}”吗？".format(preset_name))):
+            return
+        if self.preset_manager.delete_preset(preset_name):
+            self.load_preset_list()
+            self.preset_name.set("")
+            messagebox.showinfo(_("成功"), _("预设“{0}”已删除".format(preset_name)))
+        else:
+            messagebox.showerror(_("错误"), _("删除失败"))
+
+    def export_all_presets(self):
+        if not os.path.exists(self.preset_file_path):
+            if messagebox.askyesno(_("提示"), _("当前没有预设文件，是否创建一个空的预设文件并导出？")):
+                with open(self.preset_file_path, 'w', encoding='utf-8') as f:
+                    json.dump({}, f, indent=4)
+            else:
+                return
+        save_path = filedialog.asksaveasfilename(
+            title="导出全部预设 (备份)",
+            defaultextension=".json",
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+            initialfile="ffmpeg_presets_backup.json"
+        )
+        if not save_path:
+            return
+        try:
+            shutil.copy2(self.preset_file_path, save_path)
+            self._append_info_ui(_("✅ 全部预设已备份到: {0}".format(save_path)))
+            messagebox.showinfo(_("导出成功"), _("预设库已导出至:\n{0}".format(save_path)))
+        except Exception as e:
+            messagebox.showerror(_("导出失败"), str(e))
+
+    def import_presets(self):
+        import_path = filedialog.askopenfilename(
+            title="导入预设库",
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")]
+        )
+        if not import_path:
+            return
+        try:
+            with open(import_path, 'r', encoding='utf-8') as f:
+                imported = json.load(f)
+        except Exception as e:
+            messagebox.showerror(_("读取失败"), _("无法读取文件:\n{0}".format(e)))
+            return
+        if not isinstance(imported, dict):
+            messagebox.showerror(_("格式错误"), _("导入的文件必须是 JSON 对象（键为预设名称，值为设置字典）"))
+            return
+        for preset_name, settings in imported.items():
+            if isinstance(settings, dict) and "custom_args" in settings:
+                custom = settings["custom_args"].strip()
+                if re.search(r'[;&|`$]', custom):
+                    self._append_info_ui(_("警告：预设 '{0}' 中的自定义参数包含危险字符，已清空".format(preset_name)))
+                    settings["custom_args"] = ""
+        current = self.preset_manager.load_all()
+        player_cfg = self.preset_manager.load_player_settings()
+        answer = messagebox.askyesno(
+            _("导入方式"),
+            _("当前有 {0} 个预设，导入文件包含 {1} 个预设。\n是否替换整个预设库？\n（选“是”将完全替换；选“否”则合并，同名预设将被覆盖）".format(len(current), len(imported)))
+        )
+        if answer:
+            new_presets = imported
+        else:
+            new_presets = current.copy()
+            new_presets.update(imported)
+        full_data = new_presets.copy()
+        full_data["player_settings"] = player_cfg
+        try:
+            with open(self.preset_file_path, 'w', encoding='utf-8') as f:
+                json.dump(full_data, f, indent=4, ensure_ascii=False)
+            self.load_preset_list()
+            self._append_info_ui(_("预设库已更新，共 {0} 个预设".format(len(new_presets))))
+            messagebox.showinfo(_("导入成功"), _("预设库已更新，当前共 {0} 个预设".format(len(new_presets))))
+        except Exception as e:
+            messagebox.showerror(_("保存失败"), str(e))
+
+    # ---------- 预览与 UI 辅助 ----------
+    def preview_current_file(self, with_snapshot: bool = False):
+        path = self.input_file.get().strip()
+        if not path or not os.path.exists(path):
+            messagebox.showerror(_("错误"), _("请先选择一个有效的输入文件"))
+            return
+        settings = self.get_current_settings()
+        self._preview_with_settings(path, settings, with_snapshot=with_snapshot)
+
+    def preview_selected_task(self, with_snapshot: bool = False):
+        selected = self.task_tree.selection()
+        if not selected:
+            messagebox.showwarning(_("警告"), _("请先选中一个任务"))
+            return
+        idx = int(selected[0])
+        task = self.tasks[idx]
+        if not os.path.exists(task.input):
+            messagebox.showerror(_("错误"), _("输入文件不存在: {0}".format(task.input)))
+            return
+        self._preview_with_settings(task.input, task.settings, with_snapshot=with_snapshot)
+
+    def toggle_only_audio_mode(self):
+        state = tk.DISABLED if self.audio_frame.only_audio.get() else tk.NORMAL
+        self._set_recursive_state(self.video_encoder, state)
+        self._set_recursive_state(self.video_filter, state)
+        self.update_command_preview()
+    
+    def _set_recursive_state(self, widget, state):
+        try:
+            widget.config(state=state)
+        except:
+            pass
+        for child in widget.winfo_children():
+            self._set_recursive_state(child, state)
+
+
+    def open_segment_editor(self):
+        if not self.segment_enabled.get():
+            messagebox.showinfo(_("提示"), _("请先勾选「启用分段拼接模式」再打开设置窗口。"))
+            return
+        import copy
+        initial_segments = copy.deepcopy(self.segments)
+        editor = SegmentEditor(self.root, initial_segments, self)
+        # 恢复已保存的音频截取设置
+        editor.audio_trim_enabled = self.audio_trim_enabled
+        editor.audio_trim_start = self.audio_trim_start
+        editor.audio_trim_end = self.audio_trim_end
+        editor.audio_trim_enabled_var.set(self.audio_trim_enabled)
+        editor.audio_trim_start_var.set(self.audio_trim_start)
+        editor.audio_trim_end_var.set(self.audio_trim_end)
+        editor._on_audio_trim_toggle()
+        self.root.wait_window(editor.window)
+        if editor.result is not None:
+            self.segments = editor.result
+            # 保存音频独立截取设置
+            self.audio_trim_enabled = editor.audio_trim_enabled
+            self.audio_trim_start = editor.audio_trim_start
+            self.audio_trim_end = editor.audio_trim_end
+            self.update_command_preview()
+
+
+    def update_command_preview(self, *args):
+        """防抖版刷新命令预览"""
+        if self._preview_after_id:
+            self.root.after_cancel(self._preview_after_id)
+            self._preview_after_id = None
+        self._preview_after_id = self.root.after(50, self._do_update_command_preview)
+
+    def _do_update_command_preview(self):
+        """实际执行命令刷新的函数"""
+        if not hasattr(self, 'watermark_settings'):
+            return
+        self._preview_after_id = None
+        if getattr(self, '_loading_preset', False):
+            return
+        if hasattr(self, '_updating_preview') and self._updating_preview:
+            return
+        self._updating_preview = True
+        try:
+            # ---- 水印/画中画禁用组合跳转 ----
+            watermark_enabled = self.watermark_settings.get("enabled", False)
+            pip_enabled = self.pip_enabled.get()
+            if watermark_enabled or pip_enabled:
+                if self.trim_frame.show_combo_seek and self.trim_frame.combo_seek.get():
+                    self.trim_frame.combo_seek.set(False)
+                    self._append_info_ui(_("[提示] 水印/画中画模式下已自动禁用组合跳转。"))
+                    if self.trim_frame.combo_check:
+                        self.trim_frame.combo_check.config(state='disabled')
+            else:
+                if self.trim_frame.show_combo_seek and self.trim_frame.combo_check:
+                    self.trim_frame.combo_check.config(state='normal')
+            # -------------------------------------------------
+    
+            input_file = self.input_file.get()
+            try:
+                if not input_file:
+                    cmd_list = self.generate_ffmpeg_command("{input}", "{output}", self.get_current_settings(), preview=True)
+                else:
+                    settings = self.get_current_settings()
+                    output_path = self.generate_output_path(input_file, settings)
+                    cmd_list = self.generate_ffmpeg_command(input_file, output_path, settings, preview=True)
+                cmd_str = format_cmd_for_display(cmd_list)
+            except Exception as e:
+                cmd_str = f"生成命令时出错: {e}"
+    
+            # 更新预览区（根据全局开关控制状态）
+            preview = self.cmd_preview
+            preview.config(state='normal')
+            preview.delete(1.0, tk.END)
+            preview.insert(tk.END, cmd_str)
+            if hasattr(self, 'preview_editable_var') and self.preview_editable_var.get():
+                preview.config(state='normal')
+            else:
+                preview.config(state='disabled')
+    
+            # ---- 同步精准截取 ----
+            try:
+                watermark_enabled = self.watermark_settings.get("enabled", False)
+                if (watermark_enabled or self.pip_enabled.get()) and self.trim_frame.trim_enabled.get():
+                    if not self.trim_frame.precise_trim.get():
+                        self.trim_frame.precise_trim.set(True)
+                    self.trim_frame.precise_check.config(state='disabled')
+                    if not self._watermark_precise_hint_shown:
+                        self._append_info_ui(_("[水印/画中画] 已自动启用精准截取（确保叠加对齐）。"))
+                        self._watermark_precise_hint_shown = True
+                else:
+                    self.trim_frame.precise_check.config(state='normal')
+            except Exception as e:
+                pass
+        finally:
+            self._updating_preview = False
+
+
+    # ---------- 同名文件处理 ----------
+    def _unique_path(self, path: str) -> str:
+        """生成不冲突的唯一路径（自动加序号）"""
+        dirname = os.path.dirname(path)
+        basename, ext = os.path.splitext(os.path.basename(path))
+        counter = 1
+        new_path = path
+        # 检查文件系统存在或任务列表中已占用
+        while os.path.exists(new_path) or any(t.output == new_path for t in self.tasks):
+            new_path = os.path.join(dirname, f"{basename} ({counter}){ext}")
+            counter += 1
+        return new_path
+
+    def _resolve_path_conflict(self, output_path: str, show_dialog: bool = True):
+        """
+        根据当前策略处理同名文件冲突，返回最终路径。
+        若策略为 'ask' 且用户取消覆盖，则自动重命名。
+        永远不会返回 None。
+        """
+        if not output_path:
+            return output_path
+        policy = self.overwrite_policy.get()
+        
+        def conflict(path):
+            return os.path.exists(path) or any(t.output == path for t in self.tasks)
+        
+        if policy == "overwrite":
+            return output_path
+        elif policy == "rename":
+            return self._unique_path(output_path)
+        else:  # "ask"
+            if not show_dialog:
+                # 预览模式：直接重命名，不弹窗
+                return self._unique_path(output_path)
+            else:
+                if conflict(output_path):
+                    if messagebox.askyesno(_("文件已存在"), _("输出文件已存在:\n{0}\n\n是否覆盖？".format(output_path))):
+                        return output_path
+                    else:
+                        return self._unique_path(output_path)
+                return output_path
+
+
+    # ---------- 任务管理 ----------
+    def is_duplicate_task(self, input_path, output_path):
+        """检查输出路径是否已被已有任务占用（无论输入是否相同）"""
+        norm_out = normalize_path(output_path)
+        for task in self.tasks:
+            if normalize_path(task.output) == norm_out:
+                return True
+        return False
+
+
+    def add_task(self, input_path, settings=None):
+        if settings is None:
+            settings = self.get_current_settings()
+    
+        # 如果水印未启用（路径为空），则移除 watermark 键，避免残留参数污染任务
+        if not settings.get("watermark", {}).get("enabled", False) or not settings.get("watermark", {}).get("file_path", "").strip():
+            settings.pop("watermark", None)
+    
+        # 分段拼接设置：尊重调用方传入的值，否则使用界面当前值
+        if "segment_enabled" not in settings:
+            settings["segment_enabled"] = self.segment_enabled.get()
+        if "segments" not in settings:
+            settings["segments"] = copy.deepcopy(self.segments)
+    
+        try:
+            output_path = self.generate_output_path(input_path, settings)
+            self._append_info_ui(_("生成输出路径: {0}".format(output_path)))
+        except Exception as e:
+            err_msg = f"生成输出路径失败: {e}"
+            self._append_info_ui(err_msg)
+            import traceback
+            self._append_info_ui(traceback.format_exc())
+            messagebox.showerror(_("错误"), err_msg)
+            return False
+    
+        output_path = self._resolve_path_conflict(output_path)
+        if output_path is None:
+            self._append_info_ui(_("添加任务已取消"))
+            return False
+    
+        try:
+            task = Task(input_path, output_path, settings, [])
+            cmd_list = self.generate_ffmpeg_command(input_path, output_path, settings, task)
+            task.cmd = cmd_list
+            self._append_info_ui(_("命令生成成功，参数个数: {0}".format(len(cmd_list))))
+        except Exception as e:
+            err_msg = f"命令生成错误: {e}"
+            self._append_info_ui(err_msg)
+            import traceback
+            self._append_info_ui(traceback.format_exc())
+            messagebox.showerror(_("命令生成错误"), err_msg)
+            return False
+    
+
+        self.tasks.append(task)
+        self.update_task_list()
+        self._append_info_ui(_("✅ 已添加任务: {0} -> {1}".format(os.path.basename(input_path), output_path)))
+        return True
+
+    def add_current_as_task(self):
+        input_path = self.input_file.get()
+        if not input_path or not os.path.exists(input_path):
+            messagebox.showerror(_("错误"), _("请先在输入文件中选择一个有效的文件"))
+            return
+        self.add_task(input_path)
+
+    def update_task_list(self):
+        for item in self.task_tree.get_children():
+            self.task_tree.delete(item)
+    
+        for i, task in enumerate(self.tasks):
+            seq = i + 1
+            tag = 'odd' if i % 2 == 0 else 'even'
+            
+            # 构建耗时字符串
+            elapsed_str = ""
+            if task.start_time and not task.is_finished:
+                # 正在转码，实时计算
+                elapsed = time.time() - task.start_time
+                elapsed_str = f" 耗时 {seconds_to_time(elapsed, short=True)}"
+            elif task.elapsed_time is not None:
+                # 已完成或失败
+                elapsed_str = f" 耗时 {seconds_to_time(task.elapsed_time, short=True)}"
+    
+            if task.status == "转码中":
+                if task.total_sec > 0:
+                    status_display = f"转码中 {task.progress}% ({task.current_sec}/{task.total_sec} 秒){elapsed_str}"
+                else:
+                    status_display = f"转码中 {task.progress}%{elapsed_str}"
+            else:
+                status_display = f"{task.status}{elapsed_str}"
+    
+            self.task_tree.insert("", tk.END, iid=str(i), values=(
+                seq,
+                os.path.basename(task.input),
+                task.output,
+                task.get_short_cmd(),
+                status_display,
+                task.error_msg[:100] if task.error_msg else ""
+            ), tags=(tag,))
+
+    def remove_selected_tasks(self):
+        selected = self.task_tree.selection()
+        if not selected: return
+        indices = sorted([int(iid) for iid in selected], reverse=True)
+        for idx in indices:
+            if 0 <= idx < len(self.tasks):
+                if self.tasks[idx].status == "转码中":
+                    messagebox.showwarning(_("无法删除"), _("任务 {0} 正在转码中，请先停止队列".format(os.path.basename(self.tasks[idx].input))))
+                    continue
+                del self.tasks[idx]
+        self.update_task_list()
+
+    def clear_all_tasks(self):
+        if self.is_processing:
+            messagebox.showwarning(_("警告"), _("请先停止队列或等待完成后再清空"))
+            return
+        self.tasks.clear()
+        self.update_task_list()
+
+    def clear_finished_tasks(self):
+        self.tasks = [t for t in self.tasks if t.status not in ("完成", "失败")]
+        self.update_task_list()
+
+    def stop_queue(self):
+        self.stop_flag = True
+        self._append_info_ui(_("收到停止信号，当前正在运行的任务将继续完成，不再启动新任务"))
+        self.root.after(100, self._check_and_finish_if_idle)
+    
+    def _check_and_finish_if_idle(self):
+        if self.stop_flag and not self.running_futures:
+            self._finish_queue()
+
+    # ---------- 并行队列处理 ----------
+    @staticmethod
+    def is_hardware_encoder(encoder):
+        hw_keywords = ('nvenc', 'qsv', 'amf', 'vaapi', 'videotoolbox')
+        encoder_lower = encoder.lower()
+        return any(kw in encoder_lower for kw in hw_keywords)
+
+    def start_queue(self):
+        if self.is_processing:
+            if not self.running_futures and not self.pending_tasks:
+                self._finish_queue()
+            else:
+                messagebox.showinfo(_("提示"), _("队列已在运行中"))
+            return
+        if self.executor:
+            self.executor.shutdown(wait=False)
+            self.executor = None
+        self.pending_tasks = [t for t in self.tasks if t.status == "等待"]
+        if not self.pending_tasks:
+            messagebox.showinfo(_("提示"), _("没有等待中的任务"))
+            return
+        self.is_processing = True
+        self.stop_flag = False
+        max_workers = self.max_parallel.get()
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        self._append_info_ui(_("启动并行队列，最大并行任务数: {0}，硬件编码最大并发: {1}".format(max_workers, self.max_hw_parallel.get())))
+        self._submit_next_batch()
+
+    def _submit_next_batch(self):
+        if not self.is_processing or self.executor is None:
+            return
+    
+        # ---- 停止信号处理 ----
+        if self.stop_flag:
+            # 如果有正在运行的任务，让它们继续运行，但不启动新任务
+            if not self.running_futures:
+                self._finish_queue()   # 所有任务已完成，结束队列
+            return
+    
+        if not self.pending_tasks and not self.running_futures:
+            self._finish_queue()
+            return
+    
+        max_total = self.max_parallel.get()
+        max_hw = self.max_hw_parallel.get()
+    
+        if len(self.running_futures) >= max_total:
+            return
+    
+        # 查找可提交的任务
+        to_submit_idx = None
+        for idx, task in enumerate(self.pending_tasks):
+            if task.status != "等待":
+                continue
+            encoder = task.settings.get("encoder", "")
+            is_hw = self.is_hardware_encoder(encoder)
+            if is_hw and self.current_hw_encoding_count >= max_hw:
+                continue
+            else:
+                to_submit_idx = idx
+                break
+
+        if to_submit_idx is None:
+            return
+
+        task = self.pending_tasks.pop(to_submit_idx)
+        if task.status != "等待":
+            return
+
+        future = self.executor.submit(self._process_single_task, task)
+        self.running_futures.add(future)
+        if self.is_hardware_encoder(task.settings.get("encoder", "")):
+            self.current_hw_encoding_count += 1
+        future.add_done_callback(self._on_task_done)
+
+        self.root.after(10, self._submit_next_batch)
+
+    def safe_append_detail(self, text):
+        self.root.after(0, lambda: self.append_detail(text))
+
+
+
+    def _process_single_task(self, task):
+        """处理单个任务（队列模式）"""
+        task.status = "转码中"
+        task.start_time = time.time()
+        self._update_task_list_ui()
+        self._append_info_ui(_("\n========== 开始转码: {0} ==========".format(os.path.basename(task.input))))
+        cmd_str = format_cmd_for_display(task.cmd)
+        self._append_info_ui(f">>> {cmd_str}")
+        self.ensure_output_dir(task.output)
+    
+        # 获取视频总时长用于进度
+        total_duration = 0
+        if task.settings.get("segment_enabled", False) and task.settings.get("segments"):
+            # 分段拼接模式：计算所有片段时长之和（含逐段变速）
+            total_duration = self._calc_segments_total_duration(task.settings)
+            # 如果片段总时长计算失败，回退到原始方式
+            if total_duration <= 0:
+                raw_duration = self._get_media_duration(task.input)
+                total_duration = self._get_effective_duration(task.settings, raw_duration) if raw_duration is not None else 0
+        else:
+            raw_duration = self._get_media_duration(task.input)
+            total_duration = self._get_effective_duration(task.settings, raw_duration) if raw_duration is not None else 0
+        if total_duration is None:
+            total_duration = 0
+    
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                task.cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            )
+            with self._proc_lock:
+                self.running_procs.append(proc)
+                self._running_tasks.append((proc, task))
+    
+            for line in proc.stdout:
+                if not self._is_ffmpeg_banner_line(line):
+                    self.safe_append_detail(line)
+                    if total_duration > 0 and "time=" in line:
+                        match = re.search(r'time=(\d+):(\d+):(\d+\.?\d*)', line)
+                        if match:
+                            h, m, s = match.groups()
+                            current_sec = int(h) * 3600 + int(m) * 60 + float(s)
+                            self.update_progress(current=int(current_sec), total=int(total_duration), task=task, log_progress=False)
+    
+            retcode = proc.wait()
+            # 优先判断用户停止
+            if task.stopped_by_user:
+                task.status = "已停止"
+                self._append_info_ui(_("⏹️ 任务已停止: {0}".format(os.path.basename(task.input))))
+            elif retcode == 0:
+                task.status = "完成"
+                self._append_info_ui(_("✅ 任务完成: {0}".format(os.path.basename(task.input))))
+                self._log_command_to_file(cmd_str)
+            else:
+                task.status = "失败"
+                task.error_msg = f"返回码 {retcode}"
+                self._append_info_ui(_("任务失败: {0} (返回码 {1})".format(os.path.basename(task.input), retcode)))
+            self._update_task_list_ui()
+        except Exception as e:
+            self._append_info_ui(_("任务异常: {0}".format(e)))
+            task.status = "失败"
+            task.error_msg = str(e)
+            self._update_task_list_ui()
+        finally:
+            task.is_finished = True
+            if task.start_time is not None:
+                task.elapsed_time = time.time() - task.start_time
+            with self._proc_lock:
+                if proc in self.running_procs:
+                    self.running_procs.remove(proc)
+                self._running_tasks = [(p, t) for (p, t) in self._running_tasks if p != proc]
+            self.update_progress(current=0, total=0, task=task, log_progress=False)
+            if hasattr(task, 'temp_files'):
+                self._cleanup_temp_files(task.temp_files)
+                task.temp_files = []
+        return task
+
+    def _on_task_done(self, future):
+        task = future.result()
+        if self.is_hardware_encoder(task.settings.get("encoder", "")):
+            self.current_hw_encoding_count -= 1
+            self.current_hw_encoding_count = max(0, self.current_hw_encoding_count)
+        self.running_futures.discard(future)
+        self.root.after(100, self._submit_next_batch)
+
+    def _finish_queue(self):
+        if not self.is_processing:
+            return
+        self.is_processing = False
+        if self.executor:
+            self.executor.shutdown(wait=False)
+            self.executor = None
+        self.current_hw_encoding_count = 0
+        self.stop_flag = False
+        if self.stop_flag:
+            self._append_info_ui(_("\n队列已停止"))
+        else:
+            self._append_info_ui(_("\n所有任务处理完成"))
+        self.stop_flag = False
+
+    def _update_task_list_ui(self):
+        self.root.after(0, self.update_task_list)
+
+    def _append_info_ui(self, text: str):
+        self.root.after(0, lambda: self.append_info(text))
+
+    def _log_command_to_file(self, cmd_str: str):
+        """将成功执行的命令记录到日志文件（受开关控制）"""
+        if not self.log_enabled_var.get():
+            return
+        log_path = self.log_path_var.get().strip()
+        if not log_path:
+            return
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"{cmd_str}\n")
+        except Exception as e:
+            self._append_info_ui(_("无法写入命令日志: {0}".format(e)))
+
+
+    def transcode_single(self):
+        input_file = self.input_file.get()
+        if not input_file or not os.path.exists(input_file):
+            messagebox.showerror(_("错误"), _("请选择有效的输入文件"))
+            return
+        settings = self.get_current_settings()
+        output_file = self.generate_output_path(input_file, settings)
+        # ---- 新增：处理冲突 ----
+        output_file = self._resolve_path_conflict(output_file)
+        self.ensure_output_dir(output_file)
+        task = Task(input_file, output_file, settings, [])  # 临时
+        try:
+            cmd_list = self.generate_ffmpeg_command(input_file, output_file, settings, task)
+            task.cmd = cmd_list
+        except ValueError as e:
+            messagebox.showerror(_("命令生成错误"), str(e))
+            return
+        threading.Thread(target=self._run_single_transcode, args=(cmd_list, input_file, settings, task), daemon=True).start()
+
+    def refresh_with_reset(self):
+        """点击刷新按钮时：先重置列宽，再刷新命令预览"""
+        self.reset_task_tree_columns()
+        self.update_command_preview()   #刷新
+
+    def reset_task_tree_columns(self):
+        """重置任务列表列宽为默认值（与创建时一致）"""
+        if hasattr(self, 'task_tree'):
+            self.task_tree.column("序号", width=25)
+            self.task_tree.column("文件名", width=75)
+            self.task_tree.column("输出路径", width=100)
+            self.task_tree.column("命令 (简洁) 双击编辑 右键更新", width=310)
+            self.task_tree.column("状态", width=152)
+            self.task_tree.column("错误信息", width=30)
+
+    def _run_single_transcode(self, cmd_list, input_name, settings, task=None):
+        """单文件转码（非队列）"""
+        task.start_time = time.time()
+        self._append_info_ui(_("\n========== 当前选择转码: {0} ==========".format(os.path.basename(input_name))))
+        cmd_str = format_cmd_for_display(cmd_list)
+        self._append_info_ui(f">>> {cmd_str}")
+    
+        total_duration = 0
+        if settings.get("segment_enabled", False):
+            total_duration = self._calc_segments_total_duration(settings)
+            if total_duration <= 0:
+                raw_duration = self._get_media_duration(input_name)
+                if raw_duration is not None:
+                    total_duration = self._get_effective_duration(settings, raw_duration) or 0
+        else:
+            raw_duration = self._get_media_duration(input_name)
+            total_duration = self._get_effective_duration(settings, raw_duration) if raw_duration is not None else 0
+        if total_duration is None:
+            total_duration = 0
+    
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                cmd_list,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            )
+            with self._proc_lock:
+                self.running_procs.append(proc)
+    
+            for line in proc.stdout:
+                if not self._is_ffmpeg_banner_line(line):
+                    self.safe_append_detail(line)
+    
+                    if total_duration > 0 and "time=" in line:
+                        match = re.search(r'time=(\d+):(\d+):(\d+\.?\d*)', line)
+                        if match:
+                            h, m, s = match.groups()
+                            current_sec = int(h) * 3600 + int(m) * 60 + float(s)
+                            self.update_progress(current=int(current_sec), total=int(total_duration), task=task, log_progress=True)
+    
+            retcode = proc.wait()
+            if retcode == 0:
+                self._append_info_ui(_("✅ 当前选择转码完成: {0}".format(os.path.basename(input_name))))
+                self._log_command_to_file(cmd_str)
+            else:
+                self._append_info_ui(_("当前选择转码失败，返回码 {0}".format(retcode)))
+        except Exception as e:
+            self._append_info_ui(_("转码异常: {0}".format(e)))
+        finally:
+            task.is_finished = True
+            if task.start_time is not None:
+                task.elapsed_time = time.time() - task.start_time
+            with self._proc_lock:
+                if proc in self.running_procs:
+                    self.running_procs.remove(proc)
+            self.update_progress(current=0, total=0, task=task, log_progress=True)
+            if task is not None and hasattr(task, 'temp_files'):
+                self._cleanup_temp_files(task.temp_files)
+                task.temp_files = []
+
+    def ensure_output_dir(self, output_path):
+        dirname = os.path.dirname(output_path)
+        if dirname and not os.path.exists(dirname):
+            if sys.platform == "win32":
+                root_dirs = ('C:\\', 'C:/')
+                if dirname.upper() in root_dirs:
+                    raise ValueError(f"禁止将输出文件直接写入C盘根目录: {dirname}")
+            os.makedirs(dirname, exist_ok=True)
+
+    # ---------- 导出脚本、编辑任务 ----------
+    def export_script(self):
+        if not self.tasks:
+            messagebox.showinfo(_("提示"), _("任务列表为空，无法导出"))
+            return
+        file_path = filedialog.asksaveasfilename(
+            title="导出脚本",
+            defaultextension=".bat",
+            filetypes=[("Windows批处理", "*.bat"), ("Linux/macOS Shell", "*.sh"), ("所有文件", "*.*")]
+        )
+        if not file_path:
+            return
+        try:
+            if file_path.lower().endswith(".sh"):
+                script_lines = ["#!/bin/bash", "# FFmpeg batch script", ""]
+                enc = "utf-8"
+            else:
+                script_lines = ["@echo off", ":: FFmpeg batch script", "", "chcp 65001 >nul"]
+                enc = "utf-8-sig"
+            for task in self.tasks:
+                script_lines.append(f"echo Processing: {os.path.basename(task.input)}")
+                script_lines.append(format_cmd_for_display(task.cmd))
+                script_lines.append("")
+            script_lines.append("echo All tasks completed.")
+            with open(file_path, 'w', encoding=enc) as f:
+                f.write("\n".join(script_lines))
+            messagebox.showinfo(_("成功"), _("脚本已导出到:\n{0}".format(file_path)))
+        except Exception as e:
+            messagebox.showerror(_("导出失败"), str(e))
+
+    def edit_task(self, task, task_index):
+        if task.status not in ("等待", "失败", "完成"):
+            messagebox.showwarning(_("无法编辑"), _("任务状态为“{0}”，只能编辑等待、失败或已完成的任务。".format(task.status)))
+            return
+    
+        with self.SafeToplevel(self.root) as win:
+            win.title(f"编辑任务 - {os.path.basename(task.input)}")
+            center_window(win, 800, 460)
+            
+            notebook = ttk.Notebook(win)
+            notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+    
+            # 输入/输出页面
+            page_io = ttk.Frame(notebook)
+            notebook.add(page_io, text=_("输入/输出"))
+            out_dir_var = tk.StringVar(value=task.settings.get("output_dir", ""))
+            suffix_var = tk.StringVar(value=task.settings.get("output_suffix", ""))
+            custom_var = tk.StringVar(value=task.settings.get("custom_output_name", ""))
+            container_var = tk.StringVar(value=task.settings.get("output_container", "mp4"))
+            ttk.Label(page_io, text=_("输出目录:")).grid(row=0, column=0, sticky="w", padx=5, pady=5)
+            ttk.Entry(page_io, textvariable=out_dir_var, width=60).grid(row=0, column=1, padx=5, pady=5)
+            
+            ttk.Button(page_io, text=_("浏览"), command=lambda: out_dir_var.set(normalize_path(filedialog.askdirectory() or out_dir_var.get()))).grid(row=0, column=2, padx=5)
+            ttk.Label(page_io, text=_("文件名后缀:")).grid(row=1, column=0, sticky="w", padx=5, pady=5)
+            ttk.Entry(page_io, textvariable=suffix_var, width=30).grid(row=1, column=1, sticky="w", padx=5)
+            ttk.Label(page_io, text=_("自定义完整名称:")).grid(row=2, column=0, sticky="w", padx=5, pady=5)
+            ttk.Entry(page_io, textvariable=custom_var, width=60).grid(row=2, column=1, padx=5)
+            ttk.Label(page_io, text=_("输出容器:")).grid(row=3, column=0, sticky="w", padx=5, pady=5)
+            ttk.Combobox(page_io, textvariable=container_var, values=["mp4","mkv","mov","avi","webm","gif","webp","jp2","mj2"], state="readonly", width=8).grid(row=3, column=1, sticky="w", padx=5)
+    
+            # 视频编码页面
+            page_enc = ttk.Frame(notebook)
+            notebook.add(page_enc, text=_("视频编码"))
+            enc_frame = VideoEncoderFrame(page_enc, app=self)
+            enc_frame.pack(fill=tk.X, padx=5, pady=5)
+            enc_frame.set_settings(task.settings)
+            
+            # 视频滤镜页面
+            page_filt = ttk.Frame(notebook)
+            notebook.add(page_filt, text=_("视频滤镜"))
+            filt_frame = VideoFilterFrame(page_filt, app=self)
+            filt_frame.current_file = task.input
+            filt_frame.set_override_settings(task.settings)
+            filt_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+            filt_frame.set_settings(task.settings)
+            if "enhance" in task.settings:
+                filt_frame.set_enhance_settings(task.settings["enhance"])
+
+            filt_frame.set_get_trim_settings_callback(lambda: trim_frame.get_settings())
+
+            # 音频页面
+            page_audio = ttk.Frame(notebook)
+            notebook.add(page_audio, text=_("音频"))
+            container = ttk.Frame(page_audio)
+            container.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+            audio_frame = AudioFrame(container, enable_checkbox=True)
+            audio_frame.pack(fill=tk.X)
+            audio_frame.set_settings(task.settings)
+            audio_frame.volume_value.trace_add("write", lambda *a: update_preview())
+            audio_frame.volume_enabled.trace_add("write", lambda *a: update_preview())
+    
+            # 截取片段页面
+            page_trim = ttk.Frame(notebook)
+            notebook.add(page_trim, text=_("截取片段"))
+            trim_frame = TrimFrame(page_trim)
+            trim_frame.pack(fill=tk.X, padx=5, pady=5)
+            trim_frame.set_settings(task.settings)
+            
+            filt_frame.set_get_trim_settings_callback(lambda: trim_frame.get_settings())
+            trim_frame.precise_trim.trace_add("write", lambda *a: update_preview())
+
+
+            # ----- 分段拼接页面 -----
+            page_segment = ttk.Frame(notebook)
+            notebook.add(page_segment, text=_("分段拼接"))
+            
+            # 从任务设置中读取
+            seg_enabled = task.settings.get("segment_enabled", False)
+            segments = copy.deepcopy(task.settings.get("segments", []))
+            
+            # 局部变量（用于编辑）
+            seg_enabled_var = tk.BooleanVar(value=seg_enabled)
+            seg_enabled_var.trace_add("write", lambda *args: update_preview())
+            seg_list = segments  # 直接引用，修改后保存到 task
+            
+            seg_control_frame = ttk.Frame(page_segment)
+            seg_control_frame.pack(fill=tk.X, pady=10)
+            
+            ttk.Checkbutton(seg_control_frame, text=_("启用分段拼接模式 (将忽略『截取片段』设置)"),
+                            variable=seg_enabled_var).pack(side=tk.LEFT, padx=5)
+            
+            def open_task_segment_editor():
+                if not seg_enabled_var.get():
+                    messagebox.showinfo(_("提示"), _("请先勾选「启用分段拼接模式」再打开设置窗口。"))
+                    return
+                # 打开编辑器，传入 seg_list 和 seg_enabled_var 的引用
+                editor = SegmentEditor(win, seg_list, self)  # 注意：这里的 self 是主程序
+                # 注入任务专用输入文件（自动补全结束时间等需要）
+                editor._custom_input_file = task.input
+                # 恢复已保存的音频截取设置
+                editor.audio_trim_enabled = task.settings.get("audio_trim_enabled", False)
+                editor.audio_trim_start = task.settings.get("audio_trim_start", "")
+                editor.audio_trim_end = task.settings.get("audio_trim_end", "")
+                editor.audio_trim_enabled_var.set(editor.audio_trim_enabled)
+                editor.audio_trim_start_var.set(editor.audio_trim_start)
+                editor.audio_trim_end_var.set(editor.audio_trim_end)
+                editor._on_audio_trim_toggle()
+                self.root.wait_window(editor.window)
+                if editor.result is not None:
+                    seg_list.clear()
+                    seg_list.extend(editor.result)
+                    # 保存音频独立截取设置到任务
+                    task.settings["audio_trim_enabled"] = editor.audio_trim_enabled
+                    task.settings["audio_trim_start"] = editor.audio_trim_start
+                    task.settings["audio_trim_end"] = editor.audio_trim_end
+                    # 同步更新段到 task.settings
+                    if "segments" in task.settings:
+                        task.settings["segments"] = copy.deepcopy(seg_list)
+                    # 立即重新生成命令
+                    try:
+                        new_cmd = self.generate_ffmpeg_command(task.input, task.output, task.settings, task)
+                        task.cmd = new_cmd
+                    except ValueError:
+                        pass
+                    # 更新预览
+                    update_preview()
+            
+            ttk.Button(seg_control_frame, text=_("打开分段设置..."),
+                       command=open_task_segment_editor).pack(side=tk.LEFT, padx=10)
+            
+
+            ttk.Label(
+                page_segment,
+                text=_("勾选启用后，视频将按片段列表裁剪并拼接，所有片段使用相同的全局编码/滤镜设置。\n\n"
+                     "   建议使用（mpv、PotPlayer）等播放器打开视频，定位并获取精确到毫秒的时间。\n\n"
+                     "   典型用途：简单混剪、去中间广告、提取精华片段等。"),
+                foreground="grey",
+                wraplength=800,
+                justify=tk.LEFT
+            ).pack(anchor=tk.W, padx=10, pady=(5,0))
+
+
+            # 高级选项页面
+            page_adv = ttk.Frame(notebook)
+            notebook.add(page_adv, text=_("高级选项"))
+            
+
+            
+            # ---- AdvancedFrame，并传入 update_callback ----
+            watermark_dict = task.settings.get("watermark", {})   # 防止 KeyError
+            adv_frame = AdvancedFrame(
+                page_adv,
+                update_callback=None,
+                app=self,
+                show_adaptive=True,
+                watermark_dict=watermark_dict
+            )
+            task.settings["watermark"] = adv_frame.watermark_dict
+            adv_frame.pack(fill=tk.X, padx=5, pady=5)
+            adv_frame.set_settings(task.settings)
+
+
+
+            # 水印编辑按钮新命令
+            def open_task_watermark():
+                task_watermark = task.settings.get("watermark", {})
+                if not task_watermark.get("file_path"):
+                    # 检查文字水印
+                    tw = task.settings.get("text_watermark", {})
+                    if tw.get("enabled", False) and tw.get("text", "").strip():
+                        # 文字水印位置编辑
+                        canvas_w, canvas_h = 1280, 720
+                        if task.input and os.path.exists(task.input):
+                            w, h = self._get_video_dimensions_cached(task.input)
+                            if w and h:
+                                canvas_w, canvas_h = w, h
+                        text = tw.get("text", "")
+                        fs = tw.get("font_size", 48)
+                        wm_w = max(len(text) * int(fs * 0.7), int(fs * 0.7))
+                        wm_h = int(fs * 1.3)
+                        x_var = tk.StringVar(value=tw.get("overlay_x", "10"))
+                        y_var = tk.StringVar(value=tw.get("overlay_y", "10"))
+                        def on_tw_apply(nx, ny, nw, nh, ncw, nch):
+                            tw["overlay_x"] = str(nx)
+                            tw["overlay_y"] = str(ny)
+                            update_preview()
+                            self._append_info_ui(_("[文字水印] 位置已设置: ({0}, {1})".format(nx, ny)))
+                        self._generic_overlay_editor(
+                            win, canvas_w, canvas_h,
+                            safe_eval_expr(x_var.get(), {"W": canvas_w, "H": canvas_h, "w": wm_w, "h": wm_h}) or 10,
+                            safe_eval_expr(y_var.get(), {"W": canvas_w, "H": canvas_h, "w": wm_w, "h": wm_h}) or 10,
+                            wm_w, wm_h, on_tw_apply, "可视化编辑文字水印位置", None,
+                            bg_draw_func=None, rect_label='文字水印',
+                            min_visible_pixels=0, show_scale_tip=False)
+                        return
+                    messagebox.showwarning(_("提示"), _("请先在任务设置中输入水印文件路径，或启用文字水印"))
+                    return
+            
+                def on_save(new_wm):
+                    adv_frame.watermark_dict.update(new_wm)
+                    adv_frame.wm_path_var.set(adv_frame.watermark_dict.get("file_path", ""))
+                    if hasattr(adv_frame, 'adaptive_var'):
+                        adv_frame.adaptive_var.set(adv_frame.watermark_dict.get("adaptive", False))
+                    update_preview()
+                    self.update_task_list()
+                    self._append_info_ui(_("任务水印已更新"))
+            
+                # 计算主视频的最终渲染尺寸（严格按 crop → rotate → scale 顺序）
+                main_video_size = None
+                if task.input and os.path.exists(task.input):
+                    main_settings = task.settings
+                    # 直接获取原始尺寸（不含旋转）
+                    orig_w, orig_h = get_video_dimensions(self.ffprobe_cmd, task.input)
+                    if orig_w is not None and orig_h is not None:
+                        main_w, main_h = self.compute_final_size_with_order(orig_w, orig_h, main_settings)
+                        if main_w > 0 and main_h > 0:
+                            main_video_size = (main_w, main_h)
+            
+                self.edit_video_settings(
+                    title="编辑任务水印",
+                    initial_settings=task_watermark,
+                    on_save=on_save,
+                    file_path=task_watermark.get("file_path"),
+                    is_watermark=True,
+                    parent=win,
+                    track_obj=None,
+                    canvas_file=task.input,
+                    main_video_size=main_video_size
+                )
+            
+            # 替换 水印按钮的命令
+            if hasattr(adv_frame, 'watermark_btn'):
+                adv_frame.watermark_btn.config(command=open_task_watermark)
+            
+
+            # ---- 命令预览区和 update_preview 函数 ----
+            preview_frame = ttk.LabelFrame(win, text=_("新命令预览"), padding="5")
+            preview_frame.pack(fill=tk.X, pady=5, padx=5)
+            preview_text = scrolledtext.ScrolledText(preview_frame, height=10, wrap=tk.WORD)
+            preview_text.pack(fill=tk.BOTH, expand=True)
+            
+            # 根据全局开关设置初始状态
+            if hasattr(self, 'preview_editable_var') and self.preview_editable_var.get():
+                preview_text.config(state='normal')
+            else:
+                preview_text.config(state='disabled')
+            
+            def update_preview(*args):
+
+                current_state = preview_text.cget('state')
+                if task.is_custom:
+                    # 直接显示保存的命令   # 流提取相关
+                    cmd_str = format_cmd_for_display(task.cmd)
+                    preview_text.config(state='normal')
+                    preview_text.delete(1.0, tk.END)
+                    preview_text.insert(tk.END, cmd_str)
+                    preview_text.config(state=current_state)
+                    return
+
+                new_settings = {}
+                new_settings.update(enc_frame.get_settings())
+                new_settings.update(filt_frame.get_settings())
+                new_settings.update(audio_frame.get_settings())
+                new_settings.update(trim_frame.get_settings())
+                new_settings.update(adv_frame.get_settings())  # 这里 adv_frame 将在后面创建，但函数定义时不会执行，所以没问题
+                new_settings["output_dir"] = out_dir_var.get()
+                new_settings["output_suffix"] = suffix_var.get()
+                new_settings["custom_output_name"] = custom_var.get()
+                new_settings["output_container"] = container_var.get()
+                # 保留水印设置
+                new_settings["watermark"] = task.settings.get("watermark", self.watermark_settings.copy())
+                new_out = self.generate_output_path(task.input, new_settings)
+                new_settings["enhance"] = filt_frame.get_enhance_settings()
+
+                new_settings["segment_enabled"] = seg_enabled_var.get()
+                new_settings["segments"] = copy.deepcopy(seg_list)
+                # 音频独立截取（从 task.settings 带入预览）
+                new_settings["audio_trim_enabled"] = task.settings.get("audio_trim_enabled", False)
+                new_settings["audio_trim_start"] = task.settings.get("audio_trim_start", "")
+                new_settings["audio_trim_end"] = task.settings.get("audio_trim_end", "")
+              #  print(f"[edit_task update_preview] 获取到 enhance = {new_settings['enhance']}")
+                try:
+                    new_cmd_list = self.generate_ffmpeg_command(task.input, new_out, new_settings, preview=True)
+                    new_cmd_str = format_cmd_for_display(new_cmd_list)
+                except ValueError as e:
+                    new_cmd_str = f"参数错误: {e}"
+            
+                # 更新预览，保持用户状态
+                current_state = preview_text.cget('state')
+                preview_text.config(state='normal')
+                preview_text.delete(1.0, tk.END)
+                preview_text.insert(tk.END, new_cmd_str)
+                preview_text.config(state=current_state)
+
+            filt_frame._preview_callback = update_preview
+            adv_frame.update_callback = update_preview
+            trim_frame.update_callback = update_preview
+
+    
+            # 绑定各种事件
+            enc_frame.vcodec.trace_add("write", update_preview)
+            enc_frame.rate_control_type.trace_add("write", update_preview)
+            enc_frame.crf_value.trace_add("write", update_preview)
+            enc_frame.cq_value.trace_add("write", update_preview)
+            enc_frame.global_quality.trace_add("write", update_preview)
+            enc_frame.bitrate_video.trace_add("write", update_preview)
+            enc_frame.preset.trace_add("write", lambda *a: update_preview())
+            filt_frame.frame_rate_type.trace_add("write", update_preview)
+            filt_frame.frame_rate_custom.trace_add("write", update_preview)
+            filt_frame.scale_enabled.trace_add("write", update_preview)
+            filt_frame.scale_width.trace_add("write", update_preview)
+            filt_frame.scale_height.trace_add("write", update_preview)
+            filt_frame.scale_method.trace_add("write", update_preview)
+            filt_frame.crop_enabled.trace_add("write", update_preview)
+            filt_frame.crop_left.trace_add("write", update_preview)
+            filt_frame.crop_top.trace_add("write", update_preview)
+            filt_frame.crop_width.trace_add("write", update_preview)
+            filt_frame.crop_height.trace_add("write", update_preview)
+            filt_frame.rotate.trace_add("write", update_preview)
+            filt_frame.vflip.trace_add("write", update_preview)
+            filt_frame.hflip.trace_add("write", update_preview)
+            filt_frame.speed_enabled.trace_add("write", update_preview)
+            filt_frame.speed_factor.trace_add("write", update_preview)
+            filt_frame.reverse_enabled.trace_add("write", update_preview)
+            filt_frame.deinterlace_filter.trace_add("write", update_preview)
+            filt_frame.pix_fmt_enabled.trace_add("write", update_preview)
+            filt_frame.pix_fmt.trace_add("write", update_preview)
+            filt_frame.subtitle_enabled.trace_add("write", update_preview)
+            filt_frame.subtitle_path.trace_add("write", update_preview)
+            audio_frame.audio_enabled.trace_add("write", update_preview)
+            audio_frame.audio_codec.trace_add("write", update_preview)
+            audio_frame.audio_bitrate.trace_add("write", update_preview)
+            audio_frame.audio_samplerate.trace_add("write", update_preview)
+            audio_frame.only_audio.trace_add("write", update_preview)
+            audio_frame.audio_format.trace_add("write", update_preview)
+            audio_frame.audio_speed_enabled.trace_add("write", update_preview)
+            audio_frame.audio_speed_factor.trace_add("write", update_preview)
+            audio_frame.audio_reverse.trace_add("write", update_preview)
+
+
+            trim_frame.trim_enabled.trace_add("write", update_preview)
+            trim_frame.trim_start.trace_add("write", update_preview)
+            trim_frame.trim_end.trace_add("write", update_preview)
+            adv_frame.hwaccel_enabled.trace_add("write", update_preview)
+            adv_frame.hwaccel_decoder.trace_add("write", update_preview)
+            adv_frame.custom_args.trace_add("write", update_preview)
+            out_dir_var.trace_add("write", update_preview)
+            suffix_var.trace_add("write", update_preview)
+            custom_var.trace_add("write", update_preview)
+            container_var.trace_add("write", update_preview)
+
+            enc_frame.tune_var.trace_add("write", update_preview)
+            enc_frame.profile_var.trace_add("write", update_preview)
+            enc_frame.level_var.trace_add("write", update_preview)
+            enc_frame.maxrate_var.trace_add("write", update_preview)
+            enc_frame.bufsize_var.trace_add("write", update_preview)
+
+            update_preview()
+
+            def save_changes():
+                # 流提取相关
+                if task.is_custom:
+                    messagebox.showinfo(_("提示"), _("此任务为流提取生成的自定义任务，不支持修改参数。"))
+                    win.destroy()
+                    return
+                new_settings = {}
+                new_settings.update(enc_frame.get_settings())
+                new_settings.update(filt_frame.get_settings())
+                new_settings.update(audio_frame.get_settings())
+                new_settings.update(trim_frame.get_settings())
+                new_settings.update(adv_frame.get_settings())
+                new_settings["output_dir"] = out_dir_var.get()
+                new_settings["output_suffix"] = suffix_var.get()
+                new_settings["custom_output_name"] = custom_var.get()
+                new_settings["output_container"] = container_var.get()
+
+                new_settings["watermark"] = adv_frame.watermark_dict.copy()  # 或直接引用
+                new_output = self.generate_output_path(task.input, new_settings)
+                new_settings["enhance"] = filt_frame.get_enhance_settings()
+
+
+                new_settings["segment_enabled"] = seg_enabled_var.get()
+                new_settings["segments"] = copy.deepcopy(seg_list)
+                # 音频独立截取（由 SegmentEditor 写入 task.settings，需保留到 new_settings）
+                new_settings["audio_trim_enabled"] = task.settings.get("audio_trim_enabled", False)
+                new_settings["audio_trim_start"] = task.settings.get("audio_trim_start", "")
+                new_settings["audio_trim_end"] = task.settings.get("audio_trim_end", "")
+                try:
+                    new_cmd_list = self.generate_ffmpeg_command(task.input, new_output, new_settings, task)
+                except ValueError as e:
+                    messagebox.showerror(_("参数错误"), str(e))
+                    return
+                task.settings = new_settings
+                task.output = new_output
+                task.cmd = new_cmd_list
+                task.status = "等待"
+                self.update_task_list()
+                win.destroy()
+                self._append_info_ui(_("已编辑任务: {0}".format(os.path.basename(task.input))))
+    
+            btn_frame = ttk.Frame(win)
+            btn_frame.pack(pady=(5,10))
+            ttk.Button(btn_frame, text=_("保存修改"), command=save_changes).pack(side=tk.LEFT, padx=5)
+            ttk.Button(btn_frame, text=_("取消"), command=win.destroy).pack(side=tk.LEFT, padx=5)
+
+
+            win.wait_window()
+
+    def _on_task_watermark_saved(self, task, new_wm):
+        old_adaptive = task.settings.get("watermark", {}).get("adaptive", True)
+        new_wm["adaptive"] = old_adaptive
+        task.settings["watermark"] = new_wm
+        self.update_task_list()
+        self._append_info_ui(_("任务水印已更新"))
+
+    def on_task_double_click(self, event):
+        selected = self.task_tree.selection()
+        if not selected:
+            return
+        idx = int(selected[0])
+        self.edit_task(self.tasks[idx], idx)
+
+    # ==================== 封装/合并模块 ====================
+    def create_merge_tab(self, parent):
+        # 主视频文件行
+        f1 = ttk.Frame(parent)
+        f1.pack(fill=tk.X, pady=5)
+        ttk.Label(f1, text=_("主视频文件:")).pack(side=tk.LEFT)
+        ttk.Entry(f1, textvariable=self.merge_video).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(f1, text=_("浏览"), command=self.merge_select_video).pack(side=tk.RIGHT, padx=(2,15))
+    
+        if DND_AVAILABLE:
+            label_text = _("轨道列表（支持批量拖拽添加文件）")
+        else:
+            label_text = _("轨道列表")
+        ttk.Label(parent, text=label_text).pack(anchor=tk.W, pady=(0,2))
+    
+        # 轨道列表（Treeview）
+        list_container = ttk.Frame(parent)
+        list_container.pack(fill=tk.BOTH, expand=True, padx=(5,0), pady=(0,0))
+#         list_container.pack_propagate(False)
+#         min_height = int(400 * self.scaling)
+#         list_container.config(height=min_height)
+    
+        # 工具栏
+        tool_frame = ttk.Frame(list_container)
+        tool_frame.pack(fill=tk.X, pady=2)
+        ttk.Button(tool_frame, text=_("启用/禁用"), command=self.merge_toggle_selected, width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text=_("编辑"), command=self.merge_edit_selected, width=8).pack(side=tk.LEFT, padx=2)
+        btn_merge_preview = ttk.Button(tool_frame, text=_("预览"), command=self.merge_preview_selected, width=8)
+        btn_merge_preview.pack(side=tk.LEFT, padx=2)
+        # 左键=旧预览（无快照）；右键=带真实合成快照的预览
+        btn_merge_preview.bind("<Button-3>", lambda e: self.merge_preview_selected(with_snapshot=True))
+        ToolTip(btn_merge_preview, _("左键：常规预览（无快照）\n右键：预览 + 画中画真实合成快照（独立窗口）"), wraplength=320)
+        ttk.Button(tool_frame, text=_("上移"), command=self.merge_move_up_selected, width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text=_("下移"), command=self.merge_move_down_selected, width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text=_("删除"), command=self.merge_delete_selected, width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text=_("清空"), command=self.merge_clear_tracks, width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text=_("恢复列宽"), command=self.merge_reset_column_widths, width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text=_("排序"), command=self._merge_sort_ask, width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text=_("更多 ▼"), command=self._merge_popup_more_menu).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text=_("💾 保存项目"), command=self.save_merge_project).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tool_frame, text=_("📂 加载项目"), command=self.load_merge_project).pack(side=tk.LEFT, padx=2)
+    
+        # 自定义样式
+        merge_style = ttk.Style()
+        merge_style.configure("Merge.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0", rowheight=self.tree_rowheight, font=("Microsoft YaHei", 9))
+        merge_style.configure("Merge.Treeview.Heading", background="#d9d9d9", font=("Microsoft YaHei", 9))
+
+        merge_style.map("Merge.Treeview",
+                        background=[('selected', '#3475b5')],
+                        foreground=[('selected', 'white')],
+                        fieldbackground=[('selected', '#3475b5')])
+
+        # 创建 Treeview（只一次）
+        columns = ("序号", "启用", "类型", "规格", "编码", "来源 - 双击编辑 右键更多", "编码设置")
+        self.merge_tree = ttk.Treeview(list_container, columns=columns, show="headings",
+                                       height=8, style="Merge.Treeview")
+        self.merge_tree.heading("序号", text=_("序号"))
+        self.merge_tree.heading("启用", text=_("启用"))
+        self.merge_tree.heading("类型", text=_("类型"))
+        self.merge_tree.heading("规格", text=_("规格"))
+        self.merge_tree.heading("编码", text=_("编码"))
+        self.merge_tree.heading("来源 - 双击编辑 右键更多", text=_("来源 - 双击编辑 右键更多"))
+        self.merge_tree.heading("编码设置", text=_("编码设置"))
+        self.merge_tree.column("序号", width=10, anchor="center")
+        self.merge_tree.column("启用", width=5, anchor="center")
+        self.merge_tree.column("类型", width=30)
+        self.merge_tree.column("规格", width=220)
+        self.merge_tree.column("编码", width=20)
+        self.merge_tree.column("来源 - 双击编辑 右键更多", width=380)
+        self.merge_tree.column("编码设置", width=60)
+        self.merge_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    
+        # 滚动条
+        vbar = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=self.merge_tree.yview)
+        self.merge_tree.configure(yscrollcommand=vbar.set)
+        vbar.pack(side=tk.RIGHT, fill=tk.Y)
+    
+        # 绑定双击编辑
+        self.merge_tree.bind("<Double-1>", self.merge_on_tree_double_click)
+        self.merge_tree.bind("<Button-3>", self._show_merge_tree_context_menu)
+    
+
+        btn_frame = ttk.Frame(parent)
+        btn_frame.pack(fill=tk.X, pady=5)
+        ttk.Button(btn_frame, text=_("添加外部音轨"), command=lambda: self.merge_add_external("audio")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text=_("添加外部字幕"), command=lambda: self.merge_add_external("subtitle")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text=_("清空轨道"), command=self.merge_clear_tracks).pack(side=tk.LEFT, padx=2)
+        self.pip_enabled = tk.BooleanVar(value=False)
+        pip_chk = ttk.Checkbutton(btn_frame, text=_("启用画中画"), variable=self.pip_enabled)
+        pip_chk.pack(side=tk.LEFT, padx=5)
+        ToolTip(pip_chk,
+                _("「画中画」可将多个视频/图片叠加到主画面上，适合：\n"
+                "• 多机位舞台合成（多角度同屏）\n"
+                "• 制作对比演示、分镜效果或画中画解说\n"
+                "• 图片作为背景或角标（动态图片支持循环）\n\n"
+                "启用后，所有视频流将强制重新编码（无法使用 copy），\n"
+                "    输出时长默认由主视频决定，您也可以开启「手动时长」精确控制。\n\n"
+                "提示：每个视频轨道都可独立设置位置、大小、透明度、绿幕抠像等。\n"
+                "    画中画模式每个音频的倒放是独立的。\n\n"
+                "该模式下的主视频偏移页有友好操作按钮，可自动计算平铺，\n方便用户把多个视频左右或上下平铺拼接等。\n\n"
+                "提示2：画中画拖拽额外支持文件夹解析。"),
+                wraplength=700)
+
+        self.concat_enabled = tk.BooleanVar(value=False)
+        concat_chk = ttk.Checkbutton(btn_frame, text=_("串行合并（首尾拼接）"), variable=self.concat_enabled)
+        concat_chk.pack(side=tk.LEFT, padx=5)
+        ToolTip(concat_chk,
+                _("将多个视频按顺序首尾拼接，适用于合并剧集、连续片段等。\n\n"
+                "【流复制模式（编码器 = copy）】\n"
+                "• 此模式要求所有输入视频的编码参数【完全一致】，包括：\n"
+                "  - 视频编码格式（如 H.264 / HEVC）、分辨率（宽×高）、帧率（fps）\n"
+                "  - 像素格式（如 yuv420p）、采样纵横比（SAR）、时间基（timebase）\n"
+                "• 若参数不一致，可能出现：\n"
+                "  - 拼接处播放速度异常（过快/过慢）\n"
+                "  - 音画不同步、画面花屏或卡顿、部分播放器无法正常播放\n"
+                "• 适合流复制模式的常见情况：\n"
+                "  - 同一设备或软件连续录制的分段文件（如 GoPro、行车记录仪）\n"
+                "  - 同一来源压制、参数相同的剧集或系列视频\n"
+                "  - 同一个视频文件的循环拼接（如片头/背景）\n"
+                "• 建议：若不确定文件参数是否一致，或者串接后不满意，请使用【重新编码模式】。\n\n"
+                "【重新编码模式（编码器 ≠ copy）】\n"
+                "• 为提高兼容性，建议所有源文件分辨率保持一致；若不同，系统会自动统一为主视频缩放尺寸，但可能影响画质。\n"
+                "• 子视频可单独应用所有滤镜(除了字幕)\n"
+                "• 音频的变速、倒放均为独立控制，每轨单独设置，不再跟随视频参数；截取由各音频轨道单独控制。\n\n"
+                "• 若文件数量众多，重新编码会消耗较多时间，也可预先用 FFmpeg 统一转码后再使用流复制模式。\n\n"
+                "提示：串行合并拖拽额外支持文件夹解析。"),
+                wraplength=700)
+
+        ttk.Button(btn_frame, text=_("添加外部视频（画中画/串行）"), 
+            command=self.merge_add_external_video).pack(side=tk.LEFT, padx=2)
+
+        # ----- 手动时长控制 -----
+        # 变量定义
+        self.merge_manual_duration_enabled = tk.BooleanVar(value=False)
+        self.merge_manual_duration = tk.StringVar(value="")
+        # UI 控件
+        ttk.Separator(btn_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=(20,5))
+        chk_manual = ttk.Checkbutton(btn_frame, text=_("手动时长"), 
+                                     variable=self.merge_manual_duration_enabled,
+                                     command=lambda: self.merge_update_command_preview())
+        chk_manual.pack(side=tk.LEFT, padx=2)
+
+        ToolTip(chk_manual,
+            _("勾选后，将使用您输入的时长作为输出总时长（手动 -t）。\n\n"
+            "主要用途：作为应急保险，防止因滤镜循环或参数不当导致输出无限延长（尤其是画中画模式）。\n\n"
+            "次要用途：可以手动设置 -t 10 转换个10秒片段查看结果，预览命令里水印只有占位框。\n\n"
+            "「视频转码」页面可使用自定义参数 -t 实现同功能。"),
+            wraplength=600
+        )
+
+
+        self.merge_manual_duration_entry = ttk.Entry(btn_frame, 
+                                                     textvariable=self.merge_manual_duration,
+                                                     width=8)
+        self.merge_manual_duration_entry.pack(side=tk.LEFT, padx=2)
+        ttk.Label(btn_frame, text=_("秒 (覆盖自动时长)")).pack(side=tk.LEFT, padx=0)
+
+
+
+        # 绑定输入变化刷新预览
+        self.merge_manual_duration.trace_add('write', lambda *a: self.merge_update_command_preview())
+
+
+
+        chapter_frame = ttk.LabelFrame(parent, text=_("章节处理"), padding="3")
+        chapter_frame.pack(fill=tk.X, pady=5)
+        chapter_row = ttk.Frame(chapter_frame)
+        chapter_row.pack(fill=tk.X, padx=5, pady=(0,2))
+        copy_chapters_cb = ttk.Checkbutton(
+            chapter_row, text=_("从源文件复制章节"),
+            variable=self.copy_chapters
+        )
+        copy_chapters_cb.pack(side=tk.LEFT, padx=(0, 12))
+        ToolTip(copy_chapters_cb,
+                _("从源文件复制章节 (map_chapters):\n"
+                "将第一个输入源文件的章节标记原样复制到输出文件。\n"
+                "适用于源文件已有章节信息的场景。"),
+                wraplength=380)
+        # "生成章节" 复选框（仅串行模式可用）
+        gen_chapters_cb = ttk.Checkbutton(
+            chapter_row, text=_("生成章节"),
+            variable=self.generate_chapters
+        )
+        gen_chapters_cb.pack(side=tk.LEFT, padx=(0, 12))
+        self._gen_chapters_cb = gen_chapters_cb  # 保存引用以便 concat toggle 控制
+        ToolTip(gen_chapters_cb,
+                _("自动生成章节 (generate chapters):\n"
+                "串行合并模式下，根据每个视频轨道的「章节标签」自动生成章节标记。\n"
+                "需先在对应视频/音频轨道的元数据中设置「章节标签」。不写会自动写作片段。\n"
+                "章节起始时间自动累加计算，无需手动编写 FFmetadata 文件。"),
+                wraplength=380)
+        # 初始状态：非串行模式灰色
+        if not self.concat_enabled.get():
+            gen_chapters_cb.config(state='disabled')
+        right_area = ttk.Frame(chapter_row)
+        right_area.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        import_label = ttk.Label(right_area, text=_("导入外部章节:"))
+        import_label.pack(side=tk.LEFT)
+        ToolTip(import_label,
+                _("导入外部章节 (FFmetadata):\n"
+                "从外部 FFmetadata 格式文件导入章节标记。\n"
+                "与「从源文件复制章节」互斥：选择文件后自动取消复制。\n"
+                "FFmetadata 格式示例：\n"
+                ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=5000\ntitle=第一章"),
+                wraplength=380)
+        chapter_entry = ttk.Entry(right_area, textvariable=self.chapter_file)
+        chapter_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(
+            right_area, text=_("浏览..."), command=self.browse_chapter_file, width=10
+        ).pack(side=tk.LEFT, padx=(0, 5))
+
+        row_frame = ttk.Frame(parent)
+        row_frame.pack(fill=tk.X, pady=2)
+        left_container = ttk.Frame(row_frame)
+        left_container.pack(side=tk.LEFT, padx=(5, 5))
+        ttk.Label(left_container, text=_("输出容器:")).pack(side=tk.LEFT)
+        container_combo = ttk.Combobox(
+            left_container, textvariable=self.merge_container,
+            values=["mkv", "mp4", "webm"], state="readonly", width=8
+        )
+        container_combo.pack(side=tk.LEFT, padx=5)
+        container_combo.bind("<<ComboboxSelected>>", lambda e: self.merge_update_output_preview())
+        
+        right_container = ttk.Frame(row_frame)
+        right_container.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(right_container, text=_("输出文件:")).pack(side=tk.LEFT)
+        ttk.Entry(right_container, textvariable=self.merge_output).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=5
+        )
+        ttk.Button(
+            right_container, text=_("浏览..."),
+            command=self.merge_select_output, width=10
+        ).pack(side=tk.LEFT, padx=(0, 15))
+
+        opt_action_frame = ttk.Frame(parent)
+        opt_action_frame.pack(fill=tk.X, pady=2)
+        
+        ttk.Checkbutton(
+            opt_action_frame, text=_("合并成功后删除源文件"), variable=self.merge_delete_source
+        ).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Checkbutton(
+            opt_action_frame, text=_("验证输出文件"), variable=self.merge_verify
+        ).pack(side=tk.LEFT, padx=5)
+
+        self.merge_only_audio = tk.BooleanVar(value=False)
+        self.only_audio_checkbox = ttk.Checkbutton(
+            opt_action_frame, 
+            text=_("仅音频"), 
+            variable=self.merge_only_audio,
+            command=self.merge_update_command_preview
+        )
+        self.only_audio_checkbox.pack(side=tk.LEFT, padx=(5,50))
+        ToolTip(
+            self.only_audio_checkbox,
+            _("仅音频（简易实现）：输出纯音频文件（无视频流）。\n\n"
+            "核心目的：将多个音频轨道进行混合（amix），各轨道仍可单独调节音量、截取或倒放。\n"
+            "    若只需提取单音轨，请优先使用转码页面的仅音频功能。\n\n"
+            "使用说明：\n"
+            "• 本功能依赖「主视频」作为参数占位（简易实现，未完全重构生成逻辑），\n"
+            "  您可随意拖入一个视频文件作为占位，并删除或禁用其音频轨道，\n"
+            "  然后添加需要处理的音频轨道，待所有音频设置完成后再勾选此选项执行。\n"
+            "  注意：请记得修改输出文件名。\n\n"
+            "• 仅普通封装模式（非画中画/串行合并）下可用；\n"
+            "  若勾选画中画或串行合并，此选项会自动禁用并取消勾选。\n\n"
+            "• 输出文件扩展名将自动调整为 .m4a（或根据所选容器生成）。\n"
+            "  若扩展名不符，可手动修改后复制到快速命令区运行。"),
+            wraplength=600
+        )
+        
+        # 增加状态联动：当画中画或串行合并模式变化时，禁用/启用该复选框
+        def _update_only_audio_state(*args):
+            if self.pip_enabled.get() or self.concat_enabled.get():
+                self.merge_only_audio.set(False)
+                self.only_audio_checkbox.config(state='disabled')
+                self._append_info_ui(_("[封装] 画中画/串行合并模式下不支持仅音频，已自动禁用"))
+            else:
+                self.only_audio_checkbox.config(state='normal')
+            # 仅音频模式即使没有主视频也刷新预览；普通模式需主视频已设置
+            if self.merge_only_audio.get() or self.merge_video.get().strip():
+                self.root.after(40, self.merge_update_command_preview)
+        
+        self.pip_enabled.trace_add('write', _update_only_audio_state)
+        self.concat_enabled.trace_add('write', _update_only_audio_state)
+
+
+        self.merge_btn = tk.Button(opt_action_frame, text=_("开始合并"), command=self.merge_start,
+                                   height=1, width=12, bg="#4CAF50", fg="white")
+        self.merge_btn.pack(side=tk.LEFT, padx=5)
+
+        btn_refresh_merge = tk.Button(opt_action_frame, text=_("刷新命令"), 
+                                      command=self.merge_update_command_preview,
+                                      height=1, width=12, relief=tk.RAISED)
+        btn_refresh_merge.pack(side=tk.LEFT, padx=5)
+        
+        btn_copy = tk.Button(opt_action_frame, text=_("复制命令"), command=self.merge_copy_command,
+                             height=1, width=12, relief=tk.RAISED)
+        btn_copy.pack(side=tk.LEFT, padx=5)
+
+        preview_frame = ttk.LabelFrame(parent, text=_("即将执行的命令预览"), padding="0")
+        preview_frame.pack(fill=tk.BOTH, expand=True, padx=(5,0), pady=5)
+        content_frame = ttk.Frame(preview_frame)
+        content_frame.pack(fill=tk.BOTH, expand=True)
+        self.merge_cmd_preview = scrolledtext.ScrolledText(
+            content_frame, height=1, wrap=tk.WORD, font=("Microsoft YaHei", 9)
+        )
+        self.merge_cmd_preview.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=0)
+
+
+        self.merge_video.trace_add("write", lambda *a: self.merge_load_video_info())
+        self.merge_container.trace_add("write", lambda *a: self.merge_update_command_preview())
+        self.merge_output.trace_add("write", lambda *a: self.merge_update_command_preview())
+        self.copy_chapters.trace_add("write", lambda *a: self.merge_update_command_preview())
+        self.chapter_file.trace_add("write", lambda *a: self.merge_update_command_preview())
+        self.generate_chapters.trace_add("write", lambda *a: self.merge_update_command_preview())
+
+        self.pip_enabled.trace_add('write', self._on_pip_toggle)
+        self.concat_enabled.trace_add('write', self._on_concat_toggle)
+
+
+    def _merge_sort_ask(self):
+        """弹出询问框，选择排序方式（仅在串行合并模式下可用）"""
+        if not self.concat_enabled.get():
+            messagebox.showinfo(_("提示"), _("排序功能仅在「串行合并（首尾拼接）」模式下可用。\n请先勾选「串行合并（首尾拼接）」选项。"))
+            return
+        result = messagebox.askyesno(_("排序方式"), _("按文件名排序？\n（选“是”按文件名，选“否”按修改时间）"))
+        if result:
+            self.merge_sort_by_filename()
+        else:
+            self.merge_sort_by_mtime()
+
+
+    def _show_merge_tree_context_menu(self, event):
+        """右键事件触发，显示菜单"""
+        item = self.merge_tree.identify_row(event.y)
+        if not item:
+            return
+        if item not in self.merge_tree.selection():
+            self.merge_tree.selection_set(item)
+        self._popup_merge_tree_menu(event.x_root, event.y_root)
+    
+    def _popup_merge_tree_menu(self, x, y):
+        """在指定位置弹出轨道菜单（复用于按钮）"""
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label=_("复制滤镜设置"), command=self._copy_filter_from_selected)
+        if self._clipboard_filter_params is not None:
+            menu.add_command(label=_("粘贴滤镜设置"), command=self._paste_filter_to_selected)
+        else:
+            menu.add_command(label=_("粘贴滤镜设置"), state="disabled")
+        menu.add_command(label=_("还原滤镜设置"), command=self._reset_filter_settings)
+        menu.add_separator()
+        # V→A 专用：把视频轨的截取/变速/倒放一次性应用到音频轨（粘贴后可自由取消）
+        if self._has_selected_video_track():
+            menu.add_command(label=_("复制 截取/变速/倒放 (V→A)"), command=self._copy_va_filter_from_selected)
+        else:
+            menu.add_command(label=_("复制 截取/变速/倒放 (V→A)"), state="disabled")
+        if self._clipboard_va_filter is not None:
+            menu.add_command(label=_("粘贴 截取/变速/倒放 (V→A)"), command=self._paste_va_filter_to_selected)
+        else:
+            menu.add_command(label=_("粘贴 截取/变速/倒放 (V→A)"), state="disabled")
+        # 批量：选中同源音频轨（或对应视频轨）各自套用对应视频轨的截取/变速/倒放（越界自动钳制）
+        menu.add_command(label=_("同源音频批量套用同源视频 T S R (V → A)"), command=self._batch_apply_src_video_to_audio)
+        menu.add_separator()
+        menu.add_command(label=_("启用/禁用"), command=self.merge_toggle_selected)
+        menu.add_command(label=_("编辑轨道"), command=self.merge_edit_selected)
+        menu.add_command(label=_("预览轨道"), command=self.merge_preview_selected)
+        menu.add_command(label=_("预览轨道(快照)"), command=lambda: self.merge_preview_selected(with_snapshot=True))
+        menu.add_command(label=_("上移轨道"), command=self.merge_move_up_selected)
+        menu.add_command(label=_("下移轨道"), command=self.merge_move_down_selected)
+        menu.add_command(label=_("删除轨道"), command=self.merge_delete_selected)
+#        menu.add_command(label="清空轨道", command=self.merge_clear_tracks)
+#        menu.add_command(label="串行合并排序", command=self._merge_sort_ask)
+#        menu.add_command(label="保存项目", command=self.save_merge_project)
+#        menu.add_command(label="加载项目", command=self.load_merge_project)
+        menu.add_separator()
+        menu.add_command(label=_("恢复列宽"), command=self.merge_reset_column_widths)
+        menu.post(x, y)
+    
+    def _merge_popup_more_menu(self):
+        x = self.root.winfo_pointerx()
+        y = self.root.winfo_pointery()
+        self._popup_merge_tree_menu(x, y)
+
+    def _copy_filter_from_selected(self):
+        """从选中的第一个轨道复制滤镜参数。
+
+        采用「默认全复制 + 显式排除」策略：遍历 enc_settings，仅跳过
+        _COPY_FILTER_EXCLUDE_KEYS 中声明的结构/身份/编码器/运行时键，
+        其余键（含新增滤镜参数）一律复制。深拷贝字典/列表避免共享引用。
+        """
+        selected = self.merge_tree.selection()
+        if not selected:
+            return
+        idx = int(selected[0].split('_')[1])
+        if idx >= len(self.merge_tracks):
+            return
+        track = self.merge_tracks[idx]
+        track_type = track.type
+
+        params = {}
+        for key, val in track.enc_settings.items():
+            if key in _COPY_FILTER_EXCLUDE_KEYS:
+                continue
+            if val is None:
+                continue
+            if isinstance(val, (dict, list)):
+                params[key] = copy.deepcopy(val)   # 深拷贝字典/列表，避免共享引用
+            else:
+                params[key] = val
+
+        self._clipboard_filter_params = {
+            "type": track_type,
+            "params": params
+        }
+        self._append_info_ui(_("已复制 {0} 滤镜设置: {1}".format(track_type, os.path.basename(track.file_path))))
+    
+    def _paste_filter_to_selected(self):
+        """将剪贴板中的滤镜参数粘贴到选中的轨道（跳过 None 值）"""
+        if self._clipboard_filter_params is None:
+            return
+        selected = self.merge_tree.selection()
+        if not selected:
+            messagebox.showinfo(_("提示"), _("请先选择要应用滤镜的目标轨道"))
+            return
+        
+        clip_type = self._clipboard_filter_params["type"]
+        clip_params = self._clipboard_filter_params["params"]
+        
+        applied_count = 0
+        for iid in selected:
+            idx = int(iid.split('_')[1])
+            if idx >= len(self.merge_tracks):
+                continue
+            track = self.merge_tracks[idx]
+            if track.type != clip_type:
+                self._append_info_ui(_("跳过 {0} 轨道（类型不匹配）".format(track.type)))
+                continue
+            
+            # 应用参数，跳过 None
+            for key, value in clip_params.items():
+                if value is None:
+                    continue  # 跳过 None，保留目标原有值
+                if key == "enhance":
+                    track.enc_settings[key] = copy.deepcopy(value)
+                else:
+                    track.enc_settings[key] = value
+            
+            # 同步视频轨道的独立属性
+            if track.type == "video":
+                track.overlay_enabled = track.enc_settings.get("overlay_enabled", False)
+                track.overlay_x = track.enc_settings.get("overlay_x", "W-w-10")
+                track.overlay_y = track.enc_settings.get("overlay_y", "H-h-10")
+                track.pad_enabled = track.enc_settings.get("pad_enabled", False)
+                track.pad_width = track.enc_settings.get("pad_width", "")
+                track.pad_height = track.enc_settings.get("pad_height", "")
+                track.offset_x = track.enc_settings.get("offset_x", "0")
+                track.offset_y = track.enc_settings.get("offset_y", "0")
+            
+            applied_count += 1
+        
+        if applied_count:
+            self._append_info_ui(_("已将滤镜设置应用到 {0} 个轨道".format(applied_count)))
+            self.merge_update_track_list()
+            self.merge_update_command_preview()
+        else:
+            self._append_info_ui(_("没有可应用的轨道（类型不匹配或已跳过）"))
+
+    def _has_selected_video_track(self):
+        """选中轨道中是否存在视频轨道（V→A 复制菜单启用判断）"""
+        for iid in self.merge_tree.selection():
+            idx = int(iid.split('_')[1])
+            if idx < len(self.merge_tracks) and self.merge_tracks[idx].type == "video":
+                return True
+        return False
+
+    def _copy_va_filter_from_selected(self):
+        """从选中的第一个视频轨道复制「截取/变速/倒放」到 V→A 专用剪贴板。
+
+        只快照三组参数（映射到音频键名），不动其它滤镜；粘贴后音频仍可自由修改。
+        """
+        selected = self.merge_tree.selection()
+        if not selected:
+            return
+        src = None
+        for iid in selected:
+            idx = int(iid.split('_')[1])
+            if idx < len(self.merge_tracks) and self.merge_tracks[idx].type == "video":
+                src = self.merge_tracks[idx]
+                break
+        if src is None:
+            self._append_info_ui(_("请先选择视频轨道再复制 (V→A)"))
+            return
+        es = src.enc_settings
+        self._clipboard_va_filter = {
+            "trim_enabled": es.get("trim_enabled", False),
+            "trim_start": es.get("trim_start", ""),
+            "trim_end": es.get("trim_end", ""),
+            "precise_trim": es.get("precise_trim", False),
+            "speed_enabled": es.get("speed_enabled", False),
+            "speed_factor": es.get("speed_factor", "1.0"),
+            "reverse_enabled": es.get("reverse_enabled", False),
+        }
+        self._append_info_ui(_("已复制视频截取/变速/倒放 (V→A): {0}").format(os.path.basename(src.file_path)))
+
+    def _paste_va_filter_to_selected(self):
+        """把 V→A 剪贴板粘贴到选中的音频轨道。
+
+        写入明确值（等价于用户自己重新设置一次截取/变速/倒放），粘贴后可自由取消。
+        安全保护：音频源时长小于视频截取时间点时先告警，由用户决定是否仍要粘贴。
+        """
+        if self._clipboard_va_filter is None:
+            return
+        selected = self.merge_tree.selection()
+        if not selected:
+            messagebox.showinfo(_("提示"), _("请先选择要应用的目标音频轨道"))
+            return
+        clip = self._clipboard_va_filter
+
+        # —— 安全保护：时长越界告警（一次确认，确定则全部粘贴，取消则中止）——
+        if clip.get("trim_enabled"):
+            bad = []
+            for iid in selected:
+                idx = int(iid.split('_')[1])
+                if idx >= len(self.merge_tracks):
+                    continue
+                t = self.merge_tracks[idx]
+                if t.type != "audio":
+                    continue
+                dur = self._get_media_duration(t.file_path)
+                if dur is None:
+                    continue
+                try:
+                    start = time_to_seconds(clip.get("trim_start", "").strip()) if clip.get("trim_start") else 0.0
+                    end = time_to_seconds(clip.get("trim_end", "").strip()) if clip.get("trim_end") else None
+                except Exception:
+                    start, end = 0.0, None
+                if end is not None and end > dur:
+                    bad.append((os.path.basename(t.file_path), dur, end))
+                elif start > dur:
+                    bad.append((os.path.basename(t.file_path), dur, start))
+            if bad:
+                fname, dur, tsec = bad[0]
+                if not messagebox.askyesno(
+                    _("时长超出告警"),
+                    _("音频轨 {0} 的源时长只有 {1:.1f} 秒，\n"
+                      "而视频截取时间点为 {2:.1f} 秒，超出音频时长，\n"
+                      "粘贴后 atrim 可能报错或产生静音。\n\n"
+                      "仍要粘贴吗？").format(fname, dur, tsec)):
+                    self._append_info_ui(_("已取消粘贴 (V→A)（音频时长不足）"))
+                    return
+
+        applied_count = 0
+        for iid in selected:
+            idx = int(iid.split('_')[1])
+            if idx >= len(self.merge_tracks):
+                continue
+            track = self.merge_tracks[idx]
+            if track.type != "audio":
+                self._append_info_ui(_("跳过 {0} 轨道（仅音频轨可粘贴 V→A）").format(track.type))
+                continue
+            es = track.enc_settings
+            # 写明确值：等价于用户手动重新设置，未勾选也显式写 False，可自由取消
+            es["trim_enabled"] = clip.get("trim_enabled", False)
+            es["trim_start"] = clip.get("trim_start", "")
+            es["trim_end"] = clip.get("trim_end", "")
+            es["precise_trim"] = clip.get("precise_trim", False)
+            es["audio_speed_enabled"] = clip.get("speed_enabled", False)
+            es["audio_speed_factor"] = clip.get("speed_factor", "1.0")
+            es["audio_reverse"] = clip.get("reverse_enabled", False)
+            applied_count += 1
+
+        if applied_count:
+            self._append_info_ui(_("已将视频截取/变速/倒放应用到 {0} 个音频轨道（可自由取消）").format(applied_count))
+            self.merge_update_track_list()
+            self.merge_update_command_preview()
+        else:
+            self._append_info_ui(_("没有可应用的音频轨道"))
+
+    def _find_src_video_track(self, audio_track):
+        """返回与音频轨同源（file_path 相同）的启用视频轨；没有则返回 None。
+
+        仅在「同源音频轨」（拖入视频文件时选添加音频的轨道）才有对应视频轨；
+        外部单独拖入的纯音频文件无对应视频轨。
+        """
+        if audio_track.type != "audio":
+            return None
+        for t in self.merge_tracks:
+            if t.type == "video" and t.enabled and t.file_path == audio_track.file_path:
+                return t
+        return None
+
+    def _batch_apply_src_video_to_audio(self):
+        """批量：把选中的同源音频轨各自套用对应视频轨的截取/变速/倒放。
+
+        仅作用于当前选中的轨道（选中音频轨取其同源视频；选中视频轨取其同源音频），
+        不影响其他未选中的轨道。写入明确值（等价于用户手动重新设置，可自由取消）。
+        安全保护：视频截取结束时间超出音频源时长时，自动钳制到音频时长，
+        结束后一次性汇总提示被钳制的轨道（不逐条弹窗）。
+        """
+        selected = self.merge_tree.selection()
+        if not selected:
+            messagebox.showinfo(_("提示"), _("请先选择要套用的同源音频轨（或对应视频轨）"))
+            return
+        pairs = []
+        seen = set()
+        for iid in selected:
+            idx = int(iid.split('_')[1])
+            if idx >= len(self.merge_tracks):
+                continue
+            t = self.merge_tracks[idx]
+            if t.type == "audio":
+                src = self._find_src_video_track(t)
+                if src is not None and id(t) not in seen:
+                    pairs.append((t, src)); seen.add(id(t))
+            elif t.type == "video":
+                # 选中视频轨时，套用其同源（同 file_path）音频轨
+                for at in self.merge_tracks:
+                    if at.type == "audio" and at.file_path == t.file_path and id(at) not in seen:
+                        pairs.append((at, t)); seen.add(id(at))
+        if not pairs:
+            self._append_info_ui(_("所选轨道中无可套用的同源音频轨（外部音频轨请用右键『复制/粘贴 截取、变速、倒放 (V→A)』）"))
+            return
+
+        clamped = []
+        for a, s in pairs:
+            ss = s.enc_settings
+            trim_enabled = ss.get("trim_enabled", False)
+            trim_start = ss.get("trim_start", "")
+            trim_end = ss.get("trim_end", "")
+            precise_trim = ss.get("precise_trim", False)
+            speed_enabled = ss.get("speed_enabled", False)
+            speed_factor = ss.get("speed_factor", "1.0")
+            reverse_enabled = ss.get("reverse_enabled", False)
+
+            # —— 越界钳制（仅处理 end 超出音频源时长的情况）——
+            if trim_enabled:
+                dur = self._get_media_duration(a.file_path)
+                if dur is not None:
+                    try:
+                        end = time_to_seconds(trim_end.strip()) if trim_end else None
+                        st = time_to_seconds(trim_start.strip()) if trim_start else 0.0
+                    except Exception:
+                        end, st = None, 0.0
+                    if end is not None and end > dur:
+                        new_end = dur
+                        new_start = "0" if st >= new_end else trim_start
+                        a.enc_settings.update({
+                            "trim_enabled": True,
+                            "trim_start": new_start,
+                            "trim_end": f"{new_end:.3f}",
+                            "precise_trim": precise_trim,
+                            "audio_speed_enabled": speed_enabled,
+                            "audio_speed_factor": str(speed_factor),
+                            "audio_reverse": reverse_enabled,
+                        })
+                        clamped.append((os.path.basename(a.file_path), end, dur))
+                        continue
+
+            # 正常套用（写明确值，可自由取消）
+            a.enc_settings.update({
+                "trim_enabled": trim_enabled,
+                "trim_start": trim_start,
+                "trim_end": trim_end,
+                "precise_trim": precise_trim,
+                "audio_speed_enabled": speed_enabled,
+                "audio_speed_factor": str(speed_factor),
+                "audio_reverse": reverse_enabled,
+            })
+
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+        if clamped:
+            lines = "\n".join(f"• {name}：原 {e:.1f}s → 钳制到 {d:.1f}s" for name, e, d in clamped)
+            messagebox.showinfo(
+                _("批量套用完成（部分已钳制）"),
+                _("已将 {0} 个同源音频轨套用对应视频轨的截取/变速/倒放。\n"
+                  "其中 {1} 个音频轨截取结束时间超出源时长，已自动钳制到音频时长：\n\n{2}").format(len(pairs), len(clamped), lines))
+            self._append_info_ui(_("批量同源套用完成：{0} 个，其中 {1} 个越界已钳制").format(len(pairs), len(clamped)))
+        else:
+            self._append_info_ui(_("{0} 个音频轨已套用同源视频（截取/变速/倒放，可自由取消）").format(len(pairs)))
+
+    def _reset_filter_settings(self):
+        """将选中的轨道滤镜设置重置为默认状态（清空所有滤镜）"""
+        selected = self.merge_tree.selection()
+        if not selected:
+            return
+        
+        if not messagebox.askyesno(_("确认还原"), _("将清除选中轨道的所有滤镜设置（裁剪、缩放、旋转、增强、截取、变速、倒放等），确定继续吗？")):
+            return
+        
+        # 定义各类轨道的默认值
+        video_defaults = {
+            "crop_enabled": False, "crop_left": "0", "crop_top": "0", "crop_width": "iw/2", "crop_height": "ih",
+            "scale_enabled": False, "scale_width": "", "scale_height": "", "scale_method": "width",
+            "rotate": "none", "vflip": False, "hflip": False,
+            "deinterlace_filter": "none",
+            "speed_enabled": False, "speed_factor": "1.0",
+            "reverse_enabled": False,
+            "trim_enabled": False, "trim_start": "0", "trim_end": "", "precise_trim": False,
+            "overlay_enabled": True, "overlay_x": "W-w-10", "overlay_y": "H-h-10",
+            "pad_enabled": False, "pad_width": "", "pad_height": "", "offset_x": "0", "offset_y": "0",
+            "loop_enabled": False, "loop_mode": "infinite", "loop_count": 3,
+            "chroma_enabled": False, "chroma_color": "#3fff08", "chroma_similarity": 0.3, "chroma_blend": 0.1,
+            "alpha_enabled": False, "alpha_value": 1.0, "chroma_filter_type": "chromakey",
+            "enhance": {},
+            "audio_source_type": "self",
+        }
+        audio_defaults = {
+            "trim_enabled": False, "trim_start": "0", "trim_end": "", "precise_trim": False,
+            "audio_reverse": False,
+            "audio_speed_enabled": False, "audio_speed_factor": "1.0",
+            "volume_enabled": False, "volume": 1.0,
+            "mix_enabled": False,
+        }
+        # 如果音频还有 reverse_enabled 字段（兼容），一并清除
+        audio_defaults["reverse_enabled"] = False
+        
+        applied_count = 0
+        for iid in selected:
+            idx = int(iid.split('_')[1])
+            if idx >= len(self.merge_tracks):
+                continue
+            track = self.merge_tracks[idx]
+            if track.type == "video":
+                # 重置视频轨道
+                for key, value in video_defaults.items():
+                    track.enc_settings[key] = value
+                # 同步独立属性
+                track.overlay_enabled = True
+                track.overlay_x = "W-w-10"
+                track.overlay_y = "H-h-10"
+                track.pad_enabled = False
+                track.pad_width = ""
+                track.pad_height = ""
+                track.offset_x = "0"
+                track.offset_y = "0"
+            elif track.type == "audio":
+                # 重置音频轨道
+                for key, value in audio_defaults.items():
+                    track.enc_settings[key] = value
+            else:
+                self._append_info_ui(_("跳过 {0} 轨道（不支持还原）".format(track.type)))
+                continue
+            applied_count += 1
+        
+        if applied_count:
+            self._append_info_ui(_("已还原 {0} 个轨道的滤镜设置".format(applied_count)))
+            self.merge_update_track_list()
+            self.merge_update_command_preview()
+        else:
+            self._append_info_ui(_("没有可还原的轨道"))
+
+
+
+    def merge_smart_tile(self, main_track_idx, pad_enabled_var=None, pad_width_var=None, pad_height_var=None,
+                         items_per_row=4, items_per_col=4, orientation='auto', filt_frame=None):
+        """
+        智能平铺：所有视频（主视频+子视频）统一按行列排列。
+        :param items_per_row: 横向优先时，每行视频数
+        :param items_per_col: 纵向优先时，每列视频数
+        :param orientation: 'auto' / 'horizontal' / 'vertical'
+        :param filt_frame: 可选，主视频的 VideoFilterFrame 控件，用于读取未保存的缩放/裁剪设置
+        """
+        if main_track_idx is None or main_track_idx >= len(self.merge_tracks):
+            messagebox.showerror(_("错误"), _("无效的主视频轨道索引"))
+            return
+    
+        main_track = self.merge_tracks[main_track_idx]
+        if main_track.type != "video":
+            messagebox.showerror(_("错误"), _("选中的不是视频轨道"))
+            return
+    
+        # 获取所有启用的视频轨道（排除主视频自身）
+        sub_tracks = [t for t in self.merge_tracks if t.type == "video" and t.enabled and t != main_track]
+        # 强制启用所有子视频的叠加
+        for t in sub_tracks:
+            t.enc_settings['overlay_enabled'] = True
+            t.overlay_enabled = True
+    
+        # 构建总视频列表：主视频 + 子视频
+        all_tracks = [main_track] + sub_tracks
+        n = len(all_tracks)
+        if n == 1:
+            messagebox.showinfo(_("提示"), _("没有可用于平铺的视频（至少需要一个子视频）"))
+            return
+    
+        # ---- 获取主视频渲染尺寸：优先从 filt_frame 读取实时值 ----
+        if filt_frame is not None:
+            main_settings = {
+                "crop_enabled": filt_frame.crop_enabled.get(),
+                "crop_width": filt_frame.crop_width.get(),
+                "crop_height": filt_frame.crop_height.get(),
+                "scale_enabled": filt_frame.scale_enabled.get(),
+                "scale_method": filt_frame.scale_method.get(),
+                "scale_width": filt_frame.scale_width.get(),
+                "scale_height": filt_frame.scale_height.get(),
+                "rotate": filt_frame.rotate.get()
+            }
+            orig_w, orig_h = self._cached_video_dimensions(main_track.file_path)
+            if orig_w is None or orig_h is None:
+                orig_w, orig_h = 1280, 720
+            main_w, main_h = self.compute_final_size_with_order(orig_w, orig_h, main_settings)
+        else:
+            main_w, main_h = self._get_video_render_size(main_track)
+            if main_w is None or main_h is None:
+                main_w, main_h = 1280, 720
+    
+        # ---- 获取所有子视频的渲染尺寸（仍从 enc_settings 读取） ----
+        infos = [(main_w, main_h, main_track)]
+        for t in sub_tracks:
+            w, h = self._get_video_render_size(t)
+            if w is None or h is None:
+                orig_w, orig_h = self._cached_video_dimensions(t.file_path)
+                if orig_w and orig_h:
+                    w, h = compute_rendered_size(orig_w, orig_h, t.enc_settings)
+                else:
+                    w, h = 320, 240
+            infos.append((w, h, t))
+    
+        # ---- 核心改进：方向决策与智能排列 ----
+        def calculate_layout(cols):
+            """按行优先（每行 cols 个）排列 infos，返回 (row_groups, 画布宽, 画布高)。"""
+            cols = max(1, min(cols, n))
+            rows = (n + cols - 1) // cols
+            row_groups = []
+            for r in range(rows):
+                start = r * cols
+                end = min(start + cols, n)
+                row_groups.append(infos[start:end])
+            # 计算该布局下的画布真实宽高
+            c_w = max((sum(w for w, h, t in row) for row in row_groups), default=0) if row_groups else 0
+            c_h = sum((max((h for w, h, t in row), default=0) for row in row_groups), 0) if row_groups else 0
+            return row_groups, c_w, c_h
+
+        def eval_grid(cols):
+            """评估某个列数下的布局得分：空单元格越少、画布比例越接近 16:9 越好。"""
+            _, cw, ch = calculate_layout(cols)
+            rows = (n + cols - 1) // cols
+            empty = rows * cols - n
+            ratio = (cw / ch) if ch > 0 else float('inf')
+            # 空单元格权重最高，其次看画布比例接近 16:9 程度
+            return empty * 5 + abs(ratio - 16.0 / 9.0)
+
+        if orientation == 'auto':
+            # 枚举所有可能的列数，挑「空单元格最少 + 画布比例最接近 16:9」的网格，
+            # 而不是固定用「每行/每列」微调框的 4×4（那样 n=6 会得到 4×2 留 2 空格）。
+            best = None
+            for cols in range(1, n + 1):
+                sc = eval_grid(cols)
+                if best is None or sc < best[0]:
+                    best = (sc, cols)
+            cols = best[1]
+            horizontal_priority = (calculate_layout(cols)[1] >= calculate_layout(cols)[2])
+            row_groups, canvas_w, canvas_h = calculate_layout(cols)
+        elif orientation == 'horizontal':
+            # 横排优先：用「每行」微调框作为列数（保护手动指定）
+            cols = max(1, min(items_per_row, n))
+            horizontal_priority = True
+            row_groups, canvas_w, canvas_h = calculate_layout(cols)
+        else:  # vertical 竖排优先：列数尽量少、行尽量多（由「每列」微调框换算）
+            rows = max(1, min(items_per_col, n))
+            cols = max(1, min((n + rows - 1) // rows, n))
+            horizontal_priority = False
+            row_groups, canvas_w, canvas_h = calculate_layout(cols)
+    
+        if canvas_w == 0 or canvas_h == 0:
+            messagebox.showerror(_("错误"), _("计算画布尺寸失败"))
+            return
+
+        # 偶数保险：向下取整为偶数
+        if canvas_w % 2 != 0:
+            canvas_w -= 1
+        if canvas_h % 2 != 0:
+            canvas_h -= 1
+        canvas_w = max(2, canvas_w)
+        canvas_h = max(2, canvas_h)
+    
+        # ---- 更新主视频的 pad 设置 ----
+        main_track.enc_settings['pad_enabled'] = True
+        main_track.enc_settings['pad_width'] = str(canvas_w)
+        main_track.enc_settings['pad_height'] = str(canvas_h)
+        main_track.enc_settings['offset_x'] = "0"
+        main_track.enc_settings['offset_y'] = "0"
+        main_track.pad_enabled = True
+        main_track.pad_width = str(canvas_w)
+        main_track.pad_height = str(canvas_h)
+        main_track.offset_x = "0"
+        main_track.offset_y = "0"
+        if pad_enabled_var is not None:
+            pad_enabled_var.set(True)
+        if pad_width_var is not None:
+            pad_width_var.set(str(canvas_w))
+        if pad_height_var is not None:
+            pad_height_var.set(str(canvas_h))
+    
+        # ---- 计算每行的高度（用于垂直偏移） ----
+        row_heights = []
+        for row in row_groups:
+            if row:
+                row_heights.append(max(h for w, h, t in row))
+            else:
+                row_heights.append(0)
+    
+        # ---- 更新所有视频的叠加位置 ----
+        y_offset = 0
+        for row_idx, row in enumerate(row_groups):
+            x_offset = 0
+            row_h = row_heights[row_idx]
+            for w, h, t in row:
+                if t != main_track:
+                    t.enc_settings['overlay_x'] = str(x_offset)
+                    t.enc_settings['overlay_y'] = str(y_offset)
+                    t.overlay_x = str(x_offset)
+                    t.overlay_y = str(y_offset)
+                x_offset += w
+            y_offset += row_h
+    
+        # ---- 刷新界面 ----
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+        direction_str = "横向" if horizontal_priority else "纵向"
+        self._append_info_ui(_("✅ 智能平铺完成（{0}优先）：画布 {1}x{2}，总视频 {3} 个".format(direction_str, canvas_w, canvas_h, n)))
+        messagebox.showinfo(_("成功"), _("智能平铺完成\n方向: {0}优先\n画布: {1}×{2}\n总视频数: {3}".format(direction_str, canvas_w, canvas_h, n)))
+    
+
+
+
+    def save_merge_project(self):
+        """手动保存合并项目到 .fflgproject 文件"""
+        file_path = filedialog.asksaveasfilename(
+            title="保存合并项目",
+            defaultextension=".fflgproject",
+            filetypes=[("fflgproject 项目文件", "*.fflgproject"), ("JSON 文件", "*.json"), ("所有文件", "*.*")]
+        )
+        if not file_path:
+            return
+        
+        # 构造状态字典（复用之前的序列化逻辑）
+        state = self._build_merge_state_dict()
+        
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(state, f, indent=2, ensure_ascii=False)
+            self._append_info_ui(_("✅ 项目已保存到: {0}".format(os.path.basename(file_path))))
+        except Exception as e:
+            self._append_info_ui(_("❌ 保存项目失败: {0}".format(e)))
+            messagebox.showerror(_("保存失败"), str(e))
+    
+    def _build_merge_state_dict(self):
+        state = {
+            "version": "1.0",
+            "merge_video": self.merge_video.get(),
+            "merge_output": self.merge_output.get(),
+            "merge_container": self.merge_container.get(),
+            "pip_enabled": self.pip_enabled.get(),
+            "concat_enabled": self.concat_enabled.get(),
+            "merge_only_audio": self.merge_only_audio.get(),
+            "merge_manual_duration_enabled": self.merge_manual_duration_enabled.get(),
+            "merge_manual_duration": self.merge_manual_duration.get(),
+            "copy_chapters": self.copy_chapters.get(),
+            "chapter_file": self.chapter_file.get(),
+            "generate_chapters": self.generate_chapters.get(),
+            "merge_verify": self.merge_verify.get(),
+            "merge_delete_source": self.merge_delete_source.get(),
+            "tracks": []
+        }
+        for track in self.merge_tracks:
+            if track.enc_settings.get("_placeholder", False):
+                continue
+            enc_settings_copy = track.enc_settings.copy()
+            enc_settings_copy.pop("_file_path", None)  # 移除临时字段
+            track_dict = {
+                "type": track.type,
+                "codec": track.codec,
+                "file_path": track.file_path,
+                "index": track.index,
+                "enabled": track.enabled,
+                "language": track.language,
+                "title": track.title,
+                "enc_settings": enc_settings_copy
+            }
+            state["tracks"].append(track_dict)
+        return state
+
+    def load_merge_project(self):
+        """从 .fflgproject 文件加载合并项目"""
+        # 如果有未保存的更改，提示是否保存当前项目
+        if self.merge_tracks and messagebox.askyesno(_("未保存的项目"), _("当前有轨道，是否先保存当前项目？\n（选“是”保存，选“否”直接加载新项目）")):
+            self.save_merge_project()
+            # 用户可能取消保存，但继续加载，没问题
+        
+        file_path = filedialog.askopenfilename(
+            title="加载合并项目",
+            filetypes=[("fflgproject 项目文件", "*.fflgproject"), ("JSON 文件", "*.json"), ("所有文件", "*.*")]
+        )
+        if not file_path:
+            return
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+        except Exception as e:
+            self._append_info_ui(_("❌ 读取项目文件失败: {0}".format(e)))
+            messagebox.showerror(_("读取失败"), str(e))
+            return
+        
+        # 恢复状态
+        self._restore_merge_state_dict(state)
+        self._append_info_ui(_("✅ 项目已加载: {0}".format(os.path.basename(file_path))))
+
+    def _restore_merge_state_dict(self, state):
+        self._suppress_main_video_trace = True
+        self._batch_update = True          # 抑制所有中间刷新
+        try:
+            # 恢复基本设置（先恢复 merge_video 和 merge_output）
+            self.merge_video.set(state.get("merge_video", ""))
+            self.merge_output.set(state.get("merge_output", ""))   # 直接保存的路径
+            self.merge_container.set(state.get("merge_container", "mkv"))
+            self.pip_enabled.set(state.get("pip_enabled", False))
+            self.concat_enabled.set(state.get("concat_enabled", False))
+            self.merge_only_audio.set(state.get("merge_only_audio", False))
+            self.merge_manual_duration_enabled.set(state.get("merge_manual_duration_enabled", False))
+            self.merge_manual_duration.set(state.get("merge_manual_duration", ""))
+            self.copy_chapters.set(state.get("copy_chapters", True))
+            self.chapter_file.set(state.get("chapter_file", ""))
+            self.generate_chapters.set(state.get("generate_chapters", False))
+            self.merge_verify.set(state.get("merge_verify", True))
+            self.merge_delete_source.set(state.get("merge_delete_source", False))
+    
+            # 恢复轨道
+            self.merge_tracks = []
+            for track_dict in state.get("tracks", []):
+                track = Track(
+                    track_dict["index"],
+                    track_dict["type"],
+                    track_dict["codec"],
+                    track_dict["file_path"],
+                    track_dict["enabled"],
+                    copy.deepcopy(track_dict["enc_settings"])
+                )
+                track.file_path = track_dict["file_path"]
+                track.language = track_dict.get("language", "")
+                track.title = track_dict.get("title", "")
+                if track.type == "video":
+                    track.overlay_enabled = track.enc_settings.get("overlay_enabled", False)
+                    track.overlay_x = track.enc_settings.get("overlay_x", "W-w-10")
+                    track.overlay_y = track.enc_settings.get("overlay_y", "H-h-10")
+                    track.pad_enabled = track.enc_settings.get("pad_enabled", False)
+                    track.pad_width = track.enc_settings.get("pad_width", "")
+                    track.pad_height = track.enc_settings.get("pad_height", "")
+                    track.offset_x = track.enc_settings.get("offset_x", "0")
+                    track.offset_y = track.enc_settings.get("offset_y", "0")
+                self.merge_tracks.append(track)
+    
+        finally:
+            self._suppress_main_video_trace = False
+            self._batch_update = False
+    
+        # 手动刷新（不调用 merge_update_output_preview，避免覆盖 merge_output）
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+
+    def merge_sort_tracks(self, key_func):
+        """按文件分组排序轨道（同一文件的所有轨道保持在一起）"""
+        if not self.merge_tracks:
+            self._append_info_ui(_("[排序] 轨道列表为空，无需排序"))
+            return
+    
+        # 按文件路径分组
+        file_groups = {}
+        for track in self.merge_tracks:
+            file_path = track.file_path
+            if file_path not in file_groups:
+                file_groups[file_path] = []
+            file_groups[file_path].append(track)
+    
+        # 对文件排序
+        sorted_files = sorted(file_groups.keys(), key=key_func)
+    
+        # 重建轨道列表
+        new_tracks = []
+        for f in sorted_files:
+            new_tracks.extend(file_groups[f])
+    
+        self.merge_tracks = new_tracks
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+        self._append_info_ui(_("[排序] 已按选择顺序重新排序，共 {0} 个轨道".format(len(self.merge_tracks))))
+    
+    def merge_sort_by_filename(self):
+        """按文件名自然排序（仅在串联模式下可用）"""
+    
+        def natural_key(text):
+            parts = [p for p in re.split(r'(\d+)', text) if p]  # 过滤空字符串
+            def convert(part):
+                return int(part) if part.isdigit() else part.lower()
+            return [convert(p) for p in parts]
+    
+        self.merge_sort_tracks(key_func=lambda p: natural_key(os.path.basename(p)))
+    
+    def merge_sort_by_mtime(self):
+        """按修改时间排序（仅在串联模式下可用）"""
+        def get_mtime(p):
+            try:
+                return os.path.getmtime(p)
+            except OSError:
+                return 0
+        self.merge_sort_tracks(key_func=get_mtime)
+
+
+    def _on_pip_toggle(self, *args):
+        if self.pip_enabled.get() and self.concat_enabled.get():
+            self.concat_enabled.set(False)
+        # 当画中画被禁用时（切回普通模式），重置水印提示
+        if not self.pip_enabled.get():
+            self._trim_precise_hint_shown = False
+        self.merge_update_command_preview()
+        self.merge_update_track_list()
+
+    def _on_concat_toggle(self, *args):
+        if self.concat_enabled.get() and self.pip_enabled.get():
+            self.pip_enabled.set(False)
+        if not self.concat_enabled.get():
+            self._trim_precise_hint_shown = False
+        # 控制"生成章节"复选框状态
+        if hasattr(self, '_gen_chapters_cb'):
+            state = 'normal' if self.concat_enabled.get() else 'disabled'
+            self._gen_chapters_cb.config(state=state)
+            if not self.concat_enabled.get():
+                self.generate_chapters.set(False)
+        self.merge_update_command_preview()
+        self.merge_update_track_list()
+
+    def _add_pip_video_forced(self, path, add_audio=True):
+        """
+        强制添加视频作为画中画（不弹出询问对话框）。
+        - add_audio: 是否同时添加该文件的所有音频流
+        """
+        if os.path.isdir(path):
+            self._append_info_ui(_("[封装] 忽略文件夹: {0}，请选择文件".format(os.path.basename(path))))
+            return
+        info = self._get_cached_stream_info(path)
+        if not info:
+            self._append_info_ui(_("[封装] 无法解析文件: {0}".format(path)))
+            return
+
+    
+        # 检测是否为图片
+        img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
+        is_image = os.path.splitext(path)[1].lower() in img_exts
+    
+        if is_image:
+            track = Track(0, "video", "image2", path, True)
+            track.enc_settings["scale_enabled"] = True
+            track.enc_settings["scale_width"] = "320"
+            track.enc_settings["scale_height"] = ""
+            track.enc_settings["scale_method"] = "width"
+            track.enc_settings["overlay_enabled"] = True
+            track.enc_settings["overlay_x"] = "W-w-10"
+            track.enc_settings["overlay_y"] = "H-h-10"
+            track.overlay_enabled = True
+            self.merge_tracks.append(track)
+            self._append_info_ui(_("[封装] 已添加图片水印: {0}".format(os.path.basename(path))))
+            return
+    
+        # 视频处理
+        video_streams = [s for s in info["streams"] if s.get("codec_type") == "video"]
+        if not video_streams:
+            self._append_info_ui(_("[封装] 所选文件不包含视频流"))
+            return
+    
+        # 添加视频轨道
+        s = video_streams[0]
+        track = Track(s["index"], "video", s.get("codec_name", "unknown"), path, True)
+        track.enc_settings["scale_enabled"] = True
+        track.enc_settings["scale_width"] = "320"
+        track.enc_settings["scale_height"] = ""
+        track.enc_settings["scale_method"] = "width"
+        track.enc_settings["overlay_enabled"] = True
+        track.enc_settings["overlay_x"] = "W-w-10"
+        track.enc_settings["overlay_y"] = "H-h-10"
+        track.overlay_enabled = True
+        self.merge_tracks.append(track)
+        self._append_info_ui(_("[封装] 已添加画中画视频: {0}".format(os.path.basename(path))))
+    
+        # 添加音频（如果 add_audio 为 True）
+        if add_audio:
+            audio_streams = [s for s in info["streams"] if s.get("codec_type") == "audio"]
+            for s_audio in audio_streams:
+                audio_track = Track(s_audio["index"], "audio", s_audio.get("codec_name", "unknown"), path, True)
+                self.merge_tracks.append(audio_track)
+                self._append_info_ui(_("[封装] 已添加音频流: {0}".format(s_audio.get('codec_name', 'unknown'))))
+    
+    
+    def _add_concat_video_forced(self, path):
+        """
+        强制添加视频作为串联片段（不弹出询问对话框，自动添加所有音频和字幕流）
+        """
+        if os.path.isdir(path):
+            self._append_info_ui(_("[封装] 忽略文件夹: {0}，请选择文件".format(os.path.basename(path))))
+            return
+        info = self._get_cached_stream_info(path)
+        if not info:
+            self._append_info_ui(_("[封装] 无法解析文件: {0}".format(path)))
+            return
+
+    
+        # 添加所有视频流（通常只有一个）
+        video_streams = [s for s in info["streams"] if s.get("codec_type") == "video"]
+        for s in video_streams:
+            track = Track(s["index"], "video", s.get("codec_name", "unknown"), path, True)
+            # 串联模式不需要 overlay 属性
+            self.merge_tracks.append(track)
+            self._append_info_ui(_("[封装] 已添加串联视频流: {0}".format(os.path.basename(path))))
+    
+        # 添加所有音频流
+        audio_streams = [s for s in info["streams"] if s.get("codec_type") == "audio"]
+        for s_audio in audio_streams:
+            audio_track = Track(s_audio["index"], "audio", s_audio.get("codec_name", "unknown"), path, True)
+            self.merge_tracks.append(audio_track)
+            self._append_info_ui(_("[封装] 已添加音频流: {0}".format(s_audio.get('codec_name', 'unknown'))))
+    
+        # 添加所有字幕流
+        subtitle_streams = [s for s in info["streams"] if s.get("codec_type") == "subtitle"]
+        for s_sub in subtitle_streams:
+            sub_track = Track(s_sub["index"], "subtitle", s_sub.get("codec_name", "unknown"), path, True)
+            self.merge_tracks.append(sub_track)
+            self._append_info_ui(_("[封装] 已添加字幕流: {0}".format(s_sub.get('codec_name', 'unknown'))))
+
+    def _expand_files_and_folders(self, file_paths):
+        """
+        将文件路径列表中的文件夹递归展开为所有文件路径。
+        只返回文件，不返回文件夹本身。
+        """
+        expanded = []
+        for item in file_paths:
+            if os.path.isdir(item):
+                # 递归遍历文件夹
+                for root, dirs, files in os.walk(item):
+                    for f in files:
+                        expanded.append(os.path.join(root, f))
+            else:
+                expanded.append(item)
+        return expanded
+
+
+    def _handle_drop_pip_mode(self, files):
+        """
+        画中画模式下的拖拽处理 —— 瞬间添加占位，后台解析，无卡顿。
+        - 视频文件：先添加占位轨道，后台解析后替换为真实流。
+        - 图片文件：直接添加为图片水印（无需解析，但为了统一也可占位）。
+        - 音频文件：直接添加为独立音轨（无需解析）。
+        """
+
+        if not files:
+            return
+    
+        # 展开文件夹
+        all_files = self._expand_files_and_folders(files)
+        if not all_files:
+            self._append_info_ui(_("[封装] 拖拽内容中未找到任何文件"))
+            return
+    
+        # 分类（不再判断 isdir，因为 all_files 已是文件列表）
+        video_files = []
+        audio_files = []
+        image_files = []
+        other_files = []
+        video_exts = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.ts', '.webm')
+        img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
+        audio_exts = ('.mp3', '.aac', '.m4a', '.wav', '.flac', '.ogg', '.opus', '.ac3', '.dts')
+    
+        for f in all_files:  # 注意：使用 all_files，而不是 files
+            ext = os.path.splitext(f)[1].lower()
+            if ext in video_exts:
+                video_files.append(f)
+            elif ext in img_exts:
+                image_files.append(f)
+            elif ext in audio_exts:
+                audio_files.append(f)
+            else:
+                other_files.append(f)
+    
+        # ---- 立即添加占位轨道（仅对视频文件） ----
+        original_batch = self._batch_update
+        self._batch_update = False
+        try:
+            # 图片直接添加（无需占位）
+            for img in image_files:
+                self._add_pip_video_forced(img, add_audio=False)
+            # 音频直接添加
+            for audio in audio_files:
+                self.merge_add_external("audio", audio)
+            # 视频：添加占位轨道
+            for vf in video_files:
+                track = Track(0, "video", "unknown", vf, True)
+                track.enc_settings["_placeholder"] = True
+                # 画中画默认启用叠加并缩放到320宽（与原有行为一致）
+                track.enc_settings["scale_enabled"] = True
+                track.enc_settings["scale_width"] = "320"
+                track.enc_settings["scale_height"] = ""
+                track.enc_settings["scale_method"] = "width"
+                track.enc_settings["overlay_enabled"] = True
+                track.enc_settings["overlay_x"] = "W-w-10"
+                track.enc_settings["overlay_y"] = "H-h-10"
+                track.overlay_enabled = True
+                self.merge_tracks.append(track)
+            # 立即刷新列表
+            self.merge_update_track_list()
+            if video_files:
+                self._append_info_ui(_("[封装] 已添加 {0} 个视频文件（正在后台解析…）".format(len(video_files))))
+            if image_files:
+                self._append_info_ui(_("[封装] 已添加 {0} 个图片水印".format(len(image_files))))
+            if audio_files:
+                self._append_info_ui(_("[封装] 已添加 {0} 个音频轨道".format(len(audio_files))))
+            if other_files:
+                self._append_info_ui(_("[拖拽] 忽略不支持的文件类型: {0}".format(', '.join((os.path.basename(f) for f in other_files)))))
+        finally:
+            self._batch_update = original_batch
+    
+        # ---- 如果有视频文件，启动后台解析 ----
+        if video_files:
+            # 询问是否添加音频（仅一次）
+            if len(video_files) > 1:
+                add_audio = messagebox.askyesno(
+                    _("添加音频"),
+                    _("是否同时添加这 {0} 个视频文件的音频流？\n选“是”将添加所有音频流，选“否”仅添加视频作为水印。".format(len(video_files)))
+                )
+            else:
+                add_audio = messagebox.askyesno(
+                    _("添加音频"),
+                    _("是否同时添加文件「{0}」的音频流？\n选“是”将添加音频，选“否”仅添加视频作为水印。".format(os.path.basename(video_files[0])))
+                )
+    
+            def parse_and_add():
+                try:
+                    self._parse_files_concurrently(video_files, description="画中画视频文件")
+                    self.root.after(0, lambda: self._finish_drop_pip(video_files, add_audio))
+                except Exception as e:
+                    self.root.after(0, lambda e=e: self._append_info_ui(_("[封装] 解析异常: {0}".format(e))))
+    
+            threading.Thread(target=parse_and_add, daemon=True).start()
+    
+    def _finish_drop_pip(self, video_files, add_audio):
+        """
+        画中画模式后台解析完成后的回调：删除视频占位轨道，添加真实视频流，并根据 add_audio 添加音频。
+        允许重复添加（不去重）。
+        """
+        self._batch_update = True
+        try:
+            # 1. 删除本次添加的视频占位轨道（使用规范化路径比较）
+            normalized_video_files = [normalize_path(f) for f in video_files]
+            to_remove = []
+            for idx, track in enumerate(self.merge_tracks):
+                if (normalize_path(track.file_path) in normalized_video_files and 
+                    track.enc_settings.get("_placeholder", False)):
+                    to_remove.append(idx)
+            for idx in reversed(to_remove):
+                del self.merge_tracks[idx]
+    
+            # 2. 添加真实视频流和（可选）音频流（不去重）
+            for vf in video_files:
+                info = self._get_cached_stream_info(vf)
+                if not info:
+                    # 解析失败：添加错误标记轨道
+                    error_track = Track(0, "video", "error", vf, True)
+                    error_track.enc_settings["_error"] = "解析失败"
+                    self.merge_tracks.append(error_track)
+                    self._append_info_ui(_("[封装] 文件 {0} 解析失败，已标记为错误".format(os.path.basename(vf))))
+                    continue
+    
+                # 添加视频流（取第一个视频流）
+                video_streams = [s for s in info['streams'] if s.get('codec_type') == 'video']
+                if video_streams:
+                    s = video_streams[0]
+                    track = Track(s['index'], "video", s.get('codec_name', 'unknown'), vf, True)
+                    # 保留画中画默认设置
+                    track.enc_settings["scale_enabled"] = True
+                    track.enc_settings["scale_width"] = "320"
+                    track.enc_settings["scale_height"] = ""
+                    track.enc_settings["scale_method"] = "width"
+                    track.enc_settings["overlay_enabled"] = True
+                    track.enc_settings["overlay_x"] = "W-w-10"
+                    track.enc_settings["overlay_y"] = "H-h-10"
+                    track.overlay_enabled = True
+                    # 直接添加，不再检查重复
+                    self.merge_tracks.append(track)
+                    self._append_info_ui(_("[封装] 已解析并添加画中画视频: {0}".format(os.path.basename(vf))))
+                else:
+                    self._append_info_ui(_("[封装] {0} 不包含视频流，跳过".format(os.path.basename(vf))))
+    
+                # 如果需要添加音频（不去重）
+                if add_audio:
+                    audio_streams = [s for s in info['streams'] if s.get('codec_type') == 'audio']
+                    for s_audio in audio_streams:
+                        audio_track = Track(s_audio['index'], "audio", s_audio.get('codec_name', 'unknown'), vf, True)
+                        self.merge_tracks.append(audio_track)
+                        self._append_info_ui(_("[封装] 已添加音频流: {0}".format(s_audio.get('codec_name', 'unknown'))))
+    
+        finally:
+            self._batch_update = False
+            self.merge_update_track_list()
+            self.merge_auto_recommend_container()
+            self._ensure_main_video(disable_scale=True)
+            self.merge_update_output_preview()
+            self.merge_update_command_preview()
+            self._append_info_ui(_("[封装] 画中画文件解析完成，轨道列表已更新"))
+            
+
+    
+    def _handle_drop_concat_mode(self, files):
+        """
+        串行合并模式拖拽 —— 瞬间添加占位，后台解析，无卡顿。
+        """
+        if not files:
+            return
+    
+        all_files = self._expand_files_and_folders(files)
+        if not all_files:
+            self._append_info_ui(_("[封装] 拖拽内容中未找到任何文件"))
+            return
+    
+        # 分类（使用 all_files）
+        video_exts = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.ts', '.webm')
+        audio_exts = ('.mp3', '.aac', '.m4a', '.wav', '.flac', '.ogg', '.opus', '.ac3', '.dts')
+        subtitle_exts = ('.srt', '.ass', '.ssa', '.vtt', '.idx', '.sup')
+    
+        video_files = []
+        other_files = []
+        for f in all_files:
+            ext = os.path.splitext(f)[1].lower()
+            if ext in video_exts:
+                video_files.append(f)
+            else:
+                other_files.append(f)  # 音频/字幕稍后处理
+    
+        if not video_files:
+            self._append_info_ui(_("[封装] 未检测到视频文件"))
+            return
+    
+        # ========== 关键修改：强制立即刷新 ==========
+        # 保存原有批处理标志，临时关闭以确保立即刷新
+        original_batch = self._batch_update
+        self._batch_update = False
+        try:
+            for vf in video_files:
+                track = Track(0, "video", "unknown", vf, True)
+                track.enc_settings["_placeholder"] = True
+                self.merge_tracks.append(track)
+            # 立即刷新列表（此时会显示“解析中…”）
+            self.merge_update_track_list()
+            self._append_info_ui(_("[封装] 已添加 {0} 个视频文件（正在后台解析…）".format(len(video_files))))
+        finally:
+            self._batch_update = original_batch
+    
+        # ========== 后台解析线程 ==========
+        def parse_and_add():
+            try:
+                self._parse_files_concurrently(video_files, description="串联视频文件")
+                self.root.after(0, lambda: self._finish_drop_concat(video_files, other_files))
+            except Exception as e:
+                self.root.after(0, lambda e=e: self._append_info_ui(_("[封装] 解析异常: {0}".format(e))))
+    
+        threading.Thread(target=parse_and_add, daemon=True).start()
+    
+    
+    def _finish_drop_concat(self, video_files, other_files):
+        """
+        串联模式后台解析完成后的回调：删除占位，添加真实流，处理错误。
+        允许重复添加（不去重）。
+        """
+        audio_exts = ('.mp3', '.aac', '.m4a', '.wav', '.flac', '.ogg', '.opus', '.ac3', '.dts')
+        subtitle_exts = ('.srt', '.ass', '.ssa', '.vtt', '.idx', '.sup')
+    
+        self._batch_update = True
+        try:
+            # 1. 删除占位轨道（使用规范化路径比较）
+            normalized_video_files = [normalize_path(f) for f in video_files]
+            to_remove = []
+            for idx, track in enumerate(self.merge_tracks):
+                if normalize_path(track.file_path) in normalized_video_files and track.enc_settings.get("_placeholder", False):
+                    to_remove.append(idx)
+            for idx in reversed(to_remove):
+                del self.merge_tracks[idx]
+    
+            # 2. 添加真实流（视频、音频、字幕）（不去重）
+            for vf in video_files:
+                info = self._get_cached_stream_info(vf)
+                if not info:
+                    error_track = Track(0, "video", "error", vf, True)
+                    error_track.enc_settings["_error"] = "解析失败"
+                    self.merge_tracks.append(error_track)
+                    self._append_info_ui(_("[封装] 文件 {0} 解析失败，已标记为错误".format(os.path.basename(vf))))
+                    continue
+    
+                streams = info.get('streams', [])
+                for s in streams:
+                    st = s.get('codec_type')
+                    if st not in ('video', 'audio', 'subtitle'):
+                        continue
+                    track = Track(s['index'], st, s.get('codec_name', 'unknown'), vf, True)
+                    self.merge_tracks.append(track)
+                self._append_info_ui(_("[封装] 已解析并添加串联视频: {0}".format(os.path.basename(vf))))
+    
+            # 3. 处理其他文件（音频/字幕）（不去重）
+            for f in other_files:
+                ext = os.path.splitext(f)[1].lower()
+                if ext in audio_exts:
+                    self._add_external_streams_silent(f, "audio")
+                elif ext in subtitle_exts:
+                    self._add_external_streams_silent(f, "subtitle")
+                else:
+                    self._append_info_ui(_("[拖拽] 忽略不支持的文件: {0}".format(os.path.basename(f))))
+    
+        finally:
+            self._batch_update = False
+            self.merge_update_track_list()
+            self.merge_auto_recommend_container()
+            self._ensure_main_video()
+            self.merge_update_output_preview()
+            self.merge_update_command_preview()
+            self._append_info_ui(_("[封装] 所有文件解析完成，轨道列表已更新"))
+    
+    
+    def _add_external_streams_silent(self, file_path, stream_type):
+        """
+        静默添加外部音频/字幕流（不触发刷新），允许重复添加。
+        """
+        info = self._get_cached_stream_info(file_path)
+        if not info:
+            self._append_info_ui(_("[封装] 无法解析外部文件: {0}".format(os.path.basename(file_path))))
+            return
+        added = 0
+        for s in info.get('streams', []):
+            if s.get('codec_type') != stream_type:
+                continue
+            track = Track(s['index'], stream_type, s.get('codec_name', 'unknown'), file_path, True)
+            self.merge_tracks.append(track)
+            added += 1
+        if added:
+            self._append_info_ui(_("[封装] 已添加 {0} 条{1}轨道: {2}".format(added, stream_type, os.path.basename(file_path))))
+        else:
+            self._append_info_ui(_("[封装] 未添加新轨道: {0}".format(os.path.basename(file_path))))
+    
+    
+
+    
+    
+
+
+
+
+
+
+
+    def merge_add_external_video(self):
+        if self.concat_enabled.get():
+            self._add_concat_video()
+        elif self.pip_enabled.get():
+            self._add_pip_video()
+        else:
+            messagebox.showinfo(_("提示"), _("请先勾选「串行合并」或「启用画中画」"))
+
+
+    def _add_pip_video(self):
+        path = filedialog.askopenfilename(
+            title="选择视频或图片文件（画中画）",
+            filetypes=[
+                ("媒体文件", "*.mp4 *.mkv *.avi *.mov *.flv *.webm *.png *.jpg *.jpeg *.bmp *.gif *.webp"),
+                ("视频文件", "*.mp4 *.mkv *.avi *.mov *.flv *.webm"),
+                ("图片文件", "*.png *.jpg *.jpeg *.bmp *.gif *.webp")
+            ]
+        )
+        if not path:
+            return
+
+
+        info = ffprobe_json(self.ffprobe_cmd, path)
+        if not info:
+            self._append_info_ui(_("[封装] 无法解析文件: {0}".format(path)))
+            return
+    
+        # 检测是否为图片
+        img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
+        is_image = os.path.splitext(path)[1].lower() in img_exts
+    
+        if is_image:
+            # 图片直接添加（无音频）
+            self._add_pip_video_forced(path, add_audio=False)
+            self._append_info_ui(_("[封装] 已添加图片水印: {0}".format(os.path.basename(path))))
+        else:
+            # 视频：询问是否添加音频
+            add_audio = messagebox.askyesno(
+                _("添加音频"),
+                _("是否同时添加文件「{0}」的音频流？\n选“是”将添加音频，选“否”仅添加视频作为水印。".format(os.path.basename(path)))
+            )
+            self._add_pip_video_forced(path, add_audio=add_audio)
+            self._append_info_ui(_("[封装] 已添加画中画视频: {0}".format(os.path.basename(path))))
+    
+        # 统一更新界面
+        self.merge_update_track_list()
+        self.merge_auto_recommend_container()
+        self._ensure_main_video(disable_scale=True)
+        self.merge_update_output_preview()
+
+    
+    def _add_concat_video(self):
+        path = filedialog.askopenfilename(
+            title="选择视频文件（串联）",
+            filetypes=[("媒体文件", "*.mp4 *.mkv *.avi *.mov *.flv *.webm")]
+        )
+        if not path:
+            return
+
+
+        info = ffprobe_json(self.ffprobe_cmd, path)
+        if not info:
+            self._append_info_ui(_("[封装] 无法解析文件: {0}".format(path)))
+            return
+    
+        # 串联模式：直接添加所有流（不询问）
+        self._add_concat_video_forced(path)
+        self._append_info_ui(_("[封装] 已添加串联视频: {0}".format(os.path.basename(path))))
+    
+        # 统一更新界面
+        self.merge_update_track_list()
+        self.merge_auto_recommend_container()
+        self._ensure_main_video()
+        self.merge_update_output_preview()
+
+
+
+
+    def browse_chapter_file(self):
+        path = filedialog.askopenfilename(title="选择章节文件", filetypes=[("FFmetadata", "*.txt *.chapters")])
+        if path:
+            self.chapter_file.set(normalize_path(path))
+            if path:
+                self.copy_chapters.set(False)
+
+    def merge_copy_command(self):
+        cmd_str = self.merge_cmd_preview.get(1.0, tk.END).strip()
+        if cmd_str:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(cmd_str)
+            self._append_info_ui(_("[封装] 命令已复制到剪贴板"))
+        else:
+            self._append_info_ui(_("[封装] 无命令可复制"))
+
+
+    def _prepare_tracks_and_inputs(self, enabled_tracks):
+        """准备输入文件、文件索引，并计算所有轨道的 _type_index"""
+        input_files = []
+        for t in enabled_tracks:
+            if t.file_path not in input_files:
+                input_files.append(t.file_path)
+
+        file_index = {f: i for i, f in enumerate(input_files)}
+
+        # 文件流映射 + 类型索引
+        file_stream_map = {}
+        for f in input_files:
+            info = ffprobe_json(self.ffprobe_cmd, f)
+            if info:
+                streams = info.get('streams', [])
+                video_indices = [s['index'] for s in streams if s.get('codec_type') == 'video']
+                audio_indices = [s['index'] for s in streams if s.get('codec_type') == 'audio']
+                subtitle_indices = [s['index'] for s in streams if s.get('codec_type') == 'subtitle']
+                file_stream_map[f] = {
+                    'video': video_indices,
+                    'audio': audio_indices,
+                    'subtitle': subtitle_indices,
+                }
+            else:
+                file_stream_map[f] = {'video': [0], 'audio': [0], 'subtitle': [0]}
+
+        def get_type_index(track):
+            typ = track.type
+            file_path = normalize_path(track.file_path)
+            indices = file_stream_map.get(file_path, {}).get(typ, [])
+            try:
+                return indices.index(track.index)
+            except ValueError:
+                return 0
+
+        for t in enabled_tracks:
+            t._type_index = get_type_index(t)
+
+        return input_files, file_index
+
+
+    def _add_input_options(self, cmd, input_files, main_video, sub_videos=None):
+        """添加 -i 及前置参数（-ss/-to、循环等）"""
+        main_video_path = normalize_path(main_video.file_path)
+        sub_paths = [normalize_path(sv.file_path) for sv in (sub_videos or [])]
+
+        for f in input_files:
+            f_norm = normalize_path(f)
+
+            if f_norm == main_video_path:                                   # 主视频截取
+                if (main_video.enc_settings.get("trim_enabled", False) and
+                    not main_video.enc_settings.get("precise_trim", False)):
+                    start = main_video.enc_settings.get("trim_start", "").strip()
+                    end = main_video.enc_settings.get("trim_end", "").strip()
+                    if start:
+                        cmd.extend(["-ss", start])
+                    if end:
+                        cmd.extend(["-to", end])
+
+            elif sub_videos and f_norm in sub_paths:                        # 子视频循环
+                sv = next((sv for sv in sub_videos if normalize_path(sv.file_path) == f_norm), None)
+                if sv and not sv.enc_settings.get("trim_enabled", False):
+                    ext = os.path.splitext(f_norm)[1].lower()
+                    if ext == '.gif':
+                        # GIF 动画，使用 -stream_loop -1 保证无限循环，不加 -loop 和 -framerate
+                        cmd.extend(["-stream_loop", "-1"])
+                    elif ext in ('.png', '.jpg', '.jpeg', '.bmp', '.webp'):
+                        # 静态图片，使用 image2 循环
+                        fps = main_video.enc_settings.get("frame_rate_custom", "30") \
+                              if main_video.enc_settings.get("frame_rate_type") == "custom" else "30"
+                        cmd.extend(["-loop", "1", "-framerate", fps])
+                    else:
+                        # 其他视频
+                        cmd.extend(["-stream_loop", "-1"])
+
+            cmd.extend(["-i", f_norm])
+        return cmd
+
+
+    def _handle_audio_trim(self, cmd, audio, audio_map_count: int) -> bool:
+        """处理音频截取，返回是否已处理"""
+        if not audio.enc_settings.get("trim_enabled", False):
+            return False
+
+        start_str = audio.enc_settings.get("trim_start", "").strip()
+        end_str = audio.enc_settings.get("trim_end", "").strip()
+        start_sec = time_to_seconds(start_str) if start_str else 0.0
+        end_sec = time_to_seconds(end_str) if end_str else None
+
+        total_duration = self._get_media_duration(audio.file_path)
+        duration = (end_sec - start_sec) if end_sec is not None else \
+                   (total_duration - start_sec if total_duration is not None else None)
+
+        if duration is None or duration <= 0:
+            return False
+
+        enc = audio.enc_settings.get("encoder", "aac")
+        if enc == "copy":
+            enc = "aac"
+            self._append_info_ui(_("音频截取启用，轨道 {0} 编码器已从 copy 改为 {1}".format(audio_map_count + 1, enc)))
+
+        af_filter = f"atrim=start={start_sec:.3f}:duration={duration:.3f},asetpts=PTS-STARTPTS"
+        cmd.extend([f"-af:a:{audio_map_count}", af_filter])
+        cmd.extend([f"-c:a:{audio_map_count}", enc])
+        cmd.extend([f"-b:a:{audio_map_count}", audio.enc_settings.get("bitrate", "128k")])
+        cmd.extend([f"-ar:a:{audio_map_count}", audio.enc_settings.get("samplerate", "44100")])
+        return True
+
+
+    def _add_audio_tracks(self, cmd, enabled_tracks, file_index, reverse_enabled=False):
+        audio_tracks = [t for t in enabled_tracks if t.type == "audio"]
+        audio_map_count = 0
+        for audio in audio_tracks:
+            a_idx = file_index[audio.file_path]
+            cmd.extend(["-map", f"{a_idx}:a:{audio._type_index}"])
+            audio.enc_settings["_file_path"] = audio.file_path
+    
+            # 音频倒放完全独立，仅由轨道自身的 audio_reverse 决定（不再回退主视频）
+            track_reverse = audio.enc_settings.get("audio_reverse", False)
+    
+            af_str = self._build_audio_filters(
+                audio.enc_settings,
+                include_trim=True,
+                include_volume=True,
+                include_speed=True,
+                include_reverse=track_reverse
+            )
+            enc = audio.enc_settings.get("encoder", "copy")
+            if af_str:
+                if enc == "copy":
+                    enc = "aac"
+                    self._append_info_ui(_("音频轨 {0} 应用了滤镜，编码器自动改为 aac".format(audio_map_count + 1)))
+                cmd.extend([f"-af:a:{audio_map_count}", af_str])
+            if enc == "copy":
+                cmd.extend([f"-c:a:{audio_map_count}", "copy"])
+            else:
+                cmd.extend([
+                    f"-c:a:{audio_map_count}", enc,
+                    f"-b:a:{audio_map_count}", audio.enc_settings.get("bitrate", "128k"),
+                    f"-ar:a:{audio_map_count}", audio.enc_settings.get("samplerate", "44100")
+                ])
+            audio_map_count += 1
+        if audio_map_count == 0:
+            cmd.append("-an")
+        else:
+            cmd.extend(["-disposition:a:0", "default"])
+        return cmd
+
+
+    def _add_subtitles_and_chapters(self, cmd, enabled_tracks, file_index, input_files):
+        """字幕 + 章节处理"""
+        # 字幕
+        subtitle_tracks = [t for t in enabled_tracks if t.type == "subtitle"]
+        container = self.merge_container.get().lower()
+        sub_map_count = 0
+        first_sub_default = False
+
+        for sub in subtitle_tracks:
+            s_idx = file_index[sub.file_path]
+            cmd.extend(["-map", f"{s_idx}:s:{sub._type_index}"])
+
+            enc = sub.enc_settings.get("encoder", "copy")
+            if container == "mp4":
+                if enc == "copy":
+                    orig_codec = getattr(sub, 'codec', '').lower()
+                    if orig_codec not in ("mov_text", "mp4s"):
+                        enc = "mov_text"
+                        self._append_info_ui(_("[封装] 字幕格式 {0} 不兼容 MP4，自动转换为 mov_text".format(orig_codec)))
+                elif enc not in ("mov_text", "mp4s"):
+                    enc = "mov_text"
+                    self._append_info_ui(_("[封装] 字幕编码 {0} 不兼容 MP4，自动转换为 mov_text".format(enc)))
+
+            cmd.extend([f"-c:s:{sub_map_count}", enc])
+
+            if lang := sub.enc_settings.get("language", ""):
+                cmd.extend([f"-metadata:s:s:{sub_map_count}", f"language={lang}"])
+            if title := sub.enc_settings.get("title", ""):
+                cmd.extend([f"-metadata:s:s:{sub_map_count}", f"title={title}"])
+
+            if not first_sub_default:
+                cmd.extend([f"-disposition:s:{sub_map_count}", "default"])
+                first_sub_default = True
+            sub_map_count += 1
+
+        # 章节
+        if self.copy_chapters.get() and input_files:
+            cmd.extend(["-map_chapters", "0"])
+
+        chapter_file = self.chapter_file.get().strip()
+        if chapter_file and os.path.exists(chapter_file):
+            chapter_file_norm = normalize_path(chapter_file)
+            try:
+                first_i = cmd.index("-i")
+                pos = first_i + 2
+                cmd.insert(pos, "-i")
+                cmd.insert(pos + 1, chapter_file_norm)
+                cmd.extend(["-map_chapters", "1"])
+            except ValueError:
+                cmd.extend(["-i", chapter_file_norm, "-map_chapters", "1"])
+
+
+    def _add_container_optimization(self, cmd):
+        """容器优化"""
+        if self.merge_container.get().lower() in ("mp4", "mov"):
+            cmd.extend(["-movflags", "+faststart"])
+
+
+    def _add_pip_duration_control(self, cmd, main_video, enabled_tracks):
+        """PIP 时长控制：根据主音频和子视频音频存在情况选择 -shortest 或 -t"""
+        # 如果启用了手动时长，则跳过内部时长控制
+        if self.merge_manual_duration_enabled.get():
+            dur_str = self.merge_manual_duration.get().strip()
+            if dur_str and time_to_seconds(dur_str) is not None:
+                # 可选：打印一次提示（但每次刷新会重复，可改为只在第一次或使用标志）
+                self._append_info_ui(_("[封装] 手动时长已启用，将使用用户指定的时长。"))
+                return
+        sub_videos = [t for t in enabled_tracks if t.type == "video"][1:]
+        if not sub_videos:
+            return  # 没有子视频，无需时长控制
+    
+        # 判断主视频是否包含音频
+        main_video_path = normalize_path(main_video.file_path)
+        has_main_audio = any(
+            normalize_path(t.file_path) == main_video_path and t.type == "audio"
+            for t in enabled_tracks
+        )
+    
+        # 判断子视频是否包含音频（任何子视频有音频即认为有子音频）
+        sub_paths = [normalize_path(sv.file_path) for sv in sub_videos]
+        has_sub_audio = any(
+            normalize_path(t.file_path) in sub_paths and t.type == "audio"
+            for t in enabled_tracks
+        )
+    
+        if has_main_audio and not has_sub_audio:
+            # 只有主视频有音频，子视频无音频 → -shortest 精确
+            cmd.append("-shortest")
+            self._append_info_ui(_("[封装] 只有主音频，使用 -shortest 控制输出时长。"))
+        else:
+            # 其他情况：有子音频或无主音频 → 优先 -t 避免无限输出
+            raw_duration = self._get_media_duration(main_video.file_path)
+            main_duration = None
+            if main_video.enc_settings.get("trim_enabled", False):
+                start = main_video.enc_settings.get("trim_start", "0").strip()
+                end = main_video.enc_settings.get("trim_end", "").strip()
+                start_sec = time_to_seconds(start) if start else 0.0
+                end_sec = time_to_seconds(end) if end else None
+                if end_sec and end_sec > start_sec:
+                    main_duration = end_sec - start_sec
+                elif raw_duration:
+                    main_duration = raw_duration - start_sec
+            else:
+                main_duration = raw_duration
+    
+            if main_duration and main_duration > 0:
+                cmd.extend(["-t", f"{main_duration:.3f}"])
+                if has_sub_audio:
+                    self._append_info_ui(_("[封装] 检测到子视频音频，使用 -t {0:.3f}s 控制输出时长。".format(main_duration)))
+                else:
+                    self._append_info_ui(_("[封装] 主视频无音频，使用 -t {0:.3f}s 控制输出时长。".format(main_duration)))
+            else:
+                # 无法计算时长，回退 -shortest
+                cmd.append("-shortest")
+                self._append_info_ui(_("[封装] 无法计算主视频时长，使用 -shortest 控制输出。"))
+
+    def _build_audio_filters(self, track_settings, include_trim=True, include_volume=True,
+                             include_speed=True, include_reverse=False,
+                             include_fade=True, include_loudnorm=True,
+                             include_denoise=True, include_channel=True):
+        """
+        根据单个音频轨道的设置构建音频滤镜链（不含 -af 前缀）。
+        返回滤镜字符串，若无滤镜则返回空字符串。
+        include_reverse 作为默认倒放标志，若轨道有 audio_reverse 则优先使用。
+        三种合并模式（普通封装/画中画/串行重编码）共用此函数以保证音频能力一致。
+        """
+        filters = []
+        # 截取
+        if include_trim and track_settings.get("trim_enabled", False):
+            start = track_settings.get("trim_start", "").strip()
+            end = track_settings.get("trim_end", "").strip()
+            start_sec = time_to_seconds(start) if start else 0.0
+            end_sec = time_to_seconds(end) if end else None
+            file_path = track_settings.get("_file_path", "")
+            total = self._get_media_duration(file_path) if file_path else None
+            if end_sec is not None:
+                duration = end_sec - start_sec
+            elif total is not None:
+                duration = total - start_sec
+            else:
+                duration = None
+            if duration is not None and duration > 0:
+                filters.append(f"atrim=start={start_sec:.3f}:duration={duration:.3f}")
+                filters.append("asetpts=PTS-STARTPTS")
+
+        # 音量
+        if include_volume and track_settings.get("volume_enabled", False):
+            vol = track_settings.get("volume", 1.0)
+            if vol != 1.0:
+                filters.append(f"volume={vol:.2f}")
+
+        # 变速（音频）
+        if include_speed and track_settings.get("audio_speed_enabled", False):
+            factor = float(track_settings.get("audio_speed_factor", "1.0"))
+            if factor != 1.0 and factor > 0:
+                atempo = build_atempo_chain(factor)
+                if atempo:
+                    filters.append(atempo)
+
+        # 降噪
+        if include_denoise and track_settings.get("denoise_enabled", False):
+            nr = track_settings.get("denoise_nr", 12)
+            nf = track_settings.get("denoise_nf", -30)
+            filters.append(f"afftdn=nr={nr}:nf={nf}")
+
+        # 响度标准化
+        if include_loudnorm and track_settings.get("loudnorm_enabled", False):
+            i = track_settings.get("loudnorm_i", -23)
+            lra = track_settings.get("loudnorm_lra", 7)
+            tp = track_settings.get("loudnorm_tp", -2)
+            filters.append(f"loudnorm=I={i}:LRA={lra}:TP={tp}")
+
+        # 声道 / 单声道
+        if include_channel:
+            mode = track_settings.get("channel_mode", "stereo")
+            if mode == "mono":
+                filters.append("pan=mono|c0=0.5*c0+0.5*c1")
+            elif mode == "left":
+                filters.append("pan=mono|c0=c0")
+            elif mode == "right":
+                filters.append("pan=mono|c0=c1")
+            elif mode == "swap":
+                filters.append("pan=stereo|c0=c1|c1=c0")
+
+        # 均衡器（EQ）：低/中/高 三段增益（dB）
+        if track_settings.get("eq_enabled", False):
+            try:
+                eq_low = float(track_settings.get("eq_low", 0) or 0)
+            except (ValueError, TypeError):
+                eq_low = 0.0
+            try:
+                eq_mid = float(track_settings.get("eq_mid", 0) or 0)
+            except (ValueError, TypeError):
+                eq_mid = 0.0
+            try:
+                eq_high = float(track_settings.get("eq_high", 0) or 0)
+            except (ValueError, TypeError):
+                eq_high = 0.0
+            if eq_low != 0:
+                filters.append(f"bass=g={eq_low:.1f}")
+            if eq_mid != 0:
+                filters.append(f"equalizer=f=1000:width_type=h:width=200:g={eq_mid:.1f}")
+            if eq_high != 0:
+                filters.append(f"treble=g={eq_high:.1f}")
+
+        # 淡入淡出
+        if include_fade and track_settings.get("fade_enabled", False):
+            fin = track_settings.get("fade_in", "")
+            fout = track_settings.get("fade_out", "")
+            fin_s = time_to_seconds(fin) if fin else 0.0
+            fout_s = time_to_seconds(fout) if fout else 0.0
+            if fin_s > 0:
+                filters.append(f"afade=t=in:st=0:d={fin_s:.3f}")
+            if fout_s > 0:
+                total = self._get_media_duration(track_settings.get("_file_path", "")) if track_settings.get("_file_path") else None
+                if total:
+                    st = max(0.0, total - fout_s)
+                    filters.append(f"afade=t=out:st={st:.3f}:d={fout_s:.3f}")
+                else:
+                    filters.append(f"afade=t=out:st=0:d={fout_s:.3f}")
+
+        # 倒放：优先使用轨道独立设置，否则使用传入的 include_reverse
+        track_reverse = track_settings.get("audio_reverse")
+        if track_reverse is None:
+            track_reverse = include_reverse
+        if track_reverse:
+            filters.append("areverse")
+
+        return ",".join(filters) if filters else ""
+    
+    def _build_normal_cmd(self, enabled_tracks, output_norm, only_audio=False):
+        """
+        普通封装模式：支持视频滤镜、多音频/字幕、音频截取、音频混合（amix）与音量调整。
+        若 only_audio=True，则仅处理音频流，忽略视频和字幕。
+        """
+        cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
+    
+        # 获取所有音频轨道（无论是否仅音频模式）
+        audio_tracks = [t for t in enabled_tracks if t.type == "audio"]
+    
+        if only_audio:
+            input_files = []
+            file_index = {}
+            audio_tracks = [t for t in enabled_tracks if t.type == "audio"]
+            for audio in audio_tracks:
+                if audio.file_path not in file_index:
+                    file_index[audio.file_path] = len(input_files)
+                    input_files.append(audio.file_path)
+            # 为每个音频轨道设置 _type_index
+            for audio in audio_tracks:
+                info = self._get_cached_stream_info(audio.file_path)
+                if info:
+                    audio_indices = [s['index'] for s in info['streams'] if s.get('codec_type') == 'audio']
+                    try:
+                        audio._type_index = audio_indices.index(audio.index)
+                    except ValueError:
+                        audio._type_index = 0
+                else:
+                    audio._type_index = 0
+            # 然后添加输入
+            for f in input_files:
+                cmd.extend(["-i", normalize_path(f)])
+            main_video = None
+            video_reverse = False
+            video_tracks = []
+        else:
+            # 完整模式
+            input_files, file_index = self._prepare_tracks_and_inputs(enabled_tracks)
+            video_tracks = [t for t in enabled_tracks if t.type == "video"]
+            if not video_tracks:
+                self._append_info_ui(_("[封装] 没有启用的视频轨道"))
+                return []
+            main_video = video_tracks[0]
+    
+            # 在添加输入之前插入硬件解码参数（使用主视频设置）
+            self._add_hwaccel_params(cmd, main_video.enc_settings)
+    
+            # 准备输入文件和索引
+            input_files, file_index = self._prepare_tracks_and_inputs(enabled_tracks)
+    
+            # 添加输入选项（-i 及前置 -ss/-to）
+            cmd = self._add_input_options(cmd, input_files, main_video)
+    
+            # 视频处理
+            v_idx = file_index[main_video.file_path]
+            cmd.extend(["-map", f"{v_idx}:v:{main_video._type_index}"])
+            v_settings = main_video.enc_settings
+            vcodec = v_settings.get("encoder", "copy")
+            video_reverse = v_settings.get("reverse_enabled", False)
+            if vcodec == "copy" and video_reverse:
+                video_reverse = False
+                self._append_info_ui(_("[封装] 主视频为流复制模式，已自动禁用视频倒放"))
+
+            # 文字水印需要滤镜，流复制无法支持 → 强制重编码
+            if vcodec == "copy" and v_settings.get("text_watermark", {}).get("enabled", False):
+                vcodec = "libx265"
+                v_settings["encoder"] = vcodec
+                self._append_info_ui(_("[封装] 文字水印需要重新编码，已自动改为 libx265。"))
+
+            if vcodec == "copy":
+                cmd.extend(["-c:v", "copy"])
+            else:
+                video_filters = build_video_filter_chain(
+                    v_settings,
+                    include_subtitle=False,
+                    include_speed=True,            # 主视频变速生效（音频变速由 _build_audio_filters 处理）
+                    enhance_settings=v_settings.get("enhance", {}),
+                    reverse=video_reverse
+                )
+                # 追加文字水印 drawtext
+                dt = build_drawtext_filter(v_settings.get("text_watermark", {}))
+                if dt:
+                    video_filters = f"{video_filters},{dt}" if video_filters and video_filters != "null" else dt
+                if video_filters and video_filters != "null":
+                    cmd.extend(["-vf", video_filters])
+                strategy = get_encoder_strategy(vcodec)
+                cmd = strategy.build_params(cmd, v_settings)
+    
+                # ---- 视频元数据 ----
+                lang = main_video.language
+                title = main_video.title
+                if lang:
+                    cmd.extend(["-metadata:s:v:0", f"language={lang}"])
+                if title:
+                    cmd.extend(["-metadata:s:v:0", f"title={title}"])
+    
+        # ---- 音频处理（所有模式） ----
+        mix_tracks = [t for t in audio_tracks if t.enc_settings.get("mix_enabled", False)]
+    
+        if not mix_tracks:
+            audio_map_count = 0
+            for audio in audio_tracks:
+                a_idx = file_index[audio.file_path]
+                cmd.extend(["-map", f"{a_idx}:a:{audio._type_index}"])
+                audio.enc_settings["_file_path"] = audio.file_path
+                track_reverse = audio.enc_settings.get("audio_reverse", False)
+                af_str = self._build_audio_filters(
+                    audio.enc_settings,
+                    include_trim=True,
+                    include_volume=True,
+                    include_speed=True,
+                    include_reverse=track_reverse
+                )
+                enc = audio.enc_settings.get("encoder", "copy")
+                if af_str:
+                    if enc == "copy":
+                        enc = "aac"
+                        self._append_info_ui(_("音频轨 {0} 应用了滤镜，编码器自动改为 aac".format(audio_map_count + 1)))
+                    cmd.extend([f"-af:a:{audio_map_count}", af_str])
+                if enc == "copy":
+                    cmd.extend([f"-c:a:{audio_map_count}", "copy"])
+                else:
+                    cmd.extend([
+                        f"-c:a:{audio_map_count}", enc,
+                        f"-b:a:{audio_map_count}", audio.enc_settings.get("bitrate", "128k"),
+                        f"-ar:a:{audio_map_count}", audio.enc_settings.get("samplerate", "44100")
+                    ])
+    
+                # ---- 音频元数据 ----
+                lang_audio = audio.language
+                title_audio = audio.title
+                if lang_audio:
+                    cmd.extend([f"-metadata:s:a:{audio_map_count}", f"language={lang_audio}"])
+                if title_audio:
+                    cmd.extend([f"-metadata:s:a:{audio_map_count}", f"title={title_audio}"])
+                    cmd.extend([f"-metadata:s:a:{audio_map_count}", f"handler_name={title_audio}"])
+    
+                audio_map_count += 1
+            if audio_map_count == 0:
+                cmd.append("-an")
+            else:
+                cmd.extend(["-disposition:a:0", "default"])
+        else:
+            if len(mix_tracks) == 1:
+                audio = mix_tracks[0]
+                a_idx = file_index[audio.file_path]
+                cmd.extend(["-map", f"{a_idx}:a:{audio._type_index}"])
+                audio.enc_settings["_file_path"] = audio.file_path
+                af_str = self._build_audio_filters(
+                    audio.enc_settings,
+                    include_trim=True,
+                    include_volume=True,
+                    include_speed=True,
+                    include_reverse=audio.enc_settings.get("audio_reverse", False)
+                )
+                enc = audio.enc_settings.get("encoder", "copy")
+                if af_str:
+                    if enc == "copy":
+                        enc = "aac"
+                        self._append_info_ui(_("单流混合（音量/截取/倒放）强制编码为 aac"))
+                    cmd.extend(["-af", af_str])
+                if enc == "copy":
+                    cmd.extend(["-c:a", "copy"])
+                else:
+                    cmd.extend([
+                        "-c:a", enc,
+                        "-b:a", audio.enc_settings.get("bitrate", "128k"),
+                        "-ar", audio.enc_settings.get("samplerate", "44100")
+                    ])
+                # ---- 混合音频元数据 ----
+                lang = audio.language
+                title = audio.title
+                if lang:
+                    cmd.extend(["-metadata:s:a:0", f"language={lang}"])
+                if title:
+                    cmd.extend(["-metadata:s:a:0", f"title={title}"])
+                    cmd.extend(["-metadata:s:a:0", f"handler_name={title}"])
+                cmd.extend(["-disposition:a:0", "default"])
+            else:
+                filter_parts = []
+                inputs = len(mix_tracks)
+                for i, audio in enumerate(mix_tracks):
+                    a_idx = file_index[audio.file_path]
+                    audio.enc_settings["_file_path"] = audio.file_path
+                    af_str = self._build_audio_filters(
+                        audio.enc_settings,
+                        include_trim=True,
+                        include_volume=True,
+                        include_speed=True,
+                        include_reverse=audio.enc_settings.get("audio_reverse", False)
+                    )
+                    if af_str:
+                        filter_parts.append(f"[{a_idx}:a]{af_str}[a{i}]")
+                    else:
+                        filter_parts.append(f"[{a_idx}:a]asetpts=PTS-STARTPTS[a{i}]")
+                amix_filter = f"{' '.join(f'[a{i}]' for i in range(inputs))}amix=inputs={inputs}:duration=longest[aout]"
+                filter_parts.append(amix_filter)
+                cmd.extend(["-filter_complex", ";".join(filter_parts)])
+                cmd.extend(["-map", "[aout]"])
+                first_mix = mix_tracks[0]
+                enc = first_mix.enc_settings.get("encoder", "aac")
+                if enc == "copy":
+                    enc = "aac"
+                    self._append_info_ui(_("[封装] 混合模式下编码器不能为 copy，已自动改为 aac"))
+                cmd.extend([
+                    "-c:a", enc,
+                    "-b:a", first_mix.enc_settings.get("bitrate", "128k"),
+                    "-ar", first_mix.enc_settings.get("samplerate", "44100")
+                ])
+                # ---- 混合音频元数据（使用第一个混合轨道的元数据） ----
+                lang = first_mix.language
+                title = first_mix.title
+            if lang:
+                cmd.extend(["-metadata:s:a:0", f"language={lang}"])
+            if title:
+                cmd.extend(["-metadata:s:a:0", f"title={title}"])
+                cmd.extend(["-metadata:s:a:0", f"handler_name={title}"])
+                cmd.extend(["-disposition:a:0", "default"])
+    
+        if only_audio:
+            cmd.append("-vn")
+    
+        # 字幕与章节（仅非仅音频模式）
+        if not only_audio:
+            self._add_subtitles_and_chapters(cmd, enabled_tracks, file_index, input_files)
+    
+        # 容器优化
+        container = self.merge_container.get().lower()
+        if container in ("mp4", "mov") and not only_audio:
+            cmd.extend(["-movflags", "+faststart"])
+    
+        cmd.append(output_norm)
+        return cmd
+    
+    
+    def _build_pip_cmd(self, enabled_tracks, output_norm):
+        """画中画模式（叠加多个视频）"""
+        # 强制禁用组合跳转
+        for track in enabled_tracks:
+            if track.type == "video":
+                track.enc_settings["combo_seek"] = False
+    
+        cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
+        input_files, file_index = self._prepare_tracks_and_inputs(enabled_tracks)
+        video_tracks = [t for t in enabled_tracks if t.type == "video"]
+        if not video_tracks:
+            self._append_info_ui(_("[封装-画] 没有启用的视频轨道"))
+            return []
+        main_video = video_tracks[0]
+        sub_videos = video_tracks[1:]
+    
+        # 画中画模式下强制使用精准截取（由滤镜处理）
+        self._add_hwaccel_params(cmd, main_video.enc_settings)
+        main_video.enc_settings["precise_trim"] = True
+        cmd = self._add_input_options(cmd, input_files, main_video, sub_videos)
+
+        main_idx = file_index[main_video.file_path]
+
+        
+        # ---- 构建子视频信息列表（临时复制设置，避免修改原轨道） ----
+        sub_infos = []
+        for sv in sub_videos:
+            sv_settings = sv.enc_settings.copy()   # 复制一份，不影响原轨道
+            
+            if sv_settings.get("encoder") == "copy":
+                sv_settings["encoder"] = "libx265"
+                self._append_info_ui(_("[封装-画] 从视频 {0} copy 已临时改为 libx265（画中画必须重新编码）".format(os.path.basename(sv.file_path))))
+            
+            sub_infos.append((file_index[sv.file_path], sv.file_path, sv_settings))
+    
+        # 获取倒放标志，同时检测视频编码器（画中画强制重新编码，但为保险仍做检测）
+        vcodec = main_video.enc_settings.get("encoder", "libx265")
+        reverse_flag = main_video.enc_settings.get("reverse_enabled", False)
+        if vcodec == "copy" and reverse_flag:
+            reverse_flag = False
+        #    self._append_info_ui("[封装] 画中画模式视频为 copy（理论上不会发生），已禁用音频倒放")
+            # 但画中画模式已经强制将 copy 改为 libx265，所以此分支通常不会执行
+    
+        # 构建叠加滤镜（传递 reverse_flag 用于视频倒放） 检查主视频是否启用字幕烧录
+        include_subtitle_main = main_video.enc_settings.get("subtitle_enabled", False) and bool(main_video.enc_settings.get("subtitle_path", "").strip())
+        complex_filter, final_v_label = self._build_overlay_filter_complex(
+            main_idx, main_video.enc_settings, sub_infos,
+            include_subtitle_main=include_subtitle_main,
+            enhance_settings=main_video.enc_settings.get("enhance", {}),
+            reverse=reverse_flag,
+            main_file_path=main_video.file_path
+        )
+        # 追加文字水印 drawtext（在 overlay 之后）
+        dt = build_drawtext_filter(main_video.enc_settings.get("text_watermark", {}))
+        if dt:
+            new_label = "[v_dtext]"
+            complex_filter = f"{complex_filter};{final_v_label}{dt}{new_label}"
+            final_v_label = new_label
+        cmd.extend(["-filter_complex", complex_filter])
+        cmd.extend(["-map", final_v_label])
+    
+        # 视频编码（PIP强制不使用 copy）
+        if vcodec == "copy":
+            self._append_info_ui(_("[封装-画] 画中画模式不支持 copy，自动改为 libx265"))
+            vcodec = "libx265"
+            main_video.enc_settings["encoder"] = vcodec
+        strategy = get_encoder_strategy(vcodec)
+        cmd = strategy.build_params(cmd, main_video.enc_settings)
+    
+        # 音频处理（传入修正后的 reverse_flag）   
+        # 新改动 画中画音频独立控制 所以传入 False
+        self._add_audio_tracks(cmd, enabled_tracks, file_index, reverse_enabled=False)
+    
+        self._add_subtitles_and_chapters(cmd, enabled_tracks, file_index, input_files)
+        self._add_pip_duration_control(cmd, main_video, enabled_tracks)
+        self._add_container_optimization(cmd)
+        cmd.append(output_norm)
+        return cmd
+
+    def _generate_concat_chapters(self, video_tracks):
+        """为串行合并生成 FFmetadata 临时文件，返回 (path, cleanup_list)。
+        根据每个视频轨道的 chapter_label 和时长自动创建章节条目。"""
+        import tempfile
+        if not video_tracks:
+            return None, []
+        
+        fd, meta_path = tempfile.mkstemp(suffix='.txt', prefix='chapters_', text=True)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write(";FFMETADATA1\n")
+                cumulative_ms = 0
+                for i, track in enumerate(video_tracks):
+                    label = track.enc_settings.get("chapter_label", "").strip()
+                    # 计算该片段的实际时长（秒）
+                    settings = track.enc_settings
+                    effective_dur = self._get_effective_duration(settings, input_path=track.file_path)
+                    if effective_dur is None or effective_dur <= 0:
+                        effective_dur = 0.0
+                    dur_ms = int(effective_dur * 1000)
+                    
+                    title = label if label else f"片段 {i+1}"
+                    end_ms = cumulative_ms + dur_ms
+                    f.write("[CHAPTER]\n")
+                    f.write("TIMEBASE=1/1000\n")
+                    f.write(f"START={cumulative_ms}\n")
+                    f.write(f"END={end_ms}\n")
+                    f.write(f"title={title}\n")
+                    cumulative_ms = end_ms
+        except Exception as e:
+            try:
+                os.unlink(meta_path)
+            except OSError:
+                pass
+            self._append_info_ui(_("[章节] 生成 FFmetadata 失败: {0}".format(e)))
+            return None, []
+        
+        cleanup_list = [meta_path]
+        self._append_info_ui(_("[章节] 已生成 {0} 个章节标记 ({1})".format(len(video_tracks), os.path.basename(meta_path))))
+        return meta_path, cleanup_list
+
+    def _inject_chapters_into_cmd(self, cmd_list, meta_path):
+        """将 FFmetadata 章节文件注入到已构建的命令中。"""
+        if not cmd_list:
+            return cmd_list
+        
+        # 统计现有输入文件数（以 -i 计数）
+        input_count = sum(1 for a in cmd_list if a == "-i")
+        
+        # 找到最后一个输入文件后的位置，在 -filter_complex / -map 之前插入
+        insert_pos = len(cmd_list) - 1  # 默认在输出文件前
+        # 倒找最后一个输出文件（以最后一个非选项参数为输出，通常是扩展名结尾）
+        # 更可靠的做法：在 -filter_complex 或 -map 之前插入 metadata 输入
+        for idx, arg in enumerate(cmd_list):
+            if arg in ("-filter_complex", "-map", "-c:v", "-c:a", "-vn", "-an"):
+                insert_pos = idx
+                break
+        
+        # 在当前 insert_pos 处插入 -i meta_path -map_chapters N
+        inject = ["-i", normalize_path(meta_path), "-map_chapters", str(input_count)]
+        new_cmd = cmd_list[:insert_pos] + inject + cmd_list[insert_pos:]
+        return new_cmd
+
+
+
+    def _build_concat_cmd(self, enabled_tracks, output_norm, preview=False):
+        """
+        生成串行合并（Concat）命令。
+        支持两种模式：
+        1. 流复制模式（最高效，使用 concat demuxer）
+        2. 重新编码模式（使用 filter_complex concat）
+        """
+        video_tracks = [t for t in enabled_tracks if t.type == "video"]
+        if not video_tracks:
+            self._append_info_ui(_("[串联] 没有启用的视频轨道"))
+            return []
+
+        audio_tracks = [t for t in enabled_tracks if t.type == "audio"]
+        main_video = video_tracks[0]
+
+        # 判断使用哪种模式
+        vcodec = main_video.enc_settings.get("encoder", "copy")
+        acodec = audio_tracks[0].enc_settings.get("encoder", "copy") if audio_tracks else "copy"
+
+        use_copy_mode = (vcodec == "copy") and (acodec == "copy" or not audio_tracks)
+
+        # 文字水印或图片水印需要滤镜，流复制无法支持 → 强制重编码
+        if use_copy_mode and main_video.enc_settings.get("text_watermark", {}).get("enabled", False):
+            self._append_info_ui(_("[串联] 文字水印需要重新编码，自动切换到重新编码模式。"))
+            use_copy_mode = False
+
+        cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
+
+        # 硬件解码参数（流复制模式通常无需，但保留以兼容）
+        if video_tracks:
+            self._add_hwaccel_params(cmd, video_tracks[0].enc_settings)
+
+        if use_copy_mode:
+            if not self._check_video_params_consistent(video_tracks, silent=True):  # silent=True 避免内部打印
+                self._append_info_ui(_("[串联] 检测到视频参数不一致，可在规格列查看，自动切换到重新编码模式以确保兼容性。"))
+                use_copy_mode = False
+        
+        if use_copy_mode:
+            cmd_list = self._build_concat_copy_mode(cmd, video_tracks, audio_tracks, output_norm, preview=preview)
+        else:
+            cmd_list = self._build_concat_reencode_mode(cmd, video_tracks, audio_tracks, main_video, output_norm)
+
+        # 生成章节：如果勾选了"生成章节"，注入 FFmetadata 文件（跳过预览模式）
+        if self.generate_chapters.get() and not preview:
+            meta_path, cleanup = self._generate_concat_chapters(video_tracks)
+            if meta_path:
+                cmd_list = self._inject_chapters_into_cmd(cmd_list, meta_path)
+                if not hasattr(self, '_temp_concat_lists'):
+                    self._temp_concat_lists = []
+                self._temp_concat_lists.extend(cleanup)
+        return cmd_list
+
+
+    def _build_concat_copy_mode(self, cmd, video_tracks, audio_tracks, output_norm, preview=False):
+        """流复制模式 - 使用 concat demuxer（最高性能）"""
+        import tempfile
+    
+        if preview:
+            # 预览模式：使用占位符，不创建实际文件
+            list_path = "concat_random.txt"
+            self._append_info_ui(_("[串联-流] 预览命令，txt列表使用占位名，点击开始合并后随机生成"))
+        else:
+            # 实际执行：创建临时文件
+            fd, list_path = tempfile.mkstemp(suffix='.txt', prefix='concat_', text=True)
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    for track in video_tracks:
+                        safe_path = normalize_path(track.file_path).replace("'", "'\\''")
+                        f.write(f"file '{safe_path}'\n")
+            except Exception as e:
+                # with 语句已关闭 fd，切勿再次 os.close（会抛 OSError 并掩盖真实异常）
+                self._append_info_ui(_("[串联-流] 生成文件列表失败: {0}".format(e)))
+                try:
+                    os.unlink(list_path)
+                except OSError:
+                    pass
+                return []
+            # 存储真实路径以便后续清理
+            if not hasattr(self, '_temp_concat_lists'):
+                self._temp_concat_lists = []
+            self._temp_concat_lists.append(list_path)
+    
+        cmd.extend(["-f", "concat", "-safe", "0", "-i", list_path])
+        cmd.extend(["-c:v", "copy"])
+        if audio_tracks:
+            cmd.extend(["-c:a", "copy"])
+        else:
+            cmd.append("-an")
+    
+        self._add_container_optimization(cmd)
+        cmd.append(output_norm)
+    
+        self._append_info_ui(_("[串联-流] 使用流复制模式（concat demuxer）"))
+        return cmd
+
+
+    def _build_concat_reencode_mode(self, cmd, video_tracks, audio_tracks, main_video, output_norm):
+        """
+        重新编码模式 - 使用 filter_complex concat。
+        每个片段独立控制：裁剪、旋转、翻转、反交错、截取、倒放、增强、变速。
+        强制统一分辨率、像素格式、帧率、SAR。
+        全局阶段仅应用：视频字幕烧录；音频音量调整。
+        """
+        # ----- 1. 计算主视频最终输出规格（用于强制统一） -----
+        main_orig_w, main_orig_h = self._cached_video_dimensions(main_video.file_path)
+        if main_orig_w is None or main_orig_h is None:
+            main_orig_w, main_orig_h = 1280, 720
+    
+        main_target_w, main_target_h = self.compute_final_size_with_order(
+            main_orig_w, main_orig_h, main_video.enc_settings
+        )
+        if main_target_w <= 0 or main_target_h <= 0:
+            main_target_w, main_target_h = main_orig_w, main_orig_h
+    
+        # 目标像素格式
+        if main_video.enc_settings.get("pix_fmt_enabled", True):
+            target_pix_fmt = main_video.enc_settings.get("pix_fmt", "yuv420p")
+        else:
+            target_pix_fmt = self._get_stream_pix_fmt(main_video.file_path, 0) or "yuv420p"
+    
+        # 目标帧率
+        if main_video.enc_settings.get("frame_rate_type") == "custom":
+            try:
+                target_fps = float(main_video.enc_settings.get("frame_rate_custom", "30"))
+            except:
+                target_fps = 30.0
+        else:
+            raw_fps = self._get_video_framerate(main_video.file_path)
+            target_fps = raw_fps if raw_fps is not None else 30.0
+    
+        # ----- 2. 添加输入文件（视频 + 独立音频轨道） -----
+        concat_input_files = [t.file_path for t in video_tracks]
+        for audio in audio_tracks:
+            if audio.file_path not in concat_input_files:
+                concat_input_files.append(audio.file_path)
+        file_index = {p: i for i, p in enumerate(concat_input_files)}
+        for p in concat_input_files:
+            cmd.extend(["-i", normalize_path(p)])
+    
+        # ----- 3. 构建 filter_complex -----
+        n = len(video_tracks)
+        filter_parts = []
+        v_labels = []
+        a_labels = []
+    
+        for i, track in enumerate(video_tracks):
+            settings = track.enc_settings.copy()
+    
+            # ----- 视频部分（所有滤镜独立） -----
+            video_filters = build_video_filter_chain(
+                settings,
+                include_subtitle=False,
+                include_speed=True,                  # 变速独立
+                include_trim=True,                   # 截取独立
+                include_format=False,                # 格式由强制统一覆盖
+                include_scale=False,                 # 缩放由强制统一覆盖
+                enhance_settings=settings.get("enhance", {}),  # 增强独立
+                reverse=settings.get("reverse_enabled", False), # 倒放独立
+                graph_id=f"c{i}"                     # 同一 filter_complex 内标签需唯一
+            )
+    
+            # 强制统一滤镜（所有视频一致）
+            forced = [
+                f"scale={main_target_w}:{main_target_h}",
+                f"format={target_pix_fmt}",
+                f"fps={target_fps:.6f}".rstrip('0').rstrip('.'),
+                "setsar=1",
+                "setpts=PTS-STARTPTS"
+            ]
+    
+            if video_filters and video_filters != "null":
+                full_vf = f"{video_filters},{','.join(forced)}"
+            else:
+                full_vf = ",".join(forced)
+    
+            filter_parts.append(f"[{i}:v]{full_vf}[v{i}]")
+            v_labels.append(f"[v{i}]")
+    
+        # ----- 4. 视频拼接 -----
+        v_concat = f"{''.join(v_labels)}concat=n={n}:v=1:a=0[vout]"
+        filter_parts.append(v_concat)
+
+        # ----- 4b. 音频拼接 -----
+        # 优先使用「独立音频轨道」的逐轨设置（与其它模式统一，音频完全独立控制）；
+        # 若未添加任何独立音频轨道，则回退到各视频自带音轨，
+        #   此时嵌入音频仅做截取 / 基准 PTS 重置，不再跟随视频的倒放或变速（已全面解绑）。
+        a_labels = []
+        if audio_tracks:
+            for j, audio in enumerate(audio_tracks):
+                a_idx = file_index[audio.file_path]
+                audio.enc_settings["_file_path"] = audio.file_path
+                af_str = self._build_audio_filters(
+                    audio.enc_settings,
+                    include_trim=True,
+                    include_volume=True,
+                    include_speed=True,
+                    include_reverse=audio.enc_settings.get("audio_reverse", False)
+                )
+                if af_str:
+                    filter_parts.append(f"[{a_idx}:a]{af_str}[a{j}]")
+                else:
+                    filter_parts.append(f"[{a_idx}:a]asetpts=PTS-STARTPTS[a{j}]")
+                a_labels.append(f"[a{j}]")
+        else:
+            for i, track in enumerate(video_tracks):
+                settings = track.enc_settings.copy()
+                audio_type = settings.get("audio_source_type", "self")
+                effective_duration = self._get_effective_duration(settings, input_path=track.file_path)
+                if effective_duration is None or effective_duration <= 0:
+                    effective_duration = 10.0
+                has_audio = False
+                info = self._get_cached_stream_info(track.file_path)
+                if info:
+                    has_audio = any(s.get('codec_type') == 'audio' for s in info.get('streams', []))
+                if audio_type == "silence" or not has_audio:
+                    filter_parts.append(f"anullsrc=r=44100:cl=stereo:duration={effective_duration:.3f}[a{i}]")
+                else:
+                    audio_filters = []
+                    if settings.get("trim_enabled", False):
+                        start = settings.get("trim_start", "").strip()
+                        end = settings.get("trim_end", "").strip()
+                        start_sec = time_to_seconds(start) if start else 0.0
+                        if effective_duration > 0:
+                            audio_filters.append(f"atrim=start={start_sec:.3f}:duration={effective_duration:.3f}")
+                            audio_filters.append("asetpts=PTS-STARTPTS")
+                    # 视频自带音轨的音频完全独立：仅做截取 / 基准 PTS 重置，
+                    # 不再跟随视频的「倒放」「变速」（所有模式全面解绑）。
+                    # 若需对嵌入音频做倒放或变速，请在合并页单独添加音频轨道并独立设置。
+                    if not audio_filters:
+                        audio_filters.append("asetpts=PTS-STARTPTS")
+                    audio_chain = ",".join(audio_filters)
+                    filter_parts.append(f"[{i}:a]{audio_chain}[a{i}]")
+                a_labels.append(f"[a{i}]")
+    
+        # ----- 5. 视频全局滤镜：字幕、文字水印 drawtext -----
+        global_video_filters = []
+        if main_video.enc_settings.get("subtitle_enabled", False):
+            sub_path = main_video.enc_settings.get("subtitle_path", "").strip()
+            if sub_path:
+                safe_sub_path = sub_path.replace("'", "\\'")
+                global_video_filters.append(f"subtitles=filename='{safe_sub_path}'")
+        # 文字水印 drawtext（跟随主视频设置）
+        dt = build_drawtext_filter(main_video.enc_settings.get("text_watermark", {}))
+        if dt:
+            global_video_filters.append(dt)
+
+        if global_video_filters:
+            video_global_chain = ",".join(global_video_filters)
+            filter_parts.append(f"[vout]{video_global_chain}[vfinal]")
+            vmap = "[vfinal]"
+        else:
+            vmap = "[vout]"
+
+        # ----- 6. 音频拼接 -----
+        a_concat = f"{''.join(a_labels)}concat=n={len(a_labels)}:v=0:a=1[aout]"
+        filter_parts.append(a_concat)
+
+        # ----- 7. 音频映射：音量等已全部下放到每条独立音轨（_build_audio_filters），
+        #           不再在此套用全局音量，避免与主视频音量重复叠加 -----
+        amap = "[aout]"
+
+        # ----- 8. 组合所有滤镜 -----
+        all_filters = ";".join(filter_parts)
+        cmd.extend(["-filter_complex", all_filters])
+        cmd.extend(["-map", vmap, "-map", amap])
+    
+        # ----- 9. 音频编码参数 -----
+        if audio_tracks:
+            a_settings = audio_tracks[0].enc_settings
+            enc = a_settings.get("encoder", "aac")
+            if enc == "copy":
+                enc = "aac"
+                self._append_info_ui(_("[串联-编] 重新编码模式下音频自动从 copy 改为 aac"))
+            cmd.extend([
+                "-c:a", enc,
+                "-b:a", a_settings.get("bitrate", "128k"),
+                "-ar", a_settings.get("samplerate", "44100")
+            ])
+        else:
+            cmd.extend(["-c:a", "aac", "-b:a", "128k", "-ar", "44100"])
+    
+        # ----- 10. 视频编码参数 -----
+        v_settings = main_video.enc_settings.copy()
+        vcodec = v_settings.get("encoder", "libx265")
+        if vcodec == "copy":
+            self._append_info_ui(_("[串联-编] 重新编码模式下视频编码器自动改为 libx265"))
+            vcodec = "libx265"
+            v_settings["encoder"] = "libx265"
+        strategy = get_encoder_strategy(vcodec)
+        cmd = strategy.build_params(cmd, v_settings)
+    
+        # 容器优化
+        self._add_container_optimization(cmd)
+        cmd.append(output_norm)
+        self._append_info_ui(_("[串联-编] 使用 filter_complex 重新编码模式（{0} 个片段）".format(n)))
+        return cmd
+    
+    def merge_build_cmd_list(self, output_override=None, preview=False) -> List[str]:
+        """
+        根据当前模式生成合并/封装的 FFmpeg 命令列表。
+        """
+
+        if not self.ffmpeg_cmd:
+            self._append_info_ui(_("未找到 ffmpeg，无法生成合并命令。"))
+            return []
+    
+        if output_override is not None:
+            output = output_override
+        else:
+            output = self.merge_output.get().strip()
+        if not output:
+            return []
+    
+        only_audio = self.merge_only_audio.get() if hasattr(self, 'merge_only_audio') else False
+        enabled_tracks = [t for t in self.merge_tracks if t.enabled]
+
+        if any(t.enc_settings.get("_placeholder", False) for t in enabled_tracks):
+            self._append_info_ui(_("[封装] 存在占位轨道，命令生成被推迟"))
+            return []
+
+        if not enabled_tracks:
+            self._append_info_ui(_("[封装] 没有启用的轨道"))
+            return []
+
+        # 将全局文字水印设置传递到主视频轨道（供 PIP/concat 命令构建使用）
+        video_tracks = [t for t in enabled_tracks if t.type == "video"]
+        if video_tracks:
+            video_tracks[0].enc_settings["text_watermark"] = copy.deepcopy(self.text_watermark_settings)
+
+        output_norm = normalize_path(output)
+    
+        # ---- 仅音频模式：强制普通封装，并自动调整输出扩展名 ----
+        if only_audio:
+            self._append_info_ui(_("[封装] 已切换为仅音频模式（忽略视频和字幕）"))
+            if self.pip_enabled.get() or self.concat_enabled.get():
+                self._append_info_ui(_("[封装] 仅音频模式已自动切换到普通封装模式"))
+            # 如果扩展名不是常见音频格式，改为 .m4a
+            base, ext = os.path.splitext(output_norm)
+            if ext.lower() not in ('.m4a', '.mp3', '.flac', '.wav', '.aac', '.opus', '.ac3', '.ogg'):
+                output_norm = base + ".m4a"
+                self._append_info_ui(_("[封装] 仅音频模式，输出扩展名自动改为 .m4a".format()))
+            cmd_list = self._build_normal_cmd(enabled_tracks, output_norm, only_audio=True)
+        else:
+            # 根据模式选择命令生成函数
+            if self.pip_enabled.get():
+                cmd_list = self._build_pip_cmd(enabled_tracks, output_norm)
+            elif self.concat_enabled.get():
+                cmd_list = self._build_concat_cmd(enabled_tracks, output_norm, preview=preview)
+            else:
+                cmd_list = self._build_normal_cmd(enabled_tracks, output_norm)
+    
+        if not cmd_list:
+            self._append_info_ui(_("[封装] 命令生成失败，请检查设置"))
+            return []
+    
+        # ---- 手动时长覆盖（最高优先级） ----
+        if self.merge_manual_duration_enabled.get():
+            dur_str = self.merge_manual_duration.get().strip()
+            if dur_str:
+                dur_sec = time_to_seconds(dur_str)
+                if dur_sec is not None and dur_sec > 0:
+                    # 移除已有的 -t 和 -shortest 及其参数
+                    new_cmd = []
+                    skip_next = False
+                    for i, arg in enumerate(cmd_list):
+                        if skip_next:
+                            skip_next = False
+                            continue
+                        if arg in ('-t', '-shortest'):
+                            if arg == '-t':
+                                if i+1 < len(cmd_list) and not cmd_list[i+1].startswith('-'):
+                                    skip_next = True
+                            continue
+                        new_cmd.append(arg)
+                    if new_cmd and new_cmd[-1] != '-t':
+                        output_path = new_cmd.pop()
+                        new_cmd.extend(['-t', f'{dur_sec:.3f}'])
+                        new_cmd.append(output_path)
+                    cmd_list = new_cmd
+                else:
+                    self._append_info_ui(_("警告：手动时长格式无效，已忽略"))
+
+
+
+        if not preview:
+            total_len = len(' '.join(cmd_list))
+            if total_len > 25000:
+                cmd_list, temp_files = self._shorten_long_filters(cmd_list, force=True)
+            else:
+                cmd_list, temp_files = self._shorten_long_filters(cmd_list)
+            if temp_files:
+                if not hasattr(self, '_merge_temp_files'):
+                    self._merge_temp_files = []
+                self._merge_temp_files.extend(temp_files)
+        return cmd_list
+    
+    
+    def _check_video_params_consistent(self, video_tracks, silent=False) -> bool:
+        """
+        检查所有视频轨道的编码参数是否一致（用于串联 copy 模式）。
+        对比参数包括编码器名称 (codec_name)、分辨率 (高宽)、像素格式 (pix_fmt)、时间基 (time_base)、帧率 (avg_frame_rate 或 r_frame_rate)、
+        这些参数是 流复制模式下 concat 要求一致的关键参数。缺少任一项都可能导致输出异常（如花屏、音画不同步、无法播放）。
+        使用缓存避免重复检查，缓存键基于所有文件的路径+修改时间。
+        返回 True 表示参数一致，False 表示不一致（建议切换到重新编码模式）。
+        """
+        if len(video_tracks) < 2:
+            return True
+    
+        # ---- 构建缓存键 ----
+        # 使用 (文件路径, 修改时间) 元组列表作为键
+        cache_key_parts = []
+        for track in video_tracks:
+            path = track.file_path
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                mtime = 0
+            cache_key_parts.append((path, mtime))
+        cache_key = tuple(cache_key_parts)  # 元组可哈希
+    
+        # 检查缓存
+        if not hasattr(self, '_concat_params_cache'):
+            self._concat_params_cache = {}
+        if cache_key in self._concat_params_cache:
+            return self._concat_params_cache[cache_key]
+    
+        # ---- 实际检查 ----
+        ref_track = video_tracks[0]
+        ref_info = self._get_cached_stream_info(ref_track.file_path)
+        if not ref_info:
+            self._concat_params_cache[cache_key] = False
+            return False
+    
+        ref_stream = None
+        for s in ref_info.get('streams', []):
+            if s.get('codec_type') == 'video':
+                ref_stream = s
+                break
+        if not ref_stream:
+            self._concat_params_cache[cache_key] = False
+            return False
+    
+        # 提取参考参数
+        ref_codec = ref_stream.get('codec_name')          #编码器名称
+        ref_w = ref_stream.get('width')                   #宽度
+        ref_h = ref_stream.get('height')
+        ref_pix_fmt = ref_stream.get('pix_fmt')           #像素格式
+        ref_time_base = ref_stream.get('time_base')       #时间基
+        ref_frame_rate = ref_stream.get('avg_frame_rate') or ref_stream.get('r_frame_rate')     #帧率
+    
+        # 逐个比较后续轨道
+        for track in video_tracks[1:]:
+            info = self._get_cached_stream_info(track.file_path)
+            if not info:
+                self._concat_params_cache[cache_key] = False
+                return False
+    
+            stream = None
+            for s in info.get('streams', []):
+                if s.get('codec_type') == 'video':
+                    stream = s
+                    break
+            if not stream:
+                self._concat_params_cache[cache_key] = False
+                return False
+    
+            # 比较关键参数
+            if stream.get('codec_name') != ref_codec:
+                self._concat_params_cache[cache_key] = False
+                return False
+            if stream.get('width') != ref_w or stream.get('height') != ref_h:
+                self._concat_params_cache[cache_key] = False
+                return False
+            if stream.get('pix_fmt') != ref_pix_fmt:
+                self._concat_params_cache[cache_key] = False
+                return False
+            if stream.get('time_base') != ref_time_base:
+                self._concat_params_cache[cache_key] = False
+                return False
+    
+            frame_rate = stream.get('avg_frame_rate') or stream.get('r_frame_rate')
+            if frame_rate != ref_frame_rate:
+                self._concat_params_cache[cache_key] = False
+                return False
+    
+        # 所有参数一致
+        self._concat_params_cache[cache_key] = True
+        return True  
+    
+    
+    
+
+
+    def merge_update_command_preview(self, output_override=None):
+        # 取消之前排队的更新
+        if hasattr(self, '_merge_preview_after_id') and self._merge_preview_after_id:
+            self.root.after_cancel(self._merge_preview_after_id)
+            self._merge_preview_after_id = None
+    
+        # 延迟执行真正的更新（100ms 足够覆盖连续操作）
+        self._merge_preview_after_id = self.root.after(100, self._do_merge_update_command_preview, output_override)
+    
+    def _do_merge_update_command_preview(self, output_override=None):
+        self._merge_preview_after_id = None
+        if self._batch_update:
+            return
+
+        # ===== 检测是否有占位轨道 =====
+        has_placeholder = any(
+            t.enc_settings.get("_placeholder", False)
+            for t in self.merge_tracks
+            if t.type == "video"
+        )
+        if has_placeholder:
+            current_state = self.merge_cmd_preview.cget('state')
+            self.merge_cmd_preview.config(state='normal')
+            self.merge_cmd_preview.delete(1.0, tk.END)
+            self.merge_cmd_preview.insert(tk.END, "正在解析文件信息，命令预览将在解析完成后生成...")
+            self.merge_cmd_preview.config(state=current_state)
+            return
+
+        # 临时启用以便更新内容
+        current_state = self.merge_cmd_preview.cget('state')
+        self.merge_cmd_preview.config(state='normal')
+    
+        # 清空并填充
+        self.merge_cmd_preview.delete(1.0, tk.END)
+        cmd_list = self.merge_build_cmd_list(output_override=output_override, preview=True)
+        if not cmd_list:
+            self.merge_cmd_preview.insert(tk.END, "参数不完整，无法生成命令")
+        else:
+            cmd_str = format_cmd_for_display(cmd_list)
+            self.merge_cmd_preview.insert(tk.END, cmd_str)
+    
+        # 恢复用户设置的编辑状态
+        self.merge_cmd_preview.config(state=current_state)
+
+    def _get_cached_stream_info(self, path):
+        """
+        获取媒体流信息，带缓存。
+        缓存键 = (normalize_path(path), mtime)，文件修改后自动失效。
+        """
+        norm_path = normalize_path(path)
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = None
+        key = (norm_path, mtime)
+        if key in self._stream_info_cache:
+            return self._stream_info_cache[key]
+        info = ffprobe_json(self.ffprobe_cmd, path)
+        if info:
+            self._stream_info_cache[key] = info
+        return info
+
+    def merge_get_media_info(self, path):
+        return self._get_cached_stream_info(path)
+
+    def _cached_video_dimensions(self, file_path):
+        """
+        获取视频原始宽高（不考虑旋转），优先读解析缓存（拖入文件时已填充 _stream_info_cache），
+        未命中回退懒尺寸缓存，再回退未缓存 ffprobe。供构建命令复用，避免对大量文件重复探帧。
+        """
+        if not file_path or not os.path.exists(file_path):
+            return None, None
+        # 1) 解析缓存（命中即 0 次 ffprobe）
+        info = self._get_cached_stream_info(file_path)
+        if info:
+            for s in info.get("streams", []):
+                if s.get("codec_type") == "video":
+                    w = s.get("width")
+                    h = s.get("height")
+                    if w and h:
+                        return int(w), int(h)
+        # 2) 懒尺寸缓存
+        w, h = self._get_video_dimensions_cached(file_path)
+        if w is not None and h is not None:
+            return w, h
+        # 3) 终极回退（未缓存）
+        return get_video_dimensions(self.ffprobe_cmd, file_path)
+
+    def _cached_video_rotated_dimensions(self, file_path, settings):
+        """
+        获取考虑元数据旋转与用户旋转后的尺寸，优先读解析缓存。
+        缓存未命中时回退现有未缓存实现（保持原始行为完全一致）。
+        """
+        w, h = self._cached_video_dimensions(file_path)
+        if w is None:
+            return get_video_rotated_dimensions(self.ffprobe_cmd, file_path, settings)
+        # 应用元数据旋转（从缓存读取 side_data_list）
+        info = self._get_cached_stream_info(file_path)
+        if info:
+            for s in info.get("streams", []):
+                if s.get("codec_type") == "video":
+                    for sd in s.get("side_data_list", []):
+                        rot = sd.get("rotation")
+                        if rot is not None:
+                            if int(rot) % 180 == 90:
+                                w, h = h, w
+                            break
+                    break
+        # 用户旋转
+        rotate = (settings or {}).get("rotate", "none")
+        if rotate in ("90", "270"):
+            w, h = h, w
+        return w, h
+
+    def merge_load_video_info(self):
+        if self._suppress_main_video_trace:
+            return
+
+        path = self.merge_video.get().strip()
+        if not path or not os.path.exists(path):
+            self.merge_tracks = []
+            self.merge_update_track_list()
+            self.merge_update_output_preview()
+            return
+    
+        self._batch_update = True
+        try:
+            ext = os.path.splitext(path)[1].lower().lstrip('.')
+            self.original_container = ext if ext in ['mp4', 'mkv', 'mov', 'avi', 'webm'] else 'mp4'
+            info = self._get_cached_stream_info(path)
+            if not info:
+                self._append_info_ui(_("[封装] 无法解析媒体信息: {0}，可能 ffprobe 失败".format(path)))
+                self.merge_tracks = []
+                self.merge_update_track_list()
+                self.merge_update_output_preview()
+                return
+            streams = info.get("streams", [])
+            if not streams:
+                self._append_info_ui(_("[封装] {0} 中没有发现任何流".format(path)))
+                return
+            self.merge_tracks = []
+            for s in streams:
+                st = s.get("codec_type")
+                if st not in ("video","audio","subtitle"):
+                    continue
+                track = Track(s["index"], st, s.get("codec_name", "unknown"), path, True)
+                self.merge_tracks.append(track)
+            if not self.merge_tracks:
+                self._append_info_ui(_("[封装] {0} 中未找到视频/音频/字幕轨道".format(path)))
+            self.merge_update_track_list()
+            self.merge_auto_recommend_container()
+            self.merge_update_output_preview()
+        finally:
+            self._batch_update = False
+            self.merge_update_track_list()
+            self.merge_update_command_preview()  # 最终统一刷新一次
+
+    def merge_update_track_list(self):
+        """刷新轨道列表，显示分组编号（同一文件的音频/字幕共享组号）"""
+        if self._batch_update:
+            return
+    
+        # 清空现有行
+        for item in self.merge_tree.get_children():
+            self.merge_tree.delete(item)
+    
+        # 配置标签颜色（主视频、子视频、音频、字幕）
+        # 每种类型有两套：偶数行和奇数行（交替）
+        self.merge_tree.tag_configure('even_main', background='#d9e8f7')
+        self.merge_tree.tag_configure('odd_main', background='#85C1E9')
+        self.merge_tree.tag_configure('even_pip', background='#d9f0d9')
+        self.merge_tree.tag_configure('odd_pip', background='#bde0bd')
+        self.merge_tree.tag_configure('even_concat', background='#fdebd0')
+        self.merge_tree.tag_configure('odd_concat', background='#fad7a5')
+        self.merge_tree.tag_configure('even_audio', background='#f0f0f0')
+        self.merge_tree.tag_configure('odd_audio', background='#e0e0e0')
+        self.merge_tree.tag_configure('even_subtitle', background='#e8e0f0')
+        self.merge_tree.tag_configure('odd_subtitle', background='#d8cfe8')
+        self.merge_tree.tag_configure('even_video', background='#f0f0f0')
+        self.merge_tree.tag_configure('odd_video', background='#e0e0e0')
+    
+        # 确定主视频
+        enabled_video_tracks = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
+        main_video = enabled_video_tracks[0] if enabled_video_tracks else None
+    
+        # ----- 分组编号 -----
+        # 为每个不同的 file_path 分配组编号（忽略空路径）
+        file_to_group = {}
+        next_group = 1
+        for track in self.merge_tracks:
+            file_path = track.file_path
+            if file_path and file_path not in file_to_group:
+                file_to_group[file_path] = next_group
+                next_group += 1
+    
+        # 初始化每个组的各类型计数器
+        group_counters = {}
+        for group in file_to_group.values():
+            group_counters[group] = {'video': 0, 'audio': 0, 'subtitle': 0}
+        # 用于无文件路径的轨道（回退序号）
+        fallback_counter = 0
+    
+        for i, track in enumerate(self.merge_tracks):
+            # ----- 生成序号（单条时不添加后缀） -----
+            file_path = track.file_path
+            group = file_to_group.get(file_path)
+            if group is not None:
+                # 有文件路径，使用分组编号
+                if track.type == 'video':
+                    group_counters[group]['video'] += 1
+                    cnt = group_counters[group]['video']
+                    # 如果该组视频只有1条，不加后缀
+                    if cnt == 1:
+                        seq = f"V{group}"
+                    else:
+                        seq = f"V{group}-{cnt}"
+                elif track.type == 'audio':
+                    group_counters[group]['audio'] += 1
+                    cnt = group_counters[group]['audio']
+                    if cnt == 1:
+                        seq = f"A{group}"
+                    else:
+                        seq = f"A{group}-{cnt}"
+                elif track.type == 'subtitle':
+                    group_counters[group]['subtitle'] += 1
+                    cnt = group_counters[group]['subtitle']
+                    if cnt == 1:
+                        seq = f"S{group}"
+                    else:
+                        seq = f"S{group}-{cnt}"
+                else:
+                    fallback_counter += 1
+                    seq = str(fallback_counter)
+            else:
+                # 无文件路径（如静音轨道），使用回退序号
+                fallback_counter += 1
+                seq = str(fallback_counter)
+
+    
+            # 确定标签
+            if track.type == "video":
+                if track == main_video:
+                    tag = 'even_main' if i % 2 == 0 else 'odd_main'
+                elif self.pip_enabled.get():
+                    tag = 'even_pip' if i % 2 == 0 else 'odd_pip'
+                elif self.concat_enabled.get():
+                    tag = 'even_concat' if i % 2 == 0 else 'odd_concat'
+                else:
+                    tag = 'even_video' if i % 2 == 0 else 'odd_video'
+            elif track.type == "audio":
+                tag = 'even_audio' if i % 2 == 0 else 'odd_audio'
+            elif track.type == "subtitle":
+                tag = 'even_subtitle' if i % 2 == 0 else 'odd_subtitle'
+            else:
+                tag = 'even' if i % 2 == 0 else 'odd'
+    
+            # 显示内容
+            enabled_text = "✓" if track.enabled else "✗"
+            enc_text = "复制流" if not track.is_encoding() else track.enc_settings.get("encoder", "?")
+            display_type = track.type
+            if track.type == "video" and track == main_video:
+                display_type = "视频(主)"
+            elif track.type == "video":
+                if self.pip_enabled.get():
+                    display_type = "视频(画)"
+                elif self.concat_enabled.get():
+                    display_type = "视频(串)"
+                else:
+                    display_type = "视频(从)"
+    
+            # ---- 规格 ----
+            if track.type == "video":
+                if track.enc_settings.get("_placeholder", False):
+                    detail = "解析中…"
+                elif track.enc_settings.get("_error"):
+                    detail = "❌ 解析失败"
+                else:
+                    chain = self._get_video_size_chain(track)
+                    if chain:
+                        detail = " → ".join(chain)
+                    else:
+                        detail = "未知"
+                    # 附上时长
+                    dur = self._get_media_duration(track.file_path)
+                    if dur is not None:
+                        detail += f" ({seconds_to_time(dur)})"
+            elif track.type == "audio":
+                info = self._get_cached_stream_info(track.file_path)
+                if info:
+                    streams = info.get('streams', [])
+                    for s in streams:
+                        if s.get('codec_type') == 'audio' and s.get('index') == track.index:
+                            bitrate = s.get('bit_rate')
+                            if bitrate:
+                                try:
+                                    bitrate_kbps = int(bitrate) // 1000
+                                    detail = f"{bitrate_kbps} kbps"
+                                except:
+                                    detail = s.get('codec_name', '音频')
+                            else:
+                                # 构建备选信息
+                           #     codec_name = s.get('codec_name', '')
+                                sample_rate = s.get('sample_rate')
+                                channels = s.get('channels')
+                                parts = []
+                      #          if codec_name:
+                      #              parts.append(codec_name)
+                                if sample_rate:
+                                    parts.append(f"{int(sample_rate)//1000}kHz")
+                                if channels:
+                                    parts.append(f"{channels}ch")
+                                detail = " ".join(parts) if parts else "-"
+                            dur = self._get_media_duration(track.file_path)
+                            if dur is not None:
+                                detail += f" ({seconds_to_time(dur)})"
+                            break
+                    else:
+                        detail = "-"
+                else:
+                    detail = "-"
+            elif track.type == "subtitle":
+                info = self._get_cached_stream_info(track.file_path)
+                lang = ""
+                if info:
+                    streams = info.get('streams', [])
+                    for s in streams:
+                        if s.get('codec_type') == 'subtitle' and s.get('index') == track.index:
+                            tags = s.get('tags', {})
+                            lang = tags.get('language', '')
+                            break
+                detail = f"{lang}" if lang else "-"
+            else:
+                detail = "-"
+    
+            values = (
+                seq,
+                enabled_text,
+                display_type,
+                detail,
+                track.codec[:10],
+                os.path.basename(track.file_path) if track.file_path else "外部",
+                enc_text
+            )
+            iid = f"track_{i}"
+            self.merge_tree.insert("", tk.END, iid=iid, values=values, tags=(tag,))
+    
+        if not self.merge_tracks:
+            self.merge_tree.insert("", tk.END, values=("", "未加载轨道", "", "", ""))
+
+    def _get_selected_track_indices(self):
+        """获取选中行的轨道索引列表（按实际列表顺序）"""
+        selected = self.merge_tree.selection()
+        indices = []
+        for iid in selected:
+            idx = int(iid.split('_')[1])
+            if 0 <= idx < len(self.merge_tracks):
+                indices.append(idx)
+        return sorted(indices)
+    
+    def merge_toggle_selected(self):
+        indices = self._get_selected_track_indices()
+        if not indices:
+            messagebox.showinfo(_("提示"), _("请先选中轨道"))
+            return
+        # 如果所有选中的都启用，则全部禁用；否则全部启用
+        all_enabled = all(self.merge_tracks[idx].enabled for idx in indices)
+        new_state = not all_enabled
+        for idx in indices:
+            self.merge_tracks[idx].enabled = new_state
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+    
+    def merge_edit_selected(self):
+        indices = self._get_selected_track_indices()
+        if not indices:
+            messagebox.showinfo(_("提示"), _("请先选中轨道"))
+            return
+        # 只编辑第一个选中项
+        self.merge_edit_track_settings(indices[0])
+    
+    def merge_preview_selected(self, with_snapshot: bool = False):
+        indices = self._get_selected_track_indices()
+        if not indices:
+            messagebox.showinfo(_("提示"), _("请先选中轨道"))
+            return
+        self.merge_preview_track(indices[0], with_snapshot=with_snapshot)
+    
+    def merge_move_up_selected(self):
+        indices = self._get_selected_track_indices()
+        if not indices:
+            return
+        self._move_selected_tracks(indices, direction=-1)
+    
+    def merge_move_down_selected(self):
+        indices = self._get_selected_track_indices()
+        if not indices:
+            return
+        self._move_selected_tracks(indices, direction=1)
+    
+    def _move_selected_tracks(self, indices, direction):
+        """
+        将选中的轨道整体上移（direction=-1）或下移（direction=1）。
+        仅当选中轨道连续时支持整体移动，否则只移动第一个选中项。
+        """
+        if not indices:
+            return
+    
+        # 排序
+        indices = sorted(indices)
+        min_idx = indices[0]
+        max_idx = indices[-1]
+    
+        # 检查是否连续
+        if max_idx - min_idx + 1 != len(indices):
+            # 不连续：只移动第一个
+            self._append_info_ui(_("[提示] 选中轨道不连续，仅移动第一个。请选择连续轨道以整体移动。"))
+            idx = indices[0]
+            if direction == -1:
+                if idx > 0:
+                    self.merge_tracks[idx], self.merge_tracks[idx-1] = self.merge_tracks[idx-1], self.merge_tracks[idx]
+            else:
+                if idx < len(self.merge_tracks) - 1:
+                    self.merge_tracks[idx], self.merge_tracks[idx+1] = self.merge_tracks[idx+1], self.merge_tracks[idx]
+            new_selection = str(idx + direction)  # 移动后的索引
+            self.merge_update_track_list()
+            self.merge_update_command_preview()
+            if 0 <= idx + direction < len(self.merge_tracks):
+                self.merge_tree.selection_set(f"track_{idx + direction}")
+            return
+    
+        # 连续：整体移动
+        if direction == -1:
+            if min_idx == 0:
+                self._append_info_ui(_("[提示] 已在顶部，无法上移"))
+                return
+            # 将选中的块整体上移一位
+            block = self.merge_tracks[min_idx:max_idx+1]
+            before = self.merge_tracks[min_idx-1]
+            # 重新赋值：将 before 插入到块末尾，块整体前移
+            self.merge_tracks[min_idx-1:max_idx+1] = block + [before]
+            new_min = min_idx - 1
+            new_max = max_idx - 1
+        else:  # direction == 1
+            if max_idx == len(self.merge_tracks) - 1:
+                self._append_info_ui(_("[提示] 已在底部，无法下移"))
+                return
+            block = self.merge_tracks[min_idx:max_idx+1]
+            after = self.merge_tracks[max_idx+1]
+            self.merge_tracks[min_idx:max_idx+2] = [after] + block
+            new_min = min_idx + 1
+            new_max = max_idx + 1
+    
+        # 刷新列表并恢复选中状态
+        self.merge_update_track_list()
+        for i in range(new_min, new_max + 1):
+            self.merge_tree.selection_add(f"track_{i}")
+        self.merge_update_command_preview()
+        self._append_info_ui(_("[移动] 已整体{0} {1} 个轨道".format('上移' if direction == -1 else '下移', len(indices))))
+    
+    def merge_delete_selected(self):
+        indices = self._get_selected_track_indices()
+        if not indices:
+            messagebox.showinfo(_("提示"), _("请先选中轨道"))
+            return
+        # 从大到小删除
+        for idx in reversed(indices):
+            removed = self.merge_tracks.pop(idx)
+            self._append_info_ui(_("[封装] 已删除轨道: {0} - {1}".format(removed.type, os.path.basename(removed.file_path))))
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+    
+    def merge_clear_tracks(self):
+        if self.merge_tracks and messagebox.askyesno(_("确认"), _("确定清空所有轨道吗？")):
+            self.merge_tracks.clear()
+            self.merge_video.set("")
+            self.merge_output.set("")
+            self.merge_update_track_list()
+            self.merge_auto_recommend_container()
+            self.merge_update_command_preview()
+            self.merge_reset_column_widths()    #调用恢复列宽
+            self._append_info_ui(_("[封装] 已清空所有附加轨道"))
+
+
+
+    def merge_on_tree_double_click(self, event):
+        """双击编辑第一个选中的轨道"""
+        self.merge_edit_selected()
+
+    def merge_reset_column_widths(self):
+        """恢复合并页面 Treeview 各列的默认宽度"""
+        # 原创建时的列宽设置
+        self.merge_tree.column("序号", width=10)
+        self.merge_tree.column("启用", width=5)
+        self.merge_tree.column("类型", width=30)
+        self.merge_tree.column("规格", width=220)
+        self.merge_tree.column("编码", width=20)
+        self.merge_tree.column("来源 - 双击编辑 右键更多", width=380)
+        self.merge_tree.column("编码设置", width=60)
+        self._append_info_ui(_("[布局] 已恢复合并列表的列宽"))
+
+
+
+    def merge_move_track_up(self, idx):
+        if idx <= 0:
+            return
+        self.merge_tracks[idx], self.merge_tracks[idx-1] = self.merge_tracks[idx-1], self.merge_tracks[idx]
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+
+    def merge_move_track_down(self, idx):
+        if idx >= len(self.merge_tracks)-1:
+            return
+        self.merge_tracks[idx], self.merge_tracks[idx+1] = self.merge_tracks[idx+1], self.merge_tracks[idx]
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+
+
+
+    def merge_remove_track(self, track_idx):
+        if 0 <= track_idx < len(self.merge_tracks):
+            removed = self.merge_tracks.pop(track_idx)
+            self._append_info_ui(_("[封装] 已删除轨道: {0} - {1}".format(removed.type, os.path.basename(removed.file_path))))
+            self.merge_update_track_list()
+            self.merge_auto_recommend_container()
+            self.merge_update_command_preview()
+
+
+
+    def evaluate_expression(self, expr, main_w, main_h, box_w, box_h):
+        return safe_eval_expr(expr, {"W": main_w, "H": main_h, "w": box_w, "h": box_h})
+
+    def get_rendered_size(self, track):
+        w, h = self._cached_video_rotated_dimensions(track.file_path, track.enc_settings)
+        if w is None:
+            return None
+        return compute_rendered_size(w, h, track.enc_settings)
+
+    def merge_preview_track(self, track_idx, with_snapshot: bool = False):
+        """预览单个轨道，禁用倒放，变速仅 ffplay，自适应缩放（边距 自定义）"""
+        track = self.merge_tracks[track_idx]
+        if not os.path.exists(track.file_path):
+            self._append_info_ui(_("[预览] 文件不存在: {0}".format(track.file_path)))
+            return
+    
+        if track.type == "video":
+            reverse_enabled = track.enc_settings.get("reverse_enabled", False)
+            if reverse_enabled:
+                self._append_info_ui(_("[预览] 预览不支持倒放，已忽略 reverse。"))
+                temp_settings = track.enc_settings.copy()
+                temp_settings['reverse_enabled'] = False
+            else:
+                temp_settings = dict(track.enc_settings)
+            # 预览强制走软件滤镜：避免 vpp_qsv/scale_cuda 等硬件滤镜与下方屏幕自适应
+            # 软件 scale 混用（缺少 hwdownload/hwupload 包裹）导致播放器报错。
+            temp_settings["hw_filter_mode"] = "cpu"
+    
+            # ---- 视频滤镜（不含自适应缩放） ----
+            enhance = temp_settings.get("enhance", {})
+            filters = build_video_filter_chain(
+                temp_settings,
+                include_subtitle=False,
+                include_speed=False,
+                enhance_settings=enhance,
+                reverse=False
+            )
+    
+            # ---- 画中画模式：为主视频绘制子视频虚拟框 ----
+            pip_enabled = self.pip_enabled.get()
+            enabled_video_tracks = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
+            is_main_video = (enabled_video_tracks and enabled_video_tracks[0] == track)
+            if pip_enabled and is_main_video:
+                sub_videos = enabled_video_tracks[1:]
+                if sub_videos:
+                    main_w, main_h = self._get_video_render_size(track)
+                    if main_w is None:
+                        self._append_info_ui(_("[预览] 无法获取主视频尺寸，使用默认 1280x720"))
+                        main_w, main_h = 1280, 720
+                    drawboxes = []
+                    for sub in sub_videos:
+                        if not sub.enc_settings.get('overlay_enabled', True):
+                            continue
+                        rendered = self.get_rendered_size(sub)
+                        if rendered:
+                            box_w, box_h = rendered
+                        else:
+                            box_w, box_h = 200, 150
+                            self._append_info_ui(_("[预览] 无法获取从视频渲染尺寸，使用默认 {0}x{1}".format(box_w, box_h)))
+                        x_expr = sub.enc_settings.get('overlay_x', '0')
+                        y_expr = sub.enc_settings.get('overlay_y', '0')
+                        x_val = self.evaluate_expression(x_expr, main_w, main_h, box_w, box_h)
+                        y_val = self.evaluate_expression(y_expr, main_w, main_h, box_w, box_h)
+                        drawbox = f"drawbox=x={x_val}:y={y_val}:w={box_w}:h={box_h}:color=red@0.5:t=2"
+                        drawboxes.append(drawbox)
+                        self._append_info_ui(_("[预览] 从视频 {0} 实际渲染尺寸: {1}x{2}, 位置: ({3}, {4})".format(os.path.basename(sub.file_path), box_w, box_h, x_val, y_val)))
+                    if drawboxes:
+                        drawbox_chain = ",".join(drawboxes)
+                        if filters and filters != "null":
+                            filters = f"{filters},{drawbox_chain}"
+                        else:
+                            filters = drawbox_chain
+
+            # ---- 文字水印 drawtext（仅主视频） ----
+            if is_main_video:
+                dt = build_drawtext_filter(track.enc_settings.get("text_watermark", {}))
+                if dt:
+                    if filters and filters != "null":
+                        filters = f"{filters},{dt}"
+                    else:
+                        filters = dt
+
+            # ---- 自适应缩放（固定边距） ----
+            orig_w, orig_h = self._cached_video_rotated_dimensions(track.file_path, track.enc_settings)
+            if orig_w is None or orig_h is None:
+                orig_w, orig_h = 1280, 720
+            final_w, final_h = compute_rendered_size(orig_w, orig_h, track.enc_settings)
+    
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+            margin = 80
+            max_w = screen_w - margin
+            max_h = screen_h - margin
+    
+            if final_w > max_w or final_h > max_h:
+                scale = min(max_w / final_w, max_h / final_h)
+                target_w = int(final_w * scale)
+                target_h = int(final_h * scale)
+                target_w = target_w if target_w % 2 == 0 else target_w - 1
+                target_h = target_h if target_h % 2 == 0 else target_h - 1
+                if target_w < 2: target_w = 2
+                if target_h < 2: target_h = 2
+                scale_filter = f"scale={target_w}:{target_h}"
+                if filters and filters != "null":
+                    filters = f"{filters},{scale_filter}"
+                else:
+                    filters = scale_filter
+                self._append_info_ui(_("[预览] 缩放到 {0}x{1}".format(target_w, target_h)))
+            else:
+                self._append_info_ui(_("[预览] 保持原始尺寸 {0}x{1}".format(final_w, final_h)))
+    
+            # ---- 音频变速（仅 ffplay） ----
+            extra_args = []
+            af_filters = []
+            if is_main_video and track.enc_settings.get("audio_speed_enabled", False):
+                try:
+                    factor = float(track.enc_settings.get("audio_speed_factor", "1.0"))
+                    if factor != 1.0 and factor > 0:
+                        atempo = build_atempo_chain(factor)
+                        if atempo:
+                            af_filters.append(atempo)
+                except ValueError:
+                    pass
+            if af_filters:
+                if self.use_mpv.get():
+                    self._append_info_ui(_("[预览] mpv 预览不支持音频变速，已忽略。"))
+                else:
+                    af_chain = ",".join(af_filters)
+                    extra_args.extend(["-af", af_chain])
+    
+            # ---- 截取参数 ----
+            start_sec = None
+            duration = None
+            if track.enc_settings.get("trim_enabled", False):
+                start_str = track.enc_settings.get("trim_start", "").strip()
+                end_str = track.enc_settings.get("trim_end", "").strip()
+                start_sec = time_to_seconds(start_str) if start_str else None
+                end_sec = time_to_seconds(end_str) if end_str else None
+                if start_sec is not None and end_sec is not None and end_sec > start_sec:
+                    duration = end_sec - start_sec
+    
+            # ---- 调用播放器 ----
+            self.preview_with_player(track.file_path, filters or "", volume=10, extra_args=extra_args,
+                                     start_time=start_sec, duration=duration)
+            if pip_enabled and is_main_video and sub_videos:
+                self._append_info_ui(_("[预览] 占位框尺寸为从视频实际渲染大小"))
+                # 方案1：在同一次预览里额外生成"真实合成快照"（独立窗口，线程延迟开）
+                # 仅当右键预览（with_snapshot=True）时触发，左键旧预览不弹快照
+                if with_snapshot:
+                    self._show_pip_snapshot_async(track, sub_videos)
+    
+        elif track.type == "audio":
+            self.preview_with_player(track.file_path, audio_only=True, volume=10)
+        else:
+            self._append_info_ui(_("[预览] 不支持预览字幕轨"))
+
+    # ---------- 通用快照工具（画中画 / 水印共用） ----------
+    def _append_fit_scale(self, complex_filter, final_v_label, final_w, final_h):
+        """把最终视频标签按屏幕自适应缩放（与播放器预览同逻辑），返回 (complex_filter, map_label)。
+        主视频启用 pad 时，final_w/final_h 应为 pad 画布尺寸（由 _compute_output_canvas 提供）。"""
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        margin = 100
+        max_w = screen_w - margin
+        max_h = screen_h - margin
+        map_label = final_v_label
+        if final_w > max_w or final_h > max_h:
+            sc = min(max_w / final_w, max_h / final_h)
+            tw = int(final_w * sc); th = int(final_h * sc)
+            tw = tw if tw % 2 == 0 else tw - 1
+            th = th if th % 2 == 0 else th - 1
+            tw = max(tw, 2); th = max(th, 2)
+            # final_v_label 已带方括号（如 [v_out_0]），无需再加
+            complex_filter = f"{complex_filter};{final_v_label}scale={tw}:{th}[v_snap]"
+            map_label = "[v_snap]"
+        return complex_filter, map_label
+
+    def _show_snapshot_async(self, cmd, out_png, win_key, title, running_text, display_cb):
+        """通用快照入口：构造命令 → 开/复用独立窗口（先显示'生成中'）→ 线程生成后回填。
+        win_key 区分不同快照窗口（如 'pip' / 'wm'），窗口属性存于 self._snap_ui[win_key]。
+        display_cb(out_png) 在主线程执行，用于把 PNG 显示回窗口。"""
+        if not self.ffmpeg_cmd:
+            return
+        if not hasattr(self, "_snap_ui"):
+            self._snap_ui = {}
+        ui = self._snap_ui.get(win_key)
+        if ui is None or not ui["win"].winfo_exists():
+            win = tk.Toplevel(self.root)
+            ui = {"win": win, "label": ttk.Label(win), "status": ttk.Label(win, text="")}
+            ui["label"].pack(padx=6, pady=6)
+            ui["status"].pack(padx=6, pady=(0, 6))
+            self._snap_ui[win_key] = ui
+        ui["win"].title(title)
+        ui["status"].config(text=running_text)
+        ui["label"].config(image="", text=_("生成中…"))
+
+        def worker():
+            try:
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            except Exception as e:
+                self.root.after(0, lambda: ui["status"].config(text=_("快照生成失败: {0}".format(e))))
+                return
+            if os.path.exists(out_png):
+                self.root.after(0, lambda: display_cb(out_png))
+            else:
+                self.root.after(0, lambda: ui["status"].config(text=_("快照生成失败（无输出文件）")))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _display_snapshot(self, png_path, win_key):
+        """把生成的 PNG 显示到指定密钥的快照窗口（主线程执行）。"""
+        ui = getattr(self, "_snap_ui", {}).get(win_key)
+        if ui is None or not ui["win"].winfo_exists():
+            return
+        try:
+            img = tk.PhotoImage(file=png_path)
+            ui["img"] = img  # 保活，防止被 GC（引用挂在窗口 ui 上）
+            ui["label"].config(image=img, text="")
+            ui["status"].config(text=_("快照已生成: {0}".format(os.path.basename(png_path))))
+            # 居中窗口，确保整张图（含状态栏）完整可见，不溢出屏幕下方
+            try:
+                center_window(ui["win"], img.width() + 12, img.height() + 36)
+            except Exception:
+                pass
+        except Exception as e:
+            ui["status"].config(text=_("快照显示失败: {0}".format(e)))
+
+    # ---------- 画中画合成快照（方案1：静态单帧真实合成，独立窗口） ----------
+    def _build_pip_snapshot_cmd(self, track, sub_videos):
+        """
+        复用 _build_overlay_filter_complex 生成与最终成片完全一致的 filter_complex，
+        输出 1 帧 PNG 作为合成快照。子视频集合与 _build_pip_cmd 一致：
+        画中画 = 全部子视频；水印模式（转码页）只有 1 个叠加元素。
+        """
+        # ---- 输入文件与索引（复用 _prepare_tracks_and_inputs 做路径去重） ----
+        # 主视频排在最前（索引 0），子视频按路径去重后续递增；与正式合并 _build_pip_cmd
+        # 的索引分配规则保持一致（单一来源，避免两处去重逻辑漂移导致快照与成片不一致）。
+        # 注：该函数会顺带 ffprobe 计算各文件流索引并写入 _type_index，快照虽用不到，
+        # 但传入的正是 Track 对象，无副作用风险。
+        input_files, file_index = self._prepare_tracks_and_inputs([track] + list(sub_videos))
+
+        # ---- 构造 sub_infos（与 _build_pip_cmd 一致：copy 临时改 libx265） ----
+        sub_infos = []
+        for sv in sub_videos:
+            sv_settings = sv.enc_settings.copy()
+            if sv_settings.get("encoder") == "copy":
+                sv_settings["encoder"] = "libx265"
+            sub_infos.append((file_index[sv.file_path], sv.file_path, sv_settings))
+
+        complex_filter, final_v_label = self._build_overlay_filter_complex(
+            0, track.enc_settings, sub_infos,
+            include_subtitle_main=False,
+            enhance_settings=track.enc_settings.get("enhance", {}),
+            reverse=False,
+            main_file_path=track.file_path
+        )
+
+        # ---- 缩放：镜像播放器预览的自适应缩放逻辑（和红框同一个规则） ----
+        # 主视频启用 pad 时，最终输出画布为 pad 画布尺寸（含偏移），
+        # 不再用主视频自身的渲染尺寸，否则快照窗口尺寸与画布不符。
+        final_w, final_h = self._compute_output_canvas(track.enc_settings, track.file_path)
+        complex_filter, map_label = self._append_fit_scale(complex_filter, final_v_label, final_w, final_h)
+
+        # ---- 组装 ffmpeg 命令 ----
+        out_png = os.path.join(tempfile.gettempdir(), "kli_pip_snapshot.png")
+        cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
+        for idx, p in enumerate(input_files):
+            # 子视频加无限循环，保证首帧可用（与 _build_pip_cmd 的 -stream_loop 一致）
+            if idx != 0:
+                cmd.extend(["-stream_loop", "-1"])
+            cmd.extend(["-i", p])
+        cmd.extend(["-filter_complex", complex_filter])
+        cmd.extend(["-map", map_label])
+        # -update 1 让 image2 复用器把单帧直接写入 .png（避免 "does not contain an
+        # image sequence pattern" 警告导致部分 ffmpeg 版本不写文件、快照窗口报"生成失败"）
+        cmd.extend(["-vframes", "1", "-update", "1", out_png])
+        return cmd, out_png
+
+    def _show_pip_snapshot_async(self, track, sub_videos):
+        """画中画合成快照入口（方案1）：构造命令后交给通用快照流程。"""
+        try:
+            cmd, out_png = self._build_pip_snapshot_cmd(track, sub_videos)
+        except Exception as e:
+            self._append_info_ui(_("[预览] 合成快照命令构建失败: {0}".format(e)))
+            return
+        modes = [sv.enc_settings.get("blend_mode", "normal") for sv in sub_videos]
+        title = f"画中画合成快照 · 子视频{len(sub_videos)}个 · 模式: {'/'.join(modes)}"
+        self._show_snapshot_async(cmd, out_png, "pip", title, "正在生成合成快照…", self._display_pip_snapshot)
+
+    def _display_pip_snapshot(self, png_path):
+        self._display_snapshot(png_path, "pip")
+
+    # ---------- 转码页水印合成快照（真实叠加，独立窗口） ----------
+    def _build_watermark_snapshot_cmd(self, file_path, settings):
+        """构建转码页水印的真实合成快照命令（复用 _build_overlay_filter_complex）。"""
+        wm_settings = settings.get("watermark", {})
+        wm_file = (wm_settings.get("file_path", "") or "").strip()
+        if not wm_file or not os.path.exists(wm_file):
+            raise ValueError("水印文件不存在或未设置")
+
+        # 强制软件滤镜路径，与正式渲染保持一致
+        main_settings = dict(settings)
+        main_settings["hw_filter_mode"] = "cpu"
+
+        main_w, main_h = self._get_video_dimensions_cached(file_path)
+        # 提前探测水印原始尺寸（自适应表达式求值需要，用原始设置）
+        wm_orig_w, wm_orig_h = None, None
+        if wm_file and os.path.exists(wm_file):
+            wm_orig_w, wm_orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, wm_file, wm_settings)
+        if wm_settings.get("adaptive", False):
+            adapted_wm = self._adapt_sub_settings(wm_settings, main_w or 1280, main_h or 720, wm_orig_w, wm_orig_h)
+        else:
+            adapted_wm = dict(wm_settings)
+        adapted_wm["hw_filter_mode"] = "cpu"
+
+        sub_infos = [(1, wm_file, adapted_wm)]
+        complex_filter, final_v_label = self._build_overlay_filter_complex(
+            0, main_settings, sub_infos,
+            include_subtitle_main=False,
+            enhance_settings=settings.get("enhance", {}),
+            main_file_path=file_path
+        )
+
+        # ---- 输入（主视频 + 水印），循环参数与正式渲染一致 ----
+        ext = os.path.splitext(wm_file)[1].lower()
+        is_image = ext in ('.png', '.jpg', '.jpeg', '.bmp', '.webp')
+        out_png = os.path.join(tempfile.gettempdir(), "kli_wm_snapshot.png")
+        cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
+        cmd.extend(["-i", file_path])
+        if ext == '.gif':
+            cmd.extend(["-stream_loop", "-1"])
+        elif is_image:
+            cmd.extend(["-loop", "1", "-framerate", "30"])
+        else:
+            cmd.extend(["-stream_loop", "-1"])
+        cmd.extend(["-i", wm_file])
+
+        # ---- 缩放：按最终画布尺寸（含 pad 画布）适配屏幕 ----
+        final_w, final_h = self._compute_output_canvas(main_settings, file_path)
+        complex_filter, map_label = self._append_fit_scale(complex_filter, final_v_label, final_w, final_h)
+
+        cmd.extend(["-filter_complex", complex_filter])
+        cmd.extend(["-map", map_label])
+        # 同 _build_pip_snapshot_cmd：加 -update 1 确保单帧 PNG 稳定写出
+        cmd.extend(["-vframes", "1", "-update", "1", out_png])
+        mode = adapted_wm.get("blend_mode", "normal") or "normal"
+        title = f"水印合成快照 · 模式: {mode}"
+        return cmd, out_png, title
+
+    def _show_watermark_snapshot_async(self, file_path, settings):
+        """转码页水印快照入口：构造命令后交给通用快照流程。"""
+        try:
+            cmd, out_png, title = self._build_watermark_snapshot_cmd(file_path, settings)
+        except Exception as e:
+            self._append_info_ui(_("[预览] 水印快照命令构建失败: {0}".format(e)))
+            return
+        self._show_snapshot_async(cmd, out_png, "wm", title, "正在生成水印快照…", self._display_watermark_snapshot)
+
+    def _display_watermark_snapshot(self, png_path):
+        self._display_snapshot(png_path, "wm")
+
+    def merge_edit_track_settings(self, track_idx):
+        track = self.merge_tracks[track_idx]
+        if track.type == "video":
+            self.merge_edit_video_track(track_idx)
+        elif track.type == "audio":
+            self.merge_edit_audio_track(track_idx)
+        else:
+            self.merge_edit_subtitle_track(track_idx)
+
+
+    def edit_video_settings(self, title, initial_settings, on_save, file_path=None,
+                            is_watermark=False, track_idx=None, pip_enabled_var=None,
+                            overlay_mode='sub', parent=None, show_loop_chroma=True,
+                            track_obj=None, is_concat_mode=False, canvas_file=None,
+                            main_video_size=None):
+        if parent is None:
+            parent = self.root
+        with self.SafeToplevel(parent) as win:
+            win.title(title)
+            notebook = ttk.Notebook(win)
+            notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+            # ---- 页面1：编码器与质量 ----
+            page_enc = ttk.Frame(notebook)
+            notebook.add(page_enc, text=_("编码器与质量"))
+            enc_frame = VideoEncoderFrame(page_enc, app=self)
+            enc_frame.pack(fill=tk.X, padx=5, pady=5)
+            enc_frame.set_settings(initial_settings)
+
+            # ---- 页面2：视频滤镜 ----
+            page_filt = ttk.Frame(notebook)
+            notebook.add(page_filt, text=_("视频滤镜"))
+            filt_frame = VideoFilterFrame(page_filt, app=self)
+            if file_path:
+                filt_frame.current_file = file_path
+            # 设置轨道或覆盖设置
+            if track_obj is not None:
+                filt_frame.set_track(track_obj)
+            else:
+                # 如果传入的设置中包含 trim 相关键，则认为独立设置
+                if "trim_enabled" in initial_settings or "trim_start" in initial_settings:
+                    filt_frame.set_override_settings(initial_settings)
+
+
+            filt_frame.pack(fill=tk.X, padx=5, pady=5)
+            filt_frame.set_settings(initial_settings)
+
+            if "enhance" in initial_settings:
+                filt_frame.set_enhance_settings(initial_settings["enhance"])
+
+
+            # ---- 页面3：截取片段 ----
+            page_trim = ttk.Frame(notebook)
+            notebook.add(page_trim, text=_("截取片段"))
+            trim_frame = TrimFrame(page_trim, show_combo_seek=False)
+            trim_frame.pack(fill=tk.X, padx=5, pady=5)
+            trim_frame.set_settings(initial_settings)
+
+            # 水印或画中画模式下，强制启用精准截取
+            if is_watermark or (pip_enabled_var is not None and pip_enabled_var.get()):
+                trim_frame.precise_trim.set(True)
+                trim_frame.precise_check.config(state='disabled')
+                if not self._trim_precise_hint_shown:
+                    self._append_info_ui(_("[设置] 水印/画中画模式下已自动启用精准截取。"))
+                    self._trim_precise_hint_shown = True
+            else:
+                trim_frame.precise_check.config(state='normal')
+               # trim_frame.precise_trim.set(False)
+
+            # 设置回调（此时 trim_frame 已存在）
+            filt_frame.set_get_trim_settings_callback(lambda: trim_frame.get_settings())
+
+            # ---- 页面4：循环/绿幕控制（仅在需要时显示） ----
+            loop_chroma_frame = None  # 占位，确保变量始终存在
+            if show_loop_chroma:
+                page_loop = ttk.Frame(notebook)
+                notebook.add(page_loop, text=_("循环/绿幕控制"))
+                loop_chroma_frame = LoopChromaFrame(page_loop)
+                loop_chroma_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+                loop_chroma_frame.set_settings(initial_settings)
+                if file_path and os.path.exists(file_path):
+                    raw_duration = self._get_media_duration(file_path)
+                    effective_duration = self._get_effective_duration(initial_settings, raw_duration)
+                    if hasattr(loop_chroma_frame, 'set_duration_info'):
+                        loop_chroma_frame.set_duration_info(effective_duration)
+                else:
+                    if hasattr(loop_chroma_frame, 'set_duration_info'):
+                        loop_chroma_frame.set_duration_info(None)
+
+            def update_duration_on_trim_change(*args):
+                if loop_chroma_frame is None:
+                    return
+                # 获取当前截取设置（直接从 trim_frame 读取）
+                settings_snapshot = trim_frame.get_settings()
+                if file_path and os.path.exists(file_path):
+                    raw_duration = self._get_media_duration(file_path)
+                    effective_duration = self._get_effective_duration(settings_snapshot, raw_duration)
+                    if hasattr(loop_chroma_frame, 'set_duration_info'):
+                        loop_chroma_frame.set_duration_info(effective_duration)
+                else:
+                    if hasattr(loop_chroma_frame, 'set_duration_info'):
+                        loop_chroma_frame.set_duration_info(None)
+            
+            # 绑定 trace
+            trim_frame.trim_enabled.trace_add('write', update_duration_on_trim_change)
+            trim_frame.trim_start.trace_add('write', update_duration_on_trim_change)
+            trim_frame.trim_end.trace_add('write', update_duration_on_trim_change)
+
+
+            # ---- 页面5：叠加/偏移（仅在画中画或水印模式下显示） ----
+            overlay_frame = None
+            show_overlay = is_watermark or (pip_enabled_var is not None and pip_enabled_var.get())
+            if show_overlay:
+                page_overlay = ttk.Frame(notebook)
+                notebook.add(page_overlay, text=_("叠加/偏移"))
+
+                if is_watermark:
+                    # 水印模式，使用 visual_callback
+                    def watermark_visual_callback():
+                        main_file = canvas_file or self.input_file.get().strip()
+                        if not main_file or not os.path.exists(main_file):
+                            messagebox.showwarning(_("提示"), _("请先选择一个有效的输入文件作为画布"))
+                            return
+                    
+                        # 获取主视频尺寸（优先使用传入的 main_video_size）
+                        if main_video_size is not None:
+                            main_w, main_h = main_video_size
+                        else:
+                            # 从 filt_frame 读取主视频设置计算
+                            main_settings = {
+                                "crop_enabled": filt_frame.crop_enabled.get(),
+                                "crop_width": filt_frame.crop_width.get(),
+                                "crop_height": filt_frame.crop_height.get(),
+                                "scale_enabled": filt_frame.scale_enabled.get(),
+                                "scale_method": filt_frame.scale_method.get(),
+                                "scale_width": filt_frame.scale_width.get(),
+                                "scale_height": filt_frame.scale_height.get(),
+                                "rotate": filt_frame.rotate.get()
+                            }
+                            orig_w, orig_h = self._cached_video_dimensions(main_file)
+                            if orig_w is None or orig_h is None:
+                                orig_w, orig_h = 1280, 720
+                            main_w, main_h = self.compute_final_size_with_order(orig_w, orig_h, main_settings)
+                    
+                        wm_file = initial_settings.get("file_path", "")
+                        if not wm_file or not os.path.exists(wm_file):
+                            messagebox.showwarning(_("提示"), _("水印文件未设置或不存在"))
+                            return
+                    
+                        # 从 filt_frame 获取当前水印的滤镜设置（因为用户可能已修改）
+                        # 注意：filt_frame 是主视频的滤镜框架，但在水印编辑模式下，它被用于水印设置
+                        wm_settings = {
+                            "crop_enabled": filt_frame.crop_enabled.get(),
+                            "crop_width": filt_frame.crop_width.get(),
+                            "crop_height": filt_frame.crop_height.get(),
+                            "scale_enabled": filt_frame.scale_enabled.get(),
+                            "scale_method": filt_frame.scale_method.get(),
+                            "scale_width": filt_frame.scale_width.get(),
+                            "scale_height": filt_frame.scale_height.get(),
+                            "rotate": filt_frame.rotate.get(),
+                            "vflip": filt_frame.vflip.get(),
+                            "hflip": filt_frame.hflip.get(),
+                            # 其他增强滤镜不影响尺寸，不需要
+                        }
+                    
+                        orig_w, orig_h = self._cached_video_dimensions(wm_file)
+                        if orig_w is None or orig_h is None:
+                            orig_w, orig_h = 320, 240
+                    
+                        # 计算水印渲染尺寸（包含旋转）
+                        wm_w, wm_h = self.compute_final_size_with_order(orig_w, orig_h, wm_settings)
+                        if wm_w <= 0 or wm_h <= 0:
+                            wm_w, wm_h = orig_w, orig_h
+                    
+                        # 打开编辑器
+                        self.open_watermark_overlay_editor(
+                            main_w, main_h,
+                            wm_w, wm_h,
+                            overlay_frame.overlay_x,
+                            overlay_frame.overlay_y,
+                            scale_enabled_var=filt_frame.scale_enabled,   # 用于回写缩放
+                            scale_w_var=filt_frame.scale_width,
+                            scale_h_var=filt_frame.scale_height,
+                            watermark_dict=initial_settings,  # 用于回写水印设置
+                            filt_frame=filt_frame,
+                            parent=win
+                        )
+                    overlay_frame = OverlayPositionFrame(
+                        page_overlay,
+                        app=self,
+                        mode='sub',
+                        track_idx=None,
+                        track_obj=None,
+                        filt_frame=filt_frame,
+                        visual_callback=watermark_visual_callback
+                    )
+                else:
+                    # 画中画模式（或主视频偏移）
+                    overlay_frame = OverlayPositionFrame(
+                        page_overlay,
+                        app=self,
+                        mode=overlay_mode,
+                        track_idx=track_idx,
+                        track_obj=None,
+                        filt_frame=filt_frame,
+                        visual_callback=None
+                    )
+                overlay_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+                overlay_frame.set_settings(initial_settings)
+
+            # ---- 页面6：轨道元数据（仅视频轨道非水印） ----
+            if track_obj is not None and not is_watermark:
+                page_meta = ttk.Frame(notebook)
+                notebook.add(page_meta, text=_("轨道元数据"))
+                meta_frame = ttk.Frame(page_meta, padding="10")
+                meta_frame.pack(fill=tk.X, pady=5)
+            
+                # 语言选择（下拉框 + 自定义输入）
+                ttk.Label(meta_frame, text=_("语言:")).grid(row=0, column=0, sticky="w", padx=5, pady=5)
+                lang_var = tk.StringVar(value=track_obj.language)
+                # 下拉框显示友好名称
+                lang_combo = ttk.Combobox(meta_frame, textvariable=lang_var,
+                                          values=[display for display, code in self.COMMON_LANGUAGES],
+                                          state="normal", width=20)
+                lang_combo.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+            
+                # 自定义输入框（用于输入未列出的代码）
+                ttk.Label(meta_frame, text=_("或手动输入:")).grid(row=0, column=2, padx=5, pady=5)
+                custom_lang_var = tk.StringVar(value=track_obj.language)  # 初始同步
+                custom_lang_entry = ttk.Entry(meta_frame, textvariable=custom_lang_var, width=10)
+                custom_lang_entry.grid(row=0, column=3, padx=5, pady=5, sticky="w")
+            
+                # 绑定事件：从下拉框选择时，自动填充自定义框（填入标准码）
+                def on_lang_select(event):
+                    selected = lang_var.get()
+                    for display, code in self.COMMON_LANGUAGES:
+                        if display == selected:
+                            custom_lang_entry.delete(0, tk.END)
+                            custom_lang_entry.insert(0, code)
+                            break
+                lang_combo.bind("<<ComboboxSelected>>", on_lang_select)
+            
+                # 轨道标题（不变）
+                ttk.Label(meta_frame, text=_("轨道标题:")).grid(row=1, column=0, sticky="w", padx=5, pady=5)
+                title_var = tk.StringVar(value=track_obj.title)
+                title_entry = ttk.Entry(meta_frame, textvariable=title_var, width=30)
+                title_entry.grid(row=1, column=1, columnspan=3, padx=5, pady=5, sticky="w")
+
+                # 章节标签（仅串行模式）
+                chapter_label_var = tk.StringVar(value="")
+                if is_concat_mode:
+                    ttk.Label(meta_frame, text=_("章节标签:")).grid(row=2, column=0, sticky="w", padx=5, pady=5)
+                    chapter_label_var.set(track_obj.enc_settings.get("chapter_label", ""))
+                    chapter_label_entry = ttk.Entry(meta_frame, textvariable=chapter_label_var, width=30)
+                    chapter_label_entry.grid(row=2, column=1, columnspan=3, padx=5, pady=5, sticky="w")
+
+                # 提示信息
+                ttk.Label(meta_frame, text=_("从下拉框选择常用语言，或直接输入 ISO 639-2/B 代码（如 cmn、yue）"),
+                          foreground="gray").grid(row=3, column=0, columnspan=4, sticky="w", padx=5, pady=2)
+
+            # ================== 页面7：音频绑定 ==================
+            # 仅在串接模式下显示此页（水印无音频绑定需求）
+            if is_concat_mode and not is_watermark and track_obj is not None and track_obj.type == "video":
+                page_audio_binding = ttk.Frame(notebook)
+                notebook.add(page_audio_binding, text=_("音频绑定"))
+    
+                bind_frame = ttk.Frame(page_audio_binding, padding="10")
+                bind_frame.pack(fill=tk.BOTH, expand=True)
+    
+                ttk.Label(bind_frame, text=_("音频源类型:")).grid(row=0, column=0, sticky="w", padx=5, pady=5)
+                audio_source_type_var = tk.StringVar(value=initial_settings.get("audio_source_type", "self"))
+                source_frame = ttk.Frame(bind_frame)
+                source_frame.grid(row=0, column=1, sticky="w", padx=5)
+    
+                rb_self = ttk.Radiobutton(source_frame, text=_("使用视频自身音频"), 
+                                          variable=audio_source_type_var, value="self")
+                rb_silence = ttk.Radiobutton(source_frame, text=_("生成静音流"), 
+                                             variable=audio_source_type_var, value="silence")
+                # 外部音频暂时隐藏，可后续启用
+                # rb_external = ttk.Radiobutton(source_frame, text="从外部文件导入", variable=audio_source_type_var, value="external")
+                rb_self.pack(side=tk.LEFT, padx=5)
+                rb_silence.pack(side=tk.LEFT, padx=5)
+    
+                ttk.Label(
+                    bind_frame,
+                    text=_("静音流时长自动匹配视频片段时长。\n"
+                         "此功能用于解决串接时因视频缺少音频流导致的音画错位问题。\n"
+                         "注意：此功能会强制重新编码视频（无法使用流复制）。\n"
+                         "如需快速拼接且保留原始编码，可提前用命令生成静音音频文件，\n"
+                         "例如：ffmpeg -f lavfi -i anullsrc=r=44100:cl=stereo -t 10 silence.wav\n"
+                         "然后将该音频流 copy 无损封装到视频中，最后再使用 copy 模式进行串接。"),
+                    foreground="gray",
+                    justify=tk.LEFT
+                ).grid(row=1, column=0, columnspan=2, sticky="w", padx=5, pady=10)
+    
+                # 预留外部文件控件（暂时隐藏）
+                # external_frame = ttk.Frame(bind_frame)
+                # external_frame.grid(row=2, column=0, columnspan=2, sticky="we", padx=5, pady=5)
+                # external_frame.grid_remove()
+    
+            # ================== 新增结束 ==================
+
+
+
+            # ---- 窗口居中 ----
+            center_window(win, 700, 300)
+
+            # ---- 保存按钮 ----
+            def save():
+                try:
+                    new_settings = {}
+                    new_settings.update(enc_frame.get_settings())
+                    new_settings.update(filt_frame.get_settings())
+                    new_settings.update(trim_frame.get_settings())
+                    if loop_chroma_frame is not None:
+                        new_settings.update(loop_chroma_frame.get_settings())
+                    if overlay_frame is not None:
+                        new_settings.update(overlay_frame.get_settings())
+                    if is_watermark:
+                        new_settings["enabled"] = True
+                        new_settings["file_path"] = initial_settings.get("file_path", "")
+                        new_settings["duration"] = initial_settings.get("duration", None)
+                    else:
+                        # 仅在串行模式下收集音频绑定设置
+                        if is_concat_mode and track_obj is not None and track_obj.type == "video":
+                            new_settings["audio_source_type"] = audio_source_type_var.get()
+                            # 以下两项暂不支持，留作未来扩展
+                            # new_settings["external_audio_path"] = ""
+                            # new_settings["external_audio_stream"] = "0:a:0"
+
+                    new_settings["enhance"] = filt_frame.get_enhance_settings()
+
+                    if track_obj is not None and not is_watermark:
+                        # 优先使用自定义输入框，否则使用下拉框值
+                        raw_lang = custom_lang_var.get().strip() or lang_var.get().strip()
+                        # 尝试映射为标准码
+                        if raw_lang:
+                            # 如果下拉框选了显示名，但自定义框为空，这里 raw_lang 可能是显示名，需要映射
+                            # 我们只对纯代码进行映射，显示名通过下拉框关联
+                            # 但为了安全，先尝试从 COMMON_LANGUAGES 反向查找
+                            found_code = None
+                            for display, code in self.COMMON_LANGUAGES:
+                                if display == raw_lang:
+                                    found_code = code
+                                    break
+                            if found_code:
+                                new_settings["language"] = found_code
+                            else:
+                                # 否则视为代码，应用映射表
+                                new_settings["language"] = self.LANGUAGE_MAP.get(raw_lang.lower(), raw_lang)
+                        else:
+                            new_settings["language"] = ""
+                        new_settings["title"] = title_var.get().strip()
+                        # 章节标签（仅串行模式）
+                        if is_concat_mode:
+                            new_settings["chapter_label"] = chapter_label_var.get().strip()
+
+                    on_save(new_settings)
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    messagebox.showerror(_("保存错误"), _("发生错误：{0}\n请查看控制台详细错误。".format(e)))
+                finally:
+                    try:
+                        win.destroy()
+                    except:
+                        pass
+
+            ttk.Button(win, text=_("保存"), command=save).pack(pady=10)
+            win.wait_window()
+
+
+
+
+    def merge_edit_video_track(self, track_idx):
+        track = self.merge_tracks[track_idx]
+        enabled_videos = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
+        is_main = (enabled_videos and enabled_videos[0] == track)
+        overlay_mode = 'main' if is_main else 'sub'
+        # 仅在画中画模式且不是主视频时显示循环/绿幕控制
+        show_loop = self.pip_enabled.get() and not is_main
+
+        initial_settings = track.enc_settings.copy()
+        if "enhance" not in initial_settings:
+            initial_settings["enhance"] = {
+                "denoise_enabled": False,
+                "denoise_spatial": 4.0,
+                "denoise_temporal": 3.0,
+                "sharpen_enabled": False,
+                "sharpen_strength": 1.0,
+                "ivtc_enabled": False,
+                "deblock_enabled": False,
+                "deblock_strength": 4,
+                "colorspace_enabled": False,
+                "colorspace_matrix": "bt709:bt2020",
+            }
+
+        self.edit_video_settings(
+            title=f"视频轨道设置 - {track.codec}",
+            initial_settings=initial_settings,
+            on_save=lambda new: self._update_track_enc(track_idx, new),
+            file_path=track.file_path,
+            is_watermark=False,
+            track_idx=track_idx,
+            pip_enabled_var=self.pip_enabled,
+            overlay_mode=overlay_mode,
+            parent=self.root,
+            show_loop_chroma=show_loop,
+            track_obj=track,   # 传递轨道对象
+            is_concat_mode=self.concat_enabled.get()
+        )
+    
+    
+    def _update_track_enc(self, idx, new_settings):
+        track = self.merge_tracks[idx]  # 先获取 track 对象
+        old_encoder = track.enc_settings.get("encoder")
+        new_encoder = new_settings.get("encoder")
+        track.enc_settings = new_settings
+        # 更新字幕元数据
+        track.language = new_settings.get("language", "")
+        track.title = new_settings.get("title", "")
+
+        if "enhance" in new_settings:
+            track.enc_settings["enhance"] = new_settings["enhance"]
+        # 同步属性（兼容旧代码）
+
+        track.overlay_enabled = new_settings.get("overlay_enabled", False)
+        track.overlay_x = new_settings.get("overlay_x", "W-w-10")
+        track.overlay_y = new_settings.get("overlay_y", "H-h-10")
+        track.pad_enabled = new_settings.get("pad_enabled", False)
+        track.pad_width = new_settings.get("pad_width", "")
+        track.pad_height = new_settings.get("pad_height", "")
+        track.offset_x = new_settings.get("offset_x", "0")
+        track.offset_y = new_settings.get("offset_y", "0")
+
+        # 检测是否切换为 copy（仅在视频轨道且编码器变化时）
+        if track.type == "video" and old_encoder != new_encoder:
+            if new_encoder == "copy":
+                self._append_info_ui(_("[封装] 该视频轨道编码器已设为 copy，视频滤镜将被忽略。"))
+
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+
+
+    def merge_edit_audio_track(self, track_idx):
+        track = self.merge_tracks[track_idx]
+        with self.SafeToplevel(self.root) as win:
+            win.title(_("音频轨道设置 - {0}").format(track.codec))
+            center_window(win, 880, 550)
+            win.transient(self.root)
+    
+            main_frame = ttk.Frame(win, padding="10")
+            main_frame.pack(fill=tk.BOTH, expand=True)
+
+            # 左右两列布局：左列放常显控件，右列放有条件显示的控件，并借用部分常显控件以平衡高度
+            top_frame = ttk.Frame(main_frame)
+            top_frame.pack(fill=tk.X, pady=5)
+            left_col = ttk.Frame(top_frame)
+            right_col = ttk.Frame(top_frame)
+            left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
+            right_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0))
+    
+            # ---- 编码参数（水平布局） ----
+            enc_frame = ttk.LabelFrame(left_col, text=_("编码参数"), padding="5")
+            enc_frame.pack(fill=tk.X, pady=5)
+    
+            row = ttk.Frame(enc_frame)
+            row.pack(fill=tk.X, pady=2)
+    
+            ttk.Label(row, text=_("编码器:")).pack(side=tk.LEFT, padx=5)
+            encoder_var = tk.StringVar(value=track.enc_settings.get("encoder", "copy"))
+            encoder_combo = ttk.Combobox(row, textvariable=encoder_var, values=ALL_AUDIO_ENCODERS, state="readonly", width=12)
+            encoder_combo.pack(side=tk.LEFT, padx=5)
+    
+            ttk.Label(row, text=_("比特率:")).pack(side=tk.LEFT, padx=5)
+            bitrate_var = tk.StringVar(value=track.enc_settings.get("bitrate", "128k"))
+            bitrate_entry = ttk.Entry(row, textvariable=bitrate_var, width=8)
+            bitrate_entry.pack(side=tk.LEFT, padx=5)
+    
+            ttk.Label(row, text=_("采样率:")).pack(side=tk.LEFT, padx=5)
+            samplerate_var = tk.StringVar(value=track.enc_settings.get("samplerate", "44100"))
+            samplerate_entry = ttk.Entry(row, textvariable=samplerate_var, width=8)
+            samplerate_entry.pack(side=tk.LEFT, padx=5)
+    
+            # ---- 轨道元数据（语言下拉+自定义输入，标题） ----
+            meta_frame = ttk.LabelFrame(left_col, text=_("轨道元数据"), padding="5")
+            meta_frame.pack(fill=tk.X, pady=5)
+    
+            # 语言部分：下拉框 + 手动输入框
+            lang_row = ttk.Frame(meta_frame)
+            lang_row.pack(fill=tk.X, pady=2)
+    
+            ttk.Label(lang_row, text=_("语言:")).pack(side=tk.LEFT, padx=5)
+            
+            lang_display_var = tk.StringVar()
+            # 显示名列表
+            lang_display_list = [display for display, code in self.COMMON_LANGUAGES]
+            lang_combo = ttk.Combobox(lang_row, textvariable=lang_display_var,
+                                      values=lang_display_list,
+                                      state="normal", width=18)
+            lang_combo.pack(side=tk.LEFT, padx=5)
+    
+            # 手动输入框（用于输入未列出的代码，如 "cmn"）
+            ttk.Label(lang_row, text=_("或输入代码:")).pack(side=tk.LEFT, padx=(10,2))
+            custom_lang_entry = ttk.Entry(lang_row, width=10)
+            custom_lang_entry.pack(side=tk.LEFT, padx=2)
+            
+            # 从现有语言值初始化（track.language 可能是标准码）
+            current_lang = track.language or ""
+            if current_lang:
+                # 查找是否在映射表中
+                found_display = None
+                for display, code in self.COMMON_LANGUAGES:
+                    if code == current_lang:
+                        found_display = display
+                        break
+                if found_display:
+                    lang_display_var.set(found_display)
+                    custom_lang_entry.delete(0, tk.END)
+                    custom_lang_entry.insert(0, current_lang)
+                else:
+                    # 未找到，直接填入手动输入框
+                    custom_lang_entry.insert(0, current_lang)
+                    # 尝试在下拉框中匹配显示名（可能为"未指定 (und)"等）
+                    for display, code in self.COMMON_LANGUAGES:
+                        if code == "und":
+                            lang_display_var.set(display)
+                            break
+    
+            # 绑定下拉选择事件：自动填充自定义框
+            def on_lang_select(event):
+                selected = lang_display_var.get()
+                for display, code in self.COMMON_LANGUAGES:
+                    if display == selected:
+                        custom_lang_entry.delete(0, tk.END)
+                        custom_lang_entry.insert(0, code)
+                        break
+            lang_combo.bind("<<ComboboxSelected>>", on_lang_select)
+    
+            # 标题
+            title_row = ttk.Frame(meta_frame)
+            title_row.pack(fill=tk.X, pady=2)
+            ttk.Label(title_row, text=_("标题:")).pack(side=tk.LEFT, padx=5)
+            title_var = tk.StringVar(value=track.title)
+            title_entry = ttk.Entry(title_row, textvariable=title_var, width=40)
+            title_entry.pack(side=tk.LEFT, padx=5)
+
+            # 获取模式标志（提前到使用之前，避免 is_concat 未赋值导致 UnboundLocalError）
+            is_pip = self.pip_enabled.get()
+            is_concat = self.concat_enabled.get()
+
+            # 章节标签（仅串行模式）
+            chapter_label_var = tk.StringVar(value="")
+            if is_concat:
+                cl_row = ttk.Frame(meta_frame)
+                cl_row.pack(fill=tk.X, pady=2)
+                ttk.Label(cl_row, text=_("章节标签:")).pack(side=tk.LEFT, padx=5)
+                chapter_label_var.set(track.enc_settings.get("chapter_label", ""))
+                chapter_label_entry = ttk.Entry(cl_row, textvariable=chapter_label_var, width=40)
+                chapter_label_entry.pack(side=tk.LEFT, padx=5)
+
+            # ---- 音量控制（所有模式可用） ----
+            volume_frame = ttk.LabelFrame(left_col, text=_("音量调整"), padding="5")
+            volume_frame.pack(fill=tk.X, pady=(5,0))
+
+            vol_enabled_var = tk.BooleanVar(value=track.enc_settings.get("volume_enabled", False))
+            vol_value_var = tk.DoubleVar(value=track.enc_settings.get("volume", 1.0))
+
+            vol_check = ttk.Checkbutton(volume_frame, text=_("启用音量调整"), variable=vol_enabled_var)
+            vol_check.pack(anchor=tk.W, pady=(0,5))
+
+            vol_control_frame = ttk.Frame(volume_frame)
+            vol_control_frame.pack(fill=tk.X)
+
+            ttk.Label(vol_control_frame, text=_("倍数:")).pack(side=tk.LEFT)
+            vol_slider = ttk.Scale(vol_control_frame, from_=0.1, to=3.0, variable=vol_value_var,
+                                   orient=tk.HORIZONTAL, length=150, state=tk.DISABLED)
+            vol_slider.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+            vol_label = ttk.Label(vol_control_frame, text="1.0", width=5)
+            vol_label.pack(side=tk.LEFT)
+            vol_slider.configure(command=lambda v: vol_label.config(text=f"{float(v):.2f}"))
+
+            def on_vol_enabled(*args):
+                state = tk.NORMAL if vol_enabled_var.get() else tk.DISABLED
+                vol_slider.config(state=state)
+            vol_enabled_var.trace_add("write", on_vol_enabled)
+            on_vol_enabled()
+
+            # ---- 套用同源视频轨（V→A）：同源音频轨一键套用对应视频轨截取/变速/倒放（独立一行，不嵌套音量块） ----
+            src_video = self._find_src_video_track(track)
+            apply_row = ttk.Frame(left_col)
+            apply_row.pack(fill=tk.X, pady=(8,2))
+            if src_video is not None:
+                def apply_src_video_to_this():
+                    s = self._find_src_video_track(track)
+                    if s is None:
+                        return
+                    ss = s.enc_settings
+                    trim_enabled = ss.get("trim_enabled", False)
+                    trim_start = ss.get("trim_start", "")
+                    trim_end = ss.get("trim_end", "")
+                    precise_trim = ss.get("precise_trim", False)
+                    speed_enabled = ss.get("speed_enabled", False)
+                    speed_factor = ss.get("speed_factor", "1.0")
+                    reverse_enabled = ss.get("reverse_enabled", False)
+                    # 单条越界保护：弹窗问是否仍套用
+                    if trim_enabled:
+                        dur = self._get_media_duration(track.file_path)
+                        if dur is not None:
+                            try:
+                                end = time_to_seconds(trim_end.strip()) if trim_end else None
+                                start = time_to_seconds(trim_start.strip()) if trim_start else 0.0
+                            except Exception:
+                                end, start = None, 0.0
+                            over = end if (end is not None and end > dur) else (start if start > dur else None)
+                            if over is not None:
+                                if not messagebox.askyesno(
+                                    _("时长超出告警"),
+                                    _("音频轨源时长只有 {0:.1f} 秒，\n"
+                                      "而视频截取时间点为 {1:.1f} 秒，超出音频时长，\n"
+                                      "套用后 atrim 可能报错或产生静音。\n\n仍要套用吗？").format(dur, over)):
+                                    self._append_info_ui(_("已取消套用同源视频轨（音频时长不足）"))
+                                    return
+                    # 写局部变量（对话框同步显示）
+                    trim_enabled_var.set(trim_enabled)
+                    trim_start_var.set(trim_start)
+                    trim_end_var.set(trim_end)
+                    precise_trim_var.set(precise_trim)
+                    speed_enabled_var.set(speed_enabled)
+                    speed_factor_var.set(str(speed_factor))
+                    audio_reverse_var.set(reverse_enabled)
+                    # 写回 track.enc_settings（供预览与保存）
+                    track.enc_settings.update({
+                        "trim_enabled": trim_enabled,
+                        "trim_start": trim_start,
+                        "trim_end": trim_end,
+                        "precise_trim": precise_trim,
+                        "audio_speed_enabled": speed_enabled,
+                        "audio_speed_factor": str(speed_factor),
+                        "audio_reverse": reverse_enabled,
+                    })
+                    self._append_info_ui(_("已套用同源视频轨 {0} 的截取/变速/倒放（可自由取消）").format(os.path.basename(s.file_path)))
+                    self.merge_update_track_list()
+                    self.merge_update_command_preview()
+
+                btn_apply_src = ttk.Button(apply_row, text=_("套用同源视频轨截取、变速、倒放(v→a)"), command=apply_src_video_to_this)
+                btn_apply_src.pack(side=tk.LEFT)
+                ToolTip(btn_apply_src,
+                        _("把来源相同的视频轨的截取/变速/倒放一键套用到本音频轨（写明确值，可自由取消）"),
+                        wraplength=420)
+            else:
+                ttk.Label(apply_row,
+                          text=_("（本音频来自外部文件，无同源视频轨，请用右键『复制/粘贴 截取/变速/倒放 (V→A)』）"),
+                          foreground="gray").pack(side=tk.LEFT)
+
+            # ---- 音频混合（仅普通封装模式可用） ----
+            if not is_pip and not is_concat:
+                mix_frame = ttk.LabelFrame(right_col, text=_("音频混合 (amix)"), padding="5")
+                mix_frame.pack(fill=tk.X, pady=5)
+                mix_enabled_var = tk.BooleanVar(value=track.enc_settings.get("mix_enabled", False))
+                mix_cb = ttk.Checkbutton(mix_frame, text=_("参与混合 (启用后，该流将与其它勾选流合并为单音轨)"),
+                                         variable=mix_enabled_var)
+                mix_cb.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+                ToolTip(mix_cb,
+                        _("勾选后，该音频流将参与混合。\n"
+                        "如果至少一个轨道勾选，则所有勾选的流会通过 amix 滤镜合并为单音轨输出。\n"
+                        "未勾选的流将被丢弃（不输出）。\n"
+                        "若只有一个轨道勾选，则无需混合，直接输出该流。"),
+                        wraplength=500)
+            else:
+                mix_enabled_var = tk.BooleanVar(value=False)
+
+            # ---- 音频倒放（独立于视频，所有模式可用） ----
+            reverse_frame = ttk.Frame(right_col)
+            reverse_frame.pack(fill=tk.X, pady=5)
+            audio_reverse_var = tk.BooleanVar(value=track.enc_settings.get("audio_reverse", False))
+            chk_reverse = ttk.Checkbutton(
+                reverse_frame,
+                text=_("音频倒放（独立于视频，仅当前轨道）"),
+                variable=audio_reverse_var
+            )
+            chk_reverse.pack(anchor=tk.W, padx=5)
+            ToolTip(chk_reverse, _("勾选后，此音频流将单独倒放，不影响其他轨道。"))
+
+            # ---- 高级音频处理（变速/淡入淡出/响度/降噪/声道，所有模式可用） ----
+            adv_frame = ttk.LabelFrame(right_col, text=_("高级音频处理"), padding="5")
+            adv_frame.pack(fill=tk.X, pady=5)
+
+            # 变速
+            speed_enabled_var = tk.BooleanVar(value=track.enc_settings.get("audio_speed_enabled", False))
+            speed_factor_var = tk.StringVar(value=str(track.enc_settings.get("audio_speed_factor", "1.0")))
+            sf_row = ttk.Frame(adv_frame); sf_row.pack(fill=tk.X, pady=2)
+            ttk.Checkbutton(sf_row, text=_("变速 (atempo)"), variable=speed_enabled_var).pack(side=tk.LEFT)
+            ttk.Label(sf_row, text=_("倍数:")).pack(side=tk.LEFT, padx=(10,2))
+            ttk.Entry(sf_row, textvariable=speed_factor_var, width=8).pack(side=tk.LEFT)
+            ttk.Label(sf_row, text=_("(0.25~4.0, >2 自动串联)")).pack(side=tk.LEFT, padx=5)
+
+            # 淡入淡出
+            fade_enabled_var = tk.BooleanVar(value=track.enc_settings.get("fade_enabled", False))
+            fade_in_var = tk.StringVar(value=track.enc_settings.get("fade_in", ""))
+            fade_out_var = tk.StringVar(value=track.enc_settings.get("fade_out", ""))
+            fd_row = ttk.Frame(adv_frame); fd_row.pack(fill=tk.X, pady=2)
+            ttk.Checkbutton(fd_row, text=_("淡入淡出 (afade)"), variable=fade_enabled_var).pack(side=tk.LEFT)
+            ttk.Label(fd_row, text=_("淡入秒:")).pack(side=tk.LEFT, padx=(10,2))
+            ttk.Entry(fd_row, textvariable=fade_in_var, width=7).pack(side=tk.LEFT)
+            ttk.Label(fd_row, text=_("淡出秒:")).pack(side=tk.LEFT, padx=(8,2))
+            ttk.Entry(fd_row, textvariable=fade_out_var, width=7).pack(side=tk.LEFT)
+
+            # 响度标准化 + 降噪
+            loudnorm_enabled_var = tk.BooleanVar(value=track.enc_settings.get("loudnorm_enabled", False))
+            denoise_enabled_var = tk.BooleanVar(value=track.enc_settings.get("denoise_enabled", False))
+            ln_row = ttk.Frame(adv_frame); ln_row.pack(fill=tk.X, pady=2)
+            ttk.Checkbutton(ln_row, text=_("响度标准化 (loudnorm)"), variable=loudnorm_enabled_var).pack(side=tk.LEFT)
+            ttk.Checkbutton(ln_row, text=_("降噪 (afftdn)"), variable=denoise_enabled_var).pack(side=tk.LEFT, padx=(15,0))
+
+            # 声道
+            channel_mode_var = tk.StringVar(value=track.enc_settings.get("channel_mode", "stereo"))
+            ch_row = ttk.Frame(adv_frame); ch_row.pack(fill=tk.X, pady=2)
+            ttk.Label(ch_row, text=_("声道:")).pack(side=tk.LEFT)
+            ttk.Combobox(ch_row, textvariable=channel_mode_var, width=12,
+                         values=["stereo", "mono", "left", "right", "swap"], state="readonly").pack(side=tk.LEFT, padx=5)
+            ToolTip(ch_row, _("stereo=不变 / mono=单声道 / left=仅左 / right=仅右 / swap=左右交换"), wraplength=400)
+
+            # 均衡器（EQ）
+            eq_enabled_var = tk.BooleanVar(value=track.enc_settings.get("eq_enabled", False))
+            eq_low_var = tk.StringVar(value=str(track.enc_settings.get("eq_low", 0)))
+            eq_mid_var = tk.StringVar(value=str(track.enc_settings.get("eq_mid", 0)))
+            eq_high_var = tk.StringVar(value=str(track.enc_settings.get("eq_high", 0)))
+            eq_row = ttk.Frame(adv_frame); eq_row.pack(fill=tk.X, pady=2)
+            ttk.Checkbutton(eq_row, text=_("均衡器 EQ"), variable=eq_enabled_var).pack(side=tk.LEFT)
+            ttk.Label(eq_row, text=_("低:")).pack(side=tk.LEFT, padx=(10,2))
+            ttk.Entry(eq_row, textvariable=eq_low_var, width=5).pack(side=tk.LEFT)
+            ttk.Label(eq_row, text=_("中:")).pack(side=tk.LEFT, padx=(6,2))
+            ttk.Entry(eq_row, textvariable=eq_mid_var, width=5).pack(side=tk.LEFT)
+            ttk.Label(eq_row, text=_("高(dB):")).pack(side=tk.LEFT, padx=(6,2))
+            ttk.Entry(eq_row, textvariable=eq_high_var, width=5).pack(side=tk.LEFT)
+            ToolTip(eq_row, _("低音(bass)/中音(equalizer@1kHz)/高音(treble)，单位 dB，正负均可，0 表示不调整。"), wraplength=400)
+
+            # ---- 截取设置 ----
+            trim_frame = ttk.LabelFrame(main_frame, text=_("音频截取（精确到毫秒）"), padding="5")
+            trim_frame.pack(fill=tk.X, pady=5)
+    
+            trim_enabled_var = tk.BooleanVar(value=track.enc_settings.get("trim_enabled", False))
+            chk = ttk.Checkbutton(trim_frame, text=_("启用截取"), variable=trim_enabled_var)
+            chk.grid(row=0, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+            ToolTip(chk,
+                    _("注意：若截取时长短于主视频，输出将以音频为准提前结束，导致主视频内容丢失。\n"
+                    "建议截取时长 ≥ 主视频时长，或保持不截取。"),
+                    wraplength=500)
+            ttk.Label(trim_frame, text=_("开始时间 (HH:MM:SS[.mmm]):")).grid(row=1, column=0, sticky="w", padx=5, pady=5)
+            trim_start_var = tk.StringVar(value=track.enc_settings.get("trim_start", "0"))
+            ttk.Entry(trim_frame, textvariable=trim_start_var, width=15).grid(row=1, column=1, sticky="w", padx=5, pady=5)
+    
+            ttk.Label(trim_frame, text=_("结束时间 (HH:MM:SS[.mmm]):")).grid(row=2, column=0, sticky="w", padx=5, pady=5)
+            trim_end_var = tk.StringVar(value=track.enc_settings.get("trim_end", ""))
+            ttk.Entry(trim_frame, textvariable=trim_end_var, width=15).grid(row=2, column=1, sticky="w", padx=5, pady=5)
+            ttk.Label(trim_frame, text=_("结束时间 (留空到末尾)")).grid(row=2, column=2, sticky="w", padx=5, pady=5)
+    
+            precise_trim_var = tk.BooleanVar(value=track.enc_settings.get("precise_trim", False))
+            ttk.Checkbutton(trim_frame, text=_("精准模式（精确到帧）"), variable=precise_trim_var).grid(row=3, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+    
+            ttk.Label(trim_frame, text=_("注意：启用截取后，编码器将自动改为非 copy 格式（如 aac）"), foreground="gray").grid(row=4, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+    
+            # ---- 保存按钮 ----
+            def save():
+                enc = encoder_var.get()
+                # 如果截取启用且编码器为 copy，强制改 aac
+                if trim_enabled_var.get() and enc == "copy":
+                    enc = "aac"
+                    self._append_info_ui(_("音频截取启用，编码器已从 copy 改为 aac"))
+                # 混合启用时同样强制改 aac（普通模式）
+                if not is_pip and not is_concat and mix_enabled_var.get() and enc == "copy":
+                    enc = "aac"
+                    self._append_info_ui(_("音频混合启用，编码器已从 copy 改为 aac"))
+    
+                track.enc_settings.update({
+                    "encoder": enc,
+                    "bitrate": bitrate_var.get(),
+                    "samplerate": samplerate_var.get(),
+                    "trim_enabled": trim_enabled_var.get(),
+                    "trim_start": trim_start_var.get().strip(),
+                    "trim_end": trim_end_var.get().strip(),
+                    "precise_trim": precise_trim_var.get(),
+                    "mix_enabled": mix_enabled_var.get(),
+                    "volume": vol_value_var.get(),
+                    "volume_enabled": vol_enabled_var.get(),
+                    "audio_reverse": audio_reverse_var.get(),
+                    "audio_speed_enabled": speed_enabled_var.get(),
+                    "audio_speed_factor": speed_factor_var.get().strip() or "1.0",
+                    "fade_enabled": fade_enabled_var.get(),
+                    "fade_in": fade_in_var.get().strip(),
+                    "fade_out": fade_out_var.get().strip(),
+                    "loudnorm_enabled": loudnorm_enabled_var.get(),
+                    "denoise_enabled": denoise_enabled_var.get(),
+                    "channel_mode": channel_mode_var.get(),
+                    "eq_enabled": eq_enabled_var.get(),
+                    "eq_low": eq_low_var.get().strip() or "0",
+                    "eq_mid": eq_mid_var.get().strip() or "0",
+                    "eq_high": eq_high_var.get().strip() or "0",
+                })
+
+                # 获取语言：优先手动输入，其次下拉框
+                lang_code = custom_lang_entry.get().strip()
+                if not lang_code:
+                    # 从下拉框获取显示名，转为代码
+                    display = lang_display_var.get().strip()
+                    if display:
+                        for d, code in self.COMMON_LANGUAGES:
+                            if d == display:
+                                lang_code = code
+                                break
+                    else:
+                        lang_code = ""
+                # 映射标准化
+                if lang_code:
+                    lang_code = self.LANGUAGE_MAP.get(lang_code.lower(), lang_code)
+                else:
+                    lang_code = ""
+
+                track.language = lang_code
+                track.title = title_var.get().strip()
+                track.enc_settings["language"] = track.language
+                track.enc_settings["title"] = track.title
+                # 章节标签（仅串行模式）
+                if is_concat:
+                    track.enc_settings["chapter_label"] = chapter_label_var.get().strip()
+    
+                self.merge_update_track_list()
+                self.merge_update_command_preview()
+                win.destroy()
+    
+            ttk.Button(main_frame, text=_("保存"), command=save).pack(pady=10)
+            win.wait_window()
+
+    def merge_edit_subtitle_track(self, track_idx):
+        track = self.merge_tracks[track_idx]
+        with self.SafeToplevel(self.root) as win:
+            win.title(f"字幕轨道设置 - {track.codec}")
+            center_window(win, 450, 270)
+            win.transient(self.root)
+            
+            ttk.Label(win, text=_("编码器:")).grid(row=0, column=0, sticky="w", padx=5, pady=5)
+            encoder_var = tk.StringVar(value=track.enc_settings.get("encoder", "copy"))
+            combo = ttk.Combobox(win, textvariable=encoder_var, values=["copy", "mov_text", "srt"], state="readonly")
+            combo.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+            ToolTip(win.grid_slaves(row=0, column=0)[0], 
+                    _("对于 ASS/SSA 字幕，推荐使用 MKV 容器并选择「copy」流，\n"
+                    "MP4 容器支持不佳（会丢失样式），MP4 必须用 mov_text"),
+                    wraplength=500)
+            
+            # ---- 语言：下拉+自定义 ----
+            ttk.Label(win, text=_("语言:")).grid(row=1, column=0, sticky="w", padx=5, pady=5)
+            lang_frame = ttk.Frame(win)
+            lang_frame.grid(row=1, column=1, sticky="w", padx=5)
+            
+            lang_display_var = tk.StringVar()
+            lang_combo = ttk.Combobox(lang_frame, textvariable=lang_display_var,
+                                      values=[display for display, code in self.COMMON_LANGUAGES],
+                                      state="normal", width=18)
+            lang_combo.pack(side=tk.LEFT)
+            
+            ttk.Label(lang_frame, text=_("或输入代码:")).pack(side=tk.LEFT, padx=(10,2))
+            custom_lang_entry = ttk.Entry(lang_frame, width=10)
+            custom_lang_entry.pack(side=tk.LEFT)
+            
+            current_lang = track.language or ""
+            if current_lang:
+                found_display = None
+                for display, code in self.COMMON_LANGUAGES:
+                    if code == current_lang:
+                        found_display = display
+                        break
+                if found_display:
+                    lang_display_var.set(found_display)
+                    custom_lang_entry.delete(0, tk.END)
+                    custom_lang_entry.insert(0, current_lang)
+                else:
+                    custom_lang_entry.insert(0, current_lang)
+                    for display, code in self.COMMON_LANGUAGES:
+                        if code == "und":
+                            lang_display_var.set(display)
+                            break
+            
+            def on_lang_select(event):
+                selected = lang_display_var.get()
+                for display, code in self.COMMON_LANGUAGES:
+                    if display == selected:
+                        custom_lang_entry.delete(0, tk.END)
+                        custom_lang_entry.insert(0, code)
+                        break
+            lang_combo.bind("<<ComboboxSelected>>", on_lang_select)
+            
+            # 标题
+            ttk.Label(win, text=_("轨道标题:")).grid(row=2, column=0, sticky="w", padx=5, pady=5)
+            title_var = tk.StringVar(value=track.title)
+            title_entry = ttk.Entry(win, textvariable=title_var, width=30)
+            title_entry.grid(row=2, column=1, padx=5, pady=5, sticky="w")
+            
+            def save():
+                lang_code = custom_lang_entry.get().strip()
+                if not lang_code:
+                    display = lang_display_var.get().strip()
+                    if display:
+                        for d, code in self.COMMON_LANGUAGES:
+                            if d == display:
+                                lang_code = code
+                                break
+                    else:
+                        lang_code = ""
+                if lang_code:
+                    lang_code = self.LANGUAGE_MAP.get(lang_code.lower(), lang_code)
+                else:
+                    lang_code = ""
+                    
+                track.enc_settings["encoder"] = encoder_var.get()
+                track.language = lang_code
+                track.title = title_var.get().strip()
+                track.enc_settings["language"] = track.language
+                track.enc_settings["title"] = track.title
+                self.merge_update_track_list()
+                self.merge_update_command_preview()
+                win.destroy()
+            
+            ttk.Button(win, text=_("保存"), command=save).grid(row=3, column=0, columnspan=2, pady=10)
+            win.wait_window()
+
+    def merge_set_track_enabled(self, idx, enabled):
+        self.merge_tracks[idx].enabled = enabled
+        self.merge_auto_recommend_container()
+        self.merge_update_command_preview()
+
+    def merge_auto_recommend_container(self):
+        main_video = self.merge_video.get()
+        if not main_video:
+            return
+        original_ext = os.path.splitext(main_video)[1].lower().lstrip('.')
+        if original_ext not in ['mp4', 'mkv', 'mov', 'avi', 'webm']:
+            original_ext = 'mp4'
+        current_enabled = [t for t in self.merge_tracks if t.enabled]
+        need_encode = any(t.is_encoding() for t in current_enabled)
+        has_external = any(t.file_path != main_video for t in current_enabled)
+        rec = "mkv" if (need_encode or has_external) else original_ext
+        if self.merge_container.get() != rec:
+            self.merge_container.set(rec)
+            self._append_info_ui(_("[封装] 自动推荐容器: {0}".format(rec.upper())))
+   #         self.merge_update_output_preview()
+
+    def merge_add_external(self, ftype, path=None):
+        # 1. 如果未传入有效路径，弹出文件选择对话框
+        if not path:
+            if ftype == "audio":
+                types = [("音频", "*.mp3 *.aac *.m4a *.wav *.flac *.ogg *.opus *.ac3 *.dts *.mka")]
+            else:
+                types = [("字幕", "*.srt *.ass *.ssa *.vtt *.idx *.sup")]
+            path = filedialog.askopenfilename(filetypes=types)
+            if not path:
+                return
+    
+        if os.path.isdir(path):
+            self._append_info_ui(_("[封装] 忽略文件夹: {0}，请选择文件".format(os.path.basename(path))))
+            return
+    
+        if not self.merge_video.get():
+            self._append_info_ui(_("[封装] 请先设置主视频"))
+            return
+    
+        info = self._get_cached_stream_info(path)
+        if not info:
+            self._append_info_ui(_("[封装] 无法解析: {0}".format(path)))
+            return
+        expected = "audio" if ftype=="audio" else "subtitle"
+        def do_add():
+            added = 0
+            for s in info["streams"]:
+                if s.get("codec_type") != expected:
+                    continue
+                track = Track(s["index"], expected, s.get("codec_name","unknown"), path, True)
+                self.merge_tracks.append(track)
+                added += 1
+            if added:
+                self._append_info_ui(_("[封装] 已添加 {0} 条{1}轨道: {2}".format(added, expected, os.path.basename(path))))
+            else:
+                self._append_info_ui(_("[封装] 未添加新轨道: {0}".format(os.path.basename(path))))
+            self.merge_update_track_list()
+            self.merge_auto_recommend_container()
+            self.merge_update_command_preview()
+        self.root.after(0, do_add)
+
+    def merge_update_output_preview(self):
+        video = self.merge_video.get().strip()
+        if not video:
+            self.merge_output.set("")
+            return
+        dirname = os.path.dirname(video)
+        basename = os.path.splitext(os.path.basename(video))[0]
+        ext = "." + self.merge_container.get()
+        output_path = normalize_path(os.path.join(dirname, f"{basename}_merged{ext}"))
+        self.merge_output.set(output_path)
+        self.merge_update_command_preview()
+
+    def merge_select_video(self):
+        path = filedialog.askopenfilename(title="选择视频", filetypes=[("媒体","*.mp4 *.mkv *.avi *.mov *.flv *.ts *.webm")])
+        if path:
+            self.merge_video.set(normalize_path(path))
+
+    def merge_select_output(self):
+        path = filedialog.asksaveasfilename(defaultextension="."+self.merge_container.get())
+        if path:
+            self.merge_output.set(normalize_path(path))
+            self.merge_update_command_preview()
+
+    def merge_start(self):
+        if any(t.enc_settings.get("_placeholder", False) for t in self.merge_tracks if t.enabled):
+            messagebox.showwarning(_("提示"), _("仍有文件正在解析，请稍候再开始合并。"))
+            return
+        only_audio = self.merge_only_audio.get() if hasattr(self, 'merge_only_audio') else False
+        if not only_audio and not self.merge_video.get():
+            messagebox.showerror(_("错误"), _("请选择主视频和输出路径"))
+            return
+        if not self.merge_output.get():
+            messagebox.showerror(_("错误"), _("请选择输出路径"))
+            return
+        if not [t for t in self.merge_tracks if t.enabled]:
+            messagebox.showerror(_("错误"), _("没有启用的轨道"))
+            return
+        if not self._check_pip_video_encoders():
+            return
+    
+        output = self.merge_output.get().strip()
+        final_output = self._resolve_path_conflict(output, show_dialog=True)
+        self.merge_update_command_preview(output_override=final_output)  # 这个调用可能仍是预览模式，可保留或删除
+    
+        # 生成实际执行的命令（preview=False）
+        cmd_list = self.merge_build_cmd_list(output_override=final_output, preview=False)
+        if not cmd_list:
+            self._append_info_ui(_("[封装] 无法生成命令，请检查设置"))
+            return
+    
+        self.merge_btn.config(state="disabled")
+        threading.Thread(target=self.merge_do_merge, args=(cmd_list, final_output), daemon=True).start()  
+    
+    
+    def merge_do_merge(self, cmd_list, final_output):
+        """
+        执行合并/转码命令，并实时显示进度（含耗时）。
+        """
+        if not cmd_list:
+            self._append_info_ui(_("[封装] 命令列表为空，无法执行"))
+            self.root.after(0, lambda: self.merge_btn.config(state="normal"))
+            return
+    
+        # ----- 创建临时 task 用于记录耗时 -----
+        merge_task = Task("", "", {}, [])
+        merge_task.start_time = time.time()
+    
+        self._append_info_ui(_("[封装] 开始合并/转码..."))
+        output_file = final_output
+        source_files = set()
+        source_files.add(self.merge_video.get().strip())
+        for t in self.merge_tracks:
+            if t.enabled and t.file_path not in source_files:
+                source_files.add(t.file_path)
+    
+        # 根据模式计算总时长（含截取+变速），用于进度条
+        concat_mode = self.concat_enabled.get()
+        pip_mode = self.pip_enabled.get()
+        if concat_mode:
+            # 串行合并：累加所有视频轨道的有效时长
+            total_duration = 0.0
+            for t in self.merge_tracks:
+                if t.enabled and t.type == "video":
+                    dur = self._get_media_duration(t.file_path)
+                    if dur is not None:
+                        eff = self._get_effective_duration(t.enc_settings, dur)
+                        if eff is not None and eff > 0:
+                            total_duration += eff
+        else:
+            # 普通封装 / 画中画：取主视频轨道的有效时长
+            video_tracks = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
+            if video_tracks:
+                main_track = video_tracks[0]
+                raw_dur = self._get_media_duration(main_track.file_path)
+                total_duration = self._get_effective_duration(main_track.enc_settings, raw_dur) if raw_dur else 0
+            else:
+                total_duration = 0
+        if total_duration is None:
+            total_duration = 0
+    
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                cmd_list,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                creationflags=0x08000000 if sys.platform == "win32" else 0
+            )
+            with self._proc_lock:
+                self.running_procs.append(proc)
+    
+            for line in proc.stdout:
+                self.safe_append_detail(line)
+                # 解析进度
+                if total_duration > 0 and "time=" in line:
+                    match = re.search(r'time=(\d+):(\d+):(\d+\.?\d*)', line)
+                    if match:
+                        h, m, s = match.groups()
+                        current_sec = int(h) * 3600 + int(m) * 60 + float(s)
+   # 传入 merge_task，让进度更新包含耗时
+                        self.update_progress(current=int(current_sec), total=int(total_duration), task=merge_task, log_progress=True)
+    
+            ret = proc.wait()
+            if ret == 0:
+                self._append_info_ui(_("[封装] ✅ 处理完成"))
+                cmd_str = format_cmd_for_display(cmd_list)
+                self._log_command_to_file(cmd_str)
+                if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+                    if self.merge_delete_source.get():
+                        self.root.after(0, lambda: self._confirm_delete_sources(source_files, output_file))
+                    else:
+                        self._append_info_ui(_("[封装] 未勾选删除源文件，保留原文件"))
+                else:
+                    self._append_info_ui(_("[封装] 警告：输出文件 {0} 可能无效（不存在或大小为0），源文件未被删除".format(output_file)))
+            else:
+                self._append_info_ui(_("[封装] 处理失败，返回码 {0}，源文件未被删除".format(ret)))
+        except Exception as e:
+            self._append_info_ui(_("[封装] 异常: {0}".format(e)))
+        finally:
+            with self._proc_lock:
+                if proc in self.running_procs:
+                    self.running_procs.remove(proc)
+            # 标记任务完成并计算耗时
+            merge_task.is_finished = True
+            if merge_task.start_time is not None:
+                merge_task.elapsed_time = time.time() - merge_task.start_time
+            # 重置进度（转码结束或失败），传入 merge_task 以显示耗时
+            self.update_progress(current=0, total=0, task=merge_task, log_progress=True)
+            self.root.after(0, lambda: self.merge_btn.config(state="normal"))
+            if hasattr(self, '_merge_temp_files'):
+                self._cleanup_temp_files(self._merge_temp_files)
+                self._merge_temp_files = []
+
+
+    def _confirm_delete_sources(self, source_files, output_file):
+        if not messagebox.askyesno(_("确认删除"), _("是否确定删除 {0} 个源文件？\n此操作不可恢复！".format(len(source_files)))):
+            self._append_info_ui(_("[封装] 取消删除源文件"))
+            return
+        deleted_count = 0
+        for sf in source_files:
+            abs_sf = os.path.abspath(sf)
+            safe_prefixes = (os.path.abspath('.'), os.path.dirname(os.path.abspath(output_file)))
+            if not any(abs_sf.startswith(p) for p in safe_prefixes):
+                self._append_info_ui(_("跳过删除 {0}：不在安全目录内".format(sf)))
+                continue
+            try:
+                os.remove(abs_sf)
+                self._append_info_ui(_("[封装] 已删除源文件: {0}".format(os.path.basename(sf))))
+                deleted_count += 1
+            except Exception as e:
+                self._append_info_ui(_("[封装] 删除失败 {0}: {1}".format(os.path.basename(sf), e)))
+        if deleted_count > 0:
+            self._append_info_ui(_("[封装] 共删除 {0} 个源文件".format(deleted_count)))
+
+    def _check_pip_video_encoders(self):
+        """检查画中画模式下各视频轨道的编码器设置，仅给出必要警告，不阻止执行。"""
+        if not self.pip_enabled.get():
+            return True
+    
+        enabled_videos = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
+        if not enabled_videos:
+            return True
+    
+        # 查找主视频（第一个视频轨道）
+        main_video = enabled_videos[0]
+        main_encoder = main_video.enc_settings.get("encoder", "copy")
+    
+        # 检查从视频是否设为 copy
+        copy_tracks = [t for t in enabled_videos[1:] if t.enc_settings.get("encoder") == "copy"]
+        if copy_tracks:
+            # 构建警告信息（润色版）
+            warning_lines = [
+                "画中画模式下，所有视频流必须通过滤镜重新编码，「copy」设置将被忽略。",
+                f"输出视频的编码格式将由主视频的编码器「{main_encoder}」统一决定。",
+                "您无需手动修改从视频的编码器设置，系统会自动处理。",
+                "以下从视频轨道的「copy」设置已忽略："
+            ]
+            for t in copy_tracks:
+                warning_lines.append(f"  - {os.path.basename(t.file_path)}")
+            self._append_info_ui("\n".join(warning_lines))
+    
+        # 无论如何都返回 True，不中断合并操作
+        return True
+
+    # -------------------- 拖放处理 --------------------
+    def on_files_dropped(self, event):
+        """根窗口拖放：仅处理添加到队列（输入/输出框由独立回调处理）"""
+        files = self.root.tk.splitlist(event.data)
+        self._append_info_ui(_("拖拽了 {0} 个文件/文件夹".format(len(files))))
+        current_tab = self.notebook.index(self.notebook.select())
+    
+        if current_tab == 0:
+            # 转码标签页：添加到任务队列
+            # 定义视频扩展名列表
+            video_exts = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.ts', '.webm', '.m2ts', '.mpg', '.mpeg', '.wmv', '.3gp', '.webp', '.gif')
+            for item in files:
+                if os.path.isfile(item):
+                    # 如果是视频文件，直接添加
+                    if os.path.splitext(item)[1].lower() in video_exts:
+                        self.add_task(item)
+                    else:
+                        self._append_info_ui(_("忽略非视频文件: {0}".format(os.path.basename(item))))
+                elif os.path.isdir(item):
+                    # 如果是目录，递归扫描所有视频文件
+                    self._append_info_ui(_("扫描目录: {0}".format(item)))
+                    for root_dir, _, filenames in os.walk(item):
+                        for filename in filenames:
+                            file_path = os.path.join(root_dir, filename)
+                            if os.path.splitext(file_path)[1].lower() in video_exts:
+                                self.add_task(file_path)
+                    self._append_info_ui(_("目录扫描完成: {0}".format(item)))
+                else:
+                    self._append_info_ui(_("忽略无效路径: {0}".format(item)))
+        else:
+            # 封装/合并标签页的处理保持不变
+            if self.pip_enabled.get():
+                self._handle_drop_pip_mode(files)
+            elif self.concat_enabled.get():
+                self._handle_drop_concat_mode(files)
+            else:
+                if len(files) >= 2:
+                    self.merge_handle_batch_dropped(files)
+                else:
+                    for file in files:
+                        if os.path.exists(file):
+                            self.merge_handle_dropped_file(file)
+
+    def on_input_drop(self, event):
+        """拖放到输入文件框：设置输入文件，并自动设置输出目录"""
+        files = self.root.tk.splitlist(event.data)
+        if not files:
+            return
+        first_file = files[0]
+        if os.path.exists(first_file):
+            self.input_file.set(normalize_path(first_file))
+            if not self.output_dir.get():
+                self.output_dir.set(os.path.dirname(first_file))
+            self._append_info_ui(_("已设置输入文件: {0}".format(os.path.basename(first_file))))
+            self.update_command_preview()
+        else:
+            self._append_info_ui(_("文件不存在: {0}".format(first_file)))
+        return "break"  # 阻止事件冒泡到根窗口
+    
+    def on_output_drop(self, event):
+        """拖放到输出目录框：设置输出目录（若为文件则取其目录）"""
+        files = self.root.tk.splitlist(event.data)
+        if not files:
+            return
+        path = files[0]
+        if os.path.isdir(path):
+            self.output_dir.set(normalize_path(path))
+            self._append_info_ui(_("已设置输出目录: {0}".format(path)))
+        else:
+            self.output_dir.set(normalize_path(os.path.dirname(path)))
+            self._append_info_ui(_("已提取输出目录: {0}".format(os.path.dirname(path))))
+        self.update_command_preview()
+        return "break"
+
+    def merge_handle_dropped_file(self, path):
+        def process():
+            if os.path.isdir(path):
+                self._append_info_ui(_("[封装] 忽略文件夹: {0}，请选择文件".format(os.path.basename(path))))
+                return
+            video_exts = ['.mp4','.mkv','.avi','.mov','.flv','.ts','.webm']
+            ext = os.path.splitext(path)[1].lower()
+            if ext in video_exts:
+                if not self.merge_video.get():
+                    self.merge_video.set(normalize_path(path))
+                else:
+                    if messagebox.askyesno(_("选择操作"), _("将 {0} 设为主视频？\n【否】= 仅添加音频和字幕轨道".format(os.path.basename(path)))):
+                        self.merge_video.set(normalize_path(path))
+                    else:
+                        self.merge_add_external("audio", path)
+                        self.merge_add_external("subtitle", path)
+            else:
+                if not self.merge_video.get():
+                    self._append_info_ui(_("[封装] 请先拖入视频文件作为主视频，然后才能添加字幕/音频: {0}".format(os.path.basename(path))))
+                    return
+                audio_exts = ['.mp3','.aac','.m4a','.wav','.flac','.ogg','.opus','.ac3','.dts']
+                if ext in audio_exts:
+                    self.merge_add_external("audio", path)
+                else:
+                    self.merge_add_external("subtitle", path)
+        self.root.after(0, process)
+
+    def _parse_files_concurrently(self, file_paths, max_workers=None, description="文件"):
+        """
+        并发解析文件，结果自动存入 _stream_info_cache（通过 merge_get_media_info）。
+        返回成功解析的文件路径列表。
+        并发数默认回落到 self.ffprobe_parallel（即探测到的 CPU 数量 - 4，见初始化逻辑）。
+        """
+        if max_workers is None:
+            max_workers = self.ffprobe_parallel.get()
+        if max_workers < 1:
+            max_workers = 1
+        if not file_paths:
+            return []
+        total = len(file_paths)
+        done = 0
+        successful = []
+        self.root.after(0, self._update_log_progress, f"解析{description}: 0 / {total}")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_path = {executor.submit(self.merge_get_media_info, f): f for f in file_paths}
+            for future in concurrent.futures.as_completed(future_to_path):
+                f = future_to_path[future]
+                try:
+                    info = future.result()
+                    if info:
+                        successful.append(f)
+                    else:
+                        self.root.after(0, self._append_info_ui,
+                                       f"[封装] 无法解析{description}: {os.path.basename(f)}")
+                except Exception as e:
+                    self.root.after(0, self._append_info_ui,
+                                   f"[封装] 解析{description} {os.path.basename(f)} 异常: {e}")
+                done += 1
+                self.root.after(0, self._update_log_progress, f"解析{description}: {done} / {total}")
+        return successful
+    
+    def _add_tracks_from_cache(self, file_paths, track_types=('audio', 'subtitle')):
+        """
+        从缓存中读取指定文件列表的流信息，添加轨道到 merge_tracks（自动去重）。
+        返回成功添加的轨道数量。
+        """
+        added = 0
+        for f in file_paths:
+            info = self._get_cached_stream_info(f)
+            if not info:
+                continue
+            streams = info.get('streams', [])
+            for s in streams:
+                st = s.get('codec_type')
+                if st not in track_types:
+                    continue
+                # 检查是否已存在相同轨道（避免重复）
+                exists = any(t.file_path == f and t.index == s['index'] for t in self.merge_tracks)
+                if exists:
+                    continue
+                track = Track(s['index'], st, s.get('codec_name', 'unknown'), f, True)
+                self.merge_tracks.append(track)
+                added += 1
+        return added
+
+    def _remove_placeholder_tracks(self, file_paths):
+        """删除本次拖入添加的占位轨道（按规范化路径 + _placeholder 标记）。
+        用于普通模式与画中画/串行模式统一：先占位、解析完再替换为真实轨道。"""
+        normalized = [normalize_path(f) for f in file_paths]
+        to_remove = [
+            idx for idx, t in enumerate(self.merge_tracks)
+            if normalize_path(t.file_path) in normalized
+            and t.enc_settings.get("_placeholder", False)
+        ]
+        for idx in reversed(to_remove):
+            del self.merge_tracks[idx]
+
+    def merge_handle_batch_dropped(self, files):
+        """
+        批量拖拽文件到合并标签页时的处理（普通模式）
+        """
+        # 分类文件
+        files_sorted = sorted(files, key=lambda x: os.path.basename(x).lower())
+        video_exts = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.ts', '.webm', '.m2ts', '.mpg', '.mpeg', '.wmv')
+        video_files = []
+        other_files = []
+        for f in files_sorted:
+            if os.path.isdir(f):
+                continue
+            ext = os.path.splitext(f)[1].lower()
+            if ext in video_exts:
+                video_files.append(f)
+            else:
+                other_files.append(f)
+    
+        # ---- 没有视频文件 ----
+        if not video_files:
+            if self.merge_video.get().strip():
+                # 已有主视频，直接添加音频/字幕
+                self._batch_update = True
+                try:
+                    # 并发解析其他文件
+                    self._parse_files_concurrently(other_files, description="音频/字幕文件")
+                    # 从缓存添加轨道
+                    self._add_tracks_from_cache(other_files)
+                finally:
+                    self._batch_update = False
+                    self.merge_update_track_list()
+                    self.merge_auto_recommend_container()
+                    self.merge_update_command_preview()
+                    self._append_info_ui(_("[封装] 已添加 {0} 个音频/字幕文件".format(len(other_files))))
+                return
+            else:
+                messagebox.showinfo(_("提示"), _("未检测到视频文件，请先拖入或选择视频作为主视频"))
+                return
+    
+#         # ---- 有视频文件 ----
+#         if len(video_files) > 10:
+#             result = messagebox.askyesno(
+#                 "批量处理提示",
+#                 f"您正在普通模式下拖拽 {len(video_files)} 个视频文件，解析可能较慢。\n\n"
+#                 "建议：\n"
+#                 "• 若文件数超过 10 个，推荐使用「串行合并」模式批量添加。\n"
+#                 "  这个模式无多余解析，添加速度快，可添加完后切换回普通模式增删。\n\n"
+#                 "是否继续使用普通模式？\n（选“是”继续，选“否”取消本次操作）",
+#                 icon='warning'
+#             )
+#             if not result:
+#                 self._append_info_ui("[封装] 用户取消批量添加，请切换到串行或画中画模式重试。")
+#                 return
+    
+        # ---- 立即占位：与画中画/串行模式统一（先占位、后台解析、解析完再替换） ----
+        original_batch = self._batch_update
+        self._batch_update = False
+        try:
+            for vf in video_files:
+                track = Track(0, "video", "unknown", vf, True)
+                track.enc_settings["_placeholder"] = True
+                self.merge_tracks.append(track)
+            self.merge_update_track_list()
+            self._append_info_ui(_("[封装] 已添加 {0} 个视频文件（正在后台解析…）".format(len(video_files))))
+        finally:
+            self._batch_update = original_batch
+
+        # 后台解析视频文件，完成后弹出选择主视频对话框
+        def run_in_thread():
+            self._parse_files_concurrently(video_files, description="视频文件")
+            self.root.after(0, self._show_main_video_selection_dialog, video_files, other_files)
+
+        threading.Thread(target=run_in_thread, daemon=True).start()
+    
+    def _show_main_video_selection_dialog(self, video_files, other_files):
+        """
+        显示选择主视频的对话框（在主线程中执行）
+        """
+        root_tk = self.root
+        dialog = tk.Toplevel(root_tk)
+        dialog.title(_("批量处理选项"))
+        center_window(dialog, 640, 520)
+        dialog.transient(root_tk)
+        dialog.grab_set()
+    
+        has_main = bool(self.merge_video.get().strip())
+        info_text = ("请选择操作：\n\n"
+                     "• [All] 按钮：仅添加音频（不改变主视频）\n"
+                     "• 选中下方视频后点「设为主视频」或双击：设为主视频，其余添加音频")
+        tk.Label(dialog, text=info_text, justify=tk.LEFT).pack(pady=10, padx=10)
+    
+        def all_action():
+            def do_all():
+                self._batch_update = True
+                try:
+                    if not has_main and video_files:
+                        main = video_files[0]
+                        self.merge_video.set(normalize_path(main))
+                        self._append_info_ui(_("[封装] 自动设置主视频: {0}".format(os.path.basename(main))))
+                        start_idx = 1
+                    else:
+                        start_idx = 0
+                    # 移除本次添加的占位轨道
+                    self._remove_placeholder_tracks(video_files)
+                    # 添加除主视频外的其他视频的音频/字幕
+                    self._add_tracks_from_cache(video_files[start_idx:])
+                    # 处理其他文件（音频/字幕）
+                    for f in other_files:
+                        self.merge_handle_dropped_file(f)
+                finally:
+                    self._batch_update = False
+                    self.merge_update_track_list()
+                    self.merge_auto_recommend_container()
+                    self.merge_update_output_preview()
+                    self.merge_update_command_preview()
+                dialog.destroy()
+            self.root.after(0, do_all)
+    
+        btn_all = tk.Button(dialog, text=_("[All] 仅音频"), command=all_action,
+                            bg="#4CAF50", fg="white", width=22, wraplength=300)
+        btn_all.pack(pady=5, padx=10)
+    
+        # 视频选择虚拟列表（ttk.Treeview，仅渲染可见行，200+ 视频也不卡）
+        # 自定义样式：修复 Python 3.8 下 Treeview 行背景色不生效的颜色 bug
+        # 必须设置 fieldbackground 并配合 .map 选中态（照抄合并列表 / 批量列表的做法）
+        list_style = ttk.Style()
+        list_style.configure("MainSelect.Treeview", background="#f0f0f0",
+                             fieldbackground="#f0f0f0", rowheight=self.tree_rowheight, font=("Microsoft YaHei", 9))
+        list_style.configure("MainSelect.Treeview.Heading", background="#d9d9d9", font=("Microsoft YaHei", 9))
+        list_style.map("MainSelect.Treeview",
+                       background=[('selected', '#3475b5')],
+                       foreground=[('selected', 'white')],
+                       fieldbackground=[('selected', '#3475b5')])
+
+        list_frame = ttk.Frame(dialog)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        tree = ttk.Treeview(list_frame, columns=("idx", "name"), show="headings",
+                            selectmode="browse", style="MainSelect.Treeview")
+        tree.heading("idx", text=_("序号"))
+        tree.heading("name", text=_("文件名"))
+        tree.column("idx", width=60, stretch=False)
+        tree.column("name", width=480, stretch=True)
+        vsb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 交替行颜色（灰色，与合并列表"其他队列"一致）：偶数 #f0f0f0 / 奇数 #e0e0e0
+        tree.tag_configure('odd', background='#f0f0f0')
+        tree.tag_configure('even', background='#e0e0e0')
+
+        for i, vf in enumerate(video_files):
+            tag = 'odd' if i % 2 == 0 else 'even'
+            tree.insert("", tk.END, iid=str(i), values=(str(i + 1), os.path.basename(vf)), tags=(tag,))
+
+        def select_main_video(idx):
+            def do_select():
+                self._batch_update = True
+                try:
+                    main = video_files[idx]
+                    self.merge_video.set(normalize_path(main))
+                    self._append_info_ui(_("[封装] 设置主视频为: {0}".format(os.path.basename(main))))
+                    # 移除本次添加的占位轨道
+                    self._remove_placeholder_tracks(video_files)
+                    # 添加除主视频外的其他视频的音频/字幕
+                    other_videos = [f for i, f in enumerate(video_files) if i != idx]
+                    self._add_tracks_from_cache(other_videos)
+                    # 处理其他文件（音频/字幕）
+                    for f in other_files:
+                        self.merge_handle_dropped_file(f)
+                finally:
+                    self._batch_update = False
+                    self.merge_update_track_list()
+                    self.merge_auto_recommend_container()
+                    self.merge_update_output_preview()
+                    self.merge_update_command_preview()
+                dialog.destroy()
+            self.root.after(0, do_select)
+
+        def on_select():
+            sel = tree.selection()
+            if not sel:
+                return
+            select_main_video(int(sel[0]))
+
+        def on_double(event):
+            sel = tree.selection()
+            if not sel:
+                return
+            select_main_video(int(sel[0]))
+
+        if video_files:
+            tree.selection_set(tree.get_children()[0])
+
+        btn_select = tk.Button(dialog, text=_("设为主视频"), command=on_select,
+                               bg="#2196F3", fg="white", width=22)
+        btn_select.pack(pady=5, padx=10)
+        tree.bind("<Double-1>", on_double)
+
+        def cancel_action():
+            # 移除本次添加的占位轨道，恢复列表
+            self._remove_placeholder_tracks(video_files)
+            self._batch_update = False
+            self.merge_update_track_list()
+            dialog.destroy()
+
+        tk.Button(dialog, text=_("取消"), command=cancel_action).pack(pady=10)
+
+    def clear_input_output(self):
+        """清空输入文件和输出目录（带确认）"""
+        if messagebox.askyesno(_("确认清空"), _("确定要清空输入文件和输出目录吗？")):
+            self.input_file.set("")
+            self.output_dir.set("")
+            self.update_command_preview()
+            self._append_info_ui(_("已清空输入文件和输出目录"))
+
+
+    # ---------- 播放器设置标签页 ----------
+    def create_player_settings_tab(self, parent):
+        frame = ttk.Frame(parent, padding="10")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        # (界面语言选择器已移至下方「解析并发」右侧)
+
+        self.mpv_check = ttk.Checkbutton(frame, text=_("启用 mpv 作为预览播放器（推荐，支持进度条等）"),
+                                         variable=self.use_mpv,
+                                         command=self.on_player_changed)
+        self.mpv_check.pack(anchor=tk.W, pady=0)
+        path_frame = ttk.Frame(frame)
+        path_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(path_frame, text=_("mpv 可执行文件路径:")).pack(side=tk.LEFT, padx=(0,5))
+        self.mpv_path_entry = ttk.Entry(path_frame, textvariable=self.mpv_path, width=40)
+        self.mpv_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(path_frame, text=_("浏览"), command=self.browse_mpv).pack(side=tk.LEFT, padx=5)
+
+        # ---- 日志记录控制 ----
+        log_frame = ttk.Frame(frame)
+        log_frame.pack(fill=tk.X, pady=0)
+        chk_log = ttk.Checkbutton(log_frame, text=_("记录成功命令到日志"), variable=self.log_enabled_var)
+        chk_log.pack(side=tk.LEFT)
+        log_entry = ttk.Entry(log_frame, textvariable=self.log_path_var, width=30)
+        log_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(log_frame, text=_("浏览"), command=self.browse_log_file).pack(side=tk.LEFT, padx=5)
+
+        # ---- FFmpeg 版本目录（自定义） ----
+        ffmpeg_row = ttk.Frame(frame)
+        ffmpeg_row.pack(fill=tk.X, pady=5)
+
+        chk = ttk.Checkbutton(ffmpeg_row, text=_("启用自定义 FFmpeg 目录"), variable=self.ffmpeg_dir_enabled,
+                              command=self._on_ffmpeg_dir_changed)
+        chk.pack(side=tk.LEFT, padx=0)
+
+        # 添加 ToolTip
+        ToolTip(chk,
+            _("硬件编码需要 FFmpeg 版本与显卡驱动 API 兼容。\n"
+            "常见对应关系：\n"
+            "• NVIDIA: FFmpeg 6.1 需 NVENC API 12.1；FFmpeg 7.0 需 NVENC SDK 13.0\n"
+            "• AMD: FFmpeg 要求 AMF SDK 版本 ≥ 1.4.23 (较新版本要求可能更高)\n"
+            "• Intel QSV / Apple VideoToolbox 由系统框架决定\n"
+            "若遇到编码器初始化失败（如 API 版本不匹配），\n"
+            "可尝试切换 FFmpeg 版本或更新显卡驱动。"),
+            wraplength=700
+        )
+
+        entry = ttk.Entry(ffmpeg_row, textvariable=self.ffmpeg_dir_path, width=40)
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        ttk.Button(ffmpeg_row, text=_("浏览"), command=self._browse_ffmpeg_dir).pack(side=tk.LEFT, padx=5)
+
+        self.ffmpeg_dir_path.trace_add('write', self._on_ffmpeg_dir_changed)
+
+
+
+        # ---- 水平布局：同名文件处理 + 预览编辑权限 ----
+        horizontal_frame = ttk.Frame(frame)
+        horizontal_frame.pack(fill=tk.X, pady=5)
+        
+        # 左：同名文件处理策略
+        policy_frame = ttk.LabelFrame(horizontal_frame, text=_("全局同名文件处理策略"), padding="5")
+        policy_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        
+        ttk.Label(policy_frame, text=_("当输出文件已存在时:")).pack(side=tk.LEFT)
+        policy_combo = ttk.Combobox(
+            policy_frame,
+            textvariable=self.overwrite_policy_display,
+            values=list(self.POLICY_DISPLAY.values()),
+            state="readonly",
+            width=12
+        )
+        # 用户选择中文项后，翻译回英文代码写入 overwrite_policy（触发其 trace 保存）
+        policy_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda e, d=self.POLICY_DISPLAY, dv=self.overwrite_policy_display: self.overwrite_policy.set(
+                {v: k for k, v in d.items()}.get(dv.get(), "ask")
+            ),
+        )
+        policy_combo.pack(side=tk.LEFT, padx=5)
+        self.overwrite_policy.trace_add("write", lambda *a: self.save_player_settings())
+        
+        # 右：预览编辑权限控制
+        edit_frame = ttk.LabelFrame(horizontal_frame, text=_("预览区编辑权限"), padding="5")
+        edit_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
+        
+        self.preview_edit_check = ttk.Checkbutton(
+            edit_frame,
+            text=_("允许编辑预览命令（修改不影响实际转码）"),
+            variable=self.preview_editable_var,
+            command=self._update_preview_edit_state
+        )
+        self.preview_edit_check.pack(anchor=tk.W, padx=5, pady=5)
+        ToolTip(self.preview_edit_check, _("勾选后，所有命令预览区可编辑，方便修改后复制命令，不会影响实际转码，改错后只需刷新命令就会还原。"))
+
+
+
+        # ---- 停止所有转码按钮 ----
+        stop_frame = ttk.Frame(frame)
+        stop_frame.pack(fill=tk.X, pady=5)
+        
+        stop_btn = tk.Button(
+            stop_frame,
+            text=_("停止所有转码"),
+            command=self.stop_all_transcodes,
+            bg="#f44336",
+            fg="white",
+            font=("", 10, "bold")
+        )
+        stop_btn.pack(side=tk.LEFT, padx=5)
+        ToolTip(stop_btn,
+                _("向所有正在运行的 FFmpeg 进程发送停止信号。\n"
+                "主要用于紧急停止因水印/画中画循环参数截断失效而无限延伸的转码，\n"
+                "无需手动去任务管理器结束进程。"))
+
+        # ffprobe 并发数（信息页，远离主工作流）
+        lbl_parallel = ttk.Label(stop_frame, text=_("解析并发:"))
+        lbl_parallel.pack(side=tk.LEFT, padx=(100, 2))
+        ToolTip(lbl_parallel,
+                _("拖入文件时同时用 ffprobe 解析的线程数（当前默认: {default_parallel}）。\n\n"
+                  "默认为 CPU 核心数 − 4（上限 16），大多数情况不需要修改。\n"
+                  "设置过高可能导致大量文件拖入时 UI 短暂冻结；\n"
+                  "设置过低则拖入大量文件后解析更慢。\n\n"
+                  "如需还原默认值，手动输入 cpu核心数−4（不超过 16）即可。").format(default_parallel=self.ffprobe_parallel.get()),
+                wraplength=450)
+        spin_parallel = ttk.Spinbox(stop_frame, textvariable=self.ffprobe_parallel,
+                                    from_=1, to=32, width=4)
+        spin_parallel.pack(side=tk.LEFT)
+
+        # ---- 界面语言（置于解析并发右侧）----
+        def _on_lang_selected(_evt):
+            code = "zh" if self.language_display_var.get() == "中文" else "en"
+            if code == self.language_var.get():
+                return
+            self.language_var.set(code)
+            self.save_player_settings()
+            load_language(code)
+            messagebox.showinfo(
+                _("语言已切换"),
+                _("界面语言已保存为：%s。\n新建对话框将立即生效；主窗口需重启程序后完全切换。"
+                  % ("中文" if code == "zh" else "English"))
+            )
+        ttk.Label(stop_frame, text=_("选择界面显示语言：")).pack(side=tk.LEFT, padx=(40, 2))
+        self.language_display_var.set("中文" if self.language_var.get() == "zh" else "English")
+        lang_combo = ttk.Combobox(stop_frame, textvariable=self.language_display_var,
+                                  values=["中文", "English"], state="readonly", width=12)
+        lang_combo.pack(side=tk.LEFT, padx=5)
+        lang_combo.bind("<<ComboboxSelected>>", _on_lang_selected)
+        ToolTip(lang_combo, _("切换界面语言。设置会立即保存；重启程序后全部界面生效。"))
+
+
+
+        # ---- 快速命令工具 ----
+        cmd_tool_frame = ttk.LabelFrame(frame, text=_("快速命令工具"), padding="5")
+        cmd_tool_frame.pack(fill=tk.X, pady=5)
+
+        # 顶部：预设下拉 + 输出目录 + 清空
+        top_frame = ttk.Frame(cmd_tool_frame)
+        top_frame.pack(fill=tk.X, pady=(0,2))
+
+        preset_label1 = ttk.Label(top_frame, text=_("预设命令:"))
+        preset_label1.pack(side=tk.LEFT)
+        
+        ToolTip(preset_label1,
+                _("从下拉列表选择预设命令，自动填充到下方编辑框。\n\n您也可以自定义命令，编辑以下文件：\n• {0}\n\n格式为：{{\"显示名称\": \"命令模板\"}}\n\n支持占位符：\n• {{input}}    → 主界面「输入文件」的路径\n• {{output_dir}} → 右边「输出目录」的路径\n\n示例：\nffmpeg -i \"{{input}}\" -c copy \"{{output_dir}}output.mp4\"\n\n编辑后点击右侧的「重载」按钮重新加载。\n如果编辑错误导致读取异常，可以删除该json文件后重启程序。".format(self.cmd_templates_path)),
+                wraplength=500)
+
+        self.cmd_preset_var = tk.StringVar()
+
+
+        self.cmd_preset_combo = ttk.Combobox(
+            top_frame,
+            textvariable=self.cmd_preset_var,
+            state="readonly",
+            width=25,
+            height=20
+        )
+        self.cmd_preset_combo['values'] = list(self.cmd_templates.keys())
+        self.cmd_preset_combo.pack(side=tk.LEFT, padx=5)
+        self.cmd_preset_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
+
+        ttk.Button(top_frame, text=_("重载"), command=self._reload_cmd_templates, width=4).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top_frame, text=_("清空"), command=self._clear_cmd_input, width=4).pack(side=tk.LEFT, padx=5)
+        ttk.Button(top_frame, text=_("获取"), command=self._fetch_cmd_from_preview, width=4).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top_frame, text=_("重置"), command=self._reset_cmd_templates, width=4).pack(side=tk.LEFT, padx=2)
+
+        # 输出目录（与当前工作目录结合）
+        output_frame = ttk.Frame(top_frame)
+        output_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(15,0))
+        ttk.Label(output_frame, text=_("输出目录:")).pack(side=tk.LEFT)
+        entry = ttk.Entry(output_frame, textvariable=self.cmd_output_path)
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(output_frame, text=_("浏览"), command=self._browse_cmd_output).pack(side=tk.LEFT, padx=2)
+
+
+
+        # 命令编辑框（多行）
+        self.cmd_input = scrolledtext.ScrolledText(cmd_tool_frame, height=4, wrap=tk.WORD,
+                                                   font=("", 9))
+        self.cmd_input.pack(fill=tk.X, pady=5)
+
+        # 底部：运行按钮 + 提示
+        btn_frame = ttk.Frame(cmd_tool_frame)
+        btn_frame.pack(fill=tk.X, pady=2)
+        ttk.Button(btn_frame, text=_("运行命令"), command=self._run_custom_command).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text=_("复制到剪贴板"), command=self._copy_custom_command).pack(side=tk.LEFT, padx=5)
+        ttk.Label(btn_frame, text=_("（命令在独立线程执行，输出显示在日志区域）"),
+                  foreground="gray").pack(side=tk.LEFT, padx=10)
+
+
+
+
+        status_frame = ttk.LabelFrame(frame, text=_("状态检测"), padding="5")
+        status_frame.pack(fill=tk.X, pady=(0, 5))
+        self.status_text = tk.Text(status_frame, height=20, width=80, wrap=tk.WORD,
+                                   bg="#f8f8f8", relief=tk.FLAT)
+        self.status_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=(0,5))
+        self.status_text.config(state=tk.DISABLED)
+        btn_frame = ttk.Frame(status_frame)
+        btn_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Button(btn_frame, text=_("在文件管理器中打开预设文件夹"),
+                   command=self.open_preset_folder).pack(side=tk.LEFT, padx=5)
+        tip = ttk.Label(frame, text=_("提示：mpv 支持进度条、拖拽等交互，且兼容 FFmpeg 大部分滤镜。\n"
+                                     "请确保已安装 mpv 并正确设置路径（例如 C:\\mpv\\mpv.exe 或直接输入 mpv）。\n"
+                                     "未启用时使用 ffplay 预览。"),
+                        foreground="gray", wraplength=500, justify=tk.LEFT)
+        tip.pack(anchor=tk.W, pady=(10,0))
+
+
+        self.update_mpv_path_state()
+        self.use_mpv.trace_add("write", lambda *a: self.update_player_status())
+        self.mpv_path.trace_add("write", lambda *a: self.update_player_status())
+ #       self.update_player_status()    #放到延迟里运行
+
+
+    def _update_preview_edit_state(self):
+        if getattr(self, '_loading_settings', False):
+            return
+        editable = self.preview_editable_var.get()
+        # 更新转码预览区（如果存在）
+        if hasattr(self, 'cmd_preview'):
+            self.cmd_preview.config(state='normal' if editable else 'disabled')
+        # 更新合并预览区（如果存在）
+        if hasattr(self, 'merge_cmd_preview'):
+            self.merge_cmd_preview.config(state='normal' if editable else 'disabled')
+        # 仅在初始化完成后保存设置
+        if hasattr(self, '_initialized') and self._initialized:
+            self.save_player_settings()
+
+    def _fetch_cmd_from_preview(self):
+        """从预览区获取命令（转换或合并）到快速命令区"""
+        # 询问用户选择
+        result = messagebox.askyesno(
+            _("获取命令"),
+            _("是否从转换预览区获取命令？\n（点击“是”获取转换命令，点击“否”获取合并命令）")
+        )
+        if result is None:  # 用户关闭对话框
+            return
+        if result:
+            source = self.cmd_preview
+            source_name = "转换"
+        else:
+            source = self.merge_cmd_preview
+            source_name = "合并"
+        
+        cmd_str = source.get(1.0, tk.END).strip()
+        if not cmd_str:
+            self._append_info_ui(_("{0}预览区无命令".format(source_name)))
+            messagebox.showinfo(_("提示"), _("{0}预览区为空".format(source_name)))
+            return
+        
+        self.cmd_input.delete(1.0, tk.END)
+        self.cmd_input.insert(tk.END, cmd_str)
+        self._append_info_ui(_("已从{0}预览区获取命令".format(source_name)))
+        self.cmd_input.focus_set()
+
+
+    def _reload_cmd_templates(self):
+        """重新加载命令模板（用户编辑 JSON 后调用）"""
+        self._load_cmd_templates()
+        self._append_info_ui(_("✅ 已重新加载快速命令模板"))
+
+    def _reset_cmd_templates(self):
+        """从内部默认模板重建 quick_cmds.json（免去手动删文件+重启）"""
+        if not messagebox.askyesno(_("确认重置"), _("将用内置默认模板覆盖当前快速命令预设，\n你的自定义命令会丢失。确定要重置吗？")):
+            return
+        self.cmd_templates = self._get_default_cmd_templates()
+        self._save_cmd_templates()
+        self._refresh_cmd_preset_list()
+        self._append_info_ui(_("✅ 已用默认模板重建快速命令预设"))
+
+    def _browse_ffmpeg_dir(self):
+        path = filedialog.askdirectory(title="选择 FFmpeg 所在目录")
+        if path:
+            self.ffmpeg_dir_path.set(normalize_path(path))
+            self.ffmpeg_dir_enabled.set(True)
+            self._on_ffmpeg_dir_changed()
+    
+    def _on_ffmpeg_dir_changed(self):
+        if getattr(self, '_loading_settings', False):
+            return
+        self._update_ffmpeg_paths()
+        self.save_player_settings()
+        # 刷新命令预览（因为 ffmpeg 路径改变了）
+        self.update_command_preview()
+        self.update_player_status()
+
+
+    def _browse_cmd_output(self):
+        path = filedialog.askdirectory(title="选择命令执行目录")
+        if path:
+            self.cmd_output_path.set(normalize_path(path).rstrip('/'))
+            self.save_player_settings()
+    
+    
+    def _get_current_filter_vars(self):
+        # 读取当前缩放值（若为空，则用 "-2" 表示自动）
+        scale_w = self.video_filter.scale_width.get().strip()
+        scale_h = self.video_filter.scale_height.get().strip()
+        if not scale_w:
+            scale_w = "-2"
+        if not scale_h:
+            scale_h = "-2"
+    
+        # 读取裁剪值（若为空，用 "iw" 等默认）
+        crop_w = self.video_filter.crop_width.get().strip() or "iw"
+        crop_h = self.video_filter.crop_height.get().strip() or "ih"
+        crop_x = self.video_filter.crop_left.get().strip() or "0"
+        crop_y = self.video_filter.crop_top.get().strip() or "0"
+    
+        # 旋转映射
+        rotate_val = self.video_filter.rotate.get()
+        transpose_map = {"90": "1", "180": "3", "270": "2", "none": ""}
+        transpose_val = transpose_map.get(rotate_val, "")
+    
+        return {
+            "scale_w": scale_w,
+            "scale_h": scale_h,
+            "crop_w": crop_w,
+            "crop_h": crop_h,
+            "crop_x": crop_x,
+            "crop_y": crop_y,
+            "transpose_val": transpose_val,
+        }
+    
+    def _on_preset_selected(self, event=None):
+        preset_name = self.cmd_preset_var.get()
+        template = self.cmd_templates.get(preset_name, "")
+        if not template:
+            return
+    
+        # 如果是硬件滤镜片段，从界面读取参数替换占位符
+        if preset_name.startswith("【区域模糊】") or preset_name.startswith("【硬件滤镜片段】"):
+            vars = self._get_current_filter_vars()
+            try:
+                filled = template.format(**vars)
+            except KeyError as e:
+                messagebox.showerror(_("占位符错误"), _("模板中使用了未定义的键: {0}".format(e)))
+                return
+            self.cmd_input.delete(1.0, tk.END)
+            self.cmd_input.insert(tk.END, filled)
+            # 根据类型给出不同提示
+            if preset_name.startswith("【区域模糊】"):
+                self._append_info_ui(
+                    _("已生成区域模糊命令: {0}\n请复制后粘贴到「高级选项」的「自定义参数」框中。注意：若当前已使用 `-vf` 滤镜，请先移除它们，或将 `-vf` 的内容手动合并到本命令中，避免冲突。".format(filled))
+                )
+            else:
+                self._append_info_ui(_("已生成硬件滤镜片段: {0}，请复制后粘贴到「高级选项」的「自定义参数」框中。".format(filled)))
+            return
+    
+        # 原有的完整命令模板（无特殊前缀）
+        input_file = self.input_file.get().strip() or "input.mp4"
+        output_dir = self.cmd_output_path.get().strip()
+        if output_dir:
+            output_dir = normalize_path(output_dir).rstrip('/') + "/"
+        else:
+            output_dir = ""
+        cmd = template.replace("{input}", input_file).replace("{output_dir}", output_dir)
+        self.cmd_input.delete(1.0, tk.END)
+        self.cmd_input.insert(tk.END, cmd)
+
+    def _clear_cmd_input(self):
+        """清空命令文本框"""
+        self.cmd_input.delete(1.0, tk.END)
+
+    def _copy_custom_command(self):
+        """复制快速命令工具中的命令到剪贴板"""
+        cmd_str = self.cmd_input.get(1.0, tk.END).strip()
+        if cmd_str:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(cmd_str)
+            self._append_info_ui(_("快速命令已复制到剪贴板"))
+        else:
+            self._append_info_ui(_("命令文本框为空，无内容可复制"))
+
+
+    def _run_custom_command(self):
+        """执行命令文本框中的命令，在独立线程中运行，支持全局停止"""
+        cmd_str = self.cmd_input.get(1.0, tk.END).strip()
+        if not cmd_str:
+            messagebox.showwarning(_("提示"), _("请输入要执行的命令"))
+            return
+    
+        if not messagebox.askyesno(_("确认执行"), _("将执行以下命令：\n\n{0}\n\n确定吗？".format(cmd_str))):
+            return
+    
+        # 获取输出目录
+        cwd = self.cmd_output_path.get().strip()
+        if not cwd or not os.path.exists(cwd):
+            cwd = os.getcwd()
+            self.cmd_output_path.set(cwd)
+    
+        # 在独立线程中执行，避免阻塞UI
+        def run_thread():
+            self._append_info_ui(_("\n========== 快速命令开始 ==========".format()))
+            self._append_info_ui(f">>> {cmd_str}")
+            self._append_info_ui(_("工作目录: {0}".format(cwd)))
+    
+            proc = None
+            try:
+                proc = subprocess.Popen(
+                    cmd_str,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.PIPE,          # 启用 stdin 以便发送 q
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    shell=True,
+                    cwd=cwd,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                )
+                # 添加到进程列表（加锁）
+                with self._proc_lock:
+                    self.running_procs.append(proc)
+    
+                # 逐行读取输出
+                for line in proc.stdout:
+                    self.safe_append_detail(line)
+    
+                retcode = proc.wait()
+                if retcode == 0:
+                    self._append_info_ui(_("✅ 命令执行成功 (返回码 {0})".format(retcode)))
+                else:
+                    self._append_info_ui(_("❌ 命令执行失败 (返回码 {0})".format(retcode)))
+            except Exception as e:
+                self._append_info_ui(_("❌ 命令执行异常: {0}".format(e)))
+            finally:
+                # 从进程列表移除（加锁）
+                with self._proc_lock:
+                    if proc in self.running_procs:
+                        self.running_procs.remove(proc)
+                self._append_info_ui(_("========== 快速命令结束 ==========\n"))
+    
+        # 启动线程
+        threading.Thread(target=run_thread, daemon=True).start()
+
+    def open_preset_folder(self):
+        folder = os.path.dirname(self.preset_file_path)
+        if not os.path.exists(folder):
+            folder = get_script_dir()
+        try:
+            if sys.platform == "win32":
+                os.startfile(folder)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", folder])
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except Exception as e:
+            self._append_info_ui(_("打开文件夹失败: {0}".format(e)))
+
+
+    def browse_log_file(self):
+        path = filedialog.asksaveasfilename(
+            title="选择日志文件",
+            defaultextension=".txt",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")]
+        )
+        if path:
+            self.log_path_var.set(normalize_path(path))
+            self.save_player_settings()
+
+    def update_player_status(self):
+        if not hasattr(self, 'status_text'):
+            return
+        self.status_text.config(state=tk.NORMAL)
+        self.status_text.delete(1.0, tk.END)
+    
+        # 预设信息
+        preset_path = normalize_path(self.preset_file_path)
+        if os.path.exists(preset_path):
+            preset_status = _("✓ 文件存在")
+        else:
+            preset_status = _("✗ 文件不存在（将自动创建）")
+        local_preset = normalize_path(os.path.join(get_script_dir(), "ffmpeg_presets.json"))
+        if preset_path == local_preset:
+            source = _("脚本目录（便携模式）")
+        else:
+                        source = _("用户目录（%USERPROFILE%\\.FFLiteGUI）")
+        self.status_text.insert(tk.END, _("预设配置文件: {0}\n").format(preset_path))
+        self.status_text.insert(tk.END, _("配置来源: {0}  | 状态: {1}\n\n").format(source, preset_status))
+    
+        # mpv 预览状态
+        if self.use_mpv.get():
+            mpv_path = normalize_path(self.mpv_path.get().strip())
+            self.status_text.insert(tk.END, _("mpv 预览: 已启用\n"))
+            if mpv_path:
+                if os.path.exists(mpv_path) and os.access(mpv_path, os.X_OK):
+                    self.status_text.insert(tk.END, _("  mpv 路径: {0}  →  ✓ 有效\n").format(mpv_path))
+                else:
+                    self.status_text.insert(tk.END, _("  mpv 路径: {0}  →  ✗ 无效（文件不存在或不可执行）\n").format(mpv_path))
+                    self.status_text.insert(tk.END, _("  请检查路径是否正确，或重新安装 mpv。\n"))
+            else:
+                self.status_text.insert(tk.END, _("  mpv 路径未设置，预览将失败。\n"))
+        else:
+            self.status_text.insert(tk.END, _("预览播放器: ffplay（未启用 mpv）\n"))
+            if self.ffplay_cmd and os.path.exists(self.ffplay_cmd):
+                self.status_text.insert(tk.END, _("  ffplay 路径: {0}  →  ✓ 可用\n").format(normalize_path(self.ffplay_cmd)))
+            else:
+                self.status_text.insert(tk.END, _("  ffplay 未找到，请将 ffplay.exe 放在脚本目录或添加到 PATH。\n"))
+    
+        # ---- 当前 FFmpeg 全家桶路径（实际使用） ----
+        self.status_text.insert(tk.END, _("\n--- 当前 FFmpeg 全家桶路径（实际使用） ---\n"))
+        tools = [('ffmpeg', self.ffmpeg_cmd), ('ffprobe', self.ffprobe_cmd), ('ffplay', self.ffplay_cmd)]
+        for name, path in tools:
+            if path:
+                # 规范化路径显示
+                display_path = normalize_path(path)
+                # 判断来源
+                if self.ffmpeg_dir_enabled.get() and self.ffmpeg_dir_path.get().strip():
+                    base_dir = normalize_path(self.ffmpeg_dir_path.get().strip())
+                    if os.path.dirname(display_path) == base_dir:
+                        source_str = _("自定义")
+                    else:
+                        source_str = _("系统PATH")
+                else:
+                    source_str = "系统PATH"
+                self.status_text.insert(tk.END, _("  {0}: {1}  →  {2}\n").format(name, display_path, source_str))
+            else:
+                self.status_text.insert(tk.END, _("  {0}: 未找到\n").format(name))
+    
+        # ---- 环境变量 PATH 中的 FFmpeg 全家桶检测（只显示存在的） ----
+        self.status_text.insert(tk.END, _("\n--- 环境变量 PATH 中的 FFmpeg 全家桶检测 ---\n"))
+        tools = ['ffmpeg', 'ffplay', 'ffprobe']
+        script_dir = get_script_dir()
+        self.status_text.insert(tk.END, _("当前目录 ({0}):\n").format(normalize_path(script_dir)))
+        found_any = False
+        for tool in tools:
+            exe_name = tool + ".exe" if sys.platform == "win32" else tool
+            local_path = os.path.join(script_dir, exe_name)
+            if os.path.isfile(local_path) and os.access(local_path, os.X_OK):
+                self.status_text.insert(tk.END, _("  {0}: ✓ 存在 → {1}\n").format(exe_name, local_path))
+                found_any = True
+        if not found_any:
+            self.status_text.insert(tk.END, _("  无\n"))
+    
+        if getattr(sys, 'frozen', False):
+            internal_dir = os.path.join(script_dir, '_internal')
+            if os.path.isdir(internal_dir):
+                self.status_text.insert(tk.END, _("\n_internal 目录 ({0}):\n").format(internal_dir))
+                found_any = False
+                for tool in tools:
+                    exe_name = tool + ".exe" if sys.platform == "win32" else tool
+                    internal_path = os.path.join(internal_dir, exe_name)
+                    if os.path.isfile(internal_path) and os.access(internal_path, os.X_OK):
+                        self.status_text.insert(tk.END, _("  {0}: ✓ 存在 → {1}\n").format(exe_name, internal_path))
+                        found_any = True
+                if not found_any:
+                    self.status_text.insert(tk.END, _("  无\n"))
+    
+        self.status_text.insert(tk.END, _("环境变量 PATH:\n"))
+        import shutil
+        found_any = False
+        for tool in tools:
+            path_in_path = shutil.which(tool)
+            if path_in_path:
+                self.status_text.insert(tk.END, _("  {0}: ✓ 找到 → {1}\n").format(tool, normalize_path(path_in_path)))
+                found_any = True
+        if not found_any:
+            self.status_text.insert(tk.END, _("  无\n"))
+        self.status_text.insert(tk.END, _("（提示：FFmpeg 全家桶用于编码、解码、预览等核心功能，建议确保 ffmpeg、ffplay、ffprobe 三者均可访问）\n"))
+    
+        self.status_text.config(state=tk.DISABLED)
+
+    def on_player_changed(self):
+        self.update_mpv_path_state()
+        self.save_player_settings()
+        self.update_player_status()
+
+    def update_mpv_path_state(self):
+        state = tk.NORMAL if self.use_mpv.get() else tk.DISABLED
+        self.mpv_path_entry.config(state=state)
+
+    def browse_mpv(self):
+        path = filedialog.askopenfilename(title="选择 mpv 可执行文件", filetypes=[("可执行文件", "*.exe"), ("所有文件", "*.*")])
+        if path:
+            self.mpv_path.set(normalize_path(path))
+            self.save_player_settings()
+            self.update_player_status()
+
+    # ---------- 基本界面输入方法 ----------
+    def select_input(self):
+        path = filedialog.askopenfilename(title="选择视频文件")
+        if path:
+            path = normalize_path(path)
+            self.input_file.set(path)
+            if not self.output_dir.get():
+                self.output_dir.set(os.path.dirname(path))
+            self.update_command_preview()
+
+    def select_output_dir(self):
+        dirpath = filedialog.askdirectory()
+        if dirpath:
+            dirpath = normalize_path(dirpath)
+            self.output_dir.set(dirpath)
+            self.update_command_preview()
+
+    def append_info(self, text):
+        self.info_text.insert(tk.END, text + "\n")
+        self.info_text.see(tk.END)
+
+    def append_detail(self, text):
+        self.detail_text.insert(tk.END, text)
+        self.detail_text.see(tk.END)
+
+    def save_log(self, text_widget):
+        file_path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("文本文件", "*.txt")])
+        if file_path:
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(text_widget.get(1.0, tk.END))
+                self._append_info_ui(_("日志已保存到 {0}".format(file_path)))
+            except Exception as e:
+                messagebox.showerror(_("保存失败"), str(e))
+
+    def check_ffmpeg_dependencies(self):
+        return self.ffmpeg_cmd, self.ffplay_cmd, self.ffprobe_cmd
+
+    def show_quick_warning(self):
+        missing = []
+        if not self.ffmpeg_cmd: missing.append("ffmpeg")
+        if not self.ffplay_cmd: missing.append("ffplay")
+        if not self.ffprobe_cmd: missing.append("ffprobe")
+        if missing:
+            missing_str = "、".join(missing)
+            self._append_info_ui(_("必要组件缺失: ") + missing_str)
+            self._append_info_ui(_("请确保 FFmpeg 已正确安装。快捷方法："))
+            self._append_info_ui(_("  ① 将 ffmpeg.exe、ffplay.exe、ffprobe.exe 放在本脚本同一目录下（推荐，绿色便携）"))
+            self._append_info_ui(_("  ② 或者将它们所在文件夹的路径添加到系统 Path 环境变量中"))
+            self._append_info_ui(_("推荐下载 FFmpeg 的 **shared** 版本（体积小，节约空间）："))
+            self._append_info_ui(_("下载地址: https://github.com/BtbN/FFmpeg-Builds/releases"))
+            self._append_info_ui(_("选择文件名中包含 'shared' 的版本，例如: ffmpeg-master-latest-win64-gpl-shared.zip"))
+            self._append_info_ui(_("解压后，将 bin 文件夹内的三个 exe 文件复制到本脚本目录，或添加 bin 路径到 Path。"))
+            self._append_info_ui(_("提示：您可以在此日志框中直接选中上面的链接文字，右键复制。"))
+
+    def copy_command(self):
+        cmd_str = self.cmd_preview.get(1.0, tk.END).strip()
+        if cmd_str:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(cmd_str)
+            self._append_info_ui(_("[封装] 命令已复制到剪贴板"))
+        else:
+            self._append_info_ui(_("[封装] 无命令可复制"))
+
+    # 流提取页面创建
+    def create_extract_tab(self, parent):
+        main_frame = ttk.Frame(parent, padding="0")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+    
+        # ---- 独立的标签行（显示提示文本） ----
+        if DND_AVAILABLE:
+            label_text = _("输入文件列表 - 支持拖拽添加文件")
+        else:
+            label_text = _("输入文件列表")
+        ttk.Label(main_frame, text=label_text).pack(anchor=tk.W, padx=5, pady=(0, 0))
+    
+        # ---- 文件列表容器（无边框） ----
+        list_container = ttk.Frame(main_frame)
+        list_container.pack(fill=tk.BOTH, expand=True, padx=(5,0), pady=2)
+    
+        # ---- 工具栏（只包含按钮，不再重复显示标题） ----
+        tree_toolbar = ttk.Frame(list_container)
+        tree_toolbar.pack(fill=tk.X, pady=3)
+    
+        ttk.Button(tree_toolbar, text=_("添加文件"), command=self.extract_add_file).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tree_toolbar, text=_("清空列表"), command=self.extract_clear_files).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tree_toolbar, text=_("删除选中"), command=self.extract_delete_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tree_toolbar, text=_("预览选中"), command=self.extract_preview_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tree_toolbar, text=_("发送选中"), command=self.extract_send_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Label(tree_toolbar, text=_("（双击行预览当前文件）")).pack(side=tk.LEFT, padx=10)
+    
+        # ---- Treeview 与滚动条 ----
+        extract_style = ttk.Style()
+        extract_style.configure("Extract.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0", rowheight=self.tree_rowheight, font=("Microsoft YaHei", 9))
+        extract_style.configure("Extract.Treeview.Heading", background="#d9d9d9", font=("Microsoft YaHei", 9))
+
+        extract_style.map("Extract.Treeview",
+                          background=[('selected', '#3475b5')],
+                          foreground=[('selected', 'white')],
+                          fieldbackground=[('selected', '#3475b5')])
+
+        columns = ("文件名", "流信息", "完整路径")
+        self.extract_tree = ttk.Treeview(list_container, columns=columns, show="headings",
+                                         height=8, style="Extract.Treeview")
+        self.extract_tree.heading("文件名", text=_("文件名"))
+        self.extract_tree.heading("流信息", text=_("流信息"))
+        self.extract_tree.heading("完整路径", text=_("完整路径"))
+        self.extract_tree.column("文件名", width=200, minwidth=100)
+        self.extract_tree.column("流信息", width=110, minwidth=80, anchor=tk.CENTER)
+        self.extract_tree.column("完整路径", width=350, minwidth=200)
+        self.extract_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    
+        vbar = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=self.extract_tree.yview)
+        self.extract_tree.configure(yscrollcommand=vbar.set)
+        vbar.pack(side=tk.RIGHT, fill=tk.Y)
+    
+        # 双击预览
+        self.extract_tree.bind("<Double-1>", self.extract_on_tree_double_click)
+
+        # 右键菜单：选择提取轨道
+        self.extract_tree.bind("<Button-3>", self._extract_on_right_click)
+    
+        # ---- 拖拽绑定（确保只在此页面生效） ----
+        if DND_AVAILABLE:
+            list_container.drop_target_register(DND_FILES)
+            list_container.dnd_bind('<<Drop>>', self.extract_on_drop)
+    
+        # ---- 提取选项（保持不变） ----
+        opt_frame = ttk.LabelFrame(main_frame, text=_("提取选项"), padding="5")
+        opt_frame.pack(fill=tk.X, pady=5)
+        opt_frame.columnconfigure(3, weight=0)
+    
+        self.extract_video = tk.BooleanVar(value=True)
+        self.extract_audio = tk.BooleanVar(value=True)
+        self.extract_subtitle = tk.BooleanVar(value=True)
+        self.extract_only_first = tk.BooleanVar(value=False)
+        self.extract_subfolders = tk.BooleanVar(value=False)
+    
+        # 第一行：视频
+        chk_video = ttk.Checkbutton(opt_frame, text=_("提取视频流"), variable=self.extract_video)
+        chk_video.grid(row=0, column=0, sticky="w", padx=10)
+        ttk.Label(opt_frame, text=_("输出容器: ")).grid(row=0, column=1, padx=(20,0))
+        self.extract_video_container = tk.StringVar(value="mkv")
+        ttk.Combobox(opt_frame, textvariable=self.extract_video_container,
+                     values=["mkv", "mp4", "mov"], state="readonly", width=6).grid(row=0, column=2, sticky="w")
+
+        chk_chapters = ttk.Checkbutton(opt_frame, text=_("保留章节"), variable=self.extract_keep_chapters)
+        chk_chapters.grid(row=0, column=3, sticky="w", padx=(0,10))
+        ToolTip(chk_chapters,
+                _("勾选后，提取视频流音频流时会保留章节标记（-map_chapters 0）。\n\n"
+                "支持的格式：\n"
+                "• 视频：MKV、MP4、MOV 等主流容器均支持章节。\n"
+                "• 音频：M4A / M4B（推荐）、MKA 原生支持；MP3 / FLAC / OGG 虽也支持但播放器兼容性较差。\n\n"
+                "重要提示（音频提取）：\n"
+                "如果您希望保留专辑分轨或有声书章节，请关闭「自动匹配」，并手动选择输出格式为 M4A 或 MKA，以确保章节信息被完整保留。自动匹配可能根据编码扩展名选择不支持章节的格式（如 .mp3），导致章节丢失。"))
+        self.extract_keep_chapters.trace_add('write', lambda *a: self.save_player_settings())
+
+
+        # 第二行：音频 + 自动匹配
+        chk_audio = ttk.Checkbutton(opt_frame, text=_("提取音频流"), variable=self.extract_audio)
+        chk_audio.grid(row=1, column=0, sticky="w", padx=10)
+        ttk.Label(opt_frame, text=_("输出格式: ")).grid(row=1, column=1, padx=(20,0))
+        self.extract_audio_format = tk.StringVar(value="mka")
+        self.extract_audio_format_combo = ttk.Combobox(opt_frame, textvariable=self.extract_audio_format,
+                                                        values=["m4a", "mp3", "flac", "wav", "aac", "mka"], state="readonly", width=6)
+        self.extract_audio_format_combo.grid(row=1, column=2, sticky="w", padx=(0,5))
+        chk_auto_audio = ttk.Checkbutton(opt_frame, text=_("自动匹配"), variable=self.auto_match_audio_ext,
+                                         command=self._on_auto_audio_toggle)
+        chk_auto_audio.grid(row=1, column=3, sticky="w", padx=(0,10))
+        ToolTip(chk_auto_audio, _("根据检测到的音频编码自动选择输出扩展名（如 AAC→.m4a, MP3→.mp3, FLAC→.flac）"))
+
+        self.auto_match_audio_ext.trace_add('write', lambda *a: self.save_player_settings())
+
+        # 第三行：字幕 + 自动匹配
+        chk_sub = ttk.Checkbutton(opt_frame, text=_("提取字幕流"), variable=self.extract_subtitle)
+        chk_sub.grid(row=2, column=0, sticky="w", padx=10)
+        ttk.Label(opt_frame, text=_("输出格式: ")).grid(row=2, column=1, padx=(20,0))
+        self.extract_subtitle_format = tk.StringVar(value="srt")
+        self.extract_subtitle_format_combo = ttk.Combobox(opt_frame, textvariable=self.extract_subtitle_format,
+                                                          values=["srt", "ass", "vtt", "mov_text"], state="readonly", width=6)
+        self.extract_subtitle_format_combo.grid(row=2, column=2, sticky="w", padx=(0,5))
+        chk_auto_ext = ttk.Checkbutton(opt_frame, text=_("自动匹配"), variable=self.auto_match_subtitle_ext,
+                                       command=self._on_auto_ext_toggle)
+        chk_auto_ext.grid(row=2, column=3, sticky="w", padx=(0,10))
+        ToolTip(chk_auto_ext, _("根据检测到的字幕编码自动选择输出扩展名（如 ASS→.ass, SRT→.srt）"))
+
+        self.auto_match_subtitle_ext.trace_add('write', lambda *a: self.save_player_settings())
+
+
+        # 第四行：仅第一轨、分文件夹
+        chk_only_first = ttk.Checkbutton(opt_frame, text=_("仅提取第一轨（取消则提取全部匹配轨）"),
+                                         variable=self.extract_only_first)
+        chk_only_first.grid(row=3, column=0, sticky="w", padx=10)
+        ToolTip(chk_only_first,
+                _("勾选后，每种流类型仅提取第一个轨道（如第一条音频、第一条字幕）。\n"
+                "取消勾选则提取该类型的所有轨道。\n\n"
+                "如需更精确地选择特定几条轨道（而不只是「全部」或「第一轨」）：\n"
+                "右键点击文件列表中的文件 →「选择要提取的轨道…」→ 在弹窗中勾选需要的轨道即可。\n"
+                "或者在预览区复制想要的单条轨道命令手动运行。\n"
+                "每种类型流从 0 开始计数（第一条=索引 0）。"),
+                wraplength=700)
+    
+        ttk.Checkbutton(opt_frame, text=_("按流类型分文件夹存放（video/audio/subtitle）"),
+                        variable=self.extract_subfolders).grid(row=3, column=1, columnspan=2, sticky="w", padx=10)
+
+        chk_metadata = ttk.Checkbutton(opt_frame, text=_("清除元数据"), variable=self.extract_clear_metadata)
+        chk_metadata.grid(row=3, column=3, sticky="w", padx=10)
+        ToolTip(chk_metadata, _("勾选后，输出文件将不包含任何元数据（如作者、专辑等），适用于铃声或素材提取。"))
+
+
+        self.extract_clear_metadata.trace_add('write', lambda *a: self.save_player_settings())
+
+        # 第五行：提取附件
+        chk_attach = ttk.Checkbutton(opt_frame, text=_("提取附件（字体/封面图）"),
+                                     variable=self.extract_attachments)
+        chk_attach.grid(row=4, column=0, sticky="w", padx=10)
+        ToolTip(chk_attach,
+                _("勾选后，额外提取文件中的附件流（attachment）。\n\n"
+                "适用场景：\n"
+                "• MKV 内嵌字体（.ttf / .otf）— 提取后可用于 ASS 字幕渲染\n"
+                "• 音频封面图（mjpeg / png）— 提取内嵌封面为图片\n\n"
+                "附件提取为单独任务，不影响视频/音频/字幕的提取。\n"
+                "字体文件名取自附件原始文件名，封面图输出为 .jpg/.png。"))
+        self.extract_attachments.trace_add('write', lambda *a: (self.save_player_settings(), self._on_extract_option_changed()))
+
+        # 初始化自动匹配状态
+        self._suppress_save = True
+        self._on_auto_ext_toggle()
+        self._on_auto_audio_toggle()
+        self._on_extract_custom_dir_toggle()
+        self._suppress_save = False
+    
+        # ---- 输出目录 ----
+        out_frame = ttk.Frame(main_frame)
+        out_frame.pack(fill=tk.X, pady=5)
+    
+        btn_send = tk.Button(out_frame, text=_("发送所有到任务队列"), command=self.extract_add_to_queue,
+                             bg="#4CAF50", fg="white", font=("", 10, "bold"),
+                             relief=tk.RAISED, padx=10, pady=2)
+        btn_send.pack(side=tk.LEFT, padx=(5, 25))
+    
+        chk_custom = ttk.Checkbutton(out_frame, text=_("输出到自定义目录"), variable=self.extract_custom_dir,
+                                     command=self._on_extract_custom_dir_toggle)
+        chk_custom.pack(side=tk.LEFT, padx=5)
+        self.extract_output_entry = ttk.Entry(out_frame, textvariable=self.extract_output_dir, width=30, state='disabled')
+        self.extract_output_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        self.extract_browse_btn = ttk.Button(out_frame, text=_("浏览"), command=self.extract_browse_output, state='disabled')
+        self.extract_browse_btn.pack(side=tk.LEFT, padx=5)
+        ToolTip(chk_custom,
+                _("勾选后，输出文件将保存到下方指定的目录（路径会被自动记忆）。\n"
+                "不勾选时，输出文件默认保存在输入文件所在目录。"))
+
+    
+        # ---- 命令预览区 ----
+        preview_frame = ttk.LabelFrame(main_frame, text=_("命令预览（点击行预览按钮查看对应文件）"), padding="0")
+        preview_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        self.extract_preview_text = scrolledtext.ScrolledText(preview_frame, height=8, wrap=tk.WORD)
+        self.extract_preview_text.pack(fill=tk.BOTH, expand=True, padx=(5,0))
+    
+        # 绑定选项变更事件，自动刷新当前预览
+        self.extract_video.trace_add('write', self._on_extract_option_changed)
+        self.extract_audio.trace_add('write', self._on_extract_option_changed)
+        self.extract_subtitle.trace_add('write', self._on_extract_option_changed)
+        self.extract_only_first.trace_add('write', self._on_extract_option_changed)
+        self.extract_subfolders.trace_add('write', self._on_extract_option_changed)
+        self.extract_video_container.trace_add('write', self._on_extract_option_changed)
+        self.extract_audio_format.trace_add('write', self._on_extract_option_changed)
+        self.extract_subtitle_format.trace_add('write', self._on_extract_option_changed)
+        self.auto_match_subtitle_ext.trace_add('write', self._on_extract_option_changed)
+        self.auto_match_audio_ext.trace_add('write', self._on_extract_option_changed)
+        self.extract_keep_chapters.trace_add('write', lambda *a: self._on_extract_option_changed())
+        self.extract_clear_metadata.trace_add('write', lambda *a: self._on_extract_option_changed())
+
+
+        # 初始化列表
+
+        self._refresh_extract_file_list()
+
+    def _on_extract_option_changed(self, *args):
+        # 如果预览文本控件尚未创建，则直接返回
+        if not hasattr(self, 'extract_preview_text'):
+            return
+        # 如果当前有预览文件且在列表中，刷新它
+        if self.current_preview_file and self.current_preview_file in self.extract_file_list:
+            self._extract_preview_file(self.current_preview_file)
+        elif self.extract_file_list:
+            # 否则预览第一个文件
+            self.current_preview_file = self.extract_file_list[0]
+            self._extract_preview_file(self.current_preview_file)
+        else:
+            # 列表为空，清空预览
+            self.extract_preview_text.delete(1.0, tk.END)
+            self.extract_preview_text.insert(tk.END, "文件列表为空")
+
+    def extract_remove_file(self, file_path):
+        if file_path in self.extract_file_list:
+            self.extract_file_list.remove(file_path)
+            # 如果删除的是当前预览文件，清除预览
+            if self.current_preview_file == file_path:
+                self.current_preview_file = None
+            self._refresh_extract_file_list()
+            self._append_info_ui(_("[流提取] 已删除: {0}".format(os.path.basename(file_path))))
+
+    def _refresh_extract_file_list(self):
+        """刷新流提取文件列表（Treeview），交替行颜色，显示流信息摘要"""
+        for item in self.extract_tree.get_children():
+            self.extract_tree.delete(item)
+
+        # 配置交替行标签（不会影响其他 Treeview）
+        self.extract_tree.tag_configure('odd', background='#D9F0D9')
+        self.extract_tree.tag_configure('even', background='#FDEBD0')
+
+        for i, path in enumerate(self.extract_file_list):
+            tag = 'odd' if i % 2 == 0 else 'even'
+            si = self.extract_get_stream_indices(path)
+            v_cnt = len(si.get('video', []))
+            a_cnt = len(si.get('audio', []))
+            s_cnt = len(si.get('subtitle', []))
+            parts = []
+            if v_cnt:
+                parts.append(f"{v_cnt}V")
+            if a_cnt:
+                parts.append(f"{a_cnt}A")
+            if s_cnt:
+                parts.append(f"{s_cnt}S")
+            stream_info = " ".join(parts) if parts else "无"
+            self.extract_tree.insert("", tk.END, iid=f"file_{i}",
+                                     values=(os.path.basename(path), stream_info, path),
+                                     tags=(tag,))
+    
+        # 自动预览第一个文件
+        if self.extract_file_list:
+            self.current_preview_file = self.extract_file_list[0]
+            self._extract_preview_file(self.current_preview_file)
+        else:
+            self.current_preview_file = None
+            self.extract_preview_text.delete(1.0, tk.END)
+            self.extract_preview_text.insert(tk.END, "文件列表为空")
+
+    def extract_delete_selected(self):
+        """删除选中的文件"""
+        selected = self.extract_tree.selection()
+        if not selected:
+            return
+        # 按索引从大到小删除，避免越界
+        indices = sorted([int(item.split('_')[1]) for item in selected], reverse=True)
+        for idx in indices:
+            if 0 <= idx < len(self.extract_file_list):
+                removed = self.extract_file_list.pop(idx)
+                self._append_info_ui(_("[流提取] 已删除: {0}".format(os.path.basename(removed))))
+        self._refresh_extract_file_list()
+    
+    def extract_preview_selected(self):
+        """预览选中的第一个文件"""
+        selected = self.extract_tree.selection()
+        if not selected:
+            messagebox.showinfo(_("提示"), _("请先选中一个文件"))
+            return
+        iid = selected[0]
+        idx = int(iid.split('_')[1])
+        if 0 <= idx < len(self.extract_file_list):
+            self._extract_preview_file(self.extract_file_list[idx])
+    
+    def extract_send_selected(self):
+        """发送选中的文件到任务队列"""
+        selected = self.extract_tree.selection()
+        if not selected:
+            messagebox.showinfo(_("提示"), _("请先选中文件"))
+            return
+        files = []
+        for iid in selected:
+            idx = int(iid.split('_')[1])
+            if 0 <= idx < len(self.extract_file_list):
+                files.append(self.extract_file_list[idx])
+        if files:
+            self._process_send_files_to_queue(files)
+    
+
+    
+    def extract_on_tree_double_click(self, event):
+        """双击行预览该文件"""
+        item = self.extract_tree.selection()
+        if item:
+            self.extract_preview_selected()
+
+
+    def _extract_preview_file(self, file_path):
+        """预览指定文件的全部提取命令（根据当前选项），自动添加轨道语言和标题"""
+        self.current_preview_file = file_path
+        stream_indices = self.extract_get_stream_indices(file_path)
+        if not any(stream_indices.values()):
+            self.extract_preview_text.delete(1.0, tk.END)
+            self.extract_preview_text.insert(tk.END, f"文件 {os.path.basename(file_path)} 未检测到任何流")
+            return
+    
+        options = {
+            'video': self.extract_video.get(),
+            'audio': self.extract_audio.get(),
+            'subtitle': self.extract_subtitle.get(),
+            'only_first': self.extract_only_first.get(),
+            'video_container': self.extract_video_container.get(),
+            'audio_format': self.extract_audio_format.get(),
+            'subtitle_format': self.extract_subtitle_format.get(),
+            'subfolders': self.extract_subfolders.get(),
+            'auto_match': self.auto_match_subtitle_ext.get(),
+            'auto_match_audio': self.auto_match_audio_ext.get(),
+            'keep_chapters': self.extract_keep_chapters.get(),
+            'clear_metadata': self.extract_clear_metadata.get(),
+            'extract_attachments': self.extract_attachments.get(),
+        }
+    
+        if self.extract_custom_dir.get() and self.extract_output_dir.get().strip():
+            base_output_dir = self.extract_output_dir.get().strip()
+        else:
+            base_output_dir = os.path.dirname(file_path)
+    
+        base = os.path.splitext(os.path.basename(file_path))[0]
+        cmd_list_lines = []
+    
+        # ---- 视频流 ----
+        if options['video'] and stream_indices['video']:
+            indices = self._get_extract_indices(file_path, 'video', stream_indices['video'], options)
+            for idx in indices:
+                tags = self._get_stream_tags(file_path, 'video', idx)
+                lang = tags.get('language', '')
+                title = tags.get('title', '')
+                name_suffix = f"_{idx}" if len(indices) > 1 else ""
+                if lang:
+                    name_suffix += f"_{lang}"
+                subdir = "video" if options['subfolders'] else ""
+                out_dir = os.path.join(base_output_dir, subdir) if subdir else base_output_dir
+                ext = options['video_container']
+                out_path = normalize_path(os.path.join(out_dir, f"{base}_video{name_suffix}.{ext}"))
+                cmd = [self.ffmpeg_cmd, "-y", "-i", file_path,
+                       "-map", f"0:v:{idx}?", "-c:v", "copy"]
+                if options.get('keep_chapters', False):
+                    cmd.extend(["-map_chapters", "0"])
+                if options.get('clear_metadata', False):
+                    cmd.extend(["-map_metadata", "-1"])
+                else:
+                    if lang:
+                        cmd.extend(["-metadata:s:0", f"language={lang}"])
+                    if title:
+                        cmd.extend(["-metadata:s:0", f"title={title}"])
+                cmd.append(out_path)
+                cmd_list_lines.append(format_cmd_for_display(cmd))
+    
+        # ---- 音频流 ----
+        if options['audio'] and stream_indices['audio']:
+            indices = self._get_extract_indices(file_path, 'audio', stream_indices['audio'], options)
+            for idx in indices:
+                tags = self._get_stream_tags(file_path, 'audio', idx)
+                lang = tags.get('language', '')
+                title = tags.get('title', '')
+                if options.get('auto_match_audio', True):
+                    codec = self._get_stream_codec(file_path, 'audio', idx)
+                    ext = self._map_audio_codec_to_ext(codec)
+                else:
+                    ext = options['audio_format']
+                if not ext:
+                    ext = 'm4a'
+                name_suffix = f"_{idx}" if len(indices) > 1 else ""
+                if lang:
+                    name_suffix += f"_{lang}"
+                subdir = "audio" if options['subfolders'] else ""
+                out_dir = os.path.join(base_output_dir, subdir) if subdir else base_output_dir
+                out_path = normalize_path(os.path.join(out_dir, f"{base}_audio{name_suffix}.{ext}"))
+                cmd = [self.ffmpeg_cmd, "-y", "-i", file_path,
+                       "-map", f"0:a:{idx}?", "-c:a", "copy"]
+                if options.get('keep_chapters', False):
+                    cmd.extend(["-map_chapters", "0"])
+                if options.get('clear_metadata', False):
+                    cmd.extend(["-map_metadata", "-1"])
+                else:
+                    if lang:
+                        cmd.extend(["-metadata:s:0", f"language={lang}"])
+                    if title:
+                        cmd.extend(["-metadata:s:0", f"title={title}"])
+                cmd.append(out_path)
+                cmd_list_lines.append(format_cmd_for_display(cmd))
+    
+        # ---- 字幕流 ----
+        if options['subtitle'] and stream_indices['subtitle']:
+            indices = self._get_extract_indices(file_path, 'subtitle', stream_indices['subtitle'], options)
+            for idx in indices:
+                tags = self._get_stream_tags(file_path, 'subtitle', idx)
+                lang = tags.get('language', '')
+                title = tags.get('title', '')
+                sub_codec = self._get_stream_codec(file_path, 'subtitle', idx)
+                if options['auto_match']:
+                    ext = self._map_codec_to_ext(sub_codec)
+                else:
+                    ext = options['subtitle_format']
+                if not ext:
+                    ext = 'srt'
+                sub_enc = self._get_subtitle_codec_arg(sub_codec, ext)
+                name_suffix = f"_{idx}" if len(indices) > 1 else ""
+                if lang:
+                    name_suffix += f"_{lang}"
+                subdir = "subtitle" if options['subfolders'] else ""
+                out_dir = os.path.join(base_output_dir, subdir) if subdir else base_output_dir
+                out_path = normalize_path(os.path.join(out_dir, f"{base}_sub{name_suffix}.{ext}"))
+                cmd = [self.ffmpeg_cmd, "-y", "-i", file_path,
+                       "-map", f"0:s:{idx}?", "-c:s", sub_enc]
+                # 字幕通常不保留章节，但保留元数据清除
+                if options.get('clear_metadata', False):
+                    cmd.extend(["-map_metadata", "-1"])
+                else:
+                    if lang:
+                        cmd.extend(["-metadata:s:0", f"language={lang}"])
+                    if title:
+                        cmd.extend(["-metadata:s:0", f"title={title}"])
+                cmd.append(out_path)
+                cmd_list_lines.append(format_cmd_for_display(cmd))
+    
+        # ---- 附件/封面 ----
+        if options.get('extract_attachments', False):
+            attachments = self._get_attachment_streams(file_path)
+            for a in attachments:
+                if a['type'] == 'attachment':
+                    fname = a['filename'] or f"attachment_{a['index']}"
+                    subdir = "attachments" if options['subfolders'] else ""
+                    out_dir = os.path.join(base_output_dir, subdir) if subdir else base_output_dir
+                    out_path = normalize_path(os.path.join(out_dir, fname))
+                    cmd = [self.ffmpeg_cmd, "-y", "-i", file_path,
+                           "-map", f"0:t:{a['index']}?", "-c", "copy"]
+                    cmd.append(out_path)
+                    cmd_list_lines.append(format_cmd_for_display(cmd))
+                elif a['type'] == 'cover':
+                    codec_ext = self._map_cover_codec_to_ext(a['codec'])
+                    name_suffix = f"_cover_{a['index']}"
+                    subdir = "attachments" if options['subfolders'] else ""
+                    out_dir = os.path.join(base_output_dir, subdir) if subdir else base_output_dir
+                    out_path = normalize_path(os.path.join(out_dir, f"{base}{name_suffix}.{codec_ext}"))
+                    cmd = [self.ffmpeg_cmd, "-y", "-i", file_path,
+                           "-map", f"0:v:{a['index']}?", "-an", "-c:v", "copy"]
+                    cmd.append(out_path)
+                    cmd_list_lines.append(format_cmd_for_display(cmd))
+    
+        self.extract_preview_text.delete(1.0, tk.END)
+        if not cmd_list_lines:
+            self.extract_preview_text.insert(tk.END, f"文件 {os.path.basename(file_path)} 不包含用户勾选的任何流")
+        else:
+            preview_text = f"--- 预览文件: {os.path.basename(file_path)} ---\n\n"
+            preview_text += "\n\n".join(cmd_list_lines)
+            self.extract_preview_text.insert(tk.END, preview_text)
+
+    def _on_auto_ext_toggle(self):
+        if getattr(self, '_loading_settings', False):
+            return
+        if self.auto_match_subtitle_ext.get():
+            # 禁用字幕格式下拉框，并清空提示（可选）
+            self.extract_subtitle_format_combo.config(state='disabled')
+            self.extract_subtitle_format.set("")  # 或保留当前值但实际不生效
+        else:
+            self.extract_subtitle_format_combo.config(state='readonly')
+            # 若当前为空，则设置默认值
+            if not self.extract_subtitle_format.get():
+                self.extract_subtitle_format.set("srt")
+
+    def _on_auto_audio_toggle(self):
+        if getattr(self, '_loading_settings', False):
+            return
+        if self.auto_match_audio_ext.get():
+            self.extract_audio_format_combo.config(state='disabled')
+            self.extract_audio_format.set("")  # 清空显示，表示自动
+        else:
+            self.extract_audio_format_combo.config(state='readonly')
+            if not self.extract_audio_format.get():
+                self.extract_audio_format.set("mka")
+        self.save_player_settings()
+
+    def _on_extract_custom_dir_toggle(self):
+        if getattr(self, '_loading_settings', False):
+            return
+        """自定义目录开关切换时，启用/禁用输入框和浏览按钮，并自动保存设置"""
+        enabled = self.extract_custom_dir.get()
+        state = 'normal' if enabled else 'disabled'
+        # 确保控件已创建
+        if hasattr(self, 'extract_output_entry') and hasattr(self, 'extract_browse_btn'):
+            self.extract_output_entry.config(state=state)
+            self.extract_browse_btn.config(state=state)
+        # 保存设置（使状态持久化）
+        self.save_player_settings()
+        self._on_extract_option_changed()
+
+    # ---------- 右键轨道选择 ----------
+    def _extract_on_right_click(self, event):
+        """右键点击文件行 → 选中该行并弹出上下文菜单"""
+        row_id = self.extract_tree.identify_row(event.y)
+        if not row_id:
+            return
+        self.extract_tree.selection_set(row_id)
+        self.extract_tree.focus(row_id)
+
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label=_("选择提取轨道..."), command=self._open_stream_selection)
+        menu.add_command(label=_("重置为默认（取消手动选择）"), command=self._reset_stream_selection)
+        menu.add_separator()
+        menu.add_command(label=_("预览此文件"), command=self.extract_preview_selected)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _get_selected_extract_file(self):
+        """获取当前在 extract_tree 中选中的文件路径"""
+        sel = self.extract_tree.selection()
+        if not sel:
+            return None
+        values = self.extract_tree.item(sel[0], 'values')
+        if values and len(values) >= 3:
+            return values[2]  # 完整路径列
+        return None
+
+    def _reset_stream_selection(self):
+        """取消某文件的手动轨道选择，恢复默认行为"""
+        fp = self._get_selected_extract_file()
+        if not fp:
+            return
+        if fp in self._extract_stream_selection:
+            del self._extract_stream_selection[fp]
+            self._append_info_ui(_("[流提取] 已重置 {0} 的轨道选择为默认".format(os.path.basename(fp))))
+        self._on_extract_option_changed()
+
+    def _open_stream_selection(self):
+        """打开轨道选择对话框，列出所有流并允许勾选"""
+        fp = self._get_selected_extract_file()
+        if not fp:
+            return
+        data = self._get_stream_data(fp)
+        if not data:
+            messagebox.showwarning(_("提示"), _("无法读取文件信息:\n{0}".format(fp)))
+            return
+        streams = data.get('streams', [])
+        if not streams:
+            messagebox.showinfo(_("提示"), _("该文件不包含任何流"))
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"选择提取轨道 - {os.path.basename(fp)}")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text=_("勾选需要提取的轨道（取消勾选的轨道将被跳过）")).pack(padx=10, pady=(8, 4))
+
+        scroll = ttk.Frame(dlg)
+        scroll.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        canvas = tk.Canvas(scroll, highlightthickness=0)
+        sb = ttk.Scrollbar(scroll, orient=tk.VERTICAL, command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window(0, 0, window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        headers = ttk.Frame(inner)
+        headers.pack(fill=tk.X, padx=4, pady=2)
+        ttk.Label(headers, text="  ", width=3).pack(side=tk.LEFT)
+        ttk.Label(headers, text=_("类型"), width=6).pack(side=tk.LEFT, padx=4)
+        ttk.Label(headers, text=_("索引"), width=4).pack(side=tk.LEFT, padx=4)
+        ttk.Label(headers, text=_("编码"), width=14).pack(side=tk.LEFT, padx=4)
+        ttk.Label(headers, text=_("语言"), width=8).pack(side=tk.LEFT, padx=4)
+        ttk.Label(headers, text=_("标题"), width=24).pack(side=tk.LEFT, padx=4)
+
+        prev_sel = self._extract_stream_selection.get(fp)
+        check_vars = {}
+        v_cnt = a_cnt = s_cnt = 0
+        for s in streams:
+            typ = s.get('codec_type', '')
+            if typ not in ('video', 'audio', 'subtitle'):
+                continue
+            if typ == 'video':
+                idx = v_cnt; v_cnt += 1
+            elif typ == 'audio':
+                idx = a_cnt; a_cnt += 1
+            else:
+                idx = s_cnt; s_cnt += 1
+            codec = s.get('codec_name', '?')
+            tags = s.get('tags', {})
+            raw_lang = tags.get('language', '')
+            if raw_lang:
+                raw_lang = raw_lang.lower().strip()
+                lang = self.LANGUAGE_MAP.get(raw_lang, raw_lang)
+            else:
+                lang = ''
+            title = tags.get('title', '')
+            extra = ''
+            if typ == 'video':
+                w = s.get('width', 0)
+                h = s.get('height', 0)
+                if w and h:
+                    extra = f" {w}x{h}"
+            elif typ == 'audio':
+                ch = s.get('channels', 0)
+                if ch:
+                    ch_map = {1: '单声道', 2: '立体声', 6: '5.1', 8: '7.1'}
+                    extra = f" {ch_map.get(ch, f'{ch}ch')}"
+            label_text = f"{codec}{extra}"
+
+            default_checked = True
+            if prev_sel is not None:
+                default_checked = idx in prev_sel.get(typ, set())
+
+            row = ttk.Frame(inner)
+            row.pack(fill=tk.X, padx=4, pady=1)
+            var = tk.BooleanVar(value=default_checked)
+            ttk.Checkbutton(row, variable=var).pack(side=tk.LEFT)
+            ttk.Label(row, text=typ, width=6).pack(side=tk.LEFT, padx=4)
+            ttk.Label(row, text=str(idx), width=4).pack(side=tk.LEFT, padx=4)
+            ttk.Label(row, text=label_text, width=14).pack(side=tk.LEFT, padx=4)
+            ttk.Label(row, text=lang, width=8).pack(side=tk.LEFT, padx=4)
+            ttk.Label(row, text=title, width=24).pack(side=tk.LEFT, padx=4)
+            check_vars[(typ, idx)] = var
+
+        btn_frame = ttk.Frame(dlg)
+        btn_frame.pack(fill=tk.X, padx=10, pady=8)
+
+        def select_all():
+            for v in check_vars.values():
+                v.set(True)
+        def select_none():
+            for v in check_vars.values():
+                v.set(False)
+        def select_first_only():
+            seen = set()
+            for (typ, idx), v in check_vars.items():
+                key = typ
+                if key not in seen and idx == 0:
+                    v.set(True)
+                    seen.add(key)
+                else:
+                    v.set(False)
+
+        ttk.Button(btn_frame, text=_("全选"), command=select_all).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text=_("全不选"), command=select_none).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text=_("仅第一轨"), command=select_first_only).pack(side=tk.LEFT, padx=4)
+
+        def on_ok():
+            sel = {'video': set(), 'audio': set(), 'subtitle': set()}
+            for (typ, idx), v in check_vars.items():
+                if v.get():
+                    sel[typ].add(idx)
+            if all(len(sel[k]) == 0 for k in sel):
+                if fp in self._extract_stream_selection:
+                    del self._extract_stream_selection[fp]
+            else:
+                self._extract_stream_selection[fp] = sel
+            dlg.destroy()
+            self._on_extract_option_changed()
+            self._append_info_ui(_("[流提取] 已更新 {0} 的轨道选择".format(os.path.basename(fp))))
+
+        def on_cancel():
+            dlg.destroy()
+
+        ttk.Button(btn_frame, text=_("确定"), command=on_ok).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btn_frame, text=_("取消"), command=on_cancel).pack(side=tk.RIGHT, padx=4)
+
+        dlg.update_idletasks()
+        w = dlg.winfo_width()
+        h = min(dlg.winfo_reqheight(), 500)
+        x = self.root.winfo_x() + (self.root.winfo_width() - w) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - h) // 2
+        dlg.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _get_extract_indices(self, file_path, stream_type, all_indices, options):
+        """获取要提取的流索引列表。如果文件有手动选择则用选择，否则用默认 only_first/all 逻辑。"""
+        sel = self._extract_stream_selection.get(file_path)
+        if sel is not None:
+            selected = sel.get(stream_type, set())
+            return [i for i in all_indices if i in selected]
+        if options.get('only_first'):
+            return all_indices[:1]
+        return all_indices
+
+    def _get_attachment_streams(self, file_path: str) -> list:
+        """获取文件中所有附件流和封面流信息。
+        返回: [{'type': 'attachment'|'cover', 'index': int, 'codec': str, 'filename': str}, ...]
+        attachment = MKV 内嵌字体等（codec_type=attachment）
+        cover = 音频内嵌封面图（video 流但编码为 mjpeg/png/bmp 等图片编码）
+        """
+        data = self._get_stream_data(file_path)
+        if not data:
+            return []
+        streams = data.get('streams', [])
+        result = []
+        attach_idx = 0
+        cover_idx = 0
+        cover_codecs = {'mjpeg', 'png', 'bmp', 'gif', 'webp', 'jpeg', 'mjpeg2', 'jpegls'}
+        has_real_video = False
+        video_codec_list = []
+        for s in streams:
+            if s.get('codec_type') == 'video':
+                vc = s.get('codec_name', '')
+                video_codec_list.append(vc)
+                if vc not in cover_codecs:
+                    has_real_video = True
+
+        for s in streams:
+            ct = s.get('codec_type', '')
+            if ct == 'attachment':
+                codec = s.get('codec_name', '')
+                tags = s.get('tags', {})
+                filename = tags.get('filename', '')
+                result.append({
+                    'type': 'attachment',
+                    'index': attach_idx,
+                    'codec': codec,
+                    'filename': filename,
+                })
+                attach_idx += 1
+            elif ct == 'video' and not has_real_video:
+                vc = s.get('codec_name', '')
+                if vc in cover_codecs:
+                    result.append({
+                        'type': 'cover',
+                        'index': cover_idx,
+                        'codec': vc,
+                        'filename': '',
+                    })
+                    cover_idx += 1
+        return result
+
+    def _map_cover_codec_to_ext(self, codec: str) -> str:
+        m = {
+            'mjpeg': 'jpg', 'mjpeg2': 'jpg', 'jpeg': 'jpg',
+            'png': 'png', 'bmp': 'bmp', 'gif': 'gif', 'webp': 'webp',
+            'jpegls': 'jpg',
+        }
+        return m.get(codec, 'jpg')
+
+
+
+    # ---------- 流提取标签页方法 ----------
+    def extract_add_file(self, path=None):
+        if path is None:
+            paths = filedialog.askopenfilenames(title="选择文件", filetypes=[("所有文件", "*.*")])
+            if not paths:
+                return
+        else:
+            paths = [path]
+    
+        # 批量模式下禁止重绘
+        self._batch_update = True
+        try:
+            for p in paths:
+                self._add_file(p)   # 注意 _add_file 内部仍然会刷新，需要改造
+        finally:
+            self._batch_update = False
+            self._refresh_extract_file_list()   # 最终刷新一次
+    
+    def _add_file(self, path):
+        if os.path.isdir(path):
+            return
+        if path in self.extract_file_list:
+            self._append_info_ui(_("[流提取] 文件已在列表中: {0}".format(os.path.basename(path))))
+            return
+        self.extract_file_list.append(path)
+        self._refresh_extract_file_list()   # 刷新 Treeview
+        self._append_info_ui(_("[流提取] 已添加: {0}".format(os.path.basename(path))))
+    
+
+
+    def extract_clear_files(self):
+        if self.extract_file_list and messagebox.askyesno(_("确认"), _("确定清空所有文件吗？")):
+            self.extract_file_list.clear()
+            self._stream_info_cache.clear()
+            self._refresh_extract_file_list()
+            self._append_info_ui(_("[流提取] 已清空文件列表"))
+    
+    def extract_on_drop(self, event):
+        files = self.root.tk.splitlist(event.data)
+        self._batch_update = True
+        try:
+            for f in files:
+                if os.path.exists(f):
+                    self._add_file(f)
+        finally:
+            self._batch_update = False
+            self._refresh_extract_file_list()
+        return "break"
+    
+    def extract_browse_output(self):
+        if not self.extract_custom_dir.get():
+            return  # 按钮已禁用，实际不会触发
+        dirpath = filedialog.askdirectory()
+        if dirpath:
+            self.extract_output_dir.set(normalize_path(dirpath))
+            # 路径变化自动触发保存（已在 trace 中处理，或可在此主动保存）
+            self.save_player_settings()
+            self._on_extract_option_changed()
+    
+    def _get_stream_tags(self, file_path: str, stream_type: str, index: int) -> Dict[str, str]:
+        data = self._get_stream_data(file_path)
+        if not data:
+            return {}
+        streams = data.get('streams', [])
+        count = 0
+        for s in streams:
+            if s.get('codec_type') == stream_type:
+                if count == index:
+                    tags = s.get('tags', {})
+                    # ------ 新增语言映射 ------
+                    if 'language' in tags:
+                        raw = tags['language'].lower().strip()
+                        tags['language'] = self.LANGUAGE_MAP.get(raw, raw)
+                    # --------------------------
+                    return tags
+                count += 1
+        return {}
+    
+    def _get_stream_data(self, file_path: str) -> Optional[Dict[str, Any]]:
+        """获取文件的 ffprobe 流信息（带缓存）"""
+        if file_path not in self._stream_info_cache:
+            self._stream_info_cache[file_path] = ffprobe_json(self.ffprobe_cmd, file_path)
+        return self._stream_info_cache[file_path]
+    
+    def extract_get_stream_info(self, file_path: str) -> dict:
+        data = self._get_stream_data(file_path)
+        if not data:
+            return {'video': False, 'audio': False, 'subtitle': False}
+        streams = data.get('streams', [])
+        has_video = any(s.get('codec_type') == 'video' for s in streams)
+        has_audio = any(s.get('codec_type') == 'audio' for s in streams)
+        has_subtitle = any(s.get('codec_type') == 'subtitle' for s in streams)
+        return {'video': has_video, 'audio': has_audio, 'subtitle': has_subtitle}
+    
+    def extract_get_stream_indices(self, file_path: str) -> dict:
+        """
+        获取文件中各类型的流索引（该类型在文件中的顺序索引，从0开始）。
+        返回: {'video': [0,1,...], 'audio': [0,1,...], 'subtitle': [0,1,...]}
+        """
+        data = self._get_stream_data(file_path)
+        if not data:
+            return {'video': [], 'audio': [], 'subtitle': []}
+        streams = data.get('streams', [])
+        indices = {'video': [], 'audio': [], 'subtitle': []}
+        video_count = audio_count = subtitle_count = 0
+        for s in streams:
+            typ = s.get('codec_type')
+            if typ == 'video':
+                indices['video'].append(video_count)
+                video_count += 1
+            elif typ == 'audio':
+                indices['audio'].append(audio_count)
+                audio_count += 1
+            elif typ == 'subtitle':
+                indices['subtitle'].append(subtitle_count)
+                subtitle_count += 1
+        return indices
+
+    def _get_stream_codec(self, file_path: str, stream_type: str, index: int) -> Optional[str]:
+        """
+        获取指定文件、流类型、类型内索引的编码名称（如 'ass', 'subrip'）。
+        返回 None 若找不到。
+        """
+        data = self._get_stream_data(file_path)
+        if not data:
+            return None
+        streams = data.get('streams', [])
+        count = 0
+        for s in streams:
+            typ = s.get('codec_type')
+            if typ == stream_type:
+                if count == index:
+                    return s.get('codec_name')
+                count += 1
+        return None
+
+    def _map_codec_to_ext(self, codec_name: Optional[str]) -> str:
+        if not codec_name:
+            return 'srt'
+        mapping = {
+            'ass': 'ass', 'ssa': 'ass',
+            'subrip': 'srt', 'srt': 'srt',
+            'webvtt': 'vtt', 'vtt': 'vtt',
+            'mov_text': 'mov_text',
+            'dvd_subtitle': 'sup',
+            'hdmv_pgs_subtitle': 'sup',
+            # 其他可根据需要扩展
+        }
+        return mapping.get(codec_name, 'srt')
+
+    def _get_subtitle_codec_arg(self, source_codec: Optional[str], target_ext: str) -> str:
+        """根据源编码和目标扩展名决定 -c:s 参数：匹配则 copy，不匹配则转码。
+        返回 'copy' 或编码器名（如 'srt', 'ass', 'webvtt', 'mov_text'）。
+        """
+        native_ext = self._map_codec_to_ext(source_codec)
+        if native_ext == target_ext:
+            return "copy"
+        ext_to_encoder = {
+            'srt': 'srt',
+            'ass': 'ass',
+            'vtt': 'webvtt',
+            'mov_text': 'mov_text',
+        }
+        encoder = ext_to_encoder.get(target_ext)
+        if encoder:
+            return encoder
+        return "copy"
+
+    def _map_audio_codec_to_ext(self, codec_name: Optional[str]) -> str:
+        if not codec_name:
+            return 'mka'
+        mapping = {
+            'aac': 'm4a',
+            'mp3': 'mp3',
+            'mp2': 'mp2',
+            'mp1': 'mp3',
+            'flac': 'flac',
+            'opus': 'opus',
+            'vorbis': 'ogg',
+            'ac3': 'ac3',
+            'eac3': 'eac3',
+            'dts': 'dts',
+            'pcm_s16le': 'wav',
+            'pcm_s24le': 'wav',
+            'pcm_s32le': 'wav',
+            'alac': 'm4a',
+            'libfdk_aac': 'm4a',
+            'truehd': 'truehd',  # 或 .mlp
+            'mlp': 'mlp',
+            'wmav2': 'wma',
+            'wmapro': 'wma',
+            # 其他常见
+        }
+        return mapping.get(codec_name, 'mka')
+
+
+    def _process_send_files_to_queue(self, file_list):
+        """
+        将指定的文件列表按当前选项发送到任务队列（支持单文件/批量）
+        自动添加轨道语言和标题到元数据，文件名中加入语言代码
+        """
+        if not file_list:
+            return
+        if not self.extract_video.get() and not self.extract_audio.get() and not self.extract_subtitle.get() and not self.extract_attachments.get():
+            messagebox.showwarning(_("提示"), _("请至少勾选一种流类型（视频/音频/字幕/附件）"))
+            return
+    
+        single_mode = len(file_list) == 1
+        if self.extract_custom_dir.get() and self.extract_output_dir.get().strip():
+            base_output_dir = self.extract_output_dir.get().strip()
+        else:
+            base_output_dir = os.path.dirname(file_list[0])
+    
+        options = {
+            'video': self.extract_video.get(),
+            'audio': self.extract_audio.get(),
+            'subtitle': self.extract_subtitle.get(),
+            'only_first': self.extract_only_first.get(),
+            'video_container': self.extract_video_container.get(),
+            'audio_format': self.extract_audio_format.get(),
+            'subtitle_format': self.extract_subtitle_format.get(),
+            'subfolders': self.extract_subfolders.get(),
+            'auto_match': self.auto_match_subtitle_ext.get(),
+            'auto_match_audio': self.auto_match_audio_ext.get(),
+            'keep_chapters': self.extract_keep_chapters.get(),
+            'clear_metadata': self.extract_clear_metadata.get(),
+            'extract_attachments': self.extract_attachments.get(),
+        }
+    
+        total_count = 0
+        for path in file_list:
+            stream_indices = self.extract_get_stream_indices(path)
+            if not any(stream_indices.values()):
+                self._append_info_ui(_("[流提取] 警告: {0} 未检测到任何流，跳过".format(os.path.basename(path))))
+                continue
+    
+            base = os.path.splitext(os.path.basename(path))[0]
+    
+            # ---- 视频流 ----
+            if options['video'] and stream_indices['video']:
+                indices = self._get_extract_indices(path, 'video', stream_indices['video'], options)
+                for idx in indices:
+                    tags = self._get_stream_tags(path, 'video', idx)
+                    lang = tags.get('language', '')
+                    title = tags.get('title', '')
+                    name_suffix = f"_{idx}" if len(indices) > 1 else ""
+                    if lang:
+                        name_suffix += f"_{lang}"
+                    subdir = "video" if options['subfolders'] else ""
+                    out_dir = os.path.join(base_output_dir, subdir) if subdir else base_output_dir
+                    ext = options['video_container']
+                    out_path = normalize_path(os.path.join(out_dir, f"{base}_video{name_suffix}.{ext}"))
+                    cmd = [self.ffmpeg_cmd, "-y", "-i", path,
+                           "-map", f"0:v:{idx}?", "-c:v", "copy"]
+                    if options.get('keep_chapters', False):
+                        cmd.extend(["-map_chapters", "0"])
+                    if options.get('clear_metadata', False):
+                        cmd.extend(["-map_metadata", "-1"])
+                    else:
+                        if lang:
+                            cmd.extend(["-metadata:s:0", f"language={lang}"])
+                        if title:
+                            cmd.extend(["-metadata:s:0", f"title={title}"])
+                    cmd.append(out_path)
+                    self.add_custom_task(path, out_path, cmd)
+                    total_count += 1
+    
+            # ---- 音频流 ----
+            if options['audio'] and stream_indices['audio']:
+                indices = self._get_extract_indices(path, 'audio', stream_indices['audio'], options)
+                for idx in indices:
+                    tags = self._get_stream_tags(path, 'audio', idx)
+                    lang = tags.get('language', '')
+                    title = tags.get('title', '')
+                    if options.get('auto_match_audio', True):
+                        codec = self._get_stream_codec(path, 'audio', idx)
+                        ext = self._map_audio_codec_to_ext(codec)
+                    else:
+                        ext = options['audio_format']
+                    if not ext:
+                        ext = 'mka'
+                    name_suffix = f"_{idx}" if len(indices) > 1 else ""
+                    if lang:
+                        name_suffix += f"_{lang}"
+                    subdir = "audio" if options['subfolders'] else ""
+                    out_dir = os.path.join(base_output_dir, subdir) if subdir else base_output_dir
+                    out_path = normalize_path(os.path.join(out_dir, f"{base}_audio{name_suffix}.{ext}"))
+                    cmd = [self.ffmpeg_cmd, "-y", "-i", path,
+                           "-map", f"0:a:{idx}?", "-c:a", "copy"]
+                    if options.get('keep_chapters', False):
+                        cmd.extend(["-map_chapters", "0"])
+                    if options.get('clear_metadata', False):
+                        cmd.extend(["-map_metadata", "-1"])
+                    else:
+                        if lang:
+                            cmd.extend(["-metadata:s:0", f"language={lang}"])
+                        if title:
+                            cmd.extend(["-metadata:s:0", f"title={title}"])
+                    cmd.append(out_path)
+                    self.add_custom_task(path, out_path, cmd)
+                    total_count += 1
+    
+            # ---- 字幕流 ----
+            if options['subtitle'] and stream_indices['subtitle']:
+                indices = self._get_extract_indices(path, 'subtitle', stream_indices['subtitle'], options)
+                for idx in indices:
+                    tags = self._get_stream_tags(path, 'subtitle', idx)
+                    lang = tags.get('language', '')
+                    title = tags.get('title', '')
+                    sub_codec = self._get_stream_codec(path, 'subtitle', idx)
+                    if options['auto_match']:
+                        ext = self._map_codec_to_ext(sub_codec)
+                    else:
+                        ext = options['subtitle_format']
+                    if not ext:
+                        ext = 'srt'
+                    sub_enc = self._get_subtitle_codec_arg(sub_codec, ext)
+                    name_suffix = f"_{idx}" if len(indices) > 1 else ""
+                    if lang:
+                        name_suffix += f"_{lang}"
+                    subdir = "subtitle" if options['subfolders'] else ""
+                    out_dir = os.path.join(base_output_dir, subdir) if subdir else base_output_dir
+                    out_path = normalize_path(os.path.join(out_dir, f"{base}_sub{name_suffix}.{ext}"))
+                    cmd = [self.ffmpeg_cmd, "-y", "-i", path,
+                           "-map", f"0:s:{idx}?", "-c:s", sub_enc]
+                    if options.get('clear_metadata', False):
+                        cmd.extend(["-map_metadata", "-1"])
+                    else:
+                        if lang:
+                            cmd.extend(["-metadata:s:0", f"language={lang}"])
+                        if title:
+                            cmd.extend(["-metadata:s:0", f"title={title}"])
+                    cmd.append(out_path)
+                    self.add_custom_task(path, out_path, cmd)
+                    total_count += 1
+    
+            # ---- 附件/封面 ----
+            if options.get('extract_attachments', False):
+                attachments = self._get_attachment_streams(path)
+                for a in attachments:
+                    if a['type'] == 'attachment':
+                        fname = a['filename'] or f"attachment_{a['index']}"
+                        subdir = "attachments" if options['subfolders'] else ""
+                        out_dir = os.path.join(base_output_dir, subdir) if subdir else base_output_dir
+                        out_path = normalize_path(os.path.join(out_dir, fname))
+                        cmd = [self.ffmpeg_cmd, "-y", "-i", path,
+                               "-map", f"0:t:{a['index']}?", "-c", "copy"]
+                        cmd.append(out_path)
+                        self.add_custom_task(path, out_path, cmd)
+                        total_count += 1
+                    elif a['type'] == 'cover':
+                        codec_ext = self._map_cover_codec_to_ext(a['codec'])
+                        name_suffix = f"_cover_{a['index']}"
+                        subdir = "attachments" if options['subfolders'] else ""
+                        out_dir = os.path.join(base_output_dir, subdir) if subdir else base_output_dir
+                        out_path = normalize_path(os.path.join(out_dir, f"{base}{name_suffix}.{codec_ext}"))
+                        cmd = [self.ffmpeg_cmd, "-y", "-i", path,
+                               "-map", f"0:v:{a['index']}?", "-an", "-c:v", "copy"]
+                        cmd.append(out_path)
+                        self.add_custom_task(path, out_path, cmd)
+                        total_count += 1
+    
+        if total_count == 0:
+            if single_mode:
+                self._append_info_ui(_("[流提取] 文件 {0} 不包含用户勾选的任何流".format(os.path.basename(file_list[0]))))
+            else:
+                self._append_info_ui(_("[流提取] 未添加任何任务，请检查文件是否包含所勾选的流类型"))
+        else:
+            if single_mode:
+                self._append_info_ui(_("[流提取] 已为 {0} 添加 {1} 个任务到队列".format(os.path.basename(file_list[0]), total_count)))
+            else:
+                self._append_info_ui(_("[流提取] 共添加 {0} 个提取任务到队列".format(total_count)))
+        self.update_task_list()
+
+    def extract_add_to_queue(self):
+        if not self.extract_file_list:
+            messagebox.showwarning(_("提示"), _("文件列表为空"))
+            return
+        self._process_send_files_to_queue(self.extract_file_list)
+    
+    def _extract_send_single_to_queue(self, file_path):
+        self._process_send_files_to_queue([file_path])
+    
+    def extract_preview_command(self):
+        children = self.extract_tree.get_children()
+        if not children:
+            self.extract_preview_text.delete(1.0, tk.END)
+            self.extract_preview_text.insert(tk.END, "文件列表为空")
+            return
+        first_path = self.extract_tree.item(children[0], "values")[1]
+    
+        # 确定输出目录（与队列逻辑一致）
+        if self.extract_custom_dir.get() and self.extract_output_dir.get().strip():
+            base_output_dir = self.extract_output_dir.get().strip()
+        else:
+            base_output_dir = os.path.dirname(first_path)
+    
+        stream_indices = self.extract_get_stream_indices(first_path)
+        if not any(stream_indices.values()):
+            self.extract_preview_text.delete(1.0, tk.END)
+            self.extract_preview_text.insert(tk.END, "该文件未检测到任何流，无法预览命令")
+            return
+    
+        options = {
+            'video': self.extract_video.get(),
+            'audio': self.extract_audio.get(),
+            'subtitle': self.extract_subtitle.get(),
+            'only_first': self.extract_only_first.get(),
+            'video_container': self.extract_video_container.get(),
+            'audio_format': self.extract_audio_format.get(),
+            'subtitle_format': self.extract_subtitle_format.get(),
+            'subfolders': self.extract_subfolders.get(),
+        }
+    
+        cmd = [self.ffmpeg_cmd, "-y", "-i", first_path]
+        base = os.path.splitext(os.path.basename(first_path))[0]
+    
+        # 预览仅展示第一个文件的第一条流（若存在）
+        if options['video'] and stream_indices['video']:
+            idx = stream_indices['video'][0]
+            sub = "video/" if options['subfolders'] else ""
+            out_path = normalize_path(os.path.join(base_output_dir, sub, f"{base}_video_{idx}.{options['video_container']}"))
+            cmd.extend(["-map", f"0:v:{idx}?", "-c:v", "copy", out_path])
+    
+        if options['audio'] and stream_indices['audio']:
+            idx = stream_indices['audio'][0]
+            sub = "audio/" if options['subfolders'] else ""
+            out_path = normalize_path(os.path.join(base_output_dir, sub, f"{base}_audio_{idx}.{options['audio_format']}"))
+            cmd.extend(["-map", f"0:a:{idx}?", "-c:a", "copy", out_path])
+    
+        if options['subtitle'] and stream_indices['subtitle']:
+            idx = stream_indices['subtitle'][0]
+            # 确定扩展名（预览也使用自动匹配逻辑）
+            if self.auto_match_subtitle_ext.get():
+                codec = self._get_stream_codec(first_path, 'subtitle', idx)
+                ext = self._map_codec_to_ext(codec)
+            else:
+                ext = options['subtitle_format']
+            if not ext:
+                ext = 'srt'
+            sub = "subtitle/" if options['subfolders'] else ""
+            out_path = normalize_path(os.path.join(base_output_dir, sub, f"{base}_sub_{idx}.{ext}"))
+            cmd.extend(["-map", f"0:s:{idx}?", "-c:s", "copy", out_path])
+    
+        if len(cmd) == 3:  # 只有 ffmpeg -y -i file
+            cmd_str = "文件不包含用户勾选的任何流类型，无法生成预览命令"
+        else:
+            cmd_str = format_cmd_for_display(cmd)
+    
+        self.extract_preview_text.delete(1.0, tk.END)
+        self.extract_preview_text.insert(tk.END, cmd_str)
+    
+
+    def _show_task_context_menu(self, event):
+        """显示任务列表的右键菜单"""
+        # 获取点击位置的行
+        item = self.task_tree.identify_row(event.y)
+        if not item:
+            return
+        
+        # 如果点击的行未被选中，则选中它（支持多选，但点击时通常只选一个）
+        if item not in self.task_tree.selection():
+            self.task_tree.selection_set(item)
+        
+        # 创建菜单
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label=_("用命令模板更新任务"), command=self._sync_tasks_from_current_settings)
+        menu.add_separator()
+        menu.add_command(label=_("移除选中任务"), command=self.remove_selected_tasks)
+        menu.add_command(label=_("清空全部任务"), command=self.clear_all_tasks)
+        menu.add_command(label=_("清空已完成/失败任务"), command=self.clear_finished_tasks)
+        menu.add_command(label=_("停止队列"), command=self.stop_queue)
+        menu.add_command(label=_("预览选中任务"), command=self.preview_selected_task)
+        menu.add_command(label=_("预览选中任务(快照)"), command=lambda: self.preview_selected_task(with_snapshot=True))
+        menu.add_separator()
+        menu.add_command(label=_("恢复列宽"), command=self.reset_task_tree_columns)
+
+
+
+        # 弹出菜单
+        menu.post(event.x_root, event.y_root)
+    
+    def _sync_tasks_from_current_settings(self):
+        """将选中任务的设置同步为当前界面参数（保留或更新输出目录）"""
+        selected = self.task_tree.selection()
+        if not selected:
+            messagebox.showinfo(_("提示"), _("请先选中要更新的任务"))
+            return
+    
+        # 获取当前界面完整设置（作为模板）
+        template_settings = self.get_current_settings()
+        new_output_dir = template_settings.get("output_dir", "")
+        
+        # 检查是否有自定义任务（跳过）
+        custom_tasks = [int(iid) for iid in selected if int(iid) < len(self.tasks) and self.tasks[int(iid)].is_custom]
+        if custom_tasks:
+            if not messagebox.askyesno(
+                _("自定义任务"),
+                _("选中的任务中有 {0} 个是流提取生成的自定义任务，它们不支持同步参数。\n是否跳过这些任务继续？".format(len(custom_tasks)))
+            ):
+                return
+            # 从选中列表中移除自定义任务
+            selected = [iid for iid in selected if int(iid) not in custom_tasks]
+            if not selected:
+                return
+    
+        # 获取所有任务当前的输出目录
+        old_output_dirs = set()
+        for iid in selected:
+            idx = int(iid)
+            if idx < len(self.tasks):
+                task = self.tasks[idx]
+                old_output_dirs.add(os.path.dirname(task.output))
+        
+        # 如果所有任务输出目录相同且与当前界面目录不同，询问是否统一更新
+        update_output_dir = False
+        if len(old_output_dirs) == 1:
+            old_dir = old_output_dirs.pop()
+            if old_dir and new_output_dir and old_dir != new_output_dir:
+                if messagebox.askyesno(
+                    _("更新输出目录"),
+                    _("当前界面输出目录为：{0}\n选中任务的输出目录为：{1}\n是否将所有任务的输出目录更新为当前界面目录？\n\n（选“是”将一起更新，选“否”保留原路径）".format(new_output_dir, old_dir))
+                ):
+                    update_output_dir = True
+    
+        # 开始同步
+        updated_count = 0
+        for iid in selected:
+            idx = int(iid)
+            if idx >= len(self.tasks):
+                continue
+            task = self.tasks[idx]
+            if task.is_custom:
+                continue  # 已跳过
+    
+            input_path = task.input
+            old_output_path = task.output
+    
+            # 用当前界面设置替换（深拷贝）
+            new_settings = copy.deepcopy(template_settings)
+    
+            # 确定最终输出路径
+            if update_output_dir:
+                # 重新生成输出路径（使用新目录和界面设置）
+                new_output_path = self.generate_output_path(input_path, new_settings)
+                # 处理冲突（根据策略）
+                final_output = self._resolve_path_conflict(new_output_path, show_dialog=True)
+                if final_output is None:
+                    # 用户取消，跳过此任务
+                    continue
+                # 更新任务的输出路径
+                task.output = final_output
+                # 更新设置中的输出目录
+                new_settings["output_dir"] = os.path.dirname(final_output)
+            else:
+                # 保留原输出路径，但需要确保 output_dir 设置正确
+                final_output = old_output_path
+                new_settings["output_dir"] = os.path.dirname(final_output)
+    
+            # 更新任务设置
+            task.settings = new_settings
+    
+            # 重新生成命令
+            try:
+                new_cmd = self.generate_ffmpeg_command(input_path, final_output, task.settings)
+                task.cmd = new_cmd
+                task.status = "等待"
+                task.error_msg = ""
+                updated_count += 1
+            except Exception as e:
+                self._append_info_ui(_("更新任务 {0} 失败: {1}".format(os.path.basename(input_path), e)))
+    
+        if updated_count:
+            self._append_info_ui(_("✅ 已同步 {0} 个任务的参数".format(updated_count)))
+            self.update_task_list()
+            self.update_command_preview()
+        else:
+            self._append_info_ui(_("没有任务被更新"))
+
+
+    # -------------------- 界面创建 --------------------
+    def create_widgets(self):
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+    
+        self.main_paned = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
+        self.main_paned.pack(fill=tk.BOTH, expand=True)
+    
+        # ======== 左侧容器 ========
+        # 固定 width=1155*scaling + pack_propagate(False)：仅作为“故障兜底”的最小宽度。
+        # 正常情况下 PanedWindow 按 sash（70%）直接设定 pane 几何，会覆盖此 width，
+        # 左面板 = 70% 空间、日志 = 30%，内容 fill=BOTH 跟随；只有当 sash 失效/程序卡住时，
+        # 左面板才退回 1155 而不塌成 0，避免日志占满整个窗口。
+        left_container = ttk.Frame(self.main_paned, width=int(1155 * self.scaling))
+        left_container.pack_propagate(False)
+        self.left_container = left_container
+        self.main_paned.add(left_container, weight=1)
+  
+        # ======== 左侧所有内容 ========
+        left_vpane = ttk.PanedWindow(left_container, orient=tk.VERTICAL)
+        left_vpane.pack(fill=tk.BOTH, expand=True)
+        self.notebook = ttk.Notebook(left_vpane)
+        left_vpane.add(self.notebook, weight=1)
+    
+        # ---- 视频转码标签页 ----
+        transcode_tab = ttk.Frame(self.notebook)
+        self.notebook.add(transcode_tab, text=_("视频转码"))
+        transcode_sf = ScrolledFrame(transcode_tab, autohide=True)
+        transcode_sf.pack(fill=tk.BOTH, expand=True)
+        transcode_vpane = transcode_sf.inner
+    
+        settings_frame = ttk.Frame(transcode_vpane)
+        settings_frame.pack(side=tk.TOP, fill=tk.X, expand=False, pady=(0,5))
+    
+        # 输入/输出框架
+        io_frame = ttk.LabelFrame(settings_frame, text=_("输入 / 输出"), padding="5")
+        io_frame.pack(fill=tk.X, pady=5)
+        io_frame.columnconfigure(1, weight=1)
+    
+        ttk.Label(io_frame, text=_("输入文件:")).grid(row=0, column=0, sticky="w")
+        self.input_entry = ttk.Entry(io_frame, textvariable=self.input_file)
+        self.input_entry.grid(row=0, column=1, padx=5, sticky="ew")
+        if DND_AVAILABLE:
+            self.input_entry.drop_target_register(DND_FILES)
+            self.input_entry.dnd_bind('<<Drop>>', self.on_input_drop)
+        ttk.Button(io_frame, text=_("浏览"), command=self.select_input).grid(row=0, column=2)
+        ttk.Button(io_frame, text=_("添加到任务列表"), command=self.add_current_as_task).grid(row=0, column=3, padx=5)
+    
+        ttk.Label(io_frame, text=_("输出目录:")).grid(row=1, column=0, sticky="w")
+        self.output_entry = ttk.Entry(io_frame, textvariable=self.output_dir)
+        self.output_entry.grid(row=1, column=1, padx=5, sticky="ew")
+        if DND_AVAILABLE:
+            self.output_entry.drop_target_register(DND_FILES)
+            self.output_entry.dnd_bind('<<Drop>>', self.on_output_drop)
+        ttk.Button(io_frame, text=_("浏览"), command=self.select_output_dir).grid(row=1, column=2)
+        ttk.Button(io_frame, text=_("清空"), command=self.clear_input_output, width=12).grid(row=1, column=3, padx=5)
+    
+        suffix_frame = ttk.Frame(io_frame)
+        suffix_frame.grid(row=2, column=0, columnspan=4, sticky="w", pady=2)
+        ttk.Label(suffix_frame, text=_("输出文件名后缀 (如 _new):")).pack(side=tk.LEFT)
+        ttk.Entry(suffix_frame, textvariable=self.output_suffix, width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Label(suffix_frame, text=_("完整自定义名称 (覆盖后缀):")).pack(side=tk.LEFT, padx=(20,0))
+        ttk.Entry(suffix_frame, textvariable=self.custom_output_name, width=30).pack(side=tk.LEFT, padx=5)
+        ttk.Label(suffix_frame, text=_("输出容器:")).pack(side=tk.LEFT, padx=(20,0))
+        container_combo = ttk.Combobox(suffix_frame, textvariable=self.output_container,
+                                       values=["mp4", "mkv", "mov", "avi", "webm","gif","webp","jp2","mj2"], state="readonly", width=6)
+        container_combo.pack(side=tk.LEFT, padx=5)
+    
+        # 预设框架
+        preset_frame = ttk.LabelFrame(settings_frame, text=_("参数预设"), padding="5")
+        preset_frame.pack(fill=tk.X, pady=(0,5))
+        ttk.Label(preset_frame, text=_("预设名称:")).pack(side=tk.LEFT)
+        self.preset_name = tk.StringVar()
+        self.preset_combo = ttk.Combobox(preset_frame, textvariable=self.preset_name, width=25, height=20, state="readonly")
+        self.preset_combo.pack(side=tk.LEFT, padx=5)
+        self.preset_combo.bind("<<ComboboxSelected>>", lambda e: self.load_preset(self.preset_name.get()))
+        btn_save = ttk.Button(preset_frame, text=_("保存当前参数为预设"), command=self.save_preset)
+        btn_save.pack(side=tk.LEFT, padx=5)
+        btn_delete = ttk.Button(preset_frame, text=_("删除预设"), command=self.delete_preset)
+        btn_delete.pack(side=tk.LEFT, padx=5)
+        btn_export = ttk.Button(preset_frame, text=_("导出所有预设(备份)"), command=self.export_all_presets)
+        btn_export.pack(side=tk.LEFT, padx=5)
+        btn_import = ttk.Button(preset_frame, text=_("导入预设(恢复)"), command=self.import_presets)
+        btn_import.pack(side=tk.LEFT, padx=5)
+    
+        # 参数笔记本
+        param_notebook = ttk.Notebook(settings_frame)
+        param_notebook.pack(fill=tk.BOTH, expand=True, pady=5)
+    
+        # 视频编码页
+        video_enc_page = ttk.Frame(param_notebook)
+        param_notebook.add(video_enc_page, text=_("视频编码"))
+        self.video_encoder = VideoEncoderFrame(video_enc_page, app=self, refresh_callback=self.update_command_preview)
+        self.video_encoder.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+    
+        # 视频滤镜页
+        filter_page = ttk.Frame(param_notebook)
+        param_notebook.add(filter_page, text=_("视频滤镜"))
+        self.video_filter = VideoFilterFrame(filter_page, app=self)
+        self.video_filter.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+    
+        # 音频页
+        audio_page = ttk.Frame(param_notebook)
+        param_notebook.add(audio_page, text=_("音频"))
+        self.audio_frame = AudioFrame(audio_page, enable_checkbox=True)
+        self.audio_frame.pack(fill=tk.X, padx=5, pady=5)
+    
+        # 截取片段页
+        trim_page = ttk.Frame(param_notebook)
+        param_notebook.add(trim_page, text=_("截取片段"))
+        self.trim_frame = TrimFrame(trim_page, update_callback=self.update_command_preview)
+        self.trim_frame.pack(fill=tk.X, padx=5, pady=5)
+    
+        # 分段拼接页
+        segment_tab = ttk.Frame(param_notebook)
+        param_notebook.add(segment_tab, text=_("分段拼接"))
+        seg_control_frame = ttk.Frame(segment_tab)
+        seg_control_frame.pack(fill=tk.X, pady=10)
+        ttk.Checkbutton(seg_control_frame, text=_("启用分段拼接模式 (将忽略『截取片段』设置)"),
+                        variable=self.segment_enabled).pack(side=tk.LEFT, padx=5)
+        ttk.Button(seg_control_frame, text=_("打开分段设置..."),
+                   command=self.open_segment_editor).pack(side=tk.LEFT, padx=10)
+        ttk.Label(segment_tab, text=_("勾选启用后，视频将按片段列表裁剪并拼接，所有片段使用相同的全局编码/滤镜设置。\n\n"
+                                   "   建议使用（mpv、PotPlayer）等播放器打开视频，定位并获取精确到毫秒的时间。\n\n"
+                                   "   典型用途：简单混剪、去中间广告、提取精华片段等。"),
+                  foreground="grey", wraplength=1100, justify=tk.LEFT).pack(anchor=tk.W, padx=10, pady=(5,0))
+    
+        # 高级选项页
+        adv_page = ttk.Frame(param_notebook)
+        param_notebook.add(adv_page, text=_("高级选项"))
+        self.adv_frame = AdvancedFrame(adv_page, update_callback=self.update_command_preview, app=self)
+        self.adv_frame.pack(fill=tk.X, padx=5, pady=5)
+
+    
+        # 底部按钮
+        bottom_btn_frame = ttk.Frame(settings_frame)
+        bottom_btn_frame.pack(fill=tk.X, pady=(0,5))
+        btn_height = 1 if self.scaling >= 1.4 else 2
+    
+        btn_single = tk.Button(bottom_btn_frame, text=_("开始编码"), command=self.transcode_single,
+                               height=btn_height, width=18, relief=tk.RAISED,
+                               bg="#4CAF50", fg="white", font=("",12,"bold"))
+        btn_single.pack(side=tk.LEFT, padx=5, pady=5)
+    
+        btn_preview = tk.Button(bottom_btn_frame, text=_("预览当前命令"), command=self.preview_current_file,
+                                height=btn_height, width=18, relief=tk.RAISED,
+                                bg="#2196F3", fg="white", font=("",12,"bold"))
+        btn_preview.pack(side=tk.LEFT, padx=5, pady=5)
+        # 左键=旧预览（无快照）；右键=带真实合成快照的预览
+        btn_preview.bind("<Button-3>", lambda e: self.preview_current_file(with_snapshot=True))
+        ToolTip(btn_preview, _("左键：常规预览（无快照）\n右键：预览 + 水印真实合成快照（独立窗口）"), wraplength=320)
+    
+        btn_refresh = tk.Button(bottom_btn_frame, text=_("刷新命令"), command=self.refresh_with_reset,
+                                height=btn_height, width=12, relief=tk.RAISED)
+        btn_refresh.pack(side=tk.LEFT, padx=5, pady=5)
+        ToolTip(btn_refresh, _("刷新命令或重置队列区列宽"))
+    
+        btn1_copy = tk.Button(bottom_btn_frame, text=_("复制命令"), command=self.copy_command,
+                              height=btn_height, width=12, relief=tk.RAISED)
+        btn1_copy.pack(side=tk.LEFT, padx=5)
+    
+        # 命令预览
+        if DND_AVAILABLE:
+            preview_label_text = _("当前命令模板 - 拖拽文件可以按当前模板添加到队列")
+        else:
+            preview_label_text = _("当前命令模板")
+        preview_frame = ttk.LabelFrame(settings_frame, text=preview_label_text, padding="1")
+        preview_frame.pack(fill=tk.X, pady=0)
+        self.cmd_preview = scrolledtext.ScrolledText(preview_frame, height=4, wrap=tk.WORD, font=("Microsoft YaHei",9))
+        self.cmd_preview.pack(fill=tk.BOTH, expand=True, padx=(4,0))
+        self.cmd_preview.insert(tk.END, "请选择输入文件，或调整参数...")
+    
+        # 任务列表区域
+        tasks_frame = ttk.Frame(transcode_vpane)
+        tasks_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0, 0))
+    
+        # 工具栏（水平滚动）
+        toolbar_height = max(20, int(30 * self.scaling))
+        tool_canvas = tk.Canvas(tasks_frame, height=toolbar_height, highlightthickness=0)
+        tool_canvas.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
+        h_scrollbar = ttk.Scrollbar(tasks_frame, orient=tk.HORIZONTAL, command=tool_canvas.xview)
+        h_scrollbar.pack(side=tk.TOP, fill=tk.X)
+        tool_canvas.configure(xscrollcommand=h_scrollbar.set)
+        tool_container = ttk.Frame(tool_canvas)
+        tool_canvas.create_window((0, 0), window=tool_container, anchor='nw')
+        def configure_tool_canvas(event):
+            tool_canvas.configure(scrollregion=tool_canvas.bbox('all'))
+        tool_container.bind('<Configure>', configure_tool_canvas)
+    
+        btn_start = tk.Button(tool_container, text=_("开始队列"), command=self.start_queue,
+                              bg="#4CAF50", fg="white", width=12, relief=tk.RAISED)
+        btn_start.pack(side=tk.LEFT, padx=5)
+    
+        label_parallel = ttk.Label(tool_container, text=_("并行任务:"))
+        label_parallel.pack(side=tk.LEFT, padx=(10, 2))
+        ToolTip(label_parallel, _("同时运行的任务数量，建议不超过3以避免资源过度占用"))
+        self.max_parallel = tk.IntVar(value=1)
+        self.parallel_spin = ttk.Spinbox(tool_container, from_=1, to=5, width=3,
+                                         textvariable=self.max_parallel, state="readonly")
+        self.parallel_spin.pack(side=tk.LEFT, padx=2)
+    
+        label_hw = ttk.Label(tool_container, text=_("硬编并发限制:"))
+        label_hw.pack(side=tk.LEFT, padx=(10, 2))
+        ToolTip(label_hw, _("同时进行的硬件编码〔NVENC/QSV/AMF等〕任务的最大数量，推荐不超过2，显存里可能数据打架"))
+        self.max_hw_parallel = tk.IntVar(value=2)
+        self.max_hw_spin = ttk.Spinbox(tool_container, from_=1, to=4, width=3,
+                                       textvariable=self.max_hw_parallel, state="readonly")
+        self.max_hw_spin.pack(side=tk.LEFT, padx=2)
+    
+        for text, cmd in [(_("移除选中任务"), self.remove_selected_tasks),
+                          (_("清空全部任务"), self.clear_all_tasks),
+                          (_("清空已完成/失败任务"), self.clear_finished_tasks),
+                          (_("停止队列"), self.stop_queue),
+                          (_("导出为脚本"), self.export_script),
+                          (_("预览选中任务"), self.preview_selected_task)]:
+            ttk.Button(tool_container, text=text, command=cmd).pack(side=tk.LEFT, padx=5)
+    
+        # 任务列表 Treeview
+        list_container = ttk.Frame(tasks_frame)
+        list_container.pack(fill=tk.BOTH, expand=True, padx=(5,0), pady=(0, 0))
+    
+        Batch_style = ttk.Style()
+        Batch_style.configure("Batch.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0", rowheight=self.tree_rowheight, font=("Microsoft YaHei", 9))
+        Batch_style.configure("Batch.Treeview.Heading", background="#d9d9d9", font=("Microsoft YaHei", 9))
+
+        Batch_style.map("Batch.Treeview",
+                        background=[('selected', '#3475b5')],
+                        foreground=[('selected', 'white')],
+                        fieldbackground=[('selected', '#3475b5')])
+
+        columns = ("序号", "文件名", "输出路径", "命令 (简洁) 双击编辑 右键更新", "状态", "错误信息")
+        self.task_tree = ttk.Treeview(list_container, columns=columns, show="headings",
+                                       height=8, style="Batch.Treeview")
+        self.task_tree.heading("序号", text=_("序号"))
+        self.task_tree.heading("文件名", text=_("文件名"))
+        self.task_tree.heading("输出路径", text=_("输出路径"))
+        self.task_tree.heading("命令 (简洁) 双击编辑 右键更新", text=_("命令 (简洁) 双击编辑 右键更新"))
+        self.task_tree.heading("状态", text=_("状态"))
+        self.task_tree.heading("错误信息", text=_("错误信息"))
+        self.task_tree.column("序号", width=25, minwidth=20)
+        self.task_tree.column("文件名", width=75, minwidth=20)
+        self.task_tree.column("输出路径", width=100, minwidth=20)
+        self.task_tree.column("命令 (简洁) 双击编辑 右键更新", width=310, minwidth=20)
+        self.task_tree.column("状态", width=152, minwidth=20)
+        self.task_tree.column("错误信息", width=30, minwidth=20)
+        self.task_tree.tag_configure('odd', background='#e8e8e8')
+        self.task_tree.tag_configure('even', background='#ffffff')
+    
+        vbar = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=self.task_tree.yview)
+        self.task_tree.configure(yscrollcommand=vbar.set)
+        vbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.task_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    
+        self.task_tree.bind("<Double-1>", self.on_task_double_click)
+        self.task_tree.bind("<Button-3>", self._show_task_context_menu)
+
+        # 转码页滚动容器：内容构建完成后绑定滚轮并刷新
+        transcode_sf.bind_wheel()
+        transcode_sf.refresh()
+
+        # ---- 合并标签页 ----
+        merge_tab = ttk.Frame(self.notebook)
+        self.notebook.add(merge_tab, text=_("封装/合并/画中画"))
+        merge_sf = ScrolledFrame(merge_tab, autohide=True)
+        merge_sf.pack(fill=tk.BOTH, expand=True)
+        self.create_merge_tab(merge_sf.inner)
+        merge_sf.bind_wheel()
+        merge_sf.refresh()
+
+        # ---- 流提取标签页 ----
+        extract_tab = ttk.Frame(self.notebook)
+        self.notebook.add(extract_tab, text=_("流提取"))
+        extract_sf = ScrolledFrame(extract_tab, autohide=True)
+        extract_sf.pack(fill=tk.BOTH, expand=True)
+        self.create_extract_tab(extract_sf.inner)
+        extract_sf.bind_wheel()
+        extract_sf.refresh()
+
+        # ---- 信息与播放器标签页 ----
+        player_tab = ttk.Frame(self.notebook)
+        self.notebook.add(player_tab, text=_("信息与播放器"))
+        player_sf = ScrolledFrame(player_tab, autohide=True)
+        player_sf.pack(fill=tk.BOTH, expand=True)
+        self.create_player_settings_tab(player_sf.inner)
+        player_sf.bind_wheel()
+        player_sf.refresh()
+    
+        # ======== 右侧容器 ========
+        right_panel = ttk.Frame(self.main_paned)
+        self.main_paned.add(right_panel, weight=1)
+        self.right_panel = right_panel
+    
+
+        self._sash_set = False
+
+        def _sash_target(total):
+            """计算 sash 目标位置：右边占 30%（sash 在 70% 位置）。"""
+            return max(int(total * 0.7), 260)
+
+        def _delayed_set_sash():
+            if self._sash_set:
+                return
+            self.main_paned.update_idletasks()
+            total = self.main_paned.winfo_width()
+            if total <= 1:
+                # 窗口还没准备好，100ms 后再试
+                self.main_paned.after(100, _delayed_set_sash)
+                return
+            self.main_paned.sashpos(0, _sash_target(total))
+            self._sash_set = True
+        
+        # 双保险触发：idle 后立即执行，如果 missed 再用 after
+        # 注意：不再用 after(300) 二次设置，否则会出现“日志区向右缩”的可见滑动动画。
+        self.main_paned.after_idle(_delayed_set_sash)
+
+        # 窗口尺寸变化时把右侧日志区重新钉在 30%（sash 固定在 70% 位置）。
+        # 用户若手动拖过分隔条则尊重其选择，不再自动纠正。
+        self._user_sash_drag = False
+        self.main_paned.bind("<ButtonPress-1>", lambda e: setattr(self, "_user_sash_drag", True))
+        def _on_main_configure(e):
+            if self._user_sash_drag or not self._sash_set:
+                return
+            total = self.main_paned.winfo_width()
+            if total <= 1:
+                return
+            target = _sash_target(total)
+            cur = self.main_paned.sashpos(0)
+            if cur is not None and abs(cur - target) > 2:
+                self.main_paned.sashpos(0, target)
+        self.main_paned.bind("<Configure>", _on_main_configure)
+    
+    
+        # 关键信息日志区
+        info_frame = ttk.LabelFrame(right_panel, text=_("关键信息"), padding="1")
+        info_frame.pack(fill=tk.BOTH, expand=True, pady=(0,5))
+        info_top = ttk.Frame(info_frame)
+        info_top.pack(fill=tk.X, pady=(0,2))
+        ttk.Button(info_top, text=_("清空日志"), command=lambda: self.info_text.delete(1.0, tk.END)).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(info_top, text=_("保存日志"), command=lambda: self.save_log(self.info_text)).pack(side=tk.RIGHT, padx=2)
+        self.info_text = scrolledtext.ScrolledText(info_frame, bg='#EAF4FC', fg='black',
+                                                   selectbackground='#CCF09C', selectforeground='black',
+                                                   font=("Microsoft YaHei",9,"normal"), wrap=tk.WORD)
+        self.info_text.pack(fill=tk.BOTH, expand=True)
+    
+        # 转换进程信息日志区
+        detail_frame = ttk.LabelFrame(right_panel, text=_("转换进程信息"), padding="1")
+        detail_frame.pack(fill=tk.BOTH, expand=True)
+        detail_top = ttk.Frame(detail_frame)
+        detail_top.pack(fill=tk.X, pady=(0,2))
+        ttk.Button(detail_top, text=_("清空日志"), command=lambda: self.detail_text.delete(1.0, tk.END)).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(detail_top, text=_("保存日志"), command=lambda: self.save_log(self.detail_text)).pack(side=tk.RIGHT, padx=2)
+        self.detail_text = scrolledtext.ScrolledText(detail_frame, bg='#EAF4FC', fg='black',
+                                                     selectbackground='#CCF09C', selectforeground='black',
+                                                     font=("Microsoft YaHei",8,"normal"), wrap=tk.WORD)
+        self.detail_text.pack(fill=tk.BOTH, expand=True)
+    
+        # 绑定各种控件刷新命令预览
+        self.video_encoder.vcodec.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_encoder.rate_control_type.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_encoder.crf_value.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_encoder.cq_value.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_encoder.global_quality.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_encoder.bitrate_video.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_encoder.preset.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_filter.frame_rate_type.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_filter.frame_rate_custom.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_filter.scale_enabled.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_filter.scale_width.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_filter.scale_height.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_filter.scale_method.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_filter.crop_enabled.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_filter.crop_left.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_filter.crop_top.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_filter.crop_width.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_filter.crop_height.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_filter.rotate.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_filter.vflip.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_filter.hflip.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_filter.speed_enabled.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_filter.speed_factor.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_filter.deinterlace_filter.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_filter.pix_fmt_enabled.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_filter.pix_fmt.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_filter.subtitle_enabled.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_filter.subtitle_path.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_filter.reverse_enabled.trace_add("write", lambda *a: self.update_command_preview())
+        self.audio_frame.audio_enabled.trace_add("write", lambda *a: self.update_command_preview())
+        self.audio_frame.audio_codec.trace_add("write", lambda *a: self.update_command_preview())
+        self.audio_frame.audio_bitrate.trace_add("write", lambda *a: self.update_command_preview())
+        self.audio_frame.audio_samplerate.trace_add("write", lambda *a: self.update_command_preview())
+        self.audio_frame.volume_value.trace_add("write", lambda *a: self.update_command_preview())
+        self.audio_frame.volume_enabled.trace_add("write", lambda *a: self.update_command_preview())
+        self.audio_frame.audio_speed_enabled.trace_add("write", lambda *a: self.update_command_preview())
+        self.audio_frame.audio_speed_factor.trace_add("write", lambda *a: self.update_command_preview())
+        self.audio_frame.fade_enabled.trace_add("write", lambda *a: self.update_command_preview())
+        self.audio_frame.fade_in.trace_add("write", lambda *a: self.update_command_preview())
+        self.audio_frame.fade_out.trace_add("write", lambda *a: self.update_command_preview())
+        self.audio_frame.loudnorm_enabled.trace_add("write", lambda *a: self.update_command_preview())
+        self.audio_frame.denoise_enabled.trace_add("write", lambda *a: self.update_command_preview())
+        self.audio_frame.channel_mode.trace_add("write", lambda *a: self.update_command_preview())
+        self.audio_frame.eq_enabled.trace_add("write", lambda *a: self.update_command_preview())
+        self.audio_frame.eq_low.trace_add("write", lambda *a: self.update_command_preview())
+        self.audio_frame.eq_mid.trace_add("write", lambda *a: self.update_command_preview())
+        self.audio_frame.eq_high.trace_add("write", lambda *a: self.update_command_preview())
+        self.trim_frame.trim_enabled.trace_add("write", lambda *a: self.update_command_preview())
+        self.trim_frame.trim_start.trace_add("write", lambda *a: self.update_command_preview())
+        self.trim_frame.trim_end.trace_add("write", lambda *a: self.update_command_preview())
+        self.trim_frame.precise_trim.trace_add("write", lambda *a: self.update_command_preview())
+        self.adv_frame.hwaccel_enabled.trace_add("write", lambda *a: self.update_command_preview())
+        self.adv_frame.hwaccel_decoder.trace_add("write", lambda *a: self.update_command_preview())
+        self.adv_frame.custom_args.trace_add("write", lambda *a: self.update_command_preview())
+        self.audio_frame.only_audio.trace_add("write", lambda *a: self.update_command_preview())
+        self.audio_frame.audio_format.trace_add("write", lambda *a: self.update_command_preview())
+        self.output_dir.trace_add("write", lambda *a: self.update_command_preview())
+        self.output_suffix.trace_add("write", lambda *a: self.update_command_preview())
+        self.custom_output_name.trace_add("write", lambda *a: self.update_command_preview())
+        self.output_container.trace_add("write", lambda *a: self.update_command_preview())
+        self.audio_frame.only_audio.trace_add("write", lambda *a: self.toggle_only_audio_mode())
+        self.audio_frame.audio_reverse.trace_add("write", lambda *a: self.update_command_preview())
+
+        self.video_encoder.tune_var.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_encoder.profile_var.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_encoder.level_var.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_encoder.maxrate_var.trace_add("write", lambda *a: self.update_command_preview())
+        self.video_encoder.bufsize_var.trace_add("write", lambda *a: self.update_command_preview())
+
+        self.segment_enabled.trace_add("write", lambda *a: self.update_command_preview())
+    
+        self._update_preview_edit_state()
+        self._initialized = True
+
+
+class EditSegmentDialog(simpledialog.Dialog):
+    """用于编辑片段的起始时间、结束时间、翻转、变速和倒放"""
+    def __init__(self, parent, title, start, end, flip, speed="1.0", reverse=False):
+        self.start = start
+        self.end = end
+        self.flip = flip
+        self.speed = speed
+        self.reverse = reverse
+        super().__init__(parent, title=title)
+
+    def body(self, master):
+        ttk.Label(master, text=_("开始时间:")).grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.start_entry = ttk.Entry(master, width=15)
+        self.start_entry.grid(row=0, column=1, padx=5, pady=5)
+        self.start_entry.insert(0, self.start)
+
+        ttk.Label(master, text=_("结束时间:")).grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        self.end_entry = ttk.Entry(master, width=15)
+        self.end_entry.grid(row=1, column=1, padx=5, pady=5)
+        self.end_entry.insert(0, self.end)
+
+        ttk.Label(master, text=_("翻转:")).grid(row=2, column=0, padx=5, pady=5, sticky="w")
+        try:
+            _fi = FLIP_CMD_VALUES.index(self.flip)
+        except ValueError:
+            _fi = 0
+        self.flip_var = tk.StringVar(value=[_("无"), _("水平翻转"), _("垂直翻转"), _("水平+垂直")][_fi])
+        self.flip_combo = ttk.Combobox(master, textvariable=self.flip_var,
+                                       values=[_("无"), _("水平翻转"), _("垂直翻转"), _("水平+垂直")],
+                                       state="readonly", width=12)
+        self.flip_combo.grid(row=2, column=1, padx=5, pady=5)
+
+        ttk.Label(master, text=_("变速:")).grid(row=3, column=0, padx=5, pady=5, sticky="w")
+        self.speed_var = tk.StringVar(value=str(self.speed))
+        self.speed_entry = ttk.Entry(master, textvariable=self.speed_var, width=12)
+        self.speed_entry.grid(row=3, column=1, padx=5, pady=5)
+
+        self.reverse_var = tk.BooleanVar(value=self.reverse)
+        ttk.Checkbutton(master, text=_("倒放"), variable=self.reverse_var).grid(row=4, column=1, padx=5, pady=5, sticky="w")
+
+        return self.start_entry
+
+    def apply(self):
+        self.start = self.start_entry.get().strip()
+        self.end = self.end_entry.get().strip()
+        _fi = self.flip_combo.current()
+        self.flip = FLIP_CMD_VALUES[_fi] if 0 <= _fi < len(FLIP_CMD_VALUES) else "无"
+        self.speed = self.speed_var.get().strip()
+        self.reverse = self.reverse_var.get()
+
+class SegmentEditor:
+    """分段拼接设置窗口"""
+    def __init__(self, parent, segments, app):
+        self.parent = parent
+        self.app = app          # 主程序引用，用于获取时长等信息
+        self.segments = copy.deepcopy(segments)  # 深拷贝，独立修改
+        self.result = None      # 返回结果
+
+        # 音频独立截取（不分段）：起止时间 + 开关
+        self.audio_trim_enabled = False
+        self.audio_trim_start = "0"
+        self.audio_trim_end = ""
+
+        # 自定义输入文件路径（批量队列等场景注入任务文件，否则用主界面 input_file）
+        self._custom_input_file = None
+
+        self.window = tk.Toplevel(parent)
+        self.window.title(_("分段拼接设置"))
+        self.window.transient(parent)
+        self.window.grab_set()
+        self.window.geometry("900x600")
+        center_window(self.window, 900, 600)
+
+        self.create_widgets()
+        self.refresh_tree()
+        self.window.protocol("WM_DELETE_WINDOW", self.on_cancel)
+
+    # ---------- 界面创建 ----------
+    def create_widgets(self):
+        main = ttk.Frame(self.window, padding="10")
+        main.pack(fill=tk.BOTH, expand=True)
+
+        paned = ttk.PanedWindow(main, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True)
+
+        # ---- 左栏：片段列表 ----
+        left_frame = ttk.Frame(paned)
+        paned.add(left_frame, weight=3)
+
+        tool_frame = ttk.Frame(left_frame)
+        tool_frame.pack(fill=tk.X, pady=2)
+
+        ttk.Label(tool_frame, text=_("开始:")).pack(side=tk.LEFT)
+        self.start_entry = ttk.Entry(tool_frame, width=12)
+        self.start_entry.pack(side=tk.LEFT, padx=2)
+        self.start_entry.insert(0, "0")
+
+        ttk.Label(tool_frame, text=_("结束:")).pack(side=tk.LEFT, padx=(10,0))
+        self.end_entry = ttk.Entry(tool_frame, width=12)
+        self.end_entry.pack(side=tk.LEFT, padx=2)
+
+        flip_label = ttk.Label(tool_frame, text=_("翻转:"))
+        flip_label.pack(side=tk.LEFT, padx=(10,0))
+        ToolTip(flip_label, 
+                _("此翻转仅作用于当前选中的片段内部（水平/垂直翻转）\n"
+                "不影响主界面「视频滤镜」中的全局旋转/翻转设置。"),
+                wraplength=400)
+
+        _cur = getattr(self, "flip", "无")
+        try:
+            _fi = FLIP_CMD_VALUES.index(_cur)
+        except ValueError:
+            _fi = 0
+        self.flip_var = tk.StringVar(value=[_("无"), _("水平翻转"), _("垂直翻转"), _("水平+垂直")][_fi])
+        self.flip_combo = ttk.Combobox(tool_frame, textvariable=self.flip_var,
+                                       values=[_("无"), _("水平翻转"), _("垂直翻转"), _("水平+垂直")],
+                                       state="readonly", width=12)
+        self.flip_combo.pack(side=tk.LEFT, padx=2)
+
+        speed_label = ttk.Label(tool_frame, text=_("变速:"))
+        speed_label.pack(side=tk.LEFT, padx=(10,0))
+        ToolTip(speed_label,
+                _("此片段的播放速度倍率（1.0=原速，2.0=2倍速，0.5=半速）\n"
+                "不影响主界面「视频滤镜」中的全局变速。"),
+                wraplength=300)
+        self.speed_var = tk.StringVar(value="1.0")
+        self.speed_entry = ttk.Entry(tool_frame, textvariable=self.speed_var, width=6)
+        self.speed_entry.pack(side=tk.LEFT, padx=2)
+
+        self.reverse_var = tk.BooleanVar(value=False)
+        self.reverse_check = ttk.Checkbutton(tool_frame, text=_("倒放"), variable=self.reverse_var)
+        self.reverse_check.pack(side=tk.LEFT, padx=(2, 0))
+
+        ttk.Button(tool_frame, text=_("添加片段"), command=self.add_segment).pack(side=tk.LEFT, padx=5)
+
+        # 表格
+        tree_frame = ttk.Frame(left_frame)
+        tree_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        columns = ("序号", "开始", "结束", "时长", "翻转", "倒放", "变速")
+        self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=8)
+        for col in columns:
+            self.tree.heading(col, text=_(col))
+            self.tree.column(col, width=100, minwidth=60)
+        self.tree.column("序号", width=80)
+        self.tree.column("翻转", width=90)
+        self.tree.column("倒放", width=50)
+        self.tree.column("变速", width=60)
+
+        vbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vbar.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        op_frame = ttk.Frame(left_frame)
+        op_frame.pack(fill=tk.X, pady=2)
+        ttk.Button(op_frame, text=_("删除选中"), command=self.delete_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Button(op_frame, text=_("上移"), command=self.move_up).pack(side=tk.LEFT, padx=2)
+        ttk.Button(op_frame, text=_("下移"), command=self.move_down).pack(side=tk.LEFT, padx=2)
+        ttk.Button(op_frame, text=_("清空所有"), command=self.clear_all).pack(side=tk.LEFT, padx=2)
+
+        # ---- 右栏：外部命令输入 ----
+        right_frame = ttk.Frame(paned)
+        paned.add(right_frame, weight=1)
+
+        cmd_frame = ttk.LabelFrame(right_frame, text=_("输入外部命令或时间 - 提示"), padding="5")
+        cmd_frame.pack(fill=tk.BOTH, expand=True)
+
+        ToolTip(cmd_frame,
+                _("在此粘贴 FFmpeg 截取命令（每行一条），程序自动提取 -ss 和 -t/-to 时间参数。\n\n"
+                "支持的格式：\n"
+                "• 单 -ss + -to/-t：\n"
+                "    -ss 10.5 -to 20.3\n"
+                "    -ss 00:01:30 -t 5\n"
+                "• 双 -ss（组合跳转）：提取最后一个 -ss 与 -to/-t 组合\n"
+                "    -ss 5 -i input.mp4 -ss 10 -to 15\n\n"
+                "时间格式：秒数（如 10.5）或 HH:MM:SS.ms\n\n"
+                "不支持解析：\n"
+                "• -vf 或 -filter_complex 中的 trim 滤镜参数\n"
+                "• -ss 出现在 -i 之后且不带 -to/-t（无法确定结束时间）\n\n"
+                "提示：此为高级功能，普通用户可直接在左侧手动添加片段。\n"
+                "每行以 # 开头的行将被忽略。"),
+                wraplength=500
+        )
+
+        self.cmd_input = scrolledtext.ScrolledText(cmd_frame, height=15, wrap=tk.NONE,
+                                                   font=("Consolas", 9))
+        self.cmd_input.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        cmd_btn_frame = ttk.Frame(cmd_frame)
+        cmd_btn_frame.pack(fill=tk.X, pady=2)
+        ttk.Button(cmd_btn_frame, text=_("解析并导入所有片段"), command=self.import_from_commands).pack(side=tk.LEFT, padx=2)
+        ttk.Button(cmd_btn_frame, text=_("清空输入"), command=lambda: self.cmd_input.delete(1.0, tk.END)).pack(side=tk.LEFT, padx=2)
+
+        # ---- 音频独立截取（不分段） ----
+        audio_trim_frame = ttk.LabelFrame(main, text=_("音频独立截取（不分段）"), padding="8")
+        audio_trim_frame.pack(fill=tk.X, pady=5)
+
+        # 启用复选框 + 总时长参考
+        at_row0 = ttk.Frame(audio_trim_frame)
+        at_row0.pack(fill=tk.X, pady=(0, 3))
+        self.audio_trim_enabled_var = tk.BooleanVar(value=self.audio_trim_enabled)
+        at_chk = ttk.Checkbutton(at_row0, text=_("启用音频独立截取"), variable=self.audio_trim_enabled_var,
+                                  command=self._on_audio_trim_toggle)
+        at_chk.pack(side=tk.LEFT)
+        self.segment_total_label = ttk.Label(at_row0, text="", foreground="blue")
+        self.segment_total_label.pack(side=tk.LEFT, padx=(20, 0))
+        ToolTip(at_chk, _("仅对音频流单独截取（不分段），视频分段照旧。\n"
+                "适用场景：视频去中间、音乐只剪头尾来匹配拼接后的总长度。\n"
+                "提示：显示的分段视频总时长可作为音频截取的参考。"),
+                wraplength=400)
+
+        # 输入行：起始 / 结束
+        at_row1 = ttk.Frame(audio_trim_frame)
+        at_row1.pack(fill=tk.X, pady=(2, 0))
+        ttk.Label(at_row1, text=_("音频起始:")).pack(side=tk.LEFT)
+        self.audio_trim_start_var = tk.StringVar(value=self.audio_trim_start)
+        self.at_start_entry = ttk.Entry(at_row1, textvariable=self.audio_trim_start_var, width=12)
+        self.at_start_entry.pack(side=tk.LEFT, padx=3)
+        ToolTip(self.at_start_entry, _("音频开始时间，格式：秒数 (如 0) 或 HH:MM:SS.ms"))
+
+        ttk.Label(at_row1, text=_("音频结束:")).pack(side=tk.LEFT, padx=(15, 0))
+        self.audio_trim_end_var = tk.StringVar(value=self.audio_trim_end)
+        self.at_end_entry = ttk.Entry(at_row1, textvariable=self.audio_trim_end_var, width=12)
+        self.at_end_entry.pack(side=tk.LEFT, padx=3)
+        ToolTip(self.at_end_entry, _("音频结束时间，格式：秒数 或 HH:MM:SS.ms。留空=到文件末尾"))
+
+        # 初始禁用状态
+        self._on_audio_trim_toggle()
+
+        # ---- 底部按钮 ----
+        btn_frame = ttk.Frame(main)
+        btn_frame.pack(fill=tk.X, pady=10)
+        
+        label = tk.Label(btn_frame, text=_("分段切割:"), fg="blue", font=("", 10, "bold"))
+        label.pack(side=tk.LEFT, padx=(0, 5))
+        ToolTip(label,
+                _("额外功能：生成可执行的 FFmpeg 分段切割脚本，或直接发送到任务队列。\n"
+                "• 快速 (copy)：流复制截取，不重新编码，速度极快。\n"
+                "      流复制截取的片段不准确，适合作为预处理片段，或者无所谓精确的存档。\n"
+                "• 精确 (含滤镜)：应用主界面全部滤镜设置，需重新编码，帧级精准。\n"
+                "两种模式均可：\n"
+                "  - 导出脚本：保存为 .bat/.sh 文件，手动运行。\n"
+                "  - 发送到队列：自动添加到任务列表，一键执行。\n"
+                "发送到队列/导出脚本的精确模式会弹出选择框，让您决定使用 trim 滤镜还是双 -ss（组合跳转）加速。\n"
+                "双 -ss 适合长视频，能显著提升截取速度。\n"
+                "输出文件自动命名为：原文件名_seg序号.mp4。"),
+                wraplength=800
+        )
+
+
+        ttk.Label(btn_frame, text=_("发送到队列")).pack(side=tk.LEFT, padx=(10, 5))
+        ttk.Button(btn_frame, text=_("快速"), command=self.send_quick_to_queue, width=6).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text=_("精确"), command=self.send_precise_to_queue, width=6).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(btn_frame, text=_(" 导出为脚本")).pack(side=tk.LEFT, padx=(10, 5))
+        quick_btn = ttk.Button(btn_frame, text=_("快速"), command=self.export_quick_script, width=6)
+        quick_btn.pack(side=tk.LEFT, padx=5)
+        precise_btn = ttk.Button(btn_frame, text=_("精确"), command=self.export_precise_script, width=6)
+        precise_btn.pack(side=tk.LEFT, padx=5)
+
+
+
+        ttk.Button(btn_frame, text=_("取消"), command=self.on_cancel).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text=_("确定"), command=self.on_ok).pack(side=tk.RIGHT, padx=5)
+
+
+        self.window.after(100, lambda: self._set_initial_pane_size(paned))
+
+    def _set_initial_pane_size(self, paned):
+        total_width = self.window.winfo_width()
+        if total_width > 100:
+            paned.sashpos(0, int(total_width * 0.75))
+
+        # 绑定双击编辑
+        self.tree.bind("<Double-1>", self.on_tree_double_click)
+
+
+    def send_quick_to_queue(self):
+        input_file = self.app.input_file.get().strip()
+        if not input_file or not os.path.exists(input_file):
+            messagebox.showerror(_("错误"), _("请先在主界面选择输入文件"))
+            return
+        if not self.segments:
+            messagebox.showinfo(_("提示"), _("片段列表为空"))
+            return
+    
+        # 获取完整设置，并强制为 copy 模式
+        base_settings = self.app.get_current_settings()
+        base_settings.pop("watermark", None)          # 移除水印
+        base_settings["encoder"] = "copy"             # 强制流复制
+        # 禁用所有可能影响 copy 的滤镜
+        base_settings["scale_enabled"] = False
+        base_settings["crop_enabled"] = False
+        base_settings["rotate"] = "none"
+        base_settings["vflip"] = False
+        base_settings["hflip"] = False
+        base_settings["subtitle_enabled"] = False
+        base_settings["pix_fmt_enabled"] = False
+        base_settings["speed_enabled"] = False
+        base_settings["audio_speed_enabled"] = False
+        base_settings["reverse_enabled"] = False
+        base_settings["audio_codec"] = "copy"         # 音频也复制
+        base_settings["audio_enabled"] = True
+    
+        output_dir = self.app.output_dir.get().strip()
+        if not output_dir or not os.path.exists(output_dir):
+            output_dir = os.path.dirname(input_file)
+        basename = os.path.splitext(os.path.basename(input_file))[0]
+        container = base_settings.get("output_container", "mp4")
+        count = 0
+    
+        for i, seg in enumerate(self.segments, start=1):
+            settings = base_settings.copy()
+            settings["trim_enabled"] = True
+            settings["trim_start"] = seg["start"]
+            settings["trim_end"] = seg["end"]
+            settings["precise_trim"] = False
+            settings["output_dir"] = output_dir
+            settings["custom_output_name"] = f"{basename}_seg{i:03d}.{container}"
+            # 关键：禁用分段拼接模式
+            settings["segment_enabled"] = False
+            settings.pop("segments", None)
+    
+            if self.app.add_task(input_file, settings):
+                count += 1
+    
+        self.app.update_task_list()
+        self.app._append_info_ui(_("已添加 {0} 个快速分段任务到队列".format(count)))
+        messagebox.showinfo(_("成功"), _("已添加 {0} 个快速分段任务到队列".format(count)))
+    
+    def send_precise_to_queue(self):
+        input_file = self.app.input_file.get().strip()
+        if not input_file or not os.path.exists(input_file):
+            messagebox.showerror(_("错误"), _("请先在主界面选择输入文件"))
+            return
+        if not self.segments:
+            messagebox.showinfo(_("提示"), _("片段列表为空"))
+            return
+    
+        use_combo = messagebox.askyesno(
+            _("选择截取模式"),
+            _("精确模式支持两种截取方式：\n\n"
+            "• 是 (Yes)  → 双 -ss（组合跳转）\n"
+            "  先快速跳转到目标附近，再精确微调，适合长视频，解码速度快。\n\n"
+            "• 否 (No)  → trim 滤镜\n"
+            "  完全基于解码帧截取，精度更高，但解码较慢。\n\n"
+            "请选择是否使用双 -ss 加速？"),
+            icon='question'
+        )
+    
+        base_settings = self.app.get_current_settings()
+        base_settings.pop("watermark", None)   # 移除水印（保留其他滤镜）
+    
+        output_dir = self.app.output_dir.get().strip()
+        if not output_dir or not os.path.exists(output_dir):
+            output_dir = os.path.dirname(input_file)
+        basename = os.path.splitext(os.path.basename(input_file))[0]
+        container = base_settings.get("output_container", "mp4")
+        count = 0
+    
+        for i, seg in enumerate(self.segments, start=1):
+            settings = base_settings.copy()
+            settings["trim_enabled"] = True
+            settings["trim_start"] = seg["start"]
+            settings["trim_end"] = seg["end"]
+            if use_combo:
+                settings["combo_seek"] = True
+                settings["precise_trim"] = False
+                settings["combo_threshold"] = 30
+            else:
+                settings["combo_seek"] = False
+                settings["precise_trim"] = True
+            settings["output_dir"] = output_dir
+            settings["custom_output_name"] = f"{basename}_seg{i:03d}.{container}"
+            # 禁用拼接模式
+            settings["segment_enabled"] = False
+            settings.pop("segments", None)
+    
+            self.app._append_info_ui(_("[分段] 片段 {0} 模式: {1}, start={2}".format(i, '双-ss' if use_combo else 'trim', seg['start'])))
+    
+            if self.app.add_task(input_file, settings):
+                count += 1
+    
+        self.app.update_task_list()
+        mode_str = "双 -ss" if use_combo else "trim"
+        self.app._append_info_ui(_("已添加 {0} 个精确分段任务到队列（模式：{1}）".format(count, mode_str)))
+        messagebox.showinfo(_("成功"), _("已添加 {0} 个精确分段任务到队列（模式：{1}）".format(count, mode_str)))
+
+    def export_quick_script(self):
+        input_file = self.app.input_file.get().strip()
+        if not input_file or not os.path.exists(input_file):
+            messagebox.showerror(_("错误"), _("请先在主界面选择输入文件"))
+            return
+        if not self.segments:
+            messagebox.showinfo(_("提示"), _("片段列表为空"))
+            return
+    
+        # 选择保存路径
+        save_path = filedialog.asksaveasfilename(
+            title="保存快速切割脚本",
+            defaultextension=".bat" if sys.platform == "win32" else ".sh",
+            filetypes=[("批处理文件", "*.bat"), ("Shell脚本", "*.sh")]
+        )
+        if not save_path:
+            return
+    
+        output_dir = self.app.output_dir.get().strip()
+        if not output_dir or not os.path.exists(output_dir):
+            output_dir = os.path.dirname(input_file)
+        basename = os.path.splitext(os.path.basename(input_file))[0]
+        lines = []
+        # 添加文件头
+        if save_path.endswith(".sh"):
+            lines.append("#!/bin/bash")
+        else:
+            lines.append("@echo off")
+            lines.append("chcp 65001 >nul")
+        lines.append("")
+    
+        for i, seg in enumerate(self.segments, start=1):
+            start = seg["start"]
+            end = seg["end"]
+            out_name = f"{basename}_seg{i:03d}.mp4"
+            out_path = os.path.join(output_dir, out_name)
+            # 转义路径中的空格和特殊字符（Windows用双引号，Unix用单引号或转义）
+            # 这里使用双引号简单处理
+            cmd = f'ffmpeg -ss {start} -to {end} -i "{input_file}" -c copy "{out_path}"'
+            lines.append(cmd)
+    
+        with open(save_path, 'w', encoding='utf-8') as f:
+            f.write("\n".join(lines))
+    
+        messagebox.showinfo(_("成功"), _("脚本已保存到:\n{0}".format(save_path)))
+    
+    
+    def export_precise_script(self):
+        input_file = self.app.input_file.get().strip()
+        if not input_file or not os.path.exists(input_file):
+            messagebox.showerror(_("错误"), _("请先在主界面选择输入文件"))
+            return
+        if not self.segments:
+            messagebox.showinfo(_("提示"), _("片段列表为空"))
+            return
+    
+        choice = messagebox.askyesno(
+            _("选择截取模式"),
+            _("导出精确脚本支持两种截取方式：\n\n"
+            "• 是 (Yes)  → 双 -ss（组合跳转）\n"
+            "  先快速跳转到目标附近，再精确微调，适合长视频，解码速度快。\n\n"
+            "• 否 (No)  → trim 滤镜\n"
+            "  完全基于解码帧截取，精度更高，但解码较慢。\n\n"
+            "请选择是否使用双 -ss 加速？"),
+            icon='question'
+        )
+    
+        save_path = filedialog.asksaveasfilename(
+            title="保存精确切割脚本",
+            defaultextension=".bat" if sys.platform == "win32" else ".sh",
+            filetypes=[("批处理文件", "*.bat"), ("Shell脚本", "*.sh")]
+        )
+        if not save_path:
+            return
+    
+        base_settings = self.app.get_current_settings()
+        base_settings.pop("watermark", None)   # 移除水印
+        output_dir = self.app.output_dir.get().strip()
+        if not output_dir or not os.path.exists(output_dir):
+            output_dir = os.path.dirname(input_file)
+        basename = os.path.splitext(os.path.basename(input_file))[0]
+        lines = []
+        if save_path.endswith(".sh"):
+            lines.append("#!/bin/bash")
+        else:
+            lines.append("@echo off")
+            lines.append("chcp 65001 >nul")
+        lines.append("")
+    
+        for i, seg in enumerate(self.segments, start=1):
+            settings = base_settings.copy()
+            settings["trim_enabled"] = True
+            settings["trim_start"] = seg["start"]
+            settings["trim_end"] = seg["end"]
+            if choice:
+                settings["combo_seek"] = True
+                settings["precise_trim"] = False
+                settings["combo_threshold"] = 30
+            else:
+                settings["combo_seek"] = False
+                settings["precise_trim"] = True
+            # 禁用拼接
+            settings["segment_enabled"] = False
+            settings.pop("segments", None)
+    
+            out_name = f"{basename}_seg{i:03d}.mp4"
+            out_path = os.path.join(output_dir, out_name)
+    
+            try:
+                cmd_list = self.app.generate_ffmpeg_command(input_file, out_path, settings, preview=True)
+                cmd_str = format_cmd_for_display(cmd_list)
+            except Exception as e:
+                cmd_str = f"# 错误：{e}"
+            lines.append(cmd_str)
+    
+        with open(save_path, 'w', encoding='utf-8') as f:
+            f.write("\n".join(lines))
+    
+        mode_str = "双 -ss" if choice else "trim"
+        messagebox.showinfo(_("成功"), _("精确切割脚本已保存到:\n{0}\n模式：{1}".format(save_path, mode_str)))
+
+
+    # ---------- 片段管理核心方法（已优化浮点误差） ----------
+    def add_segment_with_time(self, start_sec, end_sec, flip="无", speed="1.0", reverse=False):
+        """直接使用浮点数添加片段（用于外部命令导入）"""
+        if start_sec is None or end_sec is None:
+            return False
+        if start_sec >= end_sec:
+            return False
+
+        # 检查是否超出总时长（容差 0.001 秒，自动修正）
+        dur = self._get_input_duration()
+        if dur is not None:
+            if abs(end_sec - dur) <= 0.001:
+                end_sec = dur
+            if end_sec > dur + 0.001:
+                if self.app:
+                    self.app._append_info_ui(_("[分段] 片段超出总时长，已跳过"))
+                return False
+
+        start_str = seconds_to_time(start_sec)
+        end_str = seconds_to_time(end_sec)
+        self.segments.append({"start": start_str, "end": end_str, "flip": flip, "speed": speed, "reverse": reverse})
+        self.refresh_tree()
+        return True
+
+    def add_segment(self):
+        """
+        从界面输入添加片段。
+        若结束时间为空，自动补全为视频总时长（直接使用浮点数，避免往返转换误差）。
+        """
+        start = self.start_entry.get().strip()
+        end = self.end_entry.get().strip()
+
+        if not start:
+            messagebox.showwarning(_("提示"), _("请填写开始时间"))
+            return
+
+        start_sec = time_to_seconds(start)
+        if start_sec is None:
+            messagebox.showerror(_("错误"), _("开始时间格式无效，请使用 HH:MM:SS.ms 或秒数"))
+            return
+
+        # 如果结束时间为空，自动补全为视频总时长
+        if not end:
+            dur = self._get_input_duration()
+            if dur is not None:
+                end_sec = dur                     # 直接使用浮点数
+                end = seconds_to_time(dur)        # 仅用于显示
+                if self.app:
+                    self.app._append_info_ui(_("[分段] 结束时间自动设为总时长: {0}".format(end)))
+            else:
+                if not self._get_input_path():
+                    messagebox.showerror(_("错误"), _("未指定输入文件，无法自动获取结束时间，请手动填写"))
+                else:
+                    messagebox.showerror(_("错误"), _("无法获取视频总时长，请手动填写结束时间"))
+                return
+        else:
+            end_sec = time_to_seconds(end)
+            if end_sec is None:
+                messagebox.showerror(_("错误"), _("结束时间格式无效"))
+                return
+
+        if start_sec >= end_sec:
+            messagebox.showerror(_("错误"), _("开始时间必须小于结束时间"))
+            return
+
+        # 仅对手动输入的结束时间进行超时检查（自动补全的已保证不超）
+        if end:  # 用户手动输入
+            dur = self._get_input_duration()
+            if dur is not None:
+                if abs(end_sec - dur) <= 0.001:
+                    end_sec = dur
+                    end = seconds_to_time(dur)
+                if end_sec > dur + 0.001:
+                    if self.app:
+                        self.app._append_info_ui(_("[分段] 片段超出总时长: {0}->{1}，已跳过".format(start, end)))
+                    return
+
+        _fi = self.flip_combo.current()
+        flip_value = FLIP_CMD_VALUES[_fi] if 0 <= _fi < len(FLIP_CMD_VALUES) else "无"
+        speed_value = self.speed_var.get().strip()
+        reverse_value = self.reverse_var.get()
+        self.segments.append({"start": start, "end": end, "flip": flip_value, "speed": speed_value, "reverse": reverse_value})
+        self.refresh_tree()
+
+    def delete_selected(self):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        idx = int(selected[0])
+        del self.segments[idx]
+        self.refresh_tree()
+
+    def move_up(self):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        idx = int(selected[0])
+        if idx == 0:
+            return
+        self.segments[idx], self.segments[idx-1] = self.segments[idx-1], self.segments[idx]
+        self.refresh_tree()
+        self.tree.selection_set(str(idx-1))
+
+    def move_down(self):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        idx = int(selected[0])
+        if idx == len(self.segments)-1:
+            return
+        self.segments[idx], self.segments[idx+1] = self.segments[idx+1], self.segments[idx]
+        self.refresh_tree()
+        self.tree.selection_set(str(idx+1))
+
+    def clear_all(self):
+        if self.segments and messagebox.askyesno(_("确认"), _("确定清空所有片段吗？")):
+            self.segments.clear()
+            self.refresh_tree()
+
+    def refresh_tree(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for i, seg in enumerate(self.segments):
+            start = seg["start"]
+            end = seg["end"]
+            dur = time_to_seconds(end) - time_to_seconds(start)
+            dur_str = seconds_to_time(dur) if dur is not None else "?"
+            reverse_str = "是" if seg.get("reverse", False) else "否"
+            speed_str = f"{seg.get('speed', '1.0')}x"
+            self.tree.insert("", tk.END, iid=str(i), values=(i+1, start, end, dur_str, seg.get("flip", _("无")), reverse_str, speed_str))
+
+        # 更新音频截取参考标签（分段视频总时长）
+        self._update_segment_total_label()
+
+    def _update_segment_total_label(self):
+        """计算分段视频总时长（含逐段变速），更新显示标签。"""
+        dur = 0.0
+        for seg in self.segments:
+            start = time_to_seconds(seg.get("start", ""))
+            end = time_to_seconds(seg.get("end", ""))
+            if start is not None and end is not None and end > start:
+                d = end - start
+                speed_str = seg.get("speed", "1.0").strip()
+                try:
+                    sf = float(speed_str)
+                    if sf > 0:
+                        d /= sf
+                except (ValueError, TypeError):
+                    pass
+                dur += d
+            else:
+                self.segment_total_label.config(text=_("分段视频总时长: ?"))
+                return
+        if dur > 0:
+            self.segment_total_label.config(
+                text="{} {:.1f}{} ({})".format(_("分段视频总时长:"), dur, _("秒"), seconds_to_time(dur)))
+        else:
+            self.segment_total_label.config(text=_("分段视频总时长: 0秒（请添加片段）"))
+
+    def _on_audio_trim_toggle(self):
+        """根据复选框状态启用/禁用起止时间输入框。"""
+        state = tk.NORMAL if self.audio_trim_enabled_var.get() else tk.DISABLED
+        self.at_start_entry.config(state=state)
+        self.at_end_entry.config(state=state)
+
+    def _get_input_path(self):
+        """返回应使用的输入文件路径（批量队列注入 > 主界面）。"""
+        path = self._custom_input_file
+        if path and os.path.exists(path):
+            return path
+        if self.app and hasattr(self.app, "input_file"):
+            return self.app.input_file.get().strip() or ""
+        return ""
+
+    def _get_input_duration(self):
+        """获取输入文件总时长（秒），失败返回 None。"""
+        path = self._get_input_path()
+        if not path:
+            return None
+        if self.app:
+            return self.app._get_media_duration(path)
+        return None
+
+    # ---------- 双击编辑 ----------
+    def on_tree_double_click(self, event):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        idx = int(selected[0])
+        seg = self.segments[idx]
+
+        dialog = EditSegmentDialog(self.window, "编辑片段",
+                                   start=seg["start"], end=seg["end"], flip=seg["flip"],
+                                   speed=seg.get("speed", "1.0"), reverse=seg.get("reverse", False))
+        if dialog.start is not None and dialog.end is not None:
+            start_sec = time_to_seconds(dialog.start)
+            end_sec = time_to_seconds(dialog.end)
+            if start_sec is None or end_sec is None:
+                messagebox.showerror(_("错误"), _("时间格式无效"))
+                return
+            if start_sec >= end_sec:
+                messagebox.showerror(_("错误"), _("开始时间必须小于结束时间"))
+                return
+
+            start_display = seconds_to_time(start_sec)
+            end_display = seconds_to_time(end_sec)
+
+            # 检查并修正接近总时长的时间
+            dur = self._get_input_duration()
+            if dur is not None:
+                if abs(end_sec - dur) <= 0.001:
+                    end_sec = dur
+                    end_display = seconds_to_time(end_sec)
+                if end_sec > dur + 0.001:
+                    if self.app:
+                        self.app._append_info_ui(_("[分段] 片段超出总时长: {0}->{1}，已跳过".format(start_display, end_display)))
+                    return
+
+            # 存储用户输入的原始字符串（以便显示时与输入一致）
+            seg["start"] = dialog.start
+            seg["end"] = dialog.end
+            seg["flip"] = dialog.flip
+            seg["speed"] = dialog.speed
+            seg["reverse"] = dialog.reverse
+            self.refresh_tree()
+
+    # ---------- 外部命令导入 ----------
+    def import_from_commands(self):
+        text = self.cmd_input.get(1.0, tk.END).strip()
+        if not text:
+            messagebox.showinfo(_("提示"), _("请先在右侧粘贴 FFmpeg 命令"))
+            return
+    
+        lines = text.splitlines()
+        parsed_count = 0
+        skipped_count = 0
+        errors = []
+    
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+    
+            # 匹配 -ss 时间（支持 10.5 或 00:00:10.500 或 00:10.500）
+            ss_match = re.search(r'-ss\s+([\d:.]+)', line, re.IGNORECASE)
+            if not ss_match:
+                skipped_count += 1
+                errors.append(f"未找到 -ss: {line[:80]}...")
+                continue
+    
+            start_str = ss_match.group(1)
+            start_sec = time_to_seconds(start_str)
+            if start_sec is None:
+                skipped_count += 1
+                errors.append(f"无效的开始时间: {start_str}，跳过")
+                continue
+    
+            # 匹配 -t 或 -to
+            t_match = re.search(r'-t\s+([\d:.]+)', line, re.IGNORECASE)
+            to_match = re.search(r'-to\s+([\d:.]+)', line, re.IGNORECASE)
+    
+            if t_match:
+                duration_str = t_match.group(1)
+                duration_sec = time_to_seconds(duration_str)
+                if duration_sec is None:
+                    skipped_count += 1
+                    errors.append(f"无效的持续时间: {duration_str}，跳过")
+                    continue
+                end_sec = start_sec + duration_sec
+            elif to_match:
+                end_str = to_match.group(1)
+                end_sec = time_to_seconds(end_str)
+                if end_sec is None:
+                    skipped_count += 1
+                    errors.append(f"无效的结束时间: {end_str}，跳过")
+                    continue
+            else:
+                skipped_count += 1
+                errors.append(f"未找到 -t 或 -to: {line[:80]}...")
+                continue
+    
+            if end_sec <= start_sec:
+                skipped_count += 1
+                errors.append(f"结束时间必须大于开始时间: {start_str}->{end_str}，跳过")
+                continue
+    
+            # 检查是否重复
+            start_display = seconds_to_time(start_sec)
+            end_display = seconds_to_time(end_sec)
+            if any(seg["start"] == start_display and seg["end"] == end_display for seg in self.segments):
+                skipped_count += 1
+                errors.append(f"重复片段: {start_display}->{end_display}，已跳过")
+                continue
+    
+            # 尝试添加片段（可能会检查总时长等）
+            if self.add_segment_with_time(start_sec, end_sec, flip="无", speed="1.0", reverse=False):
+                parsed_count += 1
+            else:
+                skipped_count += 1
+                errors.append(f"添加失败（可能超出总时长）: {start_display}->{end_display}")
+    
+        msg = f"成功导入 {parsed_count} 个片段"
+        if skipped_count > 0:
+            msg += f"，{skipped_count} 行被跳过"
+            if errors:
+                # 只显示前10条错误
+                error_preview = "\n".join(errors[:10])
+                if len(errors) > 10:
+                    error_preview += f"\n... 还有 {len(errors)-10} 条错误"
+                messagebox.showwarning(_("导入警告"), msg + "\n\n错误详情：\n" + error_preview)
+            else:
+                messagebox.showinfo(_("导入完成"), msg)
+        else:
+            messagebox.showinfo(_("导入完成"), msg)
+
+    # ---------- 确定/取消 ----------
+    def on_ok(self):
+        self.result = self.segments
+        # 保存音频独立截取设置
+        self.audio_trim_enabled = self.audio_trim_enabled_var.get()
+        self.audio_trim_start = self.audio_trim_start_var.get().strip()
+        self.audio_trim_end = self.audio_trim_end_var.get().strip()
+        self.window.destroy()
+
+    def on_cancel(self):
+        self.result = None
+        self.window.destroy()
+
+# ================== 主入口 ==================
+if __name__ == "__main__":
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except (AttributeError, Exception):
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+    if DND_AVAILABLE:
+        root = TkinterDnD.Tk()
+    else:
+        root = tk.Tk()
+    app = FFmpegBatchGUI(root)
+
+    def _on_app_close():
+        # 关闭前先终止仍在运行的 ffmpeg 子进程，避免变成孤儿进程继续占用输出文件
+        procs = list(getattr(app, 'running_procs', []))
+        if procs:
+            try:
+                app._kill_remaining(procs)
+            except Exception:
+                pass
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+    root.protocol("WM_DELETE_WINDOW", _on_app_close)
+    root.mainloop()
