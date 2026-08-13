@@ -318,6 +318,21 @@ class TrackFrame(ttk.LabelFrame):
         self.segment_modes = []
         self.segment_durations = []
 
+        # 特效（旋转 / delogo / 遮罩）—— 与主程序新近加的子视频能力保持对齐
+        self.spin_enabled_var = tk.BooleanVar(value=False)
+        self.spin_speed_var = tk.StringVar(value="60")
+        self.delogo_enabled_var = tk.BooleanVar(value=False)
+        self.delogo_x = tk.StringVar(value="0")
+        self.delogo_y = tk.StringVar(value="0")
+        self.delogo_w = tk.StringVar(value="100")
+        self.delogo_h = tk.StringVar(value="100")
+        self.mask_enabled_var = tk.BooleanVar(value=False)
+        self.mask_x = tk.StringVar(value="0")
+        self.mask_y = tk.StringVar(value="0")
+        self.mask_w = tk.StringVar(value="100")
+        self.mask_h = tk.StringVar(value="100")
+        self.mask_mode = tk.StringVar(value="outside")  # outside=只露矩形(矩形外透明); inside=矩形透明(矩形外正常)
+
         # ---- 轨迹按钮 ----
         btn_frame = ttk.Frame(self)
         btn_frame.pack(padx=5, pady=5, anchor="w")
@@ -361,6 +376,31 @@ class TrackFrame(ttk.LabelFrame):
         self.scale_h_entry = ttk.Entry(scale_frame, width=6, state="disabled")
         self.scale_h_entry.pack(side="left", padx=2)
         self.scale_h_entry.bind("<FocusOut>", self.on_scale_entry_change)
+
+        # ---- 特效（旋转 / delogo / 遮罩） ----
+        fx_frame = ttk.Frame(self)
+        fx_frame.pack(fill="x", padx=5, pady=2, anchor="w")
+        ttk.Checkbutton(fx_frame, text="旋转", variable=self.spin_enabled_var,
+                        command=self.toggle_fx).pack(side="left")
+        ttk.Label(fx_frame, text="转速:").pack(side="left", padx=(4, 2))
+        self.spin_speed_entry = ttk.Entry(fx_frame, width=5, textvariable=self.spin_speed_var,
+                                         state="disabled")
+        self.spin_speed_entry.pack(side="left")
+        ttk.Label(fx_frame, text="°/秒").pack(side="left")
+        self.delogo_chk = ttk.Checkbutton(fx_frame, text="delogo", variable=self.delogo_enabled_var,
+                                          command=self.toggle_fx)
+        self.delogo_chk.pack(side="left", padx=(10, 2))
+        self.delogo_btn = ttk.Button(fx_frame, text="区域…", command=lambda: self.open_rect_dialog("delogo"),
+                                     state="disabled", width=6)
+        self.delogo_btn.pack(side="left", padx=2)
+        self.mask_chk = ttk.Checkbutton(fx_frame, text="遮罩", variable=self.mask_enabled_var,
+                                        command=self.toggle_fx)
+        self.mask_chk.pack(side="left", padx=(10, 2))
+        self.mask_btn = ttk.Button(fx_frame, text="区域…", command=lambda: self.open_rect_dialog("mask"),
+                                   state="disabled", width=6)
+        self.mask_btn.pack(side="left", padx=2)
+        self.fx_summary = ttk.Label(fx_frame, text="", foreground="#666666")
+        self.fx_summary.pack(side="left", padx=(8, 0))
 
         # ---- 时间控制第一行 ----
         time_frame = ttk.Frame(self)
@@ -628,6 +668,155 @@ class TrackFrame(ttk.LabelFrame):
         self.filter_display.delete(0, tk.END)
         self.filter_display.insert(0, display_str)
         self.filter_display.config(state="readonly")
+
+    # ---------- 特效：旋转 / delogo / 遮罩 ----------
+    def toggle_fx(self):
+        """根据勾选启用/禁用对应的控件和入口按钮，并刷新摘要。"""
+        self.spin_speed_entry.config(state="normal" if self.spin_enabled_var.get() else "disabled")
+        self.delogo_btn.config(state="normal" if self.delogo_enabled_var.get() else "disabled")
+        self.mask_btn.config(state="normal" if self.mask_enabled_var.get() else "disabled")
+        self.update_fx_summary()
+
+    def update_fx_summary(self):
+        parts = []
+        if self.spin_enabled_var.get():
+            try:
+                sp = float(self.spin_speed_var.get())
+                parts.append(f"旋转 {sp:g}°/秒")
+            except (ValueError, TypeError):
+                parts.append("旋转 (转速无效)")
+        if self.delogo_enabled_var.get():
+            parts.append(f"delogo {self.delogo_x.get()},{self.delogo_y.get()} "
+                         f"{self.delogo_w.get()}×{self.delogo_h.get()}")
+        if self.mask_enabled_var.get():
+            mode = self.mask_mode.get()
+            parts.append(f"遮罩[{mode}] {self.mask_x.get()},{self.mask_y.get()} "
+                         f"{self.mask_w.get()}×{self.mask_h.get()}")
+        self.fx_summary.config(text=" · ".join(parts))
+
+    def open_rect_dialog(self, kind):
+        RectSettingsDialog(self.winfo_toplevel(), self, kind)
+
+    def set_spin(self, enabled, speed):
+        self.spin_enabled_var.set(bool(enabled))
+        self.spin_speed_var.set(f"{speed:g}" if isinstance(speed, (int, float)) else str(speed))
+        self.toggle_fx()
+
+    def set_delogo(self, enabled, x=None, y=None, w=None, h=None):
+        self.delogo_enabled_var.set(bool(enabled))
+        if x is not None: self.delogo_x.set(str(x))
+        if y is not None: self.delogo_y.set(str(y))
+        if w is not None: self.delogo_w.set(str(w))
+        if h is not None: self.delogo_h.set(str(h))
+        self.toggle_fx()
+
+    def set_mask(self, enabled, x=None, y=None, w=None, h=None, mode=None):
+        self.mask_enabled_var.set(bool(enabled))
+        if x is not None: self.mask_x.set(str(x))
+        if y is not None: self.mask_y.set(str(y))
+        if w is not None: self.mask_w.set(str(w))
+        if h is not None: self.mask_h.set(str(h))
+        if mode is not None: self.mask_mode.set(mode)
+        self.toggle_fx()
+
+# ================== 矩形/遮罩设置对话框（delogo & mask 共用） ==================
+class RectSettingsDialog(tk.Toplevel):
+    """delogo / 遮罩 区域设置对话框。delogo 不需要 mode 字段；mask 才有 mode。"""
+    def __init__(self, parent, track, kind):
+        # kind: "delogo" 或 "mask"
+        super().__init__(parent)
+        self.track = track
+        self.kind = kind
+        self.transient(parent)
+        self.resizable(False, False)
+        self.title("delogo 区域设置" if kind == "delogo" else "遮罩设置")
+
+        # 复制当前值（保存时才写回 track）
+        if kind == "delogo":
+            self.x = tk.StringVar(value=track.delogo_x.get())
+            self.y = tk.StringVar(value=track.delogo_y.get())
+            self.w = tk.StringVar(value=track.delogo_w.get())
+            self.h = tk.StringVar(value=track.delogo_h.get())
+        else:
+            self.x = tk.StringVar(value=track.mask_x.get())
+            self.y = tk.StringVar(value=track.mask_y.get())
+            self.w = tk.StringVar(value=track.mask_w.get())
+            self.h = tk.StringVar(value=track.mask_h.get())
+            self.mode = tk.StringVar(value=track.mask_mode.get())
+
+        main_frame = ttk.Frame(self, padding=10)
+        main_frame.pack(fill="both", expand=True)
+
+        ttk.Label(main_frame,
+                  text=("delogo 在缩放/裁剪前的原始帧上生效；坐标按子视频原始宽高。" if kind == "delogo"
+                        else "遮罩在缩放/裁剪前的原始帧上生效；坐标按子视频原始宽高。"),
+                  foreground="#666666").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+
+        ttk.Label(main_frame, text="x:").grid(row=1, column=0, sticky="w", padx=(0, 2), pady=2)
+        ttk.Entry(main_frame, textvariable=self.x, width=8).grid(row=1, column=1, sticky="w", pady=2)
+        ttk.Label(main_frame, text="y:").grid(row=1, column=2, sticky="w", padx=(8, 2), pady=2)
+        ttk.Entry(main_frame, textvariable=self.y, width=8).grid(row=1, column=3, sticky="w", pady=2)
+
+        ttk.Label(main_frame, text="w:").grid(row=2, column=0, sticky="w", padx=(0, 2), pady=2)
+        ttk.Entry(main_frame, textvariable=self.w, width=8).grid(row=2, column=1, sticky="w", pady=2)
+        ttk.Label(main_frame, text="h:").grid(row=2, column=2, sticky="w", padx=(8, 2), pady=2)
+        ttk.Entry(main_frame, textvariable=self.h, width=8).grid(row=2, column=3, sticky="w", pady=2)
+
+        cur_row = 3
+        if kind == "mask":
+            ttk.Label(main_frame, text="模式:").grid(row=cur_row, column=0, sticky="w", padx=(0, 2), pady=(4, 2))
+            ttk.Combobox(main_frame, textvariable=self.mode,
+                         values=["outside", "inside"], state="readonly", width=10).grid(
+                row=cur_row, column=1, columnspan=3, sticky="w", pady=(4, 2))
+            ttk.Label(main_frame,
+                      text="outside=只露矩形（矩形外透明）  inside=矩形透明（矩形外正常）",
+                      foreground="#666666").grid(row=cur_row+1, column=0, columnspan=4, sticky="w", pady=(2, 6))
+            cur_row += 2
+
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.grid(row=cur_row, column=0, columnspan=4, pady=(6, 0))
+        ttk.Button(btn_frame, text="保存", command=self.save_and_close).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="取消", command=self.destroy).pack(side="left", padx=5)
+
+        self.grab_set()
+
+    def save_and_close(self):
+        if self.kind == "delogo":
+            self.track.delogo_x.set(self.x.get().strip() or "0")
+            self.track.delogo_y.set(self.y.get().strip() or "0")
+            self.track.delogo_w.set(self.w.get().strip() or "100")
+            self.track.delogo_h.set(self.h.get().strip() or "100")
+        else:
+            self.track.mask_x.set(self.x.get().strip() or "0")
+            self.track.mask_y.set(self.y.get().strip() or "0")
+            self.track.mask_w.set(self.w.get().strip() or "100")
+            self.track.mask_h.set(self.h.get().strip() or "100")
+            self.track.mask_mode.set(self.mode.get())
+        self.track.update_fx_summary()
+        self.destroy()
+
+
+# ================== 滤镜串切分（引号感知） ==================
+def split_filters_aware(text):
+    """按顶层逗号切分滤镜串，忽略单引号内的逗号。
+
+    旋转等滤镜表达式带引号逗号（如 rotate=angle='60*PI/180*t':ow='hypot(iw,ih)'），
+    直接 str.split(',') 会把它们拆成碎片混进 filter_parts；这里只在引号外切。
+    """
+    parts = []
+    cur = []
+    in_quote = False
+    for ch in text:
+        if ch == "'":
+            in_quote = not in_quote
+        if ch == ',' and not in_quote:
+            parts.append(''.join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append(''.join(cur))
+    return [p.strip() for p in parts if p.strip()]
+
 
 # ================== 主程序 ==================
 class MultiTrackWatermarkGUI:
@@ -901,6 +1090,77 @@ class MultiTrackWatermarkGUI:
         except Exception as e:
             messagebox.showerror("获取失败", f"发生异常：{str(e)}")
 
+    def _extract_sub_chain(self, filter_complex, idx):
+        """从 filter_complex 中提取第 idx 个子视频的整条子链（含 ';' 子图）。
+
+        返回语句列表。子链结束于「overlay 两输入语句」或下一个 [N:v] 主流语句。
+        之前的正则 [N:v]([^[]+) 在首个 [ 处截断，会丢掉 split=2 之后的
+        遮罩子图甚至整个子链；这里按 ';' 拆语句后从 [idx:v] 起收集，直到遇到
+        overlay 语句（或下个子流语句），能完整保留含 ';' 的多语句链。
+        """
+        if not filter_complex:
+            return []
+        stmts = [s.strip() for s in filter_complex.split(';') if s.strip()]
+        start_token = f"[{idx}:v]"
+        out = []
+        started = False
+        two_input_re = re.compile(r'^\[[^\]]+\]\[[^\]]+\][a-zA-Z]')
+        for s in stmts:
+            if not started:
+                if s.startswith(start_token):
+                    started = True
+                    out.append(s)
+                continue
+            # 两输入语句：overlay/混合/amix 等。alphamerge 是遮罩子图的正常环节，留住。
+            if two_input_re.match(s) and 'overlay' in s:
+                break
+            if two_input_re.match(s) and 'alphamerge' in s:
+                out.append(s)
+                continue
+            if two_input_re.match(s):
+                # 其它两输入滤镜（mix、xfade 等）属于主链而非子视频，保守停
+                break
+            out.append(s)
+        return out
+
+    def _apply_scale_dims(self, w, h, scale_str):
+        """把缩放滤镜 `scale=W:H` 应用到 (w,h) 上，返回新尺寸。
+        仅支持常见写法：纯数字、一侧 -1 / -2（保持比例）；其余表达式无法求值则返回原值。
+        """
+        if not scale_str or w is None or h is None:
+            return w, h
+        m = re.match(r'^scale=([^:]+):([^:,]+)', scale_str.strip())
+        if not m:
+            return w, h
+        sw, sh = m.group(1).strip(), m.group(2).strip()
+
+        def num(s):
+            try:
+                return float(s)
+            except (ValueError, TypeError):
+                return None
+
+        nw, nh = num(sw), num(sh)
+        if nw is not None and nh is not None and nw > 0 and nh > 0:
+            return int(round(nw)), int(round(nh))
+        # 单边等比（-1 / -2：-2 取偶数）
+        try:
+            if nw is not None and nw > 0 and (nh is None or nh <= 0):
+                nh2 = h * nw / w if w else nw
+                nh2 = int(round(nh2))
+                if str(sh).strip() == '-2' and nh2 % 2:
+                    nh2 += 1
+                return int(nw), nh2
+            if nh is not None and nh > 0 and (nw is None or nw <= 0):
+                nw2 = w * nh / h if h else nh
+                nw2 = int(round(nw2))
+                if str(sw).strip() == '-2' and nw2 % 2:
+                    nw2 += 1
+                return nw2, int(nh)
+        except Exception:
+            pass
+        return w, h
+
     def parse_and_generate_tracks(self):
         for t in self.tracks:
             t.destroy()
@@ -948,17 +1208,14 @@ class MultiTrackWatermarkGUI:
             self.video_resolution = (w, h)
 
         raw_filters_map = {}
+        # 旧版用「首个 [ 处截断」的正则匹配整条子链；遇到 mask 之类的 ';' 子图
+        # 会被截掉，旋转/delogo 也丢到 filter_parts 后被跳过。现改用 _extract_sub_chain
+        # 拆 ';' 语句，能完整保留含子图的多语句链，再做特效识别。
         if filter_complex:
             pattern = r'\[(\d+):v\]([^\[]+?)(?=\s*\[|$)'
             matches = re.findall(pattern, filter_complex)
             for idx, filters in matches:
                 raw_filters_map[int(idx)] = filters.strip(',')
-
-        alpha_pattern = re.compile(r'\[v_sub_(\d+)\]colorchannelmixer=aa=([0-9.]+)')
-        alpha_map = {}
-        if filter_complex:
-            for m in alpha_pattern.finditer(filter_complex):
-                alpha_map[int(m.group(1))] = float(m.group(2))
 
         static_coords = []
         if filter_complex:
@@ -985,28 +1242,83 @@ class MultiTrackWatermarkGUI:
             track = TrackFrame(self.scrollable_frame, idx, file_name, self)
             track.pack(fill="x", padx=5, pady=5)
 
-            raw_filters = raw_filters_map.get(idx, "")
+            # 用 chain 提取拿到整条子链（包含 ';' 子图），从中识别 spin/delogo/mask/alpha/scale
+            chain_stmts = self._extract_sub_chain(filter_complex or "", idx)
+            chain_str = ";".join(chain_stmts)
+
+            # spin 持续旋转：匹配 `rotate=angle='N*PI/180*t'`
+            spin_m = re.search(r"rotate=angle='([0-9.\-]+)\*PI/180\*t'", chain_str)
+            if spin_m:
+                try:
+                    track.set_spin(True, float(spin_m.group(1)))
+                except ValueError:
+                    track.set_spin(True, spin_m.group(1))
+
+            # delogo：匹配 `delogo=x=..:y=..:w=..:h=..`
+            delogo_m = re.search(r"delogo=x=([^:]+):y=([^:]+):w=([^:]+):h=([^:]+)", chain_str)
+            if delogo_m:
+                track.set_delogo(True, delogo_m.group(1), delogo_m.group(2),
+                                  delogo_m.group(3), delogo_m.group(4))
+
+            # 遮罩：匹配 `format=gray,drawbox=0:0:iw:ih:color=WHITE_OR_BLACK:t=fill,
+            #  drawbox=x=X:y=Y:w=W:h=H:color=WHITE_OR_BLACK:t=fill`
+            # 第二个 drawbox 的 color 决定 mode（black=inside 矩形透明 / white=outside 只露矩形）
+            mask_m = re.search(
+                r"format=gray,drawbox=x=0:y=0:w=iw:h=ih:color=(\w+):t=fill,"
+                r"drawbox=x=([^:]+):y=([^:]+):w=([^:]+):h=([^:]+):color=(\w+):t=fill",
+                chain_str
+            )
+            if mask_m:
+                rect_color = mask_m.group(6)
+                mode = "inside" if rect_color == "black" else "outside"
+                track.set_mask(True, mask_m.group(2), mask_m.group(3),
+                                mask_m.group(4), mask_m.group(5), mode)
+
+            # alpha：在整条子链里搜 `colorchannelmixer=aa=N`
+            alpha_m = re.search(r"colorchannelmixer=aa=([0-9.]+)", chain_str)
+            if alpha_m:
+                try:
+                    track.set_alpha(float(alpha_m.group(1)))
+                except ValueError:
+                    pass
+
+            # scale 和其它 filter_parts：跨语句摊平扫描。
+            # 注意：scale 不一定在第一条 statement —— 主程序带遮罩时形如
+            #   [1:v]split=2[mks1a][mks1m];[mks1m]format=gray,drawbox=...[mks1msk];
+            #   [mks1a][mks1msk]alphamerge,scale=360:642,format=rgba[v_temp_0];...
+            # scale 落在 alphamerge 同句里，只扫第一条会丢 → 这里遍历整条链的每条
+            # statement，剥掉输入标签前缀（单/双输入）和尾部输出标签后按 ',' 拆，
+            # 跳过已识别的特效，把剩余部分按顺序摊平为 filter_parts。
             filter_parts = []
             scale_w = scale_h = None
-
-            if raw_filters:
-                parts = [p.strip() for p in raw_filters.split(',') if p.strip()]
-                for part in parts:
+            for stmt in (chain_stmts or [raw_filters_map.get(idx, "")]):
+                body = stmt
+                # 剥输入标签前缀：[x] 单输入 或 [x][y] 双输入（alphamerge 子图）
+                body = re.sub(r'^(\[[^\]]+\])(\[[^\]]+\])?', '', body)
+                # 剥尾部输出标签
+                body = re.sub(r'(\[[^\]]+\])+$', '', body)
+                for part in split_filters_aware(body):
                     if part.startswith('format=') or part.startswith('colorchannelmixer='):
+                        continue
+                    if part == 'null' or part.startswith('split=') or part.startswith('alphamerge'):
+                        continue  # 占位/遮罩子图已识别
+                    if part.startswith('drawbox='):
+                        continue
+                    if part.startswith('rotate=') and '*PI/180*t' in part:
+                        continue  # 持续旋转已识别
+                    if part.startswith('delogo='):
                         continue
                     if part.startswith('scale='):
                         m = re.match(r'^scale=([^:]+):([^:,]+)', part)
                         if m:
                             scale_w, scale_h = m.group(1), m.group(2)
+                        continue
                     filter_parts.append(part)
 
             track.set_filter_parts(filter_parts)
 
             if scale_w is not None and scale_h is not None:
                 track.set_scale(scale_w, scale_h)
-
-            if (idx-1) in alpha_map:
-                track.set_alpha(alpha_map[idx-1])
 
             if idx-1 < len(static_coords):
                 x, y = static_coords[idx-1]
@@ -1199,11 +1511,21 @@ class MultiTrackWatermarkGUI:
         return expr
 
     # ---------- sendcmd 数值求值（忠实复现 build_axis_expr 输出） ----------
-    def _eval_axis_expr(self, expr, t):
+    def _eval_axis_expr(self, expr, t, W=1.0, H=1.0, w=1.0, h=1.0):
         # build_axis_expr 只用 clip/mod/if/lt + 四则运算，这里用同一套语义求值，
         # 不重新实现轨迹数学，避免与表达式逻辑漂移。
+        #
+        # 关键修正：表达式里经常含 w / h（如网格点位 `10+(W-w-20)*c/(cols-1)`），
+        # 它们是「子视频渲染后」的宽/高——非送进 eval 之前的 w/h 无法确定，因此
+        # 调用方必须把主视频真实宽高 W/H 与子视频真实宽高 w/h 传进来；缺失时
+        # 这些变量在 ffmpeg overlay 上下文里可用，sendcmd 求值也必须可用，否则
+        # 整条轨迹塌到 (0,0) → 水印永远在左上角不动。
         env = {
-            'W': 1.0, 'H': 1.0, 't': float(t),
+            'W': float(W) if W else 1.0,
+            'H': float(H) if H else 1.0,
+            'w': float(w) if w else 0.0,
+            'h': float(h) if h else 0.0,
+            't': float(t),
             'clip': lambda x, a, b: max(a, min(b, x)),
             'mod': lambda a, b: a - b * math.floor(a / b),
             'lt': lambda a, b: 1.0 if a < b else 0.0,
@@ -1214,18 +1536,27 @@ class MultiTrackWatermarkGUI:
         e = expr.replace('if(', 'iff(')  # if 是 Python 关键字，改名后安全求值
         return float(eval(e, {'__builtins__': {}}, env))
 
-    def _write_sendcmd_file(self, track, x_expr, y_expr, horizon, idx, base_dir):
+    def _write_sendcmd_file(self, track, x_expr, y_expr, horizon, idx, base_dir,
+                            main_w=1.0, main_h=1.0, sub_w=1.0, sub_h=1.0,
+                            overlay_name="overlay"):
         # 沿时间采样轨迹位置，写出 sendcmd 命令文件驱动 overlay 的 x/y。
         #
-        # 关键修正（本机 ffmpeg n8.1.2 实测踩坑）：
-        #   * sendcmd 命令格式是「时刻 目标滤镜 命令 值」——第一词是“目标滤镜名”，
-        #     必须写成 `overlay x ...`。旧代码写成 `x 0.05*W`，x 被当成目标滤镜名，
-        #     命令被静默忽略（ffmpeg 仍 rc=0），overlay 退回 x=-1(被钳到左上角像素0)
-        #     且永远不动——正是“只在左上角不动”的成因。
-        #   * 值里保留 *W / *H，运行时由 ffmpeg 在 overlay 上下文求值，故分辨率无关。
+        # 命令格式（实测可用）：「time target command value;」——目标滤镜名放第二列，
+        # 末尾以分号结束一条命令（缺分号报 "Missing separator"）。
         #
-        # 为保证丝滑：相邻采样点之间用「含 t 的线性插值表达式」，overlay 每帧重求 x/y，
-        # 得到连续直线运动；每段表达式极短，彻底绕开单表达式 ~95 段上限。
+        # 【关键实测坑（ffmpeg n8.1.2）】sendcmd 的 target 必须与滤镜实例名**完全一致**：
+        #   * 无别名 overlay → target 写 `overlay`           ✓ 有效
+        #   * 别名 overlay@ov1 → target 写 `overlay@ov1`      ✓ 有效（完整名，含 @ 前缀）
+        #   * 别名 overlay@ov1 → target 写 `ov1`              ✗ 无效（只写 @ 后部分找不到滤镜）
+        # 因此多轨道时给每个 overlay 起唯一别名 `overlay@ov{idx}`，sendcmd target 写
+        # 同样的完整 `overlay@ov{idx}`，即可精确驱动各自轨道（实测双轨各自到位）。
+        # 调用方必须把完整的 `overlay@{ov_alias}` 传进来，不能只传 ov_alias。
+        #
+        # 求值：表达式里常含 w/h（如网格点位 `10+(W-w-20)*c/(cols-1)`），
+        # 必须用主/子视频真实宽高代入。求出的 kx 是像素值，再除以 W_px 归一化——
+        # sendcmd 的值在 overlay 上下文跑会再乘 W_px，等价回原像素值。kx/ky
+        # 钳到 [-0.5, 1.5]：网格点位规范在 [0,1]、自由路径在 [0,1]，溢出说明
+        # 子视频分辨率求值异常，钳住避免飞屏（探不到子视频尺寸时仍能基本可见）。
         # horizon 覆盖整段主视频时长（循环时探测主视频时长），循环轨迹即可全程复现。
         target_hz = 60.0
         n = int(horizon * target_hz) + 1
@@ -1236,13 +1567,20 @@ class MultiTrackWatermarkGUI:
             n = MAX_PTS
         dt = horizon / (n - 1) if n > 1 else horizon
 
+        # 主视频 W/H 防 0
+        mw = float(main_w) if (main_w and main_w > 0) else 1.0
+        mh = float(main_h) if (main_h and main_h > 0) else 1.0
+
         samples = []
         prev = (0.0, 0.0)
         for i in range(n):
             t_i = i * dt
             try:
-                kx = self._eval_axis_expr(x_expr, t_i)
-                ky = self._eval_axis_expr(y_expr, t_i)
+                kx = self._eval_axis_expr(x_expr, t_i, mw, mh, sub_w, sub_h) / mw
+                ky = self._eval_axis_expr(y_expr, t_i, mw, mh, sub_w, sub_h) / mh
+                # 溢出钳位：保护网格点位/自由路径的合法范围
+                kx = max(-0.5, min(1.5, kx))
+                ky = max(-0.5, min(1.5, ky))
             except Exception:
                 # 单点求值失败则沿用上一点，避免整条轨迹塌到 (0,0) 左上角
                 kx, ky = prev
@@ -1257,10 +1595,10 @@ class MultiTrackWatermarkGUI:
             sy = (ky_j - ky_i) / dt if dt > 0 else 0.0
             x_cmd = f"W*({kx_i:.6f}+({sx:.6f})*(t-{t_i:.3f}))"
             y_cmd = f"H*({ky_i:.6f}+({sy:.6f})*(t-{t_i:.3f}))"
-            lines.append(f"{t_i:.3f} overlay x {x_cmd}, overlay y {y_cmd};")
+            lines.append(f"{t_i:.3f} {overlay_name} x {x_cmd}, {overlay_name} y {y_cmd};")
         # 末尾保持最后位置，避免上一段在区间外线性外推
         t_last, kx_last, ky_last = samples[-1]
-        lines.append(f"{t_last:.3f} overlay x W*({kx_last:.6f}), overlay y H*({ky_last:.6f});")
+        lines.append(f"{t_last:.3f} {overlay_name} x W*({kx_last:.6f}), {overlay_name} y H*({ky_last:.6f});")
 
         content = "\n".join(lines) + "\n"
         fname = f"ff_sendcmd_track{idx}.txt"
@@ -1401,9 +1739,34 @@ class MultiTrackWatermarkGUI:
             sub_stream = f"[{idx}:v]"
             sub_temp_label = f"v_sub_{idx}"
             out_stream = f"[v_out_{output_counter}]"
+            ov_alias = f"ov{idx}"  # 给 overlay 起别名，多轨道时让 sendcmd 按名定向
 
-            # ---- 构建滤镜链 ----
+            # ---- 收集子视频真实尺寸（送 sendcmd 数值求值用）----
+            sub_path = input_entries[idx][1]
+            sub_native_w, sub_native_h = None, None
+            try:
+                _probe = self.get_video_resolution(sub_path)
+                if _probe:
+                    sub_native_w, sub_native_h = _probe
+            except Exception:
+                pass
+
+            # 主视频 W/H（覆盖粘贴命令时可能没探测到的情况）
+            if self.video_resolution and self.video_resolution[0] and self.video_resolution[1]:
+                main_w, main_h = self.video_resolution
+            else:
+                _mp = self.get_video_resolution(input_entries[0][1])
+                main_w, main_h = (_mp if _mp else (1, 1))
+
+            # ---- 构建 filter_parts ----
             filter_parts = track.filter_parts[:]
+            # delogo 排最前（去水印在裁剪/旋转/缩放之前，坐标按原始帧，与主程序一致）
+            if track.delogo_enabled_var.get():
+                _dx = track.delogo_x.get().strip() or "0"
+                _dy = track.delogo_y.get().strip() or "0"
+                _dw = track.delogo_w.get().strip() or "100"
+                _dh = track.delogo_h.get().strip() or "100"
+                filter_parts.insert(0, f"delogo=x={_dx}:y={_dy}:w={_dw}:h={_dh}")
             if track.use_scale_var.get():
                 w = track.scale_w_entry.get().strip()
                 h = track.scale_h_entry.get().strip()
@@ -1422,15 +1785,54 @@ class MultiTrackWatermarkGUI:
             else:
                 filter_parts = [part for part in filter_parts if not part.startswith('scale=')]
 
-            # 如果有额外滤镜，先应用它们
+            # ---- 取本次生效的 scale 字符串，用于下面求子视频渲染尺寸 ----
+            active_scale = None
+            for _p in filter_parts:
+                if _p.startswith('scale='):
+                    active_scale = _p  # 用最后一个 scale 的尺寸
+
+            # ---- 子视频渲染后宽高（用于 sendcmd 数值求值）----
+            sub_w, sub_h = sub_native_w, sub_native_h
+            if sub_w and sub_h and active_scale:
+                sub_w, sub_h = self._apply_scale_dims(sub_w, sub_h, active_scale)
+
+            # spin 开启时 overlay 输入 w/h 是对角线正方形（与主程序旋转盒一致）
+            try:
+                _sp_val = float(track.spin_speed_var.get())
+            except (ValueError, TypeError):
+                _sp_val = 60.0
+            spin_on = bool(track.spin_enabled_var.get()) and _sp_val != 0
+            if spin_on and sub_w and sub_h:
+                _d = int(round((sub_w * sub_w + sub_h * sub_h) ** 0.5))
+                sub_w = sub_h = _d
+
+            # ---- 构建滤镜图：delogo 已经在 filter_parts 里；
+            # mask 在原始帧上（filter_parts 之前），子图：split→format=gray,drawbox→alphamerge
+            cur_input = sub_stream
+
+            if track.mask_enabled_var.get():
+                _mx = track.mask_x.get().strip() or "0"
+                _my = track.mask_y.get().strip() or "0"
+                _mw = track.mask_w.get().strip() or "100"
+                _mh = track.mask_h.get().strip() or "100"
+                _mode = track.mask_mode.get() if track.mask_mode.get() in ("inside", "outside") else "outside"
+                if _mode == "inside":
+                    _draw = (f"drawbox=x=0:y=0:w=iw:h=ih:color=white:t=fill,"
+                             f"drawbox=x={_mx}:y={_my}:w={_mw}:h={_mh}:color=black:t=fill")
+                else:
+                    _draw = (f"drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill,"
+                             f"drawbox=x={_mx}:y={_my}:w={_mw}:h={_mh}:color=white:t=fill")
+                _mka, _mkm, _mkmsk, _mkout = f"mk{idx}a", f"mk{idx}m", f"mk{idx}msk", f"mk{idx}out"
+                filter_chain.append(f"{cur_input}split=2[{_mka}][{_mkm}]")
+                filter_chain.append(f"[{_mkm}]format=gray,{_draw}[{_mkmsk}]")
+                filter_chain.append(f"[{_mka}][{_mkmsk}]alphamerge[{_mkout}]")
+                cur_input = f"[{_mkout}]"
+
+            # 预处理滤镜（delogo、scale、crop、rotate=静态角度 等）
             if filter_parts:
                 filter_str = ','.join(filter_parts)
-                filter_chain.append(f"{sub_stream}{filter_str}[{sub_temp_label}]")
-                format_pipeline = f"[{sub_temp_label}]format=rgba[{sub_temp_label}_rgba]"
-            else:
-                # 无额外滤镜，直接转 rgba
-                format_pipeline = f"{sub_stream}format=rgba[{sub_temp_label}_rgba]"
-            filter_chain.append(format_pipeline)
+                filter_chain.append(f"{cur_input}{filter_str}[{sub_temp_label}]")
+                cur_input = f"[{sub_temp_label}]"
 
             # ---- 计算总周期 ----
             total_period = 0.0
@@ -1462,12 +1864,41 @@ class MultiTrackWatermarkGUI:
             if enable_expr == "1" and loop and display_val is None and delay_val == 0:
                 enable_expr = "1"
 
-            # ---- 构建 overlay ----
-            # 启用 sendcmd 且为轨迹轨道：位置由命令文件驱动，彻底绕过单表达式段数上限
+            # ---- 决定是否需要 rgba ----
+            # 透明度 <1.0、遮罩、旋转 任一开启都需要 alpha 通道
+            try:
+                _av = float(track.alpha_var.get())
+            except (ValueError, TypeError):
+                _av = 1.0
+            need_rgba = (
+                (track.use_alpha_var.get() and 0.0 <= _av < 1.0)
+                or track.mask_enabled_var.get()
+                or spin_on
+            )
+            if need_rgba:
+                filter_chain.append(f"{cur_input}format=rgba[{sub_temp_label}_rgba]")
+                cur_input = f"[{sub_temp_label}_rgba]"
+
+            # ---- alpha 透明度（在遮罩之后 / 旋转之前，与主程序顺序一致）----
+            if track.use_alpha_var.get() and 0.0 <= _av < 1.0:
+                _alpha_label = f"v_alpha_{idx}"
+                filter_chain.append(f"{cur_input}colorchannelmixer=aa={_av:.2f}[{_alpha_label}]")
+                cur_input = f"[{_alpha_label}]"
+
+            # ---- 持续旋转（需要 rgba；用对角线正方形画布）----
+            if spin_on:
+                _spin_label = f"v_spin_{idx}"
+                filter_chain.append(
+                    f"{cur_input}rotate=angle='{_sp_val}*PI/180*t':"
+                    f"ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=black@0[{_spin_label}]"
+                )
+                cur_input = f"[{_spin_label}]"
+
+            # ---- 构建 overlay（sendcmd 模式：位置由命令文件驱动）----
             use_sc = self.use_sendcmd_var.get() and has_trajectory
             if use_sc:
                 # 计算采样时间跨度 horizon：循环时覆盖整段主视频（探测主视频时长，
-                # 让轨迹在整段视频里按周期复现）；不循环时只覆盖“延迟+单周期”这一段。
+                # 让轨迹在整段视频里按周期复现）；不循环时只覆盖"延迟+单周期"这一段。
                 if loop:
                     vdur = self.get_video_duration(input_entries[0][1])
                     horizon = vdur if (vdur and vdur > 0) else max(global_duration, delay_val + 0.001)
@@ -1475,18 +1906,20 @@ class MultiTrackWatermarkGUI:
                     horizon = delay_val + total_period
                 if horizon <= 0:
                     horizon = max(global_duration, 0.001)
-                cmdfile = self._write_sendcmd_file(track, x_expr, y_expr, horizon, idx, base_dir)
+                cmdfile = self._write_sendcmd_file(track, x_expr, y_expr, horizon, idx, base_dir,
+                                                    main_w, main_h, sub_w or 0, sub_h or 0,
+                                                    overlay_name=f"overlay@{ov_alias}")
                 sendcmd_files.append(cmdfile)
-                fg_label = f"{sub_temp_label}_sc"
-                filter_chain.append(f"[{sub_temp_label}_rgba]sendcmd=f='{cmdfile}'[{fg_label}]")
-                overlay_opts = "x=-1:y=-1"
+                sc_label = f"{sub_temp_label}_sc"
+                filter_chain.append(f"{cur_input}sendcmd=f='{cmdfile}'[{sc_label}]")
+                cur_input = f"[{sc_label}]"
+                overlay_opts = f"x=-1:y=-1"
             else:
-                fg_label = f"{sub_temp_label}_rgba"
                 overlay_opts = f"x='{x_expr}':y='{y_expr}'"
             if enable_expr != "1":
                 overlay_opts += f":enable='{enable_expr}'"
-            # 直接拼接 :shortest=1 和输出标签，不加空格
-            overlay = f"{current_base}[{fg_label}]overlay={overlay_opts}:shortest=1{out_stream}"
+            # 用 overlay@ov{idx}=... 给每个轨道唯一别名，避免 sendcmd 多轨道同名撞车
+            overlay = f"{current_base}{cur_input}overlay@{ov_alias}={overlay_opts}:shortest=1{out_stream}"
             filter_chain.append(overlay)
 
             current_base = out_stream
