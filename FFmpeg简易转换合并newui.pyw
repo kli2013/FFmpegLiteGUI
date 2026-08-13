@@ -451,8 +451,18 @@ class PresetManager:
     def save_player_settings(self, settings: Dict[str, Any]):
         data = self.load_all()
         data["player_settings"] = settings
-        with open(self.preset_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
+        # 原子写入：先写临时文件再替换，避免写坏配置文件
+        dir_name = os.path.dirname(self.preset_path)
+        temp_name = None
+        try:
+            with tempfile.NamedTemporaryFile('w', dir=dir_name, delete=False, encoding='utf-8') as tf:
+                json.dump(data, tf, indent=4, ensure_ascii=False)
+                temp_name = tf.name
+            os.replace(temp_name, self.preset_path)
+        except Exception as e:
+            if temp_name and os.path.exists(temp_name):
+                os.unlink(temp_name)
+            raise e
 
 
 
@@ -474,10 +484,26 @@ def time_to_seconds(timestr: str) -> Optional[float]:
     except ValueError:
         return None
 
+
+def _channel_layout_name(ch):
+    """把声道数映射为 ffmpeg aformat 可识别的声道布局名；无法映射时返回 None。"""
+    return {1: "mono", 2: "stereo", 4: "quad", 5: "5.0", 6: "5.1", 7: "6.1", 8: "7.1"}.get(ch)
+
+
+def _majority_audio_params(params):
+    """逐维度众数：采样率、声道数、采样格式分别取出现最多的值（≥3 段跟随多数轨）。"""
+    from collections import Counter
+    sr = Counter(p["sr"] for p in params).most_common(1)[0][0]
+    ch = Counter(p["ch"] for p in params).most_common(1)[0][0]
+    fmt = Counter(p["fmt"] for p in params).most_common(1)[0][0]
+    return {"sr": sr, "ch": ch, "fmt": fmt}
+
+
 # ================== 滤镜链构建 ==================
 def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = True, include_speed: bool = True,
                               include_trim: bool = True, include_format: bool = True, include_scale: bool = True,
-                              enhance_settings=None, reverse=False, graph_id: str = "") -> str:
+                              enhance_settings=None, reverse=False, graph_id: str = "",
+                              include_fade: bool = True, clip_duration=None) -> str:
     """
     从设置字典构建视频滤镜链。
     include_subtitle: 是否包含字幕滤镜
@@ -553,6 +579,30 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
                 )
             else:
                 filters.append(_blur_f)
+
+
+    # ----- 遮罩 / 透明蒙版（子视频水印/画中画：矩形区域透明或保留，坐标同原始帧，排在裁剪前）-----
+    if settings.get("mask_enabled", False):
+        _sfx = graph_id or ""
+        mx = str(settings.get("mask_x", "0")).strip() or "0"
+        my = str(settings.get("mask_y", "0")).strip() or "0"
+        mw = str(settings.get("mask_w", "100")).strip() or "0"
+        mh = str(settings.get("mask_h", "100")).strip() or "0"
+        _mode = settings.get("mask_mode", "outside")  # outside=只露矩形(矩形外透明); inside=矩形透明(矩形外正常)
+        if _mode == "inside":
+            # 矩形透明、矩形外正常：matte = 白底 + 黑矩形
+            _draw = (f"drawbox=x=0:y=0:w=iw:h=ih:color=white:t=fill,"
+                     f"drawbox=x={mx}:y={my}:w={mw}:h={mh}:color=black:t=fill")
+        else:
+            # 只露矩形（矩形外透明）：matte = 黑底 + 白矩形
+            _draw = (f"drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill,"
+                     f"drawbox=x={mx}:y={my}:w={mw}:h={mh}:color=white:t=fill")
+        _a, _m, _msk = f"mk{_sfx}a", f"mk{_sfx}m", f"mk{_sfx}msk"
+        filters.append(
+            f"split=2[{_a}][{_m}];"
+            f"[{_m}]format=gray,{_draw}[{_msk}];"
+            f"[{_a}][{_msk}]alphamerge"
+        )
 
 
     # ----- 裁剪 -----
@@ -660,7 +710,12 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
     if include_format and settings.get("pix_fmt_enabled", True):
         # 硬件滤镜模式下，纯硬件/混合链路在边界统一处理像素格式，不在中间插入软件 format
         if not _hw_active or not _native:
-            filters.append(f"format={settings.get('pix_fmt', 'yuv420p')}")
+            # 遮罩启用时，本滤镜链已写入 alpha，必须用 rgba 保留透明通道
+            # （否则默认的 yuv420p 会把刚生成的透明区丢掉）
+            if settings.get("mask_enabled", False):
+                filters.append("format=rgba")
+            else:
+                filters.append(f"format={settings.get('pix_fmt', 'yuv420p')}")
     
     # ----- 变速 -----
     if include_speed and settings.get("speed_enabled", False):
@@ -683,6 +738,20 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
     # ----- 倒放 -----
     if reverse:
         filters.append("reverse")
+
+    # ----- 淡入淡出（片段首尾淡入黑 / 淡出黑，视频） -----
+    if include_fade and settings.get("fade_enabled", False):
+        fin = settings.get("fade_in", "")
+        fout = settings.get("fade_out", "")
+        fin_s = time_to_seconds(fin) if fin else 0.0
+        fout_s = time_to_seconds(fout) if fout else 0.0
+        if fin_s > 0:
+            filters.append(f"fade=t=in:st=0:d={fin_s:.3f}")
+        if fout_s > 0:
+            if clip_duration and clip_duration > 0:
+                st = max(0.0, clip_duration - fout_s)
+                filters.append(f"fade=t=out:st={st:.3f}:d={fout_s:.3f}")
+            # 未知时长时无法精确定位淡出起点，跳过淡出（淡入仍生效）
 
     filter_chain = ",".join(filters) if filters else "null"
     
@@ -2349,6 +2418,7 @@ class VideoFilterFrame(ttk.LabelFrame):
         self.blur_btn = ttk.Button(rot_frame, text="去水印/模糊", 
                                    command=self.open_blur_dialog, width=10)
         self.blur_btn.pack(side=tk.LEFT, padx=(10, 0))
+
 
 
         self.enhance_btn = ttk.Button(rot_frame, text="高级增强", 
@@ -4510,8 +4580,9 @@ class TrimFrame(ttk.LabelFrame):
 # ================== 公共组件：循环与绿幕 ==================
 class LoopChromaFrame(ttk.LabelFrame):
     """循环播放与绿幕抠像设置组件 - 左右并排（grid布局）"""
-    def __init__(self, master, **kwargs):
+    def __init__(self, master, filt_frame=None, **kwargs):
         super().__init__(master, text="循环/绿幕控制", padding="5", **kwargs)
+        self.filt_frame = filt_frame
         self._create_widgets()
 
     def _create_widgets(self):
@@ -4716,6 +4787,7 @@ class LoopChromaFrame(ttk.LabelFrame):
         self.alpha_enabled = tk.BooleanVar(value=False)
         alpha_cb = ttk.Checkbutton(alpha_frame, text="透明度", variable=self.alpha_enabled)
         alpha_cb.pack(side=tk.LEFT, padx=(0,5))
+
         
         self.alpha_value = tk.DoubleVar(value=1.0)
         alpha_scale = ttk.Scale(alpha_frame, from_=0.0, to=1.0, variable=self.alpha_value,
@@ -4726,7 +4798,18 @@ class LoopChromaFrame(ttk.LabelFrame):
         alpha_spin = ttk.Spinbox(alpha_frame, from_=0.0, to=1.0, increment=0.1,
                                  textvariable=self.alpha_spinbox_var, width=6)
         alpha_spin.pack(side=tk.LEFT, padx=5)
-        
+
+
+        self.mask_btn = ttk.Button(alpha_frame, text="遮罩", command=self.open_mask_dialog, width=6)
+        self.mask_btn.pack(side=tk.LEFT, padx=(25, 0))
+        ToolTip(self.mask_btn,
+                "遮罩 / 透明蒙版：选定一个矩形区域，决定子视频哪部分透明、哪部分保留。\n"
+                "遮罩区域外 = 只露矩形、矩形外透明（主视频从矩形外透出）；\n"
+                "遮罩区域内 = 矩形透明、矩形外正常（主视频从矩形孔洞透出）。\n"
+                "坐标从「裁剪」编辑器复制（与原始帧一致，排在裁剪之前）。\n"
+                "透明区在叠加时被主视频/画布透出，无需 mov 等 alpha 封装。")
+
+
         # 滑块 → Spinbox 同步
         def alpha_slider_changed(val):
             self.alpha_spinbox_var.set(f"{float(val):.1f}")
@@ -4744,6 +4827,14 @@ class LoopChromaFrame(ttk.LabelFrame):
                 self.alpha_spinbox_var.set(f"{self.alpha_value.get():.1f}")
         self.alpha_spinbox_var.trace_add("write", alpha_spin_changed)
 
+        # ----- 遮罩 / 透明蒙版 -----
+        self.mask_enabled = tk.BooleanVar(value=False)
+        self.mask_x = tk.StringVar(value="0")
+        self.mask_y = tk.StringVar(value="0")
+        self.mask_w = tk.StringVar(value="100")
+        self.mask_h = tk.StringVar(value="100")
+        self.mask_mode = tk.StringVar(value="outside")  # outside=遮罩区域外(只露矩形); inside=遮罩区域内(矩形透明)
+
 
 
     def _pick_standard_color(self):
@@ -4751,6 +4842,105 @@ class LoopChromaFrame(ttk.LabelFrame):
         color_code = colorchooser.askcolor(title="选择抠像颜色", parent=self, initialcolor=self.chroma_color.get())[1]
         if color_code:
             self.chroma_color.set(color_code)
+
+    def open_mask_dialog(self):
+        """遮罩 / 透明蒙版 设置弹窗：启用、方向、矩形坐标（可从裁剪复制）"""
+        win = tk.Toplevel(self)
+        win.title("遮罩 / 透明蒙版")
+        try:
+            win.transient(self.winfo_toplevel())
+            win.grab_set()
+            win.attributes('-topmost', True)
+        except Exception:
+            pass
+
+        # 临时变量（仅「保存」时才写回 self.mask_*）
+        t_enabled = tk.BooleanVar(value=self.mask_enabled.get())
+        t_x = tk.StringVar(value=self.mask_x.get())
+        t_y = tk.StringVar(value=self.mask_y.get())
+        t_w = tk.StringVar(value=self.mask_w.get())
+        t_h = tk.StringVar(value=self.mask_h.get())
+        t_mode = tk.StringVar(value=self.mask_mode.get())
+
+        main = ttk.Frame(win, padding=10)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        # 启用
+        ttk.Checkbutton(main, text="启用遮罩", variable=t_enabled).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+        # 遮罩方向
+        ttk.Label(main, text="遮罩方向:").grid(row=1, column=0, sticky="w", pady=2)
+        mode_frame = ttk.Frame(main)
+        mode_frame.grid(row=1, column=1, sticky="w", pady=2)
+        ttk.Radiobutton(mode_frame, text="遮罩区域外（只露矩形）",
+                        variable=t_mode, value="outside").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Radiobutton(mode_frame, text="遮罩区域内（矩形透明）",
+                        variable=t_mode, value="inside").pack(side=tk.LEFT)
+
+        # 矩形坐标
+        coord_frame = ttk.LabelFrame(main, text="矩形坐标 (x / y / 宽 / 高，原始帧)", padding=5)
+        coord_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=6)
+
+        row1 = ttk.Frame(coord_frame)
+        row1.pack(fill=tk.X, pady=2)
+        ttk.Label(row1, text="X:").pack(side=tk.LEFT)
+        ttk.Entry(row1, textvariable=t_x, width=7).pack(side=tk.LEFT, padx=2)
+        ttk.Label(row1, text="Y:").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Entry(row1, textvariable=t_y, width=7).pack(side=tk.LEFT, padx=2)
+        ttk.Label(row1, text="宽:").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Entry(row1, textvariable=t_w, width=7).pack(side=tk.LEFT, padx=2)
+        ttk.Label(row1, text="高:").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Entry(row1, textvariable=t_h, width=7).pack(side=tk.LEFT, padx=2)
+
+        def copy_from_crop():
+            ff = self.filt_frame
+            if ff is None:
+                messagebox.showwarning("提示", "未找到裁剪设置，无法复制坐标。")
+                return
+            cw = ff.crop_width.get().strip()
+            ch = ff.crop_height.get().strip()
+            cl = ff.crop_left.get().strip()
+            ct = ff.crop_top.get().strip()
+            if not cw or not ch:
+                messagebox.showwarning("提示",
+                    "裁剪未启用或参数为空，请先在「视频滤镜」中启用裁剪并设置区域。")
+                return
+            t_x.set(cl)
+            t_y.set(ct)
+            t_w.set(cw)
+            t_h.set(ch)
+            if not t_enabled.get():
+                t_enabled.set(True)
+
+        ttk.Button(coord_frame, text="📋 从裁剪复制坐标", command=copy_from_crop).pack(pady=4)
+
+        # 操作按钮
+        btn_frame = ttk.Frame(main)
+        btn_frame.grid(row=3, column=0, columnspan=2, pady=10)
+
+        def do_save():
+            self.mask_enabled.set(t_enabled.get())
+            self.mask_x.set(t_x.get().strip() or "0")
+            self.mask_y.set(t_y.get().strip() or "0")
+            self.mask_w.set(t_w.get().strip() or "0")
+            self.mask_h.set(t_h.get().strip() or "0")
+            self.mask_mode.set(t_mode.get())
+            try:
+                if self.app is not None and hasattr(self.app, "merge_update_command_preview"):
+                    self.app.merge_update_command_preview()
+            except Exception:
+                pass
+            win.destroy()
+
+        ttk.Button(btn_frame, text="保存", command=do_save, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=win.destroy, width=8).pack(side=tk.LEFT, padx=5)
+
+        win.update_idletasks()
+        try:
+            center_window(win, 400, 250)
+        except Exception:
+            pass
 
     def get_settings(self):
         return {
@@ -4765,6 +4955,13 @@ class LoopChromaFrame(ttk.LabelFrame):
             "alpha_enabled": self.alpha_enabled.get(),
             "alpha_value": self.alpha_value.get(),
             "chroma_filter_type": self.chroma_filter_type.get(),
+            # 遮罩 / 透明蒙版
+            "mask_enabled": self.mask_enabled.get(),
+            "mask_x": self.mask_x.get(),
+            "mask_y": self.mask_y.get(),
+            "mask_w": self.mask_w.get(),
+            "mask_h": self.mask_h.get(),
+            "mask_mode": self.mask_mode.get(),
         }
     
     def set_settings(self, settings):
@@ -4790,6 +4987,14 @@ class LoopChromaFrame(ttk.LabelFrame):
         val = settings.get("alpha_value", 1.0)
         self.alpha_value.set(val)
         self.alpha_spinbox_var.set(f"{val:.1f}")
+
+        # 遮罩 / 透明蒙版 恢复
+        self.mask_enabled.set(settings.get("mask_enabled", False))
+        self.mask_x.set(str(settings.get("mask_x", "0")))
+        self.mask_y.set(str(settings.get("mask_y", "0")))
+        self.mask_w.set(str(settings.get("mask_w", "100")))
+        self.mask_h.set(str(settings.get("mask_h", "100")))
+        self.mask_mode.set(settings.get("mask_mode", "outside"))
 
     def set_duration_info(self, duration_sec: Optional[float]):
         """设置时长显示信息"""
@@ -4867,6 +5072,15 @@ class OverlayPositionFrame(ttk.LabelFrame):
                                values=blend_labels, state="readonly")
         blend_cb.pack(side=tk.LEFT, padx=(0,5))
 
+        self.overlay_free_layout = tk.BooleanVar(value=False)
+        free_cb = ttk.Checkbutton(top_row, text="放开边界", variable=self.overlay_free_layout)
+        free_cb.pack(side=tk.LEFT, padx=10)
+        ToolTip(free_cb,
+                "放开边界限制（自由布局）：允许子视频比主视频大、可拖出主画面之外（编辑器不滚动，超出部分自然出框）。\n"
+                "位置/大小原样送入 ffmpeg，最终输出画布=主视频（超出部分被主帧裁掉）；主视频启用偏移/pad 时底=pad 画布。",
+                wraplength=400)
+        self._controls.append(free_cb)
+
         def _on_blend_selected(evt=None):
             sel = blend_cb.get()
             if sel in blend_labels:
@@ -4875,17 +5089,20 @@ class OverlayPositionFrame(ttk.LabelFrame):
         ToolTip(blend_cb, "「正常(透明叠加)」=常规 overlay：子视频保留自身透明、叠在主画面上层，位置随 X/Y。其余为 Photoshop 式混合算法(blend)：子视频按 X/Y 摆放、其外部区域以该模式中性色填充后再对整帧按算法混合，与「正常」视觉完全不同。", wraplength=440)
         self._controls.append(top_row)
 
-        ttk.Label(self, text="X 位置 (支持表达式，如 W-w-10):").pack(anchor=tk.W)
+        # X/Y 位置：2 行（标签行 + 编辑框行）。用 grid 分两列，
+        # 第 1 列放 X 标签/编辑框，第 2 列放 Y 标签/编辑框，
+        # 列各自左对齐 → 右侧 Y 标签与 Y 编辑框天然左对齐（不受 X 宽度影响）。
+        pos_frame = ttk.Frame(self)
+        pos_frame.pack(anchor=tk.W, fill=tk.X, pady=(2, 4))
         self.overlay_x = tk.StringVar(value="W-w-10")
-        entry = ttk.Entry(self, textvariable=self.overlay_x, width=40)
-        entry.pack(fill=tk.X, pady=2)
-        self._controls.append(entry)
-
-        ttk.Label(self, text="Y 位置 (支持表达式):").pack(anchor=tk.W)
         self.overlay_y = tk.StringVar(value="H-h-10")
-        entry = ttk.Entry(self, textvariable=self.overlay_y, width=40)
-        entry.pack(fill=tk.X, pady=2)
-        self._controls.append(entry)
+        ttk.Label(pos_frame, text="X 位置 (支持表达式，如 W-w-10):").grid(row=0, column=0, sticky="w")
+        ttk.Label(pos_frame, text="Y 位置 (支持表达式):").grid(row=0, column=1, sticky="w", padx=(24, 0))
+        x_entry = ttk.Entry(pos_frame, textvariable=self.overlay_x, width=28)
+        x_entry.grid(row=1, column=0, sticky="w", pady=2)
+        y_entry = ttk.Entry(pos_frame, textvariable=self.overlay_y, width=28)
+        y_entry.grid(row=1, column=1, sticky="w", padx=(24, 0), pady=2)
+        self._controls.extend([pos_frame, x_entry, y_entry])
 
         # 快速预设
         preset_frame = ttk.LabelFrame(self, text="快速预设", padding="3")
@@ -4917,18 +5134,40 @@ class OverlayPositionFrame(ttk.LabelFrame):
                 self.visual_callback()
             elif self.app and self.track_idx is not None:
                 parent_win = self.winfo_toplevel()
+                _free = self.overlay_free_layout.get()
                 self.app.open_visual_overlay_editor(
                     self.track_idx,
                     ov_x_var=self.overlay_x,
                     ov_y_var=self.overlay_y,
                     filt_frame=self.filt_frame,
-                    parent=parent_win
+                    parent=parent_win,
+                    free_layout=_free
                 )
             else:
                 messagebox.showinfo("提示", "无法启动可视化编辑：缺少轨道索引或回调")
         btn = ttk.Button(preset_frame, text="🎨 可视化编辑坐标", command=open_visual)
         btn.pack(side=tk.LEFT, padx=5, pady=2)
         self._controls.append(btn)
+
+        # 持续旋转（绕中心动态旋转）——仅子视频（水印/画中画）
+        spin_frame = ttk.Frame(self)
+        spin_frame.pack(anchor=tk.W, fill=tk.X, pady=(4, 2))
+        self.spin_enabled = tk.BooleanVar(value=False)
+        spin_cb = ttk.Checkbutton(spin_frame, text="持续旋转 (绕中心)", variable=self.spin_enabled)
+        spin_cb.pack(side=tk.LEFT)
+        self._controls.append(spin_cb)
+        ttk.Label(spin_frame, text="转速 (度/秒):").pack(side=tk.LEFT, padx=(12, 2))
+        self.spin_speed = tk.DoubleVar(value=60.0)
+        spin_sb = ttk.Spinbox(spin_frame, from_=1, to=720, increment=5, width=6,
+                              textvariable=self.spin_speed)
+        spin_sb.pack(side=tk.LEFT)
+        self._controls.append(spin_sb)
+        ToolTip(spin_cb,
+                "让水印/画中画在叠加过程中绕自身中心持续旋转（动态动画，不是单次旋转）。\n"
+                "转速单位为度/秒，例如 60 = 每 6 秒转一圈（angle = 转速×π/180×t）。\n"
+                "旋转后边角填充为透明（c=black@0），与现有透明/遮罩/放开边界管线兼容。\n"
+                "注意：水印本身不宜过大，旋转包围盒为对角线尺寸，过大会被主画面边缘裁切。",
+                wraplength=420)
 
     def _create_main_controls(self):
         """主视频画布偏移控件 - 左右分栏（左侧偏移设置，右侧快捷操作）"""
@@ -5371,6 +5610,9 @@ class OverlayPositionFrame(ttk.LabelFrame):
                 "overlay_x": self.overlay_x.get().strip(),
                 "overlay_y": self.overlay_y.get().strip(),
                 "blend_mode": self.blend_mode.get(),
+                "overlay_free_layout": self.overlay_free_layout.get(),
+                "spin_enabled": self.spin_enabled.get(),
+                "spin_speed": float(self.spin_speed.get()) if hasattr(self, "spin_speed") else 60.0,
             }
         else:
             return {
@@ -5389,6 +5631,12 @@ class OverlayPositionFrame(ttk.LabelFrame):
             self.blend_mode.set(settings.get("blend_mode", "normal"))
             if hasattr(self, "_blend_display"):
                 self.blend_mode_display.set(self._blend_display.get(self.blend_mode.get(), "正常(透明叠加)"))
+            self.overlay_free_layout.set(settings.get("overlay_free_layout", False))
+            self.spin_enabled.set(settings.get("spin_enabled", False))
+            try:
+                self.spin_speed.set(float(settings.get("spin_speed", 60.0)))
+            except (ValueError, TypeError):
+                self.spin_speed.set(60.0)
         else:
             self.pad_enabled.set(settings.get("pad_enabled", False))
             self.pad_width.set(settings.get("pad_width", ""))
@@ -7139,6 +7387,17 @@ class FFmpegBatchGUI:
                     break
         return None
 
+    def _pix_fmt_has_alpha(self, pix_fmt: str) -> bool:
+        """判断像素格式是否带 alpha（透明）通道，用于决定是否需 format=rgba 保留透明。"""
+        if not pix_fmt:
+            return False
+        pf = pix_fmt.lower()
+        # 排除无 alpha 但名字含 'a' 的灰度格式（gray/gray16le 等）
+        if pf.startswith("gray"):
+            return False
+        # 常见带 alpha 的格式均含 'a'：rgba/bgra/argb/abgr/yuva*/gbrap/ya*/ayuv/pal8 等
+        return "a" in pf
+
     def _get_video_framerate(self, file_path: str) -> Optional[float]:
         """获取视频文件的平均帧率（fps），优先读解析缓存，失败返回 None"""
         if not self.ffprobe_cmd or not os.path.exists(file_path):
@@ -7608,9 +7867,9 @@ class FFmpegBatchGUI:
     
         cmd.extend(["-i", input_path])
 
-        # ----- 检测输入文件是否包含音频流  -----
+        # ----- 检测输入文件是否包含音频流（走缓存）-----
         has_input_audio = False
-        info = ffprobe_json(self.ffprobe_cmd, input_path)
+        info = self._get_cached_stream_info(input_path)
         if info:
             has_input_audio = any(s.get("codec_type") == "audio" for s in info.get("streams", []))
     
@@ -7946,7 +8205,8 @@ class FFmpegBatchGUI:
             include_speed=True,
             reverse=main_settings.get('reverse_enabled', False),
             enhance_settings=enhance_settings,
-            graph_id=f"m{main_idx}"
+            graph_id=f"m{main_idx}",
+            clip_duration=self._get_media_duration(main_file_path) if main_file_path else None
         )
         if main_vf and main_vf != "null":
             filter_parts.append(f"[{main_idx}:v]{main_vf}[v_main_proc]")
@@ -8016,6 +8276,24 @@ class FFmpegBatchGUI:
                         if size <= 0:
                             use_loop = False
     
+            # 是否需要 alpha 通道：透明度 / 持续旋转 / 遮罩 / 源视频自带 alpha。
+            # 仅这些场景才需要 format=rgba；普通不透明叠加保持 YUV，避免多余色域往返（4:4:4）与带宽浪费。
+            need_alpha = (
+                sub_settings.get("alpha_enabled", False) or
+                sub_settings.get("mask_enabled", False)
+            )
+            if sub_settings.get("spin_enabled", False):
+                try:
+                    _sp_val = float(sub_settings.get("spin_speed", 60.0))
+                except (ValueError, TypeError):
+                    _sp_val = 60.0
+                if _sp_val != 0:
+                    need_alpha = True
+            # 源视频本身带 alpha（透明 mov/webm/APNG/pal8 等）
+            _src_pf = self._get_video_pix_fmt(sub_file)
+            if _src_pf and self._pix_fmt_has_alpha(_src_pf):
+                need_alpha = True
+
             # 构建子视频滤镜串
             if use_loop:
                 loop_param = "-1"
@@ -8035,16 +8313,17 @@ class FFmpegBatchGUI:
 
                 if base_vf:
                     vf_parts.append(base_vf)
-                vf_parts.append("format=rgba")
+                if need_alpha:
+                    vf_parts.append("format=rgba")
                 sub_vf = ",".join(vf_parts)
                 filter_parts.append(f"[{sub_idx}:v]{sub_vf}[v_temp_{i}]")
                 current_sub = f"v_temp_{i}"
             else:
-                # 直接使用 base_vf（已含增强），然后加 format=rgba
+                # 直接使用 base_vf（已含增强）；仅当需要 alpha 时才转 rgba
                 if base_vf:
-                    sub_vf = f"{base_vf},format=rgba"
+                    sub_vf = f"{base_vf},format=rgba" if need_alpha else base_vf
                 else:
-                    sub_vf = "format=rgba"
+                    sub_vf = "format=rgba" if need_alpha else "null"
                 filter_parts.append(f"[{sub_idx}:v]{sub_vf}[v_temp_{i}]")
                 current_sub = f"v_temp_{i}"
     
@@ -8076,6 +8355,25 @@ class FFmpegBatchGUI:
             if alpha_enabled and 0.0 <= alpha_val <= 1.0:
                 filter_parts.append(f"[{current_sub}]colorchannelmixer=aa={alpha_val:.2f}[v_alpha_{i}]")
                 current_sub = f"v_alpha_{i}"
+
+            # 持续旋转（绕中心动态旋转）：在 overlay 之前对子视频图层做 rotate。
+            # angle = 转速(度/秒) × π/180 × t，t 为帧时间戳 → 匀速连续旋转。
+            # 关键：ow/oh 固定为对角线长度 hypot(iw,ih)（以缩放后水印宽高为基准），
+            # 使输出是一个恒大小的正方形画布，旋转全程不裁切、且不随角度抖动；
+            # 水印在该正方形内居中旋转，边角填充透明 c=black@0，与现有 rgba/遮罩管线兼容。
+            # overlay 的 w/h 自动取该正方形（见 _overlay_sub_size），故 W-w-10 等表达式仍正确。
+            if sub_settings.get("spin_enabled", False):
+                _sp = sub_settings.get("spin_speed", 60.0)
+                try:
+                    _sp = float(_sp)
+                except (ValueError, TypeError):
+                    _sp = 60.0
+                if _sp != 0:
+                    filter_parts.append(
+                        f"[{current_sub}]rotate=angle='{_sp}*PI/180*t':"
+                        f"ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=black@0[v_spin_{i}]"
+                    )
+                    current_sub = f"v_spin_{i}"
     
             # 叠加（不添加 shortest=1）
             blend_mode = (sub_settings.get('blend_mode', 'normal') or 'normal').strip().lower()
@@ -8182,6 +8480,11 @@ class FFmpegBatchGUI:
             w, h = compute_rendered_size(w, h, sub_settings)
         except Exception:
             pass
+        if sub_settings.get("spin_enabled", False):
+            # 旋转时包围盒 = 对角线长度正方形，需与 rotate 的 ow/oh=hypot(iw,ih) 一致。
+            # ffmpeg 对 ow/oh 取整采用四舍五入(lrint)，故这里用 round 对齐，避免混合模式差 1px。
+            d = int(round(((w * w + h * h) ** 0.5)))
+            w = h = d
         return max(2, int(w)), max(2, int(h))
 
     def _get_effective_duration(self, settings: dict, raw_duration: Optional[float] = None, input_path: str = None) -> Optional[float]:
@@ -8326,6 +8629,19 @@ class FFmpegBatchGUI:
         self._update_ffmpeg_paths()
 
     def save_player_settings(self):
+        """防抖版保存播放器设置：合并高频触发，延迟 200ms 一次性写盘。"""
+        if getattr(self, '_suppress_save', False) or getattr(self, '_loading_settings', False):
+            return
+        if getattr(self, '_save_ps_after_id', None):
+            try:
+                self.root.after_cancel(self._save_ps_after_id)
+            except Exception:
+                pass
+        self._save_ps_after_id = self.root.after(200, self._do_save_player_settings)
+
+    def _do_save_player_settings(self):
+        """立即将播放器设置写入磁盘（供防抖到点或程序退出时 flush）。"""
+        self._save_ps_after_id = None
         if getattr(self, '_suppress_save', False) or getattr(self, '_loading_settings', False):
             return
         self.preset_manager.save_player_settings({
@@ -9202,7 +9518,11 @@ class FFmpegBatchGUI:
         wm_file_raw = wm_settings.get("file_path", "").strip()
         wm_orig_w, wm_orig_h = None, None
         if wm_file_raw and os.path.exists(wm_file_raw):
-            wm_orig_w, wm_orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, wm_file_raw, wm_settings)
+            # 注意：水印尺寸必须取「旋转后」尺寸（元数据 rotation + 用户 rotate），
+            # 与 get_video_rotated_dimensions 语义一致；切勿改用不旋转的
+            # _cached_video_dimensions / get_video_dimensions，否则水印忽略旋转，
+            # 会造成命令预览与实际转换结果不一致。
+            wm_orig_w, wm_orig_h = self._cached_video_rotated_dimensions(wm_file_raw, wm_settings)
         if main_w is not None and main_h is not None:
             if wm_settings.get("adaptive", False):
                 adapted_wm = self._adapt_sub_settings(wm_settings, main_w, main_h, wm_orig_w, wm_orig_h)
@@ -9224,9 +9544,9 @@ class FFmpegBatchGUI:
         # ---------- 强制精准截取（水印模式） ----------
         settings["precise_trim"] = True
         
-        # --- 检测源文件是否有音频流 ---
+        # --- 检测源文件是否有音频流（走缓存）---
         has_input_audio = False
-        info = ffprobe_json(self.ffprobe_cmd, input_path)
+        info = self._get_cached_stream_info(input_path)
         if info:
             has_input_audio = any(s.get("codec_type") == "audio" for s in info.get("streams", []))
         
@@ -9324,8 +9644,8 @@ class FFmpegBatchGUI:
         cmd_list.extend(["-vsync", "cfr"])
     
         # ---- 音频处理 ----
-        # 使用 ffprobe_json 检测主视频是否有音频流
-        info = ffprobe_json(self.ffprobe_cmd, input_path)
+        # 检测主视频是否有音频流（走缓存）
+        info = self._get_cached_stream_info(input_path)
         has_audio = info and any(s.get("codec_type") == "audio" for s in info.get("streams", []))
 
         if not has_audio:
@@ -9351,10 +9671,10 @@ class FFmpegBatchGUI:
             cmd_list.extend(["-movflags", "+faststart"])
     
         # ---- 时长控制：有音频时用 -shortest，无音频时用 -t ----
-        # 检查主视频是否包含音频流（可复用已有的 ffprobe 信息）
+        # 检查主视频是否包含音频流（走缓存）
         has_audio_stream = False
         if input_path and os.path.exists(input_path):
-            info = ffprobe_json(self.ffprobe_cmd, input_path)
+            info = self._get_cached_stream_info(input_path)
             if info and any(s.get("codec_type") == "audio" for s in info.get("streams", [])):
                 has_audio_stream = True
     
@@ -10146,9 +10466,11 @@ class FFmpegBatchGUI:
     # ---------- 水印位置可视化编辑器 ----------
     def open_watermark_overlay_editor(self, canvas_w, canvas_h, wm_w, wm_h, x_var, y_var,
                                       scale_enabled_var=None, scale_w_var=None, scale_h_var=None,
-                                      watermark_dict=None, filt_frame=None, parent=None):
+                                      watermark_dict=None, filt_frame=None, parent=None,
+                                      free_layout=False):
         """
         水印可视化编辑器，支持回写位置和缩放尺寸，以及更新水印字典和滤镜框架。
+        free_layout=True 时放开边界（子视频可拖出画布、可比主视频大）。
         """
         # 解析当前坐标
         rect_x = safe_eval_expr(x_var.get(), {"W": canvas_w, "H": canvas_h, "w": wm_w, "h": wm_h})
@@ -10157,8 +10479,9 @@ class FFmpegBatchGUI:
         rect_y = safe_eval_expr(y_var.get(), {"W": canvas_w, "H": canvas_h, "w": wm_w, "h": wm_h})
         if rect_y is None:
             rect_y = canvas_h - wm_h - 10
-        rect_x = max(0, min(rect_x, canvas_w - wm_w))
-        rect_y = max(0, min(rect_y, canvas_h - wm_h))
+        if not free_layout:
+            rect_x = max(0, min(rect_x, canvas_w - wm_w))
+            rect_y = max(0, min(rect_y, canvas_h - wm_h))
     
         def on_apply(new_x, new_y, new_w, new_h, new_canvas_w, new_canvas_h):
             # 更新位置变量
@@ -10192,10 +10515,11 @@ class FFmpegBatchGUI:
         self._generic_overlay_editor(parent or self.root, canvas_w, canvas_h,
                                      rect_x, rect_y, wm_w, wm_h,
                                      on_apply, title, aspect, bg_draw_func=None,rect_label='水印',
-                                     min_visible_pixels=0,show_scale_tip=True)
+                                     min_visible_pixels=0,show_scale_tip=True,
+                                     allow_negative_offset=free_layout)
     
     # ---------- 从视频位置可视化编辑器 ----------
-    def open_visual_overlay_editor(self, track_idx, ov_x_var=None, ov_y_var=None, filt_frame=None, parent=None):
+    def open_visual_overlay_editor(self, track_idx, ov_x_var=None, ov_y_var=None, filt_frame=None, parent=None, free_layout=False):
         """
         画中画子视频叠加位置/大小可视化编辑器（保留背景虚线框）
         """
@@ -10225,8 +10549,9 @@ class FFmpegBatchGUI:
         rect_y = safe_eval_expr(y_expr, {"W": canvas_w, "H": canvas_h, "w": curr_w, "h": curr_h})
         if rect_y is None:
             rect_y = canvas_h - curr_h - 10
-        rect_x = max(0, min(rect_x, canvas_w - curr_w))
-        rect_y = max(0, min(rect_y, canvas_h - curr_h))
+        if not free_layout:
+            rect_x = max(0, min(rect_x, canvas_w - curr_w))
+            rect_y = max(0, min(rect_y, canvas_h - curr_h))
     
         def on_apply(new_x, new_y, new_w, new_h, new_canvas_w, new_canvas_h):
             # 更新轨道设置
@@ -10287,7 +10612,8 @@ class FFmpegBatchGUI:
             extra_info=extra_info,
             rect_label='当前子视频',
             min_visible_pixels=0,
-            show_scale_tip=True
+            show_scale_tip=True,
+            allow_negative_offset=free_layout
         )
 
     # ---------- 预设管理 ----------
@@ -11341,7 +11667,21 @@ class FFmpegBatchGUI:
             else:
                 preview_text.config(state='disabled')
             
+            _preview_after_id = [None]
+
             def update_preview(*args):
+                # 防抖：合并高频参数变更，50ms 内只重建一次命令预览
+                if _preview_after_id[0]:
+                    try:
+                        self.root.after_cancel(_preview_after_id[0])
+                    except Exception:
+                        pass
+                _preview_after_id[0] = self.root.after(50, _do_update_preview)
+
+            def _do_update_preview():
+                _preview_after_id[0] = None
+                if not win.winfo_exists():
+                    return
 
                 current_state = preview_text.cget('state')
                 if task.is_custom:
@@ -11620,6 +11960,8 @@ class FFmpegBatchGUI:
                 wraplength=700)
 
         self.concat_enabled = tk.BooleanVar(value=False)
+        self.xfade_enabled = tk.BooleanVar(value=False)
+        self.xfade_duration = tk.StringVar(value="1.0")
         concat_chk = ttk.Checkbutton(btn_frame, text="串行合并（首尾拼接）", variable=self.concat_enabled)
         concat_chk.pack(side=tk.LEFT, padx=5)
         ToolTip(concat_chk,
@@ -11681,7 +12023,7 @@ class FFmpegBatchGUI:
 
 
         chapter_frame = ttk.LabelFrame(parent, text="章节处理", padding="3")
-        chapter_frame.pack(fill=tk.X, pady=5)
+        chapter_frame.pack(fill=tk.X, pady=(0,5))
         chapter_row = ttk.Frame(chapter_frame)
         chapter_row.pack(fill=tk.X, padx=5, pady=(0,2))
         copy_chapters_cb = ttk.Checkbutton(
@@ -11753,13 +12095,46 @@ class FFmpegBatchGUI:
         opt_action_frame = ttk.Frame(parent)
         opt_action_frame.pack(fill=tk.X, pady=2)
         
-        ttk.Checkbutton(
-            opt_action_frame, text="合并成功后删除源文件", variable=self.merge_delete_source
-        ).pack(side=tk.LEFT, padx=5)
+        del_src_cb = ttk.Checkbutton(
+            opt_action_frame, text="删除源文件", variable=self.merge_delete_source
+        )
+        del_src_cb.pack(side=tk.LEFT, padx=5)
+        ToolTip(del_src_cb,
+                "删除源文件（合并成功后）：\n"
+                "仅当本次合并执行成功后才删除对应源文件；\n"
+                "执行失败、输出文件无效或用户取消删除时均保留原文件。\n"
+                "删除前会弹出确认框，且只删除安全目录内的源文件。",
+                wraplength=400)
         
         ttk.Checkbutton(
             opt_action_frame, text="验证输出文件", variable=self.merge_verify
         ).pack(side=tk.LEFT, padx=5)
+
+        # 串行转场（片段间交叉溶解 xfade，仅串行模式可用，初始置灰）
+        xfade_cb = ttk.Checkbutton(
+            opt_action_frame, text="串行转场",
+            variable=self.xfade_enabled
+        )
+        xfade_cb.pack(side=tk.LEFT, padx=(5, 2))
+        ttk.Label(opt_action_frame, text="时长:").pack(side=tk.LEFT)
+        ttk.Entry(opt_action_frame, textvariable=self.xfade_duration, width=4).pack(side=tk.LEFT, padx=(2, 4))
+        ToolTip(xfade_cb,
+                "串行转场（片段间交叉溶解，xfade）：\n"
+                "串行合并时，在相邻视频片段之间做交叉溶解转场（两段短暂叠加淡入淡出），而非硬切。\n"
+                "仅串行合并模式下可用，需 2 个及以上片段才生效。\n\n"
+                "用法：勾选后在右侧「时长」填入每段转场持续秒数（默认 1.0）。\n"
+                "说明：\n"
+                "• 转场时长会自动钳制为最短片段的一半，避免过短片段出错；\n"
+                "• 与视频轨「淡入淡出」页配合：xfade 负责片段之间的过渡，\n"
+                "  首段淡入 / 末段淡出负责整段合并输出的起止淡黑；\n"
+                "• 开启后片段内部不再各自淡黑（避免叠加过黑）。\n"
+                "• 此「时长」编辑框的数字也用于右键菜单「一键淡入淡出（所有视频/音频轨）」：\n"
+                "  点该命令时会直接读取此处填写的秒数作为每段淡入/淡出的时长（短片段自动钳制）。",
+                wraplength=480)
+        self._xfade_cb = xfade_cb
+        # 初始状态：非串行模式灰色（与 _on_concat_toggle 联动保持一致）
+        if not self.concat_enabled.get():
+            xfade_cb.config(state='disabled')
 
         self.merge_only_audio = tk.BooleanVar(value=False)
         self.only_audio_checkbox = ttk.Checkbutton(
@@ -11831,6 +12206,8 @@ class FFmpegBatchGUI:
         self.copy_chapters.trace_add("write", lambda *a: self.merge_update_command_preview())
         self.chapter_file.trace_add("write", lambda *a: self.merge_update_command_preview())
         self.generate_chapters.trace_add("write", lambda *a: self.merge_update_command_preview())
+        self.xfade_enabled.trace_add("write", lambda *a: self.merge_update_command_preview())
+        self.xfade_duration.trace_add("write", lambda *a: self.merge_update_command_preview())
 
         self.pip_enabled.trace_add('write', self._on_pip_toggle)
         self.concat_enabled.trace_add('write', self._on_concat_toggle)
@@ -11879,6 +12256,7 @@ class FFmpegBatchGUI:
         # 批量：选中同源音频轨（或对应视频轨）各自套用对应视频轨的截取/变速/倒放（越界自动钳制）
         menu.add_command(label="同源音频批量套用同源视频 T S R (V → A)", command=self._batch_apply_src_video_to_audio)
         menu.add_separator()
+        menu.add_command(label="一键淡入淡出（All）", command=self._apply_fade_all_tracks)
         menu.add_command(label="启用/禁用", command=self.merge_toggle_selected)
         menu.add_command(label="编辑轨道", command=self.merge_edit_selected)
         menu.add_command(label="预览轨道", command=self.merge_preview_selected)
@@ -11898,6 +12276,45 @@ class FFmpegBatchGUI:
         x = self.root.winfo_pointerx()
         y = self.root.winfo_pointery()
         self._popup_merge_tree_menu(x, y)
+
+    def _apply_fade_all_tracks(self):
+        """一键为所有已启用的视频/音频轨道启用淡入淡出。
+
+        淡入淡出时长取自「串行转场」右侧的时长框（self.xfade_duration），默认 1.0s，
+        可自由填写不再死板；超过片段时长 40% 时自动钳制，避免过短片段淡入淡出互相覆盖。
+        """
+        enabled = [t for t in self.merge_tracks if t.enabled]
+        if not enabled:
+            messagebox.showinfo("提示", "没有已启用的轨道。")
+            return
+        # 取「串行转场」时长框的数字作为淡入淡出基准时长（可自定义）
+        try:
+            fade_base = float(self.xfade_duration.get().strip() or "1.0")
+        except ValueError:
+            fade_base = 1.0
+        if fade_base <= 0:
+            fade_base = 1.0
+        count = 0
+        for t in enabled:
+            if t.type == "video":
+                dur = self._get_effective_duration(t.enc_settings, input_path=t.file_path)
+                if dur is None or dur <= 0:
+                    dur = fade_base
+                f = min(fade_base, dur * 0.4)
+                t.enc_settings["fade_enabled"] = True
+                t.enc_settings["fade_in"] = f"{f:.2f}"
+                t.enc_settings["fade_out"] = f"{f:.2f}"
+                count += 1
+            elif t.type == "audio":
+                dur = self._get_media_duration(t.file_path) or fade_base
+                f = min(fade_base, dur * 0.4)
+                t.enc_settings["fade_enabled"] = True
+                t.enc_settings["fade_in"] = f"{f:.2f}"
+                t.enc_settings["fade_out"] = f"{f:.2f}"
+                count += 1
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+        self._append_info_ui(f"[淡入淡出] 已为 {count} 个视频/音频轨道启用淡入淡出（时长取自串行转场框：{fade_base:.2f}s，短片段自动钳制）")
 
     def _copy_filter_from_selected(self):
         """从选中的第一个轨道复制滤镜参数。
@@ -12471,6 +12888,8 @@ class FFmpegBatchGUI:
             "merge_container": self.merge_container.get(),
             "pip_enabled": self.pip_enabled.get(),
             "concat_enabled": self.concat_enabled.get(),
+            "xfade_enabled": self.xfade_enabled.get(),
+            "xfade_duration": self.xfade_duration.get(),
             "merge_only_audio": self.merge_only_audio.get(),
             "merge_manual_duration_enabled": self.merge_manual_duration_enabled.get(),
             "merge_manual_duration": self.merge_manual_duration.get(),
@@ -12535,6 +12954,8 @@ class FFmpegBatchGUI:
             self.merge_container.set(state.get("merge_container", "mkv"))
             self.pip_enabled.set(state.get("pip_enabled", False))
             self.concat_enabled.set(state.get("concat_enabled", False))
+            self.xfade_enabled.set(state.get("xfade_enabled", False))
+            self.xfade_duration.set(state.get("xfade_duration", "1.0"))
             self.merge_only_audio.set(state.get("merge_only_audio", False))
             self.merge_manual_duration_enabled.set(state.get("merge_manual_duration_enabled", False))
             self.merge_manual_duration.set(state.get("merge_manual_duration", ""))
@@ -12645,6 +13066,11 @@ class FFmpegBatchGUI:
             self._gen_chapters_cb.config(state=state)
             if not self.concat_enabled.get():
                 self.generate_chapters.set(False)
+        if hasattr(self, '_xfade_cb'):
+            xs = 'normal' if self.concat_enabled.get() else 'disabled'
+            self._xfade_cb.config(state=xs)
+            if not self.concat_enabled.get():
+                self.xfade_enabled.set(False)
         self.merge_update_command_preview()
         self.merge_update_track_list()
 
@@ -13274,6 +13700,18 @@ class FFmpegBatchGUI:
         return True
 
 
+    def _opus_copy_fallback(self, enc, audio_track):
+        """opus 音轨以 -c:a copy 封装进 MP4/MOV 会触发 muxer 警告 "codec frame size is not set"，
+        且 mp4/mov+opus 兼容性差（系统播放器/手机相册/网页可能不出声）。
+        检测到此组合时自动转 aac（消除警告并提升兼容性）。
+        返回 (final_enc, fallback_hint)：fallback_hint 为 None 表示无需兜底，
+        否则为提示信息片段（不含轨号），供调用方拼装完整提示。"""
+        if enc == "copy" and self.merge_container.get().lower() in ("mp4", "mov"):
+            src_codec = (getattr(audio_track, "codec", "") or "").lower()
+            if src_codec == "opus":
+                return "aac", "源编码为 opus，MP4/MOV 容器不支持 copy，已自动转码为 aac"
+        return enc, None
+
     def _add_audio_tracks(self, cmd, enabled_tracks, file_index, reverse_enabled=False):
         audio_tracks = [t for t in enabled_tracks if t.type == "audio"]
         audio_map_count = 0
@@ -13298,6 +13736,9 @@ class FFmpegBatchGUI:
                     enc = "aac"
                     self._append_info_ui(f"音频轨 {audio_map_count+1} 应用了滤镜，编码器自动改为 aac")
                 cmd.extend([f"-af:a:{audio_map_count}", af_str])
+            enc, fb = self._opus_copy_fallback(enc, audio)
+            if fb:
+                self._append_info_ui(f"音频轨 {audio_map_count+1} {fb}")
             if enc == "copy":
                 cmd.extend([f"-c:a:{audio_map_count}", "copy"])
             else:
@@ -13310,7 +13751,13 @@ class FFmpegBatchGUI:
         if audio_map_count == 0:
             cmd.append("-an")
         else:
-            cmd.extend(["-disposition:a:0", "default"])
+            # 默认轨标记（disposition）：每轨可单独设置；未设置时首轨为 default
+            for _mi, _a in enumerate(audio_tracks):
+                _disp = _a.enc_settings.get("disposition", "")
+                if _disp:
+                    cmd.extend([f"-disposition:a:{_mi}", _disp])
+                elif _mi == 0:
+                    cmd.extend([f"-disposition:a:{_mi}", "default"])
         return cmd
 
 
@@ -13344,7 +13791,11 @@ class FFmpegBatchGUI:
             if title := sub.enc_settings.get("title", ""):
                 cmd.extend([f"-metadata:s:s:{sub_map_count}", f"title={title}"])
 
-            if not first_sub_default:
+            disp = sub.enc_settings.get("disposition", "")
+            if disp:
+                cmd.extend([f"-disposition:s:{sub_map_count}", disp])
+                first_sub_default = True
+            elif not first_sub_default:
                 cmd.extend([f"-disposition:s:{sub_map_count}", "default"])
                 first_sub_default = True
             sub_map_count += 1
@@ -13459,6 +13910,15 @@ class FFmpegBatchGUI:
                 filters.append(f"atrim=start={start_sec:.3f}:duration={duration:.3f}")
                 filters.append("asetpts=PTS-STARTPTS")
 
+        # 时间偏移对齐（音频整体延后 N 秒，用于配音与原声对齐）
+        off = track_settings.get("audio_offset", 0)
+        try:
+            off_s = float(off) if off not in (None, "", 0) else 0.0
+        except (ValueError, TypeError):
+            off_s = 0.0
+        if off_s > 0:
+            filters.append(f"adelay=delays={off_s*1000:.0f}:all=1")
+
         # 音量
         if include_volume and track_settings.get("volume_enabled", False):
             vol = track_settings.get("volume", 1.0)
@@ -13528,9 +13988,9 @@ class FFmpegBatchGUI:
             if fin_s > 0:
                 filters.append(f"afade=t=in:st=0:d={fin_s:.3f}")
             if fout_s > 0:
-                total = self._get_media_duration(track_settings.get("_file_path", "")) if track_settings.get("_file_path") else None
-                if total:
-                    st = max(0.0, total - fout_s)
+                eff_dur = self._audio_effective_duration(track_settings, include_trim, include_speed)
+                if eff_dur:
+                    st = max(0.0, eff_dur - fout_s)
                     filters.append(f"afade=t=out:st={st:.3f}:d={fout_s:.3f}")
                 else:
                     filters.append(f"afade=t=out:st=0:d={fout_s:.3f}")
@@ -13544,6 +14004,61 @@ class FFmpegBatchGUI:
 
         return ",".join(filters) if filters else ""
     
+    def _audio_effective_duration(self, track_settings, include_trim=True, include_speed=True):
+        """计算音频经 截取/偏移/变速 处理后的实际时长（用于定位 afade 淡出起点）。
+        与 _build_audio_filters 内的滤镜顺序严格对应：截取 → 偏移(加头静音) → 变速(缩放)。
+        """
+        file_path = track_settings.get("_file_path", "")
+        total = self._get_media_duration(file_path) if file_path else None
+        dur = total
+        # 截取
+        if include_trim and track_settings.get("trim_enabled", False):
+            start = track_settings.get("trim_start", "").strip()
+            end = track_settings.get("trim_end", "").strip()
+            start_sec = time_to_seconds(start) if start else 0.0
+            end_sec = time_to_seconds(end) if end else None
+            if end_sec is not None:
+                dur = end_sec - start_sec
+            elif total is not None:
+                dur = total - start_sec
+            else:
+                dur = None
+        # 偏移（adelay 在段头加 N 秒静音）
+        off = track_settings.get("audio_offset", 0)
+        try:
+            off_s = float(off) if off not in (None, "", 0) else 0.0
+        except (ValueError, TypeError):
+            off_s = 0.0
+        if dur is not None and off_s > 0:
+            dur = dur + off_s
+        # 变速（atempo 缩放时长）
+        if include_speed and track_settings.get("audio_speed_enabled", False):
+            try:
+                factor = float(track_settings.get("audio_speed_factor", "1.0"))
+            except (ValueError, TypeError):
+                factor = 1.0
+            if dur is not None and factor > 0:
+                dur = dur / factor
+        return dur
+
+
+    def _build_afade_suffix(self, settings, duration):
+        """按 settings 的淡入淡出设置构建 afade 串（用于段级钳制之后，淡出精确落在段末）。"""
+        if not settings.get("fade_enabled", False):
+            return ""
+        fin = settings.get("fade_in", "")
+        fout = settings.get("fade_out", "")
+        fin_s = time_to_seconds(fin) if fin else 0.0
+        fout_s = time_to_seconds(fout) if fout else 0.0
+        parts = []
+        if fin_s > 0:
+            parts.append(f"afade=t=in:st=0:d={fin_s:.3f}")
+        if fout_s > 0 and duration and duration > 0:
+            st = max(0.0, duration - fout_s)
+            parts.append(f"afade=t=out:st={st:.3f}:d={fout_s:.3f}")
+        return ",".join(parts)
+
+
     def _build_normal_cmd(self, enabled_tracks, output_norm, only_audio=False):
         """
         普通封装模式：支持视频滤镜、多音频/字幕、音频截取、音频混合（amix）与音量调整。
@@ -13621,7 +14136,8 @@ class FFmpegBatchGUI:
                     include_subtitle=False,
                     include_speed=True,            # 主视频变速生效（音频变速由 _build_audio_filters 处理）
                     enhance_settings=v_settings.get("enhance", {}),
-                    reverse=video_reverse
+                    reverse=video_reverse,
+                    clip_duration=self._get_media_duration(main_video.file_path)
                 )
                 # 追加文字水印 drawtext
                 dt = build_drawtext_filter(v_settings.get("text_watermark", {}))
@@ -13663,6 +14179,9 @@ class FFmpegBatchGUI:
                         enc = "aac"
                         self._append_info_ui(f"音频轨 {audio_map_count+1} 应用了滤镜，编码器自动改为 aac")
                     cmd.extend([f"-af:a:{audio_map_count}", af_str])
+                enc, fb = self._opus_copy_fallback(enc, audio)
+                if fb:
+                    self._append_info_ui(f"音频轨 {audio_map_count+1} {fb}")
                 if enc == "copy":
                     cmd.extend([f"-c:a:{audio_map_count}", "copy"])
                 else:
@@ -13685,7 +14204,13 @@ class FFmpegBatchGUI:
             if audio_map_count == 0:
                 cmd.append("-an")
             else:
-                cmd.extend(["-disposition:a:0", "default"])
+                # 默认轨标记（disposition）：每轨可单独设置；未设置时首轨为 default
+                for _mi, _a in enumerate(audio_tracks):
+                    _disp = _a.enc_settings.get("disposition", "")
+                    if _disp:
+                        cmd.extend([f"-disposition:a:{_mi}", _disp])
+                    elif _mi == 0:
+                        cmd.extend([f"-disposition:a:{_mi}", "default"])
         else:
             if len(mix_tracks) == 1:
                 audio = mix_tracks[0]
@@ -13705,6 +14230,9 @@ class FFmpegBatchGUI:
                         enc = "aac"
                         self._append_info_ui("单流混合（音量/截取/倒放）强制编码为 aac")
                     cmd.extend(["-af", af_str])
+                enc, fb = self._opus_copy_fallback(enc, audio)
+                if fb:
+                    self._append_info_ui(f"[封装] {fb}")
                 if enc == "copy":
                     cmd.extend(["-c:a", "copy"])
                 else:
@@ -13721,7 +14249,11 @@ class FFmpegBatchGUI:
                 if title:
                     cmd.extend(["-metadata:s:a:0", f"title={title}"])
                     cmd.extend(["-metadata:s:a:0", f"handler_name={title}"])
-                cmd.extend(["-disposition:a:0", "default"])
+                disp = first_mix.enc_settings.get("disposition", "")
+                if disp:
+                    cmd.extend(["-disposition:a:0", disp])
+                else:
+                    cmd.extend(["-disposition:a:0", "default"])
             else:
                 filter_parts = []
                 inputs = len(mix_tracks)
@@ -13761,7 +14293,11 @@ class FFmpegBatchGUI:
             if title:
                 cmd.extend(["-metadata:s:a:0", f"title={title}"])
                 cmd.extend(["-metadata:s:a:0", f"handler_name={title}"])
-                cmd.extend(["-disposition:a:0", "default"])
+                disp = first_mix.enc_settings.get("disposition", "")
+                if disp:
+                    cmd.extend(["-disposition:a:0", disp])
+                else:
+                    cmd.extend(["-disposition:a:0", "default"])
     
         if only_audio:
             cmd.append("-vn")
@@ -14007,8 +14543,25 @@ class FFmpegBatchGUI:
     
         cmd.extend(["-f", "concat", "-safe", "0", "-i", list_path])
         cmd.extend(["-c:v", "copy"])
+        # opus→aac 自动兜底（串行流复制模式）：源音频含 opus 且输出为 mp4/mov 时，
+        # 仅音频重编码为 aac（视频仍 copy），消除 muxer 警告并提升兼容性。
+        concat_opus_fallback = False
+        if self.merge_container.get().lower() in ("mp4", "mov"):
+            for _vt in video_tracks:
+                _info = self._get_cached_stream_info(_vt.file_path)
+                if _info:
+                    for _s in _info.get("streams", []):
+                        if _s.get("codec_type") == "audio" and (_s.get("codec_name") or "").lower() == "opus":
+                            concat_opus_fallback = True
+                            break
+                if concat_opus_fallback:
+                    break
         if audio_tracks:
-            cmd.extend(["-c:a", "copy"])
+            if concat_opus_fallback:
+                cmd.extend(["-c:a", "aac", "-b:a", "192k", "-ar", "44100"])
+                self._append_info_ui("[串联-流] 检测到源音频含 opus，MP4 不支持 copy，音频已自动转码为 aac")
+            else:
+                cmd.extend(["-c:a", "copy"])
         else:
             cmd.append("-an")
     
@@ -14019,6 +14572,62 @@ class FFmpegBatchGUI:
         return cmd
 
 
+    def _probe_audio_params(self, file_path):
+        """探测文件首个音频流的采样率 / 声道数 / 采样格式，返回 dict 或 None。"""
+        info = self._get_cached_stream_info(file_path)
+        if not info:
+            return None
+        for s in info.get("streams", []):
+            if s.get("codec_type") == "audio":
+                sr = s.get("sample_rate")
+                if not sr:
+                    return None
+                ch = s.get("channels") or 2
+                fmt = s.get("sample_fmt") or "s16"
+                return {"sr": int(sr), "ch": int(ch), "fmt": fmt}
+        return None
+
+
+    def _build_audio_normalize(self, video_tracks, audio_tracks):
+        """
+        计算串行合并的音频归一串（concat / acrossfade 要求各段采样率 / 声道 / 采样格式一致）。
+        策略：
+          1 段   → 不归一（单段无 concat 约束，避免无谓重采样/下混）
+          2 段   → 跟随主视频（首段）音频参数
+          ≥3 段  → 跟随多数轨（采样率 / 声道 / 采样格式逐维度取众数）
+        返回归一串；无需归一（或探测失败）时返回空字符串。
+        """
+        src_files = []
+        if audio_tracks:
+            src_files = [a.file_path for a in audio_tracks]
+        else:
+            src_files = [t.file_path for t in video_tracks
+                         if t.enc_settings.get("audio_source_type", "self") != "silence"]
+        params = []
+        for fp in src_files:
+            p = self._probe_audio_params(fp)
+            if p:
+                params.append(p)
+        if len(params) <= 1:
+            return ""  # 1 段（或无可探测音频）不归一
+        if len(params) == 2:
+            target = params[0]  # 跟随主视频（首段）
+        else:
+            target = _majority_audio_params(params)  # 跟随多数轨
+        sr = target.get("sr")
+        if not sr:
+            return ""
+        fmt = target.get("fmt") or "s16"
+        cl = _channel_layout_name(target.get("ch", 2))
+        # 注意：本机 ffmpeg 的 aresample 不接受 channel_layout 选项，声道统一由 aformat 完成。
+        parts = [f"aresample={int(sr)}"]
+        if cl:
+            parts.append(f"aformat=sample_fmts={fmt}:channel_layouts={cl}")
+        else:
+            parts.append(f"aformat=sample_fmts={fmt}")
+        return ",".join(parts)
+
+
     def _build_concat_reencode_mode(self, cmd, video_tracks, audio_tracks, main_video, output_norm):
         """
         重新编码模式 - 使用 filter_complex concat。
@@ -14026,6 +14635,11 @@ class FFmpegBatchGUI:
         强制统一分辨率、像素格式、帧率、SAR。
         全局阶段仅应用：视频字幕烧录；音频音量调整。
         """
+        # 串行重编码模式不再使用「独立外部音轨」的 1:1 段映射：该功能未实现绑定语义，
+        # 且音频轨数量与视频段数不匹配时会导致部分段丢失音频（原 L14661 分支）。
+        # 外部音频统一改为「主视频音频绑定页 -> 背景音乐 (BGM)」全局叠加，见下方 6b 节。
+        audio_tracks = []
+
         # ----- 1. 计算主视频最终输出规格（用于强制统一） -----
         main_orig_w, main_orig_h = self._cached_video_dimensions(main_video.file_path)
         if main_orig_w is None or main_orig_h is None:
@@ -14053,11 +14667,16 @@ class FFmpegBatchGUI:
             raw_fps = self._get_video_framerate(main_video.file_path)
             target_fps = raw_fps if raw_fps is not None else 30.0
     
-        # ----- 2. 添加输入文件（视频 + 独立音频轨道） -----
+        # ----- 2. 添加输入文件（视频 + 全局 BGM） -----
+        # 注意：串行模式已不使用 audio_tracks（见函数开头），外部音频统一走 BGM。
         concat_input_files = [t.file_path for t in video_tracks]
-        for audio in audio_tracks:
-            if audio.file_path not in concat_input_files:
-                concat_input_files.append(audio.file_path)
+        # 全局背景音乐（主视频音频绑定页启用时）
+        _bgm_path = (main_video.enc_settings.get("bgm_audio_path", "") or "").strip()
+        if (main_video.enc_settings.get("bgm_enabled", False)
+                and _bgm_path and os.path.isfile(_bgm_path)):
+            _bgm_norm = normalize_path(_bgm_path)
+            if _bgm_norm not in concat_input_files:
+                concat_input_files.append(_bgm_norm)
         file_index = {p: i for i, p in enumerate(concat_input_files)}
         for p in concat_input_files:
             cmd.extend(["-i", normalize_path(p)])
@@ -14068,9 +14687,36 @@ class FFmpegBatchGUI:
         v_labels = []
         a_labels = []
     
+        # 预计算每段时长与 xfade 转场参数
+        seg_durations = []
+        for _t in video_tracks:
+            _d = self._get_effective_duration(_t.enc_settings, input_path=_t.file_path)
+            if _d is None or _d <= 0:
+                _d = 10.0
+            seg_durations.append(_d)
+
+        use_xfade = bool(self.xfade_enabled.get()) and n >= 2
+        xfade_d = None
+        if use_xfade:
+            try:
+                xfade_d = float(self.xfade_duration.get().strip() or "1.0")
+            except ValueError:
+                xfade_d = 1.0
+            if xfade_d <= 0 or min(seg_durations) <= 0:
+                use_xfade = False
+            else:
+                xfade_d = min(xfade_d, min(seg_durations) / 2.0)
+                if xfade_d < 0.05:
+                    use_xfade = False
+
+        # 串行合并音频归一：concat / acrossfade 都要求各音频段采样率 / 声道布局 / 采样格式一致。
+        # 策略：1 段不归一；2 段跟随主视频（首段）；≥3 段跟随多数轨（逐维度众数）。
+        # 返回空串表示无需归一（1 段或探测失败）。
+        audio_concat_normalize = self._build_audio_normalize(video_tracks, audio_tracks)
+
         for i, track in enumerate(video_tracks):
             settings = track.enc_settings.copy()
-    
+
             # ----- 视频部分（所有滤镜独立） -----
             video_filters = build_video_filter_chain(
                 settings,
@@ -14081,7 +14727,9 @@ class FFmpegBatchGUI:
                 include_scale=False,                 # 缩放由强制统一覆盖
                 enhance_settings=settings.get("enhance", {}),  # 增强独立
                 reverse=settings.get("reverse_enabled", False), # 倒放独立
-                graph_id=f"c{i}"                     # 同一 filter_complex 内标签需唯一
+                graph_id=f"c{i}",                     # 同一 filter_complex 内标签需唯一
+                include_fade=(not use_xfade),         # xfade 模式下不内嵌逐段淡黑，避免与交叉溶解冲突
+                clip_duration=seg_durations[i]         # 用于精确定位淡出起点
             )
     
             # 强制统一滤镜（所有视频一致）
@@ -14101,14 +14749,46 @@ class FFmpegBatchGUI:
             filter_parts.append(f"[{i}:v]{full_vf}[v{i}]")
             v_labels.append(f"[v{i}]")
     
-        # ----- 4. 视频拼接 -----
-        v_concat = f"{''.join(v_labels)}concat=n={n}:v=1:a=0[vout]"
-        filter_parts.append(v_concat)
+        # ----- 4. 视频拼接 / 交叉溶解转场 -----
+        if use_xfade:
+            # 相邻片段交叉溶解（xfade），自动累计 offset
+            prev = v_labels[0]
+            cumulative = seg_durations[0]
+            for k in range(1, n):
+                offset = cumulative - k * xfade_d
+                if offset < 0:
+                    offset = 0.0
+                out_label = "[vout]" if k == n - 1 else f"[vx{k}]"
+                filter_parts.append(
+                    f"{prev}[v{k}]xfade=transition=fade:duration={xfade_d:.3f}:offset={offset:.3f}{out_label}"
+                )
+                prev = out_label
+                cumulative += seg_durations[k]
+            # 整体上 / 下淡入淡出到黑（取首段淡入、末段淡出；仅在对应段启用了淡入淡出时生效）
+            first_in = 0.0
+            if video_tracks[0].enc_settings.get("fade_enabled", False):
+                first_in = time_to_seconds(video_tracks[0].enc_settings.get("fade_in", "")) or 0.0
+            last_out = 0.0
+            if video_tracks[-1].enc_settings.get("fade_enabled", False):
+                last_out = time_to_seconds(video_tracks[-1].enc_settings.get("fade_out", "")) or 0.0
+            total_dur = cumulative - (n - 1) * xfade_d
+            overall_fade = []
+            if first_in > 0:
+                overall_fade.append(f"fade=t=in:st=0:d={first_in:.3f}")
+            if last_out > 0:
+                st = max(0.0, total_dur - last_out)
+                overall_fade.append(f"fade=t=out:st={st:.3f}:d={last_out:.3f}")
+            if overall_fade:
+                filter_parts.append(f"[vout]{','.join(overall_fade)}[vout]")
+            self._append_info_ui(f"[串联-编] 使用 xfade 交叉溶解转场（时长 {xfade_d:.2f}s）")
+        else:
+            v_concat = f"{''.join(v_labels)}concat=n={n}:v=1:a=0[vout]"
+            filter_parts.append(v_concat)
 
         # ----- 4b. 音频拼接 -----
         # 优先使用「独立音频轨道」的逐轨设置（与其它模式统一，音频完全独立控制）；
-        # 若未添加任何独立音频轨道，则回退到各视频自带音轨，
-        #   此时嵌入音频仅做截取 / 基准 PTS 重置，不再跟随视频的倒放或变速（已全面解绑）。
+        # 若未添加任何独立音频轨道，则回退到各视频自带音轨，此时嵌入音轨跟随其视频段的
+        #   截取/变速/倒放（保持音画同步），避免被段级钳制静默截断或拖尾。
         a_labels = []
         if audio_tracks:
             for j, audio in enumerate(audio_tracks):
@@ -14119,13 +14799,30 @@ class FFmpegBatchGUI:
                     include_trim=True,
                     include_volume=True,
                     include_speed=True,
-                    include_reverse=audio.enc_settings.get("audio_reverse", False)
+                    include_reverse=audio.enc_settings.get("audio_reverse", False),
+                    include_fade=False   # 淡入淡出改在段级钳制之后统一追加，精确定位到段末
                 )
+                # 段级时长钳制：让每段音频总时长 = 对应视频段的处理后时长 seg_durations[j]，
+                # 这样 concat 顺序拼接后，各段音频与视频的累计时间一致，不会因偏移(adelay)/
+                # 变速/截取而逐段错位（连得越多越歪）。
+                # atrim=0:T 切掉超长的尾巴（偏移过大时配音尾被裁，合理）；
+                # apad=whole_dur=T 把不足 T 的用静音补到正好 T（否则下一段音频会提前开始，漂移照旧）。
+                # 严格 1:1 映射：音频轨 j 对应视频段 j。
+                tgt = seg_durations[j] if j < len(seg_durations) else (seg_durations[-1] if seg_durations else 0.0)
+                clamp = f"atrim=0:{tgt:.3f},apad=whole_dur={tgt:.3f}"
                 if af_str:
-                    filter_parts.append(f"[{a_idx}:a]{af_str}[a{j}]")
+                    chain = f"{af_str},{clamp}"
                 else:
-                    filter_parts.append(f"[{a_idx}:a]asetpts=PTS-STARTPTS[a{j}]")
+                    chain = f"asetpts=PTS-STARTPTS,{clamp}"
+                if audio_concat_normalize:
+                    chain = f"{audio_concat_normalize},{chain}"
+                if not use_xfade:
+                    f_suffix = self._build_afade_suffix(audio.enc_settings, tgt)
+                    if f_suffix:
+                        chain = f"{chain},{f_suffix}"
+                filter_parts.append(f"[{a_idx}:a]{chain}[a{j}]")
                 a_labels.append(f"[a{j}]")
+            self._append_info_ui(f"[串联-编] 音频段已逐段钳制到对应视频段时长（防止偏移/变速导致累计错位）")
         else:
             for i, track in enumerate(video_tracks):
                 settings = track.enc_settings.copy()
@@ -14138,22 +14835,51 @@ class FFmpegBatchGUI:
                 if info:
                     has_audio = any(s.get('codec_type') == 'audio' for s in info.get('streams', []))
                 if audio_type == "silence" or not has_audio:
-                    filter_parts.append(f"anullsrc=r=44100:cl=stereo:duration={effective_duration:.3f}[a{i}]")
+                    norm_suffix = f",{audio_concat_normalize}" if audio_concat_normalize else ""
+                    filter_parts.append(f"anullsrc=r=44100:cl=stereo:duration={effective_duration:.3f}{norm_suffix}[a{i}]")
                 else:
                     audio_filters = []
                     if settings.get("trim_enabled", False):
                         start = settings.get("trim_start", "").strip()
                         end = settings.get("trim_end", "").strip()
                         start_sec = time_to_seconds(start) if start else 0.0
-                        if effective_duration > 0:
-                            audio_filters.append(f"atrim=start={start_sec:.3f}:duration={effective_duration:.3f}")
+                        end_sec = time_to_seconds(end) if end else None
+                        total = self._get_media_duration(track.file_path) if track.file_path else None
+                        if end_sec is not None:
+                            trim_dur = end_sec - start_sec
+                        elif total is not None:
+                            trim_dur = total - start_sec
+                        else:
+                            trim_dur = None
+                        if trim_dur is not None and trim_dur > 0:
+                            audio_filters.append(f"atrim=start={start_sec:.3f}:duration={trim_dur:.3f}")
                             audio_filters.append("asetpts=PTS-STARTPTS")
-                    # 视频自带音轨的音频完全独立：仅做截取 / 基准 PTS 重置，
-                    # 不再跟随视频的「倒放」「变速」（所有模式全面解绑）。
-                    # 若需对嵌入音频做倒放或变速，请在合并页单独添加音频轨道并独立设置。
+                    # 视频自带音轨应与其视频段保持音画同步：跟随视频的变速与倒放，
+                    # 使嵌入音轨自然时长 == 视频段时长，避免被段级钳制静默截断/拖尾。
+                    if settings.get("speed_enabled", False):
+                        try:
+                            vfactor = float(settings.get("speed_factor", "1.0"))
+                        except (ValueError, TypeError):
+                            vfactor = 1.0
+                        if vfactor != 1.0 and vfactor > 0:
+                            atempo = build_atempo_chain(vfactor)
+                            if atempo:
+                                audio_filters.append(atempo)
+                    if settings.get("reverse_enabled", False):
+                        audio_filters.append("areverse")
                     if not audio_filters:
                         audio_filters.append("asetpts=PTS-STARTPTS")
+                    # 段级时长钳制：嵌入音轨也对齐到视频段处理后时长 effective_duration，
+                    # 避免嵌入音轨比视频段短/长导致 concat 后累计错位。
+                    audio_filters.append(f"atrim=0:{effective_duration:.3f}")
+                    audio_filters.append(f"apad=whole_dur={effective_duration:.3f}")
                     audio_chain = ",".join(audio_filters)
+                    if audio_concat_normalize:
+                        audio_chain = f"{audio_concat_normalize},{audio_chain}"
+                    if not use_xfade:
+                        f_suffix = self._build_afade_suffix(settings, effective_duration)
+                        if f_suffix:
+                            audio_chain = f"{audio_chain},{f_suffix}"
                     filter_parts.append(f"[{i}:a]{audio_chain}[a{i}]")
                 a_labels.append(f"[a{i}]")
     
@@ -14176,13 +14902,81 @@ class FFmpegBatchGUI:
         else:
             vmap = "[vout]"
 
-        # ----- 6. 音频拼接 -----
-        a_concat = f"{''.join(a_labels)}concat=n={len(a_labels)}:v=0:a=1[aout]"
-        filter_parts.append(a_concat)
+        # ----- 6. 音频拼接 / 交叉溶解转场（acrossfade，跟随串行转场按钮，不外露设置） -----
+        if use_xfade and len(a_labels) >= 2:
+            # 与视频 xfade 完全镜像：相邻音频段交叉溶解而非硬切。
+            # 段级钳制已在第 4b 节把每段音频拉到对应视频段时长 seg_durations[j]。
+            # acrossfade 的 overlap=true（默认）会让第二段开头与第一段结尾自动重叠交叉溶解，
+            # 无需手动 offset；链式拼接后总时长 = Σ段长 - (段数-1)*d，与视频 xfade 一致。
+            prev = a_labels[0]
+            a_cumulative = seg_durations[0] if seg_durations else 0.0
+            for k in range(1, len(a_labels)):
+                _sd = seg_durations[k] if k < len(seg_durations) else (seg_durations[-1] if seg_durations else 0.0)
+                out_label = "[aout]" if k == len(a_labels) - 1 else f"[ax{k}]"
+                filter_parts.append(
+                    f"{prev}[a{k}]acrossfade=c1=tri:c2=tri:d={xfade_d:.3f}{out_label}"
+                )
+                prev = out_label
+                a_cumulative += _sd
+            # 整体上 / 下淡入淡出到静音（跟随首/末视频段淡入淡出开关与时长）
+            a_first_in = 0.0
+            if video_tracks[0].enc_settings.get("fade_enabled", False):
+                a_first_in = time_to_seconds(video_tracks[0].enc_settings.get("fade_in", "")) or 0.0
+            a_last_out = 0.0
+            if video_tracks[-1].enc_settings.get("fade_enabled", False):
+                a_last_out = time_to_seconds(video_tracks[-1].enc_settings.get("fade_out", "")) or 0.0
+            total_a_dur = a_cumulative - (len(a_labels) - 1) * xfade_d
+            overall_afade = []
+            if a_first_in > 0:
+                overall_afade.append(f"afade=t=in:st=0:d={a_first_in:.3f}")
+            if a_last_out > 0:
+                st = max(0.0, total_a_dur - a_last_out)
+                overall_afade.append(f"afade=t=out:st={st:.3f}:d={a_last_out:.3f}")
+            if overall_afade:
+                filter_parts.append(f"[aout]{','.join(overall_afade)}[aout]")
+            self._append_info_ui(f"[串联-编] 音频使用 acrossfade 交叉溶解转场（跟随串行转场，时长 {xfade_d:.2f}s）")
+        else:
+            a_concat = f"{''.join(a_labels)}concat=n={len(a_labels)}:v=0:a=1[aout]"
+            filter_parts.append(a_concat)
 
         # ----- 7. 音频映射：音量等已全部下放到每条独立音轨（_build_audio_filters），
         #           不再在此套用全局音量，避免与主视频音量重复叠加 -----
         amap = "[aout]"
+
+        # ----- 6b. 全局背景音乐 (BGM) 叠加（仅主视频音频绑定页启用时） -----
+        # 外部音频循环铺满整段合并输出，按设定音量降低后混在 [aout] 原音之下。
+        _bgm_path = (main_video.enc_settings.get("bgm_audio_path", "") or "").strip()
+        if (main_video.enc_settings.get("bgm_enabled", False)
+                and _bgm_path and os.path.isfile(_bgm_path)
+                and a_labels):
+            _bgm_norm = normalize_path(_bgm_path)
+            _bgm_idx = file_index.get(_bgm_norm)
+            if _bgm_idx is not None:
+                _bgm_vol = 0.3
+                try:
+                    _bgm_vol = float(main_video.enc_settings.get("bgm_volume", 0.3) or 0.3)
+                except (ValueError, TypeError):
+                    _bgm_vol = 0.3
+                # BGM 归一：>=2 段跟随各段统一格式；单段则强制立体声 44100，便于与 [aout] 混音
+                _bgm_norm_str = audio_concat_normalize if audio_concat_normalize else "aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=44100"
+                _total_a = sum(seg_durations)
+                if use_xfade and xfade_d:
+                    _total_a -= (len(a_labels) - 1) * xfade_d
+                _bgm_chain = (
+                    f"[{_bgm_idx}:a]{_bgm_norm_str},"
+                    f"aloop=loop=-1:size=2000000000,"
+                    f"atrim=0:{_total_a:.3f},"
+                    f"volume={_bgm_vol:.3f},"
+                    f"asetpts=PTS-STARTPTS[bgm]"
+                )
+                filter_parts.append(_bgm_chain)
+                filter_parts.append(
+                    f"[aout][bgm]amix=inputs=2:duration=longest:normalize=0[afinal]"
+                )
+                amap = "[afinal]"
+                self._append_info_ui(
+                    f"[串联-编] 已叠加背景音乐（{os.path.basename(_bgm_path)}，音量 {_bgm_vol:.2f}，混在原音之下）"
+                )
 
         # ----- 8. 组合所有滤镜 -----
         all_filters = ";".join(filter_parts)
@@ -14508,6 +15302,12 @@ class FFmpegBatchGUI:
         """
         获取考虑元数据旋转与用户旋转后的尺寸，优先读解析缓存。
         缓存未命中时回退现有未缓存实现（保持原始行为完全一致）。
+
+        ⚠️ 旋转语义必须与模块级 get_video_rotated_dimensions 逐字一致：
+          1) 元数据旋转：side_data_list.rotation，rot % 180 == 90 时交换宽高；
+          2) 用户旋转：settings["rotate"] in ("90","270") 时交换宽高。
+        切勿改用不旋转的 _cached_video_dimensions / get_video_dimensions，
+        否则会丢掉旋转，导致命令预览与实际转换的尺寸不一致。
         """
         w, h = self._cached_video_dimensions(file_path)
         if w is None:
@@ -14596,6 +15396,7 @@ class FFmpegBatchGUI:
         self.merge_tree.tag_configure('odd_subtitle', background='#d8cfe8')
         self.merge_tree.tag_configure('even_video', background='#f0f0f0')
         self.merge_tree.tag_configure('odd_video', background='#e0e0e0')
+        self.merge_tree.tag_configure('disabled', foreground='#B22222')
     
         # 确定主视频
         enabled_video_tracks = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
@@ -14673,7 +15474,7 @@ class FFmpegBatchGUI:
                 tag = 'even' if i % 2 == 0 else 'odd'
     
             # 显示内容
-            enabled_text = "✓" if track.enabled else "✗"
+            enabled_text = "启" if track.enabled else "禁"
             enc_text = "复制流" if not track.is_encoding() else track.enc_settings.get("encoder", "?")
             display_type = track.type
             if track.type == "video" and track == main_video:
@@ -14760,7 +15561,8 @@ class FFmpegBatchGUI:
                 enc_text
             )
             iid = f"track_{i}"
-            self.merge_tree.insert("", tk.END, iid=iid, values=values, tags=(tag,))
+            row_tags = (tag, "disabled") if not track.enabled else (tag,)
+            self.merge_tree.insert("", tk.END, iid=iid, values=values, tags=row_tags)
     
         if not self.merge_tracks:
             self.merge_tree.insert("", tk.END, values=("", "未加载轨道", "", "", ""))
@@ -14979,7 +15781,8 @@ class FFmpegBatchGUI:
                 include_subtitle=False,
                 include_speed=False,
                 enhance_settings=enhance,
-                reverse=False
+                reverse=False,
+                clip_duration=self._get_media_duration(track.file_path)
             )
     
             # ---- 画中画模式：为主视频绘制子视频虚拟框 ----
@@ -15362,6 +16165,25 @@ class FFmpegBatchGUI:
             trim_frame.pack(fill=tk.X, padx=5, pady=5)
             trim_frame.set_settings(initial_settings)
 
+            # ---- 页面：淡入淡出（视频） ----
+            # 变量在函数作用域定义，save() 中统一写回
+            fade_enabled_var = tk.BooleanVar(value=initial_settings.get("fade_enabled", False))
+            fade_in_var = tk.StringVar(value=str(initial_settings.get("fade_in", "")))
+            fade_out_var = tk.StringVar(value=str(initial_settings.get("fade_out", "")))
+            if not is_watermark and (track_obj is None or (hasattr(track_obj, 'type') and track_obj.type == "video")):
+                page_fade = ttk.Frame(notebook)
+                notebook.add(page_fade, text="淡入淡出")
+                fade_frame = ttk.Frame(page_fade, padding="10")
+                fade_frame.pack(fill=tk.X, pady=5)
+                ttk.Checkbutton(fade_frame, text="启用淡入淡出（片段首尾淡入黑 / 淡出黑）",
+                                variable=fade_enabled_var).grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+                ttk.Label(fade_frame, text="淡入时长(秒):").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+                ttk.Entry(fade_frame, textvariable=fade_in_var, width=10).grid(row=1, column=1, padx=5, pady=5, sticky="w")
+                ttk.Label(fade_frame, text="淡出时长(秒):").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+                ttk.Entry(fade_frame, textvariable=fade_out_var, width=10).grid(row=2, column=1, padx=5, pady=5, sticky="w")
+                ttk.Label(fade_frame, text="留空=不应用该项。建议 0.5~2 秒；串行合并下片段间可用 xfade 交叉溶解转场。",
+                          foreground="gray").grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+
             # 水印或画中画模式下，强制启用精准截取
             if is_watermark or (pip_enabled_var is not None and pip_enabled_var.get()):
                 trim_frame.precise_trim.set(True)
@@ -15381,7 +16203,7 @@ class FFmpegBatchGUI:
             if show_loop_chroma:
                 page_loop = ttk.Frame(notebook)
                 notebook.add(page_loop, text="循环/绿幕控制")
-                loop_chroma_frame = LoopChromaFrame(page_loop)
+                loop_chroma_frame = LoopChromaFrame(page_loop, filt_frame=filt_frame)
                 loop_chroma_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
                 loop_chroma_frame.set_settings(initial_settings)
                 if file_path and os.path.exists(file_path):
@@ -15489,7 +16311,8 @@ class FFmpegBatchGUI:
                             scale_h_var=filt_frame.scale_height,
                             watermark_dict=initial_settings,  # 用于回写水印设置
                             filt_frame=filt_frame,
-                            parent=win
+                            parent=win,
+                            free_layout=overlay_frame.overlay_free_layout.get()
                         )
                     overlay_frame = OverlayPositionFrame(
                         page_overlay,
@@ -15564,6 +16387,15 @@ class FFmpegBatchGUI:
                 ttk.Label(meta_frame, text="从下拉框选择常用语言，或直接输入 ISO 639-2/B 代码（如 cmn、yue）",
                           foreground="gray").grid(row=3, column=0, columnspan=4, sticky="w", padx=5, pady=2)
 
+            # 是否为主视频（串行模式下第一段启用视频）= 全局 BGM 接口所在页
+            is_main_video = False
+            if is_concat_mode and track_obj is not None and getattr(track_obj, 'type', None) == 'video':
+                _vids = [t for t in self.merge_tracks if getattr(t, 'type', None) == 'video' and t.enabled]
+                is_main_video = bool(_vids) and track_obj == _vids[0]
+            bgm_enabled_var = None
+            bgm_path_var = None
+            bgm_volume_var = None
+
             # ================== 页面7：音频绑定 ==================
             # 仅在串接模式下显示此页（水印无音频绑定需求）
             if is_concat_mode and not is_watermark and track_obj is not None and track_obj.type == "video":
@@ -15573,11 +16405,13 @@ class FFmpegBatchGUI:
                 bind_frame = ttk.Frame(page_audio_binding, padding="10")
                 bind_frame.pack(fill=tk.BOTH, expand=True)
     
-                ttk.Label(bind_frame, text="音频源类型:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+                # 音频源类型：标签与单选按钮放进同一跨列容器，避免 BGM 展开时网格重分配列宽致单选按钮右移
+                src_row = ttk.Frame(bind_frame)
+                src_row.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+                ttk.Label(src_row, text="音频源类型:").pack(side=tk.LEFT, padx=(0, 5))
                 audio_source_type_var = tk.StringVar(value=initial_settings.get("audio_source_type", "self"))
-                source_frame = ttk.Frame(bind_frame)
-                source_frame.grid(row=0, column=1, sticky="w", padx=5)
-    
+                source_frame = ttk.Frame(src_row)
+                source_frame.pack(side=tk.LEFT)
                 rb_self = ttk.Radiobutton(source_frame, text="使用视频自身音频", 
                                           variable=audio_source_type_var, value="self")
                 rb_silence = ttk.Radiobutton(source_frame, text="生成静音流", 
@@ -15586,19 +16420,58 @@ class FFmpegBatchGUI:
                 # rb_external = ttk.Radiobutton(source_frame, text="从外部文件导入", variable=audio_source_type_var, value="external")
                 rb_self.pack(side=tk.LEFT, padx=5)
                 rb_silence.pack(side=tk.LEFT, padx=5)
+                ToolTip(rb_silence,
+                        "静音流时长自动匹配视频片段时长。\n"
+                        "此功能用于解决串接时因视频缺少音频流导致的音画错位问题。\n"
+                        "注意：此功能会强制重新编码视频（无法使用流复制）。\n"
+                        "如需快速拼接且保留原始编码，可提前用命令生成静音音频文件，\n"
+                        "例如：ffmpeg -f lavfi -i anullsrc=r=44100:cl=stereo -t 10 silence.wav\n"
+                        "然后将该音频流 copy 无损封装到视频中，最后再使用 copy 模式进行串接。")
+
+                if is_main_video:
+                    bgm_enabled_var = tk.BooleanVar(value=bool(initial_settings.get("bgm_enabled", False)))
+                    bgm_path_var = tk.StringVar(value=initial_settings.get("bgm_audio_path", "") or "")
+                    try:
+                        _bv = float(initial_settings.get("bgm_volume", 0.3) or 0.3)
+                    except (ValueError, TypeError):
+                        _bv = 0.3
+                    bgm_volume_var = tk.DoubleVar(value=_bv)
+
+                    bgm_frame = ttk.LabelFrame(bind_frame, text="背景音乐 (BGM，全局叠加)", padding="8")
+                    bgm_frame.grid(row=3, column=0, columnspan=2, sticky="we", padx=5, pady=8)
+
+                    ttk.Checkbutton(
+                        bgm_frame, text="叠加背景音乐（循环铺满整段输出，混在原有音频之下）",
+                        variable=bgm_enabled_var,
+                        command=lambda: _bgm_sub.grid() if bgm_enabled_var.get() else _bgm_sub.grid_remove()
+                    ).grid(row=0, column=0, sticky="w", padx=5, pady=3)
+
+                    _bgm_sub = ttk.Frame(bgm_frame)
+                    _bgm_sub.grid(row=1, column=0, sticky="we", padx=5, pady=3)
+
+                    ttk.Label(_bgm_sub, text="音频文件:").grid(row=0, column=0, sticky="w", padx=3)
+                    _bgm_entry = ttk.Entry(_bgm_sub, textvariable=bgm_path_var, width=38)
+                    _bgm_entry.grid(row=0, column=1, padx=3)
+                    ttk.Button(_bgm_sub, text="浏览...",
+                               command=lambda: self._browse_bgm_file(bgm_path_var)).grid(row=0, column=2, padx=3)
+
+                    ttk.Label(_bgm_sub, text="音量:").grid(row=1, column=0, sticky="w", padx=3, pady=4)
+                    _bgm_scale = ttk.Scale(_bgm_sub, from_=0.0, to=1.0, orient=tk.HORIZONTAL,
+                                           variable=bgm_volume_var, length=200)
+                    _bgm_scale.grid(row=1, column=1, sticky="we", padx=3, pady=4)
+                    _bgm_vollbl = ttk.Label(_bgm_sub, text=f"{_bv:.2f}")
+                    _bgm_vollbl.grid(row=1, column=2, padx=3, pady=4)
+                    _bgm_scale.config(command=lambda v: _bgm_vollbl.config(text=f"{float(v):.2f}"))
+
+                    ttk.Label(_bgm_sub,
+                              text="外部音频将循环铺满整段合并输出，并按此处比例降低音量后垫在原音之下。",
+                              foreground="gray").grid(row=2, column=0, columnspan=3, sticky="w", padx=3, pady=2)
+
+                    if not bgm_enabled_var.get():
+                        _bgm_sub.grid_remove()
     
-                ttk.Label(
-                    bind_frame,
-                    text="静音流时长自动匹配视频片段时长。\n"
-                         "此功能用于解决串接时因视频缺少音频流导致的音画错位问题。\n"
-                         "注意：此功能会强制重新编码视频（无法使用流复制）。\n"
-                         "如需快速拼接且保留原始编码，可提前用命令生成静音音频文件，\n"
-                         "例如：ffmpeg -f lavfi -i anullsrc=r=44100:cl=stereo -t 10 silence.wav\n"
-                         "然后将该音频流 copy 无损封装到视频中，最后再使用 copy 模式进行串接。",
-                    foreground="gray",
-                    justify=tk.LEFT
-                ).grid(row=1, column=0, columnspan=2, sticky="w", padx=5, pady=10)
-    
+                # 静音流说明已移至「生成静音流」单选按钮的 ToolTip，不再占用界面空间
+
                 # 预留外部文件控件（暂时隐藏）
                 # external_frame = ttk.Frame(bind_frame)
                 # external_frame.grid(row=2, column=0, columnspan=2, sticky="we", padx=5, pady=5)
@@ -15618,6 +16491,9 @@ class FFmpegBatchGUI:
                     new_settings.update(enc_frame.get_settings())
                     new_settings.update(filt_frame.get_settings())
                     new_settings.update(trim_frame.get_settings())
+                    new_settings["fade_enabled"] = fade_enabled_var.get()
+                    new_settings["fade_in"] = fade_in_var.get().strip()
+                    new_settings["fade_out"] = fade_out_var.get().strip()
                     if loop_chroma_frame is not None:
                         new_settings.update(loop_chroma_frame.get_settings())
                     if overlay_frame is not None:
@@ -15630,6 +16506,10 @@ class FFmpegBatchGUI:
                         # 仅在串行模式下收集音频绑定设置
                         if is_concat_mode and track_obj is not None and track_obj.type == "video":
                             new_settings["audio_source_type"] = audio_source_type_var.get()
+                            if is_main_video and bgm_enabled_var is not None:
+                                new_settings["bgm_enabled"] = bgm_enabled_var.get()
+                                new_settings["bgm_audio_path"] = bgm_path_var.get().strip()
+                                new_settings["bgm_volume"] = bgm_volume_var.get()
                             # 以下两项暂不支持，留作未来扩展
                             # new_settings["external_audio_path"] = ""
                             # new_settings["external_audio_stream"] = "0:a:0"
@@ -15752,7 +16632,7 @@ class FFmpegBatchGUI:
         track = self.merge_tracks[track_idx]
         with self.SafeToplevel(self.root) as win:
             win.title(f"音频轨道设置 - {track.codec}")
-            center_window(win, 880, 550)
+            center_window(win, 880, 570)
             win.transient(self.root)
     
             main_frame = ttk.Frame(win, padding="10")
@@ -15851,6 +16731,16 @@ class FFmpegBatchGUI:
             title_entry = ttk.Entry(title_row, textvariable=title_var, width=40)
             title_entry.pack(side=tk.LEFT, padx=5)
 
+            # 默认轨标记 (disposition)
+            disp_row = ttk.Frame(meta_frame)
+            disp_row.pack(fill=tk.X, pady=2)
+            ttk.Label(disp_row, text="默认轨:").pack(side=tk.LEFT, padx=5)
+            disp_var = tk.StringVar(value=track.enc_settings.get("disposition", ""))
+            ttk.Combobox(disp_row, textvariable=disp_var, width=18,
+                         values=["", "default", "none", "forced", "hearing_impaired", "visual_impaired"],
+                         state="readonly").pack(side=tk.LEFT, padx=5)
+            ttk.Label(disp_row, text="（留空=沿用首轨 default）").pack(side=tk.LEFT, padx=5)
+
             # 获取模式标志
             is_pip = self.pip_enabled.get()
             is_concat = self.concat_enabled.get()
@@ -15865,15 +16755,12 @@ class FFmpegBatchGUI:
                 chapter_label_entry = ttk.Entry(cl_row, textvariable=chapter_label_var, width=40)
                 chapter_label_entry.pack(side=tk.LEFT, padx=5)
 
-            # ---- 音量控制（所有模式可用） ----
-            volume_frame = ttk.LabelFrame(left_col, text="音量调整", padding="5")
-            volume_frame.pack(fill=tk.X, pady=(5,0))
-
+            # ---- 音量控制（所有模式可用；无外框，仅勾选 + 滑块） ----
             vol_enabled_var = tk.BooleanVar(value=track.enc_settings.get("volume_enabled", False))
             vol_value_var = tk.DoubleVar(value=track.enc_settings.get("volume", 1.0))
 
-            vol_row = ttk.Frame(volume_frame)
-            vol_row.pack(fill=tk.X, pady=(0,5))
+            vol_row = ttk.Frame(left_col)
+            vol_row.pack(fill=tk.X, pady=(5,0))
             vol_check = ttk.Checkbutton(vol_row, text="启用音量调整", variable=vol_enabled_var)
             vol_check.pack(side=tk.LEFT)
             vol_control_frame = ttk.Frame(vol_row)
@@ -16043,9 +16930,13 @@ class FFmpegBatchGUI:
             ttk.Entry(eq_row, textvariable=eq_high_var, width=5).pack(side=tk.LEFT)
             ToolTip(eq_row, "低音(bass)/中音(equalizer@1kHz)/高音(treble)，单位 dB，正负均可，0 表示不调整。", wraplength=400)
 
-            # ---- 截取设置 ----
-            trim_frame = ttk.LabelFrame(main_frame, text="音频截取（精确到毫秒）", padding="5")
-            trim_frame.pack(fill=tk.X, pady=(0,5))
+            # ---- 音频截取 + 时间偏移对齐（左右并排） ----
+            bottom_row = ttk.Frame(main_frame)
+            bottom_row.pack(fill=tk.X, pady=(0, 5))
+
+            # ---- 截取设置（左） ----
+            trim_frame = ttk.LabelFrame(bottom_row, text="音频截取（精确到毫秒）", padding="5")
+            trim_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
     
             trim_enabled_var = tk.BooleanVar(value=track.enc_settings.get("trim_enabled", False))
             chk = ttk.Checkbutton(trim_frame, text="启用截取", variable=trim_enabled_var)
@@ -16067,6 +16958,18 @@ class FFmpegBatchGUI:
             ttk.Checkbutton(trim_frame, text="精准模式（精确到帧）", variable=precise_trim_var).grid(row=3, column=0, columnspan=3, sticky="w", padx=5, pady=5)
     
             ttk.Label(trim_frame, text="注意：启用截取后，编码器将自动改为非 copy 格式（如 aac）", foreground="gray").grid(row=4, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+
+            # ---- 时间偏移对齐（右） ----
+            offset_frame = ttk.LabelFrame(bottom_row, text="时间偏移对齐（延后秒数）", padding="5")
+            offset_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
+            offset_var = tk.StringVar(value=str(track.enc_settings.get("audio_offset", "")))
+            of_row = ttk.Frame(offset_frame)
+            of_row.pack(fill=tk.X, pady=(2, 0))
+            ttk.Label(of_row, text="延后(秒, ≥0):").pack(side=tk.LEFT, padx=5)
+            ttk.Entry(of_row, textvariable=offset_var, width=10).pack(side=tk.LEFT, padx=5)
+            of_hint = ttk.Label(offset_frame, text="（配音比原声晚 N 秒时填 N；触发重新编码）",
+                                foreground="#666666", wraplength=360)
+            of_hint.pack(fill=tk.X, padx=5, pady=(0, 2), anchor=tk.W)
     
             # ---- 保存按钮 ----
             def save():
@@ -16075,6 +16978,9 @@ class FFmpegBatchGUI:
                 if trim_enabled_var.get() and enc == "copy":
                     enc = "aac"
                     self._append_info_ui("音频截取启用，编码器已从 copy 改为 aac")
+                if offset_var.get().strip() and (float(offset_var.get().strip() or 0) > 0) and enc == "copy":
+                    enc = "aac"
+                    self._append_info_ui("音频偏移启用，编码器已从 copy 改为 aac")
                 # 混合启用时同样强制改 aac（普通模式）
                 if not is_pip and not is_concat and mix_enabled_var.get() and enc == "copy":
                     enc = "aac"
@@ -16097,6 +17003,8 @@ class FFmpegBatchGUI:
                     "fade_enabled": fade_enabled_var.get(),
                     "fade_in": fade_in_var.get().strip(),
                     "fade_out": fade_out_var.get().strip(),
+                    "audio_offset": offset_var.get().strip() or "0",
+                    "disposition": disp_var.get(),
                     "loudnorm_enabled": loudnorm_enabled_var.get(),
                     "denoise_enabled": denoise_enabled_var.get(),
                     "channel_mode": channel_mode_var.get(),
@@ -16202,7 +17110,14 @@ class FFmpegBatchGUI:
             title_var = tk.StringVar(value=track.title)
             title_entry = ttk.Entry(win, textvariable=title_var, width=30)
             title_entry.grid(row=2, column=1, padx=5, pady=5, sticky="w")
-            
+
+            # 默认轨标记 (disposition)
+            ttk.Label(win, text="默认轨:").grid(row=3, column=0, sticky="w", padx=5, pady=5)
+            disp_var = tk.StringVar(value=track.enc_settings.get("disposition", ""))
+            ttk.Combobox(win, textvariable=disp_var, width=18,
+                         values=["", "default", "none", "forced", "hearing_impaired", "visual_impaired"],
+                         state="readonly").grid(row=3, column=1, sticky="w", padx=5)
+
             def save():
                 lang_code = custom_lang_entry.get().strip()
                 if not lang_code:
@@ -16220,6 +17135,7 @@ class FFmpegBatchGUI:
                     lang_code = ""
                     
                 track.enc_settings["encoder"] = encoder_var.get()
+                track.enc_settings["disposition"] = disp_var.get()
                 track.language = lang_code
                 track.title = title_var.get().strip()
                 track.enc_settings["language"] = track.language
@@ -16228,7 +17144,7 @@ class FFmpegBatchGUI:
                 self.merge_update_command_preview()
                 win.destroy()
             
-            ttk.Button(win, text="保存", command=save).grid(row=3, column=0, columnspan=2, pady=10)
+            ttk.Button(win, text="保存", command=save).grid(row=4, column=0, columnspan=2, pady=10)
             win.wait_window()
 
     def merge_set_track_enabled(self, idx, enabled):
@@ -17183,6 +18099,13 @@ class FFmpegBatchGUI:
         self.update_player_status()
 
 
+    def _browse_bgm_file(self, var):
+        """选择背景音乐音频文件，写入传入的 StringVar。"""
+        types = [("音频文件", "*.mp3 *.aac *.wav *.flac *.ogg *.m4a *.opus *.ac3"), ("所有文件", "*.*")]
+        path = filedialog.askopenfilename(title="选择背景音乐音频文件", filetypes=types)
+        if path:
+            var.set(normalize_path(path))
+
     def _browse_cmd_output(self):
         path = filedialog.askdirectory(title="选择命令执行目录")
         if path:
@@ -17368,7 +18291,7 @@ class FFmpegBatchGUI:
         # 预设信息
         preset_path = normalize_path(self.preset_file_path)
         if os.path.exists(preset_path):
-            preset_status = "✓ 文件存在"
+            preset_status = "文件存在"
         else:
             preset_status = "✗ 文件不存在（将自动创建）"
         local_preset = normalize_path(os.path.join(get_script_dir(), "ffmpeg_presets.json"))
@@ -17385,7 +18308,7 @@ class FFmpegBatchGUI:
             self.status_text.insert(tk.END, "mpv 预览: 已启用\n")
             if mpv_path:
                 if os.path.exists(mpv_path) and os.access(mpv_path, os.X_OK):
-                    self.status_text.insert(tk.END, f"  mpv 路径: {mpv_path}  →  ✓ 有效\n")
+                    self.status_text.insert(tk.END, f"  mpv 路径: {mpv_path}  →  有效\n")
                 else:
                     self.status_text.insert(tk.END, f"  mpv 路径: {mpv_path}  →  ✗ 无效（文件不存在或不可执行）\n")
                     self.status_text.insert(tk.END, "  请检查路径是否正确，或重新安装 mpv。\n")
@@ -17394,7 +18317,7 @@ class FFmpegBatchGUI:
         else:
             self.status_text.insert(tk.END, "预览播放器: ffplay（未启用 mpv）\n")
             if self.ffplay_cmd and os.path.exists(self.ffplay_cmd):
-                self.status_text.insert(tk.END, f"  ffplay 路径: {normalize_path(self.ffplay_cmd)}  →  ✓ 可用\n")
+                self.status_text.insert(tk.END, f"  ffplay 路径: {normalize_path(self.ffplay_cmd)}  →  可用\n")
             else:
                 self.status_text.insert(tk.END, f"  ffplay 未找到，请将 ffplay.exe 放在脚本目录或添加到 PATH。\n")
     
@@ -17428,7 +18351,7 @@ class FFmpegBatchGUI:
             exe_name = tool + ".exe" if sys.platform == "win32" else tool
             local_path = os.path.join(script_dir, exe_name)
             if os.path.isfile(local_path) and os.access(local_path, os.X_OK):
-                self.status_text.insert(tk.END, f"  {exe_name}: ✓ 存在 → {local_path}\n")
+                self.status_text.insert(tk.END, f"  {exe_name}: 存在 → {local_path}\n")
                 found_any = True
         if not found_any:
             self.status_text.insert(tk.END, "  无\n")
@@ -17442,7 +18365,7 @@ class FFmpegBatchGUI:
                     exe_name = tool + ".exe" if sys.platform == "win32" else tool
                     internal_path = os.path.join(internal_dir, exe_name)
                     if os.path.isfile(internal_path) and os.access(internal_path, os.X_OK):
-                        self.status_text.insert(tk.END, f"  {exe_name}: ✓ 存在 → {internal_path}\n")
+                        self.status_text.insert(tk.END, f"  {exe_name}: 存在 → {internal_path}\n")
                         found_any = True
                 if not found_any:
                     self.status_text.insert(tk.END, "  无\n")
@@ -17453,7 +18376,7 @@ class FFmpegBatchGUI:
         for tool in tools:
             path_in_path = shutil.which(tool)
             if path_in_path:
-                self.status_text.insert(tk.END, f"  {tool}: ✓ 找到 → {normalize_path(path_in_path)}\n")
+                self.status_text.insert(tk.END, f"  {tool}: 找到 → {normalize_path(path_in_path)}\n")
                 found_any = True
         if not found_any:
             self.status_text.insert(tk.END, "  无\n")
@@ -20171,6 +21094,11 @@ if __name__ == "__main__":
     app = FFmpegBatchGUI(root)
 
     def _on_app_close():
+        # 关闭前先立即落盘防抖中挂起的播放器设置，避免最后改动丢失
+        try:
+            app._do_save_player_settings()
+        except Exception:
+            pass
         # 关闭前先终止仍在运行的 ffmpeg 子进程，避免变成孤儿进程继续占用输出文件
         procs = list(getattr(app, 'running_procs', []))
         if procs:
