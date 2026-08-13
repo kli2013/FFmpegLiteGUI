@@ -16400,6 +16400,15 @@ class FFmpegBatchGUI:
                 ttk.Label(meta_frame, text=_("从下拉框选择常用语言，或直接输入 ISO 639-2/B 代码（如 cmn、yue）"),
                           foreground="gray").grid(row=3, column=0, columnspan=4, sticky="w", padx=5, pady=2)
 
+            # 是否为主视频（串行模式下第一段启用视频）= 全局 BGM 接口所在页
+            is_main_video = False
+            if is_concat_mode and track_obj is not None and getattr(track_obj, 'type', None) == 'video':
+                _vids = [t for t in self.merge_tracks if getattr(t, 'type', None) == 'video' and t.enabled]
+                is_main_video = bool(_vids) and track_obj == _vids[0]
+            bgm_enabled_var = None
+            bgm_path_var = None
+            bgm_volume_var = None
+
             # ================== 页面7：音频绑定 ==================
             # 仅在串接模式下显示此页（水印无音频绑定需求）
             if is_concat_mode and not is_watermark and track_obj is not None and track_obj.type == "video":
@@ -16409,12 +16418,14 @@ class FFmpegBatchGUI:
                 bind_frame = ttk.Frame(page_audio_binding, padding="10")
                 bind_frame.pack(fill=tk.BOTH, expand=True)
     
-                ttk.Label(bind_frame, text=_("音频源类型:")).grid(row=0, column=0, sticky="w", padx=5, pady=5)
+                # 音频源类型：标签与单选按钮放进同一跨列容器，避免 BGM 展开时网格重分配列宽致单选按钮右移
+                src_row = ttk.Frame(bind_frame)
+                src_row.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+                ttk.Label(src_row, text=_("音频源类型:")).pack(side=tk.LEFT, padx=(0, 5))
                 audio_source_type_var = tk.StringVar(value=initial_settings.get("audio_source_type", "self"))
-                source_frame = ttk.Frame(bind_frame)
-                source_frame.grid(row=0, column=1, sticky="w", padx=5)
-    
-                rb_self = ttk.Radiobutton(source_frame, text=_("使用视频自身音频"), 
+                source_frame = ttk.Frame(src_row)
+                source_frame.pack(side=tk.LEFT)
+                rb_self = ttk.Radiobutton(source_frame, text="使用视频自身音频", 
                                           variable=audio_source_type_var, value="self")
                 rb_silence = ttk.Radiobutton(source_frame, text=_("生成静音流"), 
                                              variable=audio_source_type_var, value="silence")
