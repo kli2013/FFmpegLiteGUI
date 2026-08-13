@@ -84,7 +84,7 @@ These guarantee identical specs before `concat` — no join errors.
 ### 1.5 Output settings
 - **Container**: MKV, MP4, WebM (auto-recommended by mode).
 - **Output path**: custom location.
-- **Delete sources after merge**: use with care (confirmation).
+- **Delete source files**: after merge, move sources to the Recycle Bin / Trash (soft delete, **not** permanent) — with confirmation. Tooltip notes it's a soft delete.
 - **Verify output**: integrity check after merge.
 
 ### 1.6 Command preview & control
@@ -162,6 +162,93 @@ With PiP enabled, editing the main video track opens a window with an **"Overlay
 - **Concat re-encode** — enhance/speed/reverse act inside each segment; no jump at the join.
 - **Volume** is removed in Concat; keep input levels similar or pre-process.
 - **Chroma-key / loop** only show in PiP with a visible sub-video; auto-hidden in Concat.
+
+---
+
+## 6. Audio & subtitle track advanced settings
+
+Double-click any audio or subtitle track in the list to open its detailed settings dialog. Besides basic codec / volume (audio) / language / title, these advanced features were recently added:
+
+### 6.1 Audio track time offset (delay seconds)
+- The audio-track dialog has a new **"Time offset align (delay seconds)"** frame.
+- A positive value N makes that track start **N seconds later** (e.g. when dubbing lags the original by N seconds); implemented with the `adelay` filter (leading silence padding).
+- 0 or blank = no offset. Note: enabling offset forces audio re-encode (`copy` codec auto-switches to `aac`).
+
+### 6.2 Default track (disposition)
+- Both audio and subtitle dialogs have a new **"Default track:"** dropdown: `default` / `none` / `forced` / `hearing_impaired` / `visual_impaired`; blank → first track defaults to `default`.
+- Maps to `-disposition:a:N` / `-disposition:s:N` — for bilingual subtitles, forced subtitles (player shows them by default), hearing/visual-impaired subtitles, etc.
+
+### 6.3 Apply source video to audio (V→A)
+- Applies to **source-linked audio tracks** — audio added via "Add audio" when dropping a video (its `file_path` matches the source video). Externally dropped pure-audio files have no linked video.
+- Dialog button **"Apply src video trim/spd/rev (V→A)"**: one click copies the linked video's trim/speed/reverse into this audio track (writes explicit values, freely reversible).
+- Right-click **"Batch src-audio→video T/S/R (V → A)"**: batch-applies to the source-linked audio among the **selected tracks** only; out-of-range auto-clamped with a one-time summary.
+- Refreshes the track list and command preview live.
+
+### 6.4 Audio independent trim (no split — Concat mode only)
+- In the segment editor (SegmentEditor) window, between the segment list and "Split segment", a new **"Audio independent trim"** frame appears.
+- When enabled, set start/end times: the audio is trimmed to that range while the video still joins by segments — handy when music only needs head/tail trimming to match total length (middle stays intact).
+- Editable only when enabled; the window shows a live "total segment video duration" reference (includes per-segment speed).
+
+### 6.5 Volume
+- The audio-track dialog offers an **"Enable volume adjust"** toggle + volume slider, independent of codec / bitrate / sample rate.
+
+---
+
+## 7. Clip fade in/out & serial transition (xfade)
+
+### 7.1 Video-track "Fade in/out (afade)" tab
+- Double-click a video track (Concat re-encode mode) to open settings; a new **"Fade in/out (afade)"** tab lets you check fade-in / fade-out and set durations (seconds).
+- Implemented with `fade=t=in` / `fade=t=out` (gradual black at clip ends); if duration is unknown, fade-out is skipped but fade-in still applies.
+
+### 7.2 Right-click "One-click fade in/out (All)"
+- The track-list right-click menu adds **"One-click fade in/out (All)"**: writes fade in/out to every enabled video/audio track at once.
+- Duration is taken from the serial-transition box (default 1.0 s, freely editable); short clips auto-halved (`min(1.0, dur*0.4)`) so the fade never exceeds the clip itself.
+
+### 7.3 Serial transition (xfade cross-dissolve)
+- In Concat mode, a **"Serial transition"** checkbox + **"Duration:"** box (seconds) is added.
+- When checked, adjacent video segments get an `xfade=transition=fade` cross-dissolve; only works in re-encode mode with 2+ segments.
+- Transition duration is auto-clamped to half the shortest segment; in xfade mode per-segment black fades are dropped and replaced by a single unified head/tail fade on the joined video (using the first segment's fade_in and the last segment's fade_out).
+- **Audio follows automatically**: audio auto-follows the main video transition toggle via `acrossfade` (no separate audio transition setting needed).
+
+### 7.4 Right-click menu operations overview
+- **"Copy trim/spd/rev (V→A)"** — copy the selected video track's trim/speed/reverse (enabled only when a video track is selected).
+- **"Paste trim/spd/rev (V→A)"** — apply those to selected audio tracks (enabled only with a clipboard; includes out-of-range safety guard).
+- **"Batch src-audio→video T/S/R (V → A)"** — see §6.3.
+- **"One-click fade in/out (All)"** — see §7.2.
+
+---
+
+## 9. Mask / transparent overlay
+
+The mask is a standalone feature (not a toggle on some filter). It applies to the **sub-video** and **text watermark** on the Mux page, making part of the sub-video transparent so the main video (or canvas) shows through. Entry point: on the video-track editor's **"Loop / Chroma"** tab, the **"Mask"** button to the right of the **Transparency** checkbox (spaced `padx=25` from it).
+
+### 9.1 Open the mask dialog
+- Click **Mask** to open the settings box: an **Enable mask** checkbox, mask direction, rectangle coordinates (x / y / width / height, original frame), and Save/Cancel buttons.
+- Coordinates share the same source as the **Crop** editor: click **"📋 Copy coords from crop"** to fill in one click (values match the original frame; the mask block is placed before the crop filter).
+
+### 9.2 Mask direction
+- **Outside the mask (show only rectangle)**: black background, white rectangle — opaque inside the rectangle, transparent outside; the main video shows through outside the rectangle.
+- **Inside the mask (rectangle transparent)**: white background, black rectangle — rectangle transparent, everything else normal; the main video shows through the rectangle hole.
+
+### 9.3 Scope & implementation
+- The mask applies to both **PiP sub-videos** and **text watermarks** (both share the same "Loop / Chroma" editor).
+- Internally uses `alphamerge`: writes the grayscale mask into the alpha channel (white = opaque, black = transparent). The bundled ffmpeg has no `mask` filter, so it goes `split=2[a][m];[m]format=gray,drawbox…;[a][msk]alphamerge`.
+- When the mask is enabled, the sub-video pipeline forces `format=rgba` to keep alpha; the transparent area is shown through by the main video/canvas during overlay — **no mov/alpha muxing needed** (transparency is consumed by the main video at composite time).
+
+### 9.4 Note
+- The mask belongs to the Mux page's per-track settings. The Transcode page (single-file) has no such setting and it never appears in the Transcode task queue.
+
+## 10. Sub-video free layout (unbounded)
+
+On the sub-video overlay page (PiP), a new **"Free layout"** checkbox sits to the right of the **Blend mode** dropdown, lifting the clamp on the sub-video position/size.
+
+### 10.1 Behavior
+- When checked: the sub-video may be larger than the main video and dragged fully outside the main frame (the visual editor does not scroll; overflow simply exits the frame).
+- Position/size are passed to ffmpeg as-is (`overlay` itself supports negative/out-of-range/larger-than-main; overflow is clipped by the main frame).
+- Final output canvas = main video; when the main video uses offset/pad, the base = pad canvas.
+
+### 10.2 Scope
+- Applies to both the **sub-video overlay** and **text-watermark visual editor**; the checkbox state is saved with the per-track settings (`overlay_free_layout`).
 
 ---
 
