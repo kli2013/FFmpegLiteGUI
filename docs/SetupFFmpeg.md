@@ -1,3 +1,6 @@
+[[english](setupFFmpeg_en.md)]
+
+
 # FFmpeg 配置指南（setupFFmpeg）
 
 本工具本身**不包含** FFmpeg 可执行文件，它需要你在系统中准备好以下三个程序后才能正常工作。
@@ -150,8 +153,8 @@ ffprobe -version
 
 如果你不想动 PATH、也不想把文件塞进软件目录，可以在软件里**手动指定 FFmpeg 目录**：
 
-1. 打开软件主界面下方的 **「FFmpeg 设置」**（或「选项 → FFmpeg 目录」）区域；
-2. 勾选 **「指定 FFmpeg 目录」**；
+1. 打开软件主界面上方的 **「信息与播放器」**；
+2. 勾选 **「启用自定义 FFmpeg 目录」**；
 3. 浏览并选择 **只含三个 exe 的那个文件夹**（例如 `C:\Tools\ffmpeg\` 或解压出的 `bin\`）；
 4. 软件会优先使用该目录里的 `ffmpeg.exe`、`ffprobe.exe`、`ffplay.exe`。
 
