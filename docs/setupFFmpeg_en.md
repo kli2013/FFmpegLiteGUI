@@ -118,8 +118,8 @@ All three "locations" fall into this chain; anywhere works, independently.
 
 If you don't want to touch PATH or stuff files into the app folder, set it in the app:
 
-1. Open **"FFmpeg settings"** (or "Options → FFmpeg directory") at the bottom of the main window.
-2. Check **"Specify FFmpeg directory"**.
+1. Open the **"Info & set"** tab at the top of the main window.
+2. Check **"Enable custom FFmpeg dir"**.
 3. Browse and select **the folder containing only the three exe** (e.g. `C:\Tools\ffmpeg\` or the unpacked `bin\`).
 4. The app prefers that folder's `ffmpeg.exe` / `ffprobe.exe` / `ffplay.exe`.
 
