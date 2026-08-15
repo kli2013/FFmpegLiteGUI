@@ -18,6 +18,10 @@ from typing import List, Tuple, Optional, Dict, Any, Callable
 import shlex
 import tempfile
 import time
+import types
+
+
+
 
 # --- 依赖检测 ---
 try:
@@ -12032,20 +12036,23 @@ class FFmpegBatchGUI:
             gen_chapters_cb.config(state='disabled')
         right_area = ttk.Frame(chapter_row)
         right_area.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        import_label = ttk.Label(right_area, text=_("导入外部章节:"))
+        import_label = ttk.Label(right_area, text=_("章节:"))
         import_label.pack(side=tk.LEFT)
         ToolTip(import_label,
-                _("导入外部章节 (FFmetadata):\n"
-                "从外部 FFmetadata 格式文件导入章节标记。\n"
-                "与「从源文件复制章节」互斥：选择文件后自动取消复制。\n"
-                "FFmetadata 格式示例：\n"
-                ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=5000\ntitle=第一章"),
+                _("章节编辑器（多格式导入/导出）：\n"
+                "支持 FFmetadata / CUE / EDL / CSV / YouTube 时间戳 五种格式，自动识别。\n"
+                "点「编辑...」打开可视化编辑器：导入 → 增删改 → 应用。\n"
+                "应用后生成 FFmetadata 临时文件供封装时写入（-i + -map_chapters）。\n"
+                "与「从源文件复制章节」互斥：应用后自动取消复制。"),
                 wraplength=380)
         chapter_entry = ttk.Entry(right_area, textvariable=self.chapter_file)
         chapter_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         ttk.Button(
-            right_area, text=_("浏览..."), command=self.browse_chapter_file, width=10
+            right_area, text=_("编辑..."), command=self.open_chapter_editor, width=10
         ).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(
+            right_area, text=_("浏览..."), command=self.browse_chapter_file, width=10
+        ).pack(side=tk.LEFT)
 
         row_frame = ttk.Frame(parent)
         row_frame.pack(fill=tk.X, pady=2)
@@ -13554,11 +13561,76 @@ class FFmpegBatchGUI:
         self.merge_update_output_preview()
 
     def browse_chapter_file(self):
-        path = filedialog.askopenfilename(title="选择章节文件", filetypes=[("FFmetadata", "*.txt *.chapters")])
+        path = filedialog.askopenfilename(
+            title=_("选择章节文件"),
+            filetypes=[(_("章节文件"), "*.txt *.cue *.edl *.csv *.chapters *.ffmeta"),
+                       ("FFmetadata", "*.txt *.chapters *.ffmeta"),
+                       (_("所有文件"), "*.*")])
         if path:
+            # 尝试解析（多格式）；成功则打开编辑器预览，失败则当作 FFmetadata 原样使用
+            try:
+                if chapter_fmts is not None:
+                    text = chapter_fmts.read_text_auto(path)
+                    fmt = chapter_fmts.detect_format(text)
+                    chs = chapter_fmts.parse_text(text, fmt)
+                    if chs:
+                        self._open_chapter_editor_with(chs, fmt)
+                        return
+            except Exception:
+                pass
+            # 兜底：当作 FFmetadata 原样使用
             self.chapter_file.set(normalize_path(path))
-            if path:
-                self.copy_chapters.set(False)
+            self.copy_chapters.set(False)
+
+    def open_chapter_editor(self):
+        """打开章节编辑器：若已有章节文件则先导入作为初始内容。"""
+        if not chapter_fmts:
+            messagebox.showinfo(_("提示"), _("章节模块未加载（缺少 chapter_formats.py）"))
+            return
+        initial = []
+        cf_path = self.chapter_file.get().strip()
+        if cf_path and os.path.exists(cf_path):
+            try:
+                text = chapter_fmts.read_text_auto(cf_path)
+                fmt = chapter_fmts.detect_format(text)
+                initial = chapter_fmts.parse_text(text, fmt)
+            except Exception:
+                initial = []
+        editor = ChapterEditor(self.root, initial, self)
+        self.root.wait_window(editor.window)
+        if editor.result is not None and editor.result is not initial:
+            self._apply_chapters_result(editor.result)
+
+    def _open_chapter_editor_with(self, chapters, fmt=None):
+        editor = ChapterEditor(self.root, chapters, self)
+        self.root.wait_window(editor.window)
+        if editor.result is not None:
+            self._apply_chapters_result(editor.result)
+
+    def _apply_chapters_result(self, chapters):
+        """把编辑器确认的章节列表写为 FFmetadata 临时文件并挂到 chapter_file。"""
+        if not chapter_fmts or not chapters:
+            return
+        try:
+            tmp_path = chapter_fmts.write_ffmetadata_temp(chapters)
+        except Exception as e:
+            messagebox.showerror(_("章节应用失败"), str(e))
+            return
+        # 清理旧临时文件
+        old = self.chapter_file.get().strip()
+        if old and hasattr(self, "_merge_temp_files") and old in self._merge_temp_files:
+            try:
+                if os.path.exists(old):
+                    os.unlink(old)
+                self._merge_temp_files.remove(old)
+            except Exception:
+                pass
+        if not hasattr(self, "_merge_temp_files"):
+            self._merge_temp_files = []
+        self._merge_temp_files.append(tmp_path)
+        self.chapter_file.set(normalize_path(tmp_path))
+        self.copy_chapters.set(False)
+        self._append_info_ui(_("[章节] 已应用 {0} 个章节").format(len(chapters)))
 
     def merge_copy_command(self):
         cmd_str = self.merge_cmd_preview.get(1.0, tk.END).strip()
@@ -21558,6 +21630,721 @@ class SegmentEditor:
     def on_cancel(self):
         self.result = None
         self.window.destroy()
+
+
+# ================== 章节格式解析/导出（内嵌，原 chapter_formats.py） ==================
+# 章节多格式（FFmetadata / CUE / EDL / CSV / YouTube）解析与导出。
+# 内嵌于主程序，避免打包时额外携带模块文件；原独立文件已删除。
+
+"""
+章节格式解析/导出模块（统一内部模型）
+
+内部模型：list[dict]
+    {"start": float, "title": str, "end": float|None}
+    - start: 章节起始时间（秒）
+    - end:   可选，章节结束时间（秒）；None 表示未指定（由下一章起点推导）
+
+支持的格式（检测 + 解析 + 导出）：
+    - ffmetadata : FFmpeg 原生章节格式（;FFMETADATA1 + [CHAPTER]）
+    - cue        : CUE 分轨文件（INDEX 01 = 曲目起点，TITLE = 曲目名）
+    - edl        : 剪辑决策列表（SMPTE 时间码 HH:MM:SS:FF）
+    - csv        : 逗号/制表符分隔的时间+标题
+    - youtube    : YouTube 时间戳文本（每行 "MM:SS 标题"）
+
+纯函数模块，无 GUI 依赖，可独立单测。
+"""
+
+def read_text_auto(path):
+    """自动探测编码读取文本：优先 UTF-8（含 BOM），失败回退 GB18030（兼容 GBK/GB2312/GB936）。
+    CUE/EDL/CSV 等常以 ANSI(GBK) 保存，固定 utf-8 读取会乱码。"""
+    with open(path, "rb") as f:
+        raw = f.read()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig", errors="replace")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            return raw.decode("gb18030")
+        except UnicodeDecodeError:
+            return raw.decode("utf-8", errors="replace")
+
+# ---------------------------------------------------------------------------
+# 内部模型与基础工具
+# ---------------------------------------------------------------------------
+
+def _to_seconds(h, m, s):
+    """时/分/秒 -> 秒"""
+    return h * 3600 + m * 60 + s
+
+
+def parse_hms_ms(text):
+    """解析 HH:MM:SS.mmm / MM:SS.mmm / SS 等常见时间字符串 -> 秒。失败返回 None。
+    两段冒号 = 分:秒（如 1:35 -> 95s），三段 = 时:分:秒。"""
+    if text is None:
+        return None
+    text = str(text).strip()
+    if not text:
+        return None
+    # 纯秒
+    if re.fullmatch(r"\d+(\.\d+)?", text):
+        return float(text)
+    # 冒号分隔（1~3 段）；两段按 分:秒，三段按 时:分:秒
+    m = re.fullmatch(r"(\d+):(\d{1,2})(?::(\d{1,2}))?(?:\.(\d+))?", text)
+    if m:
+        ms = float("0." + m.group(4)) if m.group(4) else 0.0
+        if m.group(3) is None:
+            # MM:SS(.mmm)
+            mi = int(m.group(1))
+            s = int(m.group(2))
+            return _to_seconds(0, mi, s) + ms
+        # HH:MM:SS(.mmm)
+        h = int(m.group(1))
+        mi = int(m.group(2))
+        s = int(m.group(3))
+        return _to_seconds(h, mi, s) + ms
+    return None
+
+
+def parse_cue_tc(tc):
+    """CUE 时间码 MM:SS:FF（帧率 75fps）-> 秒。失败返回 None。"""
+    m = re.fullmatch(r"(\d+):(\d{1,2}):(\d{1,2})", str(tc).strip())
+    if not m:
+        return None
+    mi = int(m.group(1))
+    s = int(m.group(2))
+    fr = int(m.group(3))
+    return _to_seconds(0, mi, s) + fr / 75.0
+
+
+def parse_edl_tc(tc, fps=25.0):
+    """EDL 时间码 HH:MM:SS:FF（帧率可指定，默认 25）-> 秒。失败返回 None。"""
+    m = re.fullmatch(r"(\d+):(\d{1,2}):(\d{1,2}):(\d{1,2})", str(tc).strip())
+    if not m:
+        return None
+    h = int(m.group(1))
+    mi = int(m.group(2))
+    s = int(m.group(3))
+    fr = int(m.group(4))
+    return _to_seconds(h, mi, s) + fr / float(fps)
+
+
+def format_ffmetadata_time(seconds):
+    """秒 -> HH:MM:SS.mmm（FFmetadata 格式）"""
+    seconds = max(0.0, float(seconds))
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = seconds % 60
+    return "%02d:%02d:%06.3f" % (h, m, s)
+
+
+def format_seconds_short(seconds):
+    """秒 -> 简洁时间字符串（用于显示/CSV）：优先 HH:MM:SS，不足则 MM:SS"""
+    seconds = max(0.0, float(seconds))
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = seconds % 60
+    if h > 0:
+        return "%02d:%02d:%05.2f" % (h, m, s)
+    return "%02d:%05.2f" % (m, s)
+
+
+# ---------------------------------------------------------------------------
+# 格式嗅探
+# ---------------------------------------------------------------------------
+
+FORMAT_FFMETADATA = "ffmetadata"
+FORMAT_CUE = "cue"
+FORMAT_EDL = "edl"
+FORMAT_CSV = "csv"
+FORMAT_YOUTUBE = "youtube"
+
+FORMAT_NAMES = {
+    FORMAT_FFMETADATA: "FFmetadata",
+    FORMAT_CUE: "CUE",
+    FORMAT_EDL: "EDL",
+    FORMAT_CSV: "CSV / text",
+    FORMAT_YOUTUBE: "YouTube timestamps",
+}
+
+
+def detect_format(text):
+    """内容嗅探：返回 FORMAT_* 之一。text 为文件全部内容。"""
+    if not text:
+        return FORMAT_CSV
+    head = text[:2000]
+    # FFmetadata
+    if ";FFMETADATA1" in head and "[CHAPTER]" in head:
+        return FORMAT_FFMETADATA
+    # EDL：TITLE: 开头或 001 001 V C 事件行
+    if re.search(r"(?m)^TITLE:\s", head) or re.search(r"(?m)^\d{3}\s+\d{3}\s+[VAvA]\s+C\s", head):
+        return FORMAT_EDL
+    # CUE：FILE "..."（单双引号均可）+ INDEX 01
+    if re.search(r"(?im)^FILE\s+['\"]", head) and re.search(r"(?im)^\s*INDEX\s+01\s+\d+:\d+:\d+", head):
+        return FORMAT_CUE
+    # YouTube：行首 MM:SS 或 H:MM:SS 时间戳 + 标题
+    yt_lines = [ln for ln in text.splitlines() if re.match(r"^\d{1,2}:\d{2}(?::\d{2})?\s+\S", ln)]
+    if len(yt_lines) >= 1 and not re.search(r",|\t", head):
+        return FORMAT_YOUTUBE
+    return FORMAT_CSV
+
+
+# ---------------------------------------------------------------------------
+# 解析
+# ---------------------------------------------------------------------------
+
+def parse_ffmetadata(text):
+    """解析 FFmetadata 章节 -> 内部模型列表。START/END 按 TIMEBASE 换算为秒。"""
+    chapters = []
+    cur = None
+    timebase = 1000000  # 默认 1/1000000（微秒）
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.upper().startswith("TIMEBASE="):
+            tb = line.split("=", 1)[1].strip()
+            m = re.fullmatch(r"(\d+)/(\d+)", tb)
+            if m:
+                den = float(m.group(2))
+                timebase = den / float(m.group(1)) if float(m.group(1)) else 1.0
+            else:
+                timebase = 1.0
+            continue
+        if line == "[CHAPTER]":
+            cur = {"start": None, "end": None, "title": None, "_raw_start": None, "_raw_end": None}
+            chapters.append(cur)
+        elif cur is not None:
+            if line.upper().startswith("START="):
+                cur["_raw_start"] = _parse_ffmeta_num(line.split("=", 1)[1])
+            elif line.upper().startswith("END="):
+                cur["_raw_end"] = _parse_ffmeta_num(line.split("=", 1)[1])
+            elif line.upper().startswith("TITLE="):
+                cur["title"] = line.split("=", 1)[1]
+    result = []
+    for c in chapters:
+        if c["_raw_start"] is None:
+            continue
+        # timebase = "1 单位 = 多少微秒"（TIMEBASE=1/1000 → 1000 微秒 = 1 毫秒）
+        start = c["_raw_start"] * timebase / 1000000.0
+        end = c["_raw_end"] * timebase / 1000000.0 if c["_raw_end"] is not None else None
+        result.append({
+            "start": start,
+            "title": c["title"] if c["title"] is not None else "",
+            "end": end,
+        })
+    return result
+
+
+def _parse_ffmeta_num(s):
+    """解析 FFmetadata 数值字段（可能带浮点）"""
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def parse_cue(text):
+    """解析 CUE -> 内部模型列表。TRACK 的 INDEX 01 是起点，TITLE 是曲名。"""
+    chapters = []
+    cur = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.upper().startswith("TRACK "):
+            cur = {"start": None, "title": None}
+            chapters.append(cur)
+        elif cur is not None:
+            up = line.upper()
+            if up.startswith("TITLE"):
+                # TITLE "..." 或 TITLE '...' 或 TITLE 裸文本
+                raw = line[5:].strip()
+                if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ('"', "'"):
+                    raw = raw[1:-1]
+                cur["title"] = raw
+            elif up.startswith("INDEX"):
+                parts = up.split()
+                if len(parts) >= 3 and parts[1] == "01":
+                    cur["start"] = parse_cue_tc(parts[2])
+    result = []
+    for c in chapters:
+        if c["start"] is None:
+            continue
+        result.append({
+            "start": c["start"],
+            "title": c["title"] if c["title"] is not None else "",
+            "end": None,
+        })
+    return result
+
+
+def parse_edl(text, fps=25.0):
+    """解析 EDL -> 内部模型列表。每个事件行的事件起止时间转为章节。"""
+    chapters = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"^\d{3}\s+\d{3}\s+[VAvA]\s+C\s+(\S+)\s+(\S+)", line)
+        if not m:
+            continue
+        start = parse_edl_tc(m.group(1), fps)
+        end = parse_edl_tc(m.group(2), fps)
+        if start is None:
+            continue
+        chapters.append({"start": start, "end": end, "title": ""})
+    return chapters
+
+
+def parse_csv(text, delimiter=None):
+    """解析 CSV/文本 -> 内部模型列表。每行: 时间[,分隔]标题（或 时间 标题）。
+    自动探测分隔符（逗号/制表符）。标题可选。"""
+    if delimiter is None:
+        first = text.splitlines()[0] if text.splitlines() else ""
+        delimiter = "\t" if "\t" in first else ","
+    chapters = []
+    for line in text.splitlines():
+        line = line.rstrip("\r\n")
+        if not line.strip():
+            continue
+        if delimiter in line:
+            parts = [p.strip() for p in line.split(delimiter)]
+            time_part = parts[0]
+            title = parts[1] if len(parts) > 1 else ""
+        else:
+            # 无分隔符：尝试 "时间 标题"（空格分隔）
+            m = re.match(r"^(\S+)\s+(.+)$", line.strip())
+            if m:
+                time_part, title = m.group(1), m.group(2)
+            else:
+                time_part, title = line.strip(), ""
+        start = parse_hms_ms(time_part)
+        if start is None:
+            continue
+        chapters.append({"start": start, "title": title.strip(), "end": None})
+    return chapters
+
+
+def parse_youtube(text):
+    """解析 YouTube 时间戳文本 -> 内部模型列表。每行 "MM:SS 标题"。"""
+    chapters = []
+    for line in text.splitlines():
+        line = line.rstrip("\r\n")
+        m = re.match(r"^(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s+(.+)$", line.strip())
+        if not m:
+            continue
+        start = parse_hms_ms(m.group(1))
+        if start is None:
+            continue
+        chapters.append({"start": start, "title": m.group(2).strip(), "end": None})
+    return chapters
+
+
+def parse_text(text, fmt=None, fps=25.0):
+    """按指定格式（或自动嗅探）解析文本 -> 内部模型列表"""
+    if fmt is None:
+        fmt = detect_format(text)
+    if fmt == FORMAT_FFMETADATA:
+        return parse_ffmetadata(text)
+    if fmt == FORMAT_CUE:
+        return parse_cue(text)
+    if fmt == FORMAT_EDL:
+        return parse_edl(text, fps)
+    if fmt == FORMAT_CSV:
+        return parse_csv(text)
+    if fmt == FORMAT_YOUTUBE:
+        return parse_youtube(text)
+    return []
+
+
+def parse_file(path, fmt=None, fps=25.0):
+    """按指定格式（或自动嗅探）解析文件 -> 内部模型列表"""
+    text = chapter_fmts.read_text_auto(path)
+    return parse_text(text, fmt, fps)
+
+
+# ---------------------------------------------------------------------------
+# 导出
+# ---------------------------------------------------------------------------
+
+def export_ffmetadata(chapters):
+    """内部模型 -> FFmetadata 文本"""
+    lines = [";FFMETADATA1"]
+    for c in chapters:
+        lines.append("[CHAPTER]")
+        lines.append("TIMEBASE=1/1000")
+        lines.append("START=%d" % int(round(c["start"] * 1000)))
+        end_ms = int(round(c["end"] * 1000)) if c.get("end") is not None else int(round(c["start"] * 1000))
+        lines.append("END=%d" % end_ms)
+        lines.append("title=%s" % c.get("title", ""))
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def export_cue(chapters, title=""):
+    """内部模型 -> CUE 文本"""
+    lines = []
+    if title:
+        lines.append('REM GENRE "Chapters"')
+        lines.append('TITLE "%s"' % title.replace('"', "'"))
+    lines.append('FILE "chapters.cue" WAVE')
+    for i, c in enumerate(chapters, 1):
+        lines.append("  TRACK %02d AUDIO" % i)
+        if c.get("title"):
+            lines.append('    TITLE "%s"' % c["title"].replace('"', "'"))
+        ms = int(round((c["start"] % 1) * 75))
+        total_s = int(c["start"])
+        mi, s = divmod(total_s, 60)
+        lines.append("    INDEX 01 %02d:%02d:%02d" % (mi, s, ms))
+    return "\n".join(lines) + "\n"
+
+
+def export_edl(chapters, fps=25.0):
+    """内部模型 -> EDL 文本（SMPTE 时间码 HH:MM:SS:FF）"""
+    lines = ["TITLE: Chapters", "FCM: NON-DROP FRAME"]
+    for i, c in enumerate(chapters, 1):
+        start = c["start"]
+        end = c.get("end")
+        if end is None:
+            end = start  # 无 end 时用起点占位
+        start_tc = _format_edl_tc(start, fps)
+        end_tc = _format_edl_tc(end, fps)
+        lines.append("%03d  %03d  V     C        %s %s %s %s" % (
+            i, i, start_tc, end_tc, start_tc, end_tc))
+        if c.get("title"):
+            lines.append("* FROM CLIP NAME: %s" % c["title"].replace("|", "/"))
+    return "\n".join(lines) + "\n"
+
+
+def _format_edl_tc(seconds, fps=25.0):
+    seconds = max(0.0, float(seconds))
+    total_frames = int(round(seconds * fps))
+    fr = total_frames % int(round(fps))
+    total_s = total_frames // int(round(fps))
+    h, rem = divmod(total_s, 3600)
+    m, s = divmod(rem, 60)
+    return "%02d:%02d:%02d:%02d" % (h, m, s, fr)
+
+
+def export_csv(chapters, delimiter=","):
+    """内部模型 -> CSV 文本（时间,标题）"""
+    lines = []
+    for c in chapters:
+        lines.append("%s%s%s" % (format_seconds_short(c["start"]), delimiter, c.get("title", "")))
+    return "\n".join(lines) + "\n"
+
+
+def export_youtube(chapters):
+    """内部模型 -> YouTube 时间戳文本（MM:SS 标题）"""
+    lines = []
+    for c in chapters:
+        lines.append("%s %s" % (format_seconds_short(c["start"]), c.get("title", "")))
+    return "\n".join(lines) + "\n"
+
+
+def export_text(chapters, fmt, fps=25.0):
+    """按指定格式导出内部模型 -> 文本"""
+    if fmt == FORMAT_FFMETADATA:
+        return export_ffmetadata(chapters)
+    if fmt == FORMAT_CUE:
+        return export_cue(chapters)
+    if fmt == FORMAT_EDL:
+        return export_edl(chapters, fps)
+    if fmt == FORMAT_CSV:
+        return export_csv(chapters)
+    if fmt == FORMAT_YOUTUBE:
+        return export_youtube(chapters)
+    return ""
+
+
+def export_file(chapters, path, fmt, fps=25.0):
+    """按指定格式导出内部模型 -> 文件"""
+    text = export_text(chapters, fmt, fps)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# 便捷：内部模型 -> 应用可用的 FFmetadata 临时文件路径
+# ---------------------------------------------------------------------------
+
+def write_ffmetadata_temp(chapters, tmpdir=None):
+    """把内部模型写成 FFmetadata 临时文件，返回文件路径（调用方负责清理）。"""
+    import tempfile
+    text = export_ffmetadata(chapters)
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix="ffchapter_", dir=tmpdir, text=True)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
+
+
+# 兼容命名空间：既有调用处统一走 chapter_fmts.xxx（保持零改动）
+chapter_fmts = types.SimpleNamespace(
+    FORMAT_FFMETADATA=FORMAT_FFMETADATA,
+    FORMAT_CUE=FORMAT_CUE,
+    FORMAT_EDL=FORMAT_EDL,
+    FORMAT_CSV=FORMAT_CSV,
+    FORMAT_YOUTUBE=FORMAT_YOUTUBE,
+    FORMAT_NAMES=FORMAT_NAMES,
+    parse_hms_ms=parse_hms_ms,
+    parse_cue_tc=parse_cue_tc,
+    parse_edl_tc=parse_edl_tc,
+    format_ffmetadata_time=format_ffmetadata_time,
+    format_seconds_short=format_seconds_short,
+    detect_format=detect_format,
+    parse_ffmetadata=parse_ffmetadata,
+    parse_cue=parse_cue,
+    parse_edl=parse_edl,
+    parse_csv=parse_csv,
+    parse_youtube=parse_youtube,
+    parse_text=parse_text,
+    parse_file=parse_file,
+    export_ffmetadata=export_ffmetadata,
+    export_cue=export_cue,
+    export_edl=export_edl,
+    export_csv=export_csv,
+    export_youtube=export_youtube,
+    export_text=export_text,
+    export_file=export_file,
+    read_text_auto=read_text_auto,
+    write_ffmetadata_temp=write_ffmetadata_temp,
+)
+
+
+class ChapterEditor:
+    """章节可视化编辑器：多格式导入 → 内部模型编辑 → 导出（应用为 FFmetadata 文件）。
+
+    chapters: list[dict] 内部模型 [{"start": 秒, "title": str, "end": 秒|None}]
+    应用后 result = 编辑后的内部模型；调用方负责用 write_ffmetadata_temp 转临时文件。
+    """
+
+    def __init__(self, parent, chapters, app):
+        self.parent = parent
+        self.app = app
+        self.chapters = copy.deepcopy(chapters)
+        self.result = None
+        self.edl_fps = tk.DoubleVar(value=25.0)
+
+        self.window = tk.Toplevel(parent)
+        self.window.title(_("章节编辑器"))
+        self.window.transient(parent)
+        self.window.grab_set()
+        self.window.geometry("780x520")
+        center_window(self.window, 780, 520)
+
+        self.create_widgets()
+        self.refresh_tree()
+        self.window.protocol("WM_DELETE_WINDOW", self.on_cancel)
+
+    # ---------- 界面 ----------
+    def create_widgets(self):
+        main = ttk.Frame(self.window, padding="8")
+        main.pack(fill=tk.BOTH, expand=True)
+
+        toolbar = ttk.Frame(main)
+        toolbar.pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(toolbar, text=_("导入文件..."), command=self.import_file).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(toolbar, text=_("导出为..."), command=self.export_file).pack(side=tk.LEFT, padx=4)
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        ttk.Button(toolbar, text=_("添加章节"), command=self.add_row).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text=_("删除选中"), command=self.delete_row).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text=_("上移"), command=lambda: self.move_row(-1)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text=_("下移"), command=lambda: self.move_row(1)).pack(side=tk.LEFT, padx=4)
+
+        columns = ("start", "title", "end")
+        self.tree = ttk.Treeview(main, columns=columns, show="headings", height=12)
+        self.tree.heading("start", text=_("开始时间"))
+        self.tree.heading("title", text=_("标题"))
+        self.tree.heading("end", text=_("结束时间（可选）"))
+        self.tree.column("start", width=120)
+        self.tree.column("title", width=320)
+        self.tree.column("end", width=140)
+        self.tree.pack(fill=tk.BOTH, expand=True, pady=4)
+        self.tree.bind("<Double-1>", self.on_double_click)
+
+        bottom = ttk.Frame(main)
+        bottom.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(bottom, text=_("EDL 帧率:")).pack(side=tk.LEFT)
+        ttk.Spinbox(bottom, from_=1, to=120, textvariable=self.edl_fps, width=6).pack(side=tk.LEFT, padx=(2, 12))
+        hint = ttk.Label(bottom, text=_("导入/导出 EDL 时使用；常用 23.98/25/29.97"), foreground="gray")
+        hint.pack(side=tk.LEFT)
+        ttk.Button(bottom, text=_("应用"), command=self.on_ok).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(bottom, text=_("取消"), command=self.on_cancel).pack(side=tk.RIGHT)
+
+    # ---------- 数据 ----------
+    def refresh_tree(self):
+        self.tree.delete(*self.tree.get_children())
+        for c in self.chapters:
+            self.tree.insert("", tk.END, values=(
+                chapter_fmts.format_seconds_short(c["start"]) if chapter_fmts else c["start"],
+                c.get("title", ""),
+                chapter_fmts.format_seconds_short(c["end"]) if (chapter_fmts and c.get("end") is not None) else "",
+            ))
+
+    def _collect_from_tree(self):
+        """把表格当前显示值读回 self.chapters（含用户双击编辑后的文本）"""
+        for iid, c in zip(self.tree.get_children(), self.chapters):
+            vals = self.tree.item(iid, "values")
+            try:
+                if chapter_fmts:
+                    sec = chapter_fmts.parse_hms_ms(str(vals[0]))
+                else:
+                    sec = None
+                if sec is not None:
+                    c["start"] = sec
+            except Exception:
+                pass
+            c["title"] = str(vals[1])
+            try:
+                if chapter_fmts and str(vals[2]).strip():
+                    sec = chapter_fmts.parse_hms_ms(str(vals[2]))
+                    if sec is not None:
+                        c["end"] = sec
+            except Exception:
+                pass
+
+    # ---------- 编辑操作 ----------
+    def add_row(self):
+        self._collect_from_tree()
+        self.chapters.append({"start": 0.0, "title": _("新章节"), "end": None})
+        self.refresh_tree()
+        kids = self.tree.get_children()
+        if kids:
+            self.tree.selection_set(kids[-1])
+
+    def delete_row(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo(_("提示"), _("请先选中要删除的章节"))
+            return
+        self._collect_from_tree()
+        idx = self.tree.index(sel[0])
+        del self.chapters[idx]
+        self.refresh_tree()
+
+    def move_row(self, delta):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        idx = self.tree.index(sel[0])
+        new = idx + delta
+        if new < 0 or new >= len(self.chapters):
+            return
+        self._collect_from_tree()
+        self.chapters[idx], self.chapters[new] = self.chapters[new], self.chapters[idx]
+        self.refresh_tree()
+        kids = self.tree.get_children()
+        if new < len(kids):
+            self.tree.selection_set(kids[new])
+
+    def on_double_click(self, event):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        col = self.tree.identify_column(event.x)
+        idx = self.tree.index(iid)
+        if col == "#1":
+            cur = self.tree.item(iid, "values")[0]
+            val = simpledialog.askstring(_("编辑开始时间"), _("开始时间（秒或 HH:MM:SS）:"),
+                                         initialvalue=str(cur), parent=self.window)
+            if val is not None:
+                sec = chapter_fmts.parse_hms_ms(val) if chapter_fmts else None
+                if sec is None:
+                    messagebox.showwarning(_("提示"), _("时间格式无法识别"))
+                    return
+                self.chapters[idx]["start"] = sec
+        elif col == "#2":
+            cur = self.tree.item(iid, "values")[1]
+            val = simpledialog.askstring(_("编辑标题"), _("章节标题:"),
+                                         initialvalue=str(cur), parent=self.window)
+            if val is not None:
+                self.chapters[idx]["title"] = val
+        elif col == "#3":
+            cur = self.tree.item(iid, "values")[2]
+            val = simpledialog.askstring(_("编辑结束时间"), _("结束时间（秒或 HH:MM:SS，留空=不指定）:"),
+                                         initialvalue=str(cur), parent=self.window)
+            if val is not None:
+                if str(val).strip():
+                    sec = chapter_fmts.parse_hms_ms(str(val)) if chapter_fmts else None
+                    if sec is None:
+                        messagebox.showwarning(_("提示"), _("时间格式无法识别"))
+                        return
+                    self.chapters[idx]["end"] = sec
+                else:
+                    self.chapters[idx]["end"] = None
+        self.refresh_tree()
+
+    # ---------- 导入 ----------
+    def import_file(self):
+        path = filedialog.askopenfilename(
+            title=_("导入章节文件"),
+            filetypes=[(_("章节文件"), "*.txt *.cue *.edl *.csv *.chapters *.ffmeta"),
+                       ("FFmetadata", "*.txt *.chapters *.ffmeta"),
+                       ("CUE", "*.cue"), ("EDL", "*.edl"), ("CSV", "*.csv"), (_("所有文件"), "*.*")])
+        if not path:
+            return
+        try:
+            text = chapter_fmts.read_text_auto(path)
+        except Exception as e:
+            messagebox.showerror(_("导入失败"), str(e))
+            return
+        fmt = chapter_fmts.detect_format(text) if chapter_fmts else chapter_fmts.FORMAT_CSV
+        if fmt == chapter_fmts.FORMAT_EDL:
+            chs = chapter_fmts.parse_text(text, fmt, fps=self.edl_fps.get()) if chapter_fmts else []
+        else:
+            chs = chapter_fmts.parse_text(text, fmt) if chapter_fmts else []
+        if not chs:
+            messagebox.showinfo(_("提示"), _("未识别到任何章节（格式: {0}）").format(
+                chapter_fmts.FORMAT_NAMES.get(fmt, fmt) if chapter_fmts else "?"))
+            return
+        self.chapters = chs
+        self.refresh_tree()
+        self._append_status(_("已导入 {0} 个章节（格式: {1}）").format(
+            len(chs), chapter_fmts.FORMAT_NAMES.get(fmt, fmt) if chapter_fmts else "?"))
+
+    def export_file(self):
+        self._collect_from_tree()
+        if not self.chapters:
+            messagebox.showinfo(_("提示"), _("没有可导出的章节"))
+            return
+        path = filedialog.asksaveasfilename(
+            title=_("导出章节"),
+            defaultextension=".txt",
+            filetypes=[("FFmetadata", "*.txt"), ("CUE", "*.cue"), ("EDL", "*.edl"), ("CSV", "*.csv"), (_("YouTube 文本"), "*.txt")])
+        if not path:
+            return
+        ext = os.path.splitext(path)[1].lower()
+        fmt = {".cue": "cue", ".edl": "edl", ".csv": "csv"}.get(ext, "ffmetadata")
+        try:
+            if chapter_fmts:
+                chapter_fmts.export_file(self.chapters, path, fmt, fps=self.edl_fps.get())
+        except Exception as e:
+            messagebox.showerror(_("导出失败"), str(e))
+            return
+        self._append_status(_("已导出 {0} 个章节到 {1}").format(len(self.chapters), path))
+
+    def _append_status(self, msg):
+        try:
+            if self.app:
+                self.app._append_info_ui(_("[章节] ") + msg)
+        except Exception:
+            pass
+
+    # ---------- 确定/取消 ----------
+    def on_ok(self):
+        self._collect_from_tree()
+        self.chapters = [c for c in self.chapters if c.get("start", 0) is not None]
+        self.chapters.sort(key=lambda c: c.get("start", 0))
+        self.result = self.chapters
+        self.window.destroy()
+
+    def on_cancel(self):
+        self.result = None
+        self.window.destroy()
+
 
 # ================== 主入口 ==================
 if __name__ == "__main__":
