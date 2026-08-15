@@ -4243,6 +4243,7 @@ class AudioFrame(ttk.LabelFrame):
     def _open_advanced_audio_dialog(self):
         """高级音频弹窗：淡入淡出 / 响度标准化 / 降噪 / 声道 / 均衡器（节省主区空间）。"""
         win = tk.Toplevel(self)
+        win.withdraw()  # 先隐藏，避免左上角闪一下
         win.title(_("高级音频处理"))
         try:
             center_window(win, 480, 260)
@@ -4623,7 +4624,7 @@ class LoopChromaFrame(ttk.LabelFrame):
         self.columnconfigure(1, weight=1)
 
         # ----- 左侧：循环播放（列0） -----
-        loop_frame = ttk.LabelFrame(self, text=_("循环播放"), padding="5")
+        loop_frame = ttk.LabelFrame(self, text=_("循环播放"), padding="2")
         loop_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 2))
         loop_frame.columnconfigure(0, weight=1)
 
@@ -4656,7 +4657,48 @@ class LoopChromaFrame(ttk.LabelFrame):
 
         # 时长显示标签
         self.duration_label = ttk.Label(loop_frame, text="", foreground="gray")
-        self.duration_label.grid(row=2, column=0, sticky="w", padx=10, pady=(5,0))
+        self.duration_label.grid(row=2, column=0, sticky="w", padx=10, pady=0)
+
+        # ---- 显示时段 / 循环显示（enable 控制，与次数控制 AND 叠加）----
+        self.show_start_var = tk.StringVar(value="")
+        self.show_end_var = tk.StringVar(value="")
+        self.show_cycle_var = tk.StringVar(value="")
+        self.show_once_var = tk.StringVar(value="")
+
+        seg_row = ttk.Frame(loop_frame)
+        seg_row.grid(row=3, column=0, sticky="w", padx=10, pady=(2, 0))
+        ttk.Label(seg_row, text=_("显示:")).pack(side=tk.LEFT)
+        ttk.Label(seg_row, text=_("起始")).pack(side=tk.LEFT, padx=(4, 1))
+        es_entry = ttk.Entry(seg_row, textvariable=self.show_start_var, width=7)
+        es_entry.pack(side=tk.LEFT, padx=(0, 2))
+        ToolTip(es_entry,
+                _("显示时段 - 起始时间（秒或 HH:MM:SS）：从该时刻起水印可见。\n"
+                "与「结束」配合生成 enable='between(t,起始,结束)'；只填起始=gte(t,起始)。\n"
+                "与循环次数/循环显示为叠加关系（AND），互不影响。"))
+        ttk.Label(seg_row, text=_("结束")).pack(side=tk.LEFT, padx=(4, 1))
+        ee_entry = ttk.Entry(seg_row, textvariable=self.show_end_var, width=7)
+        ee_entry.pack(side=tk.LEFT, padx=(0, 2))
+        ToolTip(ee_entry,
+                _("显示时段 - 结束时间（秒或 HH:MM:SS）：到该时刻水印消失。\n"
+                "只填结束=lte(t,结束)；起始/结束都填=between(t,起始,结束)。\n"
+                "时段外画面完全隐藏（overlay 不渲染，非黑场/定格）。"))
+
+        cyc_row = ttk.Frame(loop_frame)
+        cyc_row.grid(row=4, column=0, sticky="w", padx=10, pady=(2, 0))
+        ttk.Label(cyc_row, text=_("循环:")).pack(side=tk.LEFT)
+        ttk.Label(cyc_row, text=_("周期")).pack(side=tk.LEFT, padx=(4, 1))
+        ec_entry = ttk.Entry(cyc_row, textvariable=self.show_cycle_var, width=7)
+        ec_entry.pack(side=tk.LEFT, padx=(0, 2))
+        ToolTip(ec_entry,
+                _("循环显示 - 周期（秒）：每隔该时长重复一次显示（enable='lt(mod(t,周期),单次)'）。\n"
+                "需配合「单次」使用；周期须 ≥ 单次，否则画面一直显示。"))
+        ttk.Label(cyc_row, text=_("单次")).pack(side=tk.LEFT, padx=(4, 1))
+        eo_entry = ttk.Entry(cyc_row, textvariable=self.show_once_var, width=7)
+        eo_entry.pack(side=tk.LEFT, padx=(0, 2))
+        ToolTip(eo_entry,
+                _("循环显示 - 单次显示时长（秒）：每个周期内仅显示前这么多秒。\n"
+                "例：周 3 单 1 → 显示 1 秒、隐藏 2 秒，循环闪烁。\n"
+                "间隔期完全隐藏（overlay 不渲染），非黑场/定格。"))
 
         # 初始化 loop_mode
         self.loop_mode = tk.StringVar(value="infinite")
@@ -4674,7 +4716,7 @@ class LoopChromaFrame(ttk.LabelFrame):
         self.loop_enabled.trace_add("write", on_loop_enabled_changed)
 
         # ----- 右侧：绿幕抠像（列1） -----
-        chroma_frame = ttk.LabelFrame(self, text=_("绿幕抠像 (色度键)"), padding="5")
+        chroma_frame = ttk.LabelFrame(self, text=_("绿幕抠像 (色度键)"), padding="2")
         chroma_frame.grid(row=0, column=1, sticky="nsew", padx=(2, 0))
         chroma_frame.columnconfigure(0, weight=1)
         chroma_frame.columnconfigure(1, weight=1)
@@ -4872,6 +4914,7 @@ class LoopChromaFrame(ttk.LabelFrame):
     def open_mask_dialog(self):
         """遮罩 / 透明蒙版 设置弹窗：启用、方向、矩形坐标（可从裁剪复制）"""
         win = tk.Toplevel(self)
+        win.withdraw()  # 先隐藏，构建完成后再由 center_window 居中显示（避免左上角闪一下）
         win.title(_("遮罩 / 透明蒙版"))
         try:
             win.transient(self.winfo_toplevel())
@@ -4973,6 +5016,11 @@ class LoopChromaFrame(ttk.LabelFrame):
             "loop_enabled": self.loop_enabled.get(),
             "loop_mode": self.loop_mode.get(),
             "loop_count": self.loop_count.get(),
+            # 显示时段 / 循环显示（enable 控制）
+            "show_start": self.show_start_var.get().strip(),
+            "show_end": self.show_end_var.get().strip(),
+            "show_cycle": self.show_cycle_var.get().strip(),
+            "show_once": self.show_once_var.get().strip(),
             "chroma_enabled": self.chroma_enabled.get(),
             "chroma_color": self.chroma_color.get(),
             "chroma_similarity": self.chroma_similarity.get(),
@@ -4994,6 +5042,10 @@ class LoopChromaFrame(ttk.LabelFrame):
         self.loop_enabled.set(settings.get("loop_enabled", False))
         self.loop_mode.set(settings.get("loop_mode", "infinite"))
         self.loop_count.set(settings.get("loop_count", 3))
+        self.show_start_var.set(str(settings.get("show_start", "")))
+        self.show_end_var.set(str(settings.get("show_end", "")))
+        self.show_cycle_var.set(str(settings.get("show_cycle", "")))
+        self.show_once_var.set(str(settings.get("show_once", "")))
         self.chroma_enabled.set(settings.get("chroma_enabled", False))
         self.chroma_color.set(settings.get("chroma_color", "#3fff08"))
         sim = settings.get("chroma_similarity", 0.3)
@@ -8567,34 +8619,87 @@ class FFmpegBatchGUI:
         return total
 
     def _calc_enable_expr(self, enc_settings: dict, duration: Optional[float]) -> str:
-        loop_enabled = enc_settings.get("loop_enabled", False)
-        if not loop_enabled:
+        """计算 overlay 的 enable 表达式（FFmpeg 单表达式，多条件用 * 做 AND）。
+
+        语义（用户拍板）：
+        - 「循环显示（周期/单次）」独立参与，始终用 * 叠加：lt(mod(t,周),单)
+        - 「显示时段（起始/结束）」填了就**接管时间控制**，移除次数控制的 lte(t,...)：
+          between(t,起,结) / gte(t,起) / lte(t,结)
+        - 未填显示时段、且勾选「启用循环控制」次数有限 → lte(t,总时长)
+        - 全部为空返回 "1"（恒显示）。注意：连接符必须是 *（逗号是滤镜分隔符，会报错）。
+        """
+        parts = []
+
+        # ---- 显示时段 vs 次数控制：显示时段优先（接管时间），先入列 ----
+        window = self._build_show_window_expr(enc_settings)
+        if window:
+            parts.append(window)
+        else:
+            loop_enabled = enc_settings.get("loop_enabled", False)
+            if loop_enabled:
+                # 使用公共方法获取有效时长（已含截取+变速）
+                effective_duration = self._get_effective_duration(enc_settings, duration)
+                if effective_duration is None:
+                    effective_duration = duration
+                loop_mode = enc_settings.get("loop_mode", "infinite")
+                loop_count = enc_settings.get("loop_count", 3)
+                if loop_mode == "once":
+                    if effective_duration is not None and effective_duration > 0:
+                        parts.append(f"lte(t,{effective_duration})")
+                    else:
+                        self._append_info_ui(_("[循环] 无法获取视频时长，将一直显示"))
+                elif loop_mode == "count":
+                    if effective_duration is not None and effective_duration > 0:
+                        total = effective_duration * max(1, loop_count)
+                        parts.append(f"lte(t,{total})")
+                    else:
+                        self._append_info_ui(_("[循环] 无法获取视频时长，将按次数显示但无法精确"))
+                # infinite：不产生条件（恒真，无意义）
+
+        # ---- 循环显示（周期/单次）：独立叠加，放最后 ----
+        cycle_once = self._build_cycle_once_expr(enc_settings)
+        if cycle_once:
+            parts.append(cycle_once)
+
+        if not parts:
             return "1"
-    
-        # 使用公共方法获取有效时长（已含截取+变速）
-        effective_duration = self._get_effective_duration(enc_settings, duration)
-        if effective_duration is None:
-            # 无法计算有效时长时，降级为原始总时长或无限
-            effective_duration = duration
-    
-        loop_mode = enc_settings.get("loop_mode", "infinite")
-        loop_count = enc_settings.get("loop_count", 3)
-    
-        if loop_mode == "infinite":
-            return "1"
-        elif loop_mode == "once":
-            if effective_duration is not None and effective_duration > 0:
-                return f"lte(t,{effective_duration})"
-            else:
-                self._append_info_ui(_("[循环] 无法获取视频时长，将一直显示"))
-                return "1"
-        else:  # count
-            if effective_duration is not None and effective_duration > 0:
-                total = effective_duration * max(1, loop_count)
-                return f"lte(t,{total})"
-            else:
-                self._append_info_ui(_("[循环] 无法获取视频时长，将按次数显示但无法精确"))
-                return "1"
+        return "*".join(parts)
+
+    def _build_cycle_once_expr(self, enc_settings: dict) -> str:
+        """循环显示（周期/单次）enable 子表达式；未填时返回空串。"""
+        def _f(v):
+            v = (v or "").strip()
+            if v == "":
+                return None
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return None
+        cycle = _f(enc_settings.get("show_cycle"))
+        once = _f(enc_settings.get("show_once"))
+        if cycle is not None and once is not None and cycle > 0 and once > 0:
+            return f"lt(mod(t,{cycle:.3f}),{once:.3f})"
+        return ""
+
+    def _build_show_window_expr(self, enc_settings: dict) -> str:
+        """构建「显示时段（起始/结束）」enable 子表达式；无设置时返回空串。"""
+        def _f(v):
+            v = (v or "").strip()
+            if v == "":
+                return None
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return None
+        start = _f(enc_settings.get("show_start"))
+        end = _f(enc_settings.get("show_end"))
+        if start is not None and end is not None and end > start:
+            return f"between(t,{start:.3f},{end:.3f})"
+        if start is not None:
+            return f"gte(t,{start:.3f})"
+        if end is not None:
+            return f"lte(t,{end:.3f})"
+        return ""
 
     # ---------- 播放器设置相关方法 ----------
     def load_player_settings(self):
@@ -18013,6 +18118,7 @@ class FFmpegBatchGUI:
         """
         root_tk = self.root
         dialog = tk.Toplevel(root_tk)
+        dialog.withdraw()  # 先隐藏，避免左上角闪一下
         dialog.title(_("批量处理选项"))
         center_window(dialog, 640, 520)
         dialog.transient(root_tk)
@@ -19372,6 +19478,7 @@ class FFmpegBatchGUI:
             return
 
         dlg = tk.Toplevel(self.root)
+        dlg.withdraw()  # 先隐藏，构建完成定位后再显示（避免左上角闪一下）
         dlg.title(f"选择提取轨道 - {os.path.basename(fp)}")
         dlg.transient(self.root)
         dlg.grab_set()
@@ -19497,6 +19604,8 @@ class FFmpegBatchGUI:
         x = self.root.winfo_x() + (self.root.winfo_width() - w) // 2
         y = self.root.winfo_y() + (self.root.winfo_height() - h) // 2
         dlg.geometry(f"{w}x{h}+{x}+{y}")
+        dlg.deiconify()
+        dlg.lift()
 
     def _get_extract_indices(self, file_path, stream_type, all_indices, options):
         """获取要提取的流索引列表。如果文件有手动选择则用选择，否则用默认 only_first/all 逻辑。"""
@@ -20638,6 +20747,7 @@ class SegmentEditor:
         self._custom_input_file = None
 
         self.window = tk.Toplevel(parent)
+        self.window.withdraw()  # 先隐藏，构建完成后再由 center_window 居中显示
         self.window.title(_("分段拼接设置"))
         self.window.transient(parent)
         self.window.grab_set()
@@ -22128,6 +22238,7 @@ class ChapterEditor:
         self.edl_fps = tk.DoubleVar(value=25.0)
 
         self.window = tk.Toplevel(parent)
+        self.window.withdraw()  # 先隐藏，构建完成后再由 center_window 居中显示
         self.window.title(_("章节编辑器"))
         self.window.transient(parent)
         self.window.grab_set()
