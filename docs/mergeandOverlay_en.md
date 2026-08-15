@@ -196,25 +196,31 @@ Double-click any audio or subtitle track in the list to open its detailed settin
 
 ## 7. Clip fade in/out & serial transition (xfade)
 
-### 7.1 Video-track "Fade in/out (afade)" tab
-- Double-click a video track (Concat re-encode mode) to open settings; a new **"Fade in/out (afade)"** tab lets you check fade-in / fade-out and set durations (seconds).
+### 7.1 Video-track "Fade in/out" tab
+- Double-click a video track (Concat re-encode mode) to open settings; the **"Fade in/out"** tab lets you check "Enable fade in/out" and set fade-in / fade-out durations (seconds, on one row).
 - Implemented with `fade=t=in` / `fade=t=out` (gradual black at clip ends); if duration is unknown, fade-out is skipped but fade-in still applies.
 
-### 7.2 Right-click "One-click fade in/out (All)"
-- The track-list right-click menu adds **"One-click fade in/out (All)"**: writes fade in/out to every enabled video/audio track at once.
-- Duration is taken from the serial-transition box (default 1.0 s, freely editable); short clips auto-halved (`min(1.0, dur*0.4)`) so the fade never exceeds the clip itself.
+### 7.2 Serial transition (xfade, per-track resident attribute)
+- Transition is now a **per-track resident attribute** (attached to "this clip": this clip controls the transition between itself and the next), no longer a global switch on the merge page.
+- In Concat mode, every video track's "Fade in/out" tab has an **"Enable serial transition"** checkbox + a **transition-type dropdown** + a **"Transition duration (s)"** box.
+- **The last clip has no next clip, so its transition row is greyed out** (checkbox/dropdown disabled) and the toggle is ignored.
+- Transition type (ffmpeg `xfade` `transition`) is independently selectable per track: fade / fadeblack / fadewhite / fadegrays (fades), wipeleft / wiperight / wipeup / wipedown (wipes), slideleft / slideright / slideup / slidedown (slides), smoothleft / smoothright / smoothup / smoothdown (smooth slides), circlecrop / circleclose / circleopen / zoomin (shapes & zoom), dissolve / pixelize / radial (others).
+- Transition duration is auto-clamped to half the shorter of the two adjacent clips.
+- **Mutually exclusive with fade in/out (per track)**: this clip's fade-out is replaced by its own transition; the next clip's fade-in is replaced by the previous clip's transition; **first clip's fade-in / last clip's fade-out still apply** as the whole output's head/tail fade. Adjacent clips without a transition still hard-cut, independently.
+- **Audio follows automatically**: audio clips map 1:1 to video clips and follow the corresponding video clip's transition toggle via `acrossfade` (duration matches the video transition) — no separate audio transition setting needed.
 
-### 7.3 Serial transition (xfade cross-dissolve)
-- In Concat mode, a **"Serial transition"** checkbox + **"Duration:"** box (seconds) is added.
-- When checked, adjacent video segments get an `xfade=transition=fade` cross-dissolve; only works in re-encode mode with 2+ segments.
-- Transition duration is auto-clamped to half the shortest segment; in xfade mode per-segment black fades are dropped and replaced by a single unified head/tail fade on the joined video (using the first segment's fade_in and the last segment's fade_out).
-- **Audio follows automatically**: audio auto-follows the main video transition toggle via `acrossfade` (no separate audio transition setting needed).
+### 7.3 "One-click fade in/out (all)" & "One-click transition (all)" buttons (main video's "Fade in/out" tab)
+- In Concat mode, the main video's "Fade in/out" tab shows two batch buttons side by side at the bottom, each with its own "Duration (s):" box (default 1.0 s, freely editable):
+  - **One-click fade in/out (all)**: writes fade in/out to every enabled video/audio track (short clips auto-clamped to `min(1.0, dur*0.4)`).
+  - **One-click transition (all)**: enables serial transition on every enabled video track (except the last); type comes from the current dropdown, duration from this row's box, last clip auto-skipped.
+- The two duration boxes are **fully decoupled**.
+- Clicking also refreshes the currently-open edit window's checkboxes / dropdown / duration boxes, so "Save" won't overwrite the just-applied settings.
 
 ### 7.4 Right-click menu operations overview
 - **"Copy trim/spd/rev (V→A)"** — copy the selected video track's trim/speed/reverse (enabled only when a video track is selected).
 - **"Paste trim/spd/rev (V→A)"** — apply those to selected audio tracks (enabled only with a clipboard; includes out-of-range safety guard).
 - **"Batch src-audio→video T/S/R (V → A)"** — see §6.3.
-- **"One-click fade in/out (All)"** — see §7.2.
+- **"One-click fade in/out (all) / One-click transition (all)" buttons** — see §7.3 (now buttons + their own duration boxes inside the "Fade in/out" tab, not a right-click menu).
 
 ---
 
