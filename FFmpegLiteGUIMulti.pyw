@@ -19,8 +19,6 @@ import shlex
 import tempfile
 import time
 
-
-
 # --- 依赖检测 ---
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
@@ -139,7 +137,6 @@ def find_resource(filename: str) -> Optional[str]:
 
     return None
 
-
 def find_executable(name: str) -> Optional[str]:
     candidate = find_resource(name)
     if candidate and os.access(candidate, os.X_OK):
@@ -175,7 +172,6 @@ def center_window(win: tk.Toplevel, width: int, height: int, offset_y: int = 0):
     win.lift()
     win.focus_force()
     win.update_idletasks()
-
 
 def safe_eval_expr(expr: str, context: Dict[str, int]) -> Optional[int]:
     """
@@ -247,9 +243,6 @@ def seconds_to_time(sec, short=True):
             return f"{m:02d}:{s:06.3f}"
     else:
         return f"{h:02d}:{m:02d}:{s:06.3f}"
-
-
-
 
 # ================== 预设管理 ==================
 class PresetManager:
@@ -484,7 +477,6 @@ class PresetManager:
                os.unlink(temp_name)
            raise e
 
-
     def load_player_settings(self) -> Dict[str, Any]:
         if not os.path.exists(self.preset_path):
             return {}
@@ -511,8 +503,6 @@ class PresetManager:
                 os.unlink(temp_name)
             raise e
 
-
-
 def time_to_seconds(timestr: str) -> Optional[float]:
     """将 HH:MM:SS[.mmm] 或 MM:SS[.mmm] 或纯数字转换为秒数"""
     if not timestr:
@@ -535,7 +525,6 @@ def _channel_layout_name(ch):
     """把声道数映射为 ffmpeg aformat 可识别的声道布局名；无法映射时返回 None。"""
     return {1: "mono", 2: "stereo", 4: "quad", 5: "5.0", 6: "5.1", 7: "6.1", 8: "7.1"}.get(ch)
 
-
 def _majority_audio_params(params):
     """逐维度众数：采样率、声道数、采样格式分别取出现最多的值（≥3 段跟随多数轨）。"""
     from collections import Counter
@@ -543,7 +532,6 @@ def _majority_audio_params(params):
     ch = Counter(p["ch"] for p in params).most_common(1)[0][0]
     fmt = Counter(p["fmt"] for p in params).most_common(1)[0][0]
     return {"sr": sr, "ch": ch, "fmt": fmt}
-
 
 # ================== 滤镜链构建 ==================
 def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = True, include_speed: bool = True,
@@ -626,7 +614,6 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
             else:
                 filters.append(_blur_f)
 
-
     # ----- 遮罩 / 透明蒙版（子视频水印/画中画：矩形区域透明或保留，坐标同原始帧，排在裁剪前）-----
     if settings.get("mask_enabled", False):
         _sfx = graph_id or ""
@@ -649,7 +636,6 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
             f"[{_m}]format=gray,{_draw}[{_msk}];"
             f"[{_a}][{_msk}]alphamerge"
         )
-
 
     # ----- 裁剪 -----
     if settings.get("crop_enabled", False):
@@ -750,7 +736,6 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
             hue_parts.append(f"s={h_sat:.2f}")
         if hue_parts:
             filters.append(f"hue={':'.join(hue_parts)}")
-
 
     # ----- 像素格式 -----
     if include_format and settings.get("pix_fmt_enabled", True):
@@ -861,7 +846,6 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
 
     return filter_chain
 
-
 def _map_software_to_hw_filter(f: str, api: str):
     """把单个软件滤镜字符串映射为硬件滤镜；无解返回 None（表示仍需软件处理）。"""
     if f.startswith("scale="):
@@ -934,7 +918,6 @@ def _map_software_to_hw_filter(f: str, api: str):
             return None
     return None
 
-
 def _decoder_matches_api(decoder: str, api: str) -> bool:
     """判断硬件解码器是否与目标滤镜 API 匹配（帧能否直接在对应显存中）。"""
     decoder = (decoder or "").lower()
@@ -946,7 +929,6 @@ def _decoder_matches_api(decoder: str, api: str) -> bool:
         return ("vaapi" in decoder) or ("amf" in decoder)
     return False
 
-
 def _is_gpu_encoder(encoder: str) -> bool:
     """判断编码器是否为硬件编码器（输出帧需在显存）。"""
     if not encoder:
@@ -956,7 +938,6 @@ def _is_gpu_encoder(encoder: str) -> bool:
     suffixes = ("_nvenc", "_qsv", "_amf", "_vaapi", "_videotoolbox",
                 "_mediacodec", "_omx", "_mfx")
     return any(encoder.endswith(s) for s in suffixes)
-
 
 def _hwupload_token(api: str, device: str) -> str:
     """返回软件->硬件的上传滤镜；device 非空时显式绑定显卡设备。"""
@@ -1129,7 +1110,6 @@ def build_drawtext_filter(tw_settings: dict) -> str:
     if enable_expr:
         parts.append(f"enable='{enable_expr}'")
     return "drawtext=" + ":".join(parts)
-
 
 # ================== 视频尺寸计算 ==================
 def get_video_dimensions(ffprobe_cmd: str, file_path: str) -> Tuple[Optional[int], Optional[int]]:
@@ -1464,9 +1444,6 @@ class ToolTip:
             self.tip_window.destroy()
             self.tip_window = None
 
-
-
-
 # ================== 参数校验器 ==================
 class ParamValidator:
     @staticmethod
@@ -1738,7 +1715,6 @@ class VideoEncoderFrame(ttk.LabelFrame):
     }
     DEFAULT_PRESETS = ["medium"]   # 未知编码器 fallback
 
-
     def __init__(self, parent, app, refresh_callback=None, **kwargs):
         super().__init__(parent, text=_("视频编码与质量"), padding="5", **kwargs)
         self.app = app                     # 保存主界面引用
@@ -1798,7 +1774,6 @@ class VideoEncoderFrame(ttk.LabelFrame):
                                          values=[],          # ← 初始为空
                                          state="readonly", width=12)
         self.preset_combo.pack(side=tk.LEFT)
-
 
         ttk.Label(self, text=_("码率控制:")).grid(row=2, column=0, sticky="w", padx=5, pady=2)
         self.rate_control_type = tk.StringVar(value="crf")
@@ -1953,7 +1928,6 @@ class VideoEncoderFrame(ttk.LabelFrame):
         bufsize_entry = ttk.Entry(row2, textvariable=self.bufsize_var, width=8)
         bufsize_entry.pack(side=tk.LEFT, padx=5)
 
-
         # GIF 参数变量（存储实际值）
         self.gif_loop = tk.IntVar(value=0)
         self.gif_dither = tk.StringVar(value="bayer")
@@ -1963,7 +1937,6 @@ class VideoEncoderFrame(ttk.LabelFrame):
         self._on_gif_codec_toggle()
         self._update_profile_options()
         self._update_preset_options()
-
 
     def _update_preset_options(self, *args):
         """根据当前编码器动态更新 preset 下拉选项"""
@@ -2003,7 +1976,6 @@ class VideoEncoderFrame(ttk.LabelFrame):
         self.vcodec.trace_add("write", self._update_profile_options)
         self.vcodec.trace_add("write", self._update_preset_options)
         self.vcodec.trace_add("write", self._on_encoder_changed_for_copy_hint)
-
 
     def _on_encoder_changed_for_copy_hint(self, *args):
         """当编码器发生变化时，检测是否切换为 copy，仅在用户交互时提示"""
@@ -2097,7 +2069,6 @@ class VideoEncoderFrame(ttk.LabelFrame):
         ttk.Button(btn_frame, text=_("保存"), command=save).pack(side=tk.LEFT, padx=10)
         ttk.Button(btn_frame, text=_("取消"), command=cancel).pack(side=tk.LEFT, padx=10)
         win.wait_window()
-
 
     def update_dynamic_controls(self):
         for widget in self.dynamic_frame.winfo_children():
@@ -2291,9 +2262,6 @@ class VideoFilterFrame(ttk.LabelFrame):
         "gbrp", "gbrp10le", "gray", "gray10le", "ya8", "yuva420p"
     ]
 
-
-
-
     def __init__(self, parent, app, preview_callback=None, **kwargs):
         super().__init__(parent, text=_("视频滤镜 (裁剪/旋转/缩放/反交错/像素格式/变速/倒放)"), padding="5", **kwargs)
         self.app = app
@@ -2308,8 +2276,6 @@ class VideoFilterFrame(ttk.LabelFrame):
         # 用于控制裁剪提取线程的取消
         self._crop_extract_thread = None
         self._crop_cancel_event = threading.Event()
-
-
 
         # 去水印/模糊设置
         self._blur_enabled = tk.BooleanVar(value=False)
@@ -2340,7 +2306,6 @@ class VideoFilterFrame(ttk.LabelFrame):
             "hue_angle": 0.0,
             "hue_saturation": 0.0,
         }
-
 
     def create_widgets(self):
         main_pane = ttk.Frame(self)
@@ -2492,8 +2457,6 @@ class VideoFilterFrame(ttk.LabelFrame):
         for text, val in [(_("无"), "none"), (_("90°顺时针"), "90"), (_("180°"), "180"), (_("90°逆时针"), "270")]:
             ttk.Radiobutton(rot_frame, text=text, variable=self.rotate, value=val).pack(side=tk.LEFT, padx=2)
 
-
-
         self.vflip = tk.BooleanVar(value=False)
         self.hflip = tk.BooleanVar(value=False)
         ttk.Checkbutton(rot_frame, text=_("上下翻转"), variable=self.vflip).pack(side=tk.LEFT, padx=(20,0))
@@ -2504,12 +2467,9 @@ class VideoFilterFrame(ttk.LabelFrame):
                                    command=self.open_blur_dialog, width=10)
         self.blur_btn.pack(side=tk.LEFT, padx=(10, 0))
 
-
         self.enhance_btn = ttk.Button(rot_frame, text=_("高级增强"), 
                                       command=self.open_enhance_window, width=8)
         self.enhance_btn.pack(side=tk.LEFT, padx=(20,0))
-
-
 
         hybrid_frame = ttk.Frame(left_frame)
         hybrid_frame.pack(fill=tk.X, pady=2)
@@ -2524,14 +2484,12 @@ class VideoFilterFrame(ttk.LabelFrame):
             "推荐范围：0.1 ~ 10 倍，一般使用 0.25 ~ 4.0 已足够。"))
         ttk.Entry(hybrid_frame, textvariable=self.speed_factor, width=6).pack(side=tk.LEFT, padx=5)
 
-
         self.reverse_enabled = tk.BooleanVar(value=False)
         reverse_check = ttk.Checkbutton(hybrid_frame, text=_("启用倒放"), variable=self.reverse_enabled)
         reverse_check.pack(side=tk.LEFT, padx=(10, 0))
         ToolTip(reverse_check,
                 _("视频倒放（reverse 滤镜），仅作用于视频轨道，与音频无关。\n"
                 "音频如需倒放，请在音频设置中单独勾选「音频倒放（独立于视频）」，两者互不影响。"))
-
 
         deint_label = ttk.Label(hybrid_frame, text=_("反交错:"))
         deint_label.pack(side=tk.LEFT, padx=(10,0))
@@ -2571,7 +2529,6 @@ class VideoFilterFrame(ttk.LabelFrame):
         
         self.pix_fmt_enabled.trace_add("write", self._on_pix_fmt_changed)
 
-
     def open_blur_dialog(self):
         BlurFilterDialog(self, self)
 
@@ -2580,7 +2537,6 @@ class VideoFilterFrame(ttk.LabelFrame):
             return
         self.app.pix_fmt_enabled_default.set(self.pix_fmt_enabled.get())
         self.app.save_player_settings()
-
 
     def _swap_width_height(self):
         """交换宽度和高度数值"""
@@ -2670,8 +2626,6 @@ class VideoFilterFrame(ttk.LabelFrame):
         except Exception:
             return None, None
 
-
-
     def set_track(self, track):
         """设置当前编辑的轨道，用于获取截取设置"""
         self.current_track = track
@@ -2693,7 +2647,6 @@ class VideoFilterFrame(ttk.LabelFrame):
     def set_enhance_settings(self, settings):
         self.enhance_settings.update(settings)
         # 如果当前有打开增强窗口，可以更新控件，但为了简单，仅更新存储
-
 
     def open_enhance_window(self):
         win = tk.Toplevel(self)
@@ -2845,9 +2798,6 @@ class VideoFilterFrame(ttk.LabelFrame):
     
         ttk.Button(btn_frame, text=_("保存并关闭"), command=save_and_close).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text=_("取消"), command=win.destroy).pack(side=tk.LEFT, padx=5)
-
-
-
 
     def open_crop_editor(self):
         """可视化裁剪窗口 - 拖拽绘制矩形，支持时间跳转重新取帧，初始时间自动从主界面或者当前编辑窗口的截取起始时间获取"""
@@ -3670,7 +3620,6 @@ class VideoFilterFrame(ttk.LabelFrame):
         self._blur_h.set(settings.get("blur_h", "100"))
         self._blur_region_only.set(settings.get("blur_region_only", False))
 
-
 class TextWatermarkDialog(tk.Toplevel):
     """文字水印设置窗口（drawtext）"""
     def __init__(self, parent, app):
@@ -4175,7 +4124,6 @@ class BlurFilterDialog(tk.Toplevel):
             self.filter_frame.app.update_command_preview()
         self.destroy()
 
-
 # ================== 音频组件 ==================
 class AudioFrame(ttk.LabelFrame):
     def __init__(self, parent, enable_checkbox=False, **kwargs):
@@ -4463,7 +4411,6 @@ class AudioFrame(ttk.LabelFrame):
         self.eq_mid.set(settings.get("eq_mid", "0"))
         self.eq_high.set(settings.get("eq_high", "0"))
 
-
 # ================== 截取片段组件 ==================
 class TrimFrame(ttk.LabelFrame):
     def __init__(self, parent, show_combo_seek=True, update_callback=None, **kwargs):
@@ -4589,10 +4536,7 @@ class TrimFrame(ttk.LabelFrame):
             self.combo_threshold = tk.IntVar(value=30)
             self.combo_check = None
 
-
-
         self.on_trim_toggle()
-
 
     def _on_combo_changed(self, *args):
         """组合跳转相关控件变化时，触发外部刷新"""
@@ -4759,7 +4703,6 @@ class LoopChromaFrame(ttk.LabelFrame):
                 "对索引色（如 GIF）更稳定。若 chromakey 效果不佳可尝试此项。"),
                 wraplength=400)
 
-
         color_row = ttk.Frame(chroma_frame)
         color_row.grid(row=1, column=0, sticky="w", pady=2)
 
@@ -4908,7 +4851,6 @@ class LoopChromaFrame(ttk.LabelFrame):
                 self.alpha_spinbox_var.set(f"{self.alpha_value.get():.1f}")
         self.alpha_spinbox_var.trace_add("write", alpha_spin_changed)
 
-
         # ----- 遮罩 / 透明蒙版 -----
         self.mask_enabled = tk.BooleanVar(value=False)
         self.mask_x = tk.StringVar(value="0")
@@ -4916,7 +4858,6 @@ class LoopChromaFrame(ttk.LabelFrame):
         self.mask_w = tk.StringVar(value="100")
         self.mask_h = tk.StringVar(value="100")
         self.mask_mode = tk.StringVar(value="outside")  # outside=遮罩区域外(只露矩形); inside=遮罩区域内(矩形透明)
-
 
     def _pick_standard_color(self):
         from tkinter import colorchooser
@@ -5410,7 +5351,6 @@ class OverlayPositionFrame(ttk.LabelFrame):
                 _("将所有子视频（非主视频）的编码器恢复为「copy」（流复制）。\n"
                 "注意：恢复 copy 是为了给串行模式使用，如果你要更改模式的话。"))
 
-
         def smart_tile():
             if self.track_idx is not None:
                 orient_map = {
@@ -5451,9 +5391,6 @@ class OverlayPositionFrame(ttk.LabelFrame):
                 "• 监控画面拼接。"),
                 wraplength=700)
 
-
-
-
         param_row = ttk.Frame(right_frame)
         param_row.pack(anchor=tk.W, fill=tk.X, pady=5)
         
@@ -5476,7 +5413,6 @@ class OverlayPositionFrame(ttk.LabelFrame):
 #         tip_label = ttk.Label(right_frame, text="先取消缩放/裁剪，再平铺，效果更佳",
 #                               foreground="gray", font=("", 8))
 #         tip_label.pack(anchor=tk.W, pady=(5,0))
-
 
     def _apply_unified_height(self):
         val_str = self.unify_height_var.get().strip()
@@ -5679,7 +5615,6 @@ class OverlayPositionFrame(ttk.LabelFrame):
         else:
             self.app._append_info_ui(_("[取消子视频滤镜] 没有需要修改的子视频"))
 
-
     def get_settings(self):
         if self.mode == 'sub':
             return {
@@ -5706,21 +5641,21 @@ class OverlayPositionFrame(ttk.LabelFrame):
             self.overlay_x.set(settings.get("overlay_x", "W-w-10"))
             self.overlay_y.set(settings.get("overlay_y", "H-h-10"))
             self.blend_mode.set(settings.get("blend_mode", "normal"))
+            if hasattr(self, "_blend_display"):
+                self.blend_mode_display.set(self._blend_display.get(self.blend_mode.get(), "正常(透明叠加)"))
             self.overlay_free_layout.set(settings.get("overlay_free_layout", False))
             self.spin_enabled.set(settings.get("spin_enabled", False))
             try:
                 self.spin_speed.set(float(settings.get("spin_speed", 60.0)))
             except (ValueError, TypeError):
                 self.spin_speed.set(60.0)
-            if hasattr(self, "_blend_display"):
-                self.blend_mode_display.set(self._blend_display.get(self.blend_mode.get(), "正常(透明叠加)"))
+
         else:
             self.pad_enabled.set(settings.get("pad_enabled", False))
             self.pad_width.set(settings.get("pad_width", ""))
             self.pad_height.set(settings.get("pad_height", ""))
             self.offset_x.set(settings.get("offset_x", "0"))
             self.offset_y.set(settings.get("offset_y", "0"))
-
 
 # ================== 高级选项组件 ==================
 class AdvancedFrame(ttk.LabelFrame):
@@ -5734,7 +5669,6 @@ class AdvancedFrame(ttk.LabelFrame):
             self.watermark_dict = watermark_dict
         else:
             self.watermark_dict = self.app.watermark_settings
-
 
         self.wm_preset_var = tk.StringVar()
         self.wm_templates = {}  # 缓存所有水印模板
@@ -5751,10 +5685,7 @@ class AdvancedFrame(ttk.LabelFrame):
         self.wm_preset_file = os.path.join(preset_dir, "watermark_templates.json")
         self._load_wm_templates()  # 加载现有模板
 
-
         self.create_widgets()
-
-
 
     def create_widgets(self):
         # 硬件解码
@@ -5773,7 +5704,6 @@ class AdvancedFrame(ttk.LabelFrame):
                                           state="readonly", width=22)
         self.decoder_combo.pack(side=tk.LEFT, padx=5)
         self.decoder_combo.bind("<<ComboboxSelected>>", lambda e: self._on_hw_toggle())
-
 
         # ---- 滤镜硬件加速模式（软件 / NVIDIA / Intel QSV / AMD） ----
         ttk.Label(hw_frame, text=_("滤镜加速:")).pack(side=tk.LEFT, padx=(10, 0))
@@ -5826,7 +5756,6 @@ class AdvancedFrame(ttk.LabelFrame):
             wraplength=520
         )
         self.hw_filter_device_var.trace_add("write", lambda *a: self._trigger_update())
-
 
         # 自定义参数
         custom_frame = ttk.Frame(self)
@@ -5947,7 +5876,6 @@ class AdvancedFrame(ttk.LabelFrame):
         # 刷新下拉列表
         self._refresh_wm_preset_list()
 
-
     def _on_nvidia_toggle(self):
         """已废弃：滤镜加速改由「滤镜加速」下拉框统一控制。保留空函数避免遗留引用。"""
         self._trigger_update()
@@ -5955,7 +5883,6 @@ class AdvancedFrame(ttk.LabelFrame):
     def _on_amd_toggle(self):
         """已废弃：滤镜加速改由「滤镜加速」下拉框统一控制。保留空函数避免遗留引用。"""
         self._trigger_update()
-
 
     def _on_wm_path_changed(self, *args):
         path = self.wm_path_var.get().strip()
@@ -5979,9 +5906,6 @@ class AdvancedFrame(ttk.LabelFrame):
             return
         duration = self.app._get_media_duration(path)
         self.watermark_dict["duration"] = duration if duration is not None else None
-
-
-
 
     def _on_hw_toggle(self):
         """硬件解码/滤镜模式变化时刷新命令预览"""
@@ -6115,7 +6039,6 @@ class AdvancedFrame(ttk.LabelFrame):
             bg_draw_func=None, rect_label='文字水印',
             min_visible_pixels=0, show_scale_tip=False)
 
-
     def _get_wm_templates_path(self):
         return self.wm_preset_file
     
@@ -6231,7 +6154,6 @@ class AdvancedFrame(ttk.LabelFrame):
         else:
             messagebox.showerror(_("错误"), _("模板 \"{0}\" 不存在".format(name)))
 
-
     def get_settings(self):
         return {
             "hwaccel_enabled": self.hwaccel_enabled.get(),
@@ -6269,9 +6191,6 @@ class AdvancedFrame(ttk.LabelFrame):
         self.hw_filter_device_var.set(settings.get("hw_filter_device", ""))
         self._on_hw_toggle()
 
-
-
-
 class Task:
     def __init__(self, input_path, output_path, settings, cmd_list):
         self.input = input_path
@@ -6303,9 +6222,6 @@ class Task:
         short = re.sub(rf'(["\']?){out_quoted}\1', r'{output}', short)
         return short
 
-
-
-
 # ================== Track 类 ==================
 # ---------------------------------------------------------------------------
 # 复制滤镜时【禁止】跨轨道复制的键（集中声明，单一事实来源）。
@@ -6313,6 +6229,24 @@ class Task:
 # 因此新增滤镜参数（如 blend_mode、音频 EQ、淡入淡出等）无需再手工维护白名单，
 # 从根源上避免「漏复制」问题。
 # ---------------------------------------------------------------------------
+# 串行转场(xfade)可用 transition 类型（ffmpeg xfade 滤镜合法值）。
+# 逐轨独立选择；默认 fade（交叉溶解）。
+XFADE_TRANSITIONS = [
+    # 淡入淡出类
+    "fade", "fadeblack", "fadewhite", "fadegrays",
+    # 擦除类
+    "wipeleft", "wiperight", "wipeup", "wipedown",
+    # 滑动类
+    "slideleft", "slideright", "slideup", "slidedown",
+    # 平滑滑动
+    "smoothleft", "smoothright", "smoothup", "smoothdown",
+    # 形状与缩放
+    "circlecrop", "circleclose", "circleopen", "zoomin",
+    # 其他特效
+    "dissolve", "pixelize", "radial",
+]
+
+
 _COPY_FILTER_EXCLUDE_KEYS = frozenset({
     # —— 轨道结构 / 运行时 / 身份（不应随滤镜复制）——
     "_file_path", "_error", "_placeholder", "combo_seek", "language", "title",
@@ -6326,7 +6260,6 @@ _COPY_FILTER_EXCLUDE_KEYS = frozenset({
     # —— 外部音轨源（与具体文件绑定）——
     "external_audio_path", "external_audio_stream",
 })
-
 
 class Track:
     def __init__(self, index, typ, codec, file_path, enabled=True, enc_settings=None):
@@ -6361,6 +6294,10 @@ class Track:
                     "speed_enabled": False, "speed_factor": "1.0", "deinterlace_filter": "none",
                     "pix_fmt_enabled": True, "pix_fmt": "yuv420p",
                     "subtitle_enabled": False, "subtitle_path": "",
+                    # 串行转场（xfade）常驻字段：逐轨独立，与逐段淡入淡出互斥（连接处被转场替代，首尾保留）
+                    "transition_enabled": False,
+                    "transition_type": "fade",
+                    "transition_duration": "1.0",
                     # 新增的叠加/偏移/循环/绿幕字段（默认值）
                     "overlay_enabled": False,
                     "overlay_x": "W-w-10",
@@ -6587,7 +6524,6 @@ class ScrolledFrame(ttk.Frame):
         # 彻底修复“构造时画布高度=1 误判溢出、滚动条没默认隐藏”的问题。
         self.after_idle(self._layout_inner)
 
-
 # ================== 主界面类 ==================
 class FFmpegBatchGUI:
     # ---------- SafeToplevel 上下文管理器 ----------
@@ -6621,7 +6557,6 @@ class FFmpegBatchGUI:
                     except Exception:
                         # 忽略 grab 释放时的异常（如主窗口已销毁）
                         pass
-
 
     
     # ================== 语言映射 ==================
@@ -6708,11 +6643,6 @@ class FFmpegBatchGUI:
         ("未指定 (und)",      "und"),
     ]
 
-
-
-
-
-
     def _pick_ui_font(self, size=9, bold=False):
         """跨平台选 UI 字体：优先能正立显示 对勾的字体，老外系统无雅黑时回退到 Segoe UI Symbol。"""
         try:
@@ -6761,7 +6691,6 @@ class FFmpegBatchGUI:
         self.ffmpeg_dir_path = tk.StringVar(value="")
         # 初始化路径（需在 load_player_settings 之前调用）
         self._update_ffmpeg_paths()
-
 
         # 基本变量
         self.input_file = tk.StringVar()
@@ -6826,8 +6755,6 @@ class FFmpegBatchGUI:
 
         self.preview_editable_var = tk.BooleanVar(value=False)
 
-
-
         self.extract_custom_dir = tk.BooleanVar(value=False)   # 流提取 是否启用自定义输出目录
         self.extract_output_dir = tk.StringVar(value="")       # 流提取 自定义输出目录路径
         self.current_preview_file = None
@@ -6852,7 +6779,6 @@ class FFmpegBatchGUI:
 
         self._global_temp_files = []
 
-
         # ffprobe 并发数量计算
         cpu_count = os.cpu_count() or 4
         if cpu_count <= 16:
@@ -6867,16 +6793,12 @@ class FFmpegBatchGUI:
             max_workers=self.ffprobe_parallel.get()
         )
 
-
         self._running_tasks = []  # 存储 (proc, task)
         
         self.cmd_output_path = tk.StringVar(value="")
 
         self._duration_cache = {}
         self._dimension_cache = {}
-
-
-
 
         self._proc_lock = threading.Lock()
         self.running_procs = []  # 存储当前正在运行的 FFmpeg 进程对象（subprocess.Popen）
@@ -6988,8 +6910,6 @@ class FFmpegBatchGUI:
         # 启动后台初始化（文件释放和加载）
         self.root.after(100, self._delayed_init)   # 延迟 100ms 让窗口先显示
 
-
-
         # 处理命令行参数（支持从资源管理器“发送到”打开文件）
         if len(sys.argv) > 1:
             # 取第一个非脚本参数作为文件路径
@@ -7015,9 +6935,6 @@ class FFmpegBatchGUI:
 
         self.root.update_idletasks()
         self.root.deiconify()
-
-
-
 
     # 注：原 _get_filter_param_keys 白名单已废弃，复制滤镜改由模块级
     # _COPY_FILTER_EXCLUDE_KEYS（默认全复制 + 显式排除）驱动，新增滤镜参数自动包含。
@@ -7057,7 +6974,6 @@ class FFmpegBatchGUI:
         self._initialized = True
 #        self._append_info_ui("预设和快速命令模板已就绪")
 
-
     def _ensure_main_video(self, disable_scale=False):
         """确保 self.merge_video 已设置：若未设置，则从列表中取第一个启用的视频轨道。
         如果 disable_scale=True，则将该视频轨道的缩放禁用（仅当自动设置时）。
@@ -7085,7 +7001,6 @@ class FFmpegBatchGUI:
                 self.merge_video.set("")
                 return False
         return True
-
 
     def _set_window_icon(self):
         icon_path = find_resource("35.ico")
@@ -7130,7 +7045,6 @@ class FFmpegBatchGUI:
         self.update_task_list()
         self._append_info_ui(_("✅ 已添加提取任务: {0} -> {1}".format(os.path.basename(input_path), final_output)))
         return True
-
 
     def update_progress(self, current=0, total=0, task=None, log_progress=True):
         if total == 0:
@@ -7198,7 +7112,6 @@ class FFmpegBatchGUI:
         info.see(tk.END)
 
     
-
 
     # 过滤转换日志的无用信息
     @staticmethod
@@ -7374,7 +7287,6 @@ class FFmpegBatchGUI:
             "【硬件滤镜片段】QSV 像素格式": '-vf \"vpp_qsv=format=nv12\"',
             "【硬件滤镜片段】QSV 帧率": '-vf \"vpp_qsv=framerate=30\"',
 
-
         }
     
     def _save_cmd_templates(self):
@@ -7395,8 +7307,6 @@ class FFmpegBatchGUI:
                 self.cmd_preset_var.set(names[0])
             else:
                 self.cmd_preset_var.set("")
-
-
 
     def _add_hwaccel_params(self, cmd_list: List[str], settings: dict):
         """添加硬件解码相关参数（若启用），以及滤镜硬件加速的设备初始化。"""
@@ -7451,7 +7361,6 @@ class FFmpegBatchGUI:
             if end:
                 cmd_list.extend(["-to", end])
 
-
     def _enforce_reencode_for_precise_trim(self, settings: dict, only_audio: bool = False):
         """精准模式下强制重新编码"""
         if settings.get("precise_trim", False) and not only_audio:
@@ -7481,8 +7390,6 @@ class FFmpegBatchGUI:
         elif total_duration is not None:
             duration = total_duration - start_sec
         return start_sec, duration
-
-
 
     def _get_video_pix_fmt(self, file_path: str, stream_index: int = 0) -> Optional[str]:
         """获取视频流的像素格式，优先读解析缓存，失败返回None"""
@@ -7643,7 +7550,6 @@ class FFmpegBatchGUI:
                 steps.append("缩放(无效)")
     
         return steps
-
 
     def _build_video_encoding_params(self, cmd_list: List[str], settings: dict) -> List[str]:
         vcodec = settings.get("encoder", "libx265")
@@ -7864,7 +7770,6 @@ class FFmpegBatchGUI:
         cmd_list.extend(["-ar", settings.get("audio_samplerate", "44100")])
     
         return cmd_list
-
 
     def _adapt_sub_settings(self, sub_settings, current_w, current_h, wm_orig_w=None, wm_orig_h=None):
         """
@@ -8687,7 +8592,6 @@ class FFmpegBatchGUI:
                 self._append_info_ui(_("[循环] 无法获取视频时长，将按次数显示但无法精确"))
                 return "1"
 
-
     # ---------- 播放器设置相关方法 ----------
     def load_player_settings(self):
         self._loading_settings = True
@@ -8852,7 +8756,16 @@ class FFmpegBatchGUI:
         截取通过播放器原生跳转参数（-ss/--start）实现。
         """
         if not file_path or not os.path.exists(file_path):
-            self._append_info_ui(_("文件不存在: {0}".format(file_path)))
+            self._append_info_ui(_("文件不存在: {0}").format(file_path))
+            return
+
+        # ---- 快照模式：只弹合成快照窗口，不启动播放器预览 ----
+        if with_snapshot:
+            wm_settings = settings.get("watermark", {})
+            if wm_settings.get("enabled", False) and (wm_settings.get("file_path", "") or "").strip():
+                self._show_watermark_snapshot_async(file_path, settings)
+            else:
+                self._append_info_ui(_("[预览] 未设置水印，无法生成快照"))
             return
     
         # ---- 预览强制走软件滤镜路径 ----
@@ -9016,14 +8929,6 @@ class FFmpegBatchGUI:
             duration=duration
         )
 
-        # ---- 水印真实合成快照（独立窗口，与红框占位并行；仅右键预览带快照时触发） ----
-        wm_settings = settings.get("watermark", {})
-        if with_snapshot and wm_settings.get("enabled", False) and (wm_settings.get("file_path", "") or "").strip():
-            self._show_watermark_snapshot_async(file_path, settings)
-
-
-
-
     # ---------- 输出路径生成与命令构建 ----------
     def _sanitize_filename(self, filename: str) -> str:
         """移除 Windows 非法字符，替换为下划线"""
@@ -9158,9 +9063,6 @@ class FFmpegBatchGUI:
 
         return cmd_list
 
-
-
-
     def _safe_delete_file(self, path: str):
         """安全删除文件"""
         try:
@@ -9212,8 +9114,6 @@ class FFmpegBatchGUI:
                     os.unlink(f)
             except Exception:
                 pass
-
-
 
     # ========== 自定义滤镜自动合并系统 ==========
     # 视频滤镜优先级表（数值越小越靠前，与 build_video_filter_chain 顺序一致）
@@ -9591,8 +9491,6 @@ class FFmpegBatchGUI:
                 task.temp_files.extend(temp_files)
         return cmd_list
 
-
-
     def _add_infinite_loop_params(self, cmd_list: List[str], file_path: str, is_sub_video: bool = True, framerate: str = "30"):
         """
         为输入文件添加无限循环参数（用于子视频/水印）。
@@ -9615,7 +9513,6 @@ class FFmpegBatchGUI:
         else:
             # 普通视频
             cmd_list.extend(["-stream_loop", "-1"])
-
 
     def _generate_command_with_watermark(self, input_path: str, output_path: str, settings: dict, wm_settings: dict) -> List[str]:
         main_w, main_h = self._get_video_dimensions_cached(input_path)
@@ -9798,9 +9695,6 @@ class FFmpegBatchGUI:
 
         return cmd_list
 
-
-
-
     def get_current_settings(self):
         settings = {}
         settings.update(self.video_encoder.get_settings())
@@ -9839,7 +9733,6 @@ class FFmpegBatchGUI:
         # 添加文字水印设置（深拷贝）
         settings["text_watermark"] = copy.deepcopy(self.text_watermark_settings)
         return settings
-
 
     def load_settings_into_ui(self, settings):
         self._loading_preset = True
@@ -10027,9 +9920,6 @@ class FFmpegBatchGUI:
             canvas.create_rectangle(cx1, cy1, cx2, cy2, outline="lightgreen", width=2, dash=(4, 4), fill="", tags=tag)
             canvas.create_text(cx1 + 5, cy1 + 5, anchor="nw", text=str(sub_order[sub]),
                                fill="red", font=("Arial", 10, "bold"), tags=tag)
-
-
-
 
     # ---------- 通用公共位置可视化编辑器函数 ----------
     def _generic_overlay_editor(self, parent, canvas_w, canvas_h,
@@ -10462,7 +10352,6 @@ class FFmpegBatchGUI:
         win.wait_window()
         parent.lift()
         parent.focus_force()
-
 
     # ---------- 主视频位置可视化编辑器 ----------
     def open_visual_pad_editor(self, track_idx, pad_w_var, pad_h_var, off_x_var, off_y_var,
@@ -10904,7 +10793,6 @@ class FFmpegBatchGUI:
         for child in widget.winfo_children():
             self._set_recursive_state(child, state)
 
-
     def open_segment_editor(self):
         if not self.segment_enabled.get():
             messagebox.showinfo(_("提示"), _("请先勾选「启用分段拼接模式」再打开设置窗口。"))
@@ -10928,7 +10816,6 @@ class FFmpegBatchGUI:
             self.audio_trim_start = editor.audio_trim_start
             self.audio_trim_end = editor.audio_trim_end
             self.update_command_preview()
-
 
     def update_command_preview(self, *args):
         """防抖版刷新命令预览"""
@@ -11001,7 +10888,6 @@ class FFmpegBatchGUI:
         finally:
             self._updating_preview = False
 
-
     # ---------- 同名文件处理 ----------
     def _unique_path(self, path: str) -> str:
         """生成不冲突的唯一路径（自动加序号）"""
@@ -11044,7 +10930,6 @@ class FFmpegBatchGUI:
                         return self._unique_path(output_path)
                 return output_path
 
-
     # ---------- 任务管理 ----------
     def is_duplicate_task(self, input_path, output_path):
         """检查输出路径是否已被已有任务占用（无论输入是否相同）"""
@@ -11053,7 +10938,6 @@ class FFmpegBatchGUI:
             if normalize_path(task.output) == norm_out:
                 return True
         return False
-
 
     def add_task(self, input_path, settings=None):
         if settings is None:
@@ -11258,8 +11142,6 @@ class FFmpegBatchGUI:
     def safe_append_detail(self, text):
         self.root.after(0, lambda: self.append_detail(text))
 
-
-
     def _process_single_task(self, task):
         """处理单个任务（队列模式）"""
         task.status = "转码中"
@@ -11385,7 +11267,6 @@ class FFmpegBatchGUI:
                 f.write(f"{cmd_str}\n")
         except Exception as e:
             self._append_info_ui(_("无法写入命令日志: {0}".format(e)))
-
 
     def transcode_single(self):
         input_file = self.input_file.get()
@@ -11597,7 +11478,6 @@ class FFmpegBatchGUI:
             filt_frame.set_get_trim_settings_callback(lambda: trim_frame.get_settings())
             trim_frame.precise_trim.trace_add("write", lambda *a: update_preview())
 
-
             # ----- 分段拼接页面 -----
             page_segment = ttk.Frame(notebook)
             notebook.add(page_segment, text=_("分段拼接"))
@@ -11667,7 +11547,6 @@ class FFmpegBatchGUI:
                 justify=tk.LEFT
             ).pack(anchor=tk.W, padx=10, pady=(5,0))
 
-
             # 高级选项页面
             page_adv = ttk.Frame(notebook)
             notebook.add(page_adv, text=_("高级选项"))
@@ -11686,8 +11565,6 @@ class FFmpegBatchGUI:
             task.settings["watermark"] = adv_frame.watermark_dict
             adv_frame.pack(fill=tk.X, padx=5, pady=5)
             adv_frame.set_settings(task.settings)
-
-
 
             # 水印编辑按钮新命令
             def open_task_watermark():
@@ -11789,7 +11666,6 @@ class FFmpegBatchGUI:
                 if not win.winfo_exists():
                     return
 
-
                 current_state = preview_text.cget('state')
                 if task.is_custom:
                     # 直接显示保存的命令   # 流提取相关
@@ -11880,7 +11756,6 @@ class FFmpegBatchGUI:
             audio_frame.audio_speed_factor.trace_add("write", update_preview)
             audio_frame.audio_reverse.trace_add("write", update_preview)
 
-
             trim_frame.trim_enabled.trace_add("write", update_preview)
             trim_frame.trim_start.trace_add("write", update_preview)
             trim_frame.trim_end.trace_add("write", update_preview)
@@ -11921,7 +11796,6 @@ class FFmpegBatchGUI:
                 new_output = self.generate_output_path(task.input, new_settings)
                 new_settings["enhance"] = filt_frame.get_enhance_settings()
 
-
                 new_settings["segment_enabled"] = seg_enabled_var.get()
                 new_settings["segments"] = copy.deepcopy(seg_list)
                 # 音频独立截取（由 SegmentEditor 写入 task.settings，需保留到 new_settings）
@@ -11945,7 +11819,6 @@ class FFmpegBatchGUI:
             btn_frame.pack(pady=(5,10))
             ttk.Button(btn_frame, text=_("保存修改"), command=save_changes).pack(side=tk.LEFT, padx=5)
             ttk.Button(btn_frame, text=_("取消"), command=win.destroy).pack(side=tk.LEFT, padx=5)
-
 
             win.wait_window()
 
@@ -11992,9 +11865,9 @@ class FFmpegBatchGUI:
         ttk.Button(tool_frame, text=_("编辑"), command=self.merge_edit_selected, width=8).pack(side=tk.LEFT, padx=2)
         btn_merge_preview = ttk.Button(tool_frame, text=_("预览"), command=self.merge_preview_selected, width=8)
         btn_merge_preview.pack(side=tk.LEFT, padx=2)
-        # 左键=旧预览（无快照）；右键=带真实合成快照的预览
-        btn_merge_preview.bind("<Button-3>", lambda e: self.merge_preview_selected(with_snapshot=True))
-        ToolTip(btn_merge_preview, _("左键：常规预览（无快照）\n右键：预览 + 画中画真实合成快照（独立窗口）"), wraplength=320)
+        # 左键=常规预览；右键=弹出选择菜单（快照 / 缩略图）
+        btn_merge_preview.bind("<Button-3>", lambda e: self._merge_preview_right_menu())
+        ToolTip(btn_merge_preview, _("左键：常规预览\n右键：快照 / 缩略图 选择菜单"), wraplength=320)
         ttk.Button(tool_frame, text=_("上移"), command=self.merge_move_up_selected, width=8).pack(side=tk.LEFT, padx=2)
         ttk.Button(tool_frame, text=_("下移"), command=self.merge_move_down_selected, width=8).pack(side=tk.LEFT, padx=2)
         ttk.Button(tool_frame, text=_("删除"), command=self.merge_delete_selected, width=8).pack(side=tk.LEFT, padx=2)
@@ -12067,10 +11940,11 @@ class FFmpegBatchGUI:
                 wraplength=700)
 
         self.concat_enabled = tk.BooleanVar(value=False)
-        self.xfade_enabled = tk.BooleanVar(value=False)
-        self.xfade_duration = tk.StringVar(value="1.0")
-        self.xfade_enabled.trace_add("write", lambda *a: self.merge_update_command_preview())
-        self.xfade_duration.trace_add("write", lambda *a: self.merge_update_command_preview())
+
+        # 一键淡入淡出（All）独立时长框
+        self.oneclick_fade_duration = tk.StringVar(value="1.0")
+        # 一键转场（All）独立时长框（逐轨转场已移入视频编辑窗，此框仅供批量按钮使用）
+        self.oneclick_transition_duration = tk.StringVar(value="1.0")
         concat_chk = ttk.Checkbutton(btn_frame, text=_("串行合并（首尾拼接）"), variable=self.concat_enabled)
         concat_chk.pack(side=tk.LEFT, padx=5)
         ToolTip(concat_chk,
@@ -12095,7 +11969,7 @@ class FFmpegBatchGUI:
                 "提示：串行合并拖拽额外支持文件夹解析。"),
                 wraplength=700)
 
-        ttk.Button(btn_frame, text=_("添加外部视频（画中画/串行）"), 
+        ttk.Button(btn_frame, text=_("添加外部视频（画中画/串行）"),
             command=self.merge_add_external_video).pack(side=tk.LEFT, padx=2)
 
         # ----- 手动时长控制 -----
@@ -12104,7 +11978,7 @@ class FFmpegBatchGUI:
         self.merge_manual_duration = tk.StringVar(value="")
         # UI 控件
         ttk.Separator(btn_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=(20,5))
-        chk_manual = ttk.Checkbutton(btn_frame, text=_("手动时长"), 
+        chk_manual = ttk.Checkbutton(btn_frame, text=_("手动时长"),
                                      variable=self.merge_manual_duration_enabled,
                                      command=lambda: self.merge_update_command_preview())
         chk_manual.pack(side=tk.LEFT, padx=2)
@@ -12117,19 +11991,14 @@ class FFmpegBatchGUI:
             wraplength=600
         )
 
-
-        self.merge_manual_duration_entry = ttk.Entry(btn_frame, 
+        self.merge_manual_duration_entry = ttk.Entry(btn_frame,
                                                      textvariable=self.merge_manual_duration,
                                                      width=8)
         self.merge_manual_duration_entry.pack(side=tk.LEFT, padx=2)
         ttk.Label(btn_frame, text=_("秒 (覆盖自动时长)")).pack(side=tk.LEFT, padx=0)
 
-
-
         # 绑定输入变化刷新预览
         self.merge_manual_duration.trace_add('write', lambda *a: self.merge_update_command_preview())
-
-
 
         chapter_frame = ttk.LabelFrame(parent, text=_("章节处理"), padding="3")
         chapter_frame.pack(fill=tk.X, pady=(0,5))
@@ -12189,7 +12058,7 @@ class FFmpegBatchGUI:
         )
         container_combo.pack(side=tk.LEFT, padx=5)
         container_combo.bind("<<ComboboxSelected>>", lambda e: self.merge_update_output_preview())
-        
+
         right_container = ttk.Frame(row_frame)
         right_container.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Label(right_container, text=_("输出文件:")).pack(side=tk.LEFT)
@@ -12203,35 +12072,21 @@ class FFmpegBatchGUI:
 
         opt_action_frame = ttk.Frame(parent)
         opt_action_frame.pack(fill=tk.X, pady=2)
-        
+
         del_src_cb = ttk.Checkbutton(
             opt_action_frame, text=_("删除源文件"), variable=self.merge_delete_source
         )
         del_src_cb.pack(side=tk.LEFT, padx=5)
         ToolTip(del_src_cb,
-                _("合并成功后自动删除源文件（移动到回收站/垃圾箱，而非永久删除）。\n\n"
-                "注意：仅当最终输出文件已成功生成并（若勾选验证）通过校验后才删除。\n"
-                "建议先不勾选，确认输出无误后再开启，避免误删源素材。"),
-                wraplength=420)
+                _("删除源文件（合并成功后）：\n"
+                "仅当本次合并执行成功后才删除对应源文件；\n"
+                "执行失败、输出文件无效或用户取消删除时均保留原文件。\n"
+                "删除前会弹出确认框，且只删除安全目录内的源文件。"),
+                wraplength=400)
 
         ttk.Checkbutton(
             opt_action_frame, text=_("验证输出文件"), variable=self.merge_verify
         ).pack(side=tk.LEFT, padx=5)
-
-        xfade_cb = ttk.Checkbutton(opt_action_frame, text=_("串行转场"), variable=self.xfade_enabled)
-        xfade_cb.pack(side=tk.LEFT, padx=(5, 2))
-        ToolTip(xfade_cb,
-                _("串行转场（xfade 交叉溶解）：在相邻视频段之间做交叉淡入淡出过渡。\n\n"
-                "• 仅「重新编码模式」生效；流复制模式不支持转场。\n"
-                "• 右侧「时长」为每段转场时长（秒），默认 1.0s。\n"
-                "• 该时长也用于右键菜单「一键淡入淡出（All）」，可自由填写不再死板。\n"
-                "• 音频会自动跟随主视频的转场开关做 acrossfade 交叉淡入淡出。"),
-                wraplength=520)
-        ttk.Label(opt_action_frame, text=_("时长:")).pack(side=tk.LEFT)
-        ttk.Entry(opt_action_frame, textvariable=self.xfade_duration, width=4).pack(side=tk.LEFT, padx=(2, 4))
-        self._xfade_cb = xfade_cb
-        if not self.concat_enabled.get():
-            xfade_cb.config(state='disabled')
 
         self.merge_only_audio = tk.BooleanVar(value=False)
         self.only_audio_checkbox = ttk.Checkbutton(
@@ -12273,7 +12128,6 @@ class FFmpegBatchGUI:
         self.pip_enabled.trace_add('write', _update_only_audio_state)
         self.concat_enabled.trace_add('write', _update_only_audio_state)
 
-
         self.merge_btn = tk.Button(opt_action_frame, text=_("开始合并"), command=self.merge_start,
                                    height=1, width=12, bg="#4CAF50", fg="white")
         self.merge_btn.pack(side=tk.LEFT, padx=5)
@@ -12296,7 +12150,6 @@ class FFmpegBatchGUI:
         )
         self.merge_cmd_preview.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=0)
 
-
         self.merge_video.trace_add("write", lambda *a: self.merge_load_video_info())
         self.merge_container.trace_add("write", lambda *a: self.merge_update_command_preview())
         self.merge_output.trace_add("write", lambda *a: self.merge_update_command_preview())
@@ -12306,7 +12159,6 @@ class FFmpegBatchGUI:
 
         self.pip_enabled.trace_add('write', self._on_pip_toggle)
         self.concat_enabled.trace_add('write', self._on_concat_toggle)
-
 
     def _merge_sort_ask(self):
         """弹出询问框，选择排序方式（仅在串行合并模式下可用）"""
@@ -12318,7 +12170,6 @@ class FFmpegBatchGUI:
             self.merge_sort_by_filename()
         else:
             self.merge_sort_by_mtime()
-
 
     def _show_merge_tree_context_menu(self, event):
         """右键事件触发，显示菜单"""
@@ -12351,12 +12202,12 @@ class FFmpegBatchGUI:
         # 批量：选中同源音频轨（或对应视频轨）各自套用对应视频轨的截取/变速/倒放（越界自动钳制）
         menu.add_command(label=_("同源音频批量套用同源视频 T S R (V → A)"), command=self._batch_apply_src_video_to_audio)
         menu.add_separator()
-        menu.add_command(label=_("一键淡入淡出（All）"), command=self._apply_fade_all_tracks)
 
         menu.add_command(label=_("启用/禁用"), command=self.merge_toggle_selected)
         menu.add_command(label=_("编辑轨道"), command=self.merge_edit_selected)
         menu.add_command(label=_("预览轨道"), command=self.merge_preview_selected)
         menu.add_command(label=_("预览轨道(快照)"), command=lambda: self.merge_preview_selected(with_snapshot=True))
+        menu.add_command(label=_("创建缩略图"), command=self._contact_sheet_selected_track)
         menu.add_command(label=_("上移轨道"), command=self.merge_move_up_selected)
         menu.add_command(label=_("下移轨道"), command=self.merge_move_down_selected)
         menu.add_command(label=_("删除轨道"), command=self.merge_delete_selected)
@@ -12373,19 +12224,23 @@ class FFmpegBatchGUI:
         y = self.root.winfo_pointery()
         self._popup_merge_tree_menu(x, y)
 
-    def _apply_fade_all_tracks(self):
+    def _apply_fade_all_tracks(self, current_track_obj=None, current_fade_vars=None):
         """一键为所有已启用的视频/音频轨道启用淡入淡出。
 
-        淡入淡出时长取自「串行转场」右侧的时长框（self.xfade_duration），默认 1.0s，
+        淡入淡出时长取自视频编辑窗口「淡入淡出」页的「一键淡入淡出(all)」时长框（self.oneclick_fade_duration），默认 1.0s，
         可自由填写不再死板；超过片段时长 40% 时自动钳制，避免过短片段淡入淡出互相覆盖。
+
+        current_track_obj / current_fade_vars：当从视频编辑窗口内点击时传入「当前正在编辑的轨道对象」与
+        「窗口内淡入淡出页的局部变量 (fade_enabled_var, fade_in_var, fade_out_var)」。函数会直接写回轨道对象的
+        enc_settings，并同步窗口局部变量，避免点击「保存」时局部变量（仍为未启用）把刚写入的淡入淡出覆盖掉。
         """
         enabled = [t for t in self.merge_tracks if t.enabled]
         if not enabled:
             messagebox.showinfo(_("提示"), _("没有已启用的轨道。"))
             return
-        # 取「串行转场」时长框的数字作为淡入淡出基准时长（可自定义）
+        # 取「一键淡入淡出」时长框的数字作为淡入淡出基准时长（可自定义）
         try:
-            fade_base = float(self.xfade_duration.get().strip() or "1.0")
+            fade_base = float(self.oneclick_fade_duration.get().strip() or "1.0")
         except ValueError:
             fade_base = 1.0
         if fade_base <= 0:
@@ -12408,9 +12263,61 @@ class FFmpegBatchGUI:
                 t.enc_settings["fade_in"] = f"{f:.2f}"
                 t.enc_settings["fade_out"] = f"{f:.2f}"
                 count += 1
+        # 从编辑窗内点击时，同步窗口局部淡入淡出变量，确保「保存」不会覆盖刚写入的淡入淡出
+        if current_track_obj is not None and current_fade_vars is not None:
+            cs = current_track_obj.enc_settings
+            if cs.get("fade_enabled"):
+                en_var, in_var, out_var = current_fade_vars
+                en_var.set(True)
+                in_var.set(str(cs.get("fade_in", "")))
+                out_var.set(str(cs.get("fade_out", "")))
         self.merge_update_track_list()
         self.merge_update_command_preview()
-        self._append_info_ui(_("[淡入淡出] 已为 {0} 个视频/音频轨道启用淡入淡出（时长取自串行转场框：{1:.2f}s，短片段自动钳制）").format(count, fade_base))
+        self._append_info_ui(_("[淡入淡出] 已为 {0} 个视频/音频轨道启用淡入淡出（时长取自一键淡入淡出框：{1:.2f}s，短片段自动钳制）").format(count, fade_base))
+
+    def _apply_transition_all_tracks(self, current_track_obj=None, current_transition_vars=None):
+        """一键为所有已启用的视频轨道（除末段）开启串行转场。
+
+        转场挂本段（段 i 控制 i↔i+1 的过渡），末段无下一段自动跳过。
+        类型取编辑窗当前下拉框（transition_type_var），时长取自「一键转场」时长框
+        （self.oneclick_transition_duration），默认 1.0s；命令生成时自动钳制为相邻两段较短者的一半。
+
+        current_track_obj / current_transition_vars：从视频编辑窗口内点击时传入，用于同步窗口局部变量，
+        避免点「保存」时局部变量（仍为未启用）覆盖刚写入的转场设置。
+        """
+        vids = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
+        if not vids:
+            messagebox.showinfo(_("提示"), _("没有已启用的视频轨道。"))
+            return
+        targets = vids[:-1] if len(vids) > 1 else []
+        if not targets:
+            messagebox.showinfo(_("提示"), _("至少需要 2 个视频片段才能启用转场。"))
+            return
+        ttype = "fade"
+        if current_transition_vars is not None:
+            _, _type_var, _dur_var = current_transition_vars
+            ttype = (_type_var.get().strip() or "fade")
+        if ttype not in XFADE_TRANSITIONS:
+            ttype = "fade"
+        try:
+            td = float(self.oneclick_transition_duration.get().strip() or "1.0")
+        except ValueError:
+            td = 1.0
+        if td <= 0:
+            td = 1.0
+        for t in targets:
+            t.enc_settings["transition_enabled"] = True
+            t.enc_settings["transition_type"] = ttype
+            t.enc_settings["transition_duration"] = f"{td:.2f}"
+        if current_track_obj is not None and current_transition_vars is not None:
+            cs = current_track_obj.enc_settings
+            en_var, type_var, dur_var = current_transition_vars
+            en_var.set(bool(cs.get("transition_enabled", False)))
+            type_var.set(cs.get("transition_type", "fade") or "fade")
+            dur_var.set(str(cs.get("transition_duration", "1.0") or "1.0"))
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+        self._append_info_ui(_("[转场] 已为 {0} 个视频轨道开启串行转场（类型 {1}，时长 {2:.2f}s，末段自动跳过）").format(len(targets), ttype, td))
 
     def _copy_filter_from_selected(self):
         """从选中的第一个轨道复制滤镜参数。
@@ -12781,8 +12688,6 @@ class FFmpegBatchGUI:
         else:
             self._append_info_ui(_("没有可还原的轨道"))
 
-
-
     def merge_smart_tile(self, main_track_idx, pad_enabled_var=None, pad_width_var=None, pad_height_var=None,
                          items_per_row=4, items_per_col=4, orientation='auto', filt_frame=None):
         """
@@ -12954,8 +12859,6 @@ class FFmpegBatchGUI:
         messagebox.showinfo(_("成功"), _("智能平铺完成\n方向: {0}优先\n画布: {1}×{2}\n总视频数: {3}".format(direction_str, canvas_w, canvas_h, n)))
     
 
-
-
     def save_merge_project(self):
         """手动保存合并项目到 .fflgproject 文件"""
         file_path = filedialog.asksaveasfilename(
@@ -12985,8 +12888,7 @@ class FFmpegBatchGUI:
             "merge_container": self.merge_container.get(),
             "pip_enabled": self.pip_enabled.get(),
             "concat_enabled": self.concat_enabled.get(),
-            "xfade_enabled": self.xfade_enabled.get(),
-            "xfade_duration": self.xfade_duration.get(),
+            "oneclick_fade_duration": self.oneclick_fade_duration.get(),
             "merge_only_audio": self.merge_only_audio.get(),
             "merge_manual_duration_enabled": self.merge_manual_duration_enabled.get(),
             "merge_manual_duration": self.merge_manual_duration.get(),
@@ -13051,8 +12953,7 @@ class FFmpegBatchGUI:
             self.merge_container.set(state.get("merge_container", "mkv"))
             self.pip_enabled.set(state.get("pip_enabled", False))
             self.concat_enabled.set(state.get("concat_enabled", False))
-            self.xfade_enabled.set(state.get("xfade_enabled", False))
-            self.xfade_duration.set(state.get("xfade_duration", "1.0"))
+            self.oneclick_fade_duration.set(state.get("oneclick_fade_duration", "1.0"))
             self.merge_only_audio.set(state.get("merge_only_audio", False))
             self.merge_manual_duration_enabled.set(state.get("merge_manual_duration_enabled", False))
             self.merge_manual_duration.set(state.get("merge_manual_duration", ""))
@@ -13142,7 +13043,6 @@ class FFmpegBatchGUI:
                 return 0
         self.merge_sort_tracks(key_func=get_mtime)
 
-
     def _on_pip_toggle(self, *args):
         if self.pip_enabled.get() and self.concat_enabled.get():
             self.concat_enabled.set(False)
@@ -13163,12 +13063,6 @@ class FFmpegBatchGUI:
             self._gen_chapters_cb.config(state=state)
             if not self.concat_enabled.get():
                 self.generate_chapters.set(False)
-        # 控制"串行转场"复选框状态
-        if hasattr(self, '_xfade_cb'):
-            state = 'normal' if self.concat_enabled.get() else 'disabled'
-            self._xfade_cb.config(state=state)
-            if not self.concat_enabled.get():
-                self.xfade_enabled.set(False)
         self.merge_update_command_preview()
         self.merge_update_track_list()
 
@@ -13283,7 +13177,6 @@ class FFmpegBatchGUI:
             else:
                 expanded.append(item)
         return expanded
-
 
     def _handle_drop_pip_mode(self, files):
         """
@@ -13588,12 +13481,6 @@ class FFmpegBatchGUI:
     
     
 
-
-
-
-
-
-
     def merge_add_external_video(self):
         if self.concat_enabled.get():
             self._add_concat_video()
@@ -13601,7 +13488,6 @@ class FFmpegBatchGUI:
             self._add_pip_video()
         else:
             messagebox.showinfo(_("提示"), _("请先勾选「串行合并」或「启用画中画」"))
-
 
     def _add_pip_video(self):
         path = filedialog.askopenfilename(
@@ -13614,7 +13500,6 @@ class FFmpegBatchGUI:
         )
         if not path:
             return
-
 
         info = ffprobe_json(self.ffprobe_cmd, path)
         if not info:
@@ -13653,7 +13538,6 @@ class FFmpegBatchGUI:
         if not path:
             return
 
-
         info = ffprobe_json(self.ffprobe_cmd, path)
         if not info:
             self._append_info_ui(_("[封装] 无法解析文件: {0}".format(path)))
@@ -13668,9 +13552,6 @@ class FFmpegBatchGUI:
         self.merge_auto_recommend_container()
         self._ensure_main_video()
         self.merge_update_output_preview()
-
-
-
 
     def browse_chapter_file(self):
         path = filedialog.askopenfilename(title="选择章节文件", filetypes=[("FFmetadata", "*.txt *.chapters")])
@@ -13687,7 +13568,6 @@ class FFmpegBatchGUI:
             self._append_info_ui(_("[封装] 命令已复制到剪贴板"))
         else:
             self._append_info_ui(_("[封装] 无命令可复制"))
-
 
     def _prepare_tracks_and_inputs(self, enabled_tracks):
         """准备输入文件、文件索引，并计算所有轨道的 _type_index"""
@@ -13729,7 +13609,6 @@ class FFmpegBatchGUI:
 
         return input_files, file_index
 
-
     def _add_input_options(self, cmd, input_files, main_video, sub_videos=None):
         """添加 -i 及前置参数（-ss/-to、循环等）"""
         main_video_path = normalize_path(main_video.file_path)
@@ -13767,7 +13646,6 @@ class FFmpegBatchGUI:
             cmd.extend(["-i", f_norm])
         return cmd
 
-
     def _handle_audio_trim(self, cmd, audio, audio_map_count: int) -> bool:
         """处理音频截取，返回是否已处理"""
         if not audio.enc_settings.get("trim_enabled", False):
@@ -13796,7 +13674,6 @@ class FFmpegBatchGUI:
         cmd.extend([f"-b:a:{audio_map_count}", audio.enc_settings.get("bitrate", "128k")])
         cmd.extend([f"-ar:a:{audio_map_count}", audio.enc_settings.get("samplerate", "44100")])
         return True
-
 
     def _opus_copy_fallback(self, enc, audio_track):
         """opus 音轨以 -c:a copy 封装进 MP4/MOV 会触发 muxer 警告 "codec frame size is not set"，
@@ -13858,7 +13735,6 @@ class FFmpegBatchGUI:
                     cmd.extend([f"-disposition:a:{_mi}", "default"])
         return cmd
 
-
     def _add_subtitles_and_chapters(self, cmd, enabled_tracks, file_index, input_files):
         """字幕 + 章节处理"""
         # 字幕
@@ -13914,12 +13790,10 @@ class FFmpegBatchGUI:
             except ValueError:
                 cmd.extend(["-i", chapter_file_norm, "-map_chapters", "1"])
 
-
     def _add_container_optimization(self, cmd):
         """容器优化"""
         if self.merge_container.get().lower() in ("mp4", "mov"):
             cmd.extend(["-movflags", "+faststart"])
-
 
     def _add_pip_duration_control(self, cmd, main_video, enabled_tracks):
         """PIP 时长控制：根据主音频和子视频音频存在情况选择 -shortest 或 -t"""
@@ -14138,7 +14012,6 @@ class FFmpegBatchGUI:
             if dur is not None and factor > 0:
                 dur = dur / factor
         return dur
-
 
     def _build_afade_suffix(self, settings, duration):
         """按 settings 的淡入淡出设置构建 afade 串（用于段级钳制之后，淡出精确落在段末）。"""
@@ -14554,8 +14427,6 @@ class FFmpegBatchGUI:
         new_cmd = cmd_list[:insert_pos] + inject + cmd_list[insert_pos:]
         return new_cmd
 
-
-
     def _build_concat_cmd(self, enabled_tracks, output_norm, preview=False):
         """
         生成串行合并（Concat）命令。
@@ -14607,7 +14478,6 @@ class FFmpegBatchGUI:
                     self._temp_concat_lists = []
                 self._temp_concat_lists.extend(cleanup)
         return cmd_list
-
 
     def _build_concat_copy_mode(self, cmd, video_tracks, audio_tracks, output_norm, preview=False):
         """流复制模式 - 使用 concat demuxer（最高性能）"""
@@ -14668,7 +14538,6 @@ class FFmpegBatchGUI:
         self._append_info_ui(_("[串联-流] 使用流复制模式（concat demuxer）"))
         return cmd
 
-
     def _probe_audio_params(self, file_path):
         """探测文件首个音频流的采样率 / 声道数 / 采样格式，返回 dict 或 None。"""
         info = self._get_cached_stream_info(file_path)
@@ -14683,7 +14552,6 @@ class FFmpegBatchGUI:
                 fmt = s.get("sample_fmt") or "s16"
                 return {"sr": int(sr), "ch": int(ch), "fmt": fmt}
         return None
-
 
     def _build_audio_normalize(self, video_tracks, audio_tracks):
         """
@@ -14724,6 +14592,124 @@ class FFmpegBatchGUI:
             parts.append(f"aformat=sample_fmts={fmt}")
         return ",".join(parts)
 
+    def _build_concat_video_graph(self, video_tracks):
+        """构建串行合并「纯视频」filter_complex：主视频规格计算 + 逐轨滤镜 + 强制归一 + 逐轨转场/硬切拼接。
+
+        供 _build_concat_reencode_mode（正式命令）与 _build_concat_contact_sheet_cmd（缩略图预览）复用，
+        保证缩略图画面与最终成片的视频链完全一致（单一来源，避免两处逻辑漂移）。
+        返回 (filter_parts, v_labels, seg_durations, trans_effective, total_dur)：
+          - filter_parts：视频侧 filter_complex 分句列表（末句输出标签 [vout]）
+          - v_labels：各段视频标签 [v0]...[vn-1]
+          - seg_durations：各段处理后时长（秒）
+          - trans_effective[i]：(transition_type, duration) 或 None（段 i 未开转场 / 末段）
+          - total_dur：拼接后总时长（Σ段长 - Σ转场重叠）
+        """
+        main_video = video_tracks[0]
+        n = len(video_tracks)
+
+        # ----- 1. 主视频最终输出规格（强制统一） -----
+        main_orig_w, main_orig_h = self._cached_video_dimensions(main_video.file_path)
+        if main_orig_w is None or main_orig_h is None:
+            main_orig_w, main_orig_h = 1280, 720
+        main_target_w, main_target_h = self.compute_final_size_with_order(
+            main_orig_w, main_orig_h, main_video.enc_settings)
+        if main_target_w <= 0 or main_target_h <= 0:
+            main_target_w, main_target_h = main_orig_w, main_orig_h
+
+        if main_video.enc_settings.get("pix_fmt_enabled", True):
+            target_pix_fmt = main_video.enc_settings.get("pix_fmt", "yuv420p")
+        else:
+            target_pix_fmt = self._get_stream_pix_fmt(main_video.file_path, 0) or "yuv420p"
+
+        if main_video.enc_settings.get("frame_rate_type") == "custom":
+            try:
+                target_fps = float(main_video.enc_settings.get("frame_rate_custom", "30"))
+            except Exception:
+                target_fps = 30.0
+        else:
+            raw_fps = self._get_video_framerate(main_video.file_path)
+            target_fps = raw_fps if raw_fps is not None else 30.0
+
+        # ----- 2. 每段处理后时长 -----
+        seg_durations = []
+        for _t in video_tracks:
+            _d = self._get_effective_duration(_t.enc_settings, input_path=_t.file_path)
+            if _d is None or _d <= 0:
+                _d = 10.0
+            seg_durations.append(_d)
+
+        # ----- 3. 逐轨转场（挂本段：段 i 控制 i↔i+1 的过渡，末段无效） -----
+        trans_effective = [None] * n
+        for i in range(n):
+            if i >= n - 1:
+                break
+            _ts = video_tracks[i].enc_settings
+            if not _ts.get("transition_enabled", False):
+                continue
+            _ttype = str(_ts.get("transition_type", "fade") or "fade").strip()
+            if _ttype not in XFADE_TRANSITIONS:
+                _ttype = "fade"
+            try:
+                _td = float(str(_ts.get("transition_duration", "1.0") or "1.0").strip())
+            except ValueError:
+                _td = 1.0
+            if _td <= 0 or seg_durations[i] <= 0 or seg_durations[i + 1] <= 0:
+                continue
+            _td = min(_td, min(seg_durations[i], seg_durations[i + 1]) / 2.0)
+            if _td < 0.05:
+                continue
+            trans_effective[i] = (_ttype, _td)
+
+        # ----- 4. 逐轨视频滤镜 + 强制归一（与淡入淡出互斥） -----
+        filter_parts = []
+        v_labels = []
+        for i, track in enumerate(video_tracks):
+            settings = track.enc_settings.copy()
+            if settings.get("fade_enabled", False):
+                if trans_effective[i] is not None:
+                    settings["fade_out"] = ""
+                if i > 0 and trans_effective[i - 1] is not None:
+                    settings["fade_in"] = ""
+            video_filters = build_video_filter_chain(
+                settings,
+                include_subtitle=False, include_speed=True, include_trim=True,
+                include_format=False, include_scale=False,
+                enhance_settings=settings.get("enhance", {}),
+                reverse=settings.get("reverse_enabled", False),
+                graph_id=f"c{i}", include_fade=True, clip_duration=seg_durations[i])
+            forced = [
+                f"scale={main_target_w}:{main_target_h}",
+                f"format={target_pix_fmt}",
+                f"fps={target_fps:.6f}".rstrip('0').rstrip('.'),
+                "setsar=1", "settb=AVTB", "setpts=PTS-STARTPTS"]
+            if video_filters and video_filters != "null":
+                full_vf = f"{video_filters},{','.join(forced)}"
+            else:
+                full_vf = ",".join(forced)
+            filter_parts.append(f"[{i}:v]{full_vf}[v{i}]")
+            v_labels.append(f"[v{i}]")
+
+        # ----- 5. 视频拼接 / 逐轨交叉溶解转场 -----
+        prev = v_labels[0]
+        cumulative = seg_durations[0]
+        for k in range(1, n):
+            tr = trans_effective[k - 1]
+            out_label = "[vout]" if k == n - 1 else f"[vx{k}]"
+            if tr is not None:
+                _ttype, _td = tr
+                offset = max(0.0, cumulative - _td)
+                filter_parts.append(
+                    f"{prev}[v{k}]xfade=transition={_ttype}:duration={_td:.3f}:offset={offset:.3f}{out_label}")
+                cumulative = cumulative + seg_durations[k] - _td
+            else:
+                filter_parts.append(f"{prev}[v{k}]concat=n=2:v=1:a=0{out_label}")
+                cumulative = cumulative + seg_durations[k]
+            prev = out_label
+        if n == 1:
+            filter_parts.append(f"{v_labels[0]}null[vout]")
+
+        total_dur = sum(seg_durations) - sum(t[1] for t in trans_effective if t is not None)
+        return filter_parts, v_labels, seg_durations, trans_effective, total_dur
 
     def _build_concat_reencode_mode(self, cmd, video_tracks, audio_tracks, main_video, output_norm):
         """
@@ -14732,33 +14718,13 @@ class FFmpegBatchGUI:
         强制统一分辨率、像素格式、帧率、SAR。
         全局阶段仅应用：视频字幕烧录；音频音量调整。
         """
-        # ----- 1. 计算主视频最终输出规格（用于强制统一） -----
-        main_orig_w, main_orig_h = self._cached_video_dimensions(main_video.file_path)
-        if main_orig_w is None or main_orig_h is None:
-            main_orig_w, main_orig_h = 1280, 720
-    
-        main_target_w, main_target_h = self.compute_final_size_with_order(
-            main_orig_w, main_orig_h, main_video.enc_settings
-        )
-        if main_target_w <= 0 or main_target_h <= 0:
-            main_target_w, main_target_h = main_orig_w, main_orig_h
-    
-        # 目标像素格式
-        if main_video.enc_settings.get("pix_fmt_enabled", True):
-            target_pix_fmt = main_video.enc_settings.get("pix_fmt", "yuv420p")
-        else:
-            target_pix_fmt = self._get_stream_pix_fmt(main_video.file_path, 0) or "yuv420p"
-    
-        # 目标帧率
-        if main_video.enc_settings.get("frame_rate_type") == "custom":
-            try:
-                target_fps = float(main_video.enc_settings.get("frame_rate_custom", "30"))
-            except:
-                target_fps = 30.0
-        else:
-            raw_fps = self._get_video_framerate(main_video.file_path)
-            target_fps = raw_fps if raw_fps is not None else 30.0
-    
+        # 串行重编码模式不再使用「独立外部音轨」的 1:1 段映射：该功能未实现绑定语义，
+        # 且音频轨数量与视频段数不匹配时会导致部分段丢失音频（原 L14661 分支）。
+        # 外部音频统一改为「主视频音频绑定页 -> 背景音乐 (BGM)」全局叠加，见下方 6b 节。
+        audio_tracks = []
+
+        # 主视频最终输出规格（分辨率/像素格式/帧率）计算已抽入 _build_concat_video_graph，
+        # 与缩略图预览共用同一强制归一逻辑（单一来源，避免两处漂移）。
         # ----- 2. 添加输入文件（视频 + 全局 BGM） -----
         # 注意：串行模式已不使用 audio_tracks（见函数开头），外部音频统一走 BGM。
         concat_input_files = [t.file_path for t in video_tracks]
@@ -14773,109 +14739,17 @@ class FFmpegBatchGUI:
         for p in concat_input_files:
             cmd.extend(["-i", normalize_path(p)])
     
-        # ----- 3. 构建 filter_complex -----
+        # ----- 3. 构建纯视频 filter_complex（复用公共函数 _build_concat_video_graph） -----
         n = len(video_tracks)
-        filter_parts = []
-        v_labels = []
-        a_labels = []
-    
-        # 预计算每段时长与 xfade 转场参数
-        seg_durations = []
-        for _t in video_tracks:
-            _d = self._get_effective_duration(_t.enc_settings, input_path=_t.file_path)
-            if _d is None or _d <= 0:
-                _d = 10.0
-            seg_durations.append(_d)
-
-        use_xfade = bool(self.xfade_enabled.get()) and n >= 2
-        xfade_d = None
-        if use_xfade:
-            try:
-                xfade_d = float(self.xfade_duration.get().strip() or "1.0")
-            except ValueError:
-                xfade_d = 1.0
-            if xfade_d <= 0 or min(seg_durations) <= 0:
-                use_xfade = False
-            else:
-                xfade_d = min(xfade_d, min(seg_durations) / 2.0)
-                if xfade_d < 0.05:
-                    use_xfade = False
+        filter_parts, v_labels, seg_durations, trans_effective, total_dur = self._build_concat_video_graph(video_tracks)
+        n_trans = sum(1 for t in trans_effective if t is not None)
+        if n_trans:
+            self._append_info_ui(f"[串联-编] 使用逐轨 xfade 交叉溶解转场（{n_trans} 处）")
 
         # 串行合并音频归一：concat / acrossfade 都要求各音频段采样率 / 声道布局 / 采样格式一致。
         # 策略：1 段不归一；2 段跟随主视频（首段）；≥3 段跟随多数轨（逐维度众数）。
         # 返回空串表示无需归一（1 段或探测失败）。
         audio_concat_normalize = self._build_audio_normalize(video_tracks, audio_tracks)
-
-        for i, track in enumerate(video_tracks):
-            settings = track.enc_settings.copy()
-
-            # ----- 视频部分（所有滤镜独立） -----
-            video_filters = build_video_filter_chain(
-                settings,
-                include_subtitle=False,
-                include_speed=True,                  # 变速独立
-                include_trim=True,                   # 截取独立
-                include_format=False,                # 格式由强制统一覆盖
-                include_scale=False,                 # 缩放由强制统一覆盖
-                enhance_settings=settings.get("enhance", {}),  # 增强独立
-                reverse=settings.get("reverse_enabled", False), # 倒放独立
-                graph_id=f"c{i}",                     # 同一 filter_complex 内标签需唯一
-                include_fade=(not use_xfade),         # xfade 模式下不内嵌逐段淡黑，避免与交叉溶解冲突
-                clip_duration=seg_durations[i]         # 用于精确定位淡出起点
-            )
-    
-            # 强制统一滤镜（所有视频一致）
-            forced = [
-                f"scale={main_target_w}:{main_target_h}",
-                f"format={target_pix_fmt}",
-                f"fps={target_fps:.6f}".rstrip('0').rstrip('.'),
-                "setsar=1",
-                "setpts=PTS-STARTPTS"
-            ]
-    
-            if video_filters and video_filters != "null":
-                full_vf = f"{video_filters},{','.join(forced)}"
-            else:
-                full_vf = ",".join(forced)
-    
-            filter_parts.append(f"[{i}:v]{full_vf}[v{i}]")
-            v_labels.append(f"[v{i}]")
-    
-        # ----- 4. 视频拼接 / 交叉溶解转场 -----
-        if use_xfade:
-            # 相邻片段交叉溶解（xfade），自动累计 offset
-            prev = v_labels[0]
-            cumulative = seg_durations[0]
-            for k in range(1, n):
-                offset = cumulative - k * xfade_d
-                if offset < 0:
-                    offset = 0.0
-                out_label = "[vout]" if k == n - 1 else f"[vx{k}]"
-                filter_parts.append(
-                    f"{prev}[v{k}]xfade=transition=fade:duration={xfade_d:.3f}:offset={offset:.3f}{out_label}"
-                )
-                prev = out_label
-                cumulative += seg_durations[k]
-            # 整体上 / 下淡入淡出到黑（取首段淡入、末段淡出；仅在对应段启用了淡入淡出时生效）
-            first_in = 0.0
-            if video_tracks[0].enc_settings.get("fade_enabled", False):
-                first_in = time_to_seconds(video_tracks[0].enc_settings.get("fade_in", "")) or 0.0
-            last_out = 0.0
-            if video_tracks[-1].enc_settings.get("fade_enabled", False):
-                last_out = time_to_seconds(video_tracks[-1].enc_settings.get("fade_out", "")) or 0.0
-            total_dur = cumulative - (n - 1) * xfade_d
-            overall_fade = []
-            if first_in > 0:
-                overall_fade.append(f"fade=t=in:st=0:d={first_in:.3f}")
-            if last_out > 0:
-                st = max(0.0, total_dur - last_out)
-                overall_fade.append(f"fade=t=out:st={st:.3f}:d={last_out:.3f}")
-            if overall_fade:
-                filter_parts.append(f"[vout]{','.join(overall_fade)}[vout]")
-            self._append_info_ui(f"[串联-编] 使用 xfade 交叉溶解转场（时长 {xfade_d:.2f}s）")
-        else:
-            v_concat = f"{''.join(v_labels)}concat=n={n}:v=1:a=0[vout]"
-            filter_parts.append(v_concat)
 
         # ----- 4b. 音频拼接 -----
         # 优先使用「独立音频轨道」的逐轨设置（与其它模式统一，音频完全独立控制）；
@@ -14908,10 +14782,16 @@ class FFmpegBatchGUI:
                     chain = f"asetpts=PTS-STARTPTS,{clamp}"
                 if audio_concat_normalize:
                     chain = f"{audio_concat_normalize},{chain}"
-                if not use_xfade:
-                    f_suffix = self._build_afade_suffix(audio.enc_settings, tgt)
-                    if f_suffix:
-                        chain = f"{chain},{f_suffix}"
+                # 逐轨转场与音频淡入淡出互斥（音频段 j 对应视频段 j）
+                _aset = audio.enc_settings.copy()
+                if _aset.get("fade_enabled", False) and j < len(trans_effective):
+                    if trans_effective[j] is not None:
+                        _aset["fade_out"] = ""
+                    if j > 0 and trans_effective[j - 1] is not None:
+                        _aset["fade_in"] = ""
+                f_suffix = self._build_afade_suffix(_aset, tgt)
+                if f_suffix:
+                    chain = f"{chain},{f_suffix}"
                 filter_parts.append(f"[{a_idx}:a]{chain}[a{j}]")
                 a_labels.append(f"[a{j}]")
             self._append_info_ui(f"[串联-编] 音频段已逐段钳制到对应视频段时长（防止偏移/变速导致累计错位）")
@@ -14968,10 +14848,15 @@ class FFmpegBatchGUI:
                     audio_chain = ",".join(audio_filters)
                     if audio_concat_normalize:
                         audio_chain = f"{audio_concat_normalize},{audio_chain}"
-                    if not use_xfade:
-                        f_suffix = self._build_afade_suffix(settings, effective_duration)
-                        if f_suffix:
-                            audio_chain = f"{audio_chain},{f_suffix}"
+                    # 逐轨转场与音频淡入淡出互斥（视频自带音轨跟随其视频段）
+                    if settings.get("fade_enabled", False):
+                        if trans_effective[i] is not None:
+                            settings["fade_out"] = ""
+                        if i > 0 and trans_effective[i - 1] is not None:
+                            settings["fade_in"] = ""
+                    f_suffix = self._build_afade_suffix(settings, effective_duration)
+                    if f_suffix:
+                        audio_chain = f"{audio_chain},{f_suffix}"
                     filter_parts.append(f"[{i}:a]{audio_chain}[a{i}]")
                 a_labels.append(f"[a{i}]")
     
@@ -14994,42 +14879,24 @@ class FFmpegBatchGUI:
         else:
             vmap = "[vout]"
 
-        # ----- 6. 音频拼接 / 交叉溶解转场（acrossfade，跟随串行转场按钮，不外露设置） -----
-        if use_xfade and len(a_labels) >= 2:
-            # 与视频 xfade 完全镜像：相邻音频段交叉溶解而非硬切。
-            # 段级钳制已在第 4b 节把每段音频拉到对应视频段时长 seg_durations[j]。
-            # acrossfade 的 overlap=true（默认）会让第二段开头与第一段结尾自动重叠交叉溶解，
-            # 无需手动 offset；链式拼接后总时长 = Σ段长 - (段数-1)*d，与视频 xfade 一致。
-            prev = a_labels[0]
-            a_cumulative = seg_durations[0] if seg_durations else 0.0
-            for k in range(1, len(a_labels)):
-                _sd = seg_durations[k] if k < len(seg_durations) else (seg_durations[-1] if seg_durations else 0.0)
-                out_label = "[aout]" if k == len(a_labels) - 1 else f"[ax{k}]"
+        # ----- 6. 音频拼接 / 逐轨交叉溶解转场（acrossfade，跟随对应视频段的转场开关） -----
+        # 音频段与视频段 1:1 对应：段 k-1 开了转场 → 音频段 k-1↔k 之间 acrossfade；否则硬切。
+        prev_a = a_labels[0]
+        for k in range(1, len(a_labels)):
+            out_label = "[aout]" if k == len(a_labels) - 1 else f"[ax{k}]"
+            tr = trans_effective[k - 1] if k - 1 < len(trans_effective) else None
+            if tr is not None:
+                _td = tr[1]
                 filter_parts.append(
-                    f"{prev}[a{k}]acrossfade=c1=tri:c2=tri:d={xfade_d:.3f}{out_label}"
+                    f"{prev_a}[a{k}]acrossfade=c1=tri:c2=tri:d={_td:.3f}{out_label}"
                 )
-                prev = out_label
-                a_cumulative += _sd
-            # 整体上 / 下淡入淡出到静音（跟随首/末视频段淡入淡出开关与时长）
-            a_first_in = 0.0
-            if video_tracks[0].enc_settings.get("fade_enabled", False):
-                a_first_in = time_to_seconds(video_tracks[0].enc_settings.get("fade_in", "")) or 0.0
-            a_last_out = 0.0
-            if video_tracks[-1].enc_settings.get("fade_enabled", False):
-                a_last_out = time_to_seconds(video_tracks[-1].enc_settings.get("fade_out", "")) or 0.0
-            total_a_dur = a_cumulative - (len(a_labels) - 1) * xfade_d
-            overall_afade = []
-            if a_first_in > 0:
-                overall_afade.append(f"afade=t=in:st=0:d={a_first_in:.3f}")
-            if a_last_out > 0:
-                st = max(0.0, total_a_dur - a_last_out)
-                overall_afade.append(f"afade=t=out:st={st:.3f}:d={a_last_out:.3f}")
-            if overall_afade:
-                filter_parts.append(f"[aout]{','.join(overall_afade)}[aout]")
-            self._append_info_ui(f"[串联-编] 音频使用 acrossfade 交叉溶解转场（跟随串行转场，时长 {xfade_d:.2f}s）")
-        else:
-            a_concat = f"{''.join(a_labels)}concat=n={len(a_labels)}:v=0:a=1[aout]"
-            filter_parts.append(a_concat)
+            else:
+                filter_parts.append(f"{prev_a}[a{k}]concat=n=2:v=0:a=1{out_label}")
+            prev_a = out_label
+        if len(a_labels) == 1:
+            filter_parts.append(f"{a_labels[0]}anull[aout]")
+        if n_trans:
+            self._append_info_ui(f"[串联-编] 音频使用 acrossfade 交叉溶解转场（跟随逐轨转场开关）")
 
         # ----- 7. 音频映射：音量等已全部下放到每条独立音轨（_build_audio_filters），
         #           不再在此套用全局音量，避免与主视频音量重复叠加 -----
@@ -15052,8 +14919,8 @@ class FFmpegBatchGUI:
                 # BGM 归一：>=2 段跟随各段统一格式；单段则强制立体声 44100，便于与 [aout] 混音
                 _bgm_norm_str = audio_concat_normalize if audio_concat_normalize else "aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=44100"
                 _total_a = sum(seg_durations)
-                if use_xfade and xfade_d:
-                    _total_a -= (len(a_labels) - 1) * xfade_d
+                _trans_sum = sum(t[1] for t in trans_effective if t is not None)
+                _total_a -= _trans_sum
                 _bgm_chain = (
                     f"[{_bgm_idx}:a]{_bgm_norm_str},"
                     f"aloop=loop=-1:size=2000000000,"
@@ -15191,8 +15058,6 @@ class FFmpegBatchGUI:
                 else:
                     self._append_info_ui(_("警告：手动时长格式无效，已忽略"))
 
-
-
         if not preview:
             total_len = len(' '.join(cmd_list))
             if total_len > 25000:
@@ -15300,7 +15165,6 @@ class FFmpegBatchGUI:
     
     
     
-
 
     def merge_update_command_preview(self, output_override=None):
         # 取消之前排队的更新
@@ -15696,6 +15560,71 @@ class FFmpegBatchGUI:
             messagebox.showinfo(_("提示"), _("请先选中轨道"))
             return
         self.merge_preview_track(indices[0], with_snapshot=with_snapshot)
+
+    def _merge_preview_right_menu(self):
+        """合并页预览按钮右键：快照 / 缩略图 选择菜单"""
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label=_("快照（画中画合成）"), command=lambda: self.merge_preview_selected(with_snapshot=True))
+        menu.add_command(label=_("缩略图"), command=self._contact_sheet_selected_track)
+        x = self.root.winfo_pointerx()
+        y = self.root.winfo_pointery()
+        menu.post(x, y)
+
+    def _transcode_preview_right_menu(self):
+        """转码页预览按钮右键：快照 / 缩略图 选择菜单"""
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label=_("快照（水印合成）"), command=lambda: self.preview_current_file(with_snapshot=True))
+        menu.add_command(label=_("缩略图"), command=self._contact_sheet_current_file)
+        x = self.root.winfo_pointerx()
+        y = self.root.winfo_pointery()
+        menu.post(x, y)
+
+    def _contact_sheet_current_file(self):
+        """对转码页当前输入文件生成缩略图"""
+        path = self.input_file.get().strip()
+        if not path or not os.path.exists(path):
+            messagebox.showwarning(_("提示"), _("请先选择有效的输入文件"))
+            return
+        self._show_contact_sheet_async(path)
+
+    def _contact_sheet_selected_track(self):
+        """对合并页选中的第一个视频轨道生成缩略图。
+        若选中的是主视频：画中画模式→模拟叠加后画面；串行模式→模拟拼接+转场后画面。"""
+        indices = self._get_selected_track_indices()
+        if not indices:
+            messagebox.showinfo(_("提示"), _("请先选中轨道"))
+            return
+        track = self.merge_tracks[indices[0]]
+        if track.type != "video":
+            messagebox.showinfo(_("提示"), _("缩略图仅支持视频轨道"))
+            return
+        if not os.path.exists(track.file_path):
+            self._append_info_ui(_("[缩略图] 文件不存在"))
+            return
+        enabled_videos = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
+        is_main = bool(enabled_videos) and enabled_videos[0] == track
+        if is_main and self.pip_enabled.get() and len(enabled_videos) > 1:
+            # 画中画主视频：模拟叠加后的缩略图
+            self._show_pip_contact_sheet_async(track, enabled_videos[1:])
+        elif is_main and self.concat_enabled.get() and len(enabled_videos) > 1:
+            # 串行主视频：模拟拼接+转场后的缩略图
+            self._show_concat_contact_sheet_async(enabled_videos)
+        else:
+            # 普通单文件缩略图
+            self._show_contact_sheet_async(track.file_path)
+
+    def _contact_sheet_selected_task(self):
+        """对队列选中的第一个任务生成缩略图"""
+        selected = self.task_tree.selection()
+        if not selected:
+            messagebox.showwarning(_("提示"), _("请先选中一个任务"))
+            return
+        idx = int(selected[0])
+        task = self.tasks[idx]
+        if not os.path.exists(task.input):
+            messagebox.showwarning(_("提示"), _("输入文件不存在: {0}").format(task.input))
+            return
+        self._show_contact_sheet_async(task.input)
     
     def merge_move_up_selected(self):
         indices = self._get_selected_track_indices()
@@ -15792,8 +15721,6 @@ class FFmpegBatchGUI:
             self.merge_reset_column_widths()    #调用恢复列宽
             self._append_info_ui(_("[封装] 已清空所有附加轨道"))
 
-
-
     def merge_on_tree_double_click(self, event):
         """双击编辑第一个选中的轨道"""
         self.merge_edit_selected()
@@ -15810,8 +15737,6 @@ class FFmpegBatchGUI:
         self.merge_tree.column("编码设置", width=60)
         self._append_info_ui(_("[布局] 已恢复合并列表的列宽"))
 
-
-
     def merge_move_track_up(self, idx):
         if idx <= 0:
             return
@@ -15826,8 +15751,6 @@ class FFmpegBatchGUI:
         self.merge_update_track_list()
         self.merge_update_command_preview()
 
-
-
     def merge_remove_track(self, track_idx):
         if 0 <= track_idx < len(self.merge_tracks):
             removed = self.merge_tracks.pop(track_idx)
@@ -15835,8 +15758,6 @@ class FFmpegBatchGUI:
             self.merge_update_track_list()
             self.merge_auto_recommend_container()
             self.merge_update_command_preview()
-
-
 
     def evaluate_expression(self, expr, main_w, main_h, box_w, box_h):
         return safe_eval_expr(expr, {"W": main_w, "H": main_h, "w": box_w, "h": box_h})
@@ -15862,8 +15783,19 @@ class FFmpegBatchGUI:
                 temp_settings['reverse_enabled'] = False
             else:
                 temp_settings = dict(track.enc_settings)
-            # 预览强制走软件滤镜：避免 vpp_qsv/scale_cuda 等硬件滤镜与下方屏幕自适应
-            # 软件 scale 混用（缺少 hwdownload/hwupload 包裹）导致播放器报错。
+
+            # ---- 快照模式：只弹画中画合成快照窗口，不启动播放器预览 ----
+            pip_enabled = self.pip_enabled.get()
+            enabled_video_tracks = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
+            is_main_video = (enabled_video_tracks and enabled_video_tracks[0] == track)
+            if with_snapshot:
+                sub_videos = enabled_video_tracks[1:] if (pip_enabled and is_main_video) else []
+                if sub_videos:
+                    self._show_pip_snapshot_async(track, sub_videos)
+                else:
+                    self._append_info_ui(_("[预览] 仅画中画模式下的主视频支持合成快照"))
+                return
+
             temp_settings["hw_filter_mode"] = "cpu"
     
             # ---- 视频滤镜（不含自适应缩放） ----
@@ -15985,10 +15917,6 @@ class FFmpegBatchGUI:
                                      start_time=start_sec, duration=duration)
             if pip_enabled and is_main_video and sub_videos:
                 self._append_info_ui(_("[预览] 占位框尺寸为从视频实际渲染大小"))
-                # 方案1：在同一次预览里额外生成"真实合成快照"（独立窗口，线程延迟开）
-                # 仅当右键预览（with_snapshot=True）时触发，左键旧预览不弹快照
-                if with_snapshot:
-                    self._show_pip_snapshot_async(track, sub_videos)
     
         elif track.type == "audio":
             self.preview_with_player(track.file_path, audio_only=True, volume=10)
@@ -16016,10 +15944,12 @@ class FFmpegBatchGUI:
             map_label = "[v_snap]"
         return complex_filter, map_label
 
-    def _show_snapshot_async(self, cmd, out_png, win_key, title, running_text, display_cb):
+    def _show_snapshot_async(self, cmd, out_png, win_key, title, running_text, display_cb,
+                             save_dir=None, save_name=""):
         """通用快照入口：构造命令 → 开/复用独立窗口（先显示'生成中'）→ 线程生成后回填。
-        win_key 区分不同快照窗口（如 'pip' / 'wm'），窗口属性存于 self._snap_ui[win_key]。
-        display_cb(out_png) 在主线程执行，用于把 PNG 显示回窗口。"""
+        win_key 区分不同快照窗口（如 'pip' / 'wm' / 'sheet'），窗口属性存于 self._snap_ui[win_key]。
+        display_cb(out_png) 在主线程执行，用于把 PNG 显示回窗口。
+        save_dir 非 None 时窗口加「保存到…/一键保存」按钮；save_name 为一键保存的默认文件名（不含扩展名）。"""
         if not self.ffmpeg_cmd:
             return
         if not hasattr(self, "_snap_ui"):
@@ -16034,18 +15964,74 @@ class FFmpegBatchGUI:
         ui["win"].title(title)
         ui["status"].config(text=running_text)
         ui["label"].config(image="", text=_("生成中…"))
+        # 生成完成前先隐藏窗口（避免左上角闪「生成中…」小窗），出图/失败后再显示
+        ui["win"].withdraw()
+        # 保存按钮（save_dir 非 None 时提供）
+        ui["save_dir"] = save_dir
+        ui["save_name"] = save_name
+        ui["png_path"] = out_png
+        if save_dir:
+            btn_row = getattr(ui, "_btn_row", None)
+            if btn_row is None:
+                btn_row = ttk.Frame(ui["win"])
+                btn_row.pack(padx=6, pady=(0, 6))
+                ttk.Button(btn_row, text=_("保存到…"), command=lambda: self._save_sheet_as(out_png)).pack(side=tk.LEFT, padx=4)
+                ttk.Button(btn_row, text=_("一键保存"), command=lambda: self._save_sheet_to_dir(out_png, save_dir, save_name)).pack(side=tk.LEFT, padx=4)
+                ui["_btn_row"] = btn_row
+
+        def _show_win():
+            w = ui["win"]
+            if w.winfo_exists():
+                w.deiconify()
+                w.lift()
 
         def worker():
             try:
-                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+                flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=30, creationflags=flags)
             except Exception as e:
-                self.root.after(0, lambda: ui["status"].config(text=_("快照生成失败: {0}".format(e))))
+                self.root.after(0, lambda: (_show_win(),
+                                             ui["status"].config(text=_("快照生成失败: {0}".format(e)))))
                 return
             if os.path.exists(out_png):
-                self.root.after(0, lambda: display_cb(out_png))
+                self.root.after(0, lambda: (_show_win(), display_cb(out_png)))
             else:
-                self.root.after(0, lambda: ui["status"].config(text=_("快照生成失败（无输出文件）")))
+                self.root.after(0, lambda: (_show_win(),
+                                             ui["status"].config(text=_("快照生成失败（无输出文件）"))))
         threading.Thread(target=worker, daemon=True).start()
+
+    def _save_sheet_as(self, png_path):
+        """缩略图「保存到…」：弹出文件对话框选择路径。"""
+        if not os.path.exists(png_path):
+            messagebox.showwarning(_("提示"), _("缩略图尚未生成"))
+            return
+        default = os.path.join(self.output_dir.get().strip() or tempfile.gettempdir(), _("缩略图.png"))
+        save_path = filedialog.asksaveasfilename(
+            title=_("保存缩略图"), defaultextension=".png",
+            initialfile=os.path.basename(default),
+            filetypes=[("PNG 图片", "*.png")])
+        if not save_path:
+            return
+        try:
+            shutil.copy(png_path, save_path)
+            self._append_info_ui(_("[缩略图] 已保存到 {0}").format(save_path))
+        except Exception as e:
+            messagebox.showerror(_("保存失败"), str(e))
+
+    def _save_sheet_to_dir(self, png_path, save_dir, save_name):
+        """缩略图「一键保存」：直接保存到输出目录，文件名为 save_name + '_缩略图.png'。"""
+        if not os.path.exists(png_path):
+            messagebox.showwarning(_("提示"), _("缩略图尚未生成"))
+            return
+        d = save_dir if (save_dir and os.path.isdir(save_dir)) else tempfile.gettempdir()
+        fname = (save_name.strip() or _("缩略图")) + "_缩略图.png"
+        target = os.path.join(d, fname)
+        try:
+            shutil.copy(png_path, target)
+            self._append_info_ui(_("[缩略图] 已一键保存到 {0}").format(target))
+        except Exception as e:
+            messagebox.showerror(_("保存失败"), str(e))
 
     def _display_snapshot(self, png_path, win_key):
         """把生成的 PNG 显示到指定密钥的快照窗口（主线程执行）。"""
@@ -16102,7 +16088,7 @@ class FFmpegBatchGUI:
         complex_filter, map_label = self._append_fit_scale(complex_filter, final_v_label, final_w, final_h)
 
         # ---- 组装 ffmpeg 命令 ----
-        out_png = os.path.join(tempfile.gettempdir(), "kli_pip_snapshot.png")
+        out_png = os.path.join(tempfile.gettempdir(), "thumb_pip_snapshot.png")
         cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
         for idx, p in enumerate(input_files):
             # 子视频加无限循环，保证首帧可用（与 _build_pip_cmd 的 -stream_loop 一致）
@@ -16129,6 +16115,89 @@ class FFmpegBatchGUI:
 
     def _display_pip_snapshot(self, png_path):
         self._display_snapshot(png_path, "pip")
+
+    # ---------- 画中画 / 串行 主视频的「模拟生成后文件」缩略图 ----------
+    def _build_pip_contact_sheet_cmd(self, track, sub_videos):
+        """画中画主视频缩略图：复用 _build_overlay_filter_complex 生成与成片一致的合成画面，
+        再抽帧拼 4x2 网格单图（模拟叠加后的最终输出）。"""
+        input_files, file_index = self._prepare_tracks_and_inputs([track] + list(sub_videos))
+        sub_infos = []
+        for sv in sub_videos:
+            sv_settings = sv.enc_settings.copy()
+            if sv_settings.get("encoder") == "copy":
+                sv_settings["encoder"] = "libx265"
+            sub_infos.append((file_index[sv.file_path], sv.file_path, sv_settings))
+
+        complex_filter, final_v_label = self._build_overlay_filter_complex(
+            0, track.enc_settings, sub_infos,
+            include_subtitle_main=False,
+            enhance_settings=track.enc_settings.get("enhance", {}),
+            reverse=False,
+            main_file_path=track.file_path
+        )
+
+        # 按时长均分抽约 8 帧（4x2 网格）
+        dur = self._get_media_duration(track.file_path) or 0.0
+        interval = max(dur / 8.0, 0.5) if dur > 0 else 10.0
+
+        out_png = os.path.join(tempfile.gettempdir(), "thumb_contact_sheet.png")
+        cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
+        for idx, p in enumerate(input_files):
+            if idx != 0:
+                cmd.extend(["-stream_loop", "-1"])
+            cmd.extend(["-i", p])
+        # 在合成结果末尾追加 fps 抽帧 + tile 拼网格
+        sheet_filter = f"{complex_filter};{final_v_label}fps=1/{interval:.4f},scale=320:-1,tile=4x2[sheet]"
+        cmd.extend(["-filter_complex", sheet_filter])
+        cmd.extend(["-map", "[sheet]"])
+        cmd.extend(["-frames:v", "1", "-update", "1", out_png])
+        return cmd, out_png
+
+    def _show_pip_contact_sheet_async(self, track, sub_videos):
+        try:
+            cmd, out_png = self._build_pip_contact_sheet_cmd(track, sub_videos)
+        except Exception as e:
+            self._append_info_ui(_("[缩略图] 画中画合成缩略图命令构建失败: {0}".format(e)))
+            return
+        save_dir = self.output_dir.get().strip() or ""
+        save_name = os.path.splitext(os.path.basename(track.file_path))[0]
+        self._show_snapshot_async(cmd, out_png, "sheet",
+                                  _("缩略图（画中画合成）") + " · " + os.path.basename(track.file_path),
+                                  _("正在生成缩略图…"), self._display_contact_sheet,
+                                  save_dir=save_dir, save_name=save_name)
+
+    def _build_concat_contact_sheet_cmd(self, video_tracks):
+        """串行合并主视频缩略图：复用 _build_concat_video_graph 生成视频 filter_complex
+        （与正式成片完全一致），再抽帧拼 4x2 网格单图。
+        只做视频、忽略音频/BGM，用于预览「拼接+转场后」的最终画面。"""
+        filter_parts, v_labels, seg_durations, trans_effective, total_dur = self._build_concat_video_graph(video_tracks)
+
+        # 总时长（用于抽帧间隔）
+        interval = max(total_dur / 8.0, 0.5) if total_dur > 0 else 10.0
+
+        out_png = os.path.join(tempfile.gettempdir(), "thumb_contact_sheet.png")
+        cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
+        for t in video_tracks:
+            cmd.extend(["-i", t.file_path])
+        sheet_filter = ";".join(filter_parts) + f";[vout]fps=1/{interval:.4f},scale=320:-1,tile=4x2[sheet]"
+        cmd.extend(["-filter_complex", sheet_filter])
+        cmd.extend(["-map", "[sheet]"])
+        cmd.extend(["-frames:v", "1", "-update", "1", out_png])
+        return cmd, out_png
+
+    def _show_concat_contact_sheet_async(self, video_tracks):
+        try:
+            cmd, out_png = self._build_concat_contact_sheet_cmd(video_tracks)
+        except Exception as e:
+            self._append_info_ui(_("[缩略图] 串行合成缩略图命令构建失败: {0}".format(e)))
+            return
+        save_dir = self.output_dir.get().strip() or ""
+        save_name = os.path.splitext(os.path.basename(video_tracks[0].file_path))[0]
+        self._show_snapshot_async(cmd, out_png, "sheet",
+                                  _("缩略图（串行拼接）") + " · " + str(len(video_tracks)) + _(" 段"),
+                                  _("正在生成缩略图…"), self._display_contact_sheet,
+                                  save_dir=save_dir, save_name=save_name)
+
 
     # ---------- 转码页水印合成快照（真实叠加，独立窗口） ----------
     def _build_watermark_snapshot_cmd(self, file_path, settings):
@@ -16164,7 +16233,7 @@ class FFmpegBatchGUI:
         # ---- 输入（主视频 + 水印），循环参数与正式渲染一致 ----
         ext = os.path.splitext(wm_file)[1].lower()
         is_image = ext in ('.png', '.jpg', '.jpeg', '.bmp', '.webp')
-        out_png = os.path.join(tempfile.gettempdir(), "kli_wm_snapshot.png")
+        out_png = os.path.join(tempfile.gettempdir(), "thumb_wm_snapshot.png")
         cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
         cmd.extend(["-i", file_path])
         if ext == '.gif':
@@ -16199,6 +16268,61 @@ class FFmpegBatchGUI:
     def _display_watermark_snapshot(self, png_path):
         self._display_snapshot(png_path, "wm")
 
+    # ---------- 缩略图 contact sheet（抽帧拼 4x4 网格单图） ----------
+    def _show_contact_sheet_async(self, file_path):
+        """生成视频缩略图拼图（contact sheet），复用通用快照窗口显示。"""
+        if not file_path or not os.path.exists(file_path):
+            self._append_info_ui(_("[缩略图] 文件不存在"))
+            return
+        if not self.ffmpeg_cmd:
+            return
+        # 按时长均分抽约 8 帧（4x2 网格）；拿不到时长按 10 秒间隔兜底
+        dur = self._get_media_duration(file_path) or 0.0
+        if dur <= 0:
+            interval = 10.0
+        else:
+            interval = max(dur / 8.0, 0.5)
+        out_png = os.path.join(tempfile.gettempdir(), "thumb_contact_sheet.png")
+        cmd = [self.ffmpeg_cmd, "-y", "-i", file_path,
+               "-vf", f"fps=1/{interval:.4f},scale=320:-1,tile=4x2",
+               "-frames:v", "1", "-update", "1", out_png]
+        title = _("缩略图") + " · " + os.path.basename(file_path)
+        save_dir = self.output_dir.get().strip() or ""
+        save_name = os.path.splitext(os.path.basename(file_path))[0]
+        self._show_snapshot_async(cmd, out_png, "sheet", title, _("正在生成缩略图…"),
+                                  self._display_contact_sheet, save_dir=save_dir, save_name=save_name)
+
+    def _display_contact_sheet(self, png_path):
+        """显示缩略图：按屏幕可用空间缩放（预留标题栏/状态栏/保存按钮行的高度），
+        保证整张拼图 + 保存按钮都能完整可见，不被顶出屏幕。"""
+        ui = getattr(self, "_snap_ui", {}).get("sheet")
+        if ui is None or not ui["win"].winfo_exists():
+            return
+        try:
+            img = tk.PhotoImage(file=png_path)
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+            # 预留垂直空间给标题栏 + 状态栏 + 保存按钮行 + 外边距（多留余量）
+            reserve_h = 200
+            reserve_w = 40
+            max_w = max(screen_w - reserve_w, 200)
+            max_h = max(screen_h - reserve_h, 200)
+            factor = 1
+            while (img.width() // factor > max_w) or (img.height() // factor > max_h):
+                factor += 1
+            if factor > 1:
+                img = img.subsample(factor, factor)
+            ui["img"] = img
+            ui["label"].config(image=img, text="")
+            ui["status"].config(text=_("缩略图已生成: {0}".format(os.path.basename(png_path))))
+            try:
+                center_window(ui["win"], img.width() + 12, img.height() + 130)
+            except Exception:
+                pass
+        except Exception as e:
+            ui["status"].config(text=_("缩略图显示失败: {0}".format(e)))
+
+
     def merge_edit_track_settings(self, track_idx):
         track = self.merge_tracks[track_idx]
         if track.type == "video":
@@ -16207,7 +16331,6 @@ class FFmpegBatchGUI:
             self.merge_edit_audio_track(track_idx)
         else:
             self.merge_edit_subtitle_track(track_idx)
-
 
     def edit_video_settings(self, title, initial_settings, on_save, file_path=None,
                             is_watermark=False, track_idx=None, pip_enabled_var=None,
@@ -16242,13 +16365,11 @@ class FFmpegBatchGUI:
                 if "trim_enabled" in initial_settings or "trim_start" in initial_settings:
                     filt_frame.set_override_settings(initial_settings)
 
-
             filt_frame.pack(fill=tk.X, padx=5, pady=5)
             filt_frame.set_settings(initial_settings)
 
             if "enhance" in initial_settings:
                 filt_frame.set_enhance_settings(initial_settings["enhance"])
-
 
             # ---- 页面3：截取片段 ----
             page_trim = ttk.Frame(notebook)
@@ -16257,24 +16378,94 @@ class FFmpegBatchGUI:
             trim_frame.pack(fill=tk.X, padx=5, pady=5)
             trim_frame.set_settings(initial_settings)
 
+            # 是否为主视频 / 末段视频（串行模式）—— 主视频显示「一键淡入淡出/一键转场」批量按钮；
+            # 末段视频的转场行灰显（转场挂本段，末段无下一段故无效）
+            is_main_video = False
+            is_last_video = False
+            if is_concat_mode and track_obj is not None and getattr(track_obj, 'type', None) == 'video':
+                _vids = [t for t in self.merge_tracks if getattr(t, 'type', None) == 'video' and t.enabled]
+                is_main_video = bool(_vids) and track_obj == _vids[0]
+                is_last_video = bool(_vids) and len(_vids) > 1 and track_obj == _vids[-1]
+
             # ---- 页面：淡入淡出（视频） ----
             # 变量在函数作用域定义，save() 中统一写回
             fade_enabled_var = tk.BooleanVar(value=initial_settings.get("fade_enabled", False))
             fade_in_var = tk.StringVar(value=str(initial_settings.get("fade_in", "")))
             fade_out_var = tk.StringVar(value=str(initial_settings.get("fade_out", "")))
+            # 串行转场（逐轨常驻属性，挂本段，末段无效）
+            _tr_type_init = initial_settings.get("transition_type", "fade") or "fade"
+            if _tr_type_init not in XFADE_TRANSITIONS:
+                _tr_type_init = "fade"
+            transition_enabled_var = tk.BooleanVar(value=initial_settings.get("transition_enabled", False))
+            transition_type_var = tk.StringVar(value=_tr_type_init)
+            transition_duration_var = tk.StringVar(value=str(initial_settings.get("transition_duration", "1.0") or "1.0"))
             if not is_watermark and (track_obj is None or (hasattr(track_obj, 'type') and track_obj.type == "video")):
                 page_fade = ttk.Frame(notebook)
                 notebook.add(page_fade, text=_("淡入淡出"))
                 fade_frame = ttk.Frame(page_fade, padding="10")
                 fade_frame.pack(fill=tk.X, pady=5)
                 ttk.Checkbutton(fade_frame, text=_("启用淡入淡出（片段首尾淡入黑 / 淡出黑）"),
-                                variable=fade_enabled_var).grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=5)
-                ttk.Label(fade_frame, text=_("淡入时长(秒):")).grid(row=1, column=0, sticky="w", padx=5, pady=5)
-                ttk.Entry(fade_frame, textvariable=fade_in_var, width=10).grid(row=1, column=1, padx=5, pady=5, sticky="w")
-                ttk.Label(fade_frame, text=_("淡出时长(秒):")).grid(row=2, column=0, sticky="w", padx=5, pady=5)
-                ttk.Entry(fade_frame, textvariable=fade_out_var, width=10).grid(row=2, column=1, padx=5, pady=5, sticky="w")
-                ttk.Label(fade_frame, text=_("留空=不应用该项。建议 0.5~2 秒；串行合并下片段间可用 xfade 交叉溶解转场。"),
-                          foreground="gray").grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+                                variable=fade_enabled_var).grid(row=0, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+                ttk.Label(fade_frame, text=_("淡入:")).grid(row=1, column=0, sticky="w", padx=5, pady=5)
+                ttk.Entry(fade_frame, textvariable=fade_in_var, width=7).grid(row=1, column=1, padx=5, pady=5, sticky="w")
+                ttk.Label(fade_frame, text=_("秒  淡出:")).grid(row=1, column=2, sticky="w", padx=5, pady=5)
+                ttk.Entry(fade_frame, textvariable=fade_out_var, width=7).grid(row=1, column=3, padx=5, pady=5, sticky="w")
+                ttk.Label(fade_frame, text=_("留空=不应用该项。建议 0.5~2 秒。"),
+                          foreground="gray").grid(row=2, column=0, columnspan=3, sticky="w", padx=5, pady=2)
+                # 串行转场（逐轨常驻：串行模式下每条视频轨都有，末段灰显）
+                if is_concat_mode:
+                    tr_row = ttk.Frame(fade_frame)
+                    tr_row.grid(row=3, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+                    tr_cb = ttk.Checkbutton(tr_row, text=_("启用串行转场"),
+                                            variable=transition_enabled_var)
+                    tr_cb.pack(side=tk.LEFT)
+                    tr_combo = ttk.Combobox(tr_row, textvariable=transition_type_var,
+                                            values=XFADE_TRANSITIONS, state="readonly", width=12)
+                    tr_combo.pack(side=tk.LEFT, padx=(8, 0))
+                    ttk.Label(tr_row, text=_("转场时长:")).pack(side=tk.LEFT, padx=(8, 0))
+                    ttk.Entry(tr_row, textvariable=transition_duration_var, width=6).pack(side=tk.LEFT, padx=(2, 0))
+                    ttk.Label(tr_row, text=_("秒")).pack(side=tk.LEFT)
+                    if is_last_video:
+                        tr_cb.config(state='disabled')
+                        tr_combo.config(state='disabled')
+                    ToolTip(tr_cb,
+                            _("串行转场（片段间交叉溶解，xfade）：\n"
+                            "在本段与下一段之间做转场（而非硬切）。挂本段，末段无下一段自动无效。\n\n"
+                            "• 勾选后从下拉选择转场类型（fade=交叉溶解、wipeleft=向左擦除等）；\n"
+                            "• 转场时长自动钳制为相邻两段中较短者的一半，避免过短片段出错；\n"
+                            "• 与「淡入淡出」互斥：本段的淡出被本段转场替代，下一段的淡入被替代；\n"
+                            "  首段淡入 / 末段淡出仍保留为整段起止淡黑；\n"
+                            "• 未开转场的相邻片段之间仍为硬切（互不影响，逐轨独立）。"),
+                            wraplength=480)
+                # 一键淡入淡出 / 一键转场（批量操作，仅主视频 + 串行模式显示）
+                if is_main_video and self.concat_enabled.get():
+                    oneclick_row = ttk.Frame(fade_frame)
+                    oneclick_row.grid(row=4, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+                    ocf_btn = ttk.Button(oneclick_row, text=_("一键淡入淡出(all)"),
+                                         command=lambda: self._apply_fade_all_tracks(
+                                             current_track_obj=track_obj,
+                                             current_fade_vars=(fade_enabled_var, fade_in_var, fade_out_var),
+                                         ))
+                    ocf_btn.pack(side=tk.LEFT)
+                    ttk.Label(oneclick_row, text=_("时长(秒):")).pack(side=tk.LEFT, padx=(6, 0))
+                    ttk.Entry(oneclick_row, textvariable=self.oneclick_fade_duration, width=6).pack(side=tk.LEFT, padx=(2, 0))
+                    oct_btn = ttk.Button(oneclick_row, text=_("一键转场(all)"),
+                                         command=lambda: self._apply_transition_all_tracks(
+                                             current_track_obj=track_obj,
+                                             current_transition_vars=(transition_enabled_var, transition_type_var, transition_duration_var),
+                                         ))
+                    oct_btn.pack(side=tk.LEFT, padx=(18, 0))
+                    ttk.Label(oneclick_row, text=_("时长(秒):")).pack(side=tk.LEFT, padx=(6, 0))
+                    ttk.Entry(oneclick_row, textvariable=self.oneclick_transition_duration, width=6).pack(side=tk.LEFT, padx=(2, 0))
+                    ToolTip(ocf_btn,
+                            _("一键淡入淡出（All）：\n为所有已启用的视频/音频轨道批量设置片段首尾淡入淡出（短片段自动钳制）。\n时长取本行「时长(秒)」框，默认 1.0s。"),
+                            wraplength=420)
+                    ToolTip(oct_btn,
+                            _("一键转场（All）：\n"
+                            "为所有已启用的视频轨道（除末段）批量开启串行转场，类型取当前下拉框，\n"
+                            "时长取本行「时长(秒)」框，默认 1.0s（自动钳制为相邻两段较短者的一半）。\n"
+                            "末段无下一段，自动跳过；已开启淡入淡出的连接处会被转场替代。"),
+                            wraplength=440)
 
             # 水印或画中画模式下，强制启用精准截取
             if is_watermark or (pip_enabled_var is not None and pip_enabled_var.get()):
@@ -16325,7 +16516,6 @@ class FFmpegBatchGUI:
             trim_frame.trim_enabled.trace_add('write', update_duration_on_trim_change)
             trim_frame.trim_start.trace_add('write', update_duration_on_trim_change)
             trim_frame.trim_end.trace_add('write', update_duration_on_trim_change)
-
 
             # ---- 页面5：叠加/偏移（仅在画中画或水印模式下显示） ----
             overlay_frame = None
@@ -16479,15 +16669,10 @@ class FFmpegBatchGUI:
                 ttk.Label(meta_frame, text=_("从下拉框选择常用语言，或直接输入 ISO 639-2/B 代码（如 cmn、yue）"),
                           foreground="gray").grid(row=3, column=0, columnspan=4, sticky="w", padx=5, pady=2)
 
-            # 是否为主视频（串行模式下第一段启用视频）= 全局 BGM 接口所在页
-            is_main_video = False
-            if is_concat_mode and track_obj is not None and getattr(track_obj, 'type', None) == 'video':
-                _vids = [t for t in self.merge_tracks if getattr(t, 'type', None) == 'video' and t.enabled]
-                is_main_video = bool(_vids) and track_obj == _vids[0]
+            # 是否为主视频已在本函数前面计算（用于淡入淡出页的串行转场）
             bgm_enabled_var = None
             bgm_path_var = None
             bgm_volume_var = None
-
 
             # ================== 页面7：音频绑定 ==================
             # 仅在串接模式下显示此页（水印无音频绑定需求）
@@ -16570,8 +16755,6 @@ class FFmpegBatchGUI:
     
             # ================== 新增结束 ==================
 
-
-
             # ---- 窗口居中 ----
             center_window(win, 700, 300)
 
@@ -16585,6 +16768,10 @@ class FFmpegBatchGUI:
                     new_settings["fade_enabled"] = fade_enabled_var.get()
                     new_settings["fade_in"] = fade_in_var.get().strip()
                     new_settings["fade_out"] = fade_out_var.get().strip()
+                    # 串行转场（逐轨常驻）：转场挂本段，末段写回无效（命令生成会忽略末段）
+                    new_settings["transition_enabled"] = transition_enabled_var.get()
+                    new_settings["transition_type"] = transition_type_var.get().strip() or "fade"
+                    new_settings["transition_duration"] = transition_duration_var.get().strip() or "1.0"
                     if loop_chroma_frame is not None:
                         new_settings.update(loop_chroma_frame.get_settings())
                     if overlay_frame is not None:
@@ -16645,9 +16832,6 @@ class FFmpegBatchGUI:
 
             ttk.Button(win, text=_("保存"), command=save).pack(pady=10)
             win.wait_window()
-
-
-
 
     def merge_edit_video_track(self, track_idx):
         track = self.merge_tracks[track_idx]
@@ -16717,7 +16901,6 @@ class FFmpegBatchGUI:
 
         self.merge_update_track_list()
         self.merge_update_command_preview()
-
 
     def merge_edit_audio_track(self, track_idx):
         track = self.merge_tracks[track_idx]
@@ -17094,6 +17277,8 @@ class FFmpegBatchGUI:
                     "fade_enabled": fade_enabled_var.get(),
                     "fade_in": fade_in_var.get().strip(),
                     "fade_out": fade_out_var.get().strip(),
+                    "audio_offset": offset_var.get().strip() or "0",
+                    "disposition": disp_var.get(),
                     "loudnorm_enabled": loudnorm_enabled_var.get(),
                     "denoise_enabled": denoise_enabled_var.get(),
                     "channel_mode": channel_mode_var.get(),
@@ -17101,8 +17286,6 @@ class FFmpegBatchGUI:
                     "eq_low": eq_low_var.get().strip() or "0",
                     "eq_mid": eq_mid_var.get().strip() or "0",
                     "eq_high": eq_high_var.get().strip() or "0",
-                    "audio_offset": offset_var.get().strip() or "0",
-                    "disposition": disp_var.get(),
                 })
 
                 # 获取语言：优先手动输入，其次下拉框
@@ -17456,7 +17639,6 @@ class FFmpegBatchGUI:
             if hasattr(self, '_merge_temp_files'):
                 self._cleanup_temp_files(self._merge_temp_files)
                 self._merge_temp_files = []
-
 
     def _confirm_delete_sources(self, source_files, output_file):
         if not messagebox.askyesno(_("确认删除"), _("是否确定删除 {0} 个源文件？\n此操作不可恢复！".format(len(source_files)))):
@@ -17895,7 +18077,6 @@ class FFmpegBatchGUI:
             self.update_command_preview()
             self._append_info_ui(_("已清空输入文件和输出目录"))
 
-
     # ---------- 播放器设置标签页 ----------
     def create_player_settings_tab(self, parent):
         frame = ttk.Frame(parent, padding="10")
@@ -17950,8 +18131,6 @@ class FFmpegBatchGUI:
 
         self.ffmpeg_dir_path.trace_add('write', self._on_ffmpeg_dir_changed)
 
-
-
         # ---- 水平布局：同名文件处理 + 预览编辑权限 ----
         horizontal_frame = ttk.Frame(frame)
         horizontal_frame.pack(fill=tk.X, pady=5)
@@ -17990,8 +18169,6 @@ class FFmpegBatchGUI:
         )
         self.preview_edit_check.pack(anchor=tk.W, padx=5, pady=5)
         ToolTip(self.preview_edit_check, _("勾选后，所有命令预览区可编辑，方便修改后复制命令，不会影响实际转码，改错后只需刷新命令就会还原。"))
-
-
 
         # ---- 停止所有转码按钮 ----
         stop_frame = ttk.Frame(frame)
@@ -18046,8 +18223,6 @@ class FFmpegBatchGUI:
         lang_combo.bind("<<ComboboxSelected>>", _on_lang_selected)
         ToolTip(lang_combo, _("切换界面语言。设置会立即保存；重启程序后全部界面生效。"))
 
-
-
         # ---- 快速命令工具 ----
         cmd_tool_frame = ttk.LabelFrame(frame, text=_("快速命令工具"), padding="5")
         cmd_tool_frame.pack(fill=tk.X, pady=5)
@@ -18064,7 +18239,6 @@ class FFmpegBatchGUI:
                 wraplength=500)
 
         self.cmd_preset_var = tk.StringVar()
-
 
         self.cmd_preset_combo = ttk.Combobox(
             top_frame,
@@ -18090,8 +18264,6 @@ class FFmpegBatchGUI:
         entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         ttk.Button(output_frame, text=_("浏览"), command=self._browse_cmd_output).pack(side=tk.LEFT, padx=2)
 
-
-
         # 命令编辑框（多行）
         self.cmd_input = scrolledtext.ScrolledText(cmd_tool_frame, height=4, wrap=tk.WORD,
                                                    font=("", 9))
@@ -18104,9 +18276,6 @@ class FFmpegBatchGUI:
         ttk.Button(btn_frame, text=_("复制到剪贴板"), command=self._copy_custom_command).pack(side=tk.LEFT, padx=5)
         ttk.Label(btn_frame, text=_("（命令在独立线程执行，输出显示在日志区域）"),
                   foreground="gray").pack(side=tk.LEFT, padx=10)
-
-
-
 
         status_frame = ttk.LabelFrame(frame, text=_("状态检测"), padding="5")
         status_frame.pack(fill=tk.X, pady=(0, 5))
@@ -18124,12 +18293,10 @@ class FFmpegBatchGUI:
                         foreground="gray", wraplength=500, justify=tk.LEFT)
         tip.pack(anchor=tk.W, pady=(10,0))
 
-
         self.update_mpv_path_state()
         self.use_mpv.trace_add("write", lambda *a: self.update_player_status())
         self.mpv_path.trace_add("write", lambda *a: self.update_player_status())
  #       self.update_player_status()    #放到延迟里运行
-
 
     def _update_preview_edit_state(self):
         if getattr(self, '_loading_settings', False):
@@ -18172,7 +18339,6 @@ class FFmpegBatchGUI:
         self._append_info_ui(_("已从{0}预览区获取命令".format(source_name)))
         self.cmd_input.focus_set()
 
-
     def _reload_cmd_templates(self):
         """重新加载命令模板（用户编辑 JSON 后调用）"""
         self._load_cmd_templates()
@@ -18202,7 +18368,6 @@ class FFmpegBatchGUI:
         # 刷新命令预览（因为 ffmpeg 路径改变了）
         self.update_command_preview()
         self.update_player_status()
-
 
     def _browse_cmd_output(self):
         path = filedialog.askdirectory(title="选择命令执行目录")
@@ -18297,7 +18462,6 @@ class FFmpegBatchGUI:
         else:
             self._append_info_ui(_("命令文本框为空，无内容可复制"))
 
-
     def _run_custom_command(self):
         """执行命令文本框中的命令，在独立线程中运行，支持全局停止"""
         cmd_str = self.cmd_input.get(1.0, tk.END).strip()
@@ -18372,7 +18536,6 @@ class FFmpegBatchGUI:
                 subprocess.Popen(["xdg-open", folder])
         except Exception as e:
             self._append_info_ui(_("打开文件夹失败: {0}".format(e)))
-
 
     def browse_log_file(self):
         path = filedialog.asksaveasfilename(
@@ -18659,7 +18822,6 @@ class FFmpegBatchGUI:
                 "如果您希望保留专辑分轨或有声书章节，请关闭「自动匹配」，并手动选择输出格式为 M4A 或 MKA，以确保章节信息被完整保留。自动匹配可能根据编码扩展名选择不支持章节的格式（如 .mp3），导致章节丢失。"))
         self.extract_keep_chapters.trace_add('write', lambda *a: self.save_player_settings())
 
-
         # 第二行：音频 + 自动匹配
         chk_audio = ttk.Checkbutton(opt_frame, text=_("提取音频流"), variable=self.extract_audio)
         chk_audio.grid(row=1, column=0, sticky="w", padx=10)
@@ -18690,7 +18852,6 @@ class FFmpegBatchGUI:
 
         self.auto_match_subtitle_ext.trace_add('write', lambda *a: self.save_player_settings())
 
-
         # 第四行：仅第一轨、分文件夹
         chk_only_first = ttk.Checkbutton(opt_frame, text=_("仅提取第一轨（取消则提取全部匹配轨）"),
                                          variable=self.extract_only_first)
@@ -18710,7 +18871,6 @@ class FFmpegBatchGUI:
         chk_metadata = ttk.Checkbutton(opt_frame, text=_("清除元数据"), variable=self.extract_clear_metadata)
         chk_metadata.grid(row=3, column=3, sticky="w", padx=10)
         ToolTip(chk_metadata, _("勾选后，输出文件将不包含任何元数据（如作者、专辑等），适用于铃声或素材提取。"))
-
 
         self.extract_clear_metadata.trace_add('write', lambda *a: self.save_player_settings())
 
@@ -18774,7 +18934,6 @@ class FFmpegBatchGUI:
         self.auto_match_audio_ext.trace_add('write', self._on_extract_option_changed)
         self.extract_keep_chapters.trace_add('write', lambda *a: self._on_extract_option_changed())
         self.extract_clear_metadata.trace_add('write', lambda *a: self._on_extract_option_changed())
-
 
         # 初始化列表
 
@@ -18886,7 +19045,6 @@ class FFmpegBatchGUI:
         item = self.extract_tree.selection()
         if item:
             self.extract_preview_selected()
-
 
     def _extract_preview_file(self, file_path):
         """预览指定文件的全部提取命令（根据当前选项），自动添加轨道语言和标题"""
@@ -19334,8 +19492,6 @@ class FFmpegBatchGUI:
         }
         return m.get(codec, 'jpg')
 
-
-
     # ---------- 流提取标签页方法 ----------
     def extract_add_file(self, path=None):
         if path is None:
@@ -19364,7 +19520,6 @@ class FFmpegBatchGUI:
         self._refresh_extract_file_list()   # 刷新 Treeview
         self._append_info_ui(_("[流提取] 已添加: {0}".format(os.path.basename(path))))
     
-
 
     def extract_clear_files(self):
         if self.extract_file_list and messagebox.askyesno(_("确认"), _("确定清空所有文件吗？")):
@@ -19530,7 +19685,6 @@ class FFmpegBatchGUI:
             # 其他常见
         }
         return mapping.get(codec_name, 'mka')
-
 
     def _process_send_files_to_queue(self, file_list):
         """
@@ -19810,10 +19964,9 @@ class FFmpegBatchGUI:
         menu.add_command(label=_("停止队列"), command=self.stop_queue)
         menu.add_command(label=_("预览选中任务"), command=self.preview_selected_task)
         menu.add_command(label=_("预览选中任务(快照)"), command=lambda: self.preview_selected_task(with_snapshot=True))
+        menu.add_command(label=_("创建缩略图"), command=self._contact_sheet_selected_task)
         menu.add_separator()
         menu.add_command(label=_("恢复列宽"), command=self.reset_task_tree_columns)
-
-
 
         # 弹出菜单
         menu.post(event.x_root, event.y_root)
@@ -19914,7 +20067,6 @@ class FFmpegBatchGUI:
             self.update_command_preview()
         else:
             self._append_info_ui(_("没有任务被更新"))
-
 
     # -------------------- 界面创建 --------------------
     def create_widgets(self):
@@ -20064,9 +20216,9 @@ class FFmpegBatchGUI:
                                 height=btn_height, width=18, relief=tk.RAISED,
                                 bg="#2196F3", fg="white", font=("",12,"bold"))
         btn_preview.pack(side=tk.LEFT, padx=5, pady=5)
-        # 左键=旧预览（无快照）；右键=带真实合成快照的预览
-        btn_preview.bind("<Button-3>", lambda e: self.preview_current_file(with_snapshot=True))
-        ToolTip(btn_preview, _("左键：常规预览（无快照）\n右键：预览 + 水印真实合成快照（独立窗口）"), wraplength=320)
+        # 左键=常规预览；右键=弹出选择菜单（快照 / 缩略图）
+        btn_preview.bind("<Button-3>", lambda e: self._transcode_preview_right_menu())
+        ToolTip(btn_preview, _("左键：常规预览\n右键：快照 / 缩略图 选择菜单"), wraplength=320)
     
         btn_refresh = tk.Button(bottom_btn_frame, text=_("刷新命令"), command=self.refresh_with_reset,
                                 height=btn_height, width=12, relief=tk.RAISED)
@@ -20347,7 +20499,6 @@ class FFmpegBatchGUI:
         self._update_preview_edit_state()
         self._initialized = True
 
-
 class EditSegmentDialog(simpledialog.Dialog):
     """用于编辑片段的起始时间、结束时间、翻转、变速和倒放"""
     def __init__(self, parent, title, start, end, flip, speed="1.0", reverse=False):
@@ -20481,7 +20632,8 @@ class SegmentEditor:
         self.reverse_check = ttk.Checkbutton(tool_frame, text=_("倒放"), variable=self.reverse_var)
         self.reverse_check.pack(side=tk.LEFT, padx=(2, 0))
 
-        ttk.Button(tool_frame, text=_("添加片段"), command=self.add_segment).pack(side=tk.LEFT, padx=5)
+        ttk.Button(tool_frame, text=_("添加片段"), command=self.add_segment, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Button(tool_frame, text=_("预览"), command=self.preview_selected_segment, width=8).pack(side=tk.LEFT, padx=5)
 
         # 表格
         tree_frame = ttk.Frame(left_frame)
@@ -20542,9 +20694,12 @@ class SegmentEditor:
         ttk.Button(cmd_btn_frame, text=_("解析并导入所有片段"), command=self.import_from_commands).pack(side=tk.LEFT, padx=2)
         ttk.Button(cmd_btn_frame, text=_("清空输入"), command=lambda: self.cmd_input.delete(1.0, tk.END)).pack(side=tk.LEFT, padx=2)
 
-        # ---- 音频独立截取（不分段） ----
-        audio_trim_frame = ttk.LabelFrame(main, text=_("音频独立截取（不分段）"), padding="8")
-        audio_trim_frame.pack(fill=tk.X, pady=5)
+        # ---- 音频独立截取（不分段）+ 自动检测分段（左右并排） ----
+        bottom_row = ttk.Frame(main)
+        bottom_row.pack(fill=tk.X, pady=5)
+
+        audio_trim_frame = ttk.LabelFrame(bottom_row, text=_("音频独立截取（不分段）"), padding="8")
+        audio_trim_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
 
         # 启用复选框 + 总时长参考
         at_row0 = ttk.Frame(audio_trim_frame)
@@ -20578,6 +20733,31 @@ class SegmentEditor:
         # 初始禁用状态
         self._on_audio_trim_toggle()
 
+        # ---- 自动检测分段（场景变化 / 黑屏 / 静音） ----
+        detect_frame = ttk.LabelFrame(bottom_row, text=_("自动检测分段"), padding="8")
+        detect_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
+
+        # 第 1 行：三个检测按钮
+        det_row0 = ttk.Frame(detect_frame)
+        det_row0.pack(fill=tk.X, pady=(0, 3))
+        b_scene = ttk.Button(det_row0, text=_("场景变化"), command=lambda: self._detect_and_fill("scene"), width=10)
+        b_scene.pack(side=tk.LEFT, padx=(0, 6))
+        ToolTip(b_scene, _("按画面切换点自动切分（去转场/多机位），检测结果替换当前分段列表。"), wraplength=320)
+        b_black = ttk.Button(det_row0, text=_("黑屏"), command=lambda: self._detect_and_fill("black"), width=8)
+        b_black.pack(side=tk.LEFT, padx=(0, 6))
+        ToolTip(b_black, _("按黑屏段切分（常见广告/段落分隔），黑屏段之外的内容作为分段。"), wraplength=320)
+        b_silence = ttk.Button(det_row0, text=_("静音"), command=lambda: self._detect_and_fill("silence"), width=8)
+        b_silence.pack(side=tk.LEFT)
+        ToolTip(b_silence, _("按静音段切分，静音段之外的内容作为分段。"), wraplength=320)
+
+        # 第 2 行：进度条 + 状态
+        det_row1 = ttk.Frame(detect_frame)
+        det_row1.pack(fill=tk.X, pady=(2, 0))
+        self.detect_progress = ttk.Progressbar(det_row1, mode="determinate", maximum=100)
+        self.detect_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self.detect_status_label = ttk.Label(det_row1, text=_("检测结果会替换当前分段列表"), foreground="gray")
+        self.detect_status_label.pack(side=tk.LEFT)
+
         # ---- 底部按钮 ----
         btn_frame = ttk.Frame(main)
         btn_frame.pack(fill=tk.X, pady=10)
@@ -20598,7 +20778,6 @@ class SegmentEditor:
                 wraplength=800
         )
 
-
         ttk.Label(btn_frame, text=_("发送到队列")).pack(side=tk.LEFT, padx=(10, 5))
         ttk.Button(btn_frame, text=_("快速"), command=self.send_quick_to_queue, width=6).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text=_("精确"), command=self.send_precise_to_queue, width=6).pack(side=tk.LEFT, padx=5)
@@ -20609,11 +20788,8 @@ class SegmentEditor:
         precise_btn = ttk.Button(btn_frame, text=_("精确"), command=self.export_precise_script, width=6)
         precise_btn.pack(side=tk.LEFT, padx=5)
 
-
-
         ttk.Button(btn_frame, text=_("取消"), command=self.on_cancel).pack(side=tk.RIGHT, padx=5)
         ttk.Button(btn_frame, text=_("确定"), command=self.on_ok).pack(side=tk.RIGHT, padx=5)
-
 
         self.window.after(100, lambda: self._set_initial_pane_size(paned))
 
@@ -20624,7 +20800,6 @@ class SegmentEditor:
 
         # 绑定双击编辑
         self.tree.bind("<Double-1>", self.on_tree_double_click)
-
 
     def send_quick_to_queue(self):
         input_file = self.app.input_file.get().strip()
@@ -20858,7 +21033,6 @@ class SegmentEditor:
         mode_str = "双 -ss" if choice else "trim"
         messagebox.showinfo(_("成功"), _("精确切割脚本已保存到:\n{0}\n模式：{1}".format(save_path, mode_str)))
 
-
     # ---------- 片段管理核心方法（已优化浮点误差） ----------
     def add_segment_with_time(self, start_sec, end_sec, flip="无", speed="1.0", reverse=False):
         """直接使用浮点数添加片段（用于外部命令导入）"""
@@ -21042,6 +21216,7 @@ class SegmentEditor:
             return self.app._get_media_duration(path)
         return None
 
+
     # ---------- 双击编辑 ----------
     def on_tree_double_click(self, event):
         selected = self.tree.selection()
@@ -21173,6 +21348,203 @@ class SegmentEditor:
                 messagebox.showinfo(_("导入完成"), msg)
         else:
             messagebox.showinfo(_("导入完成"), msg)
+
+    # ---------- 自动检测分段（场景/黑屏/静音） ----------
+    def _set_detect_progress(self, pct, text=None):
+        """更新检测进度条与状态文字（主线程调用）。"""
+        try:
+            self.detect_progress["value"] = pct
+        except Exception:
+            pass
+        if text is not None:
+            self.detect_status_label.config(text=text, foreground="blue")
+
+    def _set_detect_done(self, text):
+        """检测结束：进度条拉满，状态文字置灰显示结束信息。"""
+        try:
+            self.detect_progress["value"] = 100
+        except Exception:
+            pass
+        self.detect_status_label.config(text=text, foreground="gray")
+
+    def _detect_and_fill(self, kind):
+        """后台运行 ffmpeg 检测（场景变化/黑屏/静音），解析切点并回填分段列表。"""
+        input_file = self._get_input_path()
+        if not input_file or not os.path.exists(input_file):
+            messagebox.showerror(_("错误"), _("未指定输入文件，无法检测"))
+            return
+        ffmpeg = getattr(self.app, "ffmpeg_cmd", None)
+        if not ffmpeg:
+            messagebox.showerror(_("错误"), _("未找到 FFmpeg"))
+            return
+
+        # 构造检测命令（检测结果输出到 stderr；-progress pipe:1 把进度输出到 stdout）
+        if kind == "scene":
+            # 场景变化：select 取场景切换帧 + showinfo 打印 pts_time
+            cmd = [ffmpeg, "-hide_banner", "-i", input_file,
+                   "-vf", "select='gt(scene,0.4)',showinfo", "-an",
+                   "-progress", "pipe:1", "-f", "null", "-"]
+        elif kind == "black":
+            cmd = [ffmpeg, "-hide_banner", "-i", input_file,
+                   "-vf", "blackdetect=d=0.5:pix_th=0.10", "-an",
+                   "-progress", "pipe:1", "-f", "null", "-"]
+        else:  # silence
+            cmd = [ffmpeg, "-hide_banner", "-i", input_file,
+                   "-af", "silencedetect=noise=-30dB:d=0.5",
+                   "-progress", "pipe:1", "-f", "null", "-"]
+
+        kind_name = {"scene": _("场景变化"), "black": _("黑屏"), "silence": _("静音")}[kind]
+        self.app._append_info_ui(_("[检测] 正在分析{0}…").format(kind_name))
+        total = self._get_input_duration() or 0.0
+        self._set_detect_progress(0, _("正在分析{0}… 0%").format(kind_name))
+
+        def worker():
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        text=True, errors="replace",
+                                        creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0))
+            except Exception as e:
+                self.window.after(0, lambda: self._set_detect_done(_("检测失败")))
+                self.window.after(0, lambda: messagebox.showerror(_("检测失败"), str(e)))
+                return
+
+            # stderr 单独线程读取（检测结果），避免缓冲区满阻塞 ffmpeg
+            stderr_buf = []
+            def read_stderr():
+                try:
+                    for line in proc.stderr:
+                        stderr_buf.append(line)
+                except Exception:
+                    pass
+            threading.Thread(target=read_stderr, daemon=True).start()
+
+            # 主线程读 stdout（-progress 的 out_time=HH:MM:SS.microseconds）实时更新进度
+            last_pct = -1
+            try:
+                for line in proc.stdout:
+                    m = re.search(r"out_time=(\d+):(\d+):(\d+(?:\.\d+)?)", line)
+                    if m and total > 0:
+                        sec = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+                        if sec >= 0:
+                            pct = min(100, max(0, int(sec / total * 100)))
+                            if pct != last_pct:
+                                last_pct = pct
+                                self.window.after(0, lambda p=pct: self._set_detect_progress(p))
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=600)
+            except Exception:
+                pass
+
+            stderr = "".join(stderr_buf)
+            cuts = self._parse_detect_output(kind, stderr)
+            self.window.after(0, lambda: self._apply_detected_cuts(kind, kind_name, cuts, input_file))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _parse_detect_output(self, kind, stderr):
+        """从 ffmpeg stderr 解析切点。返回：scene→切点列表；black/silence→(start,end) 区间列表。"""
+        if kind == "scene":
+            times = []
+            for m in re.finditer(r"pts_time:([\d.]+)", stderr):
+                try:
+                    times.append(float(m.group(1)))
+                except ValueError:
+                    pass
+            return sorted(set(round(t, 3) for t in times))
+        else:
+            # black: black_start:xx black_end:yy；silence: silence_start: xx / silence_end: yy
+            if kind == "black":
+                ranges = []
+                for m in re.finditer(r"black_start:([\d.]+)\s+black_end:([\d.]+)", stderr):
+                    ranges.append((float(m.group(1)), float(m.group(2))))
+                return ranges
+            else:
+                starts = [float(m.group(1)) for m in re.finditer(r"silence_start:\s*([\d.-]+)", stderr)]
+                ends = [float(m.group(1)) for m in re.finditer(r"silence_end:\s*([\d.-]+)", stderr)]
+                # silence_end 可能带 | silence_duration 后缀，上面的正则已取到数字
+                return list(zip(starts, ends))
+
+    def _apply_detected_cuts(self, kind, kind_name, cuts, input_file):
+        """把检测结果转成分段并回填列表。"""
+        dur = self._get_input_duration()
+        if dur is None or dur <= 0:
+            self._set_detect_done(_("分析完成（无法获取总时长）"))
+            messagebox.showwarning(_("警告"), _("无法获取视频总时长，检测结果无法回填"))
+            return
+
+        new_segments = []
+        if kind == "scene":
+            # 场景切换点作为切点：分段 = [0,t1], [t1,t2], ..., [tn,dur]
+            points = [0.0] + [t for t in cuts if 0.5 < t < dur - 0.5] + [dur]
+            points = sorted(set(points))
+            for i in range(len(points) - 1):
+                a, b = points[i], points[i + 1]
+                if b - a >= 0.5:
+                    new_segments.append((a, b))
+        else:
+            # 黑屏/静音区间作为「要删除的段」：分段 = 区间之间的内容段
+            ranges = [(a, b) for a, b in cuts if b > a]
+            if not ranges:
+                self._set_detect_done(_("分析完成（未检测到{0}段）").format(kind_name))
+                messagebox.showinfo(_("提示"), _("未检测到{0}段").format(kind_name))
+                return
+            # 合并重叠区间
+            ranges.sort()
+            merged = []
+            for a, b in ranges:
+                if merged and a <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+                else:
+                    merged.append((a, b))
+            # 内容段 = 黑屏/静音段之外的区间
+            prev_end = 0.0
+            for a, b in merged:
+                if a - prev_end >= 0.5:
+                    new_segments.append((prev_end, a))
+                prev_end = max(prev_end, b)
+            if dur - prev_end >= 0.5:
+                new_segments.append((prev_end, dur))
+
+        if not new_segments:
+            self._set_detect_done(_("分析完成（无有效片段）"))
+            messagebox.showinfo(_("提示"), _("未从{0}检测中切出有效片段").format(kind_name))
+            return
+
+        # 替换列表
+        self.segments.clear()
+        for a, b in new_segments:
+            self.segments.append({
+                "start": seconds_to_time(a), "end": seconds_to_time(b),
+                "flip": "无", "speed": "1.0", "reverse": False,
+            })
+        self.refresh_tree()
+        self._set_detect_done(_("分析完成，切出 {0} 段").format(len(new_segments)))
+        self.app._append_info_ui(_("[检测] {0}检测完成，切出 {1} 个片段").format(kind_name, len(new_segments)))
+        messagebox.showinfo(_("检测完成"), _("{0}检测完成，已回填 {1} 个片段").format(kind_name, len(new_segments)))
+
+    def preview_selected_segment(self):
+        """预览选中的片段（用播放器跳转到片段起止）。"""
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showinfo(_("提示"), _("请先在列表选中一个片段"))
+            return
+        idx = int(selected[0])
+        seg = self.segments[idx]
+        input_file = self._get_input_path()
+        if not input_file or not os.path.exists(input_file):
+            messagebox.showerror(_("错误"), _("输入文件不存在"))
+            return
+        start_sec = time_to_seconds(seg["start"])
+        end_sec = time_to_seconds(seg["end"])
+        if start_sec is None:
+            start_sec = 0.0
+        duration = None
+        if end_sec is not None and end_sec > start_sec:
+            duration = end_sec - start_sec
+        # 片段内部翻转/变速/倒放用播放器原生能力无法完整表达，这里只做时间跳转预览
+        self.app.preview_with_player(input_file, start_time=start_sec, duration=duration)
 
     # ---------- 确定/取消 ----------
     def on_ok(self):
