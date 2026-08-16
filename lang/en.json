@@ -1234,5 +1234,20 @@
   "显示:": "Show:",
   "显示时段 - 结束时间（秒或 HH:MM:SS）：到该时刻水印消失。\n只填结束=lte(t,结束)；起始/结束都填=between(t,起始,结束)。\n时段外画面完全隐藏（overlay 不渲染，非黑场/定格）。": "Show window - End time (sec or HH:MM:SS): watermark disappears at this moment.\nEnd only = lte(t,end); both start/end = between(t,start,end).\nOutside the window the overlay is fully hidden (not rendered, not black frame/freeze).",
   "显示时段 - 起始时间（秒或 HH:MM:SS）：从该时刻起水印可见。\n与「结束」配合生成 enable='between(t,起始,结束)'；只填起始=gte(t,起始)。\n与循环次数/循环显示为叠加关系（AND），互不影响。": "Show window - Start time (sec or HH:MM:SS): watermark becomes visible from this moment.\nWith \"End\" produces enable='between(t,start,end)'; start only = gte(t,start).\nMultiplied (AND) with loop count / cycle show, independent.",
-  "起始": "Start"
+  "起始": "Start",
+  "轨迹控制": "Trajectory",
+  "轨迹控制...": "Trajectory...",
+  "无（静态定位）": "None (static)",
+  "左右往返": "Left-right sweep",
+  "上下往返": "Up-down sweep",
+  "歪菱形循环": "Tilted diamond loop",
+  "四角跳跃": "Corner hopping",
+  "运动轨迹:": "Trajectory:",
+  "周期(秒):": "Cycle (sec):",
+  "每点停留(秒):": "Dwell per corner (sec):",
+  "边距:": "Margin:",
+  "（四角跳跃忽略上方设置的位置坐标，自动贴屏幕四角）": "(Corner hopping ignores the position coordinates above and snaps to the four screen corners)",
+  "[轨迹控制] 混合模式不支持动态轨迹，已使用基准位置": "[Trajectory] Blend modes don't support dynamic movement; using the base position",
+  "这里的周期管的是速度：周期越短，水印移动越快。\n往返 = 单程来回一次的时间；菱形 = 走完一圈的时间；\n四角跳跃不受此周期影响（用下方「每点停留」控制）。\n往返无需幅度参数：左右往返自动横跨整个画面宽度（0→W），\n上下往返自动纵跨整个画面高度（0→H）。": "The cycle here controls SPEED: shorter cycle = faster movement.\nSweep = one back-and-forth; diamond = one full loop;\ncorner hopping ignores this cycle (use 'Dwell per corner' below).\nNo amplitude needed: left-right sweeps the full width (0→W),\nup-down sweeps the full height (0→H).",
+  "四角跳跃时水印离屏幕边缘的距离。\n可填像素数（如 20）或相对式（如 W*0.03 = 主画面宽度 3%）。": "Distance of the watermark from screen edges when corner hopping.\nPixel value (e.g. 20) or relative (e.g. W*0.03 = 3% of main width)."
 }
