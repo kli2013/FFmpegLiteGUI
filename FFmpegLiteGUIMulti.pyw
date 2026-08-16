@@ -529,6 +529,135 @@ def _channel_layout_name(ch):
     """把声道数映射为 ffmpeg aformat 可识别的声道布局名；无法映射时返回 None。"""
     return {1: "mono", 2: "stereo", 4: "quad", 5: "5.0", 6: "5.1", 7: "6.1", 8: "7.1"}.get(ch)
 
+def build_move_xy_expr(mode, x0, y0, move_settings=None):
+    """生成动态水印 overlay 的 x/y 表达式（纯表达式，无需 sendcmd）。
+
+    mode: '' 无 | 'h' 左右往返 | 'v' 上下往返 | 'diamond' 歪菱形循环 | 'corners' 四角跳跃
+    x0/y0: 现有基准（overlay_x/overlay_y 字符串，如 "W-w-10"）。
+           往返模式中：h 用 y0 控制水印距上边距（x 全宽 0→W 来回）；
+           v 用 x0 控制水印距左边距（y 全高 0→H 来回）；运动速度由周期自动计算。
+    move_settings: 参数 dict，键：move_cycle(周期秒) move_dwell(四角停留秒)
+                   move_margin(四角边距,可含 W/H 表达式)
+
+    返回 (x_expr, y_expr)；mode 无效/为空返回 (None, None)。
+    表达式求值环境：W/H 主画布、w/h 子视频尺寸、t 帧时间（overlay x/y 默认逐帧求值）。
+    所有模式均用 min/max 钳制到画面内，避免水印跑出屏幕。
+    """
+    ms = move_settings or {}
+    try:
+        T = float(ms.get("move_cycle", 4.0) or 4.0)
+    except (ValueError, TypeError):
+        T = 4.0
+    if T <= 0:
+        T = 4.0
+
+    def _clamp_x(expr):
+        return f"min(max(({expr}),0),W-w-5)"
+
+    def _clamp_y(expr):
+        return f"min(max(({expr}),0),H-h-5)"
+
+    def _amp(v, default):
+        s = str(v if v is not None else "").strip()
+        if not s:
+            return default
+        try:
+            float(s)
+            return s
+        except ValueError:
+            return s  # 含 W/H 的表达式，原样使用
+
+    if mode == "h":
+        # 左右往返：x 从最左到最右（0 → W-w，水印右边缘贴到 W），y 保持基准（控制上边距）。
+        # 无幅度参数，运动速度由周期自动计算。
+        tria = f"(1-2*abs(mod(t,{T:.4f})/{T:.4f}-0.5))"
+        return _clamp_x(f"(W-w)*{tria}"), _clamp_y(f"({y0})")
+
+    if mode == "v":
+        # 上下往返：y 从最上到最下（0 → H-h，水印下边缘贴到 H），x 保持基准（控制左边距）。
+        tria = f"(1-2*abs(mod(t,{T:.4f})/{T:.4f}-0.5))"
+        return _clamp_x(f"({x0})"), _clamp_y(f"(H-h)*{tria}")
+
+    if mode == "diamond":
+        # 歪菱形循环：4 顶点取自轨迹编辑器的 5x5 网格（label = 行+1, 列+1，范围 1..5）：
+        #   (4,1) → (1,2) → (2,5) → (5,4)
+        # 网格映射：x = 10+(W-w-20)*c/4，y = 10+(H-h-20)*r/4（c=列-1, r=行-1）。
+        # 顶点（r, c）：
+        #   V0 (4,1): r=3 c=0  V1 (1,2): r=0 c=1  V2 (2,5): r=1 c=4  V3 (5,4): r=4 c=3
+        # 匀速：各段用时与边长成正比（速度 = 周长/周期 恒定），消除短边慢长边快。
+        # 用 eval 的 st/ld 变量槽存储边长/周长/段进度，避免 hypot 重复展开导致表达式膨胀。
+        def _X(c):
+            return {0: "10", 1: "10+(W-w-20)*0.25",
+                    3: "10+(W-w-20)*0.75", 4: "10+(W-w-20)"}[c]
+        def _Y(r):
+            return {0: "10", 1: "10+(H-h-20)*0.25",
+                    3: "10+(H-h-20)*0.75", 4: "10+(H-h-20)"}[r]
+        vx = [_X(0), _X(1), _X(4), _X(3)]  # V0..V3 的 x
+        vy = [_Y(3), _Y(0), _Y(1), _Y(4)]  # V0..V3 的 y
+        # st(0..3) = 各边长；st(4) = 周长；st(5..8) = 各段进度 frac
+        prefix = []
+        for i in range(4):
+            j = (i + 1) % 4
+            prefix.append(f"st({i},hypot(({vx[j]})-({vx[i]}),({vy[j]})-({vy[i]})))")
+        prefix.append("st(4,ld(0)+ld(1)+ld(2)+ld(3))")
+        tp = f"mod(t,{T:.4f})"
+        acc = ""
+        for i in range(4):
+            num = f"(({tp})*ld(4)/({T:.4f})"
+            if acc:
+                num += "-(" + acc + ")"
+            num += f")/ld({i})"
+            # 不钳制 frac：边界处轻微越界（≤1e-6 级，位置偏移 <0.001px 不可见），
+            # 由下方 1e-6 容差段判断保证任意时刻恰好一段选中（无突变/无重叠）。
+            prefix.append(f"st({5 + i},{num})")
+            acc = acc + "+" + f"ld({i})" if acc else f"ld({i})"
+        pre = ";".join(prefix) + ";"
+        # 段判断：1e-6 容差消除边界处浮点误差导致的「全段不匹配→位置突变 0」。
+        # 相邻段容差区间在边界处恰好首尾相接（前段 frac 超 1 的越界量 ≈ 后段 frac 的 ε 级），
+        # 任意时刻恰好选中一段，位置连续。
+        segs = [
+            f"lte(ld(5),1+1e-6)",
+            f"(gt(ld(6),1e-6)*lte(ld(6),1+1e-6))",
+            f"(gt(ld(7),1e-6)*lte(ld(7),1+1e-6))",
+            f"gt(ld(8),1e-6)",
+        ]
+        x_parts = []
+        y_parts = []
+        for i in range(4):
+            j = (i + 1) % 4
+            x_parts.append(f"{segs[i]}*(({vx[i]})+(({vx[j]})-({vx[i]}))*ld({5 + i}))")
+            y_parts.append(f"{segs[i]}*(({vy[i]})+(({vy[j]})-({vy[i]}))*ld({5 + i}))")
+        return _clamp_x(pre + "+".join(x_parts)), _clamp_y(pre + "+".join(y_parts))
+
+    if mode == "corners":
+        # 四角跳跃：屏幕四角内缩 margin，每点停留 dwell 秒后瞬移下一角。
+        # 角0 左上 角1 右上 角2 右下 角3 左下（忽略基准 x0/y0）。
+        try:
+            D = float(ms.get("move_dwell", 2.0) or 2.0)
+        except (ValueError, TypeError):
+            D = 2.0
+        if D <= 0:
+            D = 2.0
+        M = _amp(ms.get("move_margin"), "W*0.03")
+        period = 4.0 * D
+        p = f"mod(t,{period:.4f})"
+        s0 = f"(lt({p},{D:.4f}))"
+        s1 = f"(gte({p},{D:.4f})*lt({p},{2*D:.4f}))"
+        s2 = f"(gte({p},{2*D:.4f})*lt({p},{3*D:.4f}))"
+        s3 = f"(gte({p},{3*D:.4f}))"
+        m = f"({M})"
+        # 角坐标（含边距，钳制到画布内）
+        x_l = f"({m})"
+        x_r = f"(W-w-({m}))"
+        y_t = f"({m})"
+        y_b = f"(H-h-({m}))"
+        x = f"{s0}*{x_l}+{s1}*{x_r}+{s2}*{x_r}+{s3}*{x_l}"
+        y = f"{s0}*{y_t}+{s1}*{y_t}+{s2}*{y_b}+{s3}*{y_b}"
+        return _clamp_x(x), _clamp_y(y)
+
+    return None, None
+
+
 def _majority_audio_params(params):
     """逐维度众数：采样率、声道数、采样格式分别取出现最多的值（≥3 段跟随多数轨）。"""
     from collections import Counter
@@ -5246,6 +5375,139 @@ class OverlayPositionFrame(ttk.LabelFrame):
                 "注意：水印本身不宜过大，旋转包围盒为对角线尺寸，过大会被主画面边缘裁切。"),
                 wraplength=420)
 
+        # ---- 轨迹控制（动态水印：位置随时间循环移动） ----
+        # move 字段独立持久化；命令生成时由 build_move_xy_expr 生成 x/y 表达式，
+        # 不覆盖用户设置的 overlay_x/overlay_y 基准。
+        self.move_mode = tk.StringVar(value="")          # "" / h / v / diamond / corners
+        self.move_cycle = tk.DoubleVar(value=4.0)        # 周期（秒，往返/菱形）
+        self.move_amp = tk.StringVar(value="W*0.1")     # 幅度/尺寸（保留兼容，UI 不再编辑）
+        self.move_dwell = tk.DoubleVar(value=2.0)        # 四角跳跃每点停留（秒）
+        self.move_margin = tk.StringVar(value="W*0.03") # 四角跳跃边距（像素或相对式）
+        ttk.Button(spin_frame, text=_("轨迹控制..."), command=self._open_trajectory_dialog
+                   ).pack(side=tk.LEFT, padx=(16, 0))
+
+    def _open_trajectory_dialog(self):
+        """轨迹控制弹窗：预设动效 + 参数（先隐藏窗口，center_window 自动居中显示）。"""
+        win = tk.Toplevel(self)
+        win.title(_("轨迹控制"))
+        win.withdraw()  # 先隐藏，避免左上角闪烁
+        try:
+            win.transient(self.winfo_toplevel())
+            win.grab_set()
+            # 注意：不要设置 -topmost——ToolTip 的悬浮窗未设 topmost，
+            # 父窗置顶会把 tooltip 压到最底层（鼠标悬停看不到提示）。
+        except Exception:
+            pass
+
+        # 预设下拉（显示/值分离）
+        MODES = [
+            ("", _("无（静态定位）")),
+            ("h", _("左右往返")),
+            ("v", _("上下往返")),
+            ("diamond", _("歪菱形循环")),
+            ("corners", _("四角跳跃")),
+        ]
+        mode_disp = tk.StringVar()
+        mode_val = tk.StringVar(value=self.move_mode.get())
+        for _v, _d in MODES:
+            if _v == mode_val.get():
+                mode_disp.set(_d)
+                break
+        if not mode_disp.get():
+            mode_disp.set(MODES[0][1])
+            mode_val.set("")
+
+        frm = ttk.Frame(win, padding="10")
+        frm.pack(fill=tk.BOTH, expand=True)
+        frm.grid_columnconfigure(0, weight=1)
+        row0 = ttk.Frame(frm)
+        row0.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Label(row0, text=_("运动轨迹:")).pack(side=tk.LEFT)
+        cb = ttk.Combobox(row0, textvariable=mode_disp, values=[d for _v, d in MODES],
+                          state="readonly", width=18)
+        cb.pack(side=tk.LEFT, padx=6)
+
+        # 参数区 1：周期（往返/菱形）—— grid row=1（与参数区 2 同一格，切换显示）
+        p1 = ttk.Frame(frm)
+        p1.grid(row=1, column=0, sticky="ew", pady=3)
+        ttk.Label(p1, text=_("周期(秒):")).pack(side=tk.LEFT)
+        cyc_var = tk.DoubleVar(value=self.move_cycle.get())
+        cyc_sb = ttk.Spinbox(p1, from_=0.5, to=600, increment=0.5, width=7,
+                             textvariable=cyc_var)
+        cyc_sb.pack(side=tk.LEFT, padx=(2, 14))
+        ToolTip(cyc_sb,
+                _("这里的周期管的是速度：周期越短，水印移动越快。\n"
+                "往返 = 单程来回一次的时间；菱形 = 走完一圈的时间；\n"
+                "四角跳跃不受此周期影响（用下方「每点停留」控制）。\n"
+                "往返无需幅度参数：左右往返自动横跨整个画面宽度（0→W），\n"
+                "上下往返自动纵跨整个画面高度（0→H）。"),
+                wraplength=340)
+
+        # 参数区 2：停留 + 边距（四角跳跃）
+        p2 = ttk.Frame(frm)
+        p2.grid(row=1, column=0, sticky="ew", pady=3)
+        ttk.Label(p2, text=_("每点停留(秒):")).pack(side=tk.LEFT)
+        dwell_var = tk.DoubleVar(value=self.move_dwell.get())
+        ttk.Spinbox(p2, from_=0.2, to=600, increment=0.2, width=7,
+                    textvariable=dwell_var).pack(side=tk.LEFT, padx=(2, 14))
+        ttk.Label(p2, text=_("边距:")).pack(side=tk.LEFT)
+        margin_var = tk.StringVar(value=self.move_margin.get())
+        margin_entry = ttk.Entry(p2, textvariable=margin_var, width=10)
+        margin_entry.pack(side=tk.LEFT, padx=2)
+        ToolTip(margin_entry,
+                _("四角跳跃时水印离屏幕边缘的距离。\n"
+                "可填像素数（如 20）或相对式（如 W*0.03 = 主画面宽度 3%）。"),
+                wraplength=320)
+
+        # 提示行（固定 row=2，切换时只改文本，不增删控件）
+        tip_label = ttk.Label(frm, text="", foreground="gray")
+        tip_label.grid(row=2, column=0, sticky="ew", pady=(0, 4))
+
+        def _sync_params(*_a):
+            for _v, _d in MODES:
+                if _d == mode_disp.get():
+                    mode_val.set(_v)
+                    break
+            is_corner = (mode_val.get() == "corners")
+            # grid 切换：同一格 row=1 显隐互斥，不改变其他控件行位置
+            if is_corner:
+                p1.grid_remove()
+                p2.grid()
+                tip_label.config(text=_("（四角跳跃忽略上方设置的位置坐标，自动贴屏幕四角）"))
+            else:
+                p2.grid_remove()
+                p1.grid()
+                tip_label.config(text="")
+        cb.bind("<<ComboboxSelected>>", _sync_params)
+        _sync_params()
+
+        # 底部按钮（固定 row=3，按钮水平居中）
+        def _apply():
+            self.move_mode.set(mode_val.get())
+            try:
+                self.move_cycle.set(float(cyc_var.get()))
+            except (ValueError, TypeError):
+                pass
+            try:
+                self.move_dwell.set(float(dwell_var.get()))
+            except (ValueError, TypeError):
+                pass
+            self.move_margin.set(margin_var.get().strip() or "W*0.03")
+            win.destroy()
+
+        btn_row = ttk.Frame(frm)
+        btn_row.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        # 按钮水平居中（column 0/2 weight=1 撑开，两按钮放 column 1）
+        # UI 布局约定：确定 column=0 sticky=e、取消 column=1 sticky=w（用户指定，勿改）
+        btn_row.grid_columnconfigure(0, weight=1)
+        btn_row.grid_columnconfigure(2, weight=1)
+        ttk.Button(btn_row, text=_("确定"), command=_apply, width=8
+                   ).grid(row=0, column=0, sticky="e", padx=(0, 3))
+        ttk.Button(btn_row, text=_("取消"), command=win.destroy, width=8
+                   ).grid(row=0, column=1, sticky="w", padx=(3, 0))
+
+        center_window(win, 400, 250)
+
     def _create_main_controls(self):
         """主视频画布偏移控件 - 左右分栏（左侧偏移设置，右侧快捷操作）"""
         # 主容器：水平分割
@@ -5681,6 +5943,11 @@ class OverlayPositionFrame(ttk.LabelFrame):
                 "overlay_free_layout": self.overlay_free_layout.get(),
                 "spin_enabled": self.spin_enabled.get(),
                 "spin_speed": float(self.spin_speed.get()) if hasattr(self, "spin_speed") else 60.0,
+                "move_mode": self.move_mode.get(),
+                "move_cycle": self.move_cycle.get() if hasattr(self, "move_cycle") else 4.0,
+                "move_amp": self.move_amp.get().strip() if hasattr(self, "move_amp") else "W*0.1",
+                "move_dwell": self.move_dwell.get() if hasattr(self, "move_dwell") else 2.0,
+                "move_margin": self.move_margin.get().strip() if hasattr(self, "move_margin") else "W*0.03",
             }
         else:
             return {
@@ -5705,6 +5972,22 @@ class OverlayPositionFrame(ttk.LabelFrame):
                 self.spin_speed.set(float(settings.get("spin_speed", 60.0)))
             except (ValueError, TypeError):
                 self.spin_speed.set(60.0)
+            if hasattr(self, "move_mode"):
+                self.move_mode.set(settings.get("move_mode", ""))
+            if hasattr(self, "move_cycle"):
+                try:
+                    self.move_cycle.set(float(settings.get("move_cycle", 4.0)))
+                except (ValueError, TypeError):
+                    self.move_cycle.set(4.0)
+            if hasattr(self, "move_amp"):
+                self.move_amp.set(str(settings.get("move_amp", "W*0.1")).strip() or "W*0.1")
+            if hasattr(self, "move_dwell"):
+                try:
+                    self.move_dwell.set(float(settings.get("move_dwell", 2.0)))
+                except (ValueError, TypeError):
+                    self.move_dwell.set(2.0)
+            if hasattr(self, "move_margin"):
+                self.move_margin.set(str(settings.get("move_margin", "W*0.03")).strip() or "W*0.03")
 
         else:
             self.pad_enabled.set(settings.get("pad_enabled", False))
@@ -8451,15 +8734,26 @@ class FFmpegBatchGUI:
                 x = sub_settings.get('overlay_x', '0').strip() or '0'
                 y = sub_settings.get('overlay_y', '0').strip() or '0'
                 if blend_mode == 'normal':
+                    # 动态水印（轨迹控制）：move_mode 非空时用动效表达式替换 x/y。
+                    # 基准 overlay_x/overlay_y 保留不变（独立字段，可随时改回）。
+                    _mv = (sub_settings.get('move_mode', '') or '').strip()
+                    if _mv:
+                        _mx, _my = build_move_xy_expr(_mv, x, y, sub_settings)
+                        if _mx is not None:
+                            x, y = _mx, _my
                     duration = self._get_media_duration(sub_file)
                     enable_expr = self._calc_enable_expr(sub_settings, duration)
-                    overlay_filter = f"overlay={x}:{y}:enable='{enable_expr}'"
+                    # x/y 用引号包裹：动效表达式含逗号（mod/min/max），不包会被 filtergraph 当滤镜分隔符
+                    overlay_filter = f"overlay=x='{x}':y='{y}':enable='{enable_expr}'"
                     filter_parts.append(f"[{current_v}][{current_sub}]{overlay_filter}[v_out_{i}]")
                     current_v = f"v_out_{i}"
                 else:
                     # 混合模式：仅在子视频所在矩形「局部区域」内做 blend，再贴回原位置。
                     # 这样每种效果只作用于各自的子视频框内，不会铺满全屏；
                     # 也避免了把整张主视频转 RGBA 再转回带来的全屏发绿问题。
+                    _mv = (sub_settings.get('move_mode', '') or '').strip()
+                    if _mv:
+                        self._append_info_ui(_("[轨迹控制] 混合模式不支持动态轨迹，已使用基准位置"))
                     mw, mh = self._compute_output_canvas(main_settings, main_file_path)
                     sw, sh = self._overlay_sub_size(sub_file, sub_settings)
                     ctx = {"W": mw, "H": mh, "w": sw, "h": sh}
