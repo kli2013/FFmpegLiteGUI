@@ -489,6 +489,35 @@ def time_to_seconds(timestr: str) -> Optional[float]:
         return None
 
 
+def _ppm_dimensions_from_bytes(data):
+        """从 PPM (P6) 头部解析宽高：'P6' 后读两个数字 token（跳过注释/空白），无依赖。"""
+        try:
+            tokens = []
+            i = 2  # 跳过 'P6'
+            n = len(data)
+            while len(tokens) < 2 and i < n:
+                while i < n and data[i:i+1] in (b' ', b'\t', b'\n', b'\r'):
+                    i += 1
+                if i >= n:
+                    break
+                if data[i:i+1] == b'#':
+                    while i < n and data[i:i+1] != b'\n':
+                        i += 1
+                    continue
+                start = i
+                while i < n and data[i:i+1].isdigit():
+                    i += 1
+                if i > start:
+                    tokens.append(int(data[start:i]))
+                else:
+                    i += 1
+            if len(tokens) >= 2:
+                return tokens[0], tokens[1]
+            return None, None
+        except Exception:
+            return None, None
+
+
 def _channel_layout_name(ch):
     """把声道数映射为 ffmpeg aformat 可识别的声道布局名；无法映射时返回 None。"""
     return {1: "mono", 2: "stereo", 4: "quad", 5: "5.0", 6: "5.1", 7: "6.1", 8: "7.1"}.get(ch)
@@ -2638,16 +2667,16 @@ class VideoFilterFrame(ttk.LabelFrame):
         self.scale_width.set(h)
         self.scale_height.set(w)
 
-    def extract_video_frame_scaled(self, input_file, output_png_path, frame_sec=0.0,
-                                    target_width=None, target_height=None):
+    def extract_video_frame_scaled(self, input_file, frame_sec=0.0,
+                                   target_width=None, target_height=None):
         """
-        使用 FFmpeg 提取视频帧，并缩放到目标尺寸，输出为 PNG。
+        使用 FFmpeg 提取视频帧并缩放到目标尺寸，输出 PPM bytes（内存管道，零磁盘写）。
         若 target_width 或 target_height 为 None，则保持原始比例（自动计算）。
-        返回 (实际宽度, 实际高度) 或 (None, None) 若失败。
+        返回 (实际宽度, 实际高度, PPM_bytes) 或 (None, None, None) 若失败。
         """
         if not self.app.ffmpeg_cmd:
-            return None, None
-    
+            return None, None, None
+
         # 构建 scale 滤镜
         scale_filter = ""
         if target_width is not None and target_height is not None:
@@ -2657,68 +2686,35 @@ class VideoFilterFrame(ttk.LabelFrame):
         elif target_height is not None:
             scale_filter = f"scale=-2:{target_height}"
         # 若两者都为 None，则不加 scale（输出原始尺寸）
-    
+
         cmd = [
             self.app.ffmpeg_cmd,
             "-ss", str(frame_sec),
             "-i", input_file,
             "-vframes", "1",
             "-f", "image2pipe",
-            "-vcodec", "png",
-            "-y",
-            output_png_path
+            "-vcodec", "ppm",
         ]
         # 如果 scale_filter 非空，插入 -vf 参数（放在 -i 之后，-vframes 之前）
         if scale_filter:
-            # 找到 -vframes 的位置并插入
             vframes_idx = cmd.index("-vframes")
             cmd.insert(vframes_idx, "-vf")
             cmd.insert(vframes_idx + 1, scale_filter)
-    
+        cmd += ["pipe:1"]
+
         try:
             flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-            subprocess.run(cmd, check=True, capture_output=True, creationflags=flags, timeout=10)
-
-#             if os.path.exists(output_png_path):
-#                 size_kb = os.path.getsize(output_png_path) / 1024
-#                 self.app._append_info_ui(f"[裁剪] PNG临时文件大小: {size_kb:.1f} KB")
-            # 读取 PNG 获取尺寸（使用内置函数解析头）
-            w, h = self._get_png_dimensions(output_png_path)
-            return w, h
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, creationflags=flags)
+            data = proc.stdout.read()
+            proc.wait(timeout=10)
+            if proc.returncode != 0 or not data:
+                return None, None, None
+            w, h = _ppm_dimensions_from_bytes(data)
+            return w, h, data
         except Exception as e:
             self.app._append_info_ui(f"[裁剪辅助] 提取缩放帧失败: {e}")
-            return None, None
-    
-    
-    def _get_png_dimensions(self, png_path):
-        """读取 PNG 文件头获取宽高（无依赖）"""
-        import struct
-        try:
-            with open(png_path, 'rb') as f:
-                # 检查 PNG 签名
-                if f.read(8) != b'\x89PNG\r\n\x1a\n':
-                    return None, None
-                # 寻找 IHDR 块
-                while True:
-                    length_data = f.read(4)
-                    if len(length_data) < 4:
-                        break
-                    length = struct.unpack('>I', length_data)[0]
-                    chunk_type = f.read(4)
-                    if chunk_type == b'IHDR':
-                        data = f.read(length)
-                        if len(data) >= 8:
-                            width, height = struct.unpack('>II', data[:8])
-                            return width, height
-                        else:
-                            return None, None
-                    else:
-                        # 跳过数据 + CRC
-                        f.seek(length + 4, os.SEEK_CUR)
-                return None, None
-        except Exception:
-            return None, None
-
+            return None, None, None
 
 
     def set_track(self, track):
@@ -2993,15 +2989,11 @@ class VideoFilterFrame(ttk.LabelFrame):
         img_w, img_h = disp_w, disp_h   # 图像实际尺寸（通常与 disp 一致）
     
         # ----- 临时文件管理 -----
-        temp_file_info = {"path": None}
+        temp_file_info = {"data": None}  # 内存 PPM bytes（零磁盘写，无需清理文件）
     
         def cleanup_temp_file():
-            if temp_file_info["path"] and os.path.exists(temp_file_info["path"]):
-                try:
-                    os.unlink(temp_file_info["path"])
-                except Exception:
-                    pass
-                temp_file_info["path"] = None
+            # 内存模式无临时文件可清理
+            temp_file_info["data"] = None
     
         # ----- 窗口布局 -----
         canvas_w = disp_w + PADDING * 2
@@ -3038,6 +3030,11 @@ class VideoFilterFrame(ttk.LabelFrame):
                                highlightthickness=0)
             canvas.pack(fill=tk.BOTH, expand=True)
             canvas.config(scrollregion=(0, 0, canvas_w, canvas_h))
+            # 加载占位提示：帧提取完成前先显示（消除灰白占位的空白感）
+            loading_text = canvas.create_text(
+                canvas_w // 2, canvas_h // 2,
+                text="正在加载画面…", fill="#666666", font=("Arial", 12)
+            )
     
             # ----- 坐标转换函数 -----
             def canvas_to_display(cx, cy):
@@ -3318,83 +3315,39 @@ class VideoFilterFrame(ttk.LabelFrame):
             
                 # 定义提取线程
                 def extract_thread():
-                    fd_new, new_png = tempfile.mkstemp(suffix='.png', prefix='ffgui_crop_')
-                    os.close(fd_new)
-            
-                    # 如果取消标志被设置，则清理并返回
+                    # 如果取消标志被设置，则返回
                     if self._crop_cancel_event.is_set():
-                        if os.path.exists(new_png):
-                            os.unlink(new_png)
                         return
-            
                     try:
-                        w, h = self.extract_video_frame_scaled(
-                            input_file, new_png,
+                        w, h, data = self.extract_video_frame_scaled(
+                            input_file,
                             frame_sec=sec,
                             target_width=disp_w,
                             target_height=disp_h
                         )
                         # 再次检查取消标志
                         if self._crop_cancel_event.is_set():
-                            if os.path.exists(new_png):
-                                os.unlink(new_png)
                             return
-            
                         if w is None or h is None:
-                            if os.path.exists(new_png):
-                                os.unlink(new_png)
                             self.app.root.after(0, lambda: on_extract_failed("提取帧失败，请检查文件是否支持"))
                             return
-                        self.app.root.after(0, lambda: on_extract_success(new_png, w, h))
+                        self.app.root.after(0, lambda: on_extract_success(data, w, h))
                     except Exception as e:
-                        if os.path.exists(new_png):
-                            os.unlink(new_png)
-                        self.app.root.after(0, lambda e=e: on_extract_failed(f"提取异常: {e}"))
-            
-                # 启动新线程
+                        self.app.root.after(0, lambda: on_extract_failed(f"提取异常: {e}"))
                 self._crop_extract_thread = threading.Thread(target=extract_thread, daemon=True)
                 self._crop_extract_thread.start()
     
-                def on_extract_success(new_scaled_path, new_orig_w, new_orig_h):
+                def on_extract_success(new_data, new_orig_w, new_orig_h):
                     nonlocal img, scaled_temp_path, img_w, img_h
                     nonlocal points, rect_id, drag_start_display, drag_rect_id
                     try:
-                        new_img = tk.PhotoImage(file=new_scaled_path)
+                        new_img = tk.PhotoImage(data=new_data)
                     except Exception as e:
-                        # 加载失败，删除临时文件
-                        if os.path.exists(new_scaled_path):
-                            os.unlink(new_scaled_path)
                         on_extract_failed(f"加载缩放后的图像失败: {e}")
                         return
-    
-                    # 删除旧临时文件
-                    if temp_file_info["path"] and os.path.exists(temp_file_info["path"]):
-                        try:
-                            os.unlink(temp_file_info["path"])
-                        except Exception:
-                            pass
-                    temp_file_info["path"] = new_scaled_path  # 保存新路径
-    
-                    # 更新图像
-                    canvas.delete("bg_img")
-                    canvas.create_image(PADDING, PADDING, anchor=tk.NW, image=new_img, tags="bg_img")
-                    canvas.image = new_img
-                    img = new_img
-    
-                    # 重置选择状态
-                    if rect_id:
-                        canvas.delete(rect_id)
-                        rect_id = None
-                    if drag_rect_id:
-                        canvas.delete(drag_rect_id)
-                        drag_rect_id = None
-                    points = []
-                    drag_start_display = None
-                    update_info()
-                    info_var.set(f"✅ 已更新画面 (时间: {current_time:.2f}s) 请重新拖拽裁剪")
-                    self.app._append_info_ui(f"[裁剪] 跳转到 {current_time:.2f}s，原始尺寸 {orig_w}x{orig_h}，显示尺寸 {disp_w}x{disp_h}")
-                    refresh_btn.config(state=tk.NORMAL, text="重新获取画面")
-    
+
+                    # 内存模式无临时文件，仅保存数据供后续清理逻辑兼容
+                    temp_file_info["data"] = new_data
                 def on_extract_failed(err_msg):
                     # 清理可能残留的临时文件
                     cleanup_temp_file()
@@ -3490,35 +3443,33 @@ class VideoFilterFrame(ttk.LabelFrame):
     
             # ----- 初始加载图像 -----
             def initial_load():
-                fd, png_path = tempfile.mkstemp(suffix='.png', prefix='ffgui_crop_')
-                os.close(fd)
                 try:
-                    w, h = self.extract_video_frame_scaled(
-                        input_file, png_path,
+                    w, h, data = self.extract_video_frame_scaled(
+                        input_file,
                         frame_sec=initial_time,
                         target_width=disp_w,
                         target_height=disp_h
                     )
                     if w is None or h is None:
-                        # 失败，删除临时文件
-                        if os.path.exists(png_path):
-                            os.unlink(png_path)
                         messagebox.showerror("错误", "无法提取初始帧")
                         win.destroy()
                         return
-                    # 加载图像
-                    img_obj = tk.PhotoImage(file=png_path)
+                    # 加载图像（内存 bytes）
+                    img_obj = tk.PhotoImage(data=data)
+                    canvas.delete(loading_text)  # 清除占位提示
                     canvas.create_image(PADDING, PADDING, anchor=tk.NW, image=img_obj, tags="bg_img")
                     canvas.image = img_obj
                     nonlocal img, scaled_temp_path
                     img = img_obj
-                    temp_file_info["path"] = png_path  # 保存路径以便清理
+                    temp_file_info["data"] = data
                 except Exception as e:
-                    if os.path.exists(png_path):
-                        os.unlink(png_path)
+                    try:
+                        canvas.delete(loading_text)
+                    except Exception:
+                        pass
                     messagebox.showerror("错误", f"加载初始帧失败: {e}")
                     win.destroy()
-    
+
             # 调用初始加载
             initial_load()
     
@@ -16514,11 +16465,42 @@ class FFmpegBatchGUI:
             map_label = "[v_snap]"
         return complex_filter, map_label
 
+    def _ffmpeg_ppm_to_bytes(self, cmd, out_png):
+        """跑 ffmpeg 输出单帧 PPM 到 stdout 管道（零磁盘写、零压缩最快），返回 bytes；失败返回 None。
+        cmd 末尾为 '... -vframes/-frames:v 1 -update 1 <out_png>'，内部把输出重写为
+        '-f image2pipe -vcodec ppm pipe:1'。PPM 无压缩（编码≈内存拷贝），Tk PhotoImage 原生支持其 data。
+        单帧输出，read() 读到 EOF 返回，无管道死锁。"""
+        pipe_cmd = []
+        i = 0
+        n = len(cmd)
+        while i < n:
+            arg = cmd[i]
+            if arg == out_png:
+                i += 1
+                continue
+            if arg in ("-update",):
+                i += 2  # 跳过 -update 及其值（image2 单帧写文件选项，管道下不需要）
+                continue
+            pipe_cmd.append(arg)
+            i += 1
+        pipe_cmd += ["-f", "image2pipe", "-vcodec", "ppm", "pipe:1"]
+        try:
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            proc = subprocess.Popen(pipe_cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, creationflags=flags)
+            data = proc.stdout.read()
+            proc.wait(timeout=30)
+            if proc.returncode != 0 or not data:
+                return None
+            return data
+        except Exception:
+            return None
+
     def _show_snapshot_async(self, cmd, out_png, win_key, title, running_text, display_cb,
                              save_dir=None, save_name=""):
         """通用快照入口：构造命令 → 开/复用独立窗口（先显示'生成中'）→ 线程生成后回填。
         win_key 区分不同快照窗口（如 'pip' / 'wm' / 'sheet'），窗口属性存于 self._snap_ui[win_key]。
-        display_cb(out_png) 在主线程执行，用于把 PNG 显示回窗口。
+        display_cb(img_bytes) 在主线程执行，用于把图像显示回窗口（内存管道，零磁盘写）。
         save_dir 非 None 时窗口加「保存到…/一键保存」按钮；save_name 为一键保存的默认文件名（不含扩展名）。"""
         if not self.ffmpeg_cmd:
             return
@@ -16536,17 +16518,17 @@ class FFmpegBatchGUI:
         ui["label"].config(image="", text="生成中…")
         # 生成完成前先隐藏窗口（避免左上角闪「生成中…」小窗），出图/失败后再显示
         ui["win"].withdraw()
-        # 保存按钮（save_dir 非 None 时提供）
+        # 保存按钮（save_dir 非 None 时提供）；PNG 数据存内存，保存时才写盘
         ui["save_dir"] = save_dir
         ui["save_name"] = save_name
-        ui["png_path"] = out_png
+        ui["img"] = None  # PhotoImage 对象由 display_cb 设置；保存走 img.write
         if save_dir:
             btn_row = getattr(ui, "_btn_row", None)
             if btn_row is None:
                 btn_row = ttk.Frame(ui["win"])
                 btn_row.pack(padx=6, pady=(0, 6))
-                ttk.Button(btn_row, text="保存到…", command=lambda: self._save_sheet_as(out_png)).pack(side=tk.LEFT, padx=4)
-                ttk.Button(btn_row, text="一键保存", command=lambda: self._save_sheet_to_dir(out_png, save_dir, save_name)).pack(side=tk.LEFT, padx=4)
+                ttk.Button(btn_row, text="保存到…", command=lambda: self._save_sheet_as(ui)).pack(side=tk.LEFT, padx=4)
+                ttk.Button(btn_row, text="一键保存", command=lambda: self._save_sheet_to_dir(ui)).pack(side=tk.LEFT, padx=4)
                 ui["_btn_row"] = btn_row
 
         def _show_win():
@@ -16556,24 +16538,21 @@ class FFmpegBatchGUI:
                 w.lift()
 
         def worker():
-            try:
-                flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               timeout=30, creationflags=flags)
-            except Exception as e:
-                self.root.after(0, lambda: (_show_win(),
-                                             ui["status"].config(text=f"快照生成失败: {e}")))
-                return
-            if os.path.exists(out_png):
-                self.root.after(0, lambda: (_show_win(), display_cb(out_png)))
+            data = self._ffmpeg_ppm_to_bytes(cmd, out_png)
+            if data:
+                def _ok(d=data):
+                    _show_win()
+                    display_cb(d)
+                self.root.after(0, _ok)
             else:
                 self.root.after(0, lambda: (_show_win(),
-                                             ui["status"].config(text="快照生成失败（无输出文件）")))
+                                             ui["status"].config(text="快照生成失败")))
         threading.Thread(target=worker, daemon=True).start()
 
-    def _save_sheet_as(self, png_path):
-        """缩略图「保存到…」：弹出文件对话框选择路径。"""
-        if not os.path.exists(png_path):
+    def _save_sheet_as(self, ui):
+        """缩略图「保存到…」：弹出文件对话框，从内存 PhotoImage 导出 PNG 写盘（仅保存时落盘）。"""
+        img = ui.get("img")
+        if img is None:
             messagebox.showwarning("提示", "缩略图尚未生成")
             return
         default = os.path.join(self.output_dir.get().strip() or tempfile.gettempdir(), "缩略图.png")
@@ -16584,35 +16563,38 @@ class FFmpegBatchGUI:
         if not save_path:
             return
         try:
-            shutil.copy(png_path, save_path)
+            img.write(save_path, format="png")
             self._append_info_ui(f"[缩略图] 已保存到 {save_path}")
         except Exception as e:
             messagebox.showerror("保存失败", str(e))
 
-    def _save_sheet_to_dir(self, png_path, save_dir, save_name):
-        """缩略图「一键保存」：直接保存到输出目录，文件名为 save_name + '_缩略图.png'。"""
-        if not os.path.exists(png_path):
+    def _save_sheet_to_dir(self, ui):
+        """缩略图「一键保存」：直接保存到输出目录（从内存 PhotoImage 导出 PNG），文件名为 save_name + '_缩略图.png'。"""
+        img = ui.get("img")
+        if img is None:
             messagebox.showwarning("提示", "缩略图尚未生成")
             return
+        save_dir = ui.get("save_dir")
+        save_name = ui.get("save_name", "")
         d = save_dir if (save_dir and os.path.isdir(save_dir)) else tempfile.gettempdir()
         fname = (save_name.strip() or "缩略图") + "_缩略图.png"
         target = os.path.join(d, fname)
         try:
-            shutil.copy(png_path, target)
+            img.write(target, format="png")
             self._append_info_ui(f"[缩略图] 已一键保存到 {target}")
         except Exception as e:
             messagebox.showerror("保存失败", str(e))
 
-    def _display_snapshot(self, png_path, win_key):
-        """把生成的 PNG 显示到指定密钥的快照窗口（主线程执行）。"""
+    def _display_snapshot(self, img_bytes, win_key):
+        """把生成的图像（内存 PPM bytes）显示到指定密钥的快照窗口（主线程执行）。"""
         ui = getattr(self, "_snap_ui", {}).get(win_key)
         if ui is None or not ui["win"].winfo_exists():
             return
         try:
-            img = tk.PhotoImage(file=png_path)
+            img = tk.PhotoImage(data=img_bytes)
             ui["img"] = img  # 保活，防止被 GC（引用挂在窗口 ui 上）
             ui["label"].config(image=img, text="")
-            ui["status"].config(text=f"快照已生成: {os.path.basename(png_path)}")
+            ui["status"].config(text="快照已生成")
             # 居中窗口，确保整张图（含状态栏）完整可见，不溢出屏幕下方
             try:
                 center_window(ui["win"], img.width() + 12, img.height() + 36)
@@ -16683,8 +16665,8 @@ class FFmpegBatchGUI:
         title = f"画中画合成快照 · 子视频{len(sub_videos)}个 · 模式: {'/'.join(modes)}"
         self._show_snapshot_async(cmd, out_png, "pip", title, "正在生成合成快照…", self._display_pip_snapshot)
 
-    def _display_pip_snapshot(self, png_path):
-        self._display_snapshot(png_path, "pip")
+    def _display_pip_snapshot(self, img_bytes):
+        self._display_snapshot(img_bytes, "pip")
 
     # ---------- 画中画 / 串行 主视频的「模拟生成后文件」缩略图 ----------
     def _build_pip_contact_sheet_cmd(self, track, sub_videos):
@@ -16724,17 +16706,21 @@ class FFmpegBatchGUI:
         return cmd, out_png
 
     def _show_pip_contact_sheet_async(self, track, sub_videos):
+        """画中画主视频缩略图：seek 分段抽帧（只解码 8 帧，8K 秒出）+ 子视频合成（与成片一致）。"""
         try:
-            cmd, out_png = self._build_pip_contact_sheet_cmd(track, sub_videos)
+            input_files, file_index = self._prepare_tracks_and_inputs([track] + list(sub_videos))
         except Exception as e:
             self._append_info_ui(f"[缩略图] 画中画合成缩略图命令构建失败: {e}")
             return
-        save_dir = self.output_dir.get().strip() or ""
-        save_name = os.path.splitext(os.path.basename(track.file_path))[0]
-        self._show_snapshot_async(cmd, out_png, "sheet",
-                                  f"缩略图（画中画合成） · {os.path.basename(track.file_path)}",
-                                  "正在生成缩略图…", self._display_contact_sheet,
-                                  save_dir=save_dir, save_name=save_name)
+        sub_infos = []
+        for sv in sub_videos:
+            sv_settings = sv.enc_settings.copy()
+            if sv_settings.get("encoder") == "copy":
+                sv_settings["encoder"] = "libx265"
+            sub_infos.append((file_index[sv.file_path], sv.file_path, sv_settings))
+        title = f"缩略图（画中画合成） · {os.path.basename(track.file_path)}"
+        self._show_seek_sheet_async(track.file_path, track.enc_settings, sub_infos,
+                                    title, "正在生成缩略图…")
 
     def _build_concat_contact_sheet_cmd(self, video_tracks):
         """串行合并主视频缩略图：复用 _build_concat_video_graph 生成视频 filter_complex
@@ -16756,17 +16742,85 @@ class FFmpegBatchGUI:
         return cmd, out_png
 
     def _show_concat_contact_sheet_async(self, video_tracks):
-        try:
-            cmd, out_png = self._build_concat_contact_sheet_cmd(video_tracks)
-        except Exception as e:
-            self._append_info_ui(f"[缩略图] 串行合成缩略图命令构建失败: {e}")
+        """串行缩略图：按段抽帧——对每段文件单独 -ss seek（绕开 concat 输出 seek 无效）。
+        段多间隔取（均匀选 8 段各 1 帧）、段少重复取（每段至少 1 帧，剩余均分，段内取点），
+        凑满 4x2 网格；纯内存拼图零磁盘写。"""
+        if not self.ffmpeg_cmd:
             return
-        save_dir = self.output_dir.get().strip() or ""
-        save_name = os.path.splitext(os.path.basename(video_tracks[0].file_path))[0]
-        self._show_snapshot_async(cmd, out_png, "sheet",
-                                  f"缩略图（串行拼接） · {len(video_tracks)} 段",
-                                  "正在生成缩略图…", self._display_contact_sheet,
-                                  save_dir=save_dir, save_name=save_name)
+        if not hasattr(self, "_snap_ui"):
+            self._snap_ui = {}
+        ui = self._snap_ui.get("sheet")
+        if ui is None or not ui["win"].winfo_exists():
+            win = tk.Toplevel(self.root)
+            ui = {"win": win, "label": ttk.Label(win), "status": ttk.Label(win, text="")}
+            ui["label"].pack(padx=6, pady=6)
+            ui["status"].pack(padx=6, pady=(0, 6))
+            self._snap_ui["sheet"] = ui
+        n = len(video_tracks)
+        ui["win"].title(f"缩略图（串行拼接） · {n} 段")
+        ui["status"].config(text="正在生成缩略图…")
+        ui["label"].config(image="", text="生成中…")
+        ui["win"].withdraw()
+        ui["save_dir"] = self.output_dir.get().strip() or ""
+        ui["save_name"] = os.path.splitext(os.path.basename(video_tracks[0].file_path))[0]
+        ui["img"] = None
+        if ui["save_dir"]:
+            btn_row = getattr(ui, "_btn_row", None)
+            if btn_row is None:
+                btn_row = ttk.Frame(ui["win"])
+                btn_row.pack(padx=6, pady=(0, 6))
+                ttk.Button(btn_row, text="保存到…", command=lambda: self._save_sheet_as(ui)).pack(side=tk.LEFT, padx=4)
+                ttk.Button(btn_row, text="一键保存", command=lambda: self._save_sheet_to_dir(ui)).pack(side=tk.LEFT, padx=4)
+                ui["_btn_row"] = btn_row
+
+        # 各段时长
+        durs = []
+        for t in video_tracks:
+            d = self._get_media_duration(t.file_path) or 0.0
+            durs.append(d)
+
+        # 抽帧计划：(段文件, 段内时间) 列表，凑满 8 帧
+        plans = []
+        if n >= 8:
+            # 间隔取：均匀选 8 段，每段 1 帧（段中点）
+            for i in range(8):
+                idx = round(i * (n - 1) / 7.0) if n > 1 else 0
+                d = durs[idx]
+                plans.append((video_tracks[idx].file_path, d * 0.5 if d > 0 else 0.0))
+        else:
+            # 重复取：每段 base 帧，前 rem 段 +1，段内均分取点
+            base, rem = divmod(8, n)
+            for i in range(n):
+                quota = base + (1 if i < rem else 0)
+                d = durs[i]
+                for k in range(quota):
+                    plans.append((video_tracks[i].file_path,
+                                  d * (k + 0.5) / quota if d > 0 else 0.0))
+
+        def _show_win():
+            w = ui["win"]
+            if w.winfo_exists():
+                w.deiconify()
+                w.lift()
+
+        def worker():
+            frames = []
+            for fp, t in plans:
+                data = self._seek_frame_ppm(fp, [], None, None, t)
+                if data:
+                    frames.append(data)
+            if frames:
+                sheet = self._tile_ppm_4x2(frames)
+                if sheet:
+                    def _ok(s=sheet):
+                        _show_win()
+                        self._display_contact_sheet(s)
+                    self.root.after(0, _ok)
+                    return
+            self.root.after(0, lambda: (_show_win(),
+                                         ui["status"].config(text="缩略图生成失败")))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ---------- 转码页水印合成快照（真实叠加，独立窗口） ----------
     def _build_watermark_snapshot_cmd(self, file_path, settings):
@@ -16834,41 +16888,182 @@ class FFmpegBatchGUI:
             return
         self._show_snapshot_async(cmd, out_png, "wm", title, "正在生成水印快照…", self._display_watermark_snapshot)
 
-    def _display_watermark_snapshot(self, png_path):
-        self._display_snapshot(png_path, "wm")
+    def _display_watermark_snapshot(self, img_bytes):
+        self._display_snapshot(img_bytes, "wm")
 
     # ---------- 缩略图 contact sheet（抽帧拼 4x4 网格单图） ----------
+    def _seek_frame_ppm(self, main_file, sub_infos, complex_filter, final_v_label, t):
+        """seek 到 t 秒抽 1 帧（含子视频合成），scale=320 后 PPM 管道输出（零磁盘写）；失败返回 None。"""
+        cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts", "-ss", f"{t:.3f}", "-i", main_file]
+        for _idx, sub_file, _s in sub_infos:
+            cmd += ["-stream_loop", "-1", "-i", sub_file]
+        if complex_filter:
+            sheet_label = f"{complex_filter};{final_v_label}scale=320:-1[sheet]"
+            cmd += ["-filter_complex", sheet_label, "-map", "[sheet]"]
+        else:
+            cmd += ["-vf", "scale=320:-1"]
+        cmd += ["-frames:v", "1", "-f", "image2pipe", "-vcodec", "ppm", "pipe:1"]
+        try:
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, creationflags=flags)
+            data = proc.stdout.read()
+            proc.wait(timeout=30)
+            if proc.returncode != 0 or not data:
+                return None
+            return data
+        except Exception:
+            return None
+
+    def _tile_ppm_4x2(self, frames, cols=4):
+        """纯内存把多张 PPM 拼成 cols 列网格（行数自适应），缺失格补灰。返回 PPM bytes。
+        各帧需同尺寸（scale=320:-1 同源同比例）；不一致时按第一帧尺寸裁剪/补灰。"""
+        parsed = []
+        for d in frames:
+            w, h = _ppm_dimensions_from_bytes(d)
+            if w and h:
+                parsed.append((w, h, d))
+        if not parsed:
+            return None
+        w, h = parsed[0][0], parsed[0][1]
+        rows = (len(parsed) + cols - 1) // cols
+        out_w = w * cols
+        out_h = h * rows
+        out = bytearray(f"P6\n{out_w} {out_h}\n255\n".encode())
+        gray = bytes([0x80]) * (w * 3)
+        for r in range(rows):
+            for y in range(h):
+                for c in range(cols):
+                    idx = r * cols + c
+                    if idx < len(parsed):
+                        pw, ph, pd = parsed[idx]
+                        try:
+                            head_end = pd.index(b'\n255\n') + 5
+                            sy = min(y, ph - 1) if ph > 0 else 0
+                            row_start = head_end + sy * pw * 3
+                            row = pd[row_start:row_start + pw * 3]
+                            if len(row) < pw * 3:
+                                row = row + gray[len(row):pw * 3]
+                        except Exception:
+                            row = gray
+                    else:
+                        row = gray
+                    out += row
+        return bytes(out)
+
+    def _show_seek_sheet_async(self, main_file, main_settings, sub_infos, title, running_text):
+        """seek 分段抽帧缩略图：8 个时间点（总长/8 均分段中点）各抽 1 帧——只解码 8 帧，
+        8K 素材秒出（对比 fps 抽帧需解码全片 1 分钟+）。有子视频时每帧走合成滤镜（与成片一致）。
+        Python 纯内存拼 4 列网格（缺失格补灰），零磁盘写。"""
+        if not self.ffmpeg_cmd:
+            return
+        if not hasattr(self, "_snap_ui"):
+            self._snap_ui = {}
+        ui = self._snap_ui.get("sheet")
+        if ui is None or not ui["win"].winfo_exists():
+            win = tk.Toplevel(self.root)
+            ui = {"win": win, "label": ttk.Label(win), "status": ttk.Label(win, text="")}
+            ui["label"].pack(padx=6, pady=6)
+            ui["status"].pack(padx=6, pady=(0, 6))
+            self._snap_ui["sheet"] = ui
+        ui["win"].title(title)
+        ui["status"].config(text=running_text)
+        ui["label"].config(image="", text="生成中…")
+        ui["win"].withdraw()
+        ui["save_dir"] = self.output_dir.get().strip() or ""
+        ui["save_name"] = os.path.splitext(os.path.basename(main_file))[0]
+        ui["img"] = None
+        if ui["save_dir"]:
+            btn_row = getattr(ui, "_btn_row", None)
+            if btn_row is None:
+                btn_row = ttk.Frame(ui["win"])
+                btn_row.pack(padx=6, pady=(0, 6))
+                ttk.Button(btn_row, text="保存到…", command=lambda: self._save_sheet_as(ui)).pack(side=tk.LEFT, padx=4)
+                ttk.Button(btn_row, text="一键保存", command=lambda: self._save_sheet_to_dir(ui)).pack(side=tk.LEFT, padx=4)
+                ui["_btn_row"] = btn_row
+
+        dur = self._get_media_duration(main_file) or 0.0
+        # 有子视频时构建合成滤镜（一次，8 点复用）
+        complex_filter = final_v_label = None
+        if sub_infos:
+            try:
+                complex_filter, final_v_label = self._build_overlay_filter_complex(
+                    0, main_settings, sub_infos,
+                    include_subtitle_main=False,
+                    enhance_settings=main_settings.get("enhance", {}),
+                    reverse=False,
+                    main_file_path=main_file
+                )
+            except Exception as e:
+                self._append_info_ui(f"[缩略图] 合成滤镜构建失败，按纯抽帧处理: {e}")
+                sub_infos = []
+                complex_filter = final_v_label = None
+
+        def _show_win():
+            w = ui["win"]
+            if w.winfo_exists():
+                w.deiconify()
+                w.lift()
+
+        def worker():
+            frames = []
+            for i in range(8):
+                if dur > 0:
+                    t = dur * (i + 0.5) / 8.0   # 段中点取帧，避开首尾黑场
+                else:
+                    t = max(i * 10.0, 0.0)
+                data = self._seek_frame_ppm(main_file, sub_infos, complex_filter, final_v_label, t)
+                if data:
+                    frames.append(data)
+            if frames:
+                sheet = self._tile_ppm_4x2(frames)
+                if sheet:
+                    def _ok(s=sheet):
+                        _show_win()
+                        self._display_contact_sheet(s)
+                    self.root.after(0, _ok)
+                    return
+            self.root.after(0, lambda: (_show_win(),
+                                         ui["status"].config(text="缩略图生成失败")))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _show_contact_sheet_async(self, file_path):
-        """生成视频缩略图拼图（contact sheet），复用通用快照窗口显示。"""
+        """生成视频缩略图拼图：seek 分段抽帧（只解码 8 帧，8K 素材秒出）
+        + 当前水印设置合成（统一路径：未启用水印时子视频为空，等价纯抽帧）。"""
         if not file_path or not os.path.exists(file_path):
             self._append_info_ui("[缩略图] 文件不存在")
             return
         if not self.ffmpeg_cmd:
             return
-        # 按时长均分抽约 8 帧（4x2 网格）；拿不到时长按 10 秒间隔兜底
-        dur = self._get_media_duration(file_path) or 0.0
-        if dur <= 0:
-            interval = 10.0
-        else:
-            interval = max(dur / 8.0, 0.5)
-        out_png = os.path.join(tempfile.gettempdir(), "thumb_contact_sheet.png")
-        cmd = [self.ffmpeg_cmd, "-y", "-i", file_path,
-               "-vf", f"fps=1/{interval:.4f},scale=320:-1,tile=4x2",
-               "-frames:v", "1", "-update", "1", out_png]
+        # ---- 统一路径：主视频 + 当前水印设置（启用时）合成 ----
+        wm_settings = copy.deepcopy(getattr(self, "watermark_settings", {}) or {})
+        wm_enabled = wm_settings.get("enabled", False) and (wm_settings.get("file_path", "") or "").strip()
+        wm_file = wm_settings.get("file_path", "").strip() if wm_enabled else None
+        sub_infos = []
+        if wm_file and os.path.exists(wm_file):
+            wm_for_sub = wm_settings.copy()
+            if wm_for_sub.get("encoder") == "copy":
+                wm_for_sub["encoder"] = "libx265"
+            sub_infos.append((1, wm_file, wm_for_sub))
+        # 主视频设置：禁用裁剪/缩放/旋转/截取，画布=原始尺寸，只叠加水印（与成片一致）
+        main_settings = self.get_current_settings()
+        if not isinstance(main_settings, dict):
+            main_settings = {}
+        main_settings = copy.deepcopy(main_settings)
+        for k in ("crop_enabled", "scale_enabled", "rotate_enabled", "trim_enabled"):
+            main_settings[k] = False
         title = f"缩略图 · {os.path.basename(file_path)}"
-        save_dir = self.output_dir.get().strip() or ""
-        save_name = os.path.splitext(os.path.basename(file_path))[0]
-        self._show_snapshot_async(cmd, out_png, "sheet", title, "正在生成缩略图…",
-                                  self._display_contact_sheet, save_dir=save_dir, save_name=save_name)
+        self._show_seek_sheet_async(file_path, main_settings, sub_infos, title, "正在生成缩略图…")
 
-    def _display_contact_sheet(self, png_path):
+    def _display_contact_sheet(self, img_bytes):
         """显示缩略图：按屏幕可用空间缩放（预留标题栏/状态栏/保存按钮行的高度），
-        保证整张拼图 + 保存按钮都能完整可见，不被顶出屏幕。"""
+        保证整张拼图 + 保存按钮都能完整可见，不被顶出屏幕。img_bytes 为内存 PPM 数据。"""
         ui = getattr(self, "_snap_ui", {}).get("sheet")
         if ui is None or not ui["win"].winfo_exists():
             return
         try:
-            img = tk.PhotoImage(file=png_path)
+            img = tk.PhotoImage(data=img_bytes)
             screen_w = self.root.winfo_screenwidth()
             screen_h = self.root.winfo_screenheight()
             # 预留垂直空间给标题栏 + 状态栏 + 保存按钮行 + 外边距（多留余量）
@@ -16883,7 +17078,7 @@ class FFmpegBatchGUI:
                 img = img.subsample(factor, factor)
             ui["img"] = img
             ui["label"].config(image=img, text="")
-            ui["status"].config(text=f"缩略图已生成: {os.path.basename(png_path)}")
+            ui["status"].config(text="缩略图已生成")
             try:
                 center_window(ui["win"], img.width() + 12, img.height() + 130)
             except Exception:
@@ -18652,6 +18847,8 @@ class FFmpegBatchGUI:
             dialog.destroy()
 
         tk.Button(dialog, text="取消", command=cancel_action).pack(pady=10)
+        # 点 X（窗口关闭按钮）与取消等价：同样清理占位轨道，避免残留
+        dialog.protocol("WM_DELETE_WINDOW", cancel_action)
 
     def clear_input_output(self):
         """清空输入文件和输出目录（带确认）"""
