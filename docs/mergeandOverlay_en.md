@@ -258,6 +258,34 @@ On the sub-video overlay page (PiP), a new **"Free layout"** checkbox sits to th
 
 ---
 
+## 11. Trajectory control (dynamic watermark)
+
+Besides static positioning, a watermark / PiP sub-video can also **move along a looping trajectory over time**. Entry: the **「Trajectory...」** button on the right of the "Continuous rotation" row in the sub-video settings window (same component in the Transcode page's image-watermark settings).
+
+### 11.1 Four preset trajectories
+
+| Preset | Behavior | Parameters |
+|---|---|---|
+| Left-right sweep | Watermark sweeps the **full width** (left edge 0 → right edge W) back and forth; y uses your set coordinate (controls the top margin) | Cycle (controls speed) |
+| Up-down sweep | Sweeps the **full height** (0 → H) back and forth; x uses your set coordinate (controls the left margin) | Cycle |
+| Tilted diamond loop | Follows the 4 grid points `(4,1)→(1,2)→(2,5)→(5,4)` of the trajectory editor's 5×5 grid — a tilted diamond, **constant speed** (each segment's duration is proportional to its length) | Cycle |
+| Corner hopping | Jumps between the four screen corners (inset by margin), dwells at each corner, then teleports to the next | Dwell per corner + margin |
+
+### 11.2 Parameters
+
+- **Cycle (sec)**: controls **speed** — shorter cycle = faster movement. Sweep = one back-and-forth; diamond = one full loop. Corner hopping ignores this cycle (use "Dwell per corner" instead).
+- **Dwell per corner (sec)**: how long the watermark stays at each corner when corner hopping.
+- **Margin**: distance of the watermark from screen edges when corner hopping — pixel value (e.g. `20`) or relative expression (e.g. `W*0.03` = 3% of main width).
+
+### 11.3 Relation to other features
+
+- **No conflict with loop control (show window / cycle show / loop count)**: trajectory controls *position* (overlay `x/y` expressions), loop control governs *visibility* (`enable` expression) — they are **orthogonal dimensions** and can be freely combined. E.g. corner hopping + show window 5–10s = hopping only during seconds 5–10.
+- **Blend modes don't support dynamic trajectories**: when using overlay/screen/multiply etc. blend modes, the trajectory setting is ignored (falls back to the base position) and the program informs you.
+- **Stackable with continuous rotation**: spin + movement are independent.
+- **Implementation**: x/y use `t`-based ffmpeg eval expressions (triangle wave / piecewise linear interpolation / st-ld variable slots) — no external trajectory editor needed; the base coordinates `overlay_x/overlay_y` are preserved, so you can switch back to static at any time.
+
+---
+
 ## Appendix — filter independence/linkage across the four modes (incl. Transcode)
 
 Four working modes: ① Transcode ② Mux ③ PiP ④ Concat. Below, video filters, audio creative filters, audio reverse, and the intentionally-global filters.
