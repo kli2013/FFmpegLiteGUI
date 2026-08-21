@@ -13,12 +13,15 @@ import json
 import sys
 import shutil
 import ctypes
+import hashlib
 import concurrent.futures
 from typing import List, Tuple, Optional, Dict, Any, Callable
 import shlex
 import tempfile
 import time
 import types
+
+
 
 
 
@@ -414,6 +417,33 @@ class PresetManager:
         except Exception as e:
             print(_("创建预设文件失败: {0}").format(e))
 
+    def _write_data_atomic(self, data: Dict[str, Any]):
+        """原子写入 data 到预设文件；若文件已存在且（解析后的）内容与 data 完全一致，
+        则直接跳过写入——避免「打开程序 / 触发一次 trace」就把 ffmpeg_presets.json
+        无谓重写一遍（mtime 变化、但数值没有任何修改）。
+
+        判定用解析后的 dict 比较（而非文本比较），因此即便磁盘文件排序/格式略有差异，
+        只要语义内容相同就视为未变化。"""
+        if os.path.exists(self.preset_path):
+            try:
+                with open(self.preset_path, 'r', encoding='utf-8') as _f:
+                    _existing = json.load(_f)
+                if _existing == data:
+                    return
+            except Exception:
+                pass
+        dir_name = os.path.dirname(self.preset_path)
+        temp_name = None
+        try:
+            with tempfile.NamedTemporaryFile('w', dir=dir_name, delete=False, encoding='utf-8') as tf:
+                json.dump(data, tf, indent=4, ensure_ascii=False)
+                temp_name = tf.name
+            os.replace(temp_name, self.preset_path)
+        except Exception as e:
+            if temp_name and os.path.exists(temp_name):
+                os.unlink(temp_name)
+            raise e
+
     def load_all(self) -> Dict[str, Any]:
         """加载所有预设，返回字典 {预设名: 设置字典}，不含播放器设置"""
         if not os.path.exists(self.preset_path):
@@ -438,19 +468,8 @@ class PresetManager:
                 pass
         data[name] = settings
         data["player_settings"] = player_cfg
-    
-        # 原子写入：先写入临时文件，再替换原文件
-        dir_name = os.path.dirname(self.preset_path)
-        try:
-            with tempfile.NamedTemporaryFile('w', dir=dir_name, delete=False, encoding='utf-8') as tf:
-                json.dump(data, tf, indent=4, ensure_ascii=False)
-                temp_name = tf.name
-            os.replace(temp_name, self.preset_path)  # 原子替换
-        except Exception as e:
-            # 如果发生错误，尝试删除临时文件
-            if 'temp_name' in locals() and os.path.exists(temp_name):
-                os.unlink(temp_name)
-            raise e
+
+        self._write_data_atomic(data)
      
     def delete_preset(self, name: str) -> bool:
        """删除预设，采用原子写入防止文件损坏"""
@@ -467,19 +486,9 @@ class PresetManager:
            except:
                pass
        data["player_settings"] = player_cfg
-   
-       # 原子写入
-       dir_name = os.path.dirname(self.preset_path)
-       try:
-           with tempfile.NamedTemporaryFile('w', dir=dir_name, delete=False, encoding='utf-8') as tf:
-               json.dump(data, tf, indent=4, ensure_ascii=False)
-               temp_name = tf.name
-           os.replace(temp_name, self.preset_path)
-           return True
-       except Exception as e:
-           if 'temp_name' in locals() and os.path.exists(temp_name):
-               os.unlink(temp_name)
-           raise e
+
+       self._write_data_atomic(data)
+       return True
 
     def load_player_settings(self) -> Dict[str, Any]:
         if not os.path.exists(self.preset_path):
@@ -494,18 +503,8 @@ class PresetManager:
     def save_player_settings(self, settings: Dict[str, Any]):
         data = self.load_all()
         data["player_settings"] = settings
-        # 原子写入：先写临时文件再替换，避免写坏配置文件
-        dir_name = os.path.dirname(self.preset_path)
-        temp_name = None
-        try:
-            with tempfile.NamedTemporaryFile('w', dir=dir_name, delete=False, encoding='utf-8') as tf:
-                json.dump(data, tf, indent=4, ensure_ascii=False)
-                temp_name = tf.name
-            os.replace(temp_name, self.preset_path)
-        except Exception as e:
-            if temp_name and os.path.exists(temp_name):
-                os.unlink(temp_name)
-            raise e
+        # 走带「内容未变化则跳过」保护的原子写入（与 save_preset 共用路径）
+        self._write_data_atomic(data)
 
 def time_to_seconds(timestr: str) -> Optional[float]:
     """将 HH:MM:SS[.mmm] 或 MM:SS[.mmm] 或纯数字转换为秒数"""
@@ -558,7 +557,7 @@ def _channel_layout_name(ch):
     """把声道数映射为 ffmpeg aformat 可识别的声道布局名；无法映射时返回 None。"""
     return {1: "mono", 2: "stereo", 4: "quad", 5: "5.0", 6: "5.1", 7: "6.1", 8: "7.1"}.get(ch)
 
-def build_move_xy_expr(mode, x0, y0, move_settings=None):
+def build_move_xy_expr(mode, x0, y0, move_settings=None, sw="w", sh="h"):
     """生成动态水印 overlay 的 x/y 表达式（纯表达式，无需 sendcmd）。
 
     mode: '' 无 | 'h' 左右往返 | 'v' 上下往返 | 'diamond' 歪菱形循环 | 'corners' 四角跳跃
@@ -581,10 +580,10 @@ def build_move_xy_expr(mode, x0, y0, move_settings=None):
         T = 4.0
 
     def _clamp_x(expr):
-        return f"min(max(({expr}),0),W-w-5)"
+        return f"min(max(({expr}),0),W-{sw}-5)"
 
     def _clamp_y(expr):
-        return f"min(max(({expr}),0),H-h-5)"
+        return f"min(max(({expr}),0),H-{sh}-5)"
 
     def _amp(v, default):
         s = str(v if v is not None else "").strip()
@@ -600,12 +599,12 @@ def build_move_xy_expr(mode, x0, y0, move_settings=None):
         # 左右往返：x 从最左到最右（0 → W-w，水印右边缘贴到 W），y 保持基准（控制上边距）。
         # 无幅度参数，运动速度由周期自动计算。
         tria = f"(1-2*abs(mod(t,{T:.4f})/{T:.4f}-0.5))"
-        return _clamp_x(f"(W-w)*{tria}"), _clamp_y(f"({y0})")
+        return _clamp_x(f"(W-{sw})*{tria}"), _clamp_y(f"({y0})")
 
     if mode == "v":
         # 上下往返：y 从最上到最下（0 → H-h，水印下边缘贴到 H），x 保持基准（控制左边距）。
         tria = f"(1-2*abs(mod(t,{T:.4f})/{T:.4f}-0.5))"
-        return _clamp_x(f"({x0})"), _clamp_y(f"(H-h)*{tria}")
+        return _clamp_x(f"({x0})"), _clamp_y(f"(H-{sh})*{tria}")
 
     if mode == "diamond":
         # 歪菱形循环：4 顶点取自轨迹编辑器的 5x5 网格（label = 行+1, 列+1，范围 1..5）：
@@ -616,11 +615,11 @@ def build_move_xy_expr(mode, x0, y0, move_settings=None):
         # 匀速：各段用时与边长成正比（速度 = 周长/周期 恒定），消除短边慢长边快。
         # 用 eval 的 st/ld 变量槽存储边长/周长/段进度，避免 hypot 重复展开导致表达式膨胀。
         def _X(c):
-            return {0: "10", 1: "10+(W-w-20)*0.25",
-                    3: "10+(W-w-20)*0.75", 4: "10+(W-w-20)"}[c]
+            return {0: "10", 1: f"10+(W-{sw}-20)*0.25",
+                    3: f"10+(W-{sw}-20)*0.75", 4: f"10+(W-{sw}-20)"}[c]
         def _Y(r):
-            return {0: "10", 1: "10+(H-h-20)*0.25",
-                    3: "10+(H-h-20)*0.75", 4: "10+(H-h-20)"}[r]
+            return {0: "10", 1: f"10+(H-{sh}-20)*0.25",
+                    3: f"10+(H-{sh}-20)*0.75", 4: f"10+(H-{sh}-20)"}[r]
         vx = [_X(0), _X(1), _X(4), _X(3)]  # V0..V3 的 x
         vy = [_Y(3), _Y(0), _Y(1), _Y(4)]  # V0..V3 的 y
         # st(0..3) = 各边长；st(4) = 周长；st(5..8) = 各段进度 frac
@@ -677,14 +676,146 @@ def build_move_xy_expr(mode, x0, y0, move_settings=None):
         m = f"({M})"
         # 角坐标（含边距，钳制到画布内）
         x_l = f"({m})"
-        x_r = f"(W-w-({m}))"
+        x_r = f"(W-{sw}-({m}))"
         y_t = f"({m})"
-        y_b = f"(H-h-({m}))"
+        y_b = f"(H-{sh}-({m}))"
         x = f"{s0}*{x_l}+{s1}*{x_r}+{s2}*{x_r}+{s3}*{x_l}"
         y = f"{s0}*{y_t}+{s1}*{y_t}+{s2}*{y_b}+{s3}*{y_b}"
         return _clamp_x(x), _clamp_y(y)
 
     return None, None
+
+
+def _trajectory_dialog(parent, initial, commit):
+    """轨迹控制弹窗公共实现（图片/视频水印与文字水印共用）。
+    initial: dict，含 move_mode / move_cycle / move_dwell / move_margin 初值；
+    commit: callable(dict)，点「确定」时把规范化后的新值写回（写 tk 变量或 settings dict 均可）。"""
+    win = tk.Toplevel(parent)
+    win.title(_("轨迹控制"))
+    win.withdraw()  # 先隐藏，center_window 自动居中显示
+    try:
+        win.transient(parent.winfo_toplevel() if hasattr(parent, "winfo_toplevel") else parent)
+        win.grab_set()
+        # 注意：不要设置 -topmost——ToolTip 的悬浮窗未设 topmost，
+        # 父窗置顶会把 tooltip 压到最底层（鼠标悬停看不到提示）。
+    except Exception:
+        pass
+
+    MODES = [
+        ("", _("无（静态定位）")),
+        ("h", _("左右往返")),
+        ("v", _("上下往返")),
+        ("diamond", _("歪菱形循环")),
+        ("corners", _("四角跳跃")),
+    ]
+    mode_disp = tk.StringVar()
+    mode_val = tk.StringVar(value=initial.get("move_mode", "") or "")
+    for _v, _d in MODES:
+        if _v == mode_val.get():
+            mode_disp.set(_d)
+            break
+    if not mode_disp.get():
+        mode_disp.set(MODES[0][1])
+        mode_val.set("")
+
+    frm = ttk.Frame(win, padding="10")
+    frm.pack(fill=tk.BOTH, expand=True)
+    frm.grid_columnconfigure(0, weight=1)
+    row0 = ttk.Frame(frm)
+    row0.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+    ttk.Label(row0, text=_("运动轨迹:")).pack(side=tk.LEFT)
+    cb = ttk.Combobox(row0, textvariable=mode_disp, values=[d for _v, d in MODES],
+                      state="readonly", width=18)
+    cb.pack(side=tk.LEFT, padx=6)
+
+    p1 = ttk.Frame(frm)
+    p1.grid(row=1, column=0, sticky="ew", pady=3)
+    ttk.Label(p1, text=_("周期(秒):")).pack(side=tk.LEFT)
+    cyc_var = tk.DoubleVar(value=float(initial.get("move_cycle", 4.0) or 4.0))
+    cyc_sb = ttk.Spinbox(p1, from_=0.5, to=600, increment=0.5, width=7, textvariable=cyc_var)
+    cyc_sb.pack(side=tk.LEFT, padx=(2, 14))
+    ToolTip(cyc_sb,
+            _("这里的周期管的是速度：周期越短，水印移动越快。\n"
+            "往返 = 单程来回一次的时间；菱形 = 走完一圈的时间；\n"
+            "四角跳跃不受此周期影响（用下方「每点停留」控制）。\n"
+            "往返无需幅度参数：左右往返自动横跨整个画面宽度（0→W），\n"
+            "上下往返自动纵跨整个画面高度（0→H）。"),
+            wraplength=340)
+
+    p2 = ttk.Frame(frm)
+    p2.grid(row=1, column=0, sticky="ew", pady=3)
+    ttk.Label(p2, text=_("每点停留(秒):")).pack(side=tk.LEFT)
+    dwell_var = tk.DoubleVar(value=float(initial.get("move_dwell", 2.0) or 2.0))
+    ttk.Spinbox(p2, from_=0.2, to=600, increment=0.2, width=7, textvariable=dwell_var).pack(side=tk.LEFT, padx=(2, 14))
+    ttk.Label(p2, text=_("边距:")).pack(side=tk.LEFT)
+    margin_var = tk.StringVar(value=initial.get("move_margin", "W*0.03") or "W*0.03")
+    margin_entry = ttk.Entry(p2, textvariable=margin_var, width=10)
+    margin_entry.pack(side=tk.LEFT, padx=2)
+    ToolTip(margin_entry,
+            _("四角跳跃时水印离屏幕边缘的距离。\n"
+            "可填像素数（如 20）或相对式（如 W*0.03 = 主画面宽度 3%）。"),
+            wraplength=320)
+
+    tip_label = ttk.Label(frm, text="", foreground="gray")
+    tip_label.grid(row=2, column=0, sticky="ew", pady=(0, 4))
+
+    def _sync_params(*_a):
+        for _v, _d in MODES:
+            if _d == mode_disp.get():
+                mode_val.set(_v)
+                break
+        is_corner = (mode_val.get() == "corners")
+        # grid 切换：同一格 row=1 显隐互斥，不改变其他控件行位置
+        if is_corner:
+            p1.grid_remove()
+            p2.grid()
+            tip_label.config(text=_("（四角跳跃忽略上方设置的位置坐标，自动贴屏幕四角）"))
+        else:
+            p2.grid_remove()
+            p1.grid()
+            tip_label.config(text="")
+    cb.bind("<<ComboboxSelected>>", _sync_params)
+    _sync_params()
+
+    def _apply():
+        vals = {
+            "move_mode": mode_val.get(),
+            "move_margin": margin_var.get().strip() or "W*0.03",
+        }
+        try:
+            vals["move_cycle"] = float(cyc_var.get())
+        except (ValueError, TypeError):
+            vals["move_cycle"] = initial.get("move_cycle", 4.0)
+        try:
+            vals["move_dwell"] = float(dwell_var.get())
+        except (ValueError, TypeError):
+            vals["move_dwell"] = initial.get("move_dwell", 2.0)
+        commit(vals)
+        win.destroy()
+
+    btn_row = ttk.Frame(frm)
+    btn_row.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+    btn_row.grid_columnconfigure(0, weight=1)
+    btn_row.grid_columnconfigure(2, weight=1)
+    ttk.Button(btn_row, text=_("确定"), command=_apply, width=8).grid(row=0, column=0, sticky="e", padx=(0, 3))
+    ttk.Button(btn_row, text=_("取消"), command=win.destroy, width=8).grid(row=0, column=1, sticky="w", padx=(3, 0))
+
+    center_window(win, 400, 250)
+
+
+def open_trajectory_dialog(settings, parent):
+    """通用轨迹控制弹窗：针对传入的 settings dict 的 move_* 字段读写（文字水印用）。
+    与 OverlayPositionFrame._open_trajectory_dialog 共用公共实现 _trajectory_dialog。"""
+    _trajectory_dialog(
+        parent,
+        {"move_mode": settings.get("move_mode", "") or "",
+         "move_cycle": settings.get("move_cycle", 4.0),
+         "move_dwell": settings.get("move_dwell", 2.0),
+         "move_margin": settings.get("move_margin", "W*0.03") or "W*0.03"},
+        lambda v: settings.update(v),
+    )
+
+
 
 
 def _majority_audio_params(params):
@@ -698,8 +829,8 @@ def _majority_audio_params(params):
 # ================== 滤镜链构建 ==================
 def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = True, include_speed: bool = True,
                               include_trim: bool = True, include_format: bool = True, include_scale: bool = True,
-                              include_fade: bool = True, clip_duration=None,
-                              enhance_settings=None, reverse=False, graph_id: str = "") -> str:
+                              enhance_settings=None, reverse=False, graph_id: str = "",
+                              include_fade: bool = True, clip_duration=None) -> str:
     """
     从设置字典构建视频滤镜链。
     include_subtitle: 是否包含字幕滤镜
@@ -1246,6 +1377,14 @@ def build_drawtext_filter(tw_settings: dict) -> str:
     opacity = max(0.0, min(1.0, opacity))
     x_expr = tw_settings.get("overlay_x", "10").strip() or "10"
     y_expr = tw_settings.get("overlay_y", "10").strip() or "10"
+    # 动态轨迹（与图片/视频水印同套逻辑；文字尺寸用 tw/th，主画布用 main_w/main_h）
+    _mv = (tw_settings.get("move_mode", "") or "").strip()
+    if _mv:
+        _mx, _my = build_move_xy_expr(_mv, x_expr, y_expr, tw_settings, sw="tw", sh="th")
+        if _mx is not None:
+            # drawtext 表达式环境不提供 W/H 别名，用 main_w/main_h 表示主画布
+            x_expr = _mx.replace("W", "main_w").replace("H", "main_h")
+            y_expr = _my.replace("W", "main_w").replace("H", "main_h")
     try:
         border_w = int(tw_settings.get("border_w", 0))
     except (ValueError, TypeError):
@@ -1260,8 +1399,8 @@ def build_drawtext_filter(tw_settings: dict) -> str:
         f"text={escape_drawtext_text(text)}",
         f"fontsize={font_size}",
         f"fontcolor={fontcolor}",
-        f"x={x_expr}",
-        f"y={y_expr}",
+        f"x='{x_expr.replace(chr(39), chr(92)+chr(39))}'",
+        f"y='{y_expr.replace(chr(39), chr(92)+chr(39))}'",
     ]
     if border_w > 0:
         bc = border_color.lstrip("#")
@@ -1272,6 +1411,250 @@ def build_drawtext_filter(tw_settings: dict) -> str:
     if enable_expr:
         parts.append(f"enable='{enable_expr}'")
     return "drawtext=" + ":".join(parts)
+
+
+def estimate_text_size(text: str, font_path: str, font_size: int) -> Tuple[int, int]:
+    """
+    估算文字水印的像素宽高 (tw, th)，用于旋转时裁剪出贴合文字的透明层。
+    纯 Python 标准库实现（不依赖 PIL）：
+    - 全角区（CJK 等，U+2E80 起）按 1.0 × font_size 计宽；
+    - ASCII 可打印按 0.6 × font_size 计宽（略偏大，宁可裁大不裁字）；
+    - 其余半角扩展（拉丁扩展/希腊/西里尔等）按 0.9 × font_size 计宽；
+    - 行高 = font_size × 1.2；多行取最大行宽。
+    估算偏保守（偏大），旋转时 crop 包围盒还含 ±8px 内边距，实际不会裁到字。
+    """
+    try:
+        fs = int(font_size)
+    except (ValueError, TypeError):
+        fs = 48
+    if fs <= 0:
+        fs = 48
+    lines = (text or "").split("\n")
+    th = int(fs * 1.2) * max(1, len(lines))
+    tw = 0
+    for line in lines:
+        w = 0.0
+        for ch in (line or " "):
+            o = ord(ch)
+            if o >= 0x2E80:          # CJK 及全角区（含中文/日韩/注音等）
+                w += fs * 1.0
+            elif o <= 0x7E:          # ASCII 可打印（含空格）
+                w += fs * 0.6
+            else:                    # 其余半角扩展字符
+                w += fs * 0.9
+        if int(w) > tw:
+            tw = int(w)
+    return max(tw, fs), th
+
+
+def build_text_watermark_filtergraph(tw_settings: dict, main_label: str = "", out_label: str = "[v_tw]") -> str:
+    """
+    构建文字水印的 filter_complex 片段（或单节点 drawtext）。
+
+    - 未启用/无效 → 返回 ""
+    - 未启用旋转与持续旋转 → 返回 f"{main_label}drawtext=...{out_label}"
+      （等价于原 build_drawtext_filter 直接作用于主视频；main_label 为空则用隐式输入）
+    - 启用旋转（rotate≠0）或持续旋转（spin_enabled）→ 返回「透明层(color来自主视频alpha清零)
+      + drawtext(居中) + rotate(静态角度，可选) + rotate(持续旋转 angle=转速*PI/180*t，可选) + overlay」
+      的子图，主视频输入用 main_label（为空则隐式输入，适用预览 lavfi/-filter_complex），
+      以 out_label 结尾。调用方负责把该片段接入总 filter_complex（用 ; 分隔，并把 out_label 作为后续视频标签）。
+
+    设计要点：FFmpeg drawtext 原生不支持旋转，故旋转时把文字画到一块透明层上、
+    用 rotate 绕文字自身中心旋转、再 overlay 回主视频（与图片/视频水印 rotate 思路一致）。
+    """
+    if not tw_settings or not tw_settings.get("enabled", False):
+        return ""
+    text = tw_settings.get("text", "").strip()
+    if not text:
+        return ""
+    font_name = tw_settings.get("font_name", "微软雅黑")
+    font_path = tw_settings.get("font_path", "") or resolve_cn_font_path(font_name)
+    if not font_path or not os.path.exists(font_path):
+        return ""
+    try:
+        font_size = int(tw_settings.get("font_size", 48))
+    except (ValueError, TypeError):
+        font_size = 48
+    color = tw_settings.get("font_color", "#FFFFFF")
+    try:
+        opacity = float(tw_settings.get("opacity", 1.0))
+    except (ValueError, TypeError):
+        opacity = 1.0
+    opacity = max(0.0, min(1.0, opacity))
+    x_expr = (tw_settings.get("overlay_x", "10") or "10").strip() or "10"
+    y_expr = (tw_settings.get("overlay_y", "10") or "10").strip() or "10"
+
+    def _dt_parts(xv, yv):
+        parts = [
+            f"fontfile={escape_drawtext_path(font_path)}",
+            f"text={escape_drawtext_text(text)}",
+            f"fontsize={font_size}",
+            f"fontcolor=0x{color.lstrip('#')}@{opacity:.2f}",
+            f"x='{xv.replace(chr(39), chr(92) + chr(39))}'",
+            f"y='{yv.replace(chr(39), chr(92) + chr(39))}'",
+        ]
+        try:
+            bw = int(tw_settings.get("border_w", 0))
+        except (ValueError, TypeError):
+            bw = 0
+        if bw > 0:
+            bc = (tw_settings.get("border_color", "#000000") or "#000000").lstrip("#")
+            parts.append(f"borderw={bw}")
+            parts.append(f"bordercolor=0x{bc}@{opacity:.2f}")
+        enable_expr = _build_drawtext_enable(tw_settings)
+        if enable_expr:
+            parts.append(f"enable='{enable_expr}'")
+        return ":".join(parts)
+
+    rotate = tw_settings.get("rotate", 0)
+    try:
+        rotate = float(rotate)
+    except (ValueError, TypeError):
+        rotate = 0.0
+
+    # 持续旋转（spin）：绕中心匀速转（angle=转速*PI/180*t），与图片/视频水印同款；
+    # 静态旋转（rotate）与 spin 可叠加：先静态转，再持续转。
+    spin_on = bool(tw_settings.get("spin_enabled", False))
+    sp = tw_settings.get("spin_speed", 60.0)
+    try:
+        sp = float(sp)
+    except (ValueError, TypeError):
+        sp = 60.0
+    needs_rot = rotate != 0 or (spin_on and sp != 0)
+
+    # 动态轨迹（move）：旋转时子层尺寸用裁剪后的文字包围盒（含 padding）做钳制；
+    # 非旋转时沿用 drawtext 的 tw/th 变量（与原 build_drawtext_filter 行为一致）。
+    _mv = (tw_settings.get("move_mode", "") or "").strip()
+    if not needs_rot:
+        if _mv:
+            _mx, _my = build_move_xy_expr(_mv, x_expr, y_expr, tw_settings, sw="tw", sh="th")
+            if _mx is not None:
+                x_expr = _mx.replace("W", "main_w").replace("H", "main_h")
+                y_expr = _my.replace("W", "main_w").replace("H", "main_h")
+        dt = "drawtext=" + _dt_parts(x_expr, y_expr)
+        return f"{main_label}{dt}{out_label}" if main_label else f"{dt}{out_label}"
+
+    # ---- 旋转：透明层 + drawtext(居中) + rotate(静态/spin) + overlay ----
+    tw, th = estimate_text_size(text, font_path, font_size)
+    pad = 8
+    tw2 = tw + 2 * pad
+    th2 = th + 2 * pad
+    # 持续旋转时 overlay 画布 = 对角线正方形（rotate ow/oh=hypot），钳制用该边长；
+    # 仅静态旋转时钳制用 crop 包围盒尺寸。
+    _clamp = int((tw2 * tw2 + th2 * th2) ** 0.5) if (spin_on and sp != 0) else tw2
+    if _mv:
+        # 用裁剪后的包围盒尺寸（字面量）做钳制，避免旋转后越界
+        _mx, _my = build_move_xy_expr(_mv, x_expr, y_expr, tw_settings, sw=str(_clamp), sh=str(_clamp))
+        if _mx is not None:
+            x_expr = _mx.replace("W", "main_w").replace("H", "main_h")
+            y_expr = _my.replace("W", "main_w").replace("H", "main_h")
+    ml = main_label if main_label else ""
+    # 透明层用独立 color 源（按 crop 尺寸 tw2×th2），不再 fork ml。
+    # ⚠️ 关键：原先用 {ml}format=rgba,colorchannelmixer=aa=0[tw_bg] 时，ml（带图片水印的画布）被
+    # format=rgba 强制全局转 rgba，最终 overlay 把图片水印内容弄丢。
+    # 改用独立 color 源后，ml 只在最终 overlay 作为背景出现，画布内容完整保留。
+    base_node = f"color=c=black@0:s={tw2}x{th2}:d=999999"
+    dt_core = "drawtext=" + _dt_parts(str(pad), str(pad))
+    crop_node = f"crop={tw2}:{th2}:0:0"
+    rot_parts = []
+    _cur = "[tw_crop]"
+    if rotate != 0:
+        rot_parts.append(
+            f"{_cur}rotate=angle='{rotate}*PI/180':ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=black@0[tw_r1]")
+        _cur = "[tw_r1]"
+    if spin_on and sp != 0:
+        rot_parts.append(
+            f"{_cur}rotate=angle='{sp}*PI/180*t':ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=black@0[tw_rot]")
+        _cur = "[tw_rot]"
+    ov_node = f"overlay=x='{x_expr}':y='{y_expr}':format=auto"
+    frag = ";".join([
+        f"{base_node}[tw_bg]",
+        f"[tw_bg]{dt_core}[tw_full]",
+        f"[tw_full]{crop_node}[tw_crop]",
+    ] + rot_parts + [f"{ml}{_cur}{ov_node}{out_label}"])
+    return frag
+
+
+def text_watermark_needs_subgraph(tw_settings) -> bool:
+    """文字水印是否需要「透明层 + rotate + overlay」子图：静态旋转(rotate≠0)或持续旋转(spin)任一启用。
+    ⚠️ 必须与 build_text_watermark_filtergraph 内部的 needs_rot 判定逐字一致——
+    各调用点用它决定走 -filter_complex 子图还是普通 -vf drawtext。
+    曾因漏查 spin_enabled，导致「只开自旋转、旋转角度=0」时走了普通 drawtext 路径而不转。"""
+    if not tw_settings:
+        return False
+    try:
+        rot = float(tw_settings.get("rotate", 0) or 0) != 0
+    except (ValueError, TypeError):
+        rot = False
+    spin = bool(tw_settings.get("spin_enabled", False))
+    try:
+        sp = float(tw_settings.get("spin_speed", 0) or 0)
+    except (ValueError, TypeError):
+        sp = 0.0
+    return rot or (spin and sp != 0)
+
+
+def text_watermark_active(tw_settings) -> tuple:
+    """文字水印是否生效 + 是否需要走旋转子图。返回 (enabled, needs_subgraph)。
+
+    - enabled         = 开启且文字非空
+    - needs_subgraph  = enabled 且 (静态旋转 rotate≠0 或 持续旋转 spin_enabled)
+
+    ⚠️ 各命令生成点用它一次性算出 _tw_enabled / _tw_rotate，避免「启用判定」
+    与 text_watermark_needs_subgraph 在各处重复书写而漂移。"""
+    enabled = bool(tw_settings.get("enabled")) and bool((tw_settings.get("text", "") or "").strip())
+    return enabled, (enabled and text_watermark_needs_subgraph(tw_settings))
+
+
+def _ensure_tw_duration_limit(app, cmd_list, *, input_path=None, main_duration=None,
+                              audio_enabled=True, tag="[文字水印]"):
+    """文字水印旋转/持续旋转(spin)时，build_text_watermark_filtergraph 使用
+    color=c=black@0:s=WxH:d=999999 的无限时长透明源；若命令尚未加任何时长限制，
+    必须补上时长限制，否则输出会被无限拉长到 999999s（甚至卡死）。
+
+    时长限制策略（经真实 ffmpeg 验证）：
+    - 主视频【有音频】且音频输出启用 → 用 -shortest（音频为有限流，可正确截断；
+      实测无音频时 -shortest 对 color 无限源会卡死/不截断，故无音频绝不用 -shortest）。
+    - 主视频【无音频】或音频禁用 → 必须用 -t 精确截断：优先用调用方传入的 main_duration，
+      否则尝试探测主视频时长；两者皆无才无奈回退 -shortest（可能卡，但总比无限输出好）。
+
+    非旋转文字水印（drawtext）不带无限源，命令里不含 color=c=black@0 标记会自动跳过，
+    不影响正常有界输出。模块级辅助，app 传入调用方实例（需 _get_cached_stream_info /
+    _get_media_duration / _append_info_ui）。只就地 append 到 cmd_list。"""
+    # 仅当命令确实包含文字水印的无限透明源时才需要限制
+    if not any("color=c=black@0" in str(a) for a in cmd_list):
+        return
+    # 已有限制（trim 自带 -t、或别处已加 -shortest）则跳过，避免重复
+    if "-shortest" in cmd_list or "-t" in cmd_list:
+        return
+    has_audio_stream = False
+    if input_path and os.path.exists(input_path):
+        info = app._get_cached_stream_info(input_path)
+        if info and any(s.get("codec_type") == "audio"
+                        for s in info.get("streams", [])):
+            has_audio_stream = True
+    # 有音频：优先 -shortest（音频有限流可正确截断）
+    if audio_enabled and has_audio_stream:
+        cmd_list.append("-shortest")
+        return
+    # 无音频 / 音频禁用：必须用 -t 精确截断，避免 -shortest 对 color 无限源卡死
+    eff = main_duration
+    if not (eff and eff > 0) and input_path and os.path.exists(input_path):
+        try:
+            eff = app._get_media_duration(input_path)
+        except Exception:
+            eff = None
+    if eff and eff > 0:
+        cmd_list.extend(["-t", f"{eff:.3f}"])
+    else:
+        # 兜底：连时长都算不出，退 -shortest（可能卡，但总比无限输出好）
+        cmd_list.append("-shortest")
+        try:
+            app._append_info_ui(
+                _("{0} 警告：无法计算主视频时长，使用 -shortest 控制输出。").format(tag))
+        except Exception:
+            pass
+
 
 # ================== 视频尺寸计算 ==================
 def get_video_dimensions(ffprobe_cmd: str, file_path: str) -> Tuple[Optional[int], Optional[int]]:
@@ -3738,7 +4121,7 @@ class TextWatermarkDialog(tk.Toplevel):
         self.grab_set()
         self.resizable(False, False)
 
-        width, height = 370, 500
+        width, height = 370, 600
         center_window(self, width, height)
 
         self.create_widgets()
@@ -3754,7 +4137,11 @@ class TextWatermarkDialog(tk.Toplevel):
         # ---- 启用 ----
         self.enabled_var = tk.BooleanVar(value=s.get("enabled", False))
         ttk.Checkbutton(main, text=_("启用文字水印"), variable=self.enabled_var).grid(
-            row=0, column=0, columnspan=3, sticky="w", pady=5)
+            row=0, column=0, sticky="w", pady=5)
+        # 注入到封装页开关：开启后，本页文字水印设置会随主视频轨道带入封装页 3 个模式
+        self.inject_var = tk.BooleanVar(value=s.get("inject_to_packaging", False))
+        ttk.Checkbutton(main, text=_("注入到封装页"), variable=self.inject_var).grid(
+            row=0, column=1, sticky="w", pady=5, padx=(12, 0))
 
         # ---- 文字内容 ----
         ttk.Label(main, text=_("文字内容:")).grid(row=1, column=0, sticky="nw", pady=5)
@@ -3885,11 +4272,77 @@ class TextWatermarkDialog(tk.Toplevel):
                       command=lambda x=px, y=py: (self.tw_x_var.set(x), self.tw_y_var.set(y))
                       ).pack(side=tk.LEFT, padx=2)
 
+        # ---- 旋转（FFmpeg drawtext 原生不支持旋转，启用后用透明层+rotate+overlay 实现）----
+        rot_frame = ttk.Frame(main)
+        rot_frame.grid(row=12, column=0, columnspan=5, sticky="w", pady=(4, 2))
+        ttk.Label(rot_frame, text=_("旋转角度:")).pack(side=tk.LEFT, padx=(0, 4))
+        self.rotate_var = tk.DoubleVar(value=float(s.get("rotate", 0.0) or 0.0))
+        def _tw_sync_rotate(*_a):
+            try:
+                tw_pos["rotate"] = float(self.rotate_var.get())
+            except (ValueError, TypeError):
+                tw_pos["rotate"] = 0.0
+            if self.app.adv_frame and self.app.adv_frame.update_callback:
+                self.app.adv_frame.update_callback()
+        self.rotate_var.trace_add("write", _tw_sync_rotate)
+        ttk.Spinbox(rot_frame, from_=-180, to=180, increment=1,
+                    textvariable=self.rotate_var, width=8).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(rot_frame, text=_("度 (绕文字中心)")).pack(side=tk.LEFT)
+        ToolTip(
+            rot_frame,
+            _("文字水印旋转角度（度，支持负角）。\n"
+            "FFmpeg 的 drawtext 滤镜本身不支持旋转；启用非零角度后会改用「透明层 + rotate + overlay」"
+            "管线实现：把文字画到一块透明层上、绕文字自身中心旋转、再叠加回主视频（与图片/视频水印旋转思路一致）。\n"
+            "注意：启用旋转后，位置(X/Y)表示旋转后文字包围盒的左上角；动态轨迹(move)同样生效。"),
+            wraplength=420)
+
+        # ---- 持续旋转（绕中心，与图片/视频水印同款；angle=转速*PI/180*t）----
+        spin_frame = ttk.Frame(main)
+        spin_frame.grid(row=13, column=0, columnspan=5, sticky="w", pady=(2, 2))
+        self.spin_enabled_var = tk.BooleanVar(value=bool(s.get("spin_enabled", False)))
+        spin_cb = ttk.Checkbutton(spin_frame, text=_("持续旋转 (绕中心)"), variable=self.spin_enabled_var)
+        spin_cb.pack(side=tk.LEFT)
+        def _tw_sync_spin(*_a):
+            tw_pos["spin_enabled"] = bool(self.spin_enabled_var.get())
+            try:
+                tw_pos["spin_speed"] = float(self.spin_speed_var.get())
+            except (ValueError, TypeError):
+                tw_pos["spin_speed"] = 60.0
+            if self.app.adv_frame and self.app.adv_frame.update_callback:
+                self.app.adv_frame.update_callback()
+        self.spin_enabled_var.trace_add("write", _tw_sync_spin)
+        ttk.Label(spin_frame, text=_("转速(度/秒):")).pack(side=tk.LEFT, padx=(12, 2))
+        self.spin_speed_var = tk.DoubleVar(value=float(s.get("spin_speed", 60.0) or 60.0))
+        spin_sb = ttk.Spinbox(spin_frame, from_=1, to=720, increment=5, width=6,
+                              textvariable=self.spin_speed_var)
+        spin_sb.pack(side=tk.LEFT)
+        self.spin_speed_var.trace_add("write", _tw_sync_spin)
+        ToolTip(
+            spin_cb,
+            _("让文字水印在渲染过程中绕自身中心持续旋转（动态动画，不是单次旋转）。\n"
+            "转速单位为度/秒，例如 60 = 每 6 秒转一圈（angle = 转速×π/180×t）。\n"
+            "与上方「旋转角度」可叠加：先转静态角度、再持续旋转。\n"
+            "旋转后边角填充为透明（c=black@0）；文字不宜过大，旋转包围盒为对角线尺寸。"),
+            wraplength=420)
+
+        # ---- 动态轨迹（与图片/视频水印同套逻辑；文字尺寸用 tw/th，主画布用 main_w/main_h）----
+        traj_btn = ttk.Button(
+            main, text=_("轨迹控制"),
+            command=lambda: open_trajectory_dialog(self.app.text_watermark_settings, self),
+            width=28)
+        traj_btn.grid(row=14, column=0, columnspan=5, sticky="w", pady=(4, 2))
+        ToolTip(
+            traj_btn,
+            _("让文字水印沿预设轨迹动态移动：左右/上下往返、歪菱形循环、四角跳跃。\n"
+            "与图片/视频水印共用同一套轨迹逻辑；文字尺寸自动用 tw/th，主画布用 main_w/main_h。\n"
+            "选择「无」恢复静态定位。"),
+            wraplength=400)
+
         # ---- 位置编辑（直接在对话框内打开可视化编辑器）----
         pos_btn = ttk.Button(
             main, text=_("打开位置编辑器（可视化拖拽）"),
             command=self._open_position_editor)
-        pos_btn.grid(row=12, column=0, columnspan=5, sticky="w", pady=10)
+        pos_btn.grid(row=15, column=0, columnspan=5, sticky="w", pady=5)
         ToolTip(
             pos_btn,
             _("直接弹出可视化窗口拖拽文字水印的位置，无需关闭本窗口。\n"
@@ -3901,13 +4354,14 @@ class TextWatermarkDialog(tk.Toplevel):
 
         # ---- 按钮 ----
         btn_frame = ttk.Frame(main)
-        btn_frame.grid(row=13, column=0, columnspan=5, pady=10)
+        btn_frame.grid(row=16, column=0, columnspan=5, pady=10)
         ttk.Button(btn_frame, text=_("确定"), command=self.on_ok, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text=_("取消"), command=self.on_cancel, width=10).pack(side=tk.LEFT, padx=5)
 
     def on_ok(self):
         s = self.app.text_watermark_settings
         s["enabled"] = self.enabled_var.get()
+        s["inject_to_packaging"] = self.inject_var.get()
         s["text"] = self.text_var.get().strip()
         s["font_name"] = self.font_var.get()
         s["font_path"] = resolve_cn_font_path(self.font_var.get())
@@ -4157,6 +4611,40 @@ class BlurFilterDialog(tk.Toplevel):
                 _("已切换为局部模糊：应用后 -vf 将自动生成 split→crop→模糊→overlay 滤镜图，"
                 "并排在裁剪/旋转/缩放/亮度等滤镜之前（坐标以原始画面为准）"))
     
+    def _resolve_crop_coord(self, expr):
+        """把裁剪坐标表达式（可能含 iw/ih，如 iw/2、ih-100）按输入文件原始尺寸换算成数字。
+
+        delogo 滤镜不支持表达式（x/y/w/h 只认像素数字），而裁剪参数常填 iw/2 等相对式，
+        复制到 delogo 前必须求值。纯数字直接返回；取不到尺寸或求值失败则保留原样（与旧行为一致）。"""
+        expr = expr.strip()
+        if not expr:
+            return expr
+        if expr.lstrip("-").isdigit():
+            return expr
+        app = getattr(self.filter_frame, "app", None)
+        file_path = ""
+        if app is not None:
+            inp = getattr(app, "input_file", None)
+            if inp is not None:
+                file_path = inp.get().strip() if hasattr(inp, "get") else str(inp)
+            if not file_path:
+                file_path = getattr(self.filter_frame, "current_file", "") or ""
+        if file_path and os.path.exists(file_path) and app is not None:
+            try:
+                ow, oh = app._get_video_dimensions_cached(file_path)
+            except Exception:
+                ow = oh = None
+            if ow and oh:
+                # delogo 完整宽/高必须为偶数：字面量 iw/ih（整宽/整高）时减 2（如 1920→1918）
+                if expr == "iw":
+                    return str(ow - 2)
+                if expr == "ih":
+                    return str(oh - 2)
+                val = safe_eval_expr(expr, {"iw": ow, "ih": oh})
+                if val is not None:
+                    return str(val)
+        return expr
+
     def copy_from_crop(self, silent: bool = False):
         crop_w = self.filter_frame.crop_width.get().strip()
         crop_h = self.filter_frame.crop_height.get().strip()
@@ -4166,10 +4654,19 @@ class BlurFilterDialog(tk.Toplevel):
             if not silent:
                 messagebox.showwarning(_("提示"), _("裁剪未启用或参数为空，请先在「视频滤镜」中启用裁剪并设置区域。"))
             return
-        self.x_var.set(crop_x)
-        self.y_var.set(crop_y)
-        self.w_var.set(crop_w)
-        self.h_var.set(crop_h)
+        # delogo 不支持表达式：iw/ih 按输入文件原始尺寸换算成数字后填入
+        # delogo 的 x/y/w/h 不允许为 0（w/h=0 滤镜无效），凡解析为 0 一律改为 1
+        def _nonzero(v):
+            try:
+                if int(v) == 0:
+                    return "1"
+            except (ValueError, TypeError):
+                pass
+            return v
+        self.x_var.set(_nonzero(self._resolve_crop_coord(crop_x)))
+        self.y_var.set(_nonzero(self._resolve_crop_coord(crop_y)))
+        self.w_var.set(_nonzero(self._resolve_crop_coord(crop_w)))
+        self.h_var.set(_nonzero(self._resolve_crop_coord(crop_h)))
         if not self.enabled_var.get():
             self.enabled_var.set(True)
         # 已开启局部模糊时保持当前模糊类型，不再强制切回 delogo
@@ -5372,126 +5869,17 @@ class OverlayPositionFrame(ttk.LabelFrame):
                    ).pack(side=tk.LEFT, padx=(16, 0))
 
     def _open_trajectory_dialog(self):
-        """轨迹控制弹窗：预设动效 + 参数（先隐藏窗口，center_window 自动居中显示）。"""
-        win = tk.Toplevel(self)
-        win.title(_("轨迹控制"))
-        win.withdraw()  # 先隐藏，避免左上角闪烁
-        try:
-            win.transient(self.winfo_toplevel())
-            win.grab_set()
-            # 注意：不要设置 -topmost——ToolTip 的悬浮窗未设 topmost，
-            # 父窗置顶会把 tooltip 压到最底层（鼠标悬停看不到提示）。
-        except Exception:
-            pass
-
-        # 预设下拉（显示/值分离）
-        MODES = [
-            ("", _("无（静态定位）")),
-            ("h", _("左右往返")),
-            ("v", _("上下往返")),
-            ("diamond", _("歪菱形循环")),
-            ("corners", _("四角跳跃")),
-        ]
-        mode_disp = tk.StringVar()
-        mode_val = tk.StringVar(value=self.move_mode.get())
-        for _v, _d in MODES:
-            if _v == mode_val.get():
-                mode_disp.set(_d)
-                break
-        if not mode_disp.get():
-            mode_disp.set(MODES[0][1])
-            mode_val.set("")
-
-        frm = ttk.Frame(win, padding="10")
-        frm.pack(fill=tk.BOTH, expand=True)
-        frm.grid_columnconfigure(0, weight=1)
-        row0 = ttk.Frame(frm)
-        row0.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        ttk.Label(row0, text=_("运动轨迹:")).pack(side=tk.LEFT)
-        cb = ttk.Combobox(row0, textvariable=mode_disp, values=[d for _v, d in MODES],
-                          state="readonly", width=18)
-        cb.pack(side=tk.LEFT, padx=6)
-
-        # 参数区 1：周期（往返/菱形）—— grid row=1（与参数区 2 同一格，切换显示）
-        p1 = ttk.Frame(frm)
-        p1.grid(row=1, column=0, sticky="ew", pady=3)
-        ttk.Label(p1, text=_("周期(秒):")).pack(side=tk.LEFT)
-        cyc_var = tk.DoubleVar(value=self.move_cycle.get())
-        cyc_sb = ttk.Spinbox(p1, from_=0.5, to=600, increment=0.5, width=7,
-                             textvariable=cyc_var)
-        cyc_sb.pack(side=tk.LEFT, padx=(2, 14))
-        ToolTip(cyc_sb,
-                _("这里的周期管的是速度：周期越短，水印移动越快。\n"
-                "往返 = 单程来回一次的时间；菱形 = 走完一圈的时间；\n"
-                "四角跳跃不受此周期影响（用下方「每点停留」控制）。\n"
-                "往返无需幅度参数：左右往返自动横跨整个画面宽度（0→W），\n"
-                "上下往返自动纵跨整个画面高度（0→H）。"),
-                wraplength=340)
-
-        # 参数区 2：停留 + 边距（四角跳跃）
-        p2 = ttk.Frame(frm)
-        p2.grid(row=1, column=0, sticky="ew", pady=3)
-        ttk.Label(p2, text=_("每点停留(秒):")).pack(side=tk.LEFT)
-        dwell_var = tk.DoubleVar(value=self.move_dwell.get())
-        ttk.Spinbox(p2, from_=0.2, to=600, increment=0.2, width=7,
-                    textvariable=dwell_var).pack(side=tk.LEFT, padx=(2, 14))
-        ttk.Label(p2, text=_("边距:")).pack(side=tk.LEFT)
-        margin_var = tk.StringVar(value=self.move_margin.get())
-        margin_entry = ttk.Entry(p2, textvariable=margin_var, width=10)
-        margin_entry.pack(side=tk.LEFT, padx=2)
-        ToolTip(margin_entry,
-                _("四角跳跃时水印离屏幕边缘的距离。\n"
-                "可填像素数（如 20）或相对式（如 W*0.03 = 主画面宽度 3%）。"),
-                wraplength=320)
-
-        # 提示行（固定 row=2，切换时只改文本，不增删控件）
-        tip_label = ttk.Label(frm, text="", foreground="gray")
-        tip_label.grid(row=2, column=0, sticky="ew", pady=(0, 4))
-
-        def _sync_params(*_a):
-            for _v, _d in MODES:
-                if _d == mode_disp.get():
-                    mode_val.set(_v)
-                    break
-            is_corner = (mode_val.get() == "corners")
-            # grid 切换：同一格 row=1 显隐互斥，不改变其他控件行位置
-            if is_corner:
-                p1.grid_remove()
-                p2.grid()
-                tip_label.config(text=_("（四角跳跃忽略上方设置的位置坐标，自动贴屏幕四角）"))
-            else:
-                p2.grid_remove()
-                p1.grid()
-                tip_label.config(text="")
-        cb.bind("<<ComboboxSelected>>", _sync_params)
-        _sync_params()
-
-        # 底部按钮（固定 row=3，按钮水平居中）
-        def _apply():
-            self.move_mode.set(mode_val.get())
-            try:
-                self.move_cycle.set(float(cyc_var.get()))
-            except (ValueError, TypeError):
-                pass
-            try:
-                self.move_dwell.set(float(dwell_var.get()))
-            except (ValueError, TypeError):
-                pass
-            self.move_margin.set(margin_var.get().strip() or "W*0.03")
-            win.destroy()
-
-        btn_row = ttk.Frame(frm)
-        btn_row.grid(row=3, column=0, sticky="ew", pady=(10, 0))
-        # 按钮水平居中（column 0/2 weight=1 撑开，两按钮放 column 1）
-        # UI 布局约定：确定 column=0 sticky=e、取消 column=1 sticky=w（用户指定，勿改）
-        btn_row.grid_columnconfigure(0, weight=1)
-        btn_row.grid_columnconfigure(2, weight=1)
-        ttk.Button(btn_row, text=_("确定"), command=_apply, width=8
-                   ).grid(row=0, column=0, sticky="e", padx=(0, 3))
-        ttk.Button(btn_row, text=_("取消"), command=win.destroy, width=8
-                   ).grid(row=0, column=1, sticky="w", padx=(3, 0))
-
-        center_window(win, 400, 250)
+        """轨迹控制弹窗：预设动效 + 参数（与文字水印共用公共实现 _trajectory_dialog）。"""
+        _trajectory_dialog(
+            self,
+            {"move_mode": self.move_mode.get(),
+             "move_cycle": self.move_cycle.get(),
+             "move_dwell": self.move_dwell.get(),
+             "move_margin": self.move_margin.get()},
+            lambda v: (self.move_mode.set(v["move_mode"]),
+                       self.move_cycle.set(v["move_cycle"]),
+                       self.move_dwell.set(v["move_dwell"]),
+                       self.move_margin.set(v["move_margin"])))
 
     def _create_main_controls(self):
         """主视频画布偏移控件 - 左右分栏（左侧偏移设置，右侧快捷操作）"""
@@ -6692,6 +7080,20 @@ class Track:
     def is_encoding(self):
         return self.enc_settings.get("encoder") != "copy"
 
+
+def _apply_default_watermark_overlay(track):
+    """画中画/图片水印默认启用叠加并缩放到 320 宽（与原有行为一致）。
+
+    多处「添加水印/画中画轨道」代码重复了这 7 个 enc_settings 键 + track.overlay_enabled，
+    统一收敛到此 helper。"""
+    track.enc_settings["scale_enabled"] = True
+    track.enc_settings["scale_width"] = "320"
+    track.enc_settings["scale_height"] = ""
+    track.enc_settings["scale_method"] = "width"
+    track.enc_settings["overlay_enabled"] = True
+    track.enc_settings["overlay_x"] = "W-w-10"
+    track.enc_settings["overlay_y"] = "H-h-10"
+    track.overlay_enabled = True
 # ================== 通用滚动容器 ==================
 class ScrolledFrame(ttk.Frame):
     """整页滚动容器（浏览器式）：内容超高时右侧显示垂直滚动条，未溢出自动隐藏。
@@ -6849,6 +7251,10 @@ class ScrolledFrame(ttk.Frame):
         self.after_idle(self._layout_inner)
 
 # ================== 主界面类 ==================
+# 预览 movie 临时硬链接缓存：{源路径: 临时硬链接路径}，同源复用；程序退出统一清理
+_PREVIEW_LINKS = {}
+
+
 class FFmpegBatchGUI:
     # ---------- SafeToplevel 上下文管理器 ----------
     class SafeToplevel:
@@ -7196,8 +7602,16 @@ class FFmpegBatchGUI:
             "opacity": 1.0,
             "overlay_x": "10",
             "overlay_y": "10",
+            "rotate": 0.0,
+            "spin_enabled": False,
+            "spin_speed": 60.0,
+            "move_mode": "",
+            "move_cycle": 4.0,
+            "move_dwell": 2.0,
+            "move_margin": "W*0.03",
             "border_w": 0,
             "border_color": "#000000",
+            "inject_to_packaging": False,
         }
         # ---------------------------------
 
@@ -8429,17 +8843,29 @@ class FFmpegBatchGUI:
                 if enhance_filter and enhance_filter != "null":
                     global_filters.append(enhance_filter)
 
-            # ========== 文字水印 drawtext ==========
-            dt = build_drawtext_filter(settings.get("text_watermark", {}))
-            if dt:
-                global_filters.append(dt)
-
-            if global_filters:
-                global_filter_str = ",".join(global_filters)
-                filter_parts.append(f"[vout]{global_filter_str}[final_v]")
-                map_v = "[final_v]"
+            # ========== 文字水印 ==========
+            tw_settings = settings.get("text_watermark", {})
+            _tw_enabled, _tw_rotate = text_watermark_active(tw_settings)
+            if _tw_rotate:
+                # 旋转/spin：global_filters 先接到临时标签，文字子图（透明层+rotate+overlay）接在后面
+                global_filter_str = ",".join(global_filters) if global_filters else "null"
+                if global_filters:
+                    filter_parts.append(f"[vout]{global_filter_str}[v_pre]")
+                    tw_in = "[v_pre]"
+                else:
+                    tw_in = "[vout]"
+                filter_parts.append(build_text_watermark_filtergraph(tw_settings, main_label=tw_in, out_label="[v_tw]"))
+                map_v = "[v_tw]"
             else:
-                map_v = "[vout]"
+                dt = build_drawtext_filter(tw_settings)
+                if dt:
+                    global_filters.append(dt)
+                if global_filters:
+                    global_filter_str = ",".join(global_filters)
+                    filter_parts.append(f"[vout]{global_filter_str}[final_v]")
+                    map_v = "[final_v]"
+                else:
+                    map_v = "[vout]"
     
         # 音频 concat（如果存在音频片段；独立截取模式只有 [aout] 无需 concat）
         if a_filters:
@@ -8501,6 +8927,12 @@ class FFmpegBatchGUI:
         if container in ("mp4", "mov"):
             cmd.extend(["-movflags", "+faststart"])
     
+        # 文字水印（旋转/spin）无限源时长限制：有音频用 -shortest，无音频用 -t（分段总时长）
+        _ensure_tw_duration_limit(
+            self, cmd, input_path=input_path,
+            main_duration=self._calc_segments_total_duration(settings),
+            audio_enabled=True)
+
         cmd.append(output_path)
         return cmd
 
@@ -9071,12 +9503,50 @@ class FFmpegBatchGUI:
             "ffprobe_parallel": self.ffprobe_parallel.get(),
         })
 
+    def _cleanup_preview_links(self):
+        """程序退出时统一清理本次会话创建的临时硬链接（ffmpeg_preview*_cache*，只删链接不删数据）。"""
+        for _src, _target in list(_PREVIEW_LINKS.items()):
+            try:
+                if os.path.exists(_target):
+                    os.unlink(_target)
+            except Exception:
+                pass
+        _PREVIEW_LINKS.clear()
+
+    def _movie_path_safe(self, path, idx=0):
+        """movie 滤镜路径安全化：ffmpeg filtergraph 语法层不支持 [ ] ' , ; 等字符
+        （实测无法转义），含特殊字符时在源文件**同目录**创建临时硬链接
+        （同盘必成功，不复制；失败则返回原路径）。文件名 ffmpeg_preview{h}_cache{idx}{ext}，
+        缓存按源路径复用（重复预览不重复建）；程序退出统一清理。"""
+        if not path or not os.path.exists(path):
+            return path
+        if not re.search(r"[\[\]',;]", path):
+            return path
+        if path in _PREVIEW_LINKS and os.path.exists(_PREVIEW_LINKS[path]):
+            return _PREVIEW_LINKS[path]
+        h = hashlib.md5(path.encode("utf-8")).hexdigest()[:12]
+        ext = os.path.splitext(path)[1] or ".mp4"
+        target = os.path.join(os.path.dirname(path), f"ffmpeg_preview{h}_cache{idx}{ext}")
+        try:
+            os.link(path, target)
+        except OSError:
+            return path
+        _PREVIEW_LINKS[path] = target
+        return target
+
     def preview_with_player(self, input_path, filters=None, audio_only=False, volume=10,
-                            extra_args=None, start_time=None, duration=None):
+                            extra_args=None, start_time=None, duration=None,
+                            lavfi_complex=None):
         """
         启动播放器预览
         :param start_time: 起始时间（秒或时间字符串），仅 ffplay 使用，mpv 通过 extra_args 传递 --start
         :param duration: 播放时长（秒），仅 ffplay 使用
+        :param filters: 普通 -vf 链（mpv 用 --vf=lavfi=[...] 包装，ffplay 直接 -vf）。
+        :param lavfi_complex: mpv 复杂图（如文字水印旋转/轨迹），用 --lavfi-complex= 传递
+               （与 -vf 互斥）。占位标签：[VIN]=视频输入 [AIN]=音频输入(可选)
+               [VOUT]=视频输出 [AOUT]=音频输出(可选)，按 mpv 约定替换为 [vid1]/[aid1]/[vo]/[ao]
+               （注意音频输入是 aid1，不是 a1）。ffplay 不支持复杂图（无 -filter_complex），
+               其 -vf 直接支持分号多段图（文字水印旋转走此路线）。
         """
         file_path = normalize_path(input_path)
         extra_args = extra_args or []
@@ -9103,7 +9573,12 @@ class FFmpegBatchGUI:
             if self.use_mpv.get():
                 player = self.mpv_path.get().strip() or "mpv"
                 cmd = [player, file_path]
-                if filters:
+                if lavfi_complex:
+                    # 复杂图（文字水印旋转等）：占位标签 → mpv 约定标签（音频输入是 aid1）
+                    lc = lavfi_complex.replace("[VIN]", "[vid1]").replace("[AIN]", "[aid1]")
+                    lc = lc.replace("[VOUT]", "[vo]").replace("[AOUT]", "[ao]")
+                    cmd.append(f"--lavfi-complex={lc}")
+                elif filters:
                     # 使用 lavfi=[...] 语法（mpv 官方推荐），不再需要 graph= 与额外的引号转义；
                     # mpv 会直接解析 [...] 内的滤镜图，filters 本身无需再做 shell/转义处理。
                     cmd.append(f"--vf=lavfi=[{filters}]")
@@ -9150,8 +9625,14 @@ class FFmpegBatchGUI:
         # ---- 快照模式：只弹合成快照窗口，不启动播放器预览 ----
         if with_snapshot:
             wm_settings = settings.get("watermark", {})
-            if wm_settings.get("enabled", False) and (wm_settings.get("file_path", "") or "").strip():
+            tw_settings = settings.get("text_watermark", {})
+            wm_active = wm_settings.get("enabled", False) and (wm_settings.get("file_path", "") or "").strip()
+            tw_active = bool(tw_settings.get("enabled")) and bool((tw_settings.get("text", "") or "").strip())
+            if wm_active:
                 self._show_watermark_snapshot_async(file_path, settings)
+            elif tw_active:
+                # 仅文字水印（无图片水印）也支持快照
+                self._show_text_watermark_snapshot_async(file_path, settings)
             else:
                 self._append_info_ui(_("[预览] 未设置水印，无法生成快照"))
             return
@@ -9186,6 +9667,7 @@ class FFmpegBatchGUI:
     
         # ----- 2. 水印虚拟框 -----
         wm_settings = settings.get("watermark", {})
+        drawbox_expr = None
         if wm_settings.get("enabled", False) and wm_settings.get("file_path", "").strip():
             wm_file = wm_settings.get("file_path", "").strip()
             main_w, main_h = self._get_video_dimensions_cached(file_path)
@@ -9216,17 +9698,14 @@ class FFmpegBatchGUI:
                     y_val = main_h - wm_h - 10
                 x_val = max(0, min(x_val, main_w - wm_w))
                 y_val = max(0, min(y_val, main_h - wm_h))
-                drawbox = f"drawbox=x={x_val}:y={y_val}:w={wm_w}:h={wm_h}:color=red@0.3:t=3"
-                filter_parts.append(drawbox)
+                drawbox_expr = f"x={x_val}:y={y_val}:w={wm_w}:h={wm_h}:color=red@0.3:t=3"
                 self._append_info_ui(_("[预览] 水印虚拟框: 位置({0}, {1}) 尺寸{2}x{3}").format(x_val, y_val, wm_w, wm_h))
     
-        # ----- 3. 文字水印 drawtext（必须在自适应缩放之前，坐标按原始分辨率） -----
-        dt = build_drawtext_filter(settings.get("text_watermark", {}))
-        if dt:
-            filter_parts.append(dt)
-            self._append_info_ui(_("[预览] 已添加文字水印 drawtext"))
+        # ----- 3. 文字水印判定：旋转/spin/轨迹需复杂图，普通 drawtext 走 -vf 链 -----
+        tw_settings = settings.get("text_watermark", {})
+        _tw_enabled, _tw_rotate = text_watermark_active(tw_settings)
 
-        # ----- 4. 自适应缩放（放在最后，确保 drawtext 坐标基于原始分辨率） -----
+        # ----- 4. 自适应缩放参数（旋转路径并入复杂图；普通路径追加 vf） -----
         orig_w, orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, file_path, settings)
         if orig_w is None or orig_h is None:
             orig_w, orig_h = self._get_video_dimensions_cached(file_path)
@@ -9240,7 +9719,7 @@ class FFmpegBatchGUI:
         margin = 80
         max_w = screen_w - margin
         max_h = screen_h - margin
-        
+        scale_expr = ""
         if final_w > max_w or final_h > max_h:
             scale = min(max_w / final_w, max_h / final_h)
             target_w = int(final_w * scale)
@@ -9249,13 +9728,229 @@ class FFmpegBatchGUI:
             target_h = target_h if target_h % 2 == 0 else target_h - 1
             if target_w < 2: target_w = 2
             if target_h < 2: target_h = 2
-            filter_parts.append(f"scale={target_w}:{target_h}")
+            scale_expr = f"scale={target_w}:{target_h}"
             self._append_info_ui(_("[预览] 视频尺寸 {0}x{1} 超出屏幕，缩放到 {2}x{3}").format(final_w, final_h, target_w, target_h))
         else:
             self._append_info_ui(_("[预览] 视频尺寸 {0}x{1} 适合屏幕，保持原始").format(final_w, final_h))
         
-        # ----- 构建最终滤镜链（空则留空，不用 "null"） -----
-        filter_chain = ",".join(filter_parts) if filter_parts else ""
+        # ----- 4b. 复杂预览：mpv --lavfi-complex（文字水印旋转/图片水印真实合成），
+        #            ffplay -vf 分号图（文字水印旋转，用户实测格式：-vf 直接支持分号多段图）；
+        #            其余场景走普通 -vf 链（图片水印占位框） ----
+        filter_chain = ""
+        lavfi_complex_str = None
+        use_mpv = bool(self.use_mpv.get())
+        wm_active = bool(wm_settings.get("enabled", False)) and bool((wm_settings.get("file_path", "") or "").strip())
+        # 手动时长：从自定义参数解析 -t（如 -t 10），复杂预览时水印 overlay enable 用 lt(t,T) 且去掉 shortest
+        manual_t = None
+        try:
+            _mt = re.search(r"(?:^|\s)-t\s+(\d+(?:\.\d+)?)", settings.get("custom_args", "") or "")
+            if _mt:
+                manual_t = float(_mt.group(1))
+        except Exception:
+            manual_t = None
+
+        if use_mpv and (_tw_rotate or wm_active):
+            # ================= mpv：--lavfi-complex 复杂图（用户实测格式） =================
+            fc_parts = []
+            cur = "[VIN]"
+            if base_vf and base_vf != "null":
+                fc_parts.append(f"[VIN]{base_vf}[v0]")
+                cur = "[v0]"
+            else:
+                fc_parts.append("[VIN]format=yuv420p[v0]")
+                cur = "[v0]"
+            # ---- 图片水印：movie 源 + 子视频滤镜链（裁剪/缩放 base_vf + 绿幕 + 透明度 + 旋转）----
+            if wm_active:
+                wm_file = wm_settings.get("file_path", "").strip()
+                # 探测子视频渲染尺寸（与正式命令同套逻辑）
+                try:
+                    _wm_ow, _wm_oh = get_video_rotated_dimensions(self.ffprobe_cmd, wm_file, wm_settings)
+                    if _wm_ow is None or _wm_oh is None:
+                        _wm_ow, _wm_oh = 320, 240
+                    _mdim = self._get_video_dimensions_cached(file_path)
+                    _main_w = _mdim[0] or 1280
+                    _main_h = _mdim[1] or 720
+                    adapted_wm2 = self._adapt_sub_settings(wm_settings, _main_w, _main_h,
+                                                           _wm_ow, _wm_oh) if wm_settings.get("adaptive", False) else wm_settings
+                    _ow2, _oh2 = get_video_rotated_dimensions(self.ffprobe_cmd, wm_file, adapted_wm2)
+                    if _ow2 is None or _oh2 is None:
+                        _ow2, _oh2 = _wm_ow, _wm_oh
+                    wm_w2, wm_h2 = compute_rendered_size(_ow2, _oh2, adapted_wm2)
+                    if wm_w2 <= 0 or wm_h2 <= 0:
+                        wm_w2, wm_h2 = _ow2, _oh2
+                except Exception:
+                    adapted_wm2 = wm_settings
+                    wm_w2, wm_h2 = 320, 240
+                    _main_w, _main_h = 1280, 720
+                # movie 源：路径统一正斜杠 + 冒号转义 \\:（movie 滤镜参数解析中 \ 是转义符，
+                # Windows 反斜杠路径必须转成正斜杠，否则 \U \A 等会被当作无效转义）；
+                # 含 [ ] ' , ; 等 filtergraph 特殊字符的路径先用临时硬链接/副本规避
+                # （实测这些字符无法转义，全报错）。
+                path_esc = self._movie_path_safe(wm_file).replace("\\", "/").replace(":", "\\\\:")
+                # 子视频滤镜链：直接复用主滤镜构建函数（排除倒放/加速/字幕/像素格式等 mpv 预览不支持的），
+                # 不在此重写滤镜链；缩放统一用渲染尺寸 scale，随后绿幕/透明度 → 自旋转
+                sub_vf_parts = []
+                _sub_base = build_video_filter_chain(
+                    dict(adapted_wm2, hw_filter_mode="cpu"),
+                    include_subtitle=False,
+                    include_speed=False,
+                    include_trim=False,
+                    include_format=False,
+                    include_scale=False,
+                    enhance_settings=adapted_wm2.get("enhance", {}),
+                    reverse=False,
+                )
+                if _sub_base and _sub_base != "null":
+                    sub_vf_parts.append(_sub_base)
+                # 渲染尺寸缩放（与正式命令一致，overlay x/y 数值基准基于此尺寸）
+                sub_vf_parts.append(f"scale={wm_w2}:{wm_h2}")
+                _chroma2 = bool(adapted_wm2.get("chroma_enabled", False))
+                _alpha2 = bool(adapted_wm2.get("alpha_enabled", False))
+                # 注意：enc_settings["rotate"] 是「视频滤镜」的方向字符串（"90"/"180"/"270"），
+                # 已由 build_video_filter_chain 处理成 transpose——**不要**在这里再当角度追加 rotate
+                # （否则 rotate="270" 会 transpose 一次 + rotate 270° 一次 = 双重旋转）。
+                # 子视频只有 spin 持续旋转需要显式 rotate（与正式命令 _build_overlay_filter_complex 一致）。
+                _spin2 = bool(adapted_wm2.get("spin_enabled", False))
+                try:
+                    _sp2 = float(adapted_wm2.get("spin_speed", 60.0) or 60.0)
+                except (ValueError, TypeError):
+                    _sp2 = 60.0
+                if _chroma2 or _alpha2 or (_spin2 and _sp2 != 0):
+                    sub_vf_parts.append("format=rgba")
+                if _chroma2:
+                    _cc = str(adapted_wm2.get("chroma_color", "green") or "green")
+                    if _cc.startswith("#"):
+                        _cc = "0x" + _cc[1:].upper()
+                    try:
+                        _sim = float(adapted_wm2.get("chroma_similarity", 0.3))
+                    except (ValueError, TypeError):
+                        _sim = 0.3
+                    if _sim <= 0:
+                        _sim = 0.00001
+                    try:
+                        _blend = float(adapted_wm2.get("chroma_blend", 0.1))
+                    except (ValueError, TypeError):
+                        _blend = 0.1
+                    if (adapted_wm2.get("chroma_filter_type", "chromakey") or "chromakey") == "colorkey":
+                        sub_vf_parts.append(f"format=rgb24,colorkey={_cc}:{_sim}:{_blend}")
+                    else:
+                        sub_vf_parts.append(f"chromakey={_cc}:{_sim}:{_blend}")
+                if _alpha2:
+                    try:
+                        _av = float(adapted_wm2.get("alpha_value", 1.0))
+                    except (ValueError, TypeError):
+                        _av = 1.0
+                    if 0.0 <= _av <= 1.0:
+                        sub_vf_parts.append(f"colorchannelmixer=aa={_av:.2f}")
+                if _spin2 and _sp2 != 0:
+                    sub_vf_parts.append(f"rotate=angle='{_sp2}*PI/180*t':ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=black@0")
+                sub_chain = ",".join(sub_vf_parts) if sub_vf_parts else "null"
+                fc_parts.append(f"movie={path_esc}:loop=0,setpts=N/FRAME_RATE/TB[sub]")
+                fc_parts.append(f"[sub]{sub_chain}[sub_rot]")
+                _mv2 = (adapted_wm2.get("move_mode", "") or "").strip()
+                x_expr = str(adapted_wm2.get("overlay_x", "W-w-10") or "W-w-10")
+                y_expr = str(adapted_wm2.get("overlay_y", "H-h-10") or "H-h-10")
+                if _mv2:
+                    _mx2, _my2 = build_move_xy_expr(_mv2, x_expr, y_expr, adapted_wm2, sw="w", sh="h")
+                    if _mx2 is not None:
+                        x_expr = _mx2.replace("W", "main_w").replace("H", "main_h")
+                        y_expr = _my2.replace("W", "main_w").replace("H", "main_h")
+                else:
+                    # 基准位置必须求值成数字：mpv overlay 只认数值/原生变量，
+                    # 字符串替换残留（如 main_720-720-10）会让 mpv 只出进程无画面。
+                    _ctx2 = {"W": _main_w, "H": _main_h, "w": wm_w2, "h": wm_h2}
+                    _xv2 = safe_eval_expr(x_expr, _ctx2)
+                    _yv2 = safe_eval_expr(y_expr, _ctx2)
+                    x_expr = str(_xv2) if _xv2 is not None else str(_main_w - wm_w2 - 10)
+                    y_expr = str(_yv2) if _yv2 is not None else str(_main_h - wm_h2 - 10)
+                # enable 表达式：显示时段/循环控制（起始/结束/周期/单次）优先——与正式命令同一套
+                # _calc_enable_expr；未设显示控制时：手动 -t 优先，否则自动取主视频时长 →
+                # enable='lt(t,T)' + eof_action=pass（movie 源自带的音频不再被 shortest 截断输出）。
+                try:
+                    _wm_dur = self._get_media_duration(wm_file)
+                except Exception:
+                    _wm_dur = None
+                _ov_expr = self._calc_enable_expr(adapted_wm2, _wm_dur)
+                if _ov_expr == "1":
+                    if manual_t is not None:
+                        _ov_expr = f"lt(t,{manual_t:.3f})"
+                    else:
+                        try:
+                            _main_dur = self._get_media_duration(file_path)
+                        except Exception:
+                            _main_dur = None
+                        if _main_dur and _main_dur > 0:
+                            _ov_expr = f"lt(t,{_main_dur:.3f})"
+                if _ov_expr != "1":
+                    fc_parts.append(f"{cur}[sub_rot]overlay=x='{x_expr}':y='{y_expr}':"
+                                    f"enable='{_ov_expr}':eof_action=pass[v_wm]")
+                else:
+                    # 兜底：拿不到任何时长信息退回 shortest=1
+                    fc_parts.append(f"{cur}[sub_rot]overlay=x='{x_expr}':y='{y_expr}':enable='1':shortest=1[v_wm]")
+                cur = "[v_wm]"
+                self._append_info_ui(_("[预览] 图片水印：mpv movie 真实合成（{0}x{1}）").format(wm_w2, wm_h2))
+            # ---- 文字水印：普通 drawtext（含显示时段/循环 enable）或旋转子图都接入 ----
+            # 旋转时走透明层子图（eof_action=pass）；非旋转直接 drawtext 片段（enable 由
+            # _build_drawtext_enable 生成：显示时段 between / 循环 lt(mod(t,L),D)）。
+            if _tw_enabled:
+                tw_frag = build_text_watermark_filtergraph(tw_settings, main_label=cur, out_label="[v_tw]")
+                if tw_frag:
+                    if manual_t is not None:
+                        tw_frag = tw_frag.replace(":format=auto",
+                                                  f":format=auto:eof_action=pass:enable='lt(t,{manual_t:.3f})'")
+                    elif _tw_rotate:
+                        tw_frag = tw_frag.replace(":format=auto", ":format=auto:eof_action=pass")
+                    fc_parts.append(tw_frag)
+                    cur = "[v_tw]"
+                    self._append_info_ui(_("[预览] 文字水印：mpv lavfi-complex 预览"))
+            # ---- 屏幕缩放 / 兜底 null 输出 ----
+            fc_parts.append(f"{cur}{scale_expr}[VOUT]" if scale_expr else f"{cur}null[VOUT]")
+            # ---- 音频 passthrough（仅当源含音频流；无音频不引用 [AIN]，避免 mpv 报错） ----
+            has_audio = False
+            info = self._get_cached_stream_info(file_path)
+            if info:
+                has_audio = any(s.get("codec_type") == "audio" for s in info.get("streams", []))
+            if has_audio:
+                fc_parts.append("[AIN]anull[AOUT]")
+            lavfi_complex_str = ";".join(fc_parts)
+
+        elif _tw_rotate and not use_mpv:
+            # ================= ffplay：-vf 分号多段图（用户实测格式，无需 lavfi 包装） =================
+            vf_parts = []
+            if base_vf and base_vf != "null":
+                vf_parts.append(f"{base_vf}[v0]")
+                cur = "[v0]"
+            else:
+                vf_parts.append("format=yuv420p[v0]")
+                cur = "[v0]"
+            if drawbox_expr:
+                vf_parts.append(f"{cur}drawbox={drawbox_expr}[v1]")
+                cur = "[v1]"
+            tw_out = "[v_tw]" if scale_expr else ""
+            tw_frag = build_text_watermark_filtergraph(tw_settings, main_label=cur, out_label=tw_out)
+            if tw_frag:
+                if manual_t is not None:
+                    tw_frag = tw_frag.replace(":format=auto",
+                                              f":format=auto:eof_action=pass:enable='lt(t,{manual_t:.3f})'")
+                else:
+                    tw_frag = tw_frag.replace(":format=auto", ":format=auto:eof_action=pass")
+                vf_parts.append(tw_frag)
+                if scale_expr:
+                    vf_parts.append(f"[v_tw]{scale_expr}")
+                filter_chain = ";".join(vf_parts)
+                self._append_info_ui(_("[预览] 文字水印旋转/轨迹：ffplay -vf 分号图预览"))
+
+        # ----- 5. 普通路径：文字水印 drawtext + 图片水印占位框 + 缩放 -----
+        if not lavfi_complex_str and not filter_chain:
+            if drawbox_expr:
+                filter_parts.append(f"drawbox={drawbox_expr}")
+            dt = build_drawtext_filter(tw_settings)
+            if dt:
+                filter_parts.append(dt)
+                self._append_info_ui(_("[预览] 已添加文字水印 drawtext"))
+            if scale_expr:
+                filter_parts.append(scale_expr)
+            filter_chain = ",".join(filter_parts) if filter_parts else ""
     
         # ----- 4. 音频滤镜（变速 / 音量 / EQ / 降噪） -----
         extra_args = []
@@ -9314,7 +10009,8 @@ class FFmpegBatchGUI:
             volume=10,
             extra_args=extra_args,
             start_time=start_sec,
-            duration=duration
+            duration=duration,
+            lavfi_complex=lavfi_complex_str
         )
 
     # ---------- 输出路径生成与命令构建 ----------
@@ -9835,12 +10531,24 @@ class FFmpegBatchGUI:
                     enhance_settings=enhance_settings,
                     reverse=settings.get('reverse_enabled', False),
                 )
-                # 追加文字水印 drawtext
-                dt = build_drawtext_filter(settings.get("text_watermark", {}))
-                if dt:
-                    vf = f"{vf},{dt}" if vf != "null" else dt
-                if vf != "null":
-                    cmd_list.extend(["-vf", vf])
+                # 文字水印（旋转时走透明层+rotate+overlay，需 filter_complex）
+                tw_settings = settings.get("text_watermark", {})
+                _tw_enabled, _tw_rotate = text_watermark_active(tw_settings)
+                if _tw_rotate:
+                    base_vf = vf if (vf and vf != "null") else "null"
+                    fc = f"[0:v]{base_vf}[v_tw_base];" + build_text_watermark_filtergraph(
+                        tw_settings, main_label="[v_tw_base]", out_label="[v_tw]")
+                    cmd_list.extend(["-filter_complex", fc])
+                    cmd_list.extend(["-map", "[v_tw]"])
+                    if settings.get("audio_enabled", True):
+                        cmd_list.extend(["-map", "0:a?"])
+                        cmd_list.extend(["-map", "0:s?"])
+                else:
+                    dt = build_drawtext_filter(tw_settings)
+                    if dt:
+                        vf = f"{vf},{dt}" if vf != "null" else dt
+                    if vf != "null":
+                        cmd_list.extend(["-vf", vf])
 
                 cmd_list = self._build_video_encoding_params(cmd_list, settings)
     
@@ -9864,6 +10572,12 @@ class FFmpegBatchGUI:
             if container in ("mp4", "mov"):
                 cmd_list.extend(["-movflags", "+faststart"])
     
+        # 文字水印（旋转/spin）无限源时长限制：优先 -shortest，无音频用 -t
+        _ensure_tw_duration_limit(
+            self, cmd_list, input_path=input_path,
+            main_duration=self._get_media_duration(input_path) if input_path else None,
+            audio_enabled=settings.get("audio_enabled", True))
+
         cmd_list.append(output_path)
 
         # 普通模式处理长滤镜
@@ -9914,6 +10628,10 @@ class FFmpegBatchGUI:
         wm_file_raw = wm_settings.get("file_path", "").strip()
         wm_orig_w, wm_orig_h = None, None
         if wm_file_raw and os.path.exists(wm_file_raw):
+            # 注意：水印尺寸必须取「旋转后」尺寸（元数据 rotation + 用户 rotate），
+            # 与 get_video_rotated_dimensions 语义一致；切勿改用不旋转的
+            # _cached_video_dimensions / get_video_dimensions，否则水印忽略旋转，
+            # 会造成命令预览与实际转换结果不一致。
             wm_orig_w, wm_orig_h = self._cached_video_rotated_dimensions(wm_file_raw, wm_settings)
         if main_w is not None and main_h is not None:
             if wm_settings.get("adaptive", False):
@@ -10022,12 +10740,12 @@ class FFmpegBatchGUI:
             0, settings, sub_infos, include_subtitle_main=True,
             enhance_settings=enhance_settings
         )
-        # 追加文字水印 drawtext（在 overlay 之后）
-        dt = build_drawtext_filter(settings.get("text_watermark", {}))
-        if dt:
-            new_label = "[v_dtext]"
-            complex_filter = f"{complex_filter};{final_v_label}{dt}{new_label}"
-            final_v_label = new_label
+        # 追加文字水印（在 overlay 之后；旋转时走透明层+rotate+overlay 子图）
+        tw_settings = settings.get("text_watermark", {})
+        tw_frag = build_text_watermark_filtergraph(tw_settings, main_label=final_v_label, out_label="[v_dtext]")
+        if tw_frag:
+            complex_filter = f"{complex_filter};{tw_frag}"
+            final_v_label = "[v_dtext]"
         cmd_list.extend(["-filter_complex", complex_filter])
         cmd_list.extend(["-map", final_v_label])
     
@@ -12598,6 +13316,7 @@ class FFmpegBatchGUI:
         menu.add_command(label=_("编辑轨道"), command=self.merge_edit_selected)
         menu.add_command(label=_("预览轨道"), command=self.merge_preview_selected)
         menu.add_command(label=_("预览轨道(快照)"), command=lambda: self.merge_preview_selected(with_snapshot=True))
+        menu.add_command(label=_("实时预览（画中画，可能卡顿）"), command=self.merge_preview_pip_live)
         menu.add_command(label=_("创建缩略图"), command=self._contact_sheet_selected_track)
         menu.add_command(label=_("上移轨道"), command=self.merge_move_up_selected)
         menu.add_command(label=_("下移轨道"), command=self.merge_move_down_selected)
@@ -13027,6 +13746,11 @@ class FFmpegBatchGUI:
             "reverse_enabled": False,
             "trim_enabled": False, "trim_start": "0", "trim_end": "", "precise_trim": False,
             "overlay_enabled": True, "overlay_x": "W-w-10", "overlay_y": "H-h-10",
+            "blend_mode": "normal", "overlay_free_layout": False,
+            # 画中画/水印子视频的旋转(spin)与轨迹(move)：还原时必须一并清空，否则残留导致仍旋转/移动
+            "spin_enabled": False, "spin_speed": 60.0,
+            "move_mode": "", "move_cycle": 4.0, "move_amp": "W*0.1",
+            "move_dwell": 2.0, "move_margin": "W*0.03",
             "pad_enabled": False, "pad_width": "", "pad_height": "", "offset_x": "0", "offset_y": "0",
             "loop_enabled": False, "loop_mode": "infinite", "loop_count": 3,
             "chroma_enabled": False, "chroma_color": "#3fff08", "chroma_similarity": 0.3, "chroma_blend": 0.1,
@@ -13477,14 +14201,7 @@ class FFmpegBatchGUI:
     
         if is_image:
             track = Track(0, "video", "image2", path, True)
-            track.enc_settings["scale_enabled"] = True
-            track.enc_settings["scale_width"] = "320"
-            track.enc_settings["scale_height"] = ""
-            track.enc_settings["scale_method"] = "width"
-            track.enc_settings["overlay_enabled"] = True
-            track.enc_settings["overlay_x"] = "W-w-10"
-            track.enc_settings["overlay_y"] = "H-h-10"
-            track.overlay_enabled = True
+            _apply_default_watermark_overlay(track)
             self.merge_tracks.append(track)
             self._append_info_ui(_("[封装] 已添加图片水印: {0}").format(os.path.basename(path)))
             return
@@ -13498,14 +14215,7 @@ class FFmpegBatchGUI:
         # 添加视频轨道
         s = video_streams[0]
         track = Track(s["index"], "video", s.get("codec_name", "unknown"), path, True)
-        track.enc_settings["scale_enabled"] = True
-        track.enc_settings["scale_width"] = "320"
-        track.enc_settings["scale_height"] = ""
-        track.enc_settings["scale_method"] = "width"
-        track.enc_settings["overlay_enabled"] = True
-        track.enc_settings["overlay_x"] = "W-w-10"
-        track.enc_settings["overlay_y"] = "H-h-10"
-        track.overlay_enabled = True
+        _apply_default_watermark_overlay(track)
         self.merge_tracks.append(track)
         self._append_info_ui(_("[封装] 已添加画中画视频: {0}").format(os.path.basename(path)))
     
@@ -13621,14 +14331,7 @@ class FFmpegBatchGUI:
                 track = Track(0, "video", "unknown", vf, True)
                 track.enc_settings["_placeholder"] = True
                 # 画中画默认启用叠加并缩放到320宽（与原有行为一致）
-                track.enc_settings["scale_enabled"] = True
-                track.enc_settings["scale_width"] = "320"
-                track.enc_settings["scale_height"] = ""
-                track.enc_settings["scale_method"] = "width"
-                track.enc_settings["overlay_enabled"] = True
-                track.enc_settings["overlay_x"] = "W-w-10"
-                track.enc_settings["overlay_y"] = "H-h-10"
-                track.overlay_enabled = True
+                _apply_default_watermark_overlay(track)
                 self.merge_tracks.append(track)
             # 立即刷新列表
             self.merge_update_track_list()
@@ -13700,14 +14403,7 @@ class FFmpegBatchGUI:
                     s = video_streams[0]
                     track = Track(s['index'], "video", s.get('codec_name', 'unknown'), vf, True)
                     # 保留画中画默认设置
-                    track.enc_settings["scale_enabled"] = True
-                    track.enc_settings["scale_width"] = "320"
-                    track.enc_settings["scale_height"] = ""
-                    track.enc_settings["scale_method"] = "width"
-                    track.enc_settings["overlay_enabled"] = True
-                    track.enc_settings["overlay_x"] = "W-w-10"
-                    track.enc_settings["overlay_y"] = "H-h-10"
-                    track.overlay_enabled = True
+                    _apply_default_watermark_overlay(track)
                     # 直接添加，不再检查重复
                     self.merge_tracks.append(track)
                     self._append_info_ui(_("[封装] 已解析并添加画中画视频: {0}").format(os.path.basename(vf)))
@@ -14485,6 +15181,19 @@ class FFmpegBatchGUI:
             parts.append(f"afade=t=out:st={st:.3f}:d={fout_s:.3f}")
         return ",".join(parts)
     
+    def _apply_text_watermark_injection(self, video_tracks):
+        """「注入到封装页」开关：开启且已启用文字水印时，把全局文字水印设置写入主视频
+        轨道 enc_settings，供封装页 3 个模式（普通/画中画/串行）命令构建使用；
+        否则清除该键，保证转码页设置不会污染封装页（默认关闭）。"""
+        if not video_tracks:
+            return
+        tw = self.text_watermark_settings
+        main = video_tracks[0]
+        if tw.get("inject_to_packaging") and tw.get("enabled") and (tw.get("text", "") or "").strip():
+            main.enc_settings["text_watermark"] = copy.deepcopy(tw)
+        else:
+            main.enc_settings.pop("text_watermark", None)
+
     def _build_normal_cmd(self, enabled_tracks, output_norm, only_audio=False):
         """
         普通封装模式：支持视频滤镜、多音频/字幕、音频截取、音频混合（amix）与音量调整。
@@ -14528,7 +15237,9 @@ class FFmpegBatchGUI:
                 self._append_info_ui(_("[封装] 没有启用的视频轨道"))
                 return []
             main_video = video_tracks[0]
-    
+            # 注入到封装页（按需）：把全局文字水印带入封装普通模式
+            self._apply_text_watermark_injection(video_tracks)
+
             # 在添加输入之前插入硬件解码参数（使用主视频设置）
             self._add_hwaccel_params(cmd, main_video.enc_settings)
     
@@ -14540,7 +15251,6 @@ class FFmpegBatchGUI:
     
             # 视频处理
             v_idx = file_index[main_video.file_path]
-            cmd.extend(["-map", f"{v_idx}:v:{main_video._type_index}"])
             v_settings = main_video.enc_settings
             vcodec = v_settings.get("encoder", "copy")
             video_reverse = v_settings.get("reverse_enabled", False)
@@ -14548,8 +15258,14 @@ class FFmpegBatchGUI:
                 video_reverse = False
                 self._append_info_ui(_("[封装] 主视频为流复制模式，已自动禁用视频倒放"))
 
+            # 文字水印旋转判定（提前，决定是否走 filter_complex 并跳过原始视频 -map）
+            _tw = v_settings.get("text_watermark", {})
+            _tw_enabled, _tw_rotate = text_watermark_active(_tw)
+            if not _tw_rotate:
+                cmd.extend(["-map", f"{v_idx}:v:{main_video._type_index}"])
+
             # 文字水印需要滤镜，流复制无法支持 → 强制重编码
-            if vcodec == "copy" and v_settings.get("text_watermark", {}).get("enabled", False):
+            if vcodec == "copy" and _tw.get("enabled", False):
                 vcodec = "libx265"
                 v_settings["encoder"] = vcodec
                 self._append_info_ui(_("[封装] 文字水印需要重新编码，已自动改为 libx265。"))
@@ -14565,12 +15281,20 @@ class FFmpegBatchGUI:
                     reverse=video_reverse,
                     clip_duration=self._get_media_duration(main_video.file_path)
                 )
-                # 追加文字水印 drawtext
-                dt = build_drawtext_filter(v_settings.get("text_watermark", {}))
-                if dt:
-                    video_filters = f"{video_filters},{dt}" if video_filters and video_filters != "null" else dt
-                if video_filters and video_filters != "null":
-                    cmd.extend(["-vf", video_filters])
+                if _tw_rotate:
+                    # 旋转：主视频先接出临时标签，文字子图（透明层+rotate+overlay）接在后面
+                    main_vlabel = f"[{v_idx}:v:{main_video._type_index}]"
+                    base_vf = video_filters if (video_filters and video_filters != "null") else "null"
+                    fc = f"{main_vlabel}{base_vf}[v_tw_base];" + build_text_watermark_filtergraph(
+                        _tw, main_label="[v_tw_base]", out_label="[v_tw]")
+                    cmd.extend(["-filter_complex", fc])
+                    cmd.extend(["-map", "[v_tw]"])
+                else:
+                    dt = build_drawtext_filter(_tw)
+                    if dt:
+                        video_filters = f"{video_filters},{dt}" if video_filters and video_filters != "null" else dt
+                    if video_filters and video_filters != "null":
+                        cmd.extend(["-vf", video_filters])
                 strategy = get_encoder_strategy(vcodec)
                 cmd = strategy.build_params(cmd, v_settings)
     
@@ -14737,6 +15461,12 @@ class FFmpegBatchGUI:
         if container in ("mp4", "mov") and not only_audio:
             cmd.extend(["-movflags", "+faststart"])
     
+        # 文字水印（旋转/spin）无限源时长限制：有音频用 -shortest，无音频用 -t（主视频时长）
+        _ensure_tw_duration_limit(
+            self, cmd, input_path=main_video.file_path,
+            main_duration=self._get_media_duration(main_video.file_path),
+            audio_enabled=True)
+
         cmd.append(output_norm)
         return cmd
     
@@ -14755,6 +15485,8 @@ class FFmpegBatchGUI:
             self._append_info_ui(_("[封装-画] 没有启用的视频轨道"))
             return []
         main_video = video_tracks[0]
+        # 注入到封装页（按需）：把全局文字水印带入封装画中画模式
+        self._apply_text_watermark_injection(video_tracks)
         sub_videos = video_tracks[1:]
     
         # 画中画模式下强制使用精准截取（由滤镜处理）
@@ -14793,12 +15525,12 @@ class FFmpegBatchGUI:
             reverse=reverse_flag,
             main_file_path=main_video.file_path
         )
-        # 追加文字水印 drawtext（在 overlay 之后）
-        dt = build_drawtext_filter(main_video.enc_settings.get("text_watermark", {}))
-        if dt:
-            new_label = "[v_dtext]"
-            complex_filter = f"{complex_filter};{final_v_label}{dt}{new_label}"
-            final_v_label = new_label
+        # 追加文字水印（在 overlay 之后；旋转时走透明层+rotate+overlay 子图）
+        tw_settings = main_video.enc_settings.get("text_watermark", {})
+        tw_frag = build_text_watermark_filtergraph(tw_settings, main_label=final_v_label, out_label="[v_dtext]")
+        if tw_frag:
+            complex_filter = f"{complex_filter};{tw_frag}"
+            final_v_label = "[v_dtext]"
         cmd.extend(["-filter_complex", complex_filter])
         cmd.extend(["-map", final_v_label])
     
@@ -14897,6 +15629,8 @@ class FFmpegBatchGUI:
 
         audio_tracks = [t for t in enabled_tracks if t.type == "audio"]
         main_video = video_tracks[0]
+        # 注入到封装页（按需）：把全局文字水印带入封装串行模式
+        self._apply_text_watermark_injection(video_tracks)
 
         # 判断使用哪种模式
         vcodec = main_video.enc_settings.get("encoder", "copy")
@@ -15323,17 +16057,29 @@ class FFmpegBatchGUI:
             if sub_path:
                 safe_sub_path = sub_path.replace("'", "\\'")
                 global_video_filters.append(f"subtitles=filename='{safe_sub_path}'")
-        # 文字水印 drawtext（跟随主视频设置）
-        dt = build_drawtext_filter(main_video.enc_settings.get("text_watermark", {}))
-        if dt:
-            global_video_filters.append(dt)
-
-        if global_video_filters:
-            video_global_chain = ",".join(global_video_filters)
-            filter_parts.append(f"[vout]{video_global_chain}[vfinal]")
-            vmap = "[vfinal]"
+        # 文字水印（跟随主视频设置；旋转时走透明层+rotate+overlay 子图）
+        tw_settings = main_video.enc_settings.get("text_watermark", {})
+        _tw_enabled, _tw_rotate = text_watermark_active(tw_settings)
+        if _tw_rotate:
+            # 旋转：global_video_filters 先接到临时标签，文字子图接在后面
+            video_global_chain = ",".join(global_video_filters) if global_video_filters else "null"
+            if global_video_filters:
+                filter_parts.append(f"[vout]{video_global_chain}[v_pre]")
+                tw_in = "[v_pre]"
+            else:
+                tw_in = "[vout]"
+            filter_parts.append(build_text_watermark_filtergraph(tw_settings, main_label=tw_in, out_label="[v_tw]"))
+            vmap = "[v_tw]"
         else:
-            vmap = "[vout]"
+            dt = build_drawtext_filter(tw_settings)
+            if dt:
+                global_video_filters.append(dt)
+            if global_video_filters:
+                video_global_chain = ",".join(global_video_filters)
+                filter_parts.append(f"[vout]{video_global_chain}[vfinal]")
+                vmap = "[vfinal]"
+            else:
+                vmap = "[vout]"
 
         # ----- 6. 音频拼接 / 逐轨交叉溶解转场（acrossfade，跟随对应视频段的转场开关） -----
         # 音频段与视频段 1:1 对应：段 k-1 开了转场 → 音频段 k-1↔k 之间 acrossfade；否则硬切。
@@ -15425,6 +16171,11 @@ class FFmpegBatchGUI:
     
         # 容器优化
         self._add_container_optimization(cmd)
+        # 文字水印（旋转/spin）无限源时长限制：各段有限流，-shortest 正确截断到总时长
+        _ensure_tw_duration_limit(
+            self, cmd, input_path=main_video.file_path,
+            main_duration=None, audio_enabled=True)
+
         cmd.append(output_norm)
         self._append_info_ui(f"[串联-编] 使用 filter_complex 重新编码模式（{n} 个片段）")
         return cmd
@@ -15456,11 +16207,8 @@ class FFmpegBatchGUI:
             self._append_info_ui(_("[封装] 没有启用的轨道"))
             return []
 
-        # 将全局文字水印设置传递到主视频轨道（供 PIP/concat 命令构建使用）
-        video_tracks = [t for t in enabled_tracks if t.type == "video"]
-        if video_tracks:
-            video_tracks[0].enc_settings["text_watermark"] = copy.deepcopy(self.text_watermark_settings)
-
+        # 文字水印注入改为各封装模式构建器内按「注入到封装页」开关按需执行
+        # （_apply_text_watermark_injection），此处不再无条件塞入主视频 enc_settings。
         output_norm = normalize_path(output)
     
         # ---- 仅音频模式：强制普通封装，并自动调整输出扩展名 ----
@@ -16017,11 +16765,221 @@ class FFmpegBatchGUI:
             return
         self.merge_preview_track(indices[0], with_snapshot=with_snapshot)
 
+    def merge_preview_pip_live(self):
+        """画中画实时预览（mpv --lavfi-complex）：主视频 + 各子视频走 movie 滤镜真实合成。
+        所有子视频渲染滤镜与正式命令一致（裁剪/缩放/绿幕/透明度/旋转/轨迹）；
+        mpv 的 lavfi-complex 多输入只能引用主文件流，子视频必须用 movie 滤镜（防卡顿）。
+        子视频最多 15 个（防止复杂图过大卡死），超出在日志提示。"""
+        if not self.pip_enabled.get():
+            self._append_info_ui(_("[预览] 实时预览仅画中画模式可用"))
+            return
+        if not self.use_mpv.get():
+            messagebox.showinfo(_("提示"), _("实时预览需要 mpv 播放器（lavfi-complex 复杂图）"))
+            return
+        if not self.ffmpeg_cmd:
+            self._append_info_ui(_("[预览] 未找到 ffmpeg，无法生成实时预览"))
+            return
+        enabled_tracks = [t for t in self.merge_tracks if t.enabled]
+        video_tracks = [t for t in enabled_tracks if t.type == "video"]
+        if not video_tracks:
+            self._append_info_ui(_("[封装-画] 没有启用的视频轨道"))
+            return
+        main_video = video_tracks[0]
+        sub_videos = video_tracks[1:]
+        if len(sub_videos) > 15:
+            self._append_info_ui(_("[预览] 子视频数量 {0} 超过 15 个，实时预览仅支持前 15 个").format(len(sub_videos)))
+            sub_videos = sub_videos[:15]
+        main_file = normalize_path(main_video.file_path)
+
+        parts = []
+        # ---- 主视频（[vid1]）----
+        _ms = dict(main_video.enc_settings)
+        _ms["hw_filter_mode"] = "cpu"
+        base_vf = build_video_filter_chain(
+            _ms, include_subtitle=False, include_speed=False, include_trim=False,
+            enhance_settings=_ms.get("enhance", {}), reverse=False,
+        )
+        cur = "[vid1]"
+        if base_vf and base_vf != "null":
+            parts.append(f"[vid1]{base_vf}[v0]")
+            cur = "[v0]"
+        else:
+            parts.append("[vid1]format=yuv420p[v0]")
+            cur = "[v0]"
+        _mdim = self._get_video_dimensions_cached(main_file)
+        _main_w = _mdim[0] or 1280
+        _main_h = _mdim[1] or 720
+        # 主视频时长（enable 上限，防 movie 音频截断）
+        _main_dur = None
+        try:
+            _main_dur = self._get_media_duration(main_file)
+        except Exception:
+            _main_dur = None
+        # ---- 主视频画布偏移（pad）----
+        if _ms.get("pad_enabled", False):
+            _pw = str(_ms.get("pad_width", "") or "").strip()
+            _ph = str(_ms.get("pad_height", "") or "").strip()
+            if _pw and _ph:
+                _ox = str(_ms.get("offset_x", "0") or "0").strip() or "0"
+                _oy = str(_ms.get("offset_y", "0") or "0").strip() or "0"
+                # 画布必须限制时长：color 默认无限源，主视频播完后会只剩黑画布继续输出
+                # （movie 子视频 loop=0 已播完消失）。有主视频时长 → color:duration=主视频时长，
+                # 画布与主视频同长一起结束；拿不到时长 → overlay shortest=1（任一输入结束即结束，
+                # 基于实际流时长；eof_action=pass 实测此 ffmpeg 版本不生效会卡死）。
+                _pad_dur = ""
+                if _main_dur and _main_dur > 0:
+                    _pad_dur = f":duration={_main_dur:.3f}"
+                parts.append(f"color=c=black:s={_pw}x{_ph}{_pad_dur}[canvas]")
+                if _pad_dur:
+                    parts.append(f"[canvas]{cur}overlay={_ox}:{_oy}[v_main_pad]")
+                else:
+                    parts.append(f"[canvas]{cur}overlay={_ox}:{_oy}:shortest=1[v_main_pad]")
+                cur = "[v_main_pad]"
+                self._append_info_ui(_("[预览] 主视频画布偏移：{0}x{1} @ ({2},{3})").format(_pw, _ph, _ox, _oy))
+
+        # ---- 子视频：movie 滤镜路线（最多 15 个）----
+        for _k, _sv in enumerate(sub_videos):
+            _s = _sv.enc_settings
+            _sfile = _sv.file_path
+            try:
+                _ow, _oh = get_video_rotated_dimensions(self.ffprobe_cmd, _sfile, _s)
+                if _ow is None or _oh is None:
+                    _ow, _oh = 320, 240
+                _rw, _rh = compute_rendered_size(_ow, _oh, _s)
+                if _rw <= 0 or _rh <= 0:
+                    _rw, _rh = _ow, _oh
+            except Exception:
+                _rw, _rh = 320, 240
+            _path_esc = self._movie_path_safe(_sfile, _k).replace("\\", "/").replace(":", "\\\\:")
+            _sp = []
+            # 子视频滤镜链：直接复用主滤镜构建函数（排除倒放/加速/字幕/像素格式等 mpv 预览不支持的），
+            # 不在此重写滤镜链；缩放统一用渲染尺寸 scale，随后绿幕/透明度 → 自旋转
+            _sb = build_video_filter_chain(
+                dict(_s, hw_filter_mode="cpu"), include_subtitle=False,
+                include_speed=False, include_trim=False, include_format=False,
+                include_scale=False,
+                enhance_settings=_s.get("enhance", {}), reverse=False,
+            )
+            if _sb and _sb != "null":
+                _sp.append(_sb)
+            # 渲染尺寸缩放（与正式命令一致，overlay x/y 数值基准基于此尺寸）
+            _sp.append(f"scale={_rw}:{_rh}")
+            _chroma = bool(_s.get("chroma_enabled", False))
+            _alpha = bool(_s.get("alpha_enabled", False))
+            # 注意：enc_settings["rotate"] 是「视频滤镜」的方向字符串（"90"/"180"/"270"），
+            # 已由 build_video_filter_chain 处理成 transpose——不要在这里再当角度追加 rotate
+            # （否则 rotate="270" 会 transpose 一次 + rotate 270° 一次 = 双重旋转）。
+            # 子视频只有 spin 持续旋转需要显式 rotate（与正式命令 _build_overlay_filter_complex 一致）。
+            _spin = bool(_s.get("spin_enabled", False))
+            try:
+                _spd = float(_s.get("spin_speed", 60.0) or 60.0)
+            except (ValueError, TypeError):
+                _spd = 60.0
+            if _chroma or _alpha or (_spin and _spd != 0):
+                _sp.append("format=rgba")
+            if _chroma:
+                _cc = str(_s.get("chroma_color", "green") or "green")
+                if _cc.startswith("#"):
+                    _cc = "0x" + _cc[1:].upper()
+                try:
+                    _sim = float(_s.get("chroma_similarity", 0.3))
+                except (ValueError, TypeError):
+                    _sim = 0.3
+                if _sim <= 0:
+                    _sim = 0.00001
+                try:
+                    _bl = float(_s.get("chroma_blend", 0.1))
+                except (ValueError, TypeError):
+                    _bl = 0.1
+                if (_s.get("chroma_filter_type", "chromakey") or "chromakey") == "colorkey":
+                    _sp.append(f"format=rgb24,colorkey={_cc}:{_sim}:{_bl}")
+                else:
+                    _sp.append(f"chromakey={_cc}:{_sim}:{_bl}")
+            if _alpha:
+                try:
+                    _av = float(_s.get("alpha_value", 1.0))
+                except (ValueError, TypeError):
+                    _av = 1.0
+                if 0.0 <= _av <= 1.0:
+                    _sp.append(f"colorchannelmixer=aa={_av:.2f}")
+            if _spin and _spd != 0:
+                _sp.append(f"rotate=angle='{_spd}*PI/180*t':ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=black@0")
+            _sub_chain = ",".join(_sp) if _sp else "null"
+            parts.append(f"movie={_path_esc}:loop=0,setpts=N/FRAME_RATE/TB[sub{_k}]")
+            parts.append(f"[sub{_k}]{_sub_chain}[subr{_k}]")
+            # 位置：move 轨迹或数值化基准
+            _mv = (_s.get("move_mode", "") or "").strip()
+            _x = str(_s.get("overlay_x", "W-w-10") or "W-w-10")
+            _y = str(_s.get("overlay_y", "H-h-10") or "H-h-10")
+            if _mv:
+                _mx, _my = build_move_xy_expr(_mv, _x, _y, _s, sw="w", sh="h")
+                if _mx is not None:
+                    _x = _mx.replace("W", "main_w").replace("H", "main_h")
+                    _y = _my.replace("W", "main_w").replace("H", "main_h")
+            else:
+                _ctx = {"W": _main_w, "H": _main_h, "w": _rw, "h": _rh}
+                _xv = safe_eval_expr(_x, _ctx)
+                _yv = safe_eval_expr(_y, _ctx)
+                _x = str(_xv) if _xv is not None else str(_main_w - _rw - 10)
+                _y = str(_yv) if _yv is not None else str(_main_h - _rh - 10)
+            # enable：显示时段/循环控制（起始/结束/周期/单次）优先，同正式命令 _calc_enable_expr；
+            # 未设显示控制时用主视频时长上限 + eof_action=pass（防 movie 音频截断），拿不到才 shortest 兜底
+            try:
+                _s_dur = self._get_media_duration(_sfile)
+            except Exception:
+                _s_dur = None
+            _ov_expr = self._calc_enable_expr(_s, _s_dur)
+            if _ov_expr == "1" and _main_dur and _main_dur > 0:
+                _ov_expr = f"lt(t,{_main_dur:.3f})"
+            if _ov_expr != "1":
+                parts.append(f"{cur}[subr{_k}]overlay=x='{_x}':y='{_y}':"
+                             f"enable='{_ov_expr}':eof_action=pass[v_sub{_k}]")
+            else:
+                parts.append(f"{cur}[subr{_k}]overlay=x='{_x}':y='{_y}':enable='1':shortest=1[v_sub{_k}]")
+            cur = f"[v_sub{_k}]"
+
+        # ---- 注入到封装页的文字水印（普通/复杂，与正式命令 _build_pip_cmd 一致）----
+        # 实时预览不经过 merge_build_cmd_list 的注入，这里按同一开关逻辑补一次
+        self._apply_text_watermark_injection([main_video])
+        _tw_pip = main_video.enc_settings.get("text_watermark", {})
+        _tw_frag = build_text_watermark_filtergraph(_tw_pip, main_label=cur, out_label="[v_tw]")
+        if _tw_frag:
+            # 旋转子图含 color 无限源：eof_action=pass 主视频结束即停（与转换页预览一致）
+            _tw_frag = _tw_frag.replace(":format=auto", ":format=auto:eof_action=pass")
+            parts.append(_tw_frag)
+            cur = "[v_tw]"
+            self._append_info_ui(_("[预览] 画中画实时预览：已叠加注入的文字水印"))
+
+        parts.append(f"{cur}null[vo]")
+        # 音频：主视频音频 passthrough（多音轨混音预览暂不合成，仅主视频声音）
+        _has_audio = False
+        try:
+            _info = self._get_cached_stream_info(main_file)
+            if _info:
+                _has_audio = any(x.get("codec_type") == "audio" for x in _info.get("streams", []))
+        except Exception:
+            _has_audio = False
+        if _has_audio:
+            parts.append("[aid1]anull[ao]")
+        graph = ";".join(parts)
+
+        player = self.mpv_path.get().strip() or "mpv"
+        cmd = [player, main_file, f"--lavfi-complex={graph}"]
+        self._append_info_ui(_("[预览] 画中画实时预览：mpv lavfi-complex（{0} 个子视频 movie 合成，可能卡顿）").format(len(sub_videos)))
+        self._append_info_ui(_("执行命令: ") + format_cmd_for_display(cmd))
+        try:
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
+        except Exception as e:
+            self._append_info_ui(_("[预览] 实时预览启动失败: {0}").format(e))
+
     def _merge_preview_right_menu(self):
-        """合并页预览按钮右键：快照 / 缩略图 选择菜单"""
+        """合并页预览按钮右键：快照 / 缩略图 / 实时预览 选择菜单"""
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label=_("快照（画中画合成）"), command=lambda: self.merge_preview_selected(with_snapshot=True))
         menu.add_command(label=_("缩略图"), command=self._contact_sheet_selected_track)
+        menu.add_separator()
+        menu.add_command(label=_("实时预览（画中画，可能卡顿）"), command=self.merge_preview_pip_live)
         x = self.root.winfo_pointerx()
         y = self.root.winfo_pointery()
         menu.post(x, y)
@@ -16400,142 +17358,6 @@ class FFmpegBatchGUI:
             map_label = "[v_snap]"
         return complex_filter, map_label
 
-    def _seek_frame_ppm(self, main_file, sub_infos, complex_filter, final_v_label, t):
-        """seek 到 t 秒抽 1 帧（含子视频合成），scale=320 后 PPM 管道输出（零磁盘写）；失败返回 None。"""
-        cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts", "-ss", f"{t:.3f}", "-i", main_file]
-        for _idx, sub_file, _s in sub_infos:
-            cmd += ["-stream_loop", "-1", "-i", sub_file]
-        if complex_filter:
-            sheet_label = f"{complex_filter};{final_v_label}scale=320:-1[sheet]"
-            cmd += ["-filter_complex", sheet_label, "-map", "[sheet]"]
-        else:
-            cmd += ["-vf", "scale=320:-1"]
-        cmd += ["-frames:v", "1", "-f", "image2pipe", "-vcodec", "ppm", "pipe:1"]
-        try:
-            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, creationflags=flags)
-            data = proc.stdout.read()
-            proc.wait(timeout=30)
-            if proc.returncode != 0 or not data:
-                return None
-            return data
-        except Exception:
-            return None
-
-    def _tile_ppm_4x2(self, frames, cols=4):
-        """纯内存把多张 PPM 拼成 cols 列网格（行数自适应），缺失格补灰。返回 PPM bytes。
-        各帧需同尺寸（scale=320:-1 同源同比例）；不一致时按第一帧尺寸裁剪/补灰。"""
-        parsed = []
-        for d in frames:
-            w, h = _ppm_dimensions_from_bytes(d)
-            if w and h:
-                parsed.append((w, h, d))
-        if not parsed:
-            return None
-        w, h = parsed[0][0], parsed[0][1]
-        rows = (len(parsed) + cols - 1) // cols
-        out_w = w * cols
-        out_h = h * rows
-        out = bytearray(f"P6\n{out_w} {out_h}\n255\n".encode())
-        gray = bytes([0x80]) * (w * 3)
-        for r in range(rows):
-            for y in range(h):
-                for c in range(cols):
-                    idx = r * cols + c
-                    if idx < len(parsed):
-                        pw, ph, pd = parsed[idx]
-                        try:
-                            head_end = pd.index(b'\n255\n') + 5
-                            sy = min(y, ph - 1) if ph > 0 else 0
-                            row_start = head_end + sy * pw * 3
-                            row = pd[row_start:row_start + pw * 3]
-                            if len(row) < pw * 3:
-                                row = row + gray[len(row):pw * 3]
-                        except Exception:
-                            row = gray
-                    else:
-                        row = gray
-                    out += row
-        return bytes(out)
-
-    def _show_seek_sheet_async(self, main_file, main_settings, sub_infos, title, running_text):
-        """seek 分段抽帧缩略图：8 个时间点（总长/8 均分段中点）各抽 1 帧——只解码 8 帧，
-        8K 素材秒出（对比 fps 抽帧需解码全片 1 分钟+）。有子视频时每帧走合成滤镜（与成片一致）。
-        Python 纯内存拼 4 列网格（缺失格补灰），零磁盘写。"""
-        if not self.ffmpeg_cmd:
-            return
-        if not hasattr(self, "_snap_ui"):
-            self._snap_ui = {}
-        ui = self._snap_ui.get("sheet")
-        if ui is None or not ui["win"].winfo_exists():
-            win = tk.Toplevel(self.root)
-            ui = {"win": win, "label": ttk.Label(win), "status": ttk.Label(win, text="")}
-            ui["label"].pack(padx=6, pady=6)
-            ui["status"].pack(padx=6, pady=(0, 6))
-            self._snap_ui["sheet"] = ui
-        ui["win"].title(title)
-        ui["status"].config(text=running_text)
-        ui["label"].config(image="", text=_("生成中…"))
-        ui["win"].withdraw()
-        ui["save_dir"] = self.output_dir.get().strip() or ""
-        ui["save_name"] = os.path.splitext(os.path.basename(main_file))[0]
-        ui["img"] = None
-        if ui["save_dir"]:
-            btn_row = getattr(ui, "_btn_row", None)
-            if btn_row is None:
-                btn_row = ttk.Frame(ui["win"])
-                btn_row.pack(padx=6, pady=(0, 6))
-                ttk.Button(btn_row, text=_("保存到…"), command=lambda: self._save_sheet_as(ui)).pack(side=tk.LEFT, padx=4)
-                ttk.Button(btn_row, text=_("一键保存"), command=lambda: self._save_sheet_to_dir(ui)).pack(side=tk.LEFT, padx=4)
-                ui["_btn_row"] = btn_row
-
-        dur = self._get_media_duration(main_file) or 0.0
-        # 有子视频时构建合成滤镜（一次，8 点复用）
-        complex_filter = final_v_label = None
-        if sub_infos:
-            try:
-                complex_filter, final_v_label = self._build_overlay_filter_complex(
-                    0, main_settings, sub_infos,
-                    include_subtitle_main=False,
-                    enhance_settings=main_settings.get("enhance", {}),
-                    reverse=False,
-                    main_file_path=main_file
-                )
-            except Exception as e:
-                self._append_info_ui(_("[缩略图] 合成滤镜构建失败，按纯抽帧处理: {0}").format(e))
-                sub_infos = []
-                complex_filter = final_v_label = None
-
-        def _show_win():
-            w = ui["win"]
-            if w.winfo_exists():
-                w.deiconify()
-                w.lift()
-
-        def worker():
-            frames = []
-            for i in range(8):
-                if dur > 0:
-                    t = dur * (i + 0.5) / 8.0   # 段中点取帧，避开首尾黑场
-                else:
-                    t = max(i * 10.0, 0.0)
-                data = self._seek_frame_ppm(main_file, sub_infos, complex_filter, final_v_label, t)
-                if data:
-                    frames.append(data)
-            if frames:
-                sheet = self._tile_ppm_4x2(frames)
-                if sheet:
-                    def _ok(s=sheet):
-                        _show_win()
-                        self._display_contact_sheet(s)
-                    self.root.after(0, _ok)
-                    return
-            self.root.after(0, lambda: (_show_win(),
-                                         ui["status"].config(text=_("缩略图生成失败"))))
-
-        threading.Thread(target=worker, daemon=True).start()
-
     def _ffmpeg_ppm_to_bytes(self, cmd, out_png):
         """跑 ffmpeg 输出单帧 PPM 到 stdout 管道（零磁盘写、零压缩最快），返回 bytes；失败返回 None。
         cmd 末尾为 '... -vframes/-frames:v 1 -update 1 <out_png>'，内部把输出重写为
@@ -16721,6 +17543,14 @@ class FFmpegBatchGUI:
             reverse=False,
             main_file_path=track.file_path
         )
+        # 注入到封装页的文字水印（普通/复杂，与正式命令 _build_pip_cmd 一致）：
+        # 快照不经过 merge_build_cmd_list 的注入，这里按同一开关逻辑补一次
+        self._apply_text_watermark_injection([track])
+        _tw_settings = track.enc_settings.get("text_watermark", {})
+        _tw_frag = build_text_watermark_filtergraph(_tw_settings, main_label=final_v_label, out_label="[v_dtext]")
+        if _tw_frag:
+            complex_filter = f"{complex_filter};{_tw_frag}"
+            final_v_label = "[v_dtext]"
 
         # ---- 缩放：镜像播放器预览的自适应缩放逻辑（和红框同一个规则） ----
         # 主视频启用 pad 时，最终输出画布为 pad 画布尺寸（含偏移），
@@ -16980,6 +17810,208 @@ class FFmpegBatchGUI:
 
     def _display_watermark_snapshot(self, png_path):
         self._display_snapshot(png_path, "wm")
+
+    def _build_text_watermark_snapshot_cmd(self, file_path, settings):
+        """构建仅文字水印的真实合成快照命令（无图片水印时走这条路径）。
+        与正式渲染一致：build_video_filter_chain + build_text_watermark_filtergraph
+        （支持静态旋转/持续旋转/动态轨迹；-filter_complex 输出单帧 PNG）。"""
+        tw_settings = settings.get("text_watermark", {})
+        if not tw_settings.get("enabled") or not (tw_settings.get("text", "") or "").strip():
+            raise ValueError("文字水印未设置")
+
+        # 强制软件滤镜路径，与正式渲染保持一致
+        main_settings = dict(settings)
+        main_settings["hw_filter_mode"] = "cpu"
+        base_vf = build_video_filter_chain(
+            main_settings,
+            include_subtitle=False,
+            include_speed=False,
+            include_trim=False,
+            enhance_settings=settings.get("enhance", {}),
+            reverse=False,
+            clip_duration=self._get_media_duration(file_path)
+        )
+        base_vf = base_vf if (base_vf and base_vf != "null") else "null"
+        tw_frag = build_text_watermark_filtergraph(tw_settings, main_label="[v_tw_base]", out_label="[v_tw]")
+        if not tw_frag:
+            raise ValueError("文字水印滤镜构建失败")
+        fc = f"[0:v]{base_vf}[v_tw_base];{tw_frag}"
+
+        # ---- 缩放：按最终画布尺寸（含 pad 画布）适配屏幕 ----
+        final_w, final_h = self._compute_output_canvas(main_settings, file_path)
+        fc, map_label = self._append_fit_scale(fc, "[v_tw]", final_w, final_h)
+
+        out_png = os.path.join(tempfile.gettempdir(), "thumb_text_snapshot.png")
+        cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts", "-i", file_path]
+        cmd.extend(["-filter_complex", fc])
+        cmd.extend(["-map", map_label])
+        # 同 _build_pip_snapshot_cmd：加 -update 1 确保单帧 PNG 稳定写出
+        cmd.extend(["-vframes", "1", "-update", "1", out_png])
+        return cmd, out_png, "文字水印快照"
+
+    def _show_text_watermark_snapshot_async(self, file_path, settings):
+        """转码页仅文字水印的快照入口：构造命令后交给通用快照流程。"""
+        try:
+            cmd, out_png, title = self._build_text_watermark_snapshot_cmd(file_path, settings)
+        except Exception as e:
+            self._append_info_ui(_("[预览] 文字水印快照命令构建失败: {0}").format(e))
+            return
+        self._show_snapshot_async(cmd, out_png, "wm", title, "正在生成文字水印快照…", self._display_watermark_snapshot)
+
+    def _seek_frame_ppm(self, main_file, sub_infos, complex_filter, final_v_label, t):
+        """seek 到 t 秒抽 1 帧（含子视频合成），scale=320 后 PPM 管道输出（零磁盘写）；失败返回 None。
+        ⚠️ `-ss` 输入 seek 会把输出 PTS 重置为 0，导致 rotate(时间)/overlay enable(时间)/色键
+        等基于 t 的滤镜在所有 8 个抽帧点都得到 t≈0——自旋转、淡入淡出等时间效果全部丢失。
+        修法：在主/子视频的入口前注入 setpts=PTS+{t}/TB，把第一帧的时间戳恢复到真实 seek 点。"""
+        cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts", "-ss", f"{t:.3f}", "-i", main_file]
+        for _idx, sub_file, _s in sub_infos:
+            cmd += ["-stream_loop", "-1", "-i", sub_file]
+        if complex_filter:
+            cf = complex_filter
+            # 注入 setpts 恢复时间戳（仅替换每个标签首次出现，避开后续引用）
+            cf = cf.replace("[0:v]", f"[0:v]setpts=PTS+{t:.3f}/TB,", 1)
+            for _idx, _sf, _s in sub_infos:
+                cf = cf.replace(f"[{_idx}:v]", f"[{_idx}:v]setpts=PTS+{t:.3f}/TB,", 1)
+            sheet_label = f"{cf};{final_v_label}scale=320:-1[sheet]"
+            cmd += ["-filter_complex", sheet_label, "-map", "[sheet]"]
+        else:
+            cmd += ["-vf", f"setpts=PTS+{t:.3f}/TB,scale=320:-1"]
+        cmd += ["-frames:v", "1", "-f", "image2pipe", "-vcodec", "ppm", "pipe:1"]
+        try:
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, creationflags=flags)
+            data = proc.stdout.read()
+            proc.wait(timeout=30)
+            if proc.returncode != 0 or not data:
+                return None
+            return data
+        except Exception:
+            return None
+
+    def _tile_ppm_4x2(self, frames, cols=4):
+        """纯内存把多张 PPM 拼成 cols 列网格（行数自适应），缺失格补灰。返回 PPM bytes。
+        各帧需同尺寸（scale=320:-1 同源同比例）；不一致时按第一帧尺寸裁剪/补灰。"""
+        parsed = []
+        for d in frames:
+            w, h = _ppm_dimensions_from_bytes(d)
+            if w and h:
+                parsed.append((w, h, d))
+        if not parsed:
+            return None
+        w, h = parsed[0][0], parsed[0][1]
+        rows = (len(parsed) + cols - 1) // cols
+        out_w = w * cols
+        out_h = h * rows
+        out = bytearray(f"P6\n{out_w} {out_h}\n255\n".encode())
+        gray = bytes([0x80]) * (w * 3)
+        for r in range(rows):
+            for y in range(h):
+                for c in range(cols):
+                    idx = r * cols + c
+                    if idx < len(parsed):
+                        pw, ph, pd = parsed[idx]
+                        try:
+                            head_end = pd.index(b'\n255\n') + 5
+                            sy = min(y, ph - 1) if ph > 0 else 0
+                            row_start = head_end + sy * pw * 3
+                            row = pd[row_start:row_start + pw * 3]
+                            if len(row) < pw * 3:
+                                row = row + gray[len(row):pw * 3]
+                        except Exception:
+                            row = gray
+                    else:
+                        row = gray
+                    out += row
+        return bytes(out)
+
+    def _show_seek_sheet_async(self, main_file, main_settings, sub_infos, title, running_text):
+        """seek 分段抽帧缩略图：8 个时间点（总长/8 均分段中点）各抽 1 帧——只解码 8 帧，
+        8K 素材秒出（对比 fps 抽帧需解码全片 1 分钟+）。有子视频时每帧走合成滤镜（与成片一致）。
+        Python 纯内存拼 4 列网格（缺失格补灰），零磁盘写。"""
+        if not self.ffmpeg_cmd:
+            return
+        if not hasattr(self, "_snap_ui"):
+            self._snap_ui = {}
+        ui = self._snap_ui.get("sheet")
+        if ui is None or not ui["win"].winfo_exists():
+            win = tk.Toplevel(self.root)
+            ui = {"win": win, "label": ttk.Label(win), "status": ttk.Label(win, text="")}
+            ui["label"].pack(padx=6, pady=6)
+            ui["status"].pack(padx=6, pady=(0, 6))
+            self._snap_ui["sheet"] = ui
+        ui["win"].title(title)
+        ui["status"].config(text=running_text)
+        ui["label"].config(image="", text=_("生成中…"))
+        ui["win"].withdraw()
+        ui["save_dir"] = self.output_dir.get().strip() or ""
+        ui["save_name"] = os.path.splitext(os.path.basename(main_file))[0]
+        ui["img"] = None
+        if ui["save_dir"]:
+            btn_row = getattr(ui, "_btn_row", None)
+            if btn_row is None:
+                btn_row = ttk.Frame(ui["win"])
+                btn_row.pack(padx=6, pady=(0, 6))
+                ttk.Button(btn_row, text=_("保存到…"), command=lambda: self._save_sheet_as(ui)).pack(side=tk.LEFT, padx=4)
+                ttk.Button(btn_row, text=_("一键保存"), command=lambda: self._save_sheet_to_dir(ui)).pack(side=tk.LEFT, padx=4)
+                ui["_btn_row"] = btn_row
+
+        dur = self._get_media_duration(main_file) or 0.0
+        # 文字水印（与成片一致；仅设置文字水印时同样生效）
+        tw_settings = main_settings.get("text_watermark", {}) if isinstance(main_settings, dict) else {}
+        tw_active = bool(tw_settings.get("enabled")) and bool((tw_settings.get("text", "") or "").strip())
+        # 有子视频或文字水印时构建合成滤镜（一次，8 点复用）
+        complex_filter = final_v_label = None
+        if sub_infos or tw_active:
+            try:
+                complex_filter, final_v_label = self._build_overlay_filter_complex(
+                    0, main_settings, sub_infos,
+                    include_subtitle_main=False,
+                    enhance_settings=main_settings.get("enhance", {}),
+                    reverse=False,
+                    main_file_path=main_file
+                )
+                if tw_active:
+                    tw_frag = build_text_watermark_filtergraph(
+                        tw_settings, main_label=final_v_label, out_label="[v_tw_sheet]")
+                    if tw_frag:
+                        complex_filter = f"{complex_filter};{tw_frag}"
+                        final_v_label = "[v_tw_sheet]"
+            except Exception as e:
+                self._append_info_ui(_("[缩略图] 合成滤镜构建失败，按纯抽帧处理: {0}").format(e))
+                sub_infos = []
+                complex_filter = final_v_label = None
+
+        def _show_win():
+            w = ui["win"]
+            if w.winfo_exists():
+                w.deiconify()
+                w.lift()
+
+        def worker():
+            frames = []
+            for i in range(8):
+                if dur > 0:
+                    t = dur * (i + 0.5) / 8.0   # 段中点取帧，避开首尾黑场
+                else:
+                    t = max(i * 10.0, 0.0)
+                data = self._seek_frame_ppm(main_file, sub_infos, complex_filter, final_v_label, t)
+                if data:
+                    frames.append(data)
+            if frames:
+                sheet = self._tile_ppm_4x2(frames)
+                if sheet:
+                    def _ok(s=sheet):
+                        _show_win()
+                        self._display_contact_sheet(s)
+                    self.root.after(0, _ok)
+                    return
+            self.root.after(0, lambda: (_show_win(),
+                                         ui["status"].config(text=_("缩略图生成失败"))))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
 
     # ---------- 缩略图 contact sheet（抽帧拼 4x4 网格单图） ----------
     def _show_contact_sheet_async(self, file_path):
@@ -23017,6 +24049,11 @@ if __name__ == "__main__":
         # 关闭前先立即落盘防抖中挂起的播放器设置，避免最后改动丢失
         try:
             app._do_save_player_settings()
+        except Exception:
+            pass
+        # 关闭前清理本次会话创建的预览临时硬链接（ffmpeg_preview*_cache*，只删链接不删数据）
+        try:
+            app._cleanup_preview_links()
         except Exception:
             pass
         # 关闭前先终止仍在运行的 ffmpeg 子进程，避免变成孤儿进程继续占用输出文件
