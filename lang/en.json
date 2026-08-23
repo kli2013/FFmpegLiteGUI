@@ -1313,5 +1313,14 @@
   "[末端] 末端处理注入失败，已跳过: {0}": "[End FX] End FX injection failed, skipped: {0}",
   "[末端] 图片尾部已设置输出总时长 -t {0:.3f}s（主视频 {1:.1f}s + 尾部 {2:.1f}s）": "[End FX] Image tail: output duration set to -t {0:.3f}s (main video {1:.1f}s + tail {2:.1f}s)",
   "[封装] 主视频为静态图片，已自动按 10 秒输出；可在「手动时长」调整。": "[Mux] Main video is a static image; output auto-set to 10 s. Adjust in 'Manual duration'.",
-  "[封装] 已有主视频，图片 {0} 请在画中画模式作为水印使用": "[Mux] Main video already set; image {0} should be used as a watermark in PiP mode"
+  "[封装] 已有主视频，图片 {0} 请在画中画模式作为水印使用": "[Mux] Main video already set; image {0} should be used as a watermark in PiP mode",
+  "角度:": "Angle:",
+  "静态角度旋转（自由角度，度，支持负角）。\n与文字水印旋转一致：在透明层上绕自身中心旋转，边角填充透明(c=black@0)，\n叠加到主视频不会出现黑色裁切块。\n与「持续旋转」可叠加：先转静态角度、再持续旋转。\n注意：旋转包围盒为对角线尺寸，水印不宜过大，否则会被主画面边缘裁切。": "Static angle rotation (free angle, degrees, negative supported).\nSame as text-watermark rotation: rotate around its own center on a transparent layer, corners filled transparent (c=black@0),\nso no black cut corners appear when overlaid on the main video.\nCan be combined with \"Continuous rotation\": static angle first, then continuous spin.\nNote: the rotation bounding box is the diagonal size; keep the watermark small or it may be clipped by the main frame edges.",
+  "[预览] 从视频 {0} 启用了旋转，占位框显示为正方形包围盒 {1}x{1}（旋转后实际叠加尺寸）": "[Preview] Rotation enabled on sub-video {0}; placeholder shown as square bounding box {1}x{1} (actual overlay size after rotation)",
+  "[预览] 水印启用了旋转，蓝色正方形占位 {0}x{0} 与红色原始矩形同时显示": "[Preview] Watermark rotation enabled; blue square placeholder {0}x{0} shown together with the red original rect",
+  "[可视化-从] 已保存旋转角度: {0}°": "[Visual-sub] Rotation angle saved: {0}°",
+  "[可视化-水] 已保存旋转角度: {0}°": "[Visual-wm] Rotation angle saved: {0}°",
+  "[文字水印] 旋转角度已更新: {0}°": "[Text watermark] Rotation angle updated: {0}°",
+  "[任务编辑] 文字水印画布尺寸: {0}x{1}（按任务渲染设置计算）": "[Task edit] Text watermark canvas size: {0}x{1} (computed from task render settings)",
+  "[任务编辑] 无法定位主视频，文字水印画布使用默认 1280x720": "[Task edit] Cannot locate main video; text watermark canvas uses default 1280x720"
 }
