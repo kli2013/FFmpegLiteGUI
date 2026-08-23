@@ -135,6 +135,57 @@ def center_window(win: tk.Toplevel, width: int, height: int, offset_y: int = 0):
     win.update_idletasks()
 
 
+def rotate_rect_polygon(x, y, w, h, angle_deg):
+    """计算 (x,y,w,h) 轴对齐矩形绕自身中心旋转 angle_deg 度后的 4 个顶点。
+
+    返回 [(x1,y1), (x2,y2), (x3,y3), (x4,y4)]。
+    语义与 ffmpeg rotate 滤镜一致：正角为顺时针（屏幕/视频坐标系 y 向下），
+    旋转中心 = 矩形中心。angle_deg 为 0 时直接返回原 4 角。
+    供可视化编辑器/背景虚线框按当前角度绘制旋转后的子视频矩形。
+    """
+    import math
+    if not angle_deg:
+        return [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+    a = math.radians(angle_deg)
+    ca, sa = math.cos(a), math.sin(a)
+    cx, cy = x + w / 2.0, y + h / 2.0
+    pts = []
+    for px, py in [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]:
+        dx, dy = px - cx, py - cy
+        pts.append((cx + dx * ca - dy * sa, cy + dx * sa + dy * ca))
+    return pts
+
+
+def build_rotated_rect_drawboxes(x, y, w, h, angle_deg, color="red@0.5", t=2, n=2):
+    """把旋转矩形 (x,y,w,h,angle) 的 4 条边离散成 n 段 drawbox 细条，近似画倾斜边框。
+
+    ffmpeg 的 drawbox 只能画轴对齐矩形，无法画任意角度的矩形；
+    用若干段细长矩形拼接可近似旋转后的边框（预览占位框显示旋转角度用）。
+    默认每边 2 段（共 8 个 drawbox），性能与观感平衡；角度为 0 时退化为单条 drawbox。
+    返回完整 drawbox 滤镜字符串列表。
+    """
+    if not angle_deg:
+        return [f"drawbox=x={x}:y={y}:w={w}:h={h}:color={color}:t={t}"]
+    pts = rotate_rect_polygon(x, y, w, h, angle_deg)
+    segs = []
+    for i in range(4):
+        p1 = pts[i]
+        p2 = pts[(i + 1) % 4]
+        for k in range(n):
+            f0 = k / n
+            f1 = (k + 1) / n
+            ax = p1[0] + (p2[0] - p1[0]) * f0
+            ay = p1[1] + (p2[1] - p1[1]) * f0
+            bx = p1[0] + (p2[0] - p1[0]) * f1
+            by = p1[1] + (p2[1] - p1[1]) * f1
+            sx, sy = min(ax, bx), min(ay, by)
+            sw, sh = abs(bx - ax), abs(by - ay)
+            if sw < 1 and sh < 1:
+                continue
+            segs.append(f"drawbox=x={sx:.1f}:y={sy:.1f}:w={max(sw, 1):.1f}:h={max(sh, 1):.1f}:color={color}:t={t}")
+    return segs
+
+
 def safe_eval_expr(expr: str, context: Dict[str, int]) -> Optional[int]:
     """
     安全计算数学表达式，支持 + - * / ( ) 以及 context 中的变量。
@@ -934,7 +985,9 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
     # 同样提前到缩放前，保留完整场信息（缩放后反交错易拉丝/误判）
     if not ivtc_enabled:  # 添加条件
         deint = settings.get("deinterlace_filter", "none")
-        if deint != "none":
+        # 防御：旧设置/模板可能存 bool（False/True），str 之外一律忽略，否则会被直接
+        # append 进滤镜链导致 ",".join 崩溃（expected str instance, bool found）
+        if isinstance(deint, str) and deint not in ("none", ""):
             filters.append(deint)
 
     # ----- 缩放 -----
@@ -4222,12 +4275,29 @@ class VideoFilterFrame(ttk.LabelFrame):
 
 
 class TextWatermarkDialog(tk.Toplevel):
-    """文字水印设置窗口（drawtext）"""
-    def __init__(self, parent, app):
+    """文字水印设置窗口（drawtext）
+
+    settings_target: 要编辑的文字水印设置 dict。默认 None → 编辑 app.text_watermark_settings
+        （主界面全局）。队列任务编辑必须传入任务自己的 text_watermark dict，
+        否则「队列里改文字水印」会改到转换主界面、且对任务不生效。
+    refresh_cb: 设置变化后刷新命令预览的回调。默认 None → 用主界面 adv_frame 的回调；
+        队列任务编辑传入任务编辑窗口的 update_preview。
+    """
+    def __init__(self, parent, app, settings_target=None, refresh_cb=None, show_inject=True):
         super().__init__(parent)
         self.withdraw()
         self.app = app
         self.parent = parent
+        self.settings = settings_target if settings_target is not None else app.text_watermark_settings
+        self.tw_refresh = refresh_cb
+        # 「注入到封装页」复选框是否显示：仅转换主界面打开的文字水印窗口显示，
+        # 队列任务编辑（settings_target 指向任务自己的 dict）隐藏
+        self.show_inject = show_inject
+        # 保存到主应用，便于位置编辑器「应用」时同步回写本窗口的旋转角度数值框
+        try:
+            app.text_wm_dialog = self
+        except Exception:
+            pass
         self.title("文字水印")
         self.transient(parent)
         self.grab_set()
@@ -4244,16 +4314,25 @@ class TextWatermarkDialog(tk.Toplevel):
         main = ttk.Frame(self, padding="10")
         main.pack(fill=tk.BOTH, expand=True)
 
-        s = self.app.text_watermark_settings
+        s = self.settings
 
         # ---- 启用 ----
         self.enabled_var = tk.BooleanVar(value=s.get("enabled", False))
         ttk.Checkbutton(main, text="启用文字水印", variable=self.enabled_var).grid(
             row=0, column=0, sticky="w", pady=5)
-        # 注入到封装页开关：开启后，本页文字水印设置会随主视频轨道带入封装页 3 个模式
+        # 注入到封装页开关：开启后，本页文字水印设置会随主视频轨道带入封装页 3 个模式。
+        # 仅转换主界面打开的文字水印窗口显示；队列任务编辑隐藏（inject_var 仍创建，
+        # 保留已有键值，on_ok 照常写回，不显示控件而已）。
+        # ⚠️ 必须 trace 实时写回（不能只在 on_ok 写）：否则勾选注入后立即点「打开位置编辑器」，
+        # 画布判定（_tw_canvas_size 读 inject_to_packaging）还是旧值 False → 回退 1280x720。
         self.inject_var = tk.BooleanVar(value=s.get("inject_to_packaging", False))
-        ttk.Checkbutton(main, text="注入到封装页", variable=self.inject_var).grid(
-            row=0, column=1, sticky="w", pady=5, padx=(12, 0))
+        def _tw_sync_inject(*_a):
+            self.settings["inject_to_packaging"] = bool(self.inject_var.get())
+            self._refresh()
+        self.inject_var.trace_add("write", _tw_sync_inject)
+        if self.show_inject:
+            ttk.Checkbutton(main, text="注入到封装页", variable=self.inject_var).grid(
+                row=0, column=1, sticky="w", pady=5, padx=(12, 0))
 
         # ---- 文字内容 ----
         ttk.Label(main, text="文字内容:").grid(row=1, column=0, sticky="nw", pady=5)
@@ -4350,19 +4429,17 @@ class TextWatermarkDialog(tk.Toplevel):
         # 注意：x/y 必须用**独立** trace——合用一个回调时，同步 x 输入框会触发回调，
         # 用当时的旧 y 值把 overlay_y 覆盖掉（位置编辑器刚写回的 y 丢失），
         # 表现为「只有 x 数值框变化、y 一直是 10」。
-        tw_pos = self.app.text_watermark_settings
+        tw_pos = self.settings
         self.tw_x_var = tk.StringVar(value=tw_pos.get("overlay_x", "10"))
         self.tw_y_var = tk.StringVar(value=tw_pos.get("overlay_y", "10"))
 
         def _tw_sync_x(*_a):
             tw_pos["overlay_x"] = self.tw_x_var.get().strip() or "10"
-            if self.app.adv_frame and self.app.adv_frame.update_callback:
-                self.app.adv_frame.update_callback()
+            self._refresh()
 
         def _tw_sync_y(*_a):
             tw_pos["overlay_y"] = self.tw_y_var.get().strip() or "10"
-            if self.app.adv_frame and self.app.adv_frame.update_callback:
-                self.app.adv_frame.update_callback()
+            self._refresh()
 
         self.tw_x_var.trace_add("write", _tw_sync_x)
         self.tw_y_var.trace_add("write", _tw_sync_y)
@@ -4401,8 +4478,7 @@ class TextWatermarkDialog(tk.Toplevel):
                 tw_pos["rotate"] = float(self.rotate_var.get())
             except (ValueError, TypeError):
                 tw_pos["rotate"] = 0.0
-            if self.app.adv_frame and self.app.adv_frame.update_callback:
-                self.app.adv_frame.update_callback()
+            self._refresh()
         self.rotate_var.trace_add("write", _tw_sync_rotate)
         ttk.Spinbox(rot_frame, from_=-180, to=180, increment=1,
                     textvariable=self.rotate_var, width=8).pack(side=tk.LEFT, padx=(0, 4))
@@ -4427,8 +4503,7 @@ class TextWatermarkDialog(tk.Toplevel):
                 tw_pos["spin_speed"] = float(self.spin_speed_var.get())
             except (ValueError, TypeError):
                 tw_pos["spin_speed"] = 60.0
-            if self.app.adv_frame and self.app.adv_frame.update_callback:
-                self.app.adv_frame.update_callback()
+            self._refresh()
         self.spin_enabled_var.trace_add("write", _tw_sync_spin)
         ttk.Label(spin_frame, text="转速(度/秒):").pack(side=tk.LEFT, padx=(12, 2))
         self.spin_speed_var = tk.DoubleVar(value=float(s.get("spin_speed", 60.0) or 60.0))
@@ -4447,7 +4522,7 @@ class TextWatermarkDialog(tk.Toplevel):
         # ---- 动态轨迹（与图片/视频水印同套逻辑；文字尺寸用 tw/th，主画布用 main_w/main_h）----
         traj_btn = ttk.Button(
             main, text="轨迹控制",
-            command=lambda: open_trajectory_dialog(self.app.text_watermark_settings, self),
+            command=lambda: open_trajectory_dialog(self.settings, self),
             width=28)
         traj_btn.grid(row=14, column=0, columnspan=5, sticky="w", pady=(4, 2))
         ToolTip(
@@ -4477,8 +4552,22 @@ class TextWatermarkDialog(tk.Toplevel):
         ttk.Button(btn_frame, text="确定", command=self.on_ok, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="取消", command=self.on_cancel, width=10).pack(side=tk.LEFT, padx=5)
 
+    def _refresh(self):
+        """设置变化后刷新命令预览：优先用传入的回调（队列任务编辑），否则主界面 adv_frame。"""
+        if self.tw_refresh is not None:
+            try:
+                self.tw_refresh()
+                return
+            except Exception:
+                pass
+        try:
+            if self.app.adv_frame and self.app.adv_frame.update_callback:
+                self.app.adv_frame.update_callback()
+        except Exception:
+            pass
+
     def on_ok(self):
-        s = self.app.text_watermark_settings
+        s = self.settings
         s["enabled"] = self.enabled_var.get()
         s["inject_to_packaging"] = self.inject_var.get()
         s["text"] = self.text_var.get().strip()
@@ -4494,8 +4583,7 @@ class TextWatermarkDialog(tk.Toplevel):
         s["enable_cycle"] = self.enable_cycle_var.get().strip()
         s["enable_show"] = self.enable_show_var.get().strip()
         # 触发命令预览更新
-        if self.app.adv_frame and self.app.adv_frame.update_callback:
-            self.app.adv_frame.update_callback()
+        self._refresh()
         self.destroy()
 
     def on_cancel(self):
@@ -4522,14 +4610,14 @@ class TextWatermarkDialog(tk.Toplevel):
         # 此处必须把本对话框的 font_size 输入框同步刷新，否则点击「确定」时 on_ok 会用
         # 旧的 size_var 把回写值覆盖掉，导致「绘制矩形→回写字体大小」看起来像没生效。
         try:
-            new_fs = int(self.app.text_watermark_settings.get("font_size", self.size_var.get()))
+            new_fs = int(self.settings.get("font_size", self.size_var.get()))
             self.size_var.set(new_fs)
         except (ValueError, TypeError):
             pass
         # 同步 X/Y 编辑框：可视化编辑器会把拖拽结果写回 overlay_x/overlay_y
         try:
-            self.tw_x_var.set(str(self.app.text_watermark_settings.get("overlay_x", "10")))
-            self.tw_y_var.set(str(self.app.text_watermark_settings.get("overlay_y", "10")))
+            self.tw_x_var.set(str(self.settings.get("overlay_x", "10")))
+            self.tw_y_var.set(str(self.settings.get("overlay_y", "10")))
         except Exception:
             pass
 
@@ -5529,13 +5617,13 @@ class LoopChromaFrame(ttk.LabelFrame):
         sim_label = ttk.Label(sim_frame, text="相似度 (0~1):")
         sim_label.pack(side=tk.LEFT)
         ToolTip(sim_label,
-                "【绿幕/蓝幕】推荐 0.3 左右，可适当调整。\n如果觉得转换后的对象发虚透明，降低相似度重试。",
+                "【绿幕/蓝幕】推荐 0.2 左右，可适当调整。\n如果觉得转换后的对象发虚透明，降低相似度重试。",
                 wraplength=400)
         self.chroma_similarity = tk.DoubleVar(value=0.3)
         sim_slider = ttk.Scale(sim_frame, from_=0.0, to=1.0, variable=self.chroma_similarity,
                                orient=tk.HORIZONTAL, length=100)
         sim_slider.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        self.sim_entry_var = tk.StringVar(value="0.3000")
+        self.sim_entry_var = tk.StringVar(value="0.2000")
         sim_entry = ttk.Entry(sim_frame, textvariable=self.sim_entry_var, width=8)
         sim_entry.pack(side=tk.LEFT, padx=5)
         def sim_slider_changed(val):
@@ -5946,6 +6034,7 @@ class OverlayPositionFrame(ttk.LabelFrame):
                     self.track_idx,
                     ov_x_var=self.overlay_x,
                     ov_y_var=self.overlay_y,
+                    ov_angle_var=getattr(self, "rotate_angle", None),
                     filt_frame=self.filt_frame,
                     parent=parent_win,
                     free_layout=_free
@@ -5986,6 +6075,21 @@ class OverlayPositionFrame(ttk.LabelFrame):
         self.move_margin = tk.StringVar(value="W*0.03") # 四角跳跃边距（像素或相对式）
         ttk.Button(spin_frame, text="轨迹控制...", command=self._open_trajectory_dialog
                    ).pack(side=tk.LEFT, padx=(16, 0))
+
+        # ---- 静态角度旋转（自由角度）：透明层上绕中心旋转，边角透明，与文字水印旋转一致 ----
+        ttk.Label(spin_frame, text="角度:").pack(side=tk.LEFT, padx=(16, 2))
+        self.rotate_angle = tk.DoubleVar(value=0.0)
+        rot_sb = ttk.Spinbox(spin_frame, from_=-180, to=180, increment=1, width=6,
+                             textvariable=self.rotate_angle)
+        rot_sb.pack(side=tk.LEFT)
+        self._controls.append(rot_sb)
+        ToolTip(rot_sb,
+                "静态角度旋转（自由角度，度，支持负角）。\n"
+                "与文字水印旋转一致：在透明层上绕自身中心旋转，边角填充透明(c=black@0)，\n"
+                "叠加到主视频不会出现黑色裁切块。\n"
+                "与「持续旋转」可叠加：先转静态角度、再持续旋转。\n"
+                "注意：旋转包围盒为对角线尺寸，水印不宜过大，否则会被主画面边缘裁切。",
+                wraplength=420)
 
     def _open_trajectory_dialog(self):
         """轨迹控制弹窗：预设动效 + 参数（与文字水印共用公共实现 _trajectory_dialog）。"""
@@ -6462,6 +6566,7 @@ class OverlayPositionFrame(ttk.LabelFrame):
                 "overlay_free_layout": self.overlay_free_layout.get(),
                 "spin_enabled": self.spin_enabled.get(),
                 "spin_speed": float(self.spin_speed.get()) if hasattr(self, "spin_speed") else 60.0,
+                "rotate_angle": float(self.rotate_angle.get()) if hasattr(self, "rotate_angle") else 0.0,
                 "move_mode": self.move_mode.get(),
                 "move_cycle": self.move_cycle.get() if hasattr(self, "move_cycle") else 4.0,
                 "move_amp": self.move_amp.get().strip() if hasattr(self, "move_amp") else "W*0.1",
@@ -6491,6 +6596,11 @@ class OverlayPositionFrame(ttk.LabelFrame):
                 self.spin_speed.set(float(settings.get("spin_speed", 60.0)))
             except (ValueError, TypeError):
                 self.spin_speed.set(60.0)
+            if hasattr(self, "rotate_angle"):
+                try:
+                    self.rotate_angle.set(float(settings.get("rotate_angle", 0.0)))
+                except (ValueError, TypeError):
+                    self.rotate_angle.set(0.0)
             if hasattr(self, "move_mode"):
                 self.move_mode.set(settings.get("move_mode", ""))
             if hasattr(self, "move_cycle"):
@@ -6517,7 +6627,8 @@ class OverlayPositionFrame(ttk.LabelFrame):
 
 # ================== 高级选项组件 ==================
 class AdvancedFrame(ttk.LabelFrame):
-    def __init__(self, parent, update_callback=None, app=None, show_adaptive=True, watermark_dict=None, **kwargs):
+    def __init__(self, parent, update_callback=None, app=None, show_adaptive=True, watermark_dict=None,
+                 tw_settings=None, tw_canvas_file=None, tw_full_settings=None, **kwargs):
         super().__init__(parent, text="高级选项 (硬件解码/自定义参数)", padding="5", **kwargs)
         self.update_callback = update_callback
         self.app = app
@@ -6527,6 +6638,20 @@ class AdvancedFrame(ttk.LabelFrame):
             self.watermark_dict = watermark_dict
         else:
             self.watermark_dict = self.app.watermark_settings
+
+        # 文字水印目标设置 dict：默认主界面全局；队列任务编辑必须传入任务自己的
+        # text_watermark dict（否则「队列里改文字水印」会改到转换主界面、任务不生效）
+        if tw_settings is not None:
+            self.tw_settings = tw_settings
+        else:
+            self.tw_settings = self.app.text_watermark_settings if self.app is not None else {}
+        # 「注入到封装页」复选框显示条件：仅转换主界面（tw_settings 未显式传入）显示，
+        # 队列任务编辑（传了任务自己的 dict）隐藏
+        self.tw_show_inject = (tw_settings is None)
+        # 文字水印位置编辑器画布基准文件：默认主界面输入文件；队列任务编辑传 task.input
+        self.tw_canvas_file = tw_canvas_file
+        # 队列任务编辑时传任务完整 settings，用于按渲染设置（裁剪/缩放/旋转）算画布
+        self.tw_full_settings = tw_full_settings
 
 
         self.wm_preset_var = tk.StringVar()
@@ -6810,10 +6935,16 @@ class AdvancedFrame(ttk.LabelFrame):
             self.update_callback()
 
     def open_text_watermark_dialog(self):
-        """打开文字水印设置窗口"""
+        """打开文字水印设置窗口
+
+        队列任务编辑（tw_settings 指向任务自己的 dict）时，对话框读写任务级设置、
+        刷新用任务编辑窗口的 update_preview，不再触碰主界面全局 text_watermark_settings。"""
         if self.app is None:
             return
-        TextWatermarkDialog(self, self.app)
+        TextWatermarkDialog(self, self.app,
+                            settings_target=self.tw_settings,
+                            refresh_cb=self.update_callback,
+                            show_inject=self.tw_show_inject)
 
     def open_watermark_editor(self):
         """打开图片/视频水印的参数编辑窗口（缩放、裁剪、旋转、位置等）。
@@ -6861,15 +6992,68 @@ class AdvancedFrame(ttk.LabelFrame):
         if self.update_callback:
             self.update_callback()
 
+    def _tw_canvas_from_file(self, main_file, full_settings):
+        """按渲染设置（裁剪/缩放/旋转）计算文件的画布尺寸；失败返回 None。
+        full_settings 为 None 时用原始尺寸（主界面输入文件场景，与旧行为一致）。"""
+        if not main_file or not os.path.exists(main_file):
+            return None
+        try:
+            if full_settings:
+                orig_w, orig_h = get_video_rotated_dimensions(self.app.ffprobe_cmd, main_file, full_settings)
+                if orig_w is None or orig_h is None:
+                    orig_w, orig_h = self.app._get_video_dimensions_cached(main_file)
+                if orig_w and orig_h:
+                    try:
+                        rw, rh = compute_rendered_size(orig_w, orig_h, full_settings)
+                    except Exception:
+                        rw, rh = orig_w, orig_h
+                    if rw and rh and rw > 0 and rh > 0:
+                        return int(rw), int(rh)
+            else:
+                w, h = self.app._get_video_dimensions_cached(main_file)
+                if w and h:
+                    return int(w), int(h)
+        except Exception:
+            pass
+        return None
+
+    def _tw_canvas_size(self):
+        """文字水印位置编辑器画布尺寸（优先级从高到低）：
+        1. tw_canvas_file（队列任务编辑显式传入 task.input）→ 任务渲染后尺寸
+           （不受注入标志影响：任务文字水印不注入封装页）；
+        2. 「注入到封装页」开启且封装页有主视频（仅主界面场景）→ 封装页主视频
+           渲染后画布（_get_canvas_size：pad/裁剪/缩放/旋转后的最终 overlay 画布）；
+        3. 主界面输入文件 → 渲染后尺寸；
+        4. 兜底 1280x720。"""
+        # 1) 队列任务编辑：任务自己的文件优先
+        if self.tw_canvas_file:
+            r = self._tw_canvas_from_file(self.tw_canvas_file, self.tw_full_settings)
+            if r:
+                return r
+        # 2) 主界面 + 勾选「注入到封装页」：文字水印叠加在封装页主视频上，
+        #    画布必须取封装页当前主视频尺寸（而不是转换页主界面输入文件）
+        if self.app is not None and self.tw_canvas_file is None and \
+                bool(self.tw_settings.get("inject_to_packaging", False)):
+            try:
+                main_track = next((t for t in self.app.merge_tracks
+                                   if t.enabled and t.type == "video"), None)
+                if main_track is not None:
+                    w, h = self.app._get_canvas_size(main_track)
+                    if w and h and w > 0 and h > 0:
+                        return int(w), int(h)
+            except Exception:
+                pass
+        # 3) 主界面输入文件
+        if self.app is not None:
+            r = self._tw_canvas_from_file(self.app.input_file.get().strip(), None)
+            if r:
+                return r
+        return 1280, 720
+
     def _open_text_wm_position_editor(self):
         """为文字水印打开可视化位置编辑器"""
-        tw = self.app.text_watermark_settings
-        main_file = self.app.input_file.get().strip()
-        canvas_w, canvas_h = 1280, 720
-        if main_file and os.path.exists(main_file):
-            w, h = self.app._get_video_dimensions_cached(main_file)
-            if w and h:
-                canvas_w, canvas_h = w, h
+        tw = self.tw_settings
+        canvas_w, canvas_h = self._tw_canvas_size()
         # 估算文字尺寸
         text = tw.get("text", "")
         fs = tw.get("font_size", 48)
@@ -6893,17 +7077,48 @@ class AdvancedFrame(ttk.LabelFrame):
                 self.update_callback()
             self.app._append_info_ui(f"[文字水印] 位置已设置: ({nx}, {ny})")
         title = "可视化编辑文字水印位置"
+        # 文字水印静态旋转角度（-180..180），旋转后为 hypot 正方形包围盒
+        try:
+            _tw_ra = float(tw.get("rotate", 0) or 0)
+        except (ValueError, TypeError):
+            _tw_ra = 0.0
+        _tw_spin = bool(tw.get("spin_enabled", False))
+        _eff_w, _eff_h = wm_w, wm_h
+        if _tw_ra != 0 or _tw_spin:
+            _tw_d = int(round(((wm_w * wm_w + wm_h * wm_h) ** 0.5)))
+            _eff_w = _eff_h = _tw_d
         # 初始坐标：safe_eval_expr 可能返回 0（合法位置），必须用 None 判断而非 `or 10`，
         # 否则 y=0 会被 `0 or 10` 顶成 10，看起来「y 没返回数值」。
-        _init_x = safe_eval_expr(x_var.get(), {"W": canvas_w, "H": canvas_h, "w": wm_w, "h": wm_h})
-        _init_y = safe_eval_expr(y_var.get(), {"W": canvas_w, "H": canvas_h, "w": wm_w, "h": wm_h})
+        _init_x = safe_eval_expr(x_var.get(), {"W": canvas_w, "H": canvas_h, "w": _eff_w, "h": _eff_h})
+        _init_y = safe_eval_expr(y_var.get(), {"W": canvas_w, "H": canvas_h, "w": _eff_w, "h": _eff_h})
+
+        def apply_tw_angle(new_angle):
+            tw["rotate"] = float(new_angle or 0.0)
+            # 同步回写文字水印对话框内的「旋转角度」数值框（对话框实例存于 app.text_wm_dialog）
+            _dlg = getattr(self.app, "text_wm_dialog", None)
+            if _dlg is not None:
+                try:
+                    if _dlg.winfo_exists():
+                        _dlg.rotate_var.set(float(new_angle or 0.0))
+                except Exception:
+                    pass
+            if hasattr(self, "rotate_var"):
+                try:
+                    self.rotate_var.set(float(new_angle or 0.0))
+                except Exception:
+                    pass
+            if self.update_callback:
+                self.update_callback()
+            self.app._append_info_ui(f"[文字水印] 旋转角度已更新: {new_angle}°")
+
         self.app._generic_overlay_editor(
             self, canvas_w, canvas_h,
             10 if _init_x is None else _init_x,
             10 if _init_y is None else _init_y,
             wm_w, wm_h, on_apply, title, None,
             bg_draw_func=None, rect_label='文字水印',
-            min_visible_pixels=0, show_scale_tip=False)
+            min_visible_pixels=0, show_scale_tip=False,
+            rotate_angle=_tw_ra, angle_cb=apply_tw_angle)
 
 
     def _get_wm_templates_path(self):
@@ -6951,8 +7166,9 @@ class AdvancedFrame(ttk.LabelFrame):
         current.pop("base_height", None)
         # 同时保存文字水印设置（与主预设一致，包含 enabled 等完整字段），
         # 记为嵌套键 text_watermark，避免与图片/视频水印字段冲突，且旧模板无此键时向后兼容
-        if self.app is not None and hasattr(self.app, 'text_watermark_settings'):
-            current["text_watermark"] = copy.deepcopy(self.app.text_watermark_settings)
+        # 注：队列任务编辑时 tw_settings 是任务自己的 dict，保存的也是任务级设置
+        if self.app is not None:
+            current["text_watermark"] = copy.deepcopy(self.tw_settings)
 
         # 弹出对话框输入模板名称
         name = simpledialog.askstring("保存水印模板", "请输入模板名称:", parent=self)
@@ -6994,10 +7210,11 @@ class AdvancedFrame(ttk.LabelFrame):
         if hasattr(self, 'adaptive_var'):
             self.adaptive_var.set(self.watermark_dict.get("adaptive", False))
         # 恢复文字水印设置（若模板包含；与主预设一致，含 enabled 等完整字段）
+        # 注：队列任务编辑时 tw_settings 是任务自己的 dict，加载到任务级设置而非主界面全局
         tw = template.get("text_watermark")
-        if isinstance(tw, dict) and self.app is not None and hasattr(self.app, 'text_watermark_settings'):
-            self.app.text_watermark_settings.update(tw)
-        # 如果文字水印设置窗口正打开，其内部状态会在 on_ok 时读取 app.text_watermark_settings，
+        if isinstance(tw, dict):
+            self.tw_settings.update(tw)
+        # 如果文字水印设置窗口正打开，其内部状态会在 on_ok 时读取目标 settings dict，
         # 此处无需额外处理；更新回调已触发命令预览刷新
         if self.update_callback:
             self.update_callback()
@@ -9222,6 +9439,12 @@ class FFmpegBatchGUI:
                     _sp_val = 60.0
                 if _sp_val != 0:
                     need_alpha = True
+            try:
+                _ra_val = float(sub_settings.get("rotate_angle", 0) or 0)
+            except (ValueError, TypeError):
+                _ra_val = 0.0
+            if _ra_val != 0:
+                need_alpha = True
             # 源视频本身带 alpha（透明 mov/webm/APNG/pal8 等）
             _src_pf = self._get_video_pix_fmt(sub_file)
             if _src_pf and self._pix_fmt_has_alpha(_src_pf):
@@ -9265,15 +9488,32 @@ class FFmpegBatchGUI:
             # 使输出是一个恒大小的正方形画布，旋转全程不裁切、且不随角度抖动；
             # 水印在该正方形内居中旋转，边角填充透明 c=black@0，与现有 rgba/遮罩管线兼容。
             # overlay 的 w/h 自动取该正方形（见 _overlay_sub_size），故 W-w-10 等表达式仍正确。
-            if sub_settings.get("spin_enabled", False):
+            # 静态角度(自由角度) + 持续旋转：合并为单个 rotate，避免两次 hypot 旋转变大。
+            # 静态角度与文字水印旋转一致：透明层上绕中心旋转、边角透明(c=black@0)，叠加无黑边。
+            try:
+                _ra = float(sub_settings.get("rotate_angle", 0) or 0)
+            except (ValueError, TypeError):
+                _ra = 0.0
+            # ⚠️ spin 必须由 spin_enabled 显式启用：只设静态角度(rotate_angle≠0)而 spin 关闭时，
+            # 绝不能把 spin_speed 默认值(60)拼进表达式，否则「只转角度」会变成「角度+自旋转」
+            # （预览代码按 _spin and _spd != 0 判定，此处分叉会导致预览与转换不一致）。
+            _spin_on = bool(sub_settings.get("spin_enabled", False))
+            if _spin_on or _ra != 0:
                 _sp = sub_settings.get("spin_speed", 60.0)
                 try:
                     _sp = float(_sp)
                 except (ValueError, TypeError):
                     _sp = 60.0
-                if _sp != 0:
+                if (_spin_on and _sp != 0) or _ra != 0:
+                    _angle_expr = ""
+                    if _ra != 0:
+                        _angle_expr = f"{_ra}*PI/180"
+                    if _spin_on and _sp != 0:
+                        if _angle_expr:
+                            _angle_expr += " + "
+                        _angle_expr += f"{_sp}*PI/180*t"
                     filter_parts.append(
-                        f"[{current_sub}]rotate=angle='{_sp}*PI/180*t':"
+                        f"[{current_sub}]rotate=angle='{_angle_expr}':"
                         f"ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=black@0[v_spin_{i}]"
                     )
                     current_sub = f"v_spin_{i}"
@@ -9394,7 +9634,7 @@ class FFmpegBatchGUI:
             w, h = compute_rendered_size(w, h, sub_settings)
         except Exception:
             pass
-        if sub_settings.get("spin_enabled", False):
+        if sub_settings.get("spin_enabled", False) or (sub_settings.get("rotate_angle", 0) or 0) != 0:
             # 旋转时包围盒 = 对角线长度正方形，需与 rotate 的 ow/oh=hypot(iw,ih) 一致。
             # ffmpeg 对 ow/oh 取整采用四舍五入(lrint)，故这里用 round 对齐，避免混合模式差 1px。
             d = int(round(((w * w + h * h) ** 0.5)))
@@ -9871,19 +10111,44 @@ class FFmpegBatchGUI:
                 wm_w, wm_h = compute_rendered_size(orig_w, orig_h, adapted_wm)
                 if wm_w <= 0 or wm_h <= 0:
                     wm_w, wm_h = orig_w, orig_h
-                ctx = {"W": main_w, "H": main_h, "w": wm_w, "h": wm_h}
+                # 旋转后：蓝色正方形占位 + 红色原始内容矩形（都以旋转中心为中心，两个 drawbox 同时存在）
+                try:
+                    _wm_ra = float(adapted_wm.get("rotate_angle", 0) or 0)
+                except (ValueError, TypeError):
+                    _wm_ra = 0.0
+                _wm_spin = bool(adapted_wm.get("spin_enabled", False))
+                eff_w, eff_h = wm_w, wm_h
+                if _wm_ra != 0 or _wm_spin:
+                    d = int(round(((wm_w * wm_w + wm_h * wm_h) ** 0.5)))
+                    eff_w = eff_h = d
+                    self._append_info_ui(f"[预览] 水印启用了旋转，蓝色正方形占位 {d}x{d} 与红色原始矩形同时显示")
+                ctx = {"W": main_w, "H": main_h, "w": eff_w, "h": eff_h}
                 x_expr = adapted_wm.get("overlay_x", "W-w-10")
                 y_expr = adapted_wm.get("overlay_y", "H-h-10")
                 x_val = safe_eval_expr(x_expr, ctx)
                 y_val = safe_eval_expr(y_expr, ctx)
                 if x_val is None:
-                    x_val = main_w - wm_w - 10
+                    x_val = main_w - eff_w - 10
                 if y_val is None:
-                    y_val = main_h - wm_h - 10
-                x_val = max(0, min(x_val, main_w - wm_w))
-                y_val = max(0, min(y_val, main_h - wm_h))
-                drawbox_expr = f"x={x_val}:y={y_val}:w={wm_w}:h={wm_h}:color=red@0.3:t=3"
-                self._append_info_ui(f"[预览] 水印虚拟框: 位置({x_val}, {y_val}) 尺寸{wm_w}x{wm_h}")
+                    y_val = main_h - eff_h - 10
+                x_val = max(0, min(x_val, main_w - eff_w))
+                y_val = max(0, min(y_val, main_h - eff_h))
+                if _wm_ra != 0 or _wm_spin:
+                    d = eff_w
+                    cx = x_val + d / 2.0
+                    cy = y_val + d / 2.0
+                    # 蓝色正方形占位 + 红色斜矩形；仅 spin 时红框轴对齐
+                    parts = [f"x={x_val}:y={y_val}:w={d}:h={d}:color=blue@0.5:t=3"]
+                    if _wm_ra != 0:
+                        parts.extend(build_rotated_rect_drawboxes(
+                            cx - wm_w / 2.0, cy - wm_h / 2.0, wm_w, wm_h, _wm_ra,
+                            color="red@0.3", t=3, n=5))
+                    else:
+                        parts.append(f"drawbox=x={cx - wm_w / 2.0:.1f}:y={cy - wm_h / 2.0:.1f}:w={wm_w}:h={wm_h}:color=red@0.3:t=3")
+                    drawbox_expr = ",".join(parts)
+                else:
+                    drawbox_expr = f"x={x_val}:y={y_val}:w={wm_w}:h={wm_h}:color=red@0.3:t=3"
+                self._append_info_ui(f"[预览] 水印虚拟框: 位置({x_val}, {y_val}) 尺寸{eff_w}x{eff_h}")
     
         # ----- 3. 文字水印判定：旋转/spin/轨迹需复杂图，普通 drawtext 走 -vf 链 -----
         tw_settings = settings.get("text_watermark", {})
@@ -10002,7 +10267,11 @@ class FFmpegBatchGUI:
                     _sp2 = float(adapted_wm2.get("spin_speed", 60.0) or 60.0)
                 except (ValueError, TypeError):
                     _sp2 = 60.0
-                if _alpha2 or (_spin2 and _sp2 != 0):
+                try:
+                    _ra2 = float(adapted_wm2.get("rotate_angle", 0) or 0)
+                except (ValueError, TypeError):
+                    _ra2 = 0.0
+                if _alpha2 or (_spin2 and _sp2 != 0) or _ra2 != 0:
                     sub_vf_parts.append("format=rgba")
                 if _alpha2:
                     try:
@@ -10011,8 +10280,15 @@ class FFmpegBatchGUI:
                         _av = 1.0
                     if 0.0 <= _av <= 1.0:
                         sub_vf_parts.append(f"colorchannelmixer=aa={_av:.2f}")
-                if _spin2 and _sp2 != 0:
-                    sub_vf_parts.append(f"rotate=angle='{_sp2}*PI/180*t':ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=black@0")
+                if (_spin2 and _sp2 != 0) or _ra2 != 0:
+                    _angle_expr2 = ""
+                    if _ra2 != 0:
+                        _angle_expr2 = f"{_ra2}*PI/180"
+                    if _spin2 and _sp2 != 0:
+                        if _angle_expr2:
+                            _angle_expr2 += " + "
+                        _angle_expr2 += f"{_sp2}*PI/180*t"
+                    sub_vf_parts.append(f"rotate=angle='{_angle_expr2}':ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=black@0")
                 sub_chain = ",".join(sub_vf_parts) if sub_vf_parts else "null"
                 # movie 层只载入（无 loop 参数=默认播一次）；循环统一由 chain 的 loop_size 处理
                 fc_parts.append(f"movie={path_esc}[sub]")
@@ -10028,11 +10304,17 @@ class FFmpegBatchGUI:
                 else:
                     # 基准位置必须求值成数字：mpv overlay 只认数值/原生变量，
                     # 字符串替换残留（如 main_720-720-10）会让 mpv 只出进程无画面。
-                    _ctx2 = {"W": _main_w, "H": _main_h, "w": wm_w2, "h": wm_h2}
+                    # 旋转（静态角度/持续旋转）时实际叠加尺寸为 hypot 正方形，w/h 求值必须用 d
+                    # （与正式命令 _overlay_sub_size / 占位框逻辑一致）。
+                    _ew2, _eh2 = wm_w2, wm_h2
+                    if _ra2 != 0 or (_spin2 and _sp2 != 0):
+                        _ed2 = int(round(((wm_w2 * wm_w2 + wm_h2 * wm_h2) ** 0.5)))
+                        _ew2 = _eh2 = _ed2
+                    _ctx2 = {"W": _main_w, "H": _main_h, "w": _ew2, "h": _eh2}
                     _xv2 = safe_eval_expr(x_expr, _ctx2)
                     _yv2 = safe_eval_expr(y_expr, _ctx2)
-                    x_expr = str(_xv2) if _xv2 is not None else str(_main_w - wm_w2 - 10)
-                    y_expr = str(_yv2) if _yv2 is not None else str(_main_h - wm_h2 - 10)
+                    x_expr = str(_xv2) if _xv2 is not None else str(_main_w - _ew2 - 10)
+                    y_expr = str(_yv2) if _yv2 is not None else str(_main_h - _eh2 - 10)
                 # enable 表达式：显示时段/循环控制（起始/结束/周期/单次）优先——与正式命令同一套
                 # _calc_enable_expr；未设显示控制时：手动 -t 优先，否则自动取主视频时长 →
                 # enable='lt(t,T)' + eof_action=pass（movie 源自带的音频不再被 shortest 截断输出）。
@@ -11198,18 +11480,37 @@ class FFmpegBatchGUI:
             if not size:
                 continue
             sw, sh = size
+            # 有旋转（静态角度/持续旋转）时用 hypot 正方形包围盒求值/绘制，与 overlay 的 w/h 语义一致
+            try:
+                _ra_sub = float(sub.enc_settings.get("rotate_angle", 0) or 0)
+            except (ValueError, TypeError):
+                _ra_sub = 0.0
+            eff_w, eff_h = sw, sh
+            if _ra_sub != 0 or sub.enc_settings.get("spin_enabled", False):
+                d = int(round(((sw * sw + sh * sh) ** 0.5)))
+                eff_w = eff_h = d
             x_expr = sub.enc_settings.get('overlay_x', '0')
             y_expr = sub.enc_settings.get('overlay_y', '0')
-            x_val = safe_eval_expr(x_expr, {"W": canvas_w, "H": canvas_h, "w": sw, "h": sh})
-            y_val = safe_eval_expr(y_expr, {"W": canvas_w, "H": canvas_h, "w": sw, "h": sh})
+            x_val = safe_eval_expr(x_expr, {"W": canvas_w, "H": canvas_h, "w": eff_w, "h": eff_h})
+            y_val = safe_eval_expr(y_expr, {"W": canvas_w, "H": canvas_h, "w": eff_w, "h": eff_h})
             if x_val is None or y_val is None:
                 continue
-            x_val = max(0, min(x_val, canvas_w - sw))
-            y_val = max(0, min(y_val, canvas_h - sh))
-            cx1, cy1 = self._to_canvas_coords(x_val, y_val, scale)
-            cx2, cy2 = self._to_canvas_coords(x_val + sw, y_val + sh, scale)
-            canvas.create_rectangle(cx1, cy1, cx2, cy2, outline="lightgreen", width=2, dash=(4, 4), fill="", tags=tag)
-            canvas.create_text(cx1 + 5, cy1 + 5, anchor="nw", text=str(sub_order[sub]),
+            x_val = max(0, min(x_val, canvas_w - eff_w))
+            y_val = max(0, min(y_val, canvas_h - eff_h))
+            if _ra_sub != 0:
+                # 画旋转后的内容多边形（内容矩形以正方形中心为中心绕 rotate_angle 旋转）
+                d = eff_w
+                cx, cy = x_val + d / 2.0, y_val + d / 2.0
+                pts = rotate_rect_polygon(cx - sw / 2.0, cy - sh / 2.0, sw, sh, _ra_sub)
+                cpts = [tuple(self._to_canvas_coords(px, py, scale)) for px, py in pts]
+                canvas.create_polygon(cpts, outline="lightgreen", width=2, dash=(4, 4), fill="", tags=tag)
+                tx, ty = min(p[0] for p in cpts) + 5, min(p[1] for p in cpts) + 5
+            else:
+                cx1, cy1 = self._to_canvas_coords(x_val, y_val, scale)
+                cx2, cy2 = self._to_canvas_coords(x_val + eff_w, y_val + eff_h, scale)
+                canvas.create_rectangle(cx1, cy1, cx2, cy2, outline="lightgreen", width=2, dash=(4, 4), fill="", tags=tag)
+                tx, ty = cx1 + 5, cy1 + 5
+            canvas.create_text(tx, ty, anchor="nw", text=str(sub_order[sub]),
                                fill="red", font=("Arial", 10, "bold"), tags=tag)
 
 
@@ -11228,7 +11529,12 @@ class FFmpegBatchGUI:
                                 extra_info="",   #子视频的额外主视频偏移信息
                                 rect_label='',   # 单独的方框显示名
                                 min_visible_pixels=0,  # 主视频偏移限制 至少留10  默认传0
-                                show_scale_tip=False   # 子视频和水印的 新绘制操作提示
+                                show_scale_tip=False,   # 子视频和水印的 新绘制操作提示
+                                rotate_angle=0.0,       # 初始旋转角度（度）；>0 时启用旋转显示与旋转手柄
+                                angle_cb=None,          # 应用时回调 angle_cb(new_angle)，用于写回 rotate_angle
+                                angle_editable=True,    # False=只读显示角度（不显示旋转手柄，如主视频档位旋转）
+                                rot_square=True         # True=锚点为旋转后正方形包围盒左上角（子视频自由角度）；
+                                                        # False=锚点为内容矩形左上角（主视频 transpose 档位）
                                 ):
         """
         通用叠加/偏移可视化编辑器（核心重构函数）
@@ -11271,6 +11577,7 @@ class FFmpegBatchGUI:
     
         # ---- 内部状态 ----
         current_x, current_y, current_w, current_h = rect_x, rect_y, rect_w, rect_h
+        current_angle = float(rotate_angle or 0.0)
         current_canvas_w, current_canvas_h = canvas_w, canvas_h
         rect_id = None
         text_id = None
@@ -11282,6 +11589,13 @@ class FFmpegBatchGUI:
         drag_start_x = 0
         drag_start_y = 0
         drag_mouse_start = (0, 0)
+        rotate_handle_id = None       # 旋转手柄（右上角外侧小圆点）
+        rotating = False              # 是否正在拖旋转手柄
+        rot_mouse_start = (0, 0)
+        rot_start_angle = 0.0
+
+        # 启用旋转功能的条件：初始角度非 0 或提供了角度回调（子视频编辑器会传）
+        rotation_enabled = (current_angle != 0) or (angle_cb is not None)
     
         # ---- 辅助函数 ----
         def to_canvas(ox, oy):
@@ -11290,6 +11604,40 @@ class FFmpegBatchGUI:
         def to_real(cx, cy):
             return int(round(cx / scale)), int(round(cy / scale))
     
+        # ---- 旋转辅助（rotation_enabled 时启用）----
+        def content_diag():
+            """旋转后包围盒边长 d（与 rotate 滤镜 ow/oh=hypot(iw,ih) 一致）；仅 rot_square 模式使用。"""
+            return int(round(((current_w * current_w + current_h * current_h) ** 0.5)))
+
+        def content_center():
+            """内容矩形旋转中心：rot_square=True 时=旋转后正方形中心（子视频自由角度）；
+            False 时=内容矩形自身中心（主视频 transpose 档位）。"""
+            if rot_square:
+                d = content_diag()
+                return current_x + d / 2.0, current_y + d / 2.0
+            return current_x + current_w / 2.0, current_y + current_h / 2.0
+
+        def polygon_canvas():
+            """内容矩形绕中心旋转 current_angle 后的 4 顶点（画布坐标）。"""
+            cx, cy = content_center()
+            pts = rotate_rect_polygon(cx - current_w / 2.0, cy - current_h / 2.0,
+                                      current_w, current_h, current_angle)
+            return [tuple(to_canvas(px, py)) for px, py in pts]
+
+        def rotate_handle_canvas():
+            """旋转手柄位置：内容矩形旋转后的右上角，沿旋转方向外推 14px（画布坐标）。"""
+            import math as _m
+            d = content_diag()
+            cx, cy = content_center()
+            a = _m.radians(current_angle)
+            ca, sa = _m.cos(a), _m.sin(a)
+            px, py = cx + current_w / 2.0, cy - current_h / 2.0
+            dx, dy = px - cx, py - cy
+            rx, ry = cx + dx * ca - dy * sa, cy + dx * sa + dy * ca
+            vx, vy = rx - cx, ry - cy
+            vlen = (vx * vx + vy * vy) ** 0.5 or 1.0
+            return tuple(to_canvas(rx + vx / vlen * 14, ry + vy / vlen * 14))
+
         def clamp_rect():
             nonlocal current_x, current_y, current_w, current_h
             if allow_negative_offset and min_visible_pixels > 0:
@@ -11302,46 +11650,95 @@ class FFmpegBatchGUI:
                 # 完全放开，无任何限制
                 pass
             else:
-                # 严格限制在画布内（子视频/水印模式）
-                current_x = max(0, min(current_x, current_canvas_w - current_w))
-                current_y = max(0, min(current_y, current_canvas_h - current_h))
-                current_w = min(current_w, current_canvas_w)
-                current_h = min(current_h, current_canvas_h)
-    
+                # 严格限制在画布内（子视频/水印模式）。rot_square 旋转时用正方形包围盒 d 钳制，
+                # 保证旋转后实际叠加区域（正方形）完全落在画布内。
+                if rotation_enabled and rot_square:
+                    d = content_diag()
+                    current_x = max(0, min(current_x, max(0, current_canvas_w - d)))
+                    current_y = max(0, min(current_y, max(0, current_canvas_h - d)))
+                    current_w = min(current_w, current_canvas_w)
+                    current_h = min(current_h, current_canvas_h)
+                else:
+                    current_x = max(0, min(current_x, current_canvas_w - current_w))
+                    current_y = max(0, min(current_y, current_canvas_h - current_h))
+                    current_w = min(current_w, current_canvas_w)
+                    current_h = min(current_h, current_canvas_h)
+
         def create_rect():
-            nonlocal rect_id, text_id, coord_disp_id
-            cx1, cy1 = to_canvas(current_x, current_y)
-            cx2, cy2 = to_canvas(current_x + current_w, current_y + current_h)
-            rid = canvas.create_rectangle(cx1, cy1, cx2, cy2, outline=rect_color, width=2,
-                                          fill=rect_color, stipple="gray50", tags="rect")
-            tid = canvas.create_text(cx1 + 5, cy1 + 5, anchor="nw", text=rect_label,
+            nonlocal rect_id, text_id, coord_disp_id, rotate_handle_id
+            if rotation_enabled:
+                pts = polygon_canvas()
+                rid = canvas.create_polygon(pts, outline=rect_color, width=2,
+                                            fill=rect_color, stipple="gray50", tags="rect")
+                bbox = canvas.bbox(rid)
+                if angle_editable:
+                    hx, hy = rotate_handle_canvas()
+                    rotate_handle_id = canvas.create_oval(hx - 6, hy - 6, hx + 6, hy + 6,
+                                                          outline="yellow", width=2, fill="black",
+                                                          tags="rothead")
+                    tx, ty = (bbox[0] + 5, bbox[1] + 5) if bbox else (hx + 5, hy + 5)
+                else:
+                    tx, ty = (bbox[0] + 5, bbox[1] + 5) if bbox else (current_x + 5, current_y + 5)
+            else:
+                cx1, cy1 = to_canvas(current_x, current_y)
+                cx2, cy2 = to_canvas(current_x + current_w, current_y + current_h)
+                rid = canvas.create_rectangle(cx1, cy1, cx2, cy2, outline=rect_color, width=2,
+                                              fill=rect_color, stipple="gray50", tags="rect")
+                tx, ty = cx1 + 5, cy1 + 5
+            tid = canvas.create_text(tx, ty, anchor="nw", text=rect_label,
                                      fill="white", font=("Arial", 9), tags="rect")
-            # 浮动坐标显示（矩形上方居中）→ P2 改进
-            coord_disp_id = canvas.create_text((cx1 + cx2) // 2, cy1 - 10, anchor="s",
-                                                text=f"({current_x}, {current_y})",
+            # 浮动坐标显示（矩形上方居中）
+            bbox2 = canvas.bbox(rid) if rotation_enabled else (cx1, cy1, cx2, cy2)
+            coord_disp_id = canvas.create_text((bbox2[0] + bbox2[2]) // 2, bbox2[1] - 10,
+                                                anchor="s", text=f"({current_x}, {current_y})",
                                                 fill="#00ff00", font=("Arial", 8),
                                                 tags="coord_disp")
             return rid, tid
-    
+
         def update_rect_position():
-            cx1, cy1 = to_canvas(current_x, current_y)
-            cx2, cy2 = to_canvas(current_x + current_w, current_y + current_h)
-            canvas.coords(rect_id, cx1, cy1, cx2, cy2)
-            canvas.coords(text_id, cx1 + 5, cy1 + 5)
-            # 浮动坐标（矩形上方居中；贴顶时放下方）
-            if coord_disp_id:
-                if cy1 > 20:
-                    canvas.coords(coord_disp_id, (cx1 + cx2) // 2, cy1 - 10)
-                else:
-                    canvas.coords(coord_disp_id, (cx1 + cx2) // 2, cy2 + 14)
-                canvas.itemconfig(coord_disp_id, text=f"({current_x}, {current_y})")
+            if rotation_enabled:
+                pts = polygon_canvas()
+                canvas.coords(rect_id, [c for pt in pts for c in pt])
+                bbox = canvas.bbox(rect_id)
+                if bbox:
+                    canvas.coords(text_id, bbox[0] + 5, bbox[1] + 5)
+                if angle_editable and rotate_handle_id:
+                    hx, hy = rotate_handle_canvas()
+                    canvas.coords(rotate_handle_id, hx - 6, hy - 6, hx + 6, hy + 6)
+                # 浮动坐标（包围盒上方居中；贴顶时放下方）
+                if coord_disp_id and bbox:
+                    if bbox[1] > 20:
+                        canvas.coords(coord_disp_id, (bbox[0] + bbox[2]) // 2, bbox[1] - 10)
+                    else:
+                        canvas.coords(coord_disp_id, (bbox[0] + bbox[2]) // 2, bbox[3] + 14)
+                    canvas.itemconfig(coord_disp_id, text=f"({current_x}, {current_y})")
+            else:
+                cx1, cy1 = to_canvas(current_x, current_y)
+                cx2, cy2 = to_canvas(current_x + current_w, current_y + current_h)
+                canvas.coords(rect_id, cx1, cy1, cx2, cy2)
+                canvas.coords(text_id, cx1 + 5, cy1 + 5)
+                # 浮动坐标（矩形上方居中；贴顶时放下方）
+                if coord_disp_id:
+                    if cy1 > 20:
+                        canvas.coords(coord_disp_id, (cx1 + cx2) // 2, cy1 - 10)
+                    else:
+                        canvas.coords(coord_disp_id, (cx1 + cx2) // 2, cy2 + 14)
+                    canvas.itemconfig(coord_disp_id, text=f"({current_x}, {current_y})")
             update_coord_display()
-    
+
         def update_coord_display():
             if coord_mode == 'offset':
                 coord_var.set(f"偏移: X={current_x}, Y={current_y}")
             else:
-                coord_var.set(f"左上角: ({current_x}, {current_y})  宽: {current_w}  高: {current_h}")
+                if rotation_enabled:
+                    if rot_square:
+                        coord_var.set(f"左上角: ({current_x}, {current_y})  宽: {current_w}  高: {current_h}  角度: {current_angle}°\n"
+                                      f"（有旋转时 X/Y 为旋转后正方形包围盒的左上角）")
+                    else:
+                        coord_var.set(f"左上角: ({current_x}, {current_y})  宽: {current_w}  高: {current_h}  角度: {current_angle}°\n"
+                                      f"（档位旋转：90°顺/180°/90°逆，角度应用时吸附 90° 档）")
+                else:
+                    coord_var.set(f"左上角: ({current_x}, {current_y})  宽: {current_w}  高: {current_h}")
     
         # ---- 画布尺寸应用 ----
         def _apply_canvas_size():
@@ -11409,7 +11806,39 @@ class FFmpegBatchGUI:
             nonlocal dragging
             dragging = False
             status_var.set("拖拽完成，可调整或应用")
-    
+
+        # ---- 旋转手柄（rotation_enabled 时启用）：拖动时绕中心算角度 ----
+        def start_rotate(event):
+            nonlocal rotating, rot_mouse_start, rot_start_angle
+            if draw_mode_active or not rotation_enabled:
+                return
+            canvas.focus_set()
+            rot_mouse_start = (event.x, event.y)
+            rot_start_angle = current_angle
+            rotating = True
+            status_var.set("拖拽旋转手柄调整角度（可负角）")
+
+        def on_rotate(event):
+            nonlocal current_angle, rotating
+            if not rotating or draw_mode_active:
+                return
+            import math as _m
+            mcx, mcy = content_center()
+            mcx, mcy = to_canvas(mcx, mcy)
+            a0 = _m.atan2(rot_mouse_start[1] - mcy, rot_mouse_start[0] - mcx)
+            a1 = _m.atan2(event.y - mcy, event.x - mcx)
+            delta = (a1 - a0) * 180.0 / _m.pi
+            # 归一化到 [-180, 180]，与数值框范围一致
+            new_angle = (rot_start_angle + delta + 180.0) % 360.0 - 180.0
+            current_angle = round(new_angle, 1)
+            update_rect_position()
+            status_var.set(f"旋转角度: {current_angle}°（可负角）")
+
+        def stop_rotate(event):
+            nonlocal rotating
+            rotating = False
+            status_var.set(f"旋转完成，当前角度 {current_angle}°，点「应用」写回角度框")
+
         # ---- 绘制新矩形（仅当 allow_resize=True 时可用） ----
         def start_draw(event):
             nonlocal draw_start, draw_rect_temp, draw_mode_active
@@ -11488,7 +11917,9 @@ class FFmpegBatchGUI:
                         canvas.delete(rect_id)
                         canvas.delete(text_id)
                         canvas.delete(coord_disp_id)
-                        rect_id, text_id = create_rect()
+                        if rotate_handle_id:
+                            canvas.delete(rotate_handle_id)
+                        rect_id, text_id = create_rect()  # 新矩形沿用当前旋转角度（钳制新角度）
                         update_coord_display()
                         status_var.set("新矩形已创建，可拖拽移动或应用")
                 if draw_rect_temp:
@@ -11523,7 +11954,7 @@ class FFmpegBatchGUI:
     
         # ---- 重置位置 ----
         def reset_position():
-            nonlocal current_x, current_y
+            nonlocal current_x, current_y, current_angle
             # 如果是主视频模式（允许负偏移且为蓝色），重置到左上角 (0,0)
             if allow_negative_offset and rect_color == 'deepskyblue':
                 current_x = 0
@@ -11532,15 +11963,19 @@ class FFmpegBatchGUI:
                 # 否则（子视频/水印）重置到右下角（保留 10px 边距）
                 current_x = current_canvas_w - current_w - 10
                 current_y = current_canvas_h - current_h - 10
+            if angle_editable:
+                current_angle = 0.0  # 重置位置的同时把旋转角度归零
             clamp_rect()
             update_rect_position()
-            status_var.set("已重置位置")
+            status_var.set("已重置位置" + ("，角度已归零" if angle_editable else ""))
     
         # ---- 应用与取消 ----
         def apply():
             clamp_rect()
             on_apply(current_x, current_y, current_w, current_h,
                      current_canvas_w, current_canvas_h)
+            if angle_cb is not None:
+                angle_cb(current_angle)
             win.destroy()
     
         def cancel():
@@ -11604,6 +12039,10 @@ class FFmpegBatchGUI:
         canvas.tag_bind("rect", "<Button-1>", start_move)
         canvas.tag_bind("rect", "<B1-Motion>", on_move)
         canvas.tag_bind("rect", "<ButtonRelease-1>", stop_move)
+        if rotation_enabled and angle_editable:
+            canvas.tag_bind("rothead", "<Button-1>", start_rotate)
+            canvas.tag_bind("rothead", "<B1-Motion>", on_rotate)
+            canvas.tag_bind("rothead", "<ButtonRelease-1>", stop_rotate)
         canvas.bind("<Button-1>", start_draw, add=True)
         canvas.bind("<B1-Motion>", on_draw_move, add=True)
         canvas.bind("<ButtonRelease-1>", end_draw, add=True)
@@ -11637,6 +12076,12 @@ class FFmpegBatchGUI:
         update_coord_display()
         if rect_color == 'deepskyblue':
             status_var.set("拖拽蓝色矩形移动，调整主视频内容在画布中的位置。")
+        elif rotation_enabled and angle_editable:
+            status_var.set("红色多边形=旋转后的子视频（已钳制当前角度）。拖拽移动/调整大小，"
+                           "拖黄色圆点旋转角度，点「应用」写回。有旋转时 X/Y 为旋转后正方形包围盒的左上角。")
+        elif rotation_enabled:
+            status_var.set("蓝色矩形=主视频内容，已显示旋转状态（档位角度，仅指示不可拖转）。"
+                           "拖拽移动/调整画布，点「应用」写回。")
         else:
             status_var.set("红色矩形可拖拽移动。")
         if not allow_resize and 'draw_btn_frame' in locals():
@@ -11758,21 +12203,37 @@ class FFmpegBatchGUI:
     def open_watermark_overlay_editor(self, canvas_w, canvas_h, wm_w, wm_h, x_var, y_var,
                                       scale_enabled_var=None, scale_w_var=None, scale_h_var=None,
                                       watermark_dict=None, filt_frame=None, parent=None,
-                                      free_layout=False):
+                                      free_layout=False, ov_angle_var=None):
         """
         水印可视化编辑器，支持回写位置和缩放尺寸，以及更新水印字典和滤镜框架。
         free_layout=True 时放开边界（子视频可拖出画布、可比主视频大）。
+        ov_angle_var: OverlayPositionFrame 的 rotate_angle DoubleVar（应用时写回角度）
         """
-        # 解析当前坐标
-        rect_x = safe_eval_expr(x_var.get(), {"W": canvas_w, "H": canvas_h, "w": wm_w, "h": wm_h})
+        # 水印静态旋转角度（rotate_angle），旋转后为 hypot 正方形包围盒
+        try:
+            _wm_ra = float((watermark_dict or {}).get("rotate_angle", 0) or 0)
+        except (ValueError, TypeError):
+            _wm_ra = 0.0
+        if ov_angle_var is not None:
+            try:
+                _wm_ra = float(ov_angle_var.get() or 0)
+            except (ValueError, TypeError):
+                pass
+        _wm_spin = bool((watermark_dict or {}).get("spin_enabled", False))
+        # 解析当前坐标：有旋转时用 hypot 正方形包围盒求值（与 overlay 的 w/h 语义一致）
+        eff_w, eff_h = wm_w, wm_h
+        if _wm_ra != 0 or _wm_spin:
+            d = int(round(((wm_w * wm_w + wm_h * wm_h) ** 0.5)))
+            eff_w = eff_h = d
+        rect_x = safe_eval_expr(x_var.get(), {"W": canvas_w, "H": canvas_h, "w": eff_w, "h": eff_h})
         if rect_x is None:
-            rect_x = canvas_w - wm_w - 10
-        rect_y = safe_eval_expr(y_var.get(), {"W": canvas_w, "H": canvas_h, "w": wm_w, "h": wm_h})
+            rect_x = canvas_w - eff_w - 10
+        rect_y = safe_eval_expr(y_var.get(), {"W": canvas_w, "H": canvas_h, "w": eff_w, "h": eff_h})
         if rect_y is None:
-            rect_y = canvas_h - wm_h - 10
+            rect_y = canvas_h - eff_h - 10
         if not free_layout:
-            rect_x = max(0, min(rect_x, canvas_w - wm_w))
-            rect_y = max(0, min(rect_y, canvas_h - wm_h))
+            rect_x = max(0, min(rect_x, canvas_w - eff_w))
+            rect_y = max(0, min(rect_y, canvas_h - eff_h))
     
         def on_apply(new_x, new_y, new_w, new_h, new_canvas_w, new_canvas_h):
             # 更新位置变量
@@ -11798,7 +12259,17 @@ class FFmpegBatchGUI:
                 filt_frame.scale_width.set(str(new_w))
                 filt_frame.scale_height.set(str(new_h))
             self._append_info_ui(f"[可视化-水] 已保存位置: ({new_x}, {new_y}) 尺寸: {new_w}x{new_h}")
-    
+
+        def apply_wm_angle(new_angle):
+            if watermark_dict is not None:
+                watermark_dict["rotate_angle"] = float(new_angle or 0.0)
+            if ov_angle_var is not None:
+                try:
+                    ov_angle_var.set(float(new_angle or 0.0))
+                except Exception:
+                    pass
+            self._append_info_ui(f"[可视化-水] 已保存旋转角度: {new_angle}°")
+
         title = "可视化编辑水印位置及大小"
         aspect = None
         if wm_h and wm_h > 0:
@@ -11807,12 +12278,15 @@ class FFmpegBatchGUI:
                                      rect_x, rect_y, wm_w, wm_h,
                                      on_apply, title, aspect, bg_draw_func=None,rect_label='水印',
                                      min_visible_pixels=0,show_scale_tip=True,
-                                     allow_negative_offset=free_layout)
+                                     allow_negative_offset=free_layout,
+                                     rotate_angle=_wm_ra, angle_cb=apply_wm_angle)
     
     # ---------- 从视频位置可视化编辑器 ----------
-    def open_visual_overlay_editor(self, track_idx, ov_x_var=None, ov_y_var=None, filt_frame=None, parent=None, free_layout=False):
+    def open_visual_overlay_editor(self, track_idx, ov_x_var=None, ov_y_var=None, ov_angle_var=None,
+                                   filt_frame=None, parent=None, free_layout=False):
         """
         画中画子视频叠加位置/大小可视化编辑器（保留背景虚线框）
+        ov_angle_var: OverlayPositionFrame 的 rotate_angle DoubleVar（应用时写回角度）
         """
         track = self.merge_tracks[track_idx]
         if track.type != "video":
@@ -11829,20 +12303,30 @@ class FFmpegBatchGUI:
             messagebox.showerror("错误", "无法获取视频渲染尺寸")
             return
     
+        # 当前旋转角度（静态角度 rotate_angle）
+        try:
+            _ra = float(track.enc_settings.get("rotate_angle", 0) or 0)
+        except (ValueError, TypeError):
+            _ra = 0.0
+    
         canvas_w, canvas_h = self._get_canvas_size(main_track)
     
-        # 计算当前矩形位置
+        # 计算当前矩形位置：有旋转时用旋转后包围盒（hypot 正方形）求值，与 ffmpeg overlay 的 w/h 语义一致
         x_expr = track.enc_settings.get('overlay_x', '0')
         y_expr = track.enc_settings.get('overlay_y', '0')
-        rect_x = safe_eval_expr(x_expr, {"W": canvas_w, "H": canvas_h, "w": curr_w, "h": curr_h})
+        eff_w, eff_h = curr_w, curr_h
+        if _ra != 0 or track.enc_settings.get("spin_enabled", False):
+            d = int(round(((curr_w * curr_w + curr_h * curr_h) ** 0.5)))
+            eff_w = eff_h = d
+        rect_x = safe_eval_expr(x_expr, {"W": canvas_w, "H": canvas_h, "w": eff_w, "h": eff_h})
         if rect_x is None:
-            rect_x = canvas_w - curr_w - 10
-        rect_y = safe_eval_expr(y_expr, {"W": canvas_w, "H": canvas_h, "w": curr_w, "h": curr_h})
+            rect_x = canvas_w - eff_w - 10
+        rect_y = safe_eval_expr(y_expr, {"W": canvas_w, "H": canvas_h, "w": eff_w, "h": eff_h})
         if rect_y is None:
-            rect_y = canvas_h - curr_h - 10
+            rect_y = canvas_h - eff_h - 10
         if not free_layout:
-            rect_x = max(0, min(rect_x, canvas_w - curr_w))
-            rect_y = max(0, min(rect_y, canvas_h - curr_h))
+            rect_x = max(0, min(rect_x, canvas_w - eff_w))
+            rect_y = max(0, min(rect_y, canvas_h - eff_h))
     
         def on_apply(new_x, new_y, new_w, new_h, new_canvas_w, new_canvas_h):
             # 更新轨道设置
@@ -11867,6 +12351,17 @@ class FFmpegBatchGUI:
             self.merge_update_track_list()
             self.merge_update_command_preview()
             self._append_info_ui(f"[可视化-从] 已保存位置: ({new_x}, {new_y}) 大小: {new_w}x{new_h}")
+
+        def apply_angle(new_angle):
+            """编辑器「应用」时写回旋转角度（rotate_angle）到轨道设置与叠加位置控件。"""
+            track.enc_settings['rotate_angle'] = float(new_angle or 0.0)
+            if ov_angle_var is not None:
+                try:
+                    ov_angle_var.set(float(new_angle or 0.0))
+                except Exception:
+                    pass
+            self.merge_update_command_preview()
+            self._append_info_ui(f"[可视化-从] 已保存旋转角度: {new_angle}°")
     
         main_pad_enabled = main_track.enc_settings.get('pad_enabled', False)
         if main_pad_enabled:
@@ -11904,7 +12399,9 @@ class FFmpegBatchGUI:
             rect_label='当前子视频',
             min_visible_pixels=0,
             show_scale_tip=True,
-            allow_negative_offset=free_layout
+            allow_negative_offset=free_layout,
+            rotate_angle=_ra,
+            angle_cb=apply_angle
         )
 
     # ---------- 预设管理 ----------
@@ -12715,6 +13212,10 @@ class FFmpegBatchGUI:
         if task.status not in ("等待", "失败", "完成"):
             messagebox.showwarning("无法编辑", f"任务状态为“{task.status}”，只能编辑等待、失败或已完成的任务。")
             return
+
+        # 归一化输入路径（批量/拖拽可能存相对路径），确保滤镜探测/画布计算能定位
+        if task.input and not os.path.isabs(task.input):
+            task.input = normalize_path(os.path.abspath(task.input))
     
         with self.SafeToplevel(self.root) as win:
             win.title(f"编辑任务 - {os.path.basename(task.input)}")
@@ -12861,12 +13362,20 @@ class FFmpegBatchGUI:
             
             # ---- AdvancedFrame，并传入 update_callback ----
             watermark_dict = task.settings.get("watermark", {})   # 防止 KeyError
+            # 任务文字水印设置：队列编辑必须改任务自己的 dict，不能动主界面全局
+            # text_watermark_settings（否则「队列里改文字水印」改的是转换主界面、
+            # 任务不生效）。旧任务没有该键时从主界面当前设置复制一份作初始值。
+            if "text_watermark" not in task.settings or not isinstance(task.settings.get("text_watermark"), dict):
+                task.settings["text_watermark"] = copy.deepcopy(self.text_watermark_settings)
             adv_frame = AdvancedFrame(
                 page_adv,
                 update_callback=None,
                 app=self,
                 show_adaptive=True,
-                watermark_dict=watermark_dict
+                watermark_dict=watermark_dict,
+                tw_settings=task.settings["text_watermark"],
+                tw_canvas_file=task.input,
+                tw_full_settings=task.settings,
             )
             task.settings["watermark"] = adv_frame.watermark_dict
             adv_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -12883,10 +13392,24 @@ class FFmpegBatchGUI:
                     if tw.get("enabled", False) and tw.get("text", "").strip():
                         # 文字水印位置编辑
                         canvas_w, canvas_h = 1280, 720
-                        if task.input and os.path.exists(task.input):
-                            w, h = self._get_video_dimensions_cached(task.input)
-                            if w and h:
-                                canvas_w, canvas_h = w, h
+                        _in = task.input or ""
+                        if not os.path.isabs(_in):
+                            _in = normalize_path(os.path.abspath(_in))
+                        if _in and os.path.exists(_in):
+                            # 用任务设置计算主视频渲染后尺寸（裁剪/缩放/旋转），保证画布准确
+                            orig_w, orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, _in, task.settings)
+                            if orig_w is None or orig_h is None:
+                                orig_w, orig_h = self._get_video_dimensions_cached(_in)
+                            if orig_w and orig_h:
+                                try:
+                                    rw, rh = compute_rendered_size(orig_w, orig_h, task.settings)
+                                except Exception:
+                                    rw, rh = orig_w, orig_h
+                                if rw and rh and rw > 0 and rh > 0:
+                                    canvas_w, canvas_h = rw, rh
+                                    self._append_info_ui(f"[任务编辑] 文字水印画布尺寸: {canvas_w}x{canvas_h}（按任务渲染设置计算）")
+                        else:
+                            self._append_info_ui("[任务编辑] 无法定位主视频，文字水印画布使用默认 1280x720")
                         text = tw.get("text", "")
                         fs = tw.get("font_size", 48)
                         wm_w = max(len(text) * int(fs * 0.7), int(fs * 0.7))
@@ -12898,17 +13421,34 @@ class FFmpegBatchGUI:
                             tw["overlay_y"] = str(ny)
                             update_preview()
                             self._append_info_ui(f"[文字水印] 位置已设置: ({nx}, {ny})")
+                        # 文字水印静态旋转角度（-180..180），旋转后为 hypot 正方形包围盒
+                        try:
+                            _tw2_ra = float(tw.get("rotate", 0) or 0)
+                        except (ValueError, TypeError):
+                            _tw2_ra = 0.0
+                        _tw2_spin = bool(tw.get("spin_enabled", False))
+                        _eff2_w, _eff2_h = wm_w, wm_h
+                        if _tw2_ra != 0 or _tw2_spin:
+                            _tw2_d = int(round(((wm_w * wm_w + wm_h * wm_h) ** 0.5)))
+                            _eff2_w = _eff2_h = _tw2_d
                         # 初始坐标：safe_eval_expr 可能返回 0（合法位置），必须用 None 判断而非 `or 10`，
                         # 否则 y=0 会被 `0 or 10` 顶成 10，看起来「y 没返回数值」。
-                        _init_x2 = safe_eval_expr(x_var.get(), {"W": canvas_w, "H": canvas_h, "w": wm_w, "h": wm_h})
-                        _init_y2 = safe_eval_expr(y_var.get(), {"W": canvas_w, "H": canvas_h, "w": wm_w, "h": wm_h})
+                        _init_x2 = safe_eval_expr(x_var.get(), {"W": canvas_w, "H": canvas_h, "w": _eff2_w, "h": _eff2_h})
+                        _init_y2 = safe_eval_expr(y_var.get(), {"W": canvas_w, "H": canvas_h, "w": _eff2_w, "h": _eff2_h})
+
+                        def apply_tw2_angle(new_angle):
+                            tw["rotate"] = float(new_angle or 0.0)
+                            update_preview()
+                            self._append_info_ui(f"[文字水印] 旋转角度已更新: {new_angle}°")
+
                         self._generic_overlay_editor(
                             win, canvas_w, canvas_h,
                             10 if _init_x2 is None else _init_x2,
                             10 if _init_y2 is None else _init_y2,
                             wm_w, wm_h, on_tw_apply, "可视化编辑文字水印位置", None,
                             bg_draw_func=None, rect_label='文字水印',
-                            min_visible_pixels=0, show_scale_tip=False)
+                            min_visible_pixels=0, show_scale_tip=False,
+                            rotate_angle=_tw2_ra, angle_cb=apply_tw2_angle)
                         return
                     messagebox.showwarning("提示", "请先在任务设置中输入水印文件路径，或启用文字水印")
                     return
@@ -13000,6 +13540,9 @@ class FFmpegBatchGUI:
                 new_settings["output_container"] = container_var.get()
                 # 保留水印设置
                 new_settings["watermark"] = task.settings.get("watermark", self.watermark_settings.copy())
+                # 保留文字水印设置（队列文字水印对话框直接改 task.settings["text_watermark"]，
+                # 不在这里带上则命令预览里看不到队列设置的文字水印）
+                new_settings["text_watermark"] = task.settings.get("text_watermark", {})
                 new_out = self.generate_output_path(task.input, new_settings)
                 new_settings["enhance"] = filt_frame.get_enhance_settings()
 
@@ -13094,7 +13637,10 @@ class FFmpegBatchGUI:
                     messagebox.showinfo("提示", "此任务为流提取生成的自定义任务，不支持修改参数。")
                     win.destroy()
                     return
-                new_settings = {}
+                # 以原 task.settings 为基础再覆盖各子面板值：text_watermark 等不在任何
+                # 子面板 get_settings 里的键（如文字水印、BGM、末端处理等）必须保留，
+                # 否则编辑任务后这些设置会丢失导致不生效。
+                new_settings = dict(task.settings)
                 new_settings.update(enc_frame.get_settings())
                 new_settings.update(filt_frame.get_settings())
                 new_settings.update(audio_frame.get_settings())
@@ -14366,7 +14912,7 @@ class FFmpegBatchGUI:
             "overlay_enabled": True, "overlay_x": "W-w-10", "overlay_y": "H-h-10",
             "blend_mode": "normal", "overlay_free_layout": False,
             # 画中画/水印子视频的旋转(spin)与轨迹(move)：还原时必须一并清空，否则残留导致仍旋转/移动
-            "spin_enabled": False, "spin_speed": 60.0,
+            "spin_enabled": False, "spin_speed": 60.0, "rotate_angle": 0.0,
             "move_mode": "", "move_cycle": 4.0, "move_amp": "W*0.1",
             "move_dwell": 2.0, "move_margin": "W*0.03",
             "pad_enabled": False, "pad_width": "", "pad_height": "", "offset_x": "0", "offset_y": "0",
@@ -16174,7 +16720,10 @@ class FFmpegBatchGUI:
                 if title:
                     cmd.extend(["-metadata:s:a:0", f"title={title}"])
                     cmd.extend(["-metadata:s:a:0", f"handler_name={title}"])
-                disp = first_mix.enc_settings.get("disposition", "")
+                # ⚠️ 单轨混合时用 audio（唯一那轨）：不能用 first_mix——它只在下方多轨 else 分支
+                # 才赋值（first_mix = mix_tracks[0]），单轨时未定义会 NameError 崩溃
+                # （multi 版此处一直是 audio，正确）。
+                disp = audio.enc_settings.get("disposition", "")
                 if disp:
                     cmd.extend(["-disposition:a:0", disp])
                 else:
@@ -16236,11 +16785,15 @@ class FFmpegBatchGUI:
         if container in ("mp4", "mov") and not only_audio:
             cmd.extend(["-movflags", "+faststart"])
     
-        # 文字水印（旋转/spin）无限源时长限制：有音频用 -shortest，无音频用 -t（主视频时长）
-        _ensure_tw_duration_limit(
-            self, cmd, input_path=main_video.file_path,
-            main_duration=self._get_media_duration(main_video.file_path),
-            audio_enabled=True)
+        # 文字水印（旋转/spin）无限源时长限制：有音频用 -shortest，无音频用 -t（主视频时长）。
+        # ⚠️ only_audio 时 main_video 为 None，且仅音频模式不会注入文字水印（命令无
+        # color=c=black@0 标记，函数内部也会自动跳过）——必须跳过，否则访问
+        # main_video.file_path 直接 NoneType AttributeError（普通模式选「仅音频」即触发）。
+        if not only_audio and main_video is not None:
+            _ensure_tw_duration_limit(
+                self, cmd, input_path=main_video.file_path,
+                main_duration=self._get_media_duration(main_video.file_path),
+                audio_enabled=True)
 
         cmd.append(output_norm)
         return cmd
@@ -17576,7 +18129,7 @@ class FFmpegBatchGUI:
         """画中画实时预览（mpv --lavfi-complex）：主视频 + 各子视频走 movie 滤镜真实合成。
         所有子视频渲染滤镜与正式命令一致（截取/裁剪/缩放/绿幕/透明度/旋转/轨迹）；
         mpv 的 lavfi-complex 多输入只能引用主文件流，子视频必须用 movie 滤镜（防卡顿）。
-        子视频最多 4 个（防止复杂图过大卡死），超出在日志提示。"""
+        子视频最多 15 个（防止复杂图过大卡死），超出在日志提示。"""
         if not self.pip_enabled.get():
             self._append_info_ui("[预览] 实时预览仅画中画模式可用")
             return
@@ -17718,7 +18271,11 @@ class FFmpegBatchGUI:
                 _spd = float(_s.get("spin_speed", 60.0) or 60.0)
             except (ValueError, TypeError):
                 _spd = 60.0
-            if _alpha or (_spin and _spd != 0):
+            try:
+                _rad = float(_s.get("rotate_angle", 0) or 0)
+            except (ValueError, TypeError):
+                _rad = 0.0
+            if _alpha or (_spin and _spd != 0) or _rad != 0:
                 _sp.append("format=rgba")
             if _alpha:
                 try:
@@ -17727,8 +18284,15 @@ class FFmpegBatchGUI:
                     _av = 1.0
                 if 0.0 <= _av <= 1.0:
                     _sp.append(f"colorchannelmixer=aa={_av:.2f}")
-            if _spin and _spd != 0:
-                _sp.append(f"rotate=angle='{_spd}*PI/180*t':ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=black@0")
+            if (_spin and _spd != 0) or _rad != 0:
+                _angle_exprd = ""
+                if _rad != 0:
+                    _angle_exprd = f"{_rad}*PI/180"
+                if _spin and _spd != 0:
+                    if _angle_exprd:
+                        _angle_exprd += " + "
+                    _angle_exprd += f"{_spd}*PI/180*t"
+                _sp.append(f"rotate=angle='{_angle_exprd}':ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=black@0")
             _sub_chain = ",".join(_sp) if _sp else "null"
             # movie 层只载入（无 loop 参数=默认播一次）；循环统一由 chain 的 loop_size 处理
             parts.append(f"movie={_path_esc}[sub{_k}]")
@@ -17743,11 +18307,18 @@ class FFmpegBatchGUI:
                     _x = _mx.replace("W", "main_w").replace("H", "main_h")
                     _y = _my.replace("W", "main_w").replace("H", "main_h")
             else:
-                _ctx = {"W": _main_w, "H": _main_h, "w": _rw, "h": _rh}
+                # 旋转（静态角度/持续旋转）时实际叠加尺寸为 hypot 正方形（rotate ow/oh=hypot），
+                # 位置求值必须用正方形边长 d，否则 W-w-10 等预设位置会偏移
+                # （与正式命令 _overlay_sub_size / 占位框逻辑一致）。
+                _eval_w, _eval_h = _rw, _rh
+                if _rad != 0 or (_spin and _spd != 0):
+                    _eval_d = int(round(((_rw * _rw + _rh * _rh) ** 0.5)))
+                    _eval_w = _eval_h = _eval_d
+                _ctx = {"W": _main_w, "H": _main_h, "w": _eval_w, "h": _eval_h}
                 _xv = safe_eval_expr(_x, _ctx)
                 _yv = safe_eval_expr(_y, _ctx)
-                _x = str(_xv) if _xv is not None else str(_main_w - _rw - 10)
-                _y = str(_yv) if _yv is not None else str(_main_h - _rh - 10)
+                _x = str(_xv) if _xv is not None else str(_main_w - _eval_w - 10)
+                _y = str(_yv) if _yv is not None else str(_main_h - _eval_h - 10)
             # enable：显示时段/循环控制（起始/结束/周期/单次）优先，同正式命令 _calc_enable_expr；
             # 未设显示控制时用主视频时长上限 + eof_action=pass（防 movie 音频截断），拿不到才 shortest 兜底
             try:
@@ -18083,13 +18654,43 @@ class FFmpegBatchGUI:
                         else:
                             box_w, box_h = 200, 150
                             self._append_info_ui(f"[预览] 无法获取从视频渲染尺寸，使用默认 {box_w}x{box_h}")
+                        # 静态角度旋转(rotate_angle) / 持续旋转(spin)：实际输出为 hypot 包围盒正方形
+                        # （rotate 滤镜 ow/oh=hypot(iw,ih)），overlay 的 w/h 取正方形边长 d，
+                        # 位置表达式里的 w/h 也必须按 d 求值，否则占位框位置会偏移。
+                        eff_w, eff_h = box_w, box_h
+                        try:
+                            _ra = float(sub.enc_settings.get("rotate_angle", 0) or 0)
+                        except (ValueError, TypeError):
+                            _ra = 0.0
+                        _spin_on = sub.enc_settings.get("spin_enabled", False)
+                        if _ra != 0 or _spin_on:
+                            d = int(round(((box_w * box_w + box_h * box_h) ** 0.5)))
+                            eff_w = eff_h = d
+                            self._append_info_ui(
+                                f"[预览] 从视频 {os.path.basename(sub.file_path)} 启用了旋转，"
+                                f"占位框显示为正方形包围盒 {d}x{d}（旋转后实际叠加尺寸）")
                         x_expr = sub.enc_settings.get('overlay_x', '0')
                         y_expr = sub.enc_settings.get('overlay_y', '0')
-                        x_val = self.evaluate_expression(x_expr, main_w, main_h, box_w, box_h)
-                        y_val = self.evaluate_expression(y_expr, main_w, main_h, box_w, box_h)
-                        drawbox = f"drawbox=x={x_val}:y={y_val}:w={box_w}:h={box_h}:color=red@0.5:t=2"
-                        drawboxes.append(drawbox)
-                        self._append_info_ui(f"[预览] 从视频 {os.path.basename(sub.file_path)} 实际渲染尺寸: {box_w}x{box_h}, 位置: ({x_val}, {y_val})")
+                        x_val = self.evaluate_expression(x_expr, main_w, main_h, eff_w, eff_h)
+                        y_val = self.evaluate_expression(y_expr, main_w, main_h, eff_w, eff_h)
+                        # 占位框：未旋转=红色矩形；旋转后=蓝色正方形占位 + 红色倾斜原始矩形
+                        if _ra != 0 or _spin_on:
+                            drawboxes.append(f"drawbox=x={x_val}:y={y_val}:w={eff_w}:h={eff_h}:color=blue@0.5:t=2")
+                            d = eff_w
+                            cx = x_val + d / 2.0
+                            cy = y_val + d / 2.0
+                            if _ra != 0:
+                                drawboxes.extend(build_rotated_rect_drawboxes(
+                                    cx - box_w / 2.0, cy - box_h / 2.0, box_w, box_h, _ra,
+                                    color="red@0.5", t=2, n=5))
+                                self._append_info_ui(
+                                    f"[预览] 从视频 {os.path.basename(sub.file_path)} 同时显示蓝色正方形占位与红色旋转原始矩形")
+                            else:
+                                # 仅持续旋转（角度动态）：红色轴对齐原始矩形
+                                drawboxes.append(f"drawbox=x={cx - box_w / 2.0:.1f}:y={cy - box_h / 2.0:.1f}:w={box_w}:h={box_h}:color=red@0.5:t=2")
+                        else:
+                            drawboxes.append(f"drawbox=x={x_val}:y={y_val}:w={eff_w}:h={eff_h}:color=red@0.5:t=2")
+                        self._append_info_ui(f"[预览] 从视频 {os.path.basename(sub.file_path)} 实际渲染尺寸: {eff_w}x{eff_h}, 位置: ({x_val}, {y_val})")
                     if drawboxes:
                         drawbox_chain = ",".join(drawboxes)
                         if filters and filters != "null":
@@ -19167,7 +19768,8 @@ class FFmpegBatchGUI:
                             watermark_dict=initial_settings,  # 用于回写水印设置
                             filt_frame=filt_frame,
                             parent=win,
-                            free_layout=overlay_frame.overlay_free_layout.get()
+                            free_layout=overlay_frame.overlay_free_layout.get(),
+                            ov_angle_var=getattr(overlay_frame, "rotate_angle", None)
                         )
                     overlay_frame = OverlayPositionFrame(
                         page_overlay,
