@@ -1325,5 +1325,11 @@
   "[任务编辑] 无法定位主视频，文字水印画布使用默认 1280x720": "[Task edit] Cannot locate main video; text watermark canvas uses default 1280x720",
   "[轨迹控制] 混合模式轨迹不支持，已使用基准位置": "[Trajectory] Trajectory unsupported for this blend mode; using the base position",
   "[预览] 子视频 {0} 混合模式+轨迹控制：轨迹模式不支持，已按基准位置 blend": "[Preview] Sub video {0} blend + trajectory: trajectory mode unsupported; blended at base position",
-  "[预览] 图片水印：mpv 区域化 blend 真实合成（{0}）": "[Preview] Image watermark: mpv regional blend real composite ({0})"
+  "[预览] 图片水印：mpv 区域化 blend 真实合成（{0}）": "[Preview] Image watermark: mpv regional blend real composite ({0})",
+  "[预览] mpv 不可用（{0} 无法启动），已回退 ffplay": "[Preview] mpv unavailable ({0} cannot start), fell back to ffplay",
+  "[预览] mpv 启动失败（{0}）：{1}，已回退 ffplay": "[Preview] mpv failed to start ({0}): {1}, fell back to ffplay",
+  "[预览] 提示：原预览为 mpv 复杂图（lavfi-complex），ffplay 不支持复杂图，回退后为原始画面；如需合成效果请用快照预览": "[Preview] Note: the original preview was an mpv lavfi-complex graph; ffplay cannot play complex graphs, so the fallback shows the raw picture. Use Snapshot preview for the composited result",
+  "[预览] mpv 启动失败: {0}（已标记 mpv 不可用，请检查路径或用快照预览）": "[Preview] mpv failed to start: {0} (marked mpv unavailable; check the path or use Snapshot preview)",
+  "mpv 不可用（{0} 无法启动），\n实时预览依赖 mpv 的 lavfi-complex 复杂图能力，无法回退 ffplay。\n请检查 mpv 路径是否正确，或使用「快照」预览查看合成效果。": "mpv unavailable ({0} cannot start),\nreal-time preview depends on mpv's lavfi-complex capability and cannot fall back to ffplay.\nCheck the mpv path, or use the Snapshot preview to see the composited result.",
+  "预览: {0}": "Preview: {0}"
 }
