@@ -1941,32 +1941,49 @@ def compute_rendered_size(original_w: int, original_h: int, settings: Dict[str, 
 
 
 def _blend_move_exprs(mode, move_settings=None, sw="w", sh="h"):
-    """为 blend 区域化动态窗口构造【无逗号、无问号】动效表达式。
+    """为 blend 动态区域构造【双轴】轨迹表达式（overlay 版 W/H/w/h；crop 版由调用方 W/H→iw/ih）。
 
-    ⚠️ 实测约束（ffmpeg n8.1）：
-    - crop 的 x/y 表达式不支持逗号函数（mod/min/max 会被参数解析截断，转义无效）；
-    - `?` 字符在 filtergraph 引号内仍导致解析失败（三元 clamp 不可用，crop/overlay 都不行）。
-    因此动效轴表达式必须：不用 mod/min/max/三元，且天然在画布内（无需 clamp）。
-    h 左右往返：x = (W-w)*(1-2*abs(mod_无逗号))，tria∈[0,1] → x∈[0,W-w] 天然贴画布；
-    v 上下往返：y = (H-h)*tria → y∈[0,H-h]。
-    另一轴（基准坐标）由调用方在 Python 里求值并 clamp 成静态数字。
-    返回 (axis, expr)：axis='x'/'y' 表示该轴动效；不支持返回 (None, None)。"""
+    ⚠️ 2026-08-24 实测纠错：crop 的 x/y 表达式【支持】逗号函数与状态变量
+    （min/max/mod/lt/gte/st/ld/分号全可用，ffmpeg 8.1 六项实验全过）——旧认知
+    "crop 不支持逗号函数"是当年实测误判。因此 h/v/diamond/corners 所有轨迹均可
+    blend 动态跟随（"走到哪混到哪"），不再有仅 h/v 的限制。
+    表达式基于 build_move_xy_expr（含 min/max 夹紧到画布内），sw/sh 传区域尺寸数字。
+    返回 (x_expr, y_expr)；mode 不支持返回 (None, None)。"""
     ms = move_settings or {}
-    try:
-        T = float(ms.get("move_cycle", 4.0) or 4.0)
-    except (ValueError, TypeError):
-        T = 4.0
-    if T <= 0:
-        T = 4.0
-    if mode == "h":
-        # 左右往返：x 在 0..W-w 往返（右边缘贴 W），y 保持基准（控制上边距）
-        tria = f"(1-2*abs((t-{T:.4f}*floor(t/{T:.4f}))/{T:.4f}-0.5))"
-        return "x", f"(W-{sw})*{tria}"
-    if mode == "v":
-        # 上下往返：y 在 0..H-h 往返（下边缘贴 H），x 保持基准（控制左边距）
-        tria = f"(1-2*abs((t-{T:.4f}*floor(t/{T:.4f}))/{T:.4f}-0.5))"
-        return "y", f"(H-{sh})*{tria}"
-    return None, None
+    if mode not in ("h", "v", "diamond", "corners"):
+        return None, None
+    x0 = str(ms.get("overlay_x", "0") or "0")
+    y0 = str(ms.get("overlay_y", "0") or "0")
+    return build_move_xy_expr(mode, x0, y0, ms, sw=str(sw), sh=str(sh))
+
+
+def _blend_crop_exprs(x_expr, y_expr, bw, bh):
+    """动态轨迹 blend 的 crop 版表达式：W/H→iw/ih + 独立 w/h→区域尺寸数字。
+    crop 表达式环境只有 iw/ih（无 W/H/w/h 变量）；overlay_x/y 基准可能含 "W-w-10" 等。
+    正则 \bw\b/\bh\b 只匹配独立变量，不会误伤 iw/ih 里的 w/h（前接 i 非单词边界）。
+    返回 (x_crop, y_crop)。正式命令 / 合并页预览 / 转换页预览 三处共用，勿复制粘贴。"""
+    def _conv(e):
+        e = e.replace("W", "iw").replace("H", "ih")
+        e = re.sub(r"\bw\b", str(bw), e)
+        e = re.sub(r"\bh\b", str(bh), e)
+        return e
+    return _conv(x_expr), _conv(y_expr)
+
+
+def _blend_region_size(w, h, rotated):
+    """blend 区域尺寸：旋转（自旋转/静态角度）时用对角线 d=round(hypot(w,h))（需求2：
+    不切旋转内容，与正式命令 _overlay_sub_size 一致）；非旋转用渲染尺寸。偶数化 + min 2。
+    正式命令 / 合并页预览 / 转换页预览 三处共用，勿复制粘贴。"""
+    if rotated:
+        d = int(round(((w * w + h * h) ** 0.5)))
+        bw = bh = d
+    else:
+        bw, bh = int(w), int(h)
+    if bw % 2:
+        bw -= 1
+    if bh % 2:
+        bh -= 1
+    return max(2, bw), max(2, bh)
 
 # ================== 子进程执行封装 ==================
 def run_ffmpeg_command(cmd: List[str], on_output_line: Optional[Callable] = None, timeout: Optional[float] = None) -> Tuple[int, str]:
@@ -6028,6 +6045,33 @@ class OverlayPositionFrame(ttk.LabelFrame):
             "difference": "差值(difference)",
             "softlight": "柔光(softlight)",
             "hardlight": "强光(hardlight)",
+
+            "average": "平均(average)",
+            "burn": "颜色加深(burn)",
+            "grainextract": "颗粒提取(grainextract)",
+            "divide": "划分(divide)",
+            "dodge": "颜色减淡(dodge)",
+            "freeze": "冻结(freeze)",
+            "exclusion": "排除(exclusion)",
+            "extremity": "极值(extremity)",
+            "glow": "发光(glow)",
+            "hardmix": "实色混合(hardmix)",
+            "heat": "加热(heat)",
+            "linearlight": "线性光(linearlight)",
+            "multiply128": "正片叠底128(multiply128)",
+            "grainmerge": "颗粒合并(grainmerge)",
+            "phoenix": "凤凰(phoenix)",
+            "pinlight": "点光(pinlight)",
+            "reflect": "反射(reflect)",
+            "subtract": "相减(subtract)",
+            "vividlight": "亮光(vividlight)",
+
+             #位运算类（and/or/xor/negation）是逐像素按位逻辑运算，8-bit 下效果很怪（基本是黑白噪点感），合法但实用价值低
+            "or": "按位或(or)",
+            "and": "按位与(and)",
+            "xor": "按位异或(xor)",
+            "negation": "反相(negation)",
+
         }
         blend_values = list(self._blend_display.keys())
         blend_labels = [self._blend_display[k] for k in blend_values]
@@ -9365,6 +9409,89 @@ class FFmpegBatchGUI:
         cmd.append(output_path)
         return cmd
 
+    def _blend_static_geometry(self, xv, yv, sw, sh, mw, mh):
+        """计算区域化 blend 的「主画面裁切矩形」与「子视频裁切偏移」（静态位置）。
+        与 _build_overlay_filter_complex 静态分支逐字一致：越界裁剪 + 偶数对齐（yuv420p）+ 夹紧到画布内。
+        返回 (bx, by, bw, bh, sx, sy)。bw/bh<2 表示子视频完全在画布外。"""
+        bx = xv if xv > 0 else 0
+        by = yv if yv > 0 else 0
+        bw = sw + (xv if xv < 0 else 0)
+        bh = sh + (yv if yv < 0 else 0)
+        if bx + bw > mw:
+            bw = mw - bx
+        if by + bh > mh:
+            bh = mh - by
+        # yuv420p 要求偶数尺寸与位置（对齐时只缩小，绝不增大，避免越界）
+        if bx % 2:
+            bx -= 1
+        if by % 2:
+            by -= 1
+        if bx < 0:
+            bx = 0
+        if by < 0:
+            by = 0
+        if bw % 2:
+            bw -= 1
+        if bh % 2:
+            bh -= 1
+        # 对齐后再次夹紧到画布内
+        if bx + bw > mw:
+            bw = mw - bx
+        if by + bh > mh:
+            bh = mh - by
+        sx = -xv if xv < 0 else 0
+        sy = -yv if yv < 0 else 0
+        return bx, by, bw, bh, sx, sy
+
+    def _make_blend_region(self, crop_label, sub_label, ov_label, mc_x, mc_y, bw, bh,
+                           sub_cx, sub_cy, ov_x, ov_y, blend_mode, out_label, idx_tag,
+                           ov_suffix=""):
+        """生成「区域化 blend」子图（RGBA 隔离铁律），供正式命令与实时预览共用，勿复制粘贴。
+        - crop_label：主画面「区域来源」label（裁 cut 区域用，区域隔离时= v_crop_i，否则= current_v / cur）
+        - sub_label：子视频 label（如 'v_temp_0' / 'subr0'），带/不带括号均可（内部统一加 []）
+        - ov_label：最终 overlay 的「合成目标」label（= current_v / cur，与 crop_label 在区域隔离时不同！）
+        - mc_x/mc_y：主画面裁切坐标（静态为整数字符串，动态为 "x='expr'" 形式）
+        - sub_cx/sub_cy：子视频裁切偏移（整数字符串）
+        - ov_x/ov_y：最终 overlay 贴回坐标（与 mc 可能不同：动态时 crop 用 iw/ih、overlay 用 W/H）
+        - bw/bh：裁切矩形宽高（已偶数化）
+        - blend_mode：ffmpeg blend mode 字符串
+        - out_label：输出 label（不含括号），如 'v_out_0'
+        - idx_tag：本子图唯一标识（避免多子视频内部 label 冲突），如 '0' / 'sub0'
+        - ov_suffix：追加到最终 overlay 的参数（如 ":eof_action=pass"）。**仅实时预览传**：
+          mpv lavfi-complex 无全局 -shortest，主视频播完必须靠 eof_action=pass 收尾，
+          否则 movie 子视频无限循环 → 画面定格在末帧继续动。正式命令不传（靠全局 -shortest）。
+        返回 filter_parts 字符串列表（最后一条 overlay 输出到 [out_label]）。
+        注意：blend 后的 overlay 不带 enable（与正式命令一致：blend 子视频按像素重算，不响应显示
+        时段 enable；这是既有行为，勿擅自加 enable 导致预览/成片分叉）。"""
+        def _lbl(s):
+            s = str(s).strip()
+            if s.startswith("[") and s.endswith("]"):
+                s = s[1:-1]
+            return s
+        ml = _lbl(crop_label)
+        sl = _lbl(sub_label)
+        ol = _lbl(ov_label)
+        mc = f"mcr{idx_tag}"
+        alp = f"alp{idx_tag}"
+        rgx = f"rgx{idx_tag}"
+        aex = f"aex{idx_tag}"
+        blr = f"blx{idx_tag}r"
+        bl = f"blx{idx_tag}"
+        parts = []
+        # 1) 主视频裁出该区域并转 RGB（blend 纯 RGB 空间、无 alpha 可破坏）
+        parts.append(f"[{ml}]crop={bw}:{bh}:{mc_x}:{mc_y},format=rgb24[{mc}]")
+        # 2) 子视频裁出对应部分，split 出 alpha 单独提取，RGB 部分转 rgb24 参与 blend
+        parts.append(f"[{sl}]crop={bw}:{bh}:{sub_cx}:{sub_cy},format=rgba,split=2[{alp}][{rgx}]")
+        parts.append(f"[{alp}]alphaextract[{aex}]")
+        parts.append(f"[{rgx}]format=rgb24[{rgx}b]")
+        # 3) 仅在该矩形区域内混合（RGB 空间，输出 rgb24 无 alpha）
+        parts.append(f"[{mc}][{rgx}b]blend=all_mode={blend_mode}[{blr}]")
+        # 4) 把子视频 alpha 合并回来（遮罩/透明度原样保留）
+        parts.append(f"[{blr}][{aex}]alphamerge,format=rgba[{bl}]")
+        # 5) 把混合结果贴回原位置（合成目标 = ov_label = current_v / cur）
+        parts.append(f"[{ol}][{bl}]overlay={ov_x}:{ov_y}{ov_suffix}[{out_label}]")
+        return parts
+
     def _build_overlay_filter_complex(self, main_idx: int, main_settings: dict,
                                        sub_infos: List[Tuple[int, str, dict]],
                                        include_subtitle_main: bool = False,
@@ -9618,118 +9745,47 @@ class FFmpegBatchGUI:
                         bw = 2
                     if bh < 2:
                         bh = 2
-                    # 动态轨迹 blend：仅 h/v 往返支持（crop 的 x/y 表达式不支持逗号函数、
-                    # `?` 在 filtergraph 引号内也会解析失败 → diamond/corners 回退静态提示）
+                    # 动态轨迹 blend：h/v/diamond/corners 全部支持（2026-08-24 实测：crop 的
+                    # x/y 表达式支持逗号函数与状态变量 → 双轴表达式均可动态跟随，"走到哪混到哪"）
                     _dyn = None
                     if _mv:
-                        _axis, _dexpr = _blend_move_exprs(_mv, sub_settings, bw, bh)
-                        if _axis is not None and "," not in _dexpr and "?" not in _dexpr:
-                            # 动效轴天然在画布内；静态轴（基准坐标）在 Python 里求值并 clamp 成数字
-                            _ctx_s = {"W": mw, "H": mh, "w": bw, "h": bh}
-                            if _axis == "x":
-                                _sv = safe_eval_expr(y, _ctx_s)
-                                _sv = int(_sv) if _sv is not None else 0
-                                _sv = max(0, min(_sv, mh - bh))
-                                _x_expr, _y_expr = _dexpr, str(_sv)
-                            else:
-                                _sv = safe_eval_expr(x, _ctx_s)
-                                _sv = int(_sv) if _sv is not None else 0
-                                _sv = max(0, min(_sv, mw - bw))
-                                _x_expr, _y_expr = str(_sv), _dexpr
-                            _dyn = (_x_expr, _y_expr)
+                        _dx, _dy = _blend_move_exprs(_mv, sub_settings, bw, bh)
+                        if _dx is not None:
+                            _dyn = (_dx, _dy)
                         else:
-                            self._append_info_ui(_("[轨迹控制] 混合模式轨迹仅支持左右/上下往返，已使用基准位置"))
+                            self._append_info_ui(_("[轨迹控制] 混合模式轨迹不支持，已使用基准位置"))
                     if _dyn:
                         # ---- 动态轨迹 blend：crop 窗口与 overlay 位置跟随动效表达式 ----
-                        # 实测：crop 的 x/y 只认 iw/ih（W/H/w/h 会运行失败），overlay 只认
-                        # W/H（不支持 iw）→ 同一动效生成两套：crop 版 W/H→iw/ih，overlay 版原样。
-                        # 动效轴天然在画布内（tria∈[0,1]）无需 clamp；无逗号无问号（crop 不支持）。
+                        # （区域隔离子图改用共享 _make_blend_region，与实时预览共用，勿复制粘贴）
                         _x_expr, _y_expr = _dyn
-                        _x_expr_crop = _x_expr.replace("W", "iw").replace("H", "ih")
-                        _y_expr_crop = _y_expr.replace("W", "iw").replace("H", "ih")
-                        # 1) 主视频原始帧裁出动态窗口并转 RGB（blend 纯 RGB 空间、无 alpha）
-                        filter_parts.append(
-                            f"[{_src_label}]crop={bw}:{bh}:x='{_x_expr_crop}':y='{_y_expr_crop}',"
-                            f"format=rgb24[mc_{i}]")
-                        # 2) 子视频全尺寸（窗口=子视频大小，sx=sy=0），split 出 alpha 单独提取，
-                        #    RGB 部分转 rgb24（blend 的 c3_mode 实测无效，alpha 会按 all_mode
-                        #    运算破坏遮罩 → 必须剥离 alpha 单独 alphamerge 合并）
-                        filter_parts.append(
-                            f"[{current_sub}]crop={bw}:{bh}:0:0,format=rgba,"
-                            f"split=2[sa_{i}][sr_{i}]")
-                        filter_parts.append(f"[sa_{i}]alphaextract[aa_{i}]")
-                        filter_parts.append(f"[sr_{i}]format=rgb24[sr_{i}b]")
-                        # 3) 窗口内混合（RGB 空间，输出 rgb24 无 alpha）
-                        filter_parts.append(
-                            f"[mc_{i}][sr_{i}b]blend=all_mode={blend_mode}[bl_{i}r]")
-                        # 4) 合并回子视频 alpha（遮罩/透明度原样保留）
-                        filter_parts.append(
-                            f"[bl_{i}r][aa_{i}]alphamerge,format=rgba[bl_{i}]")
-                        # 5) 贴回原位（overlay 版表达式，位置始终与 crop 窗口一致）
-                        filter_parts.append(
-                            f"[{current_v}][bl_{i}]overlay=x='{_x_expr}':y='{_y_expr}'[v_out_{i}]")
+                        _x_expr_crop, _y_expr_crop = _blend_crop_exprs(_x_expr, _y_expr, bw, bh)
+                        filter_parts.extend(self._make_blend_region(
+                            _src_label, current_sub, current_v,
+                            f"x='{_x_expr_crop}'", f"y='{_y_expr_crop}'",
+                            bw, bh, "0", "0",
+                            f"x='{_x_expr}'", f"y='{_y_expr}'",
+                            blend_mode, f"v_out_{i}", str(i)))
                         current_v = f"v_out_{i}"
                     else:
                         # ---- 静态位置 blend：保持原区域化逻辑（含越界裁剪/偶数对齐） ----
+                        # （区域隔离子图改用共享 _make_blend_region，与实时预览共用，勿复制粘贴）
                         ctx = {"W": mw, "H": mh, "w": sw, "h": sh}
                         xv = safe_eval_expr(x, ctx)
                         yv = safe_eval_expr(y, ctx)
                         xv = int(xv) if xv is not None else 0
                         yv = int(yv) if yv is not None else 0
-                        # 子视频在主画布上的可见矩形（处理子视频越出画布边缘的情况）
-                        bx = xv if xv > 0 else 0
-                        by = yv if yv > 0 else 0
-                        bw = sw + (xv if xv < 0 else 0)
-                        bh = sh + (yv if yv < 0 else 0)
-                        if bx + bw > mw:
-                            bw = mw - bx
-                        if by + bh > mh:
-                            bh = mh - by
-                        # yuv420p 要求偶数尺寸与位置（对齐时只缩小，绝不增大，避免越界）
-                        if bx % 2:
-                            bx -= 1
-                        if by % 2:
-                            by -= 1
-                        if bx < 0:
-                            bx = 0
-                        if by < 0:
-                            by = 0
-                        if bw % 2:
-                            bw -= 1
-                        if bh % 2:
-                            bh -= 1
-                        # 对齐后再次夹紧到画布内
-                        if bx + bw > mw:
-                            bw = mw - bx
-                        if by + bh > mh:
-                            bh = mh - by
+                        bx, by, bw, bh, sx, sy = self._blend_static_geometry(xv, yv, sw, sh, mw, mh)
                         if bw >= 2 and bh >= 2:
-                            sx = -xv if xv < 0 else 0
-                            sy = -yv if yv < 0 else 0
                             # ⚠️ alpha 必须与 blend 剥离：实测 ffmpeg 8.1 的 blend 滤镜
                             # c3_mode 无效——alpha 通道实际按 all_mode 公式运算
                             # （difference 时 alpha=|a1-a2| 反相、average 时 alpha=(a1+a2)/2、
                             # screen 时矩形内 alpha=255 挖不出洞），遮罩黑白层被破坏。
                             # 正确做法：RGB 用 rgb24（blend 纯 RGB 空间、无 alpha 可破坏），
                             # 子视频 alpha 用 alphaextract 单独提取、blend 后 alphamerge 合并。
-                            # 1) 主视频裁出该区域并转 RGB（blend 在 RGB 空间运算，无 alpha 干扰）
-                            filter_parts.append(
-                                f"[{_src_label}]crop={bw}:{bh}:{bx}:{by},format=rgb24[mc_{i}]")
-                            # 2) 子视频裁出对应部分（含 mask/透明度/绿幕 alpha），
-                            #    split 出 alpha 单独提取，RGB 部分转 rgb24 参与 blend
-                            filter_parts.append(
-                                f"[{current_sub}]crop={bw}:{bh}:{sx}:{sy},format=rgba,"
-                                f"split=2[sa_{i}][sr_{i}]")
-                            filter_parts.append(f"[sa_{i}]alphaextract[aa_{i}]")
-                            filter_parts.append(f"[sr_{i}]format=rgb24[sr_{i}b]")
-                            # 3) 仅在该矩形区域内混合（RGB 空间，输出 rgb24 无 alpha）
-                            filter_parts.append(
-                                f"[mc_{i}][sr_{i}b]blend=all_mode={blend_mode}[bl_{i}r]")
-                            # 4) 把子视频 alpha 合并回来（遮罩/透明度原样保留）
-                            filter_parts.append(
-                                f"[bl_{i}r][aa_{i}]alphamerge,format=rgba[bl_{i}]")
-                            # 5) 把混合结果贴回原位置
-                            filter_parts.append(f"[{current_v}][bl_{i}]overlay={bx}:{by}[v_out_{i}]")
+                            filter_parts.extend(self._make_blend_region(
+                                _src_label, current_sub, current_v, str(bx), str(by), bw, bh,
+                                str(sx), str(sy), str(bx), str(by),
+                                blend_mode, f"v_out_{i}", str(i)))
                             current_v = f"v_out_{i}"
                         else:
                             # 子视频完全在画布外，跳过混合（保持主画面，不报错）
@@ -10472,13 +10528,57 @@ class FFmpegBatchGUI:
                             _main_dur = None
                         if _main_dur and _main_dur > 0:
                             _ov_expr = f"lt(t,{_main_dur:.3f})"
-                if _ov_expr != "1":
-                    fc_parts.append(f"{cur}[sub_rot]overlay=x='{x_expr}':y='{y_expr}':"
-                                    f"enable='{_ov_expr}':eof_action=pass[v_wm]")
+                _blend2 = (str(adapted_wm2.get('blend_mode', 'normal') or 'normal')).strip().lower()
+                if _blend2 != 'normal':
+                    # 区域化 blend（与正式命令/合并页预览共用 _make_blend_region）：
+                    # 旋转（自旋转/静态角度）时区域=对角线 d（不切旋转内容）；
+                    # 轨迹动态跟随（h/v/diamond/corners 全支持，crop 窗口跟动效）。
+                    _rot2 = (_ra2 != 0 or (_spin2 and _sp2 != 0))
+                    _bw2, _bh2 = _blend_region_size(wm_w2, wm_h2, _rot2)
+                    _dx2 = _dy2 = None
+                    if _mv2:
+                        _dx2, _dy2 = _blend_move_exprs(_mv2, adapted_wm2, _bw2, _bh2)
+                    if _dx2 is not None:
+                        # 动态轨迹 blend：crop 版（_blend_crop_exprs 转 iw/ih + w/h→尺寸），
+                        # overlay 版 W/H→main_w/main_h（mpv 预览约定，与普通轨迹一致）
+                        _x2c, _y2c = _blend_crop_exprs(_dx2, _dy2, _bw2, _bh2)
+                        _x2ov = _dx2.replace("W", "main_w").replace("H", "main_h")
+                        _y2ov = _dy2.replace("W", "main_w").replace("H", "main_h")
+                        # 单水印：cur 只出现一次 → split=2 出区域来源/合成目标（防同一 label 双消费）
+                        fc_parts.append(f"{cur}split=2[cur_cr2][cur_ov2]")
+                        fc_parts.extend(self._make_blend_region(
+                            "cur_cr2", "sub_rot", "cur_ov2",
+                            f"x='{_x2c}'", f"y='{_y2c}'", _bw2, _bh2, "0", "0",
+                            f"x='{_x2ov}'", f"y='{_y2ov}'",
+                            _blend2, "v_wm", "wm", ":eof_action=pass"))
+                    else:
+                        # 静态位置 blend：基准坐标独立求值（_xv2/_yv2 仅在无 move 分支定义，这里重算）
+                        _ctx2b = {"W": _main_w, "H": _main_h, "w": _bw2, "h": _bh2}
+                        _tb = safe_eval_expr(str(adapted_wm2.get("overlay_x", "W-w-10")), _ctx2b)
+                        _bxv2 = int(round(float(_tb))) if _tb is not None else _main_w - _bw2 - 10
+                        _tb = safe_eval_expr(str(adapted_wm2.get("overlay_y", "H-h-10")), _ctx2b)
+                        _byv2 = int(round(float(_tb))) if _tb is not None else _main_h - _bh2 - 10
+                        _bbx2, _bby2, _bbw2, _bbh2, _bsx2, _bsy2 = self._blend_static_geometry(
+                            _bxv2, _byv2, _bw2, _bh2, _main_w, _main_h)
+                        if _bbw2 >= 2 and _bbh2 >= 2:
+                            fc_parts.append(f"{cur}split=2[cur_cr2][cur_ov2]")
+                            fc_parts.extend(self._make_blend_region(
+                                "cur_cr2", "sub_rot", "cur_ov2", str(_bbx2), str(_bby2), _bbw2, _bbh2,
+                                str(_bsx2), str(_bsy2), str(_bbx2), str(_bby2),
+                                _blend2, "v_wm", "wm", ":eof_action=pass"))
+                        else:
+                            # 水印完全在画布外，跳过混合（保持主画面）
+                            fc_parts.append(f"{cur}null[v_wm]")
+                    cur = "[v_wm]"
+                    self._append_info_ui(_("[预览] 图片水印：mpv 区域化 blend 真实合成（{0}）").format(_blend2))
                 else:
-                    # 兜底：拿不到任何时长信息退回 shortest=1
-                    fc_parts.append(f"{cur}[sub_rot]overlay=x='{x_expr}':y='{y_expr}':enable='1':shortest=1[v_wm]")
-                cur = "[v_wm]"
+                    if _ov_expr != "1":
+                        fc_parts.append(f"{cur}[sub_rot]overlay=x='{x_expr}':y='{y_expr}':"
+                                        f"enable='{_ov_expr}':eof_action=pass[v_wm]")
+                    else:
+                        # 兜底：拿不到任何时长信息退回 shortest=1
+                        fc_parts.append(f"{cur}[sub_rot]overlay=x='{x_expr}':y='{y_expr}':enable='1':shortest=1[v_wm]")
+                    cur = "[v_wm]"
                 self._append_info_ui(_("[预览] 图片水印：mpv movie 真实合成（{0}x{1}）").format(wm_w2, wm_h2))
             # ---- 文字水印：普通 drawtext（含显示时段/循环 enable）或旋转子图都接入 ----
             # 旋转时走透明层子图（eof_action=pass）；非旋转直接 drawtext 片段（enable 由
@@ -18293,6 +18393,24 @@ class FFmpegBatchGUI:
                 cur = "[v_main_pad]"
                 self._append_info_ui(_("[预览] 主视频画布偏移：{0}x{1} @ ({2},{3})").format(_pw, _ph, _ox, _oy))
 
+        # ---- 多 blend 子视频区域隔离（需求3）：主视频 split 出原始帧副本 ----
+        # 非 normal blend 子视频 ≥2 个时，blend 主区域从主视频【原始帧】副本取
+        # （而非已被前面 blend 改过的主干 cur），重叠区互不干涉（与正式命令 _use_regional 一致）。
+        # 单 blend / 全 normal 不 split（零行为变化）。split 是帧引用（零拷贝）。
+        def _does_blend(es):
+            # 与正式命令 _use_regional 计数一致：overlay 启用且 blend≠normal 即算
+            # （含 diamond/corners 静态基准位置回退，见 blend 分支）
+            if not es.get('overlay_enabled', True):
+                return False
+            return ((es.get('blend_mode', 'normal') or 'normal').strip().lower() != 'normal')
+        _nb = sum(1 for _sv in sub_videos if _does_blend(_sv.enc_settings))
+        _regional = _nb >= 2
+        if _regional:
+            _base_labels = "".join(f"[cur_base{j}]" for j in range(_nb))
+            parts.append(f"{cur}split={_nb + 1}[cur]{_base_labels}")
+            cur = "[cur]"  # 运行主干 = split 第一个输出（与正式命令 current_v=v_main_base 一致）
+        _bj = 0
+
         # ---- 子视频：movie 滤镜路线（最多 15 个）----
         for _k, _sv in enumerate(sub_videos):
             _s = _sv.enc_settings
@@ -18361,26 +18479,35 @@ class FFmpegBatchGUI:
             parts.append(f"[sub{_k}]{_sub_chain}[subr{_k}]")
             # 位置：move 轨迹或数值化基准
             _mv = (_s.get("move_mode", "") or "").strip()
-            _x = str(_s.get("overlay_x", "W-w-10") or "W-w-10")
-            _y = str(_s.get("overlay_y", "H-h-10") or "H-h-10")
+            _x_raw = str(_s.get("overlay_x", "W-w-10") or "W-w-10")
+            _y_raw = str(_s.get("overlay_y", "H-h-10") or "H-h-10")
+            # 旋转（静态角度/持续旋转）时实际叠加尺寸为 hypot 正方形（rotate ow/oh=hypot），
+            # 位置求值必须用正方形边长 d，否则 W-w-10 等预设位置会偏移
+            # （与正式命令 _overlay_sub_size / 占位框逻辑一致）。
+            _eval_w, _eval_h = _rw, _rh
+            if _rad != 0 or (_spin and _spd != 0):
+                _eval_d = int(round(((_rw * _rw + _rh * _rh) ** 0.5)))
+                _eval_w = _eval_h = _eval_d
+            _ctx = {"W": _main_w, "H": _main_h, "w": _eval_w, "h": _eval_h}
+            # 基准数值位置（blend 静态分支/动态分支的静态轴都要用，必须不受 _mv 表达式影响）
+            try:
+                _bxv = int(round(float(safe_eval_expr(_x_raw, _ctx))))
+            except (ValueError, TypeError):
+                _bxv = _main_w - _eval_w - 10
+            try:
+                _byv = int(round(float(safe_eval_expr(_y_raw, _ctx))))
+            except (ValueError, TypeError):
+                _byv = _main_h - _eval_h - 10
             if _mv:
-                _mx, _my = build_move_xy_expr(_mv, _x, _y, _s, sw="w", sh="h")
+                _mx, _my = build_move_xy_expr(_mv, _x_raw, _y_raw, _s, sw="w", sh="h")
                 if _mx is not None:
+                    # 预览 overlay 约定用 main_w/main_h（ffmpeg overlay 合法变量，与正式命令 W/H 等价）
                     _x = _mx.replace("W", "main_w").replace("H", "main_h")
                     _y = _my.replace("W", "main_w").replace("H", "main_h")
+                else:
+                    _x, _y = str(_bxv), str(_byv)
             else:
-                # 旋转（静态角度/持续旋转）时实际叠加尺寸为 hypot 正方形（rotate ow/oh=hypot），
-                # 位置求值必须用正方形边长 d，否则 W-w-10 等预设位置会偏移
-                # （与正式命令 _overlay_sub_size / 占位框逻辑一致）。
-                _eval_w, _eval_h = _rw, _rh
-                if _rad != 0 or (_spin and _spd != 0):
-                    _eval_d = int(round(((_rw * _rw + _rh * _rh) ** 0.5)))
-                    _eval_w = _eval_h = _eval_d
-                _ctx = {"W": _main_w, "H": _main_h, "w": _eval_w, "h": _eval_h}
-                _xv = safe_eval_expr(_x, _ctx)
-                _yv = safe_eval_expr(_y, _ctx)
-                _x = str(_xv) if _xv is not None else str(_main_w - _eval_w - 10)
-                _y = str(_yv) if _yv is not None else str(_main_h - _eval_h - 10)
+                _x, _y = str(_bxv), str(_byv)
             # enable：显示时段/循环控制（起始/结束/周期/单次）优先，同正式命令 _calc_enable_expr；
             # 未设显示控制时用主视频时长上限 + eof_action=pass（防 movie 音频截断），拿不到才 shortest 兜底
             try:
@@ -18390,12 +18517,82 @@ class FFmpegBatchGUI:
             _ov_expr = self._calc_enable_expr(_s, _s_dur)
             if _ov_expr == "1" and _main_limit and _main_limit > 0:
                 _ov_expr = f"lt(t,{_main_limit:.3f})"
-            if _ov_expr != "1":
-                parts.append(f"{cur}[subr{_k}]overlay=x='{_x}':y='{_y}':"
-                             f"enable='{_ov_expr}':eof_action=pass[v_sub{_k}]")
+            # blend 混合模式（区域隔离 + RGBA 剥离，与正式命令 _build_overlay_filter_complex 共用 _make_blend_region）
+            _blend_mode = (str(_s.get('blend_mode', 'normal') or 'normal')).strip().lower()
+            if _blend_mode != 'normal':
+                # 自旋转/静态角度时子视频链输出为 hypot 正方形画布 → blend 区域必须用对角线
+                # 边长 d 扩大（否则旋转甩出的部分被原始矩形切掉）。非旋转用原始渲染尺寸。
+                _rotated = (_rad != 0 or (_spin and _spd != 0))
+                _bw_src, _bh_src = _blend_region_size(_rw, _rh, _rotated)
+                if _mv:
+                    # 动态轨迹 blend：h/v/diamond/corners 全部支持（crop 的 x/y 表达式支持
+                    # 逗号函数与状态变量 → 双轴表达式均可动态跟随，与正式命令一致）
+                    _bw, _bh = _bw_src, _bh_src
+                    _dx, _dy = _blend_move_exprs(_mv, _s, _bw, _bh)
+                    if _dx is not None:
+                        _x_expr, _y_expr = _dx, _dy
+                        _x_expr_crop, _y_expr_crop = _blend_crop_exprs(_x_expr, _y_expr, _bw, _bh)
+                        # 区域隔离：≥2 blend 时主区域从 split 出的原始帧 cur_base 取，
+                        # 否则单 blend 把 cur 自己 split 出「区域来源/合成目标」两个副本避免双消费
+                        if _regional:
+                            _crl, _ovl = f"cur_base{_bj}", cur
+                        else:
+                            parts.append(f"{cur}split=2[cur_cr{_k}][cur_ov{_k}]")
+                            _crl, _ovl = f"cur_cr{_k}", f"cur_ov{_k}"
+                        parts.extend(self._make_blend_region(
+                            _crl, f"subr{_k}", _ovl,
+                            f"x='{_x_expr_crop}'", f"y='{_y_expr_crop}'",
+                            _bw, _bh, "0", "0",
+                            f"x='{_x_expr}'", f"y='{_y_expr}'",
+                            _blend_mode, f"v_sub{_k}", str(_k), ":eof_action=pass"))
+                        cur = f"[v_sub{_k}]"
+                        _bj += 1
+                    else:
+                        # mode 未知（理论不发生）→ 兜底静态基准位置 blend
+                        self._append_info_ui(
+                            _("[预览] 子视频 {0} 混合模式+轨迹控制：轨迹模式不支持，已按基准位置 blend").format(_k + 1))
+                        _bbx, _bby, _bbw, _bbh, _bsx, _bsy = self._blend_static_geometry(
+                            _bxv, _byv, _bw_src, _bh_src, _main_w, _main_h)
+                        if _bbw >= 2 and _bbh >= 2:
+                            if _regional:
+                                _crl, _ovl = f"cur_base{_bj}", cur
+                            else:
+                                parts.append(f"{cur}split=2[cur_cr{_k}][cur_ov{_k}]")
+                                _crl, _ovl = f"cur_cr{_k}", f"cur_ov{_k}"
+                            parts.extend(self._make_blend_region(
+                                _crl, f"subr{_k}", _ovl, str(_bbx), str(_bby), _bbw, _bbh,
+                                str(_bsx), str(_bsy), str(_bbx), str(_bby),
+                                _blend_mode, f"v_sub{_k}", str(_k), ":eof_action=pass"))
+                            cur = f"[v_sub{_k}]"
+                            _bj += 1
+                        else:
+                            parts.append(f"{cur}null{cur}")
+                else:
+                    # 静态位置 blend：基准数值位置 + 区域隔离（区域隔离 split 见循环前）
+                    _bbx, _bby, _bbw, _bbh, _bsx, _bsy = self._blend_static_geometry(
+                        _bxv, _byv, _bw_src, _bh_src, _main_w, _main_h)
+                    if _bbw >= 2 and _bbh >= 2:
+                        if _regional:
+                            _crl, _ovl = f"cur_base{_bj}", cur
+                        else:
+                            parts.append(f"{cur}split=2[cur_cr{_k}][cur_ov{_k}]")
+                            _crl, _ovl = f"cur_cr{_k}", f"cur_ov{_k}"
+                        parts.extend(self._make_blend_region(
+                            _crl, f"subr{_k}", _ovl, str(_bbx), str(_bby), _bbw, _bbh,
+                            str(_bsx), str(_bsy), str(_bbx), str(_bby),
+                            _blend_mode, f"v_sub{_k}", str(_k), ":eof_action=pass"))
+                        cur = f"[v_sub{_k}]"
+                        _bj += 1
+                    else:
+                        # 子视频完全在画布外，跳过混合（保持主画面）
+                        parts.append(f"{cur}null{cur}")
             else:
-                parts.append(f"{cur}[subr{_k}]overlay=x='{_x}':y='{_y}':enable='1':shortest=1[v_sub{_k}]")
-            cur = f"[v_sub{_k}]"
+                if _ov_expr != "1":
+                    parts.append(f"{cur}[subr{_k}]overlay=x='{_x}':y='{_y}':"
+                                 f"enable='{_ov_expr}':eof_action=pass[v_sub{_k}]")
+                else:
+                    parts.append(f"{cur}[subr{_k}]overlay=x='{_x}':y='{_y}':enable='1':shortest=1[v_sub{_k}]")
+                cur = f"[v_sub{_k}]"
 
         # ---- 注入到封装页的文字水印（普通/复杂，与正式命令 _build_pip_cmd 一致）----
         # 实时预览不经过 merge_build_cmd_list 的注入，这里按同一开关逻辑补一次
