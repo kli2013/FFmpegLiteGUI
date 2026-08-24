@@ -1985,6 +1985,25 @@ def _blend_region_size(w, h, rotated):
         bh -= 1
     return max(2, bw), max(2, bh)
 
+
+def _content_box_expr(expr, w, h):
+    """把位置表达式里的独立 \bw\b/\bh\b 替换为内容盒尺寸数字。
+
+    旋转时 overlay 的 w/h 变量 = 旋转画布 d×d（overlay 输入尺寸），而 overlay_x/y
+    （如 "W-w-10"）的语义是**内容盒**（未旋转 w×h）→ 求值前必须替换，否则内容整体
+    偏移 (d-w)/2。正则 \bw\b 不会误伤 iw/ih/ow/oh 里的 w/h（前接 i/o 非单词边界）。
+    与 _blend_crop_exprs 的 _conv 同一策略，勿复制粘贴。"""
+    e = re.sub(r"\bw\b", str(w), str(expr))
+    e = re.sub(r"\bh\b", str(h), e)
+    return e
+
+
+def _content_box_shift(content_w, content_h, box_w, box_h):
+    """旋转中心对齐偏移：内容盒（未旋转 w×h）→ 叠加盒（旋转画布 d×d 或 clamp 后区域）
+    的定位偏移。叠加盒与内容盒中心重合 → 叠加盒左上角 = 内容盒左上角 - (box-w)/2。
+    非旋转时 box=内容盒 → 返回 (0,0)。"""
+    return (box_w - content_w) / 2.0, (box_h - content_h) / 2.0
+
 # ================== 子进程执行封装 ==================
 def run_ffmpeg_command(cmd: List[str], on_output_line: Optional[Callable] = None, timeout: Optional[float] = None) -> Tuple[int, str]:
     """
@@ -6960,9 +6979,40 @@ class AdvancedFrame(ttk.LabelFrame):
         ttk.Button(preset_row, text=_("保存模板"), command=self.save_wm_preset).pack(side=tk.LEFT, padx=2)
         ttk.Button(preset_row, text=_("删除模板"), command=self.delete_wm_preset).pack(side=tk.LEFT, padx=2)
         ttk.Button(preset_row, text=_("加载模板"), command=self.load_wm_preset).pack(side=tk.LEFT, padx=2)
-        
+        # 末端处理：主界面与队列任务编辑共用同一个按钮（高级选项页复用）。
+        # 行为自适应：主界面改 app._trans_end_handling；队列任务编辑（tw_full_settings
+        # 指向 task.settings）改任务自己的 end_handling，互不干扰。
+        if self.app is not None:
+            _btn_end = ttk.Button(preset_row, text=_("末端处理"),
+                                  command=self._open_end_handling_for_context, width=8)
+            _btn_end.pack(side=tk.LEFT, padx=20)
+            ToolTip(_btn_end,
+                    _("末端处理：多画面拼接 / 末尾追加图片（如二维码）或视频。\n"
+                      "主界面设置作用于转码/新入队任务；队列任务在「任务编辑」里用同一按钮\n"
+                      "设置各自的末端处理（互不影响）。\n"
+                      "图片自动缩放适配输出尺寸，不足则黑底居中，再 concat 到视频末尾。"),
+                    wraplength=400)
+
         # 刷新下拉列表
         self._refresh_wm_preset_list()
+
+    def _open_end_handling_for_context(self):
+        """末端处理按钮（主界面/队列任务编辑共用同一个按钮，行为自适应）：
+        - 主界面：改 app._trans_end_handling，确定后刷新主界面命令预览
+        - 队列任务编辑（tw_full_settings 指向 task.settings）：改任务自己的
+          end_handling，确定后触发 update_callback（弹窗命令预览重建）
+        两种上下文设置互不干扰。"""
+        if self.app is None:
+            return
+        if self.tw_full_settings is not None and isinstance(self.tw_full_settings, dict):
+            # 队列任务编辑：任务自己的 end_handling（旧任务无键时复制主界面当前值作初始）
+            if not isinstance(self.tw_full_settings.get("end_handling"), dict):
+                self.tw_full_settings["end_handling"] = copy.deepcopy(self.app._trans_end_handling)
+            self.app._open_end_handling_dialog(
+                target=self.tw_full_settings["end_handling"],
+                on_apply=self.update_callback or (lambda: None))
+        else:
+            self.app._open_transcode_end_handling()
 
     def _on_nvidia_toggle(self):
         """已废弃：滤镜加速改由「滤镜加速」下拉框统一控制。保留空函数避免遗留引用。"""
@@ -8092,6 +8142,16 @@ class FFmpegBatchGUI:
             "border_w": 0,
             "border_color": "#000000",
             "inject_to_packaging": False,
+        }
+        # 转码页末端处理设置（与封装页 _merge_end_handling 结构一致、互相独立）：
+        # get_current_settings 会把它带进转码/队列 settings["end_handling"]。
+        self._trans_end_handling = {
+            "split_enabled": False,      # 多画面拼接
+            "split_rows": 1,             # 行数
+            "split_cols": 1,             # 列数
+            "concat_enabled": False,     # 末端 concat 图片/视频
+            "concat_path": "",           # 追加文件（图片或视频）
+            "concat_sec": 5.0,           # 图片显示秒数
         }
         # ---------------------------------
 
@@ -9717,11 +9777,38 @@ class FFmpegBatchGUI:
                 if blend_mode == 'normal':
                     # 动态水印（轨迹控制）：move_mode 非空时用动效表达式替换 x/y。
                     # 基准 overlay_x/overlay_y 保留不变（独立字段，可随时改回）。
+                    # ⚠️ 定位语义（2026-08-25 理顺）：overlay_x/y 的 w/h 始终指**内容盒**
+                    # （未旋转渲染尺寸 w×h）；旋转时 overlay 输入是 d×d 旋转画布（w/h 变量=d），
+                    # 必须先把表达式 w/h 替换成内容盒数字，再减中心对齐偏移 (d-w)/2，
+                    # 否则内容整体偏左上 (d-w)/2（子视频越大越明显）。
+                    _content_w, _content_h = self._overlay_content_size(sub_file, sub_settings)
+                    try:
+                        _spv = float(sub_settings.get("spin_speed", 60.0) or 60.0)
+                    except (ValueError, TypeError):
+                        _spv = 60.0
+                    _rot_ov = (_spin_on and _spv != 0) or (_ra != 0)
                     _mv = (sub_settings.get('move_mode', '') or '').strip()
                     if _mv:
-                        _mx, _my = build_move_xy_expr(_mv, x, y, sub_settings)
+                        # 轨迹范围/基准都按内容盒（sw/sh=内容盒数字，x0/y0 的 w/h 内容盒化）
+                        _mx, _my = build_move_xy_expr(
+                            _mv, _content_box_expr(x, _content_w, _content_h),
+                            _content_box_expr(y, _content_w, _content_h),
+                            sub_settings, sw=str(_content_w), sh=str(_content_h))
                         if _mx is not None:
                             x, y = _mx, _my
+                        else:
+                            x = _content_box_expr(x, _content_w, _content_h)
+                            y = _content_box_expr(y, _content_w, _content_h)
+                    elif _rot_ov:
+                        # 静态位置：数字求值（内容盒语义），旋转时下面统一减中心偏移
+                        x = _content_box_expr(x, _content_w, _content_h)
+                        y = _content_box_expr(y, _content_w, _content_h)
+                    if _rot_ov:
+                        # 旋转中心对齐：叠加盒(d×d)中心=内容盒中心 → 减 (d-w)/2
+                        _sw_b, _sh_b = self._overlay_sub_size(sub_file, sub_settings)
+                        _offx, _offy = _content_box_shift(_content_w, _content_h, _sw_b, _sh_b)
+                        x = f"({x}) - {_offx:.6g}"
+                        y = f"({y}) - {_offy:.6g}"
                     duration = self._get_media_duration(sub_file)
                     enable_expr = self._calc_enable_expr(sub_settings, duration)
                     # x/y 用引号包裹：动效表达式含逗号（mod/min/max），不包会被 filtergraph 当滤镜分隔符
@@ -9739,6 +9826,14 @@ class FFmpegBatchGUI:
                     _blend_idx += 1
                     mw, mh = self._compute_output_canvas(main_settings, main_file_path)
                     sw, sh = self._overlay_sub_size(sub_file, sub_settings)
+                    # 内容盒尺寸（未旋转渲染尺寸）——overlay_x/y 的 w/h 定位语义基准；
+                    # 旋转时叠加盒 d×d 中心与内容盒中心对齐（_content_box_shift）
+                    _content_w, _content_h = self._overlay_content_size(sub_file, sub_settings)
+                    try:
+                        _spv2 = float(sub_settings.get("spin_speed", 60.0) or 60.0)
+                    except (ValueError, TypeError):
+                        _spv2 = 60.0
+                    _rot_ov2 = (_spin_on and _spv2 != 0) or (_ra != 0)
                     _mv = (sub_settings.get('move_mode', '') or '').strip()
                     # 窗口尺寸（动态/静态共用）：偶数化（yuv420p 对齐；动态位置无法保证偶数，
                     # 色度微偏可接受）。静态分支的 bw/bh 在下面越界裁剪处还会再调整。
@@ -9754,11 +9849,38 @@ class FFmpegBatchGUI:
                         bh = 2
                     # 动态轨迹 blend：h/v/diamond/corners 全部支持（2026-08-24 实测：crop 的
                     # x/y 表达式支持逗号函数与状态变量 → 双轴表达式均可动态跟随，"走到哪混到哪"）
+                    # ⚠️ 旋转时区域 d 可能 > 画布尺寸（竖屏/横屏子视频）→ 必须先 clamp 到画布内，
+                    # 否则动态 crop 越界在 ffmpeg 8.1 报 "Invalid too big or non positive size"
+                    # （mpv lavfi 桥接包装成 "no media data to loop"）；静态分支由
+                    # _blend_static_geometry 的尺寸 clamp 兜底，动态分支必须在这里做。
                     _dyn = None
                     if _mv:
-                        _dx, _dy = _blend_move_exprs(_mv, sub_settings, bw, bh)
+                        _bw_c, _bh_c = bw, bh
+                        if mw and mh:
+                            _bw_c = min(bw, mw)
+                            _bh_c = min(bh, mh)
+                            if _bw_c % 2:
+                                _bw_c -= 1
+                            if _bh_c % 2:
+                                _bh_c -= 1
+                            if _bw_c < 2:
+                                _bw_c = 2
+                            if _bh_c < 2:
+                                _bh_c = 2
+                        # 定位语义：轨迹范围/基准按内容盒（x0/y0 的 w/h 内容盒化，sw/sh=内容盒），
+                        # 区域位置 = 内容盒位置 - 中心对齐偏移，再 clamp 到画布内（crop 不越界）
+                        _ms2 = dict(sub_settings)
+                        _ms2["overlay_x"] = _content_box_expr(
+                            _ms2.get("overlay_x", "W-w-10"), _content_w, _content_h)
+                        _ms2["overlay_y"] = _content_box_expr(
+                            _ms2.get("overlay_y", "H-h-10"), _content_w, _content_h)
+                        _dx, _dy = _blend_move_exprs(_mv, _ms2, _content_w, _content_h)
                         if _dx is not None:
+                            _offx2, _offy2 = _content_box_shift(_content_w, _content_h, _bw_c, _bh_c)
+                            _dx = f"min(max(({_dx}) - {_offx2:.6g},0),{max(0, mw - _bw_c)})"
+                            _dy = f"min(max(({_dy}) - {_offy2:.6g},0),{max(0, mh - _bh_c)})"
                             _dyn = (_dx, _dy)
+                            bw, bh = _bw_c, _bh_c
                         else:
                             self._append_info_ui(_("[轨迹控制] 混合模式轨迹不支持，已使用基准位置"))
                     if _dyn:
@@ -9776,11 +9898,16 @@ class FFmpegBatchGUI:
                     else:
                         # ---- 静态位置 blend：保持原区域化逻辑（含越界裁剪/偶数对齐） ----
                         # （区域隔离子图改用共享 _make_blend_region，与实时预览共用，勿复制粘贴）
-                        ctx = {"W": mw, "H": mh, "w": sw, "h": sh}
-                        xv = safe_eval_expr(x, ctx)
-                        yv = safe_eval_expr(y, ctx)
+                        # 定位语义：x/y 按内容盒求值，旋转时叠加盒中心对齐内容盒（减偏移）
+                        ctx = {"W": mw, "H": mh, "w": _content_w, "h": _content_h}
+                        xv = safe_eval_expr(_content_box_expr(x, _content_w, _content_h), ctx)
+                        yv = safe_eval_expr(_content_box_expr(y, _content_w, _content_h), ctx)
                         xv = int(xv) if xv is not None else 0
                         yv = int(yv) if yv is not None else 0
+                        if _rot_ov2:
+                            _offx3, _offy3 = _content_box_shift(_content_w, _content_h, sw, sh)
+                            xv -= int(round(_offx3))
+                            yv -= int(round(_offy3))
                         bx, by, bw, bh, sx, sy = self._blend_static_geometry(xv, yv, sw, sh, mw, mh)
                         if bw >= 2 and bh >= 2:
                             # ⚠️ alpha 必须与 blend 剥离：实测 ffmpeg 8.1 的 blend 滤镜
@@ -9827,7 +9954,11 @@ class FFmpegBatchGUI:
                 orig_w, orig_h = 1280, 720
         return compute_rendered_size(orig_w, orig_h, main_settings)
 
-    def _overlay_sub_size(self, sub_file, sub_settings):
+    def _overlay_content_size(self, sub_file, sub_settings):
+        """子视频「内容盒」渲染尺寸（未旋转 w×h，考虑元数据/用户旋转、裁剪、缩放）。
+
+        定位语义基准：overlay_x/y（如 "W-w-10"）里的 w/h 始终指**内容盒**，旋转画布
+        d×d 只是姿态载体（中心对齐）。旋转时叠加盒尺寸见 _overlay_sub_size。"""
         w, h = get_video_rotated_dimensions(self.ffprobe_cmd, sub_file, sub_settings)
         if w is None or h is None:
             w, h = self._get_video_dimensions_cached(sub_file)
@@ -9837,6 +9968,12 @@ class FFmpegBatchGUI:
             w, h = compute_rendered_size(w, h, sub_settings)
         except Exception:
             pass
+        return max(2, int(w)), max(2, int(h))
+
+    def _overlay_sub_size(self, sub_file, sub_settings):
+        """子视频实际叠加尺寸：旋转（自旋转/静态角度）时返回对角线 d×d（rotate
+        ow/oh=hypot(iw,ih) 的输出画布）；非旋转返回内容盒渲染尺寸。"""
+        w, h = self._overlay_content_size(sub_file, sub_settings)
         if sub_settings.get("spin_enabled", False) or (sub_settings.get("rotate_angle", 0) or 0) != 0:
             # 旋转时包围盒 = 对角线长度正方形，需与 rotate 的 ow/oh=hypot(iw,ih) 一致。
             # ffmpeg 对 ow/oh 取整采用四舍五入(lrint)，故这里用 round 对齐，避免混合模式差 1px。
@@ -10397,27 +10534,35 @@ class FFmpegBatchGUI:
                 except (ValueError, TypeError):
                     _wm_ra = 0.0
                 _wm_spin = bool(adapted_wm.get("spin_enabled", False))
-                eff_w, eff_h = wm_w, wm_h
-                if _wm_ra != 0 or _wm_spin:
-                    d = int(round(((wm_w * wm_w + wm_h * wm_h) ** 0.5)))
-                    eff_w = eff_h = d
-                    self._append_info_ui(_("[预览] 水印启用了旋转，蓝色正方形占位 {0}x{0} 与红色原始矩形同时显示").format(d))
-                ctx = {"W": main_w, "H": main_h, "w": eff_w, "h": eff_h}
+                _rot_ph = (_wm_ra != 0 or _wm_spin)
+                # 定位语义（2026-08-25 理顺）：overlay_x/y 的 w/h = 内容盒（wm_w/wm_h）。
+                # 旋转时蓝色 d×d 正方形中心与内容盒中心对齐 → 正方形位置 = 内容盒位置 - (d-w)/2。
+                # clamp 仅当内容盒 ≤ 画布时启用（防丢）；内容盒 > 画布时放开（开放边界可拉出）。
+                ctx = {"W": main_w, "H": main_h, "w": wm_w, "h": wm_h}
                 x_expr = adapted_wm.get("overlay_x", "W-w-10")
                 y_expr = adapted_wm.get("overlay_y", "H-h-10")
                 x_val = safe_eval_expr(x_expr, ctx)
                 y_val = safe_eval_expr(y_expr, ctx)
                 if x_val is None:
-                    x_val = main_w - eff_w - 10
+                    x_val = main_w - wm_w - 10
                 if y_val is None:
-                    y_val = main_h - eff_h - 10
-                x_val = max(0, min(x_val, main_w - eff_w))
-                y_val = max(0, min(y_val, main_h - eff_h))
-                if _wm_ra != 0 or _wm_spin:
+                    y_val = main_h - wm_h - 10
+                if wm_w <= main_w:
+                    x_val = max(0, min(x_val, main_w - wm_w))
+                if wm_h <= main_h:
+                    y_val = max(0, min(y_val, main_h - wm_h))
+                eff_w, eff_h = wm_w, wm_h
+                if _rot_ph:
+                    d = int(round(((wm_w * wm_w + wm_h * wm_h) ** 0.5)))
+                    eff_w = eff_h = d
+                    x_val = x_val - (d - wm_w) / 2.0
+                    y_val = y_val - (d - wm_h) / 2.0
+                    self._append_info_ui(_("[预览] 水印启用了旋转，蓝色正方形占位 {0}x{0} 与红色原始矩形同时显示").format(d))
+                if _rot_ph:
                     d = eff_w
                     cx = x_val + d / 2.0
                     cy = y_val + d / 2.0
-                    parts = [f"x={x_val}:y={y_val}:w={d}:h={d}:color=blue@0.5:t=3"]
+                    parts = [f"x={x_val:.1f}:y={y_val:.1f}:w={d}:h={d}:color=blue@0.5:t=3"]
                     if _wm_ra != 0:
                         parts.extend(build_rotated_rect_drawboxes(
                             cx - wm_w / 2.0, cy - wm_h / 2.0, wm_w, wm_h, _wm_ra,
@@ -10426,8 +10571,8 @@ class FFmpegBatchGUI:
                         parts.append(f"drawbox=x={cx - wm_w / 2.0:.1f}:y={cy - wm_h / 2.0:.1f}:w={wm_w}:h={wm_h}:color=red@0.3:t=3")
                     drawbox_expr = ",".join(parts)
                 else:
-                    drawbox_expr = f"x={x_val}:y={y_val}:w={wm_w}:h={wm_h}:color=red@0.3:t=3"
-                self._append_info_ui(_("[预览] 水印虚拟框: 位置({0}, {1}) 尺寸{2}x{3}").format(x_val, y_val, eff_w, eff_h))
+                    drawbox_expr = f"x={x_val:.1f}:y={y_val:.1f}:w={wm_w}:h={wm_h}:color=red@0.3:t=3"
+                self._append_info_ui(_("[预览] 水印虚拟框: 位置({0:.1f}, {1:.1f}) 尺寸{2}x{3}").format(x_val, y_val, eff_w, eff_h))
     
         # ----- 3. 文字水印判定：旋转/spin/轨迹需复杂图，普通 drawtext 走 -vf 链 -----
         tw_settings = settings.get("text_watermark", {})
@@ -10577,25 +10722,38 @@ class FFmpegBatchGUI:
                 _mv2 = (adapted_wm2.get("move_mode", "") or "").strip()
                 x_expr = str(adapted_wm2.get("overlay_x", "W-w-10") or "W-w-10")
                 y_expr = str(adapted_wm2.get("overlay_y", "H-h-10") or "H-h-10")
+                # 定位语义（2026-08-25 理顺）：overlay_x/y 的 w/h = 内容盒（wm_w2/wm_h2）；
+                # 旋转时叠加盒 d×d 中心与内容盒中心对齐 → 位置减 (d-w)/2（与正式命令一致）。
+                _rot2v = (_ra2 != 0 or (_spin2 and _sp2 != 0))
+                if _rot2v:
+                    _ed2v = int(round(((wm_w2 * wm_w2 + wm_h2 * wm_h2) ** 0.5)))
+                    _off2x, _off2y = _content_box_shift(wm_w2, wm_h2, _ed2v, _ed2v)
+                else:
+                    _off2x = _off2y = 0.0
                 if _mv2:
-                    _mx2, _my2 = build_move_xy_expr(_mv2, x_expr, y_expr, adapted_wm2, sw="w", sh="h")
+                    # 轨迹范围/基准按内容盒（sw/sh=内容盒数字，x0/y0 的 w/h 内容盒化）
+                    _mx2, _my2 = build_move_xy_expr(
+                        _mv2, _content_box_expr(x_expr, wm_w2, wm_h2),
+                        _content_box_expr(y_expr, wm_w2, wm_h2),
+                        adapted_wm2, sw=str(wm_w2), sh=str(wm_h2))
                     if _mx2 is not None:
                         x_expr = _mx2.replace("W", "main_w").replace("H", "main_h")
                         y_expr = _my2.replace("W", "main_w").replace("H", "main_h")
+                    else:
+                        x_expr = _content_box_expr(x_expr, wm_w2, wm_h2)
+                        y_expr = _content_box_expr(y_expr, wm_w2, wm_h2)
                 else:
                     # 基准位置必须求值成数字：mpv overlay 只认数值/原生变量，
                     # 字符串替换残留（如 main_720-720-10）会让 mpv 只出进程无画面。
-                    # 旋转（静态角度/持续旋转）时实际叠加尺寸为 hypot 正方形，w/h 求值必须用 d
-                    # （与正式命令 _overlay_sub_size / 占位框逻辑一致）。
-                    _ew2, _eh2 = wm_w2, wm_h2
-                    if _ra2 != 0 or (_spin2 and _sp2 != 0):
-                        _ed2 = int(round(((wm_w2 * wm_w2 + wm_h2 * wm_h2) ** 0.5)))
-                        _ew2 = _eh2 = _ed2
-                    _ctx2 = {"W": _main_w, "H": _main_h, "w": _ew2, "h": _eh2}
+                    # w/h 用内容盒（wm_w2/wm_h2）；旋转偏移统一在下面减。
+                    _ctx2 = {"W": _main_w, "H": _main_h, "w": wm_w2, "h": wm_h2}
                     _xv2 = safe_eval_expr(x_expr, _ctx2)
                     _yv2 = safe_eval_expr(y_expr, _ctx2)
-                    x_expr = str(_xv2) if _xv2 is not None else str(_main_w - _ew2 - 10)
-                    y_expr = str(_yv2) if _yv2 is not None else str(_main_h - _eh2 - 10)
+                    x_expr = str(_xv2) if _xv2 is not None else str(_main_w - wm_w2 - 10)
+                    y_expr = str(_yv2) if _yv2 is not None else str(_main_h - wm_h2 - 10)
+                if _rot2v:
+                    x_expr = f"({x_expr}) - {_off2x:.6g}"
+                    y_expr = f"({y_expr}) - {_off2y:.6g}"
                 # enable 表达式：显示时段/循环控制（起始/结束/周期/单次）优先——与正式命令同一套
                 # _calc_enable_expr；未设显示控制时：手动 -t 优先，否则自动取主视频时长 →
                 # enable='lt(t,T)' + eof_action=pass（movie 源自带的音频不再被 shortest 截断输出）。
@@ -10623,7 +10781,32 @@ class FFmpegBatchGUI:
                     _bw2, _bh2 = _blend_region_size(wm_w2, wm_h2, _rot2)
                     _dx2 = _dy2 = None
                     if _mv2:
-                        _dx2, _dy2 = _blend_move_exprs(_mv2, adapted_wm2, _bw2, _bh2)
+                        # ⚠️ 旋转时 d 可能 > 画布（竖屏/横屏）→ 先 clamp 到画布内再生成轨迹表达式，
+                        # 否则动态 crop 越界在 ffmpeg 8.1 报 "Invalid too big or non positive size"
+                        # （mpv lavfi 桥接包装成 "no media data to loop"，单开自旋转走静态分支
+                        # 有 _blend_static_geometry 兜底所以不报）
+                        _bw2 = min(_bw2, _main_w)
+                        _bh2 = min(_bh2, _main_h)
+                        if _bw2 % 2:
+                            _bw2 -= 1
+                        if _bh2 % 2:
+                            _bh2 -= 1
+                        if _bw2 < 2:
+                            _bw2 = 2
+                        if _bh2 < 2:
+                            _bh2 = 2
+                        # 定位语义：轨迹范围/基准按内容盒（x0/y0 的 w/h 内容盒化，sw/sh=内容盒），
+                        # 区域位置 = 内容盒位置 - 中心对齐偏移，再 clamp 到画布内（crop 不越界）
+                        _ms2b = dict(adapted_wm2)
+                        _ms2b["overlay_x"] = _content_box_expr(
+                            _ms2b.get("overlay_x", "W-w-10"), wm_w2, wm_h2)
+                        _ms2b["overlay_y"] = _content_box_expr(
+                            _ms2b.get("overlay_y", "H-h-10"), wm_w2, wm_h2)
+                        _dx2, _dy2 = _blend_move_exprs(_mv2, _ms2b, wm_w2, wm_h2)
+                        if _dx2 is not None:
+                            _off2b, _off2c = _content_box_shift(wm_w2, wm_h2, _bw2, _bh2)
+                            _dx2 = f"min(max(({_dx2}) - {_off2b:.6g},0),{max(0, _main_w - _bw2)})"
+                            _dy2 = f"min(max(({_dy2}) - {_off2c:.6g},0),{max(0, _main_h - _bh2)})"
                     if _dx2 is not None:
                         # 动态轨迹 blend：crop 版（_blend_crop_exprs 转 iw/ih + w/h→尺寸），
                         # overlay 版 W/H→main_w/main_h（mpv 预览约定，与普通轨迹一致）
@@ -10638,12 +10821,19 @@ class FFmpegBatchGUI:
                             f"x='{_x2ov}'", f"y='{_y2ov}'",
                             _blend2, "v_wm", "wm", ":eof_action=pass"))
                     else:
-                        # 静态位置 blend：基准坐标独立求值（_xv2/_yv2 仅在无 move 分支定义，这里重算）
-                        _ctx2b = {"W": _main_w, "H": _main_h, "w": _bw2, "h": _bh2}
-                        _tb = safe_eval_expr(str(adapted_wm2.get("overlay_x", "W-w-10")), _ctx2b)
-                        _bxv2 = int(round(float(_tb))) if _tb is not None else _main_w - _bw2 - 10
-                        _tb = safe_eval_expr(str(adapted_wm2.get("overlay_y", "H-h-10")), _ctx2b)
-                        _byv2 = int(round(float(_tb))) if _tb is not None else _main_h - _bh2 - 10
+                        # 静态位置 blend：基准坐标独立求值（内容盒语义），旋转时叠加盒
+                        # 中心对齐内容盒（减偏移）；区域尺寸由 _blend_static_geometry clamp。
+                        _ctx2b = {"W": _main_w, "H": _main_h, "w": wm_w2, "h": wm_h2}
+                        _tb = safe_eval_expr(_content_box_expr(
+                            str(adapted_wm2.get("overlay_x", "W-w-10")), wm_w2, wm_h2), _ctx2b)
+                        _bxv2 = int(round(float(_tb))) if _tb is not None else _main_w - wm_w2 - 10
+                        _tb = safe_eval_expr(_content_box_expr(
+                            str(adapted_wm2.get("overlay_y", "H-h-10")), wm_w2, wm_h2), _ctx2b)
+                        _byv2 = int(round(float(_tb))) if _tb is not None else _main_h - wm_h2 - 10
+                        if _rot2:
+                            _off2d, _off2e = _content_box_shift(wm_w2, wm_h2, _bw2, _bh2)
+                            _bxv2 -= int(round(_off2d))
+                            _byv2 -= int(round(_off2e))
                         _bbx2, _bby2, _bbw2, _bbh2, _bsx2, _bsy2 = self._blend_static_geometry(
                             _bxv2, _byv2, _bw2, _bh2, _main_w, _main_h)
                         if _bbw2 >= 2 and _bbh2 >= 2:
@@ -11174,6 +11364,22 @@ class FFmpegBatchGUI:
         return cmd_list
 
     def generate_ffmpeg_command(self, input_path: str, output_path: str, settings: dict, task=None, preview=False) -> List[str]:
+        """转码命令构建入口（转码页单文件/队列/队列编辑共用，6 处调用点零改动）。
+        构建后统一注入末端处理：settings["end_handling"] 各自独立（转换页 _trans_end_handling /
+        队列 task.settings 快照 / 队列编辑 task.settings["end_handling"]），互不干扰。
+        only_audio 与 GIF 不注入（末端处理是视频语义）。注入失败仅日志提示，不阻塞转码。"""
+        cmd_list = self._generate_ffmpeg_command_core(input_path, output_path, settings, task, preview)
+        try:
+            eh = settings.get("end_handling") or {}
+            if eh and not settings.get("only_audio", False) and settings.get("encoder") != "gif":
+                if eh.get("split_enabled", False) or eh.get("concat_enabled", False):
+                    mw, mh, fps, dur = self._probe_end_handling_dims(input_path, settings)
+                    cmd_list = self._apply_end_handling_cmd(cmd_list, eh, mw, mh, fps, dur)
+        except Exception as e:
+            self._append_info_ui(_("[末端] 末端处理注入失败: {0}").format(e))
+        return cmd_list
+
+    def _generate_ffmpeg_command_core(self, input_path: str, output_path: str, settings: dict, task=None, preview=False) -> List[str]:
         if settings.get("segment_enabled", False) and settings.get("segments", []):
             return self._generate_segment_concat_command(input_path, output_path, settings)
         if not self.ffmpeg_cmd:
@@ -11615,6 +11821,8 @@ class FFmpegBatchGUI:
         settings["enhance"] = self.video_filter.get_enhance_settings()
         # 添加文字水印设置（深拷贝）
         settings["text_watermark"] = copy.deepcopy(self.text_watermark_settings)
+        # 添加末端处理设置（深拷贝；转换页/队列各自独立，队列 add_task 快照此值）
+        settings["end_handling"] = copy.deepcopy(self._trans_end_handling)
         return settings
 
     def load_settings_into_ui(self, settings):
@@ -11636,6 +11844,10 @@ class FFmpegBatchGUI:
             self.audio_trim_enabled = settings.get("audio_trim_enabled", False)
             self.audio_trim_start = settings.get("audio_trim_start", "")
             self.audio_trim_end = settings.get("audio_trim_end", "")
+            # 恢复末端处理（主预设持久化 end_handling；与封装页 _merge_end_handling 无关）
+            _eh = settings.get("end_handling")
+            if isinstance(_eh, dict):
+                self._trans_end_handling = copy.deepcopy(_eh)
 #             # 恢复水印设置
 #             if "watermark" in settings:
 #                 self.watermark_settings = copy.deepcopy(settings["watermark"])
@@ -13246,6 +13458,14 @@ class FFmpegBatchGUI:
 
     def _process_single_task(self, task):
         """处理单个任务（队列模式）"""
+        # 防设置残留：末端处理等子弹窗会就地改 task.settings 的 dict，若用户在子弹窗
+        # 确定后未在主弹窗点「确定」，task.cmd 仍是旧命令（可能带着已取消的 split/concat）。
+        # 执行前用 task.settings 重新生成命令，保证所见即所得（custom 任务除外）。
+        if not getattr(task, "is_custom", False):
+            try:
+                task.cmd = self.generate_ffmpeg_command(task.input, task.output, task.settings, task)
+            except Exception:
+                pass  # 生成失败保留原命令（原始错误会在执行时暴露）
         task.status = "转码中"
         task.start_time = time.time()
         self._update_task_list_ui()
@@ -13840,6 +14060,9 @@ class FFmpegBatchGUI:
                 # 保留文字水印设置（队列文字水印对话框直接改 task.settings["text_watermark"]，
                 # 不在这里带上则命令预览里看不到队列设置的文字水印）
                 new_settings["text_watermark"] = task.settings.get("text_watermark", {})
+                # 保留末端处理（队列末端处理对话框直接改 task.settings["end_handling"]；
+                # 命令预览通过 generate_ffmpeg_command wrapper 注入，必须带上）
+                new_settings["end_handling"] = task.settings.get("end_handling", {})
                 new_out = self.generate_output_path(task.input, new_settings)
                 new_settings["enhance"] = filt_frame.get_enhance_settings()
 
@@ -14351,10 +14574,20 @@ class FFmpegBatchGUI:
             self.merge_sort_by_mtime()
 
 
-    def _open_end_handling_dialog(self):
-        """末端处理弹窗：①多画面拼接（split 网格） ②末端 concat 图片/视频。
-        设置存 self._merge_end_handling dict；确定后刷新命令预览。"""
-        eh = self._merge_end_handling
+    def _open_transcode_end_handling(self):
+        """转码页末端处理弹窗入口：编辑 self._trans_end_handling（独立于封装页/队列），
+        确定后刷新转码页命令预览（generate_ffmpeg_command wrapper 会注入末端处理）。"""
+        self._open_end_handling_dialog(
+            target=self._trans_end_handling,
+            on_apply=lambda: self.update_command_preview())
+
+    def _open_end_handling_dialog(self, target=None, on_apply=None):
+        """末端处理弹窗（通用）：①多画面拼接（split 网格） ②末端 concat 图片/视频。
+        - target：设置 dict（封装页默认 self._merge_end_handling；转换页传 self._trans_end_handling；
+          队列任务编辑传 task.settings["end_handling"]——三处独立不互相干扰）
+        - on_apply：确定后的刷新回调（默认封装页 merge_update_command_preview）。
+        弹窗直接读写 target dict（就地修改）。"""
+        eh = target if target is not None else self._merge_end_handling
         win = tk.Toplevel(self.root)
         win.title(_("末端处理"))
         win.withdraw()  # 先隐藏，center_window 自动居中显示
@@ -14368,7 +14601,12 @@ class FFmpegBatchGUI:
         f1 = ttk.LabelFrame(win, text=_("多画面拼接（split 网格）"), padding="6")
         f1.pack(fill=tk.X, padx=10, pady=(10, 4))
         split_on = tk.BooleanVar(value=bool(eh.get("split_enabled", False)))
-        ttk.Checkbutton(f1, text=_("启用多画面拼接"), variable=split_on).pack(anchor=tk.W)
+        # split 与 concat 互斥（同标签 [v_end_out] 冲突会导致 ffmpeg 报错）：
+        # 勾选一个自动取消另一个；注入侧也有兜底（见 _apply_end_handling_cmd）
+        def _set_split():
+            if split_on.get() and concat_on.get():
+                concat_on.set(False)
+        ttk.Checkbutton(f1, text=_("启用多画面拼接"), variable=split_on, command=_set_split).pack(anchor=tk.W)
         r1 = ttk.Frame(f1)
         r1.pack(fill=tk.X, pady=(4, 0))
         ttk.Label(r1, text=_("行数:")).pack(side=tk.LEFT)
@@ -14392,7 +14630,11 @@ class FFmpegBatchGUI:
         f2 = ttk.LabelFrame(win, text=_("末端 concat（图片/视频）"), padding="6")
         f2.pack(fill=tk.X, padx=10, pady=4)
         concat_on = tk.BooleanVar(value=bool(eh.get("concat_enabled", False)))
-        ttk.Checkbutton(f2, text=_("在视频末尾追加一段图片或视频"), variable=concat_on).pack(anchor=tk.W)
+        def _set_concat():
+            if concat_on.get() and split_on.get():
+                split_on.set(False)
+        ttk.Checkbutton(f2, text=_("在视频末尾追加一段图片或视频"), variable=concat_on,
+                        command=_set_concat).pack(anchor=tk.W)
         r2 = ttk.Frame(f2)
         r2.pack(fill=tk.X, pady=(4, 0))
         ttk.Label(r2, text=_("文件:")).pack(side=tk.LEFT)
@@ -14450,7 +14692,10 @@ class FFmpegBatchGUI:
             eh["concat_path"] = p
             eh["concat_sec"] = max(0.5, float(sec_var.get() or 5.0))
             win.destroy()
-            self.merge_update_command_preview()
+            if on_apply is not None:
+                on_apply()
+            else:
+                self.merge_update_command_preview()
             self._append_info_ui(_("[末端] 末端处理设置已更新"))
 
         ttk.Button(btm, text=_("确定"), command=_on_ok, width=8).pack(side=tk.RIGHT, padx=(6, 0))
@@ -14467,33 +14712,10 @@ class FFmpegBatchGUI:
 
 
     def _apply_end_handling(self, cmd_list, enabled_tracks):
-        """末端处理统一注入（普通/画中画/串行三种模式通用）。
-        在 merge_build_cmd_list 生成 cmd_list 后、手动时长覆盖前调用：
-        ①多画面拼接（split 网格）→ 在最终视频输出标签上追加 split/hstack/vstack 段；
-        ②末端 concat 图片/视频 → 额外输入文件 + scale/pad 适配输出尺寸后 concat 到主视频末尾。
-
-        ⚠️ 本方法修改的是 cmd_list（就地重建），需要找到「最终视频输出标签」：
-        - 有 -filter_complex → filtergraph 末尾的输出标签（-map [xxx] 的目标，排除音频 [a...]）
-        - 只有 -vf（普通模式无旋转）→ 视频输出是主视频输入流，需把 -vf 链并入新的 filter_complex 再追加末端段
-        - 纯 copy（普通/串行流复制）→ 强制升级为 filter_complex + 重编码（末端处理必须重编码）
-        返回新 cmd_list；未启用末端处理或解析失败时原样返回。"""
+        """末端处理统一注入（封装页入口）。解析主轨道尺寸/帧率/时长后调通用 _apply_end_handling_cmd。"""
         eh = self._merge_end_handling
-        split_on = bool(eh.get("split_enabled", False))
-        concat_on = bool(eh.get("concat_enabled", False))
-        if not split_on and not concat_on:
+        if not (eh.get("split_enabled", False) or eh.get("concat_enabled", False)):
             return cmd_list
-        split_rows = max(1, int(eh.get("split_rows", 1) or 1))
-        split_cols = max(1, int(eh.get("split_cols", 1) or 1))
-        concat_path = (eh.get("concat_path", "") or "").strip()
-        concat_sec = float(eh.get("concat_sec", 5.0) or 5.0)
-        if split_on and not (2 <= split_rows * split_cols <= 5):
-            split_on = False
-        if concat_on and (not concat_path or not os.path.isfile(concat_path)):
-            concat_on = False
-        if not split_on and not concat_on:
-            return cmd_list
-
-        # ---- 主视频轨道（取尺寸/帧率/有效时长用于 concat 对齐） ----
         main_track = None
         for t in enabled_tracks:
             if t.type == "video":
@@ -14519,6 +14741,71 @@ class FFmpegBatchGUI:
                     main_dur = float(_d)
             except Exception:
                 pass
+        return self._apply_end_handling_cmd(cmd_list, eh, main_w, main_h, fps, main_dur)
+
+    def _probe_end_handling_dims(self, input_path, settings):
+        """转换页/队列主视频末端处理对齐参数：画布尺寸/帧率/有效时长。
+        与封装页 _get_canvas_size 同构（pad 优先 → compute_final_size_with_order）。"""
+        main_w, main_h = 1280, 720
+        pad_on = bool(settings.get("pad_enabled", False))
+        if pad_on:
+            try:
+                _pw = int(str(settings.get("pad_width", "")).strip())
+                _ph = int(str(settings.get("pad_height", "")).strip())
+                if _pw > 0 and _ph > 0:
+                    main_w, main_h = _pw, _ph
+            except (ValueError, TypeError):
+                pass
+        if (main_w, main_h) == (1280, 720) or not pad_on:
+            _w, _h = self._cached_video_dimensions(input_path)
+            if _w is not None and _h is not None:
+                _w2, _h2 = self.compute_final_size_with_order(_w, _h, settings)
+                if _w2 and _w2 > 0 and _h2 and _h2 > 0:
+                    main_w, main_h = _w2, _h2
+        try:
+            _f = self._get_video_framerate(input_path)
+            fps = float(_f) if (_f and _f > 0) else 30.0
+        except Exception:
+            fps = 30.0
+        try:
+            _d = self._get_effective_duration(settings, input_path=input_path)
+            main_dur = float(_d) if (_d and _d > 0) else 0.0
+        except Exception:
+            main_dur = 0.0
+        return main_w, main_h, fps, main_dur
+
+    def _apply_end_handling_cmd(self, cmd_list, eh, main_w, main_h, fps, main_dur):
+        """末端处理统一注入（封装页/转换页/队列三处共用）。
+        在 cmd_list 生成后调用：
+        ①多画面拼接（split 网格）→ 在最终视频输出标签上追加 split/hstack/vstack 段；
+        ②末端 concat 图片/视频 → 额外输入文件 + scale/pad 适配输出尺寸后 concat 到主视频末尾。
+        eh：末端处理设置 dict（三处各自独立：_merge_end_handling / _trans_end_handling /
+            task.settings["end_handling"]）。
+        main_w/main_h/fps/main_dur：主视频对齐参数（封装页从轨道、转换页从 _probe_end_handling_dims）。
+
+        ⚠️ 本方法修改的是 cmd_list（就地重建），需要找到「最终视频输出标签」：
+        - 有 -filter_complex → filtergraph 末尾的输出标签（-map [xxx] 的目标，排除音频 [a...]）
+        - 只有 -vf（普通模式无旋转）→ 视频输出是主视频输入流，需把 -vf 链并入新的 filter_complex 再追加末端段
+        - 纯 copy（普通/串行流复制）→ 强制升级为 filter_complex + 重编码（末端处理必须重编码）
+        返回新 cmd_list；未启用末端处理或解析失败时原样返回。"""
+        split_on = bool(eh.get("split_enabled", False))
+        concat_on = bool(eh.get("concat_enabled", False))
+        if not split_on and not concat_on:
+            return cmd_list
+        split_rows = max(1, int(eh.get("split_rows", 1) or 1))
+        split_cols = max(1, int(eh.get("split_cols", 1) or 1))
+        concat_path = (eh.get("concat_path", "") or "").strip()
+        concat_sec = float(eh.get("concat_sec", 5.0) or 5.0)
+        if split_on and concat_on:
+            # 互斥兜底（弹窗已联动，这里防残留/外部设置的旧值）：concat 优先，split 忽略
+            split_on = False
+            self._append_info_ui(_("[末端] 多画面拼接与末端 concat 互斥，已优先 concat（split 忽略）"))
+        if split_on and not (2 <= split_rows * split_cols <= 5):
+            split_on = False
+        if concat_on and (not concat_path or not os.path.isfile(concat_path)):
+            concat_on = False
+        if not split_on and not concat_on:
+            return cmd_list
 
         # ---- 解析 cmd_list：-filter_complex / -vf / 视频 -map / 输入计数 / copy 标记 ----
         fc_idx = None; fc_val = ""
@@ -14582,7 +14869,13 @@ class FFmpegBatchGUI:
         new_cmd = list(cmd_list)
         # 形态 A：有 -filter_complex → 在 filtergraph 末尾追加末端段
         if fc_idx is not None and fc_val:
-            base_label = vmap_val if (vmap_val and vmap_val.startswith("[")) else "[v_end_in]"
+            if vmap_val and vmap_val.startswith("["):
+                base_label = vmap_val
+            else:
+                # 无 -map：取 filtergraph 最后一个输出标签作为末端段输入
+                # （如 [0:v]...drawtext=...[v_base] → [v_base]）
+                _tags = re.findall(r"\[([^\]]+)\](?=\s*(?:;|$))", fc_val)
+                base_label = f"[{_tags[-1]}]" if _tags else "[v_end_in]"
             frag = end_frag.replace("[v_end_in]", base_label)
             # 保证 base_label 存在：若 fc 里没有该标签则回退 [v_end_in]（理论上不会）
             new_fc = fc_val + ";" + frag
@@ -14602,7 +14895,9 @@ class FFmpegBatchGUI:
                     if a == "-c:v" and k + 1 < len(new_cmd) and new_cmd[k + 1] == "copy":
                         new_cmd[k + 1] = "libx265"
                         break
-            return self._adjust_end_concat_duration(new_cmd, main_track, concat_sec, concat_path, concat_on)
+            # 无视频 -map 时补映射（转换页普通命令；否则 [v_end_out] unconnected）
+            new_cmd = self._ensure_end_video_map(new_cmd)
+            return self._adjust_end_concat_duration(new_cmd, main_dur, concat_sec, concat_path, concat_on)
 
         # 形态 B：只有 -vf（普通模式无旋转，视频直接 map 源流）→ 并入 filter_complex
         if vf_idx is not None and vf_val:
@@ -14612,8 +14907,10 @@ class FFmpegBatchGUI:
             new_fc = f"[{v_idx}:v]{base_vf}[v_base];{frag}"
             # 删除 -vf 及其值
             del new_cmd[vf_idx:vf_idx + 2]
-            # 找插入点：在第一个 -map 之前插入 -filter_complex
-            ins = next((k for k, a in enumerate(new_cmd) if a == "-map"), len(new_cmd))
+            # 找插入点：第一个 -map 之前；无 -map（转换页普通命令）→ 输出文件前
+            ins = next((k for k, a in enumerate(new_cmd) if a == "-map"), None)
+            if ins is None:
+                ins = self._find_end_output_pos(new_cmd)
             new_cmd[ins:ins] = ["-filter_complex", new_fc]
             # 插入后视频 -map 索引偏移 2；统一重新查找视频 -map 改为 [v_end_out]
             for k, a in enumerate(new_cmd):
@@ -14639,13 +14936,18 @@ class FFmpegBatchGUI:
                     if a == "-c:v" and k + 1 < len(new_cmd) and new_cmd[k + 1] == "copy":
                         new_cmd[k + 1] = "libx265"
                         break
-            return self._adjust_end_concat_duration(new_cmd, main_track, concat_sec, concat_path, concat_on)
+            new_cmd = self._ensure_end_video_map(new_cmd)
+            return self._adjust_end_concat_duration(new_cmd, main_dur, concat_sec, concat_path, concat_on)
 
         # 形态 C：纯 copy（无 -vf 无 filter_complex）→ 新建 filter_complex + 强制重编码
         v_idx = vmap_val.split(":")[0] if vmap_val and ":" in vmap_val else "0"
         frag = end_frag.replace("[v_end_in]", f"[{v_idx}:v]")
         new_fc = frag
-        ins = next((k for k, a in enumerate(new_cmd) if a == "-map"), len(new_cmd))
+        ins = next((k for k, a in enumerate(new_cmd) if a == "-map"), None)
+        if ins is None:
+            # 无 -map（转换页普通命令）：插到输出文件之前，绝不能插到输出文件后
+            # （ffmpeg 会把 -filter_complex 认作下一输出、图输出不映射）
+            ins = self._find_end_output_pos(new_cmd)
         new_cmd[ins:ins] = ["-filter_complex", new_fc]
         # 插入后视频 -map 索引偏移 2；统一重新查找视频 -map 改为 [v_end_out]
         for k, a in enumerate(new_cmd):
@@ -14671,9 +14973,45 @@ class FFmpegBatchGUI:
                 if a == "-c:v" and k + 1 < len(new_cmd) and new_cmd[k + 1] == "copy":
                     new_cmd[k + 1] = "libx265"
                     break
-        return self._adjust_end_concat_duration(new_cmd, main_track, concat_sec, concat_path, concat_on)
+        new_cmd = self._ensure_end_video_map(new_cmd)
+        return self._adjust_end_concat_duration(new_cmd, main_dur, concat_sec, concat_path, concat_on)
 
-    def _adjust_end_concat_duration(self, new_cmd, main_track, concat_sec, concat_path, concat_on=False):
+    def _find_end_output_pos(self, new_cmd):
+        """找输出文件路径在命令中的位置（倒序第一个非选项参数，跳过 -filter_complex/-vf
+        的滤镜图值——用户命令里 filter_complex 可能出现在输出文件之后）。返回索引。"""
+        i = len(new_cmd) - 1
+        while i >= 0:
+            a = new_cmd[i]
+            if not a.startswith("-") and not a.startswith("["):
+                # 非选项参数：若它是 -filter_complex/-vf 的值（前一项是指令）则跳过
+                if i > 0 and new_cmd[i - 1] in ("-filter_complex", "-vf"):
+                    i -= 2
+                    continue
+                return i
+            i -= 1
+        return len(new_cmd) - 1
+
+    def _ensure_end_video_map(self, new_cmd):
+        """末端处理注入后确保输出映射完整：
+        转换页普通命令**没有 -map**（默认 map 输入流），而 filter_complex 的输出流不会
+        自动映射 → 注入的 [v_end_out] 会 unconnected 报错。此处扫描：已有视频 -map 则
+        不动；否则在输出文件前显式补 `-map [v_end_out] -map 0:a?`（视频用合成结果、
+        音频保持源可选流）。"""
+        for k, a in enumerate(new_cmd):
+            if a == "-map" and k + 1 < len(new_cmd):
+                tgt = new_cmd[k + 1]
+                if tgt.startswith("["):
+                    if not (tgt.startswith("[a") or tgt.startswith("[A")):
+                        return new_cmd  # 已有视频 -map
+                elif ":" in tgt:
+                    parts = tgt.split(":")
+                    if len(parts) >= 2 and parts[1] == "v":
+                        return new_cmd
+        out_idx = self._find_end_output_pos(new_cmd)
+        new_cmd[out_idx:out_idx] = ["-map", "[v_end_out]", "-map", "0:a?"]
+        return new_cmd
+
+    def _adjust_end_concat_duration(self, new_cmd, main_dur, concat_sec, concat_path, concat_on=False):
         """concat 尾部素材启用时调整输出时长：
         - 仅当 concat_on=True 且 concat_path 有效时生效（否则直接返回，绝不干扰 -t/-shortest）
         - 移除 -shortest（concat 尾部为有限流，自然结束即可；-shortest 会被音频长度截断导致尾部丢失）
@@ -14689,14 +15027,6 @@ class FFmpegBatchGUI:
                 new_cmd = [a for a in new_cmd if a != "-shortest"]
             return new_cmd
         # ---- 图片尾部：确保输出级有 -t = 主时长 + 尾部秒数 ----
-        main_dur = None
-        if main_track is not None:
-            try:
-                # 用有效时长（考虑截取/变速），避免原始时长导致 -t 过长
-                main_dur = self._get_effective_duration(main_track.enc_settings,
-                                                        input_path=main_track.file_path)
-            except Exception:
-                main_dur = None
         if main_dur is None or main_dur <= 0:
             # 图片主视频默认 10s（与 merge_build_cmd_list 的图片默认时长逻辑一致）
             main_dur = 10.0
@@ -14715,10 +15045,8 @@ class FFmpegBatchGUI:
         if t_idx is not None:
             new_cmd[t_idx + 1] = f"{total:.3f}"
         else:
-            # 追加输出级 -t：插到输出文件路径前（最后一个非选项参数）
-            out_idx = len(new_cmd) - 1
-            while out_idx > 0 and new_cmd[out_idx].startswith("-"):
-                out_idx -= 1
+            # 追加输出级 -t：插到输出文件路径前（跳过 -filter_complex/-vf 的滤镜图值）
+            out_idx = self._find_end_output_pos(new_cmd)
             new_cmd[out_idx:out_idx] = ["-t", f"{total:.3f}"]
         try:
             self._append_info_ui(_("[末端] 图片尾部已设置输出总时长 -t {0:.3f}s（主视频 {1:.1f}s + 尾部 {2:.1f}s）").format(total, main_dur, concat_sec))
@@ -18577,25 +18905,32 @@ class FFmpegBatchGUI:
             _mv = (_s.get("move_mode", "") or "").strip()
             _x_raw = str(_s.get("overlay_x", "W-w-10") or "W-w-10")
             _y_raw = str(_s.get("overlay_y", "H-h-10") or "H-h-10")
-            # 旋转（静态角度/持续旋转）时实际叠加尺寸为 hypot 正方形（rotate ow/oh=hypot），
-            # 位置求值必须用正方形边长 d，否则 W-w-10 等预设位置会偏移
-            # （与正式命令 _overlay_sub_size / 占位框逻辑一致）。
-            _eval_w, _eval_h = _rw, _rh
-            if _rad != 0 or (_spin and _spd != 0):
+            # 定位语义（2026-08-25 理顺）：overlay_x/y 的 w/h = 内容盒（_rw/_rh）；旋转时
+            # 叠加盒 d×d 中心与内容盒中心对齐 → 位置减 (d-w)/2（与正式命令/转换页预览一致）。
+            _rot_pv = (_rad != 0 or (_spin and _spd != 0))
+            if _rot_pv:
                 _eval_d = int(round(((_rw * _rw + _rh * _rh) ** 0.5)))
-                _eval_w = _eval_h = _eval_d
-            _ctx = {"W": _main_w, "H": _main_h, "w": _eval_w, "h": _eval_h}
+                _offPx, _offPy = _content_box_shift(_rw, _rh, _eval_d, _eval_d)
+            else:
+                _offPx = _offPy = 0.0
+            _ctx = {"W": _main_w, "H": _main_h, "w": _rw, "h": _rh}
             # 基准数值位置（blend 静态分支/动态分支的静态轴都要用，必须不受 _mv 表达式影响）
             try:
-                _bxv = int(round(float(safe_eval_expr(_x_raw, _ctx))))
+                _bxv = int(round(float(safe_eval_expr(
+                    _content_box_expr(_x_raw, _rw, _rh), _ctx))))
             except (ValueError, TypeError):
-                _bxv = _main_w - _eval_w - 10
+                _bxv = _main_w - _rw - 10
             try:
-                _byv = int(round(float(safe_eval_expr(_y_raw, _ctx))))
+                _byv = int(round(float(safe_eval_expr(
+                    _content_box_expr(_y_raw, _rw, _rh), _ctx))))
             except (ValueError, TypeError):
-                _byv = _main_h - _eval_h - 10
+                _byv = _main_h - _rh - 10
             if _mv:
-                _mx, _my = build_move_xy_expr(_mv, _x_raw, _y_raw, _s, sw="w", sh="h")
+                # 轨迹范围/基准按内容盒（sw/sh=内容盒数字，x0/y0 的 w/h 内容盒化）
+                _mx, _my = build_move_xy_expr(
+                    _mv, _content_box_expr(_x_raw, _rw, _rh),
+                    _content_box_expr(_y_raw, _rw, _rh),
+                    _s, sw=str(_rw), sh=str(_rh))
                 if _mx is not None:
                     # 预览 overlay 约定用 main_w/main_h（ffmpeg overlay 合法变量，与正式命令 W/H 等价）
                     _x = _mx.replace("W", "main_w").replace("H", "main_h")
@@ -18604,6 +18939,9 @@ class FFmpegBatchGUI:
                     _x, _y = str(_bxv), str(_byv)
             else:
                 _x, _y = str(_bxv), str(_byv)
+            if _rot_pv:
+                _x = f"({_x}) - {_offPx:.6g}"
+                _y = f"({_y}) - {_offPy:.6g}"
             # enable：显示时段/循环控制（起始/结束/周期/单次）优先，同正式命令 _calc_enable_expr；
             # 未设显示控制时用主视频时长上限 + eof_action=pass（防 movie 音频截断），拿不到才 shortest 兜底
             try:
@@ -18624,8 +18962,32 @@ class FFmpegBatchGUI:
                     # 动态轨迹 blend：h/v/diamond/corners 全部支持（crop 的 x/y 表达式支持
                     # 逗号函数与状态变量 → 双轴表达式均可动态跟随，与正式命令一致）
                     _bw, _bh = _bw_src, _bh_src
-                    _dx, _dy = _blend_move_exprs(_mv, _s, _bw, _bh)
+                    # ⚠️ 旋转时 d 可能 > 画布（竖屏/横屏）→ 先 clamp 到画布内再生成轨迹表达式，
+                    # 否则动态 crop 越界在 ffmpeg 8.1 报 "Invalid too big or non positive size"
+                    # （mpv lavfi 桥接包装成 "no media data to loop"；静态分支有
+                    # _blend_static_geometry 尺寸 clamp 兜底）
+                    _bw = min(_bw, _main_w)
+                    _bh = min(_bh, _main_h)
+                    if _bw % 2:
+                        _bw -= 1
+                    if _bh % 2:
+                        _bh -= 1
+                    if _bw < 2:
+                        _bw = 2
+                    if _bh < 2:
+                        _bh = 2
+                    # 定位语义：轨迹范围/基准按内容盒（x0/y0 的 w/h 内容盒化，sw/sh=内容盒），
+                    # 区域位置 = 内容盒位置 - 中心对齐偏移，再 clamp 到画布内（crop 不越界）
+                    _ms3 = dict(_s)
+                    _ms3["overlay_x"] = _content_box_expr(
+                        _ms3.get("overlay_x", "W-w-10"), _rw, _rh)
+                    _ms3["overlay_y"] = _content_box_expr(
+                        _ms3.get("overlay_y", "H-h-10"), _rw, _rh)
+                    _dx, _dy = _blend_move_exprs(_mv, _ms3, _rw, _rh)
                     if _dx is not None:
+                        _offP2, _offP3 = _content_box_shift(_rw, _rh, _bw, _bh)
+                        _dx = f"min(max(({_dx}) - {_offP2:.6g},0),{max(0, _main_w - _bw)})"
+                        _dy = f"min(max(({_dy}) - {_offP3:.6g},0),{max(0, _main_h - _bh)})"
                         _x_expr, _y_expr = _dx, _dy
                         _x_expr_crop, _y_expr_crop = _blend_crop_exprs(_x_expr, _y_expr, _bw, _bh)
                         # 区域隔离：≥2 blend 时主区域从 split 出的原始帧 cur_base 取，
@@ -18648,7 +19010,7 @@ class FFmpegBatchGUI:
                         self._append_info_ui(
                             _("[预览] 子视频 {0} 混合模式+轨迹控制：轨迹模式不支持，已按基准位置 blend").format(_k + 1))
                         _bbx, _bby, _bbw, _bbh, _bsx, _bsy = self._blend_static_geometry(
-                            _bxv, _byv, _bw_src, _bh_src, _main_w, _main_h)
+                            int(_bxv - _offPx), int(_byv - _offPy), _bw_src, _bh_src, _main_w, _main_h)
                         if _bbw >= 2 and _bbh >= 2:
                             if _regional:
                                 _crl, _ovl = f"cur_base{_bj}", cur
@@ -18664,9 +19026,10 @@ class FFmpegBatchGUI:
                         else:
                             parts.append(f"{cur}null{cur}")
                 else:
-                    # 静态位置 blend：基准数值位置 + 区域隔离（区域隔离 split 见循环前）
+                    # 静态位置 blend：基准数值位置（内容盒语义 + 旋转中心偏移）+ 区域隔离
+                    # （区域隔离 split 见循环前）
                     _bbx, _bby, _bbw, _bbh, _bsx, _bsy = self._blend_static_geometry(
-                        _bxv, _byv, _bw_src, _bh_src, _main_w, _main_h)
+                        int(_bxv - _offPx), int(_byv - _offPy), _bw_src, _bh_src, _main_w, _main_h)
                     if _bbw >= 2 and _bbh >= 2:
                         if _regional:
                             _crl, _ovl = f"cur_base{_bj}", cur
