@@ -317,6 +317,8 @@ class TrackFrame(ttk.LabelFrame):
         self.filter_parts = []
         self.segment_modes = []
         self.segment_durations = []
+        # blend 混合模式（parse 时从命令识别，normal=普通叠加；非 normal 时生成区域化 blend 子图）
+        self.blend_mode = "normal"
 
         # 特效（旋转 / delogo / 遮罩）—— 与主程序新近加的子视频能力保持对齐
         self.spin_enabled_var = tk.BooleanVar(value=False)
@@ -822,7 +824,7 @@ def split_filters_aware(text):
 class MultiTrackWatermarkGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("FFmpeg 多轨道水印轨迹编排器 v18.0")
+        self.root.title("FFmpeg 多轨道水印轨迹编排器 v18.1")
 
         # 屏幕自适应
         screen_width = self.root.winfo_screenwidth()
@@ -1217,6 +1219,18 @@ class MultiTrackWatermarkGUI:
             for idx, filters in matches:
                 raw_filters_map[int(idx)] = filters.strip(',')
 
+        # blend 混合模式识别：主程序区域化 blend 子图形如
+        #   [mcr0][rgx0b]blend=all_mode=multiply[blx0r]
+        # mcr 后数字 = 子视频序号（0 起，与 -i 顺序对应）。按出现顺序兜底。
+        blend_map = {}
+        if filter_complex:
+            for _bm in re.finditer(r"\[mcr(\d+)\]\[rgx\1b\]blend=all_mode=([a-z0-9]+)", filter_complex):
+                blend_map[int(_bm.group(1))] = _bm.group(2)
+            if not blend_map:
+                _bms = re.findall(r"blend=all_mode=([a-z0-9]+)", filter_complex)
+                if _bms:
+                    blend_map = {j: bm for j, bm in enumerate(_bms)}
+
         static_coords = []
         if filter_complex:
             pattern1 = r"overlay=x='([^']*)':y='([^']*)'"
@@ -1282,6 +1296,11 @@ class MultiTrackWatermarkGUI:
                 except ValueError:
                     pass
 
+            # blend 混合模式：mcr 后数字 = 子视频序号（0 起，= idx-1）。识别后：
+            # ① filter_parts 摊平时跳过 blend 残留（采样 crop/alphaextract，子图生成时重建）；
+            # ② generate_command 走区域化 blend 子图（不再普通叠加）。
+            track.blend_mode = str(blend_map.get(idx - 1, "normal") or "normal").strip().lower()
+
             # scale 和其它 filter_parts：跨语句摊平扫描。
             # 注意：scale 不一定在第一条 statement —— 主程序带遮罩时形如
             #   [1:v]split=2[mks1a][mks1m];[mks1m]format=gray,drawbox=...[mks1msk];
@@ -1312,6 +1331,13 @@ class MultiTrackWatermarkGUI:
                         m = re.match(r'^scale=([^:]+):([^:,]+)', part)
                         if m:
                             scale_w, scale_h = m.group(1), m.group(2)
+                        continue
+                    if part.startswith('alphaextract'):
+                        continue  # blend 子图残留（子图在生成时重建）
+                    if track.blend_mode != "normal" and part.startswith('crop='):
+                        # blend 子视频的采样 crop（主区域+子区域两处，含静态数字与动态表达式两种）；
+                        # 区域 blend 子图在 generate 时重建，残留只会造成错位双裁剪。
+                        # 已知限制：blend 模式下用户自带的裁剪 crop 一并忽略（如需裁剪请用 scale）。
                         continue
                     filter_parts.append(part)
 
@@ -1538,8 +1564,11 @@ class MultiTrackWatermarkGUI:
 
     def _write_sendcmd_file(self, track, x_expr, y_expr, horizon, idx, base_dir,
                             main_w=1.0, main_h=1.0, sub_w=1.0, sub_h=1.0,
-                            overlay_name="overlay"):
+                            overlay_name="overlay", crop_name=None):
         # 沿时间采样轨迹位置，写出 sendcmd 命令文件驱动 overlay 的 x/y。
+        # crop_name（如 "crop@cr0"）非 None 时，同一份采样额外输出 crop 的 x/y 命令：
+        # blend 区域化时 crop 窗口必须与 overlay 位置同步（"走到哪混到哪"）。crop 上下文
+        # 只有 iw/ih（无 W/H）→ 表达式前缀换 iw/ih，overlay 上下文用 W/H，两者同步采样。
         #
         # 命令格式（实测可用）：「time target command value;」——目标滤镜名放第二列，
         # 末尾以分号结束一条命令（缺分号报 "Missing separator"）。
@@ -1595,10 +1624,20 @@ class MultiTrackWatermarkGUI:
             sy = (ky_j - ky_i) / dt if dt > 0 else 0.0
             x_cmd = f"W*({kx_i:.6f}+({sx:.6f})*(t-{t_i:.3f}))"
             y_cmd = f"H*({ky_i:.6f}+({sy:.6f})*(t-{t_i:.3f}))"
+            if crop_name:
+                # crop 上下文无 W/H（只有 iw/ih）→ 同一条插值换前缀；值与 overlay 完全同步
+                lines.append(f"{t_i:.3f} {crop_name} x "
+                             f"{x_cmd.replace('W*', 'iw*').replace('H*', 'ih*')}, "
+                             f"{crop_name} y "
+                             f"{y_cmd.replace('W*', 'iw*').replace('H*', 'ih*')};")
             lines.append(f"{t_i:.3f} {overlay_name} x {x_cmd}, {overlay_name} y {y_cmd};")
         # 末尾保持最后位置，避免上一段在区间外线性外推
         t_last, kx_last, ky_last = samples[-1]
-        lines.append(f"{t_last:.3f} {overlay_name} x W*({kx_last:.6f}), {overlay_name} y H*({ky_last:.6f});")
+        if crop_name:
+            lines.append(f"{t_last:.3f} {crop_name} x iw*({kx_last:.6f}), "
+                         f"{crop_name} y ih*({ky_last:.6f});")
+        lines.append(f"{t_last:.3f} {overlay_name} x W*({kx_last:.6f}), "
+                     f"{overlay_name} y H*({ky_last:.6f});")
 
         content = "\n".join(lines) + "\n"
         fname = f"ff_sendcmd_track{idx}.txt"
@@ -1686,6 +1725,26 @@ class MultiTrackWatermarkGUI:
         filter_chain.append("[0:v]format=yuv420p[v_main]")
         current_base = "[v_main]"
         output_counter = 0
+
+        # ---- 多 blend 轨道区域隔离（与主程序 _use_regional 一致）----
+        # ≥2 个 blend 轨道时，主视频 split 出原始帧副本，每个 blend 从自己的副本裁区域
+        # → 重叠区互不干涉（blend A 的结果不会被 blend B 当作背景再混一次）。
+        # 单 blend / 全普通叠加不 split（零行为变化）。split 是帧引用（零拷贝）。
+        _blend_plan = []
+        for _t in self.tracks:
+            _ht = len(_t.trajectory) >= 1
+            _hs = (_t.static_x is not None and _t.static_y is not None)
+            if not _ht and not _hs:
+                continue
+            _bm = str(getattr(_t, "blend_mode", "normal") or "normal").strip().lower()
+            if _bm not in ("", "normal"):
+                _blend_plan.append(_t)
+        use_regional = len(_blend_plan) >= 2
+        if use_regional:
+            _n = len(_blend_plan)
+            _labs = "".join(f"[bl_base{j}]" for j in range(_n))
+            filter_chain.append(f"[v_main]split={_n + 1}[v_main]{_labs}")
+        _blend_seq = 0  # blend 轨道序号（对应 bl_baseN）
 
         for track in self.tracks:
             has_trajectory = len(track.trajectory) >= 1
@@ -1802,7 +1861,11 @@ class MultiTrackWatermarkGUI:
             except (ValueError, TypeError):
                 _sp_val = 60.0
             spin_on = bool(track.spin_enabled_var.get()) and _sp_val != 0
-            if spin_on and sub_w and sub_h:
+            # 静态旋转（filter_parts 里的 rotate= 非持续旋转）同样输出 hypot 正方形画布
+            # （rotate=..:ow=hypot(iw,ih):oh=hypot(iw,ih):c=black@0），blend 区域必须用对角线
+            has_static_rotate = any(
+                p.startswith('rotate=') and '*PI/180*t' not in p for p in filter_parts)
+            if (spin_on or has_static_rotate) and sub_w and sub_h:
                 _d = int(round((sub_w * sub_w + sub_h * sub_h) ** 0.5))
                 sub_w = sub_h = _d
 
@@ -1895,7 +1958,90 @@ class MultiTrackWatermarkGUI:
                 cur_input = f"[{_spin_label}]"
 
             # ---- 构建 overlay（sendcmd 模式：位置由命令文件驱动）----
+            blend_mode = str(getattr(track, "blend_mode", "normal") or "normal").strip().lower()
+            is_blend = blend_mode not in ("", "normal")
             use_sc = self.use_sendcmd_var.get() and has_trajectory
+
+            if is_blend:
+                # ================= 区域化 blend（与主程序 _make_blend_region 同构） =================
+                # 区域尺寸 = 子视频渲染尺寸（spin/静态旋转已是对角线正方形），偶数化
+                _bw, _bh = int(sub_w or 0), int(sub_h or 0)
+                if _bw < 2 or _bh < 2:
+                    messagebox.showerror(
+                        "错误", f"轨道 {track['text']} 无法确定子视频尺寸（blend 需要精确区域），"
+                                f"请确认缩放尺寸有效或检查视频可读性")
+                    return
+                if _bw % 2:
+                    _bw -= 1
+                if _bh % 2:
+                    _bh -= 1
+                _bw = max(2, _bw); _bh = max(2, _bh)
+                # 唯一 label / 别名（多轨道不撞名）
+                _cr = f"cr{idx}"
+                _mc, _ap, _rg, _ae, _br, _bx = (f"b{idx}{x}" for x in ("mc", "ap", "rg", "ae", "br", "bx"))
+                # 主区域来源：区域隔离时用 bl_base{_blend_seq}（原始帧副本，重叠区互不干涉），
+                # 否则用当前合成主干（单 blend 直接与当前画面混合）
+                if use_regional:
+                    _src = f"[bl_base{_blend_seq}]"
+                else:
+                    _src = current_base
+                _blend_seq += 1
+
+                if has_trajectory and use_sc:
+                    # ---- sendcmd：crop 窗口与 overlay 位置由同一份命令文件同步驱动 ----
+                    if loop:
+                        vdur = self.get_video_duration(input_entries[0][1])
+                        horizon = vdur if (vdur and vdur > 0) else max(global_duration, delay_val + 0.001)
+                    else:
+                        horizon = delay_val + total_period
+                    if horizon <= 0:
+                        horizon = max(global_duration, 0.001)
+                    cmdfile = self._write_sendcmd_file(track, x_expr, y_expr, horizon, idx, base_dir,
+                                                        main_w, main_h, _bw, _bh,
+                                                        overlay_name=f"overlay@{ov_alias}",
+                                                        crop_name=f"crop@{_cr}")
+                    sendcmd_files.append(cmdfile)
+                    sc_label = f"{sub_temp_label}_sc"
+                    filter_chain.append(f"{cur_input}sendcmd=f='{cmdfile}'[{sc_label}]")
+                    cur_input = f"[{sc_label}]"
+                    # crop 初始占位 0:0（sendcmd 首命令 t=0 即覆盖；crop 的 x/y 由命令文件按 iw/ih 驱动）
+                    filter_chain.append(f"{_src}crop@{_cr}={_bw}:{_bh}:0:0,format=rgb24[{_mc}]")
+                    overlay_opts = "x=-1:y=-1"
+                elif has_trajectory:
+                    # ---- 表达式：crop 用 iw/ih 变体（W/H→iw/ih + 独立 w/h→区域尺寸），overlay 用 W/H 原样 ----
+                    # （正则 \bw\b/\bh\b 防误伤 iw/ih 里的 w/h，与主程序 _blend_crop_exprs 一致）
+                    xc = re.sub(r"\bw\b", str(_bw), x_expr.replace("W", "iw").replace("H", "ih"))
+                    xc = re.sub(r"\bh\b", str(_bh), xc)
+                    yc = re.sub(r"\bw\b", str(_bw), y_expr.replace("W", "iw").replace("H", "ih"))
+                    yc = re.sub(r"\bh\b", str(_bh), yc)
+                    filter_chain.append(f"{_src}crop={_bw}:{_bh}:x='{xc}':y='{yc}',format=rgb24[{_mc}]")
+                    overlay_opts = f"x='{x_expr}':y='{y_expr}'"
+                else:
+                    # ---- 静态位置：基准坐标求值（可能含 W/H/w/h 表达式）+ clamp 到画布内 ----
+                    try:
+                        _sxv = self._eval_axis_expr(x_expr, 0, main_w, main_h, _bw, _bh)
+                        _syv = self._eval_axis_expr(y_expr, 0, main_w, main_h, _bw, _bh)
+                    except Exception:
+                        _sxv, _syv = 0, 0
+                    _sxv = int(max(0, min(_sxv, main_w - _bw)))
+                    _syv = int(max(0, min(_syv, main_h - _bh)))
+                    filter_chain.append(f"{_src}crop={_bw}:{_bh}:{_sxv}:{_syv},format=rgb24[{_mc}]")
+                    overlay_opts = f"{_sxv}:{_syv}"
+
+                # ---- 子视频采样 + RGBA 剥离（blend 纯 RGB 空间运算，alpha 单独提取后合并回）----
+                filter_chain.append(f"{cur_input}crop={_bw}:{_bh}:0:0,format=rgba,split=2[{_ap}][{_rg}]")
+                filter_chain.append(f"[{_ap}]alphaextract[{_ae}]")
+                filter_chain.append(f"[{_rg}]format=rgb24[{_rg}b]")
+                filter_chain.append(f"[{_mc}][{_rg}b]blend=all_mode={blend_mode}[{_br}]")
+                filter_chain.append(f"[{_br}][{_ae}]alphamerge,format=rgba[{_bx}]")
+                # blend overlay 不带 enable（与主程序一致：blend 按像素重算，不响应显示时段）
+                overlay = f"{current_base}[{_bx}]overlay@{ov_alias}={overlay_opts}:shortest=1{out_stream}"
+                filter_chain.append(overlay)
+                current_base = out_stream
+                output_counter += 1
+                continue
+
+            # ---- 普通叠加（既有逻辑）----
             if use_sc:
                 # 计算采样时间跨度 horizon：循环时覆盖整段主视频（探测主视频时长，
                 # 让轨迹在整段视频里按周期复现）；不循环时只覆盖"延迟+单周期"这一段。
