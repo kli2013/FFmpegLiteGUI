@@ -1054,9 +1054,9 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
         if color.startswith("#"):
             color = "0x" + color[1:].upper()
         try:
-            similarity = float(chroma_settings.get("chroma_similarity", 0.3))
+            similarity = float(chroma_settings.get("chroma_similarity", 0.2))
         except (ValueError, TypeError):
-            similarity = 0.3
+            similarity = 0.2
         if similarity <= 0:
             similarity = 0.00001
         try:
@@ -5708,13 +5708,13 @@ class LoopChromaFrame(ttk.LabelFrame):
         sim_label = ttk.Label(sim_frame, text=_("相似度 (0~1):"))
         sim_label.pack(side=tk.LEFT)
         ToolTip(sim_label,
-                _("【绿幕/蓝幕】推荐 0.3 左右，可适当调整。\n如果觉得转换后的对象发虚透明，降低相似度重试。"),
+                _("【绿幕/蓝幕】推荐 0.2 左右，可适当调整。\n如果觉得转换后的对象发虚透明，降低相似度重试。"),
                 wraplength=400)
-        self.chroma_similarity = tk.DoubleVar(value=0.3)
+        self.chroma_similarity = tk.DoubleVar(value=0.2)
         sim_slider = ttk.Scale(sim_frame, from_=0.0, to=1.0, variable=self.chroma_similarity,
                                orient=tk.HORIZONTAL, length=100)
         sim_slider.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        self.sim_entry_var = tk.StringVar(value="0.3000")
+        self.sim_entry_var = tk.StringVar(value="0.2000")
         sim_entry = ttk.Entry(sim_frame, textvariable=self.sim_entry_var, width=8)
         sim_entry.pack(side=tk.LEFT, padx=5)
         def sim_slider_changed(val):
@@ -5951,9 +5951,9 @@ class LoopChromaFrame(ttk.LabelFrame):
         self.show_once_var.set(str(settings.get("show_once", "")))
         self.chroma_enabled.set(settings.get("chroma_enabled", False))
         self.chroma_color.set(settings.get("chroma_color", "#3fff08"))
-        sim = settings.get("chroma_similarity", 0.3)
+        sim = settings.get("chroma_similarity", 0.2)
         if sim <= 0:
-            sim = 0.3
+            sim = 0.2
         self.chroma_similarity.set(sim)
         self.sim_entry_var.set(f"{sim:.4f}")
         blend = settings.get("chroma_blend", 0.1)
@@ -7497,7 +7497,7 @@ class Track:
                     "loop_count": 3,
                     "chroma_enabled": False,
                     "chroma_color": "#3fff08",
-                    "chroma_similarity": 0.3,
+                    "chroma_similarity": 0.2,
                     "chroma_blend": 0.1,
                     "alpha_enabled": False,
                     "chroma_filter_type": "chromakey",   # 默认 chromakey
@@ -7934,6 +7934,13 @@ class FFmpegBatchGUI:
 
         self.use_mpv = tk.BooleanVar(value=False)
         self.mpv_path = tk.StringVar(value="mpv")
+        # mpv 可用性标志：None=未检测 / True / False。
+        # 只判断「二进制能否启动」——滤镜图错误（lavfi-complex 报错）是运行期错误，绝不走回退。
+        self._mpv_usable = None
+        # 启动时检测一次 + 中途修改 use_mpv/mpv_path 重新检测（load_player_settings 的 set 也会触发）
+        self.use_mpv.trace_add("write", self._refresh_mpv_flag)
+        self.mpv_path.trace_add("write", self._refresh_mpv_flag)
+        self._refresh_mpv_flag()
         
         self.overwrite_policy = tk.StringVar(value='ask')    # 内部值(英文代码): 'ask', 'rename', 'overwrite'
         # 下拉中文映射：显示中文，内部仍用英文代码，判断/保存逻辑无需改动
@@ -8048,7 +8055,7 @@ class FFmpegBatchGUI:
             "trim_end": "",
             "chroma_enabled": False,
             "chroma_color": "#3fff08",
-            "chroma_similarity": 0.3,
+            "chroma_similarity": 0.2,
             "chroma_blend": 0.1,
             "overlay_enabled": True,
             "overlay_x": "W-w-10",
@@ -10154,6 +10161,58 @@ class FFmpegBatchGUI:
         _PREVIEW_LINKS[path] = target
         return target
 
+    def _check_mpv_usable(self) -> bool:
+        """检测 mpv 二进制是否真正可用（存在 + 能启动 --version）。
+
+        为什么不用 os.path.isfile/os.access(X_OK)：Windows 下 .exe 的 X_OK 恒真，
+        且文件在但缺 DLL/运行库（mpv 同目录 dll 或 VC 运行时）时照样启动失败——
+        这类「文件在但用不了」只有实际跑一次才知道。--version 是「mpv 无法使用」
+        的最可靠判据（~几十 ms，仅在启动/改路径时各跑一次）。
+
+        注意边界：这里只判「二进制可用性」。滤镜图错误（--lavfi-complex 报错）是
+        mpv 起来之后才发生的运行期错误（进程退出码非零、Popen 不抛异常），
+        永远不会走到回退——回退仅由「Popen 抛 OSError（进程起不来）」触发。"""
+        raw = self.mpv_path.get().strip()
+        if not raw:
+            return False
+        exe = raw
+        if not os.path.isabs(exe):
+            # "mpv" 这类裸名按 PATH/PATHEXT 解析（找 mpv.exe）
+            found = find_executable(exe) or shutil.which(exe)
+            if not found:
+                return False
+            exe = found
+        if not os.path.isfile(exe):
+            return False
+        try:
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            r = subprocess.run([exe, "--version"], capture_output=True,
+                               timeout=5, creationflags=flags)
+            return r.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    def _refresh_mpv_flag(self, *args):
+        """重算 mpv 可用标志：启动时 + use_mpv/mpv_path 变更时（trace）调用。"""
+        if not self.use_mpv.get():
+            self._mpv_usable = False
+        else:
+            self._mpv_usable = self._check_mpv_usable()
+
+    def _mpv_ready(self, log=True) -> bool:
+        """统一入口：use_mpv 开启 且 mpv 二进制可用 → True。
+        False 时按需打一条「回退」日志（调用方决定场景：可回退的走 ffplay，
+        不可回退的（lavfi-complex 复杂图）自行提示）。"""
+        if not self.use_mpv.get():
+            return False
+        if self._mpv_usable is None:
+            self._mpv_usable = self._check_mpv_usable()
+        if not self._mpv_usable and log:
+            raw = self.mpv_path.get().strip()
+            self._append_info_ui(
+                _("[预览] mpv 不可用（{0} 无法启动），已回退 ffplay").format(raw or _("未设置")))
+        return bool(self._mpv_usable)
+
     def preview_with_player(self, input_path, filters=None, audio_only=False, volume=10,
                             extra_args=None, start_time=None, duration=None,
                             lavfi_complex=None):
@@ -10170,68 +10229,93 @@ class FFmpegBatchGUI:
         """
         file_path = normalize_path(input_path)
         extra_args = extra_args or []
-    
-        if audio_only:
-            if self.use_mpv.get():
-                player = self.mpv_path.get().strip() or "mpv"
-                cmd = [player, file_path]
-                if start_time is not None:
-                    cmd.append(f"--start={start_time}")
-                if duration is not None:
-                    cmd.append(f"--length={duration}")
-            else:
-                if not self.ffplay_cmd:
-                    self._append_info_ui(_("未找到 ffplay，无法预览。"))
-                    return
-                cmd = [self.ffplay_cmd, "-nodisp", "-autoexit", "-volume", str(volume)]
-                if start_time is not None:
-                    cmd.extend(["-ss", str(start_time)])
-                if duration is not None:
-                    cmd.extend(["-t", str(duration)])
-                cmd.append(file_path)
-        else:
-            if self.use_mpv.get():
-                player = self.mpv_path.get().strip() or "mpv"
-                cmd = [player, file_path]
+        used_mpv = False  # 记录本次实际走了 mpv（Popen 异常兜底回退时用）
+
+        def _build_mpv():
+            player = self.mpv_path.get().strip() or "mpv"
+            c = [player, file_path]
+            if not audio_only:
                 if lavfi_complex:
                     # 复杂图（文字水印旋转等）：占位标签 → mpv 约定标签（音频输入是 aid1）
                     lc = lavfi_complex.replace("[VIN]", "[vid1]").replace("[AIN]", "[aid1]")
                     lc = lc.replace("[VOUT]", "[vo]").replace("[AOUT]", "[ao]")
-                    cmd.append(f"--lavfi-complex={lc}")
+                    c.append(f"--lavfi-complex={lc}")
                 elif filters:
                     # 使用 lavfi=[...] 语法（mpv 官方推荐），不再需要 graph= 与额外的引号转义；
                     # mpv 会直接解析 [...] 内的滤镜图，filters 本身无需再做 shell/转义处理。
-                    cmd.append(f"--vf=lavfi=[{filters}]")
+                    c.append(f"--vf=lavfi=[{filters}]")
+            if start_time is not None:
+                c.append(f"--start={start_time}")
+            if duration is not None:
+                c.append(f"--length={duration}")
+            if extra_args:
+                c.extend(extra_args)
+            return c
+
+        def _build_ffplay():
+            if not self.ffplay_cmd:
+                return None
+            if audio_only:
+                c = [self.ffplay_cmd, "-nodisp", "-autoexit", "-volume", str(volume)]
                 if start_time is not None:
-                    cmd.append(f"--start={start_time}")
+                    c.extend(["-ss", str(start_time)])
                 if duration is not None:
-                    cmd.append(f"--length={duration}")
-                if extra_args:
-                    cmd.extend(extra_args)
+                    c.extend(["-t", str(duration)])
+                c.append(file_path)
             else:
-                if not self.ffplay_cmd:
-                    self._append_info_ui(_("未找到 ffplay，无法预览。"))
-                    return
-                cmd = [self.ffplay_cmd]
+                c = [self.ffplay_cmd]
                 if start_time is not None:
-                    cmd.extend(["-ss", str(start_time)])
+                    c.extend(["-ss", str(start_time)])
                 if duration is not None:
-                    cmd.extend(["-t", str(duration)])
-                cmd.extend(["-i", file_path])
+                    c.extend(["-t", str(duration)])
+                c.extend(["-i", file_path])
                 if filters:
-                    cmd.extend(["-vf", filters])
-                cmd.extend(["-volume", str(volume)])
+                    c.extend(["-vf", filters])
+                c.extend(["-volume", str(volume)])
                 if extra_args:
-                    cmd.extend(extra_args)
-                if "-window_title" not in cmd:
-                    cmd.extend(["-window_title", f"预览: {os.path.basename(file_path)}"])
-    
+                    c.extend(extra_args)
+                if "-window_title" not in c:
+                    c.extend(["-window_title", _("预览: {0}").format(os.path.basename(file_path))])
+            return c
+
+        if self._mpv_ready():
+            cmd = _build_mpv()
+            used_mpv = True
+        else:
+            cmd = _build_ffplay()
+            if cmd is None:
+                self._append_info_ui(_("未找到 ffplay，无法预览。"))
+                return
+
         self._append_info_ui(_("执行命令: ") + format_cmd_for_display(cmd))
         try:
             flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
         except Exception as e:
-            self._append_info_ui(_("预览失败: {0}").format(e))
+            if used_mpv:
+                # 兜底：标志检测后 mpv 仍可能被删/移动（竞态）——Popen 抛 OSError 说明
+                # 进程根本起不来（=mpv 不可用），置标志并回退 ffplay。
+                # 注意：滤镜图错误时 mpv 进程能启动、只是退出码非零，Popen 不抛异常，
+                # 永远不会进到这里（滤镜错误绝不回退）。
+                self._mpv_usable = False
+                raw = self.mpv_path.get().strip()
+                self._append_info_ui(
+                    _("[预览] mpv 启动失败（{0}）：{1}，已回退 ffplay").format(raw or _("未设置"), e))
+                fb = _build_ffplay()
+                if fb is None:
+                    self._append_info_ui(_("未找到 ffplay，无法预览。"))
+                    return
+                if lavfi_complex and not audio_only:
+                    self._append_info_ui(_("[预览] 提示：原预览为 mpv 复杂图（lavfi-complex），"
+                                           "ffplay 不支持复杂图，回退后为原始画面；如需合成效果请用快照预览"))
+                self._append_info_ui(_("执行命令: ") + format_cmd_for_display(fb))
+                try:
+                    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                    subprocess.Popen(fb, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
+                except Exception as e2:
+                    self._append_info_ui(_("预览失败: {0}").format(e2))
+            else:
+                self._append_info_ui(_("预览失败: {0}").format(e))
     
     def _preview_with_settings(self, file_path: str, settings: dict, with_snapshot: bool = False):
         """
@@ -10382,7 +10466,9 @@ class FFmpegBatchGUI:
         #            其余场景走普通 -vf 链（图片水印占位框） ----
         filter_chain = ""
         lavfi_complex_str = None
-        use_mpv = bool(self.use_mpv.get())
+        # mpv 不可用时走非 mpv 滤镜分支（ffplay 播带滤镜/占位框画面），而非构建 lavfi-complex
+        # 后再由 preview_with_player 回退（那样 ffplay 只能播原始画面，滤镜全丢）
+        use_mpv = bool(self.use_mpv.get()) and self._mpv_ready(log=False)
         wm_active = bool(wm_settings.get("enabled", False)) and bool((wm_settings.get("file_path", "") or "").strip())
         # 手动时长：从自定义参数解析 -t（如 -t 10），复杂预览时水印 overlay enable 用 lt(t,T) 且去掉 shortest
         manual_t = None
@@ -14279,7 +14365,7 @@ class FFmpegBatchGUI:
             pass
 
         # ---------- 功能1：多画面拼接 ----------
-        f1 = ttk.LabelFrame(win, text=_("① 多画面拼接（split 网格）"), padding="6")
+        f1 = ttk.LabelFrame(win, text=_("多画面拼接（split 网格）"), padding="6")
         f1.pack(fill=tk.X, padx=10, pady=(10, 4))
         split_on = tk.BooleanVar(value=bool(eh.get("split_enabled", False)))
         ttk.Checkbutton(f1, text=_("启用多画面拼接"), variable=split_on).pack(anchor=tk.W)
@@ -14303,7 +14389,7 @@ class FFmpegBatchGUI:
                 wraplength=380)
 
         # ---------- 功能2：末端 concat 图片/视频 ----------
-        f2 = ttk.LabelFrame(win, text=_("② 末端 concat（图片/视频）"), padding="6")
+        f2 = ttk.LabelFrame(win, text=_("末端 concat（图片/视频）"), padding="6")
         f2.pack(fill=tk.X, padx=10, pady=4)
         concat_on = tk.BooleanVar(value=bool(eh.get("concat_enabled", False)))
         ttk.Checkbutton(f2, text=_("在视频末尾追加一段图片或视频"), variable=concat_on).pack(anchor=tk.W)
@@ -15114,7 +15200,7 @@ class FFmpegBatchGUI:
             "move_dwell": 2.0, "move_margin": "W*0.03",
             "pad_enabled": False, "pad_width": "", "pad_height": "", "offset_x": "0", "offset_y": "0",
             "loop_enabled": False, "loop_mode": "infinite", "loop_count": 3,
-            "chroma_enabled": False, "chroma_color": "#3fff08", "chroma_similarity": 0.3, "chroma_blend": 0.1,
+            "chroma_enabled": False, "chroma_color": "#3fff08", "chroma_similarity": 0.2, "chroma_blend": 0.1,
             "alpha_enabled": False, "alpha_value": 1.0, "chroma_filter_type": "chromakey",
             "enhance": {},
             "audio_source_type": "self",
@@ -18298,6 +18384,16 @@ class FFmpegBatchGUI:
         if not self.use_mpv.get():
             messagebox.showinfo(_("提示"), _("实时预览需要 mpv 播放器（lavfi-complex 复杂图）"))
             return
+        if not self._mpv_ready(log=False):
+            # lavfi-complex 复杂图 ffplay 无法播放（无 -filter_complex）→ 不回退，
+            # 明确提示修复 mpv 路径或用快照预览（避免 WinError 2 报错）
+            messagebox.showwarning(
+                _("提示"),
+                _("mpv 不可用（{0} 无法启动），\n"
+                  "实时预览依赖 mpv 的 lavfi-complex 复杂图能力，无法回退 ffplay。\n"
+                  "请检查 mpv 路径是否正确，或使用「快照」预览查看合成效果。")
+                .format(self.mpv_path.get().strip() or _("未设置")))
+            return
         if not self.ffmpeg_cmd:
             self._append_info_ui(_("[预览] 未找到 ffmpeg，无法生成实时预览"))
             return
@@ -18632,7 +18728,10 @@ class FFmpegBatchGUI:
             flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
         except Exception as e:
-            self._append_info_ui(_("[预览] 实时预览启动失败: {0}").format(e))
+            # 兜底：Popen 抛 OSError=mpv 进程起不来（不可用），标记标志供后续预览直接回退/提示
+            self._mpv_usable = False
+            self._append_info_ui(
+                _("[预览] mpv 启动失败: {0}（已标记 mpv 不可用，请检查路径或用快照预览）").format(e))
 
     def _merge_preview_right_menu(self):
         """合并页预览按钮右键：快照 / 缩略图 / 实时预览 选择菜单"""
