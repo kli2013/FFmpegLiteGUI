@@ -1906,6 +1906,35 @@ def compute_rendered_size(original_w: int, original_h: int, settings: Dict[str, 
             pass
     return w, h
 
+
+def _blend_move_exprs(mode, move_settings=None, sw="w", sh="h"):
+    """为 blend 区域化动态窗口构造【无逗号、无问号】动效表达式。
+
+    ⚠️ 实测约束（ffmpeg n8.1）：
+    - crop 的 x/y 表达式不支持逗号函数（mod/min/max 会被参数解析截断，转义无效）；
+    - `?` 字符在 filtergraph 引号内仍导致解析失败（三元 clamp 不可用，crop/overlay 都不行）。
+    因此动效轴表达式必须：不用 mod/min/max/三元，且天然在画布内（无需 clamp）。
+    h 左右往返：x = (W-w)*(1-2*abs(mod_无逗号))，tria∈[0,1] → x∈[0,W-w] 天然贴画布；
+    v 上下往返：y = (H-h)*tria → y∈[0,H-h]。
+    另一轴（基准坐标）由调用方在 Python 里求值并 clamp 成静态数字。
+    返回 (axis, expr)：axis='x'/'y' 表示该轴动效；不支持返回 (None, None)。"""
+    ms = move_settings or {}
+    try:
+        T = float(ms.get("move_cycle", 4.0) or 4.0)
+    except (ValueError, TypeError):
+        T = 4.0
+    if T <= 0:
+        T = 4.0
+    if mode == "h":
+        # 左右往返：x 在 0..W-w 往返（右边缘贴 W），y 保持基准（控制上边距）
+        tria = f"(1-2*abs((t-{T:.4f}*floor(t/{T:.4f}))/{T:.4f}-0.5))"
+        return "x", f"(W-{sw})*{tria}"
+    if mode == "v":
+        # 上下往返：y 在 0..H-h 往返（下边缘贴 H），x 保持基准（控制左边距）
+        tria = f"(1-2*abs((t-{T:.4f}*floor(t/{T:.4f}))/{T:.4f}-0.5))"
+        return "y", f"(H-{sh})*{tria}"
+    return None, None
+
 # ================== 子进程执行封装 ==================
 def run_ffmpeg_command(cmd: List[str], on_output_line: Optional[Callable] = None, timeout: Optional[float] = None) -> Tuple[int, str]:
     """
@@ -9336,10 +9365,10 @@ class FFmpegBatchGUI:
         输出结束由全局 -shortest 控制。
         """
         filter_parts = []
-        # ---- 多子视频混合模式保护提示（仅日志，不阻止生成） ----
-        # 混合模式（非 normal）按像素重算主+子区域，多个叠加在数学上互相干涉、
-        # 结果不可预测（部分子视频会"融"进主画面看不清）。水印/转换页只有 1 个子视频，
-        # 因此只在 len(sub_infos)>=2（画中画）且其中 >=2 个设了混合模式时才提示。
+        # ---- 多子视频混合模式提示（仅日志，不阻止生成） ----
+        # 08:25 起已实现 blend 区域隔离：≥2 个非 normal blend 子视频时，主视频 split 出
+        # 原始帧副本，每个 blend 只在自己区域与原始帧混合 → 互不干涉（旧警告「多个叠加
+        # 互相干涉、结果不可预测」已过时，勿回退）。此处仅保留一条简短提示说明行为。
         if len(sub_infos) >= 2:
             blended = []
             for _mi, _mf, _ms in sub_infos:
@@ -9348,11 +9377,9 @@ class FFmpegBatchGUI:
                     blended.append(_bm)
             if len(blended) >= 2:
                 self._append_info_ui(
-                    "⚠️ 多子视频混合模式干涉警告：检测到 %d 个子视频设置了混合模式(%s)。"
-                    "混合模式不是把子视频当贴纸，而是按像素重算主+子区域，多个叠加在数学上会互相干涉、"
-                    "结果不可预测（部分子视频会融进主画面看不清）。建议多个子视频统一使用"
-                    "「正常(透明叠加)」模式；混合模式更适合单个艺术化叠加。"
-                    % (len(blended), "/".join(blended))
+                    "ℹ️ 多个子视频使用混合模式(%s)：已启用区域隔离，每个混合只作用于"
+                    "自己的矩形区域（互不干涉）；重叠区域按叠加顺序覆盖。混合模式按像素"
+                    "重算主+子区域，非透明贴纸语义。" % "/".join(blended)
                 )
         # 画中画/水印走 filter_complex，强制软件滤镜避免显存/内存混用导致叠加失败
         main_settings_sw = dict(main_settings)
@@ -9386,6 +9413,24 @@ class FFmpegBatchGUI:
                 filter_parts.append(f"color=c=black:s={pw}x{ph}[canvas]")
                 filter_parts.append(f"[canvas][{current_v}]overlay={ox}:{oy}[v_main_pad]")
                 current_v = "v_main_pad"
+
+        # ---- 多混合模式子视频隔离：主视频 split 出原始帧副本 ----
+        # 非 normal blend 子视频 ≥2 个时，blend 的主区域必须从主视频【原始帧】取
+        # （而不是已被前面 blend 修改过的主干 current_v），否则多个 blend 区域重叠时
+        # 会互相干涉（后一个 blend 拿到的"主视频"已被前一个改过）。
+        # 单 blend / 全 normal 不 split → 零行为变化；split 是帧引用（零拷贝），性能无感。
+        _blend_count = 0
+        for _mi, _mf, _ms in sub_infos:
+            if _ms.get('overlay_enabled', True) and \
+                    ((_ms.get('blend_mode', 'normal') or 'normal').strip().lower() != 'normal'):
+                _blend_count += 1
+        _use_regional = _blend_count >= 2
+        _blend_idx = 0
+        if _use_regional:
+            _split_out = "".join(
+                f"[{_l}]" for _l in (["v_main_base"] + [f"v_crop_{j}" for j in range(_blend_count)]))
+            filter_parts.append(f"[{current_v}]split={_blend_count + 1}{_split_out}")
+            current_v = "v_main_base"
     
         # 处理每个子视频
         for i, (sub_idx, sub_file, sub_settings) in enumerate(sub_infos):
@@ -9541,59 +9586,142 @@ class FFmpegBatchGUI:
                     # 混合模式：仅在子视频所在矩形「局部区域」内做 blend，再贴回原位置。
                     # 这样每种效果只作用于各自的子视频框内，不会铺满全屏；
                     # 也避免了把整张主视频转 RGBA 再转回带来的全屏发绿问题。
-                    _mv = (sub_settings.get('move_mode', '') or '').strip()
-                    if _mv:
-                        self._append_info_ui("[轨迹控制] 混合模式不支持动态轨迹，已使用基准位置")
+                    # 区域隔离（_use_regional，≥2 个 blend 子视频）时，主区域从 split 出的
+                    # 主视频【原始帧】副本（v_crop_{idx}）裁取，避免多个 blend 互相干涉；
+                    # 单 blend 时 _src_label=current_v（主干=原始帧），行为与旧版一致。
+                    _src_label = f"v_crop_{_blend_idx}" if _use_regional else current_v
+                    _blend_idx += 1
                     mw, mh = self._compute_output_canvas(main_settings, main_file_path)
                     sw, sh = self._overlay_sub_size(sub_file, sub_settings)
-                    ctx = {"W": mw, "H": mh, "w": sw, "h": sh}
-                    xv = safe_eval_expr(x, ctx)
-                    yv = safe_eval_expr(y, ctx)
-                    xv = int(xv) if xv is not None else 0
-                    yv = int(yv) if yv is not None else 0
-                    # 子视频在主画布上的可见矩形（处理子视频越出画布边缘的情况）
-                    bx = xv if xv > 0 else 0
-                    by = yv if yv > 0 else 0
-                    bw = sw + (xv if xv < 0 else 0)
-                    bh = sh + (yv if yv < 0 else 0)
-                    if bx + bw > mw:
-                        bw = mw - bx
-                    if by + bh > mh:
-                        bh = mh - by
-                    # yuv420p 要求偶数尺寸与位置（对齐时只缩小，绝不增大，避免越界）
-                    if bx % 2:
-                        bx -= 1
-                    if by % 2:
-                        by -= 1
-                    if bx < 0:
-                        bx = 0
-                    if by < 0:
-                        by = 0
+                    _mv = (sub_settings.get('move_mode', '') or '').strip()
+                    # 窗口尺寸（动态/静态共用）：偶数化（yuv420p 对齐；动态位置无法保证偶数，
+                    # 色度微偏可接受）。静态分支的 bw/bh 在下面越界裁剪处还会再调整。
+                    bw = int(sw)
+                    bh = int(sh)
                     if bw % 2:
                         bw -= 1
                     if bh % 2:
                         bh -= 1
-                    # 对齐后再次夹紧到画布内
-                    if bx + bw > mw:
-                        bw = mw - bx
-                    if by + bh > mh:
-                        bh = mh - by
-                    if bw >= 2 and bh >= 2:
-                        sx = -xv if xv < 0 else 0
-                        sy = -yv if yv < 0 else 0
-                        # 1) 主视频裁出该区域并转 RGBA（保证 blend 在 RGB 空间运算，
-                        #    避免 YUV 色度分量相乘/相除导致的偏色发绿）
-                        filter_parts.append(f"[{current_v}]crop={bw}:{bh}:{bx}:{by},format=rgba[mc_{i}]")
-                        # 2) 子视频裁出对应部分（已含格式/绿幕/透明），同样转 RGBA
-                        filter_parts.append(f"[{current_sub}]crop={bw}:{bh}:{sx}:{sy},format=rgba[sc_{i}]")
-                        # 3) 仅在该矩形区域内混合（RGB 空间运算正确），混合后转回 yuv420p，不外溢全屏
-                        filter_parts.append(f"[mc_{i}][sc_{i}]blend=all_mode={blend_mode},format=yuv420p[bl_{i}]")
-                        # 4) 把混合结果贴回原位置
-                        filter_parts.append(f"[{current_v}][bl_{i}]overlay={bx}:{by}[v_out_{i}]")
+                    if bw < 2:
+                        bw = 2
+                    if bh < 2:
+                        bh = 2
+                    # 动态轨迹 blend：仅 h/v 往返支持（crop 的 x/y 表达式不支持逗号函数、
+                    # `?` 在 filtergraph 引号内也会解析失败 → diamond/corners 回退静态提示）
+                    _dyn = None
+                    if _mv:
+                        _axis, _dexpr = _blend_move_exprs(_mv, sub_settings, bw, bh)
+                        if _axis is not None and "," not in _dexpr and "?" not in _dexpr:
+                            # 动效轴天然在画布内；静态轴（基准坐标）在 Python 里求值并 clamp 成数字
+                            _ctx_s = {"W": mw, "H": mh, "w": bw, "h": bh}
+                            if _axis == "x":
+                                _sv = safe_eval_expr(y, _ctx_s)
+                                _sv = int(_sv) if _sv is not None else 0
+                                _sv = max(0, min(_sv, mh - bh))
+                                _x_expr, _y_expr = _dexpr, str(_sv)
+                            else:
+                                _sv = safe_eval_expr(x, _ctx_s)
+                                _sv = int(_sv) if _sv is not None else 0
+                                _sv = max(0, min(_sv, mw - bw))
+                                _x_expr, _y_expr = str(_sv), _dexpr
+                            _dyn = (_x_expr, _y_expr)
+                        else:
+                            self._append_info_ui("[轨迹控制] 混合模式轨迹仅支持左右/上下往返，已使用基准位置")
+                    if _dyn:
+                        # ---- 动态轨迹 blend：crop 窗口与 overlay 位置跟随动效表达式 ----
+                        # 实测：crop 的 x/y 只认 iw/ih（W/H/w/h 会运行失败），overlay 只认
+                        # W/H（不支持 iw）→ 同一动效生成两套：crop 版 W/H→iw/ih，overlay 版原样。
+                        # 动效轴天然在画布内（tria∈[0,1]）无需 clamp；无逗号无问号（crop 不支持）。
+                        _x_expr, _y_expr = _dyn
+                        _x_expr_crop = _x_expr.replace("W", "iw").replace("H", "ih")
+                        _y_expr_crop = _y_expr.replace("W", "iw").replace("H", "ih")
+                        # 1) 主视频原始帧裁出动态窗口并转 RGB（blend 纯 RGB 空间、无 alpha）
+                        filter_parts.append(
+                            f"[{_src_label}]crop={bw}:{bh}:x='{_x_expr_crop}':y='{_y_expr_crop}',"
+                            f"format=rgb24[mc_{i}]")
+                        # 2) 子视频全尺寸（窗口=子视频大小，sx=sy=0），split 出 alpha 单独提取，
+                        #    RGB 部分转 rgb24（blend 的 c3_mode 实测无效，alpha 会按 all_mode
+                        #    运算破坏遮罩 → 必须剥离 alpha 单独 alphamerge 合并）
+                        filter_parts.append(
+                            f"[{current_sub}]crop={bw}:{bh}:0:0,format=rgba,"
+                            f"split=2[sa_{i}][sr_{i}]")
+                        filter_parts.append(f"[sa_{i}]alphaextract[aa_{i}]")
+                        filter_parts.append(f"[sr_{i}]format=rgb24[sr_{i}b]")
+                        # 3) 窗口内混合（RGB 空间，输出 rgb24 无 alpha）
+                        filter_parts.append(
+                            f"[mc_{i}][sr_{i}b]blend=all_mode={blend_mode}[bl_{i}r]")
+                        # 4) 合并回子视频 alpha（遮罩/透明度原样保留）
+                        filter_parts.append(
+                            f"[bl_{i}r][aa_{i}]alphamerge,format=rgba[bl_{i}]")
+                        # 5) 贴回原位（overlay 版表达式，位置始终与 crop 窗口一致）
+                        filter_parts.append(
+                            f"[{current_v}][bl_{i}]overlay=x='{_x_expr}':y='{_y_expr}'[v_out_{i}]")
                         current_v = f"v_out_{i}"
                     else:
-                        # 子视频完全在画布外，跳过混合（保持主画面，不报错）
-                        filter_parts.append(f"[{current_v}]null[{current_v}]")
+                        # ---- 静态位置 blend：保持原区域化逻辑（含越界裁剪/偶数对齐） ----
+                        ctx = {"W": mw, "H": mh, "w": sw, "h": sh}
+                        xv = safe_eval_expr(x, ctx)
+                        yv = safe_eval_expr(y, ctx)
+                        xv = int(xv) if xv is not None else 0
+                        yv = int(yv) if yv is not None else 0
+                        # 子视频在主画布上的可见矩形（处理子视频越出画布边缘的情况）
+                        bx = xv if xv > 0 else 0
+                        by = yv if yv > 0 else 0
+                        bw = sw + (xv if xv < 0 else 0)
+                        bh = sh + (yv if yv < 0 else 0)
+                        if bx + bw > mw:
+                            bw = mw - bx
+                        if by + bh > mh:
+                            bh = mh - by
+                        # yuv420p 要求偶数尺寸与位置（对齐时只缩小，绝不增大，避免越界）
+                        if bx % 2:
+                            bx -= 1
+                        if by % 2:
+                            by -= 1
+                        if bx < 0:
+                            bx = 0
+                        if by < 0:
+                            by = 0
+                        if bw % 2:
+                            bw -= 1
+                        if bh % 2:
+                            bh -= 1
+                        # 对齐后再次夹紧到画布内
+                        if bx + bw > mw:
+                            bw = mw - bx
+                        if by + bh > mh:
+                            bh = mh - by
+                        if bw >= 2 and bh >= 2:
+                            sx = -xv if xv < 0 else 0
+                            sy = -yv if yv < 0 else 0
+                            # ⚠️ alpha 必须与 blend 剥离：实测 ffmpeg 8.1 的 blend 滤镜
+                            # c3_mode 无效——alpha 通道实际按 all_mode 公式运算
+                            # （difference 时 alpha=|a1-a2| 反相、average 时 alpha=(a1+a2)/2、
+                            # screen 时矩形内 alpha=255 挖不出洞），遮罩黑白层被破坏。
+                            # 正确做法：RGB 用 rgb24（blend 纯 RGB 空间、无 alpha 可破坏），
+                            # 子视频 alpha 用 alphaextract 单独提取、blend 后 alphamerge 合并。
+                            # 1) 主视频裁出该区域并转 RGB（blend 在 RGB 空间运算，无 alpha 干扰）
+                            filter_parts.append(
+                                f"[{_src_label}]crop={bw}:{bh}:{bx}:{by},format=rgb24[mc_{i}]")
+                            # 2) 子视频裁出对应部分（含 mask/透明度/绿幕 alpha），
+                            #    split 出 alpha 单独提取，RGB 部分转 rgb24 参与 blend
+                            filter_parts.append(
+                                f"[{current_sub}]crop={bw}:{bh}:{sx}:{sy},format=rgba,"
+                                f"split=2[sa_{i}][sr_{i}]")
+                            filter_parts.append(f"[sa_{i}]alphaextract[aa_{i}]")
+                            filter_parts.append(f"[sr_{i}]format=rgb24[sr_{i}b]")
+                            # 3) 仅在该矩形区域内混合（RGB 空间，输出 rgb24 无 alpha）
+                            filter_parts.append(
+                                f"[mc_{i}][sr_{i}b]blend=all_mode={blend_mode}[bl_{i}r]")
+                            # 4) 把子视频 alpha 合并回来（遮罩/透明度原样保留）
+                            filter_parts.append(
+                                f"[bl_{i}r][aa_{i}]alphamerge,format=rgba[bl_{i}]")
+                            # 5) 把混合结果贴回原位置
+                            filter_parts.append(f"[{current_v}][bl_{i}]overlay={bx}:{by}[v_out_{i}]")
+                            current_v = f"v_out_{i}"
+                        else:
+                            # 子视频完全在画布外，跳过混合（保持主画面，不报错）
+                            filter_parts.append(f"[{current_v}]null[{current_v}]")
             else:
                 filter_parts.append(f"[{current_v}]null[{current_v}]")
     
@@ -11617,18 +11745,32 @@ class FFmpegBatchGUI:
                 return current_x + d / 2.0, current_y + d / 2.0
             return current_x + current_w / 2.0, current_y + current_h / 2.0
 
+        def geom_center():
+            """当前真实几何的旋转中心：角度≠0 时内容矩形在 d×d 正方形内居中，
+            正方形中心=内容矩形中心（= content_center()）；角度=0 时无旋转滤镜，
+            最终图像就是 w×h 矩形本身 → 旋转中心=内容矩形中心。
+            与正式命令一致：overlay x/y 恒为「最终渲染图像（旋转后为正方形）的左上角」，
+            角度=0 时矩形左上角就是 current_x/current_y，不得按正方形中心反推偏移。"""
+            if current_angle != 0:
+                return content_center()
+            return current_x + current_w / 2.0, current_y + current_h / 2.0
+
         def polygon_canvas():
-            """内容矩形绕中心旋转 current_angle 后的 4 顶点（画布坐标）。"""
-            cx, cy = content_center()
+            """内容矩形绕中心旋转 current_angle 后的 4 顶点（画布坐标）。
+            必须用 geom_center()（角度 0 → 内容矩形中心）而非 content_center()：
+            content_center 的 rot_square 分支返回正方形中心 (current_x+d/2, current_y+d/2)，
+            角度 0 时反推的矩形左上角会偏移 (d-w)/2,(d-h)/2（「显示 x0 y0 矩形却偏」）。"""
+            cx, cy = geom_center()
             pts = rotate_rect_polygon(cx - current_w / 2.0, cy - current_h / 2.0,
                                       current_w, current_h, current_angle)
             return [tuple(to_canvas(px, py)) for px, py in pts]
 
         def rotate_handle_canvas():
-            """旋转手柄位置：内容矩形旋转后的右上角，沿旋转方向外推 14px（画布坐标）。"""
+            """旋转手柄位置：内容矩形旋转后的右上角，沿旋转方向外推 14px（画布坐标）。
+            角度=0 时旋转恒等 → 手柄=内容矩形右上角 (x+w, y)；角度≠0 时绕内容中心
+            （=正方形中心）旋转，与 rotate 滤镜物理中心一致。"""
             import math as _m
-            d = content_diag()
-            cx, cy = content_center()
+            cx, cy = geom_center()
             a = _m.radians(current_angle)
             ca, sa = _m.cos(a), _m.sin(a)
             px, py = cx + current_w / 2.0, cy - current_h / 2.0
@@ -11650,9 +11792,13 @@ class FFmpegBatchGUI:
                 # 完全放开，无任何限制
                 pass
             else:
-                # 严格限制在画布内（子视频/水印模式）。rot_square 旋转时用正方形包围盒 d 钳制，
-                # 保证旋转后实际叠加区域（正方形）完全落在画布内。
-                if rotation_enabled and rot_square:
+                # 严格限制在画布内（子视频/水印模式）。旋转（实际角度≠0）且 rot_square 时用
+                # 正方形包围盒 d 钳制，保证旋转后实际叠加区域（正方形）完全落在画布内。
+                # ⚠️ 必须判 current_angle != 0 而非 rotation_enabled：子视频/文字水印编辑器
+                # 都传了 angle_cb（供随时开启旋转），rotation_enabled 恒为 True，若用它判定，
+                # 角度=0 时也会按对角线 d=hypot(w,h) 钳制 → 矩形拖不到边、留出 d-w 的边距，
+                # 且矩形越大差量越大（用户实测「无旋转时矩形外有无形边框」）。
+                if current_angle != 0 and rot_square:
                     d = content_diag()
                     current_x = max(0, min(current_x, max(0, current_canvas_w - d)))
                     current_y = max(0, min(current_y, max(0, current_canvas_h - d)))
@@ -11666,29 +11812,27 @@ class FFmpegBatchGUI:
 
         def create_rect():
             nonlocal rect_id, text_id, coord_disp_id, rotate_handle_id
-            if rotation_enabled:
-                pts = polygon_canvas()
-                rid = canvas.create_polygon(pts, outline=rect_color, width=2,
-                                            fill=rect_color, stipple="gray50", tags="rect")
-                bbox = canvas.bbox(rid)
-                if angle_editable:
-                    hx, hy = rotate_handle_canvas()
-                    rotate_handle_id = canvas.create_oval(hx - 6, hy - 6, hx + 6, hy + 6,
-                                                          outline="yellow", width=2, fill="black",
-                                                          tags="rothead")
-                    tx, ty = (bbox[0] + 5, bbox[1] + 5) if bbox else (hx + 5, hy + 5)
-                else:
-                    tx, ty = (bbox[0] + 5, bbox[1] + 5) if bbox else (current_x + 5, current_y + 5)
-            else:
-                cx1, cy1 = to_canvas(current_x, current_y)
-                cx2, cy2 = to_canvas(current_x + current_w, current_y + current_h)
-                rid = canvas.create_rectangle(cx1, cy1, cx2, cy2, outline=rect_color, width=2,
-                                              fill=rect_color, stipple="gray50", tags="rect")
-                tx, ty = cx1 + 5, cy1 + 5
+            # 统一用 polygon 绘制（4 顶点=矩形，N 顶点=旋转矩形）：
+            # ⚠️ 绝不能按角度 0 创建 create_rectangle——拖手柄后角度变非 0，
+            # update_rect_position 会用 8 个顶点 coords 一个 rectangle 对象（只收 4 坐标）
+            # → TclError/静默失败，矩形不跟随旋转（用户实测「第一次打开拖手柄矩形不动」）。
+            # 角度=0 时 polygon_canvas 经 geom_center（内容中心）算出 4 顶点 = 精确矩形，
+            # 左上角就是 current_x/current_y（无偏移），与坐标显示一致。
+            pts = polygon_canvas()
+            rid = canvas.create_polygon(pts, outline=rect_color, width=2,
+                                        fill=rect_color, stipple="gray50", tags="rect")
+            bbox = canvas.bbox(rid)
+            tx, ty = (bbox[0] + 5, bbox[1] + 5) if bbox else (current_x + 5, current_y + 5)
             tid = canvas.create_text(tx, ty, anchor="nw", text=rect_label,
                                      fill="white", font=("Arial", 9), tags="rect")
-            # 浮动坐标显示（矩形上方居中）
-            bbox2 = canvas.bbox(rid) if rotation_enabled else (cx1, cy1, cx2, cy2)
+            # 旋转手柄：可编辑角度时始终显示（角度 0 也保留，保证能随时拖手柄开始旋转）
+            if angle_editable:
+                hx, hy = rotate_handle_canvas()
+                rotate_handle_id = canvas.create_oval(hx - 6, hy - 6, hx + 6, hy + 6,
+                                                      outline="yellow", width=2, fill="black",
+                                                      tags="rothead")
+            # 浮动坐标显示（包围盒上方居中）
+            bbox2 = canvas.bbox(rid)
             coord_disp_id = canvas.create_text((bbox2[0] + bbox2[2]) // 2, bbox2[1] - 10,
                                                 anchor="s", text=f"({current_x}, {current_y})",
                                                 fill="#00ff00", font=("Arial", 8),
@@ -11696,41 +11840,29 @@ class FFmpegBatchGUI:
             return rid, tid
 
         def update_rect_position():
-            if rotation_enabled:
-                pts = polygon_canvas()
-                canvas.coords(rect_id, [c for pt in pts for c in pt])
-                bbox = canvas.bbox(rect_id)
-                if bbox:
-                    canvas.coords(text_id, bbox[0] + 5, bbox[1] + 5)
-                if angle_editable and rotate_handle_id:
-                    hx, hy = rotate_handle_canvas()
-                    canvas.coords(rotate_handle_id, hx - 6, hy - 6, hx + 6, hy + 6)
-                # 浮动坐标（包围盒上方居中；贴顶时放下方）
-                if coord_disp_id and bbox:
-                    if bbox[1] > 20:
-                        canvas.coords(coord_disp_id, (bbox[0] + bbox[2]) // 2, bbox[1] - 10)
-                    else:
-                        canvas.coords(coord_disp_id, (bbox[0] + bbox[2]) // 2, bbox[3] + 14)
-                    canvas.itemconfig(coord_disp_id, text=f"({current_x}, {current_y})")
-            else:
-                cx1, cy1 = to_canvas(current_x, current_y)
-                cx2, cy2 = to_canvas(current_x + current_w, current_y + current_h)
-                canvas.coords(rect_id, cx1, cy1, cx2, cy2)
-                canvas.coords(text_id, cx1 + 5, cy1 + 5)
-                # 浮动坐标（矩形上方居中；贴顶时放下方）
-                if coord_disp_id:
-                    if cy1 > 20:
-                        canvas.coords(coord_disp_id, (cx1 + cx2) // 2, cy1 - 10)
-                    else:
-                        canvas.coords(coord_disp_id, (cx1 + cx2) // 2, cy2 + 14)
-                    canvas.itemconfig(coord_disp_id, text=f"({current_x}, {current_y})")
+            pts = polygon_canvas()
+            canvas.coords(rect_id, [c for pt in pts for c in pt])
+            bbox = canvas.bbox(rect_id)
+            if bbox:
+                canvas.coords(text_id, bbox[0] + 5, bbox[1] + 5)
+            if angle_editable and rotate_handle_id:
+                hx, hy = rotate_handle_canvas()
+                canvas.coords(rotate_handle_id, hx - 6, hy - 6, hx + 6, hy + 6)
+            # 浮动坐标（包围盒上方居中；贴顶时放下方）
+            if coord_disp_id and bbox:
+                if bbox[1] > 20:
+                    canvas.coords(coord_disp_id, (bbox[0] + bbox[2]) // 2, bbox[1] - 10)
+                else:
+                    canvas.coords(coord_disp_id, (bbox[0] + bbox[2]) // 2, bbox[3] + 14)
+                canvas.itemconfig(coord_disp_id, text=f"({current_x}, {current_y})")
             update_coord_display()
 
         def update_coord_display():
             if coord_mode == 'offset':
                 coord_var.set(f"偏移: X={current_x}, Y={current_y}")
             else:
-                if rotation_enabled:
+                # 用真实角度判定：角度 0 显示纯矩形语义（左上角=矩形左上角）
+                if current_angle != 0:
                     if rot_square:
                         coord_var.set(f"左上角: ({current_x}, {current_y})  宽: {current_w}  高: {current_h}  角度: {current_angle}°\n"
                                       f"（有旋转时 X/Y 为旋转后正方形包围盒的左上角）")
@@ -11823,7 +11955,7 @@ class FFmpegBatchGUI:
             if not rotating or draw_mode_active:
                 return
             import math as _m
-            mcx, mcy = content_center()
+            mcx, mcy = geom_center()
             mcx, mcy = to_canvas(mcx, mcy)
             a0 = _m.atan2(rot_mouse_start[1] - mcy, rot_mouse_start[0] - mcx)
             a1 = _m.atan2(event.y - mcy, event.x - mcx)
