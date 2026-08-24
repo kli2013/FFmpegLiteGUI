@@ -1322,5 +1322,8 @@
   "[可视化-水] 已保存旋转角度: {0}°": "[Visual-wm] Rotation angle saved: {0}°",
   "[文字水印] 旋转角度已更新: {0}°": "[Text watermark] Rotation angle updated: {0}°",
   "[任务编辑] 文字水印画布尺寸: {0}x{1}（按任务渲染设置计算）": "[Task edit] Text watermark canvas size: {0}x{1} (computed from task render settings)",
-  "[任务编辑] 无法定位主视频，文字水印画布使用默认 1280x720": "[Task edit] Cannot locate main video; text watermark canvas uses default 1280x720"
+  "[任务编辑] 无法定位主视频，文字水印画布使用默认 1280x720": "[Task edit] Cannot locate main video; text watermark canvas uses default 1280x720",
+  "[轨迹控制] 混合模式轨迹不支持，已使用基准位置": "[Trajectory] Trajectory unsupported for this blend mode; using the base position",
+  "[预览] 子视频 {0} 混合模式+轨迹控制：轨迹模式不支持，已按基准位置 blend": "[Preview] Sub video {0} blend + trajectory: trajectory mode unsupported; blended at base position",
+  "[预览] 图片水印：mpv 区域化 blend 真实合成（{0}）": "[Preview] Image watermark: mpv regional blend real composite ({0})"
 }
