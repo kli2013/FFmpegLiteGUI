@@ -98,12 +98,24 @@ def find_resource(filename: str) -> Optional[str]:
     return None
 
 
+# find_executable 结果缓存：脚本目录+PATH 在运行期视为静态，启动期会重复查询
+#（__init__ 与 _update_ffmpeg_paths 共 12 次，shutil.which 每次全量扫 PATH 合计约 120ms），
+# 缓存后仅首次查询走真实扫描。None 也缓存（避免对不存在的工具反复扫 PATH）。
+# 注意：ffmpeg_dir_enabled 分支不走本函数，无缓存失效问题；运行时手动向脚本目录
+# 放入新 exe 需要重启才生效（正常使用不受影响）。
+_executable_cache: Dict[str, Optional[str]] = {}
+
 def find_executable(name: str) -> Optional[str]:
+    if name in _executable_cache:
+        return _executable_cache[name]
     candidate = find_resource(name)
     if candidate and os.access(candidate, os.X_OK):
+        _executable_cache[name] = candidate
         return candidate
     # 未在脚本目录找到，回退到系统 PATH
-    return shutil.which(name)
+    result = shutil.which(name)
+    _executable_cache[name] = result
+    return result
 
 def get_dpi_scaling(root: tk.Tk) -> float:
     """获取系统 DPI 缩放因子"""
@@ -900,33 +912,57 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
 
     # ----- 去水印/模糊（必须排在裁剪/旋转/缩放之前，坐标才与原始帧一致）-----
     if settings.get("blur_enabled", False):
-        blur_type = settings.get("blur_type", "delogo")
-        x = str(settings.get("blur_x", "0")).strip()
-        y = str(settings.get("blur_y", "0")).strip()
-        w = str(settings.get("blur_w", "100")).strip()
-        h = str(settings.get("blur_h", "100")).strip()
-        strength = settings.get("blur_strength", "5")
-        region_only = settings.get("blur_region_only", False)
+        # 多区域列表（2026-08-26）：遍历 blur_items 生成多条；无列表时用旧单键
+        blur_items = settings.get("blur_items")
+        if not blur_items:
+            blur_items = [{
+                "enabled": True,
+                "type": settings.get("blur_type", "delogo"),
+                "x": str(settings.get("blur_x", "0")).strip(),
+                "y": str(settings.get("blur_y", "0")).strip(),
+                "w": str(settings.get("blur_w", "100")).strip(),
+                "h": str(settings.get("blur_h", "100")).strip(),
+                "strength": settings.get("blur_strength", "5"),
+                "region_only": settings.get("blur_region_only", False),
+                "enable_start": "", "enable_end": "", "enable_cycle": "", "enable_show": "",
+            }]
+        for _bi in blur_items:
+            if not _bi.get("enabled", True):
+                continue
+            blur_type = str(_bi.get("type", "delogo") or "delogo").strip()
+            x = str(_bi.get("x", "0")).strip() or "0"
+            y = str(_bi.get("y", "0")).strip() or "0"
+            w = str(_bi.get("w", "100")).strip() or "100"
+            h = str(_bi.get("h", "100")).strip() or "100"
+            strength = _bi.get("strength", "5")
+            region_only = _bi.get("region_only", False)
 
-        if blur_type == "delogo":
-            filters.append(f"delogo=x={x}:y={y}:w={w}:h={h}")
-        elif blur_type in ("boxblur", "gblur"):
-            if blur_type == "boxblur":
-                _blur_f = f"boxblur={strength}:{strength}"
-            else:
-                _blur_f = f"gblur=sigma={strength}"
-            if region_only and w and h:
-                # 局部模糊：把原帧一分为二，一路裁出目标区域做模糊，再叠回原位。
-                # 生成的是带标签的分支子图，因此本函数返回值可能含 ';'。
-                _sfx = graph_id or ""
-                _bg, _fg, _bl = f"rb{_sfx}bg", f"rb{_sfx}fg", f"rb{_sfx}bl"
-                filters.append(
-                    f"split=2[{_bg}][{_fg}];"
-                    f"[{_fg}]crop={w}:{h}:{x}:{y},{_blur_f}[{_bl}];"
-                    f"[{_bg}][{_bl}]overlay={x}:{y}"
-                )
-            else:
-                filters.append(_blur_f)
+            # 显示时段 / 循环控制（与文字水印同套 enable 表达式；2026-08-26 新增）
+            _enable_expr = _build_drawtext_enable(_bi)
+            _sfx_en = f":enable='{_enable_expr}'" if _enable_expr else ""
+
+            if blur_type == "delogo":
+                filters.append(f"delogo=x={x}:y={y}:w={w}:h={h}{_sfx_en}")
+            elif blur_type in ("boxblur", "gblur"):
+                if blur_type == "boxblur":
+                    _blur_f = f"boxblur={strength}:{strength}{_sfx_en}"
+                else:
+                    _blur_f = f"gblur=sigma={strength}{_sfx_en}"
+                if region_only and w and h:
+                    # 局部模糊：把原帧一分为二，一路裁出目标区域做模糊，再叠回原位。
+                    # 生成的是带标签的分支子图，因此本函数返回值可能含 ';'。
+                    # 多条时用序号后缀避免标签冲突。
+                    _sfx = graph_id or ""
+                    _idx = blur_items.index(_bi) if blur_items else 0
+                    _sfx += f"b{_idx}"
+                    _bg, _fg, _bl = f"rb{_sfx}bg", f"rb{_sfx}fg", f"rb{_sfx}bl"
+                    filters.append(
+                        f"split=2[{_bg}][{_fg}];"
+                        f"[{_fg}]crop={w}:{h}:{x}:{y},{_blur_f}[{_bl}];"
+                        f"[{_bg}][{_bl}]overlay={x}:{y}"
+                    )
+                else:
+                    filters.append(_blur_f)
 
 
     # ----- 遮罩 / 透明蒙版（子视频水印/画中画：矩形区域透明或保留，坐标同原始帧，排在裁剪前）-----
@@ -1323,8 +1359,9 @@ def build_preview_filter_chain(settings: Dict[str, Any], target_height: int = 96
         enhance_settings=enhance_settings,
         reverse=reverse
     )
-    # 追加文字水印 drawtext
-    dt = build_drawtext_filter(settings.get("text_watermark", {}))
+    # 追加文字水印 drawtext（多条非旋转项逗号串联；旋转项需 filter_complex，-vf 预览跳过）
+    dt = build_drawtext_chain_vf(settings.get("text_watermark", {}),
+                                 settings.get("text_watermark_items"))
     if dt:
         vf = f"{vf},{dt}" if vf != "null" else dt
     if vf != "null":
@@ -1478,6 +1515,31 @@ def build_drawtext_filter(tw_settings: dict) -> str:
     if enable_expr:
         parts.append(f"enable='{enable_expr}'")
     return "drawtext=" + ":".join(parts)
+
+
+def build_drawtext_chain_vf(tw_settings, tw_items=None) -> str:
+    """构建 -vf 可用的多条 drawtext 逗号串（仅非旋转项）。
+
+    2026-08-26：普通预览（ffplay/SimplePreviewer 的 -vf 链）此前只渲染第一条文字水印。
+    多条 drawtext 在 -vf 里可以用逗号链式串联（ffmpeg 支持），旋转/spin 项需要
+    filter_complex 子图（color 源 + rotate + overlay），-vf 无法表达 → 跳过（完整合成
+    与 mpv 实时预览仍走 build_text_watermark_chain，旋转项不受影响）。"""
+    if tw_items is None:
+        tw_items = [tw_settings]
+    elif isinstance(tw_items, list) and not tw_items:
+        tw_items = [tw_settings]
+    parts = []
+    for it in tw_items:
+        if not it.get("enabled", True):
+            continue
+        if not str(it.get("text", "") or "").strip():
+            continue
+        if text_watermark_needs_subgraph(it):
+            continue  # 旋转/spin 无法进 -vf → 跳过
+        d = build_drawtext_filter(it)
+        if d:
+            parts.append(d)
+    return ",".join(parts)
 
 
 def estimate_text_size(text: str, font_path: str, font_size: int) -> Tuple[int, int]:
@@ -1728,6 +1790,35 @@ def build_text_watermark_filtergraph(tw_settings: dict, main_label: str = "", ou
     return frag
 
 
+def build_text_watermark_chain(tw_input, main_label: str = "", out_label: str = "[v_tw]") -> str:
+    """多个文字水印链式生成（2026-08-26）。
+
+    tw_input: 完整 settings（含 text_watermark_items / text_watermark）或单条 tw dict。
+    - 完整 settings 且有 text_watermark_items → 遍历启用项逐个调用 build_text_watermark_filtergraph，
+      out_label 逐级串联（第 k 项输出接第 k+1 项输入）；
+    - 无 items → 退化为单条（text_watermark 或 tw_input 本身），行为与旧版一致。
+    """
+    if isinstance(tw_input, dict) and ("text_watermark_items" in tw_input or "text_watermark" in tw_input):
+        items = tw_input.get("text_watermark_items")
+        if not items:
+            items = [tw_input.get("text_watermark") or {}]
+    else:
+        items = [tw_input or {}]
+    active = [i for i in items
+              if i.get("enabled", True) and str(i.get("text", "")).strip()]
+    if not active:
+        return ""
+    cur_in = main_label
+    frags = []
+    for k, tw in enumerate(active):
+        out = out_label if k == len(active) - 1 else f"[v_tw{k}]"
+        f = build_text_watermark_filtergraph(tw, main_label=cur_in, out_label=out)
+        if f:
+            frags.append(f)
+            cur_in = out
+    return ";".join(frags)
+
+
 def text_watermark_needs_subgraph(tw_settings) -> bool:
     """文字水印是否需要「透明层 + rotate + overlay」子图：静态旋转(rotate≠0)或持续旋转(spin)任一启用。
     ⚠️ 必须与 build_text_watermark_filtergraph 内部的 needs_rot 判定逐字一致——
@@ -1970,6 +2061,26 @@ def _content_box_shift(content_w, content_h, box_w, box_h):
     的定位偏移。叠加盒与内容盒中心重合 → 叠加盒左上角 = 内容盒左上角 - (box-w)/2。
     非旋转时 box=内容盒 → 返回 (0,0)。"""
     return (box_w - content_w) / 2.0, (box_h - content_h) / 2.0
+
+
+def _pad_canvas_geometry(main_settings) -> Optional[Tuple[int, int, str, str]]:
+    """提取 pad 画布几何：返回 (pad_w, pad_h, offset_x, offset_y) 或 None（未启用/无效）。
+    正式命令 + 转换页预览 + 合并页预览三处共用，避免 pad 判定分叉。"""
+    if not main_settings.get("pad_enabled", False):
+        return None
+    pw = (main_settings.get("pad_width", "") or "").strip()
+    ph = (main_settings.get("pad_height", "") or "").strip()
+    if not pw or not ph:
+        return None
+    try:
+        cw, ch = int(float(pw)), int(float(ph))
+        if cw <= 0 or ch <= 0:
+            return None
+    except (ValueError, TypeError):
+        return None
+    ox = (main_settings.get("offset_x", "0") or "0").strip() or "0"
+    oy = (main_settings.get("offset_y", "0") or "0").strip() or "0"
+    return cw, ch, ox, oy
 
 # ================== 子进程执行封装 ==================
 def run_ffmpeg_command(cmd: List[str], on_output_line: Optional[Callable] = None, timeout: Optional[float] = None) -> Tuple[int, str]:
@@ -3031,6 +3142,9 @@ class VideoFilterFrame(ttk.LabelFrame):
         self._blur_h = tk.StringVar(value="100")
         # 局部模糊：boxblur/gblur 只作用于上面的坐标区域（自动生成 split/overlay 滤镜图）
         self._blur_region_only = tk.BooleanVar(value=False)
+        # 多区域列表（2026-08-26）：每项 {"enabled","type","x","y","w","h","strength","region_only"}。
+        # 空列表 → 用上方单实例键（旧版兼容）。get_settings 输出列表，生成遍历列表。
+        self._blur_items = []
 
         self.enhance_settings = {
             "denoise_enabled": False,
@@ -3766,6 +3880,25 @@ class VideoFilterFrame(ttk.LabelFrame):
                     return
                 points[0] = (l, t); points[1] = (r, b)
                 redraw_crop_rect()
+
+            def grow_adjust(edge, delta):
+                """扩大边界: edge='top'|'bottom'|'left'|'right', delta=像素数(正=扩大)
+                （2026-08-26 新增「加」行：上加/下加/左加/右加，与「减」行相对）"""
+                if len(points) != 2:
+                    return
+                x1, y1 = points[0]; x2, y2 = points[1]
+                l = min(x1, x2); r = max(x1, x2)
+                t = min(y1, y2); b = max(y1, y2)
+                if edge == 'left':   l -= delta
+                elif edge == 'right': r += delta
+                elif edge == 'top':    t -= delta
+                elif edge == 'bottom': b += delta
+                l = max(0, l); t = max(0, t)
+                r = min(orig_w, r); b = min(orig_h, b)
+                if r <= l or b <= t:
+                    return
+                points[0] = (l, t); points[1] = (r, b)
+                redraw_crop_rect()
     
             # ----- 拖拽事件 -----
             def on_drag_start(event):
@@ -4067,6 +4200,16 @@ class VideoFilterFrame(ttk.LabelFrame):
             ttk.Label(edge_row, text="步进:").pack(side=tk.LEFT, padx=(8, 2))
             ttk.Spinbox(edge_row, textvariable=edge_step, from_=1, to=999, width=4).pack(side=tk.LEFT)
 
+            # 边界扩大行（上加/下加/左加/右加 + 独立步进；2026-08-26 新增，紧接「减」行下方）
+            grow_row = ttk.Frame(btn_frame)
+            grow_row.pack(fill=tk.X, pady=1)
+            grow_step = tk.StringVar(value="1")
+            for label, edge in [("上加", "top"), ("下加", "bottom"), ("左加", "left"), ("右加", "right")]:
+                ttk.Button(grow_row, text=label, width=4,
+                           command=lambda e=edge: grow_adjust(e, _get_step(grow_step))).pack(side=tk.LEFT, padx=1)
+            ttk.Label(grow_row, text="步进:").pack(side=tk.LEFT, padx=(8, 2))
+            ttk.Spinbox(grow_row, textvariable=grow_step, from_=1, to=999, width=4).pack(side=tk.LEFT)
+
             # 平移行（上移/下移/左移/右移 + 独立步进）
             shift_row = ttk.Frame(btn_frame)
             shift_row.pack(fill=tk.X, pady=1)
@@ -4130,6 +4273,10 @@ class VideoFilterFrame(ttk.LabelFrame):
                     nonlocal img, scaled_temp_path
                     img = img_obj
                     temp_file_info["data"] = data
+                    # ⚠️ 任务1修复：图像 create_image 会盖住此前（4125 行）先画的裁剪框，
+                    # 必须在图像显示后重画——否则"打开显示旧坐标框"看不到。
+                    if points:
+                        redraw_crop_rect()
                 except Exception as e:
                     try:
                         canvas.delete(loading_text)
@@ -4303,7 +4450,26 @@ class VideoFilterFrame(ttk.LabelFrame):
             "blur_w": self._blur_w.get(),
             "blur_h": self._blur_h.get(),
             "blur_region_only": self._blur_region_only.get(),
+            # 多区域列表（2026-08-26）：有列表用列表，否则用旧单键迁移（旧预设兼容）
+            "blur_items": self._blur_items or self._migrate_blur_single(),
         }
+
+    def _migrate_blur_single(self):
+        """旧版单实例键 → 单元素列表（向后兼容迁移）。仅当 _blur_items 为空时调用。"""
+        if not self._blur_enabled.get() and self._blur_type.get() in ("", "delogo") \
+                and not self._blur_x.get() and not self._blur_w.get():
+            return []
+        return [{
+            "enabled": self._blur_enabled.get(),
+            "type": self._blur_type.get() or "delogo",
+            "x": self._blur_x.get(),
+            "y": self._blur_y.get(),
+            "w": self._blur_w.get(),
+            "h": self._blur_h.get(),
+            "strength": self._blur_strength.get(),
+            "region_only": self._blur_region_only.get(),
+            "enable_start": "", "enable_end": "", "enable_cycle": "", "enable_show": "",
+        }]
 
     def set_settings(self, settings):
         self.frame_rate_type.set(settings.get("frame_rate_type", "keep"))
@@ -4337,6 +4503,100 @@ class VideoFilterFrame(ttk.LabelFrame):
         self._blur_w.set(settings.get("blur_w", "100"))
         self._blur_h.set(settings.get("blur_h", "100"))
         self._blur_region_only.set(settings.get("blur_region_only", False))
+        # 多区域列表：优先取列表；无列表则从旧单键迁移（兼容旧预设/旧快照）
+        items = settings.get("blur_items")
+        if items:
+            self._blur_items = [dict(i) for i in items]
+        elif (settings.get("blur_enabled") or settings.get("blur_x") or settings.get("blur_w")):
+            self._blur_items = [{
+                "enabled": settings.get("blur_enabled", False),
+                "type": settings.get("blur_type", "delogo") or "delogo",
+                "x": settings.get("blur_x", "0"),
+                "y": settings.get("blur_y", "0"),
+                "w": settings.get("blur_w", "100"),
+                "h": settings.get("blur_h", "100"),
+                "strength": settings.get("blur_strength", "5"),
+                "region_only": settings.get("blur_region_only", False),
+                "enable_start": settings.get("blur_enable_start", ""),
+                "enable_end": settings.get("blur_enable_end", ""),
+                "enable_cycle": settings.get("blur_enable_cycle", ""),
+                "enable_show": settings.get("blur_enable_show", ""),
+            }]
+        else:
+            self._blur_items = []
+
+
+def _open_tw_position_editor_impl(app, tw, canvas_w, canvas_h, refresh_cb, parent_widget):
+    """文字水印位置编辑器公共实现（AdvancedFrame 转换页/队列 与 封装页共用）。
+
+    - tw：要编辑的文字水印设置 dict（写回 overlay_x/overlay_y/font_size/rotate）
+    - canvas_w/h：画布尺寸（调用方各自计算：转换页/队列/封装页主视频渲染尺寸）
+    - refresh_cb：应用后的刷新回调（命令预览）
+    - parent_widget：通用编辑器的宿主控件（AdvancedFrame 自身 / 文字水印对话框）
+    """
+    text = tw.get("text", "")
+    try:
+        fs = int(tw.get("font_size", 48))
+    except (ValueError, TypeError):
+        fs = 48
+    wm_w = max(len(str(text)) * int(fs * 0.7), int(fs * 0.7))
+    wm_h = int(fs * 1.3)
+    x_var = tk.StringVar(value=tw.get("overlay_x", "10"))
+    y_var = tk.StringVar(value=tw.get("overlay_y", "10"))
+    def on_apply(nx, ny, nw, nh, ncw, nch):
+        x_var.set(str(nx))
+        y_var.set(str(ny))
+        tw["overlay_x"] = str(nx)
+        tw["overlay_y"] = str(ny)
+        # 矩形高度反推字体大小（wm_h = fs * 1.3 → fs = nh / 1.3）
+        if nh > 0:
+            new_fs = max(8, int(round(nh / 1.3)))
+            old_fs = int(tw.get("font_size", 48))
+            if new_fs != old_fs:
+                tw["font_size"] = new_fs
+                app._append_info_ui(f"[文字水印] 字体大小已更新: {old_fs} → {new_fs}")
+        if refresh_cb:
+            refresh_cb()
+        app._append_info_ui(f"[文字水印] 位置已设置: ({nx}, {ny})")
+    title = "可视化编辑文字水印位置"
+    # 文字水印静态旋转角度（-180..180），旋转后为 hypot 正方形包围盒
+    try:
+        _tw_ra = float(tw.get("rotate", 0) or 0)
+    except (ValueError, TypeError):
+        _tw_ra = 0.0
+    _tw_spin = bool(tw.get("spin_enabled", False))
+    _eff_w, _eff_h = wm_w, wm_h
+    if _tw_ra != 0 or _tw_spin:
+        _tw_d = int(round(((wm_w * wm_w + wm_h * wm_h) ** 0.5)))
+        _eff_w = _eff_h = _tw_d
+    # 初始坐标：safe_eval_expr 可能返回 0（合法位置），必须用 None 判断而非 `or 10`，
+    # 否则 y=0 会被 `0 or 10` 顶成 10，看起来「y 没返回数值」。
+    _init_x = safe_eval_expr(x_var.get(), {"W": canvas_w, "H": canvas_h, "w": _eff_w, "h": _eff_h})
+    _init_y = safe_eval_expr(y_var.get(), {"W": canvas_w, "H": canvas_h, "w": _eff_w, "h": _eff_h})
+
+    def apply_tw_angle(new_angle):
+        tw["rotate"] = float(new_angle or 0.0)
+        # 同步回写文字水印对话框内的「旋转角度」数值框（对话框实例存于 app.text_wm_dialog）
+        _dlg = getattr(app, "text_wm_dialog", None)
+        if _dlg is not None:
+            try:
+                if _dlg.winfo_exists():
+                    _dlg.rotate_var.set(float(new_angle or 0.0))
+            except Exception:
+                pass
+        if refresh_cb:
+            refresh_cb()
+        app._append_info_ui(f"[文字水印] 旋转角度已更新: {new_angle}°")
+
+    app._generic_overlay_editor(
+        parent_widget, canvas_w, canvas_h,
+        10 if _init_x is None else _init_x,
+        10 if _init_y is None else _init_y,
+        wm_w, wm_h, on_apply, title, None,
+        bg_draw_func=None, rect_label='文字水印',
+        min_visible_pixels=0, show_scale_tip=False,
+        rotate_angle=_tw_ra, angle_cb=apply_tw_angle,
+        show_nudge=False)   # 文字水印位置编辑器：看不到画布，无微调按钮
 
 
 class TextWatermarkDialog(tk.Toplevel):
@@ -4348,16 +4608,36 @@ class TextWatermarkDialog(tk.Toplevel):
     refresh_cb: 设置变化后刷新命令预览的回调。默认 None → 用主界面 adv_frame 的回调；
         队列任务编辑传入任务编辑窗口的 update_preview。
     """
-    def __init__(self, parent, app, settings_target=None, refresh_cb=None, show_inject=True):
+    def __init__(self, parent, app, settings_target=None, refresh_cb=None,
+                 settings_container=None, position_editor_cb=None):
         super().__init__(parent)
         self.withdraw()
         self.app = app
         self.parent = parent
         self.settings = settings_target if settings_target is not None else app.text_watermark_settings
         self.tw_refresh = refresh_cb
-        # 「注入到封装页」复选框是否显示：仅转换主界面打开的文字水印窗口显示，
-        # 队列任务编辑（settings_target 指向任务自己的 dict）隐藏
-        self.show_inject = show_inject
+        # 位置编辑器回调（封装页独立文字水印入口传入）：None → 委托 parent._open_text_wm_position_editor
+        self._pos_editor_cb = position_editor_cb
+        # 多文字水印容器（2026-08-26）：None → 主界面（app.text_watermark_items）；
+        # 队列任务编辑 → task.settings（写 text_watermark_items）；封装页 → self._merge_tw dict
+        self.items_container = settings_container if settings_container is not None else app
+        # 多实例列表：优先容器.text_watermark_items，空则迁移当前单条。
+        # ⚠️ 2026-08-26 修复：主界面容器是 App 对象（非 dict），原来只对 dict 容器读列表，
+        #   导致「保存后重开只剩最开始那条空白项」——列表写进了 app.text_watermark_items
+        #   却从未读回。这里统一支持 dict 与对象两种容器。
+        if isinstance(self.items_container, dict):
+            _items = self.items_container.get("text_watermark_items")
+        else:
+            _items = getattr(self.items_container, "text_watermark_items", None)
+        if not _items:
+            _tw = self.settings
+            _items = [dict(_tw)] if (_tw.get("enabled") or _tw.get("text")) else [dict(_tw)]
+        self.items = [dict(i) for i in _items]
+        self.settings = self.items[0] if self.items else {}
+        self._tw_last_sel = None
+        # 2026-08-26：_load_tw_form 期间置守卫，避免 var.set() → trace(_tw_sync_x 等)
+        # → _refresh_tw_tree → selection 事件 → _load_tw_form 递归
+        self._tw_loading = False
         # 保存到主应用，便于位置编辑器「应用」时同步回写本窗口的旋转角度数值框
         try:
             app.text_wm_dialog = self
@@ -4368,10 +4648,19 @@ class TextWatermarkDialog(tk.Toplevel):
         self.grab_set()
         self.resizable(False, False)
 
-        width, height = 370, 600
+        width, height = 500, 780
         center_window(self, width, height)
 
         self.create_widgets()
+        self._refresh_tw_tree()
+        # 默认选中第 0 项：表单初始即对应 items[0]，且 _tw_last_sel 有值，
+        # 之后「添加/切换/确定」能把表单编辑正确收集回列表（否则编辑内容丢失）
+        if self.items:
+            try:
+                self.tw_tree.selection_set("0")
+            except Exception:
+                pass
+            self._tw_last_sel = 0
         self.deiconify()
 
     def create_widgets(self):
@@ -4381,10 +4670,31 @@ class TextWatermarkDialog(tk.Toplevel):
 
         s = self.settings
 
-        # ---- 启用 ----
+        # ---- 多文字水印列表（2026-08-26：可添加多个文字水印）----
+        list_frame = ttk.LabelFrame(main, text="多条文字水印（选中项编辑下方参数）", padding="3")
+        list_frame.grid(row=0, column=0, columnspan=4, sticky="ew", pady=3)
+        self.tw_tree = ttk.Treeview(list_frame, columns=("en", "txt", "pos"), show="headings", height=3)
+        self.tw_tree.heading("en", text="启用")
+        self.tw_tree.heading("txt", text="文字内容")
+        self.tw_tree.heading("pos", text="位置")
+        self.tw_tree.column("en", width=42, anchor="center")
+        self.tw_tree.column("txt", width=220)
+        self.tw_tree.column("pos", width=150)
+        self.tw_tree.pack(fill=tk.X, padx=3, pady=(3, 1))
+        self.tw_tree.bind("<<TreeviewSelect>>", self._on_tw_select)
+        self.tw_tree.bind("<ButtonRelease-1>", self._on_tw_click)
+        tw_btn = ttk.Frame(list_frame)
+        tw_btn.pack(fill=tk.X, padx=3, pady=(0, 3))
+        ttk.Button(tw_btn, text="添加", width=5, command=self._add_tw_item).pack(side=tk.LEFT, padx=1)
+        ttk.Button(tw_btn, text="删除", width=5, command=self._del_tw_item).pack(side=tk.LEFT, padx=1)
+        ttk.Button(tw_btn, text="上移", width=5, command=lambda: self._move_tw_item(-1)).pack(side=tk.LEFT, padx=1)
+        ttk.Button(tw_btn, text="下移", width=5, command=lambda: self._move_tw_item(1)).pack(side=tk.LEFT, padx=1)
+        ttk.Label(tw_btn, text="点「启用」列可切换", foreground="gray").pack(side=tk.LEFT, padx=8)
+
+        # ---- 启用（当前项）----
         self.enabled_var = tk.BooleanVar(value=s.get("enabled", False))
         ttk.Checkbutton(main, text="启用文字水印", variable=self.enabled_var).grid(
-            row=0, column=0, sticky="w", pady=5)
+            row=1, column=0, sticky="w", pady=5)
         # 注入到封装页开关：开启后，本页文字水印设置会随主视频轨道带入封装页 3 个模式。
         # 仅转换主界面打开的文字水印窗口显示；队列任务编辑隐藏（inject_var 仍创建，
         # 保留已有键值，on_ok 照常写回，不显示控件而已）。
@@ -4395,34 +4705,34 @@ class TextWatermarkDialog(tk.Toplevel):
             self.settings["inject_to_packaging"] = bool(self.inject_var.get())
             self._refresh()
         self.inject_var.trace_add("write", _tw_sync_inject)
-        if self.show_inject:
-            ttk.Checkbutton(main, text="注入到封装页", variable=self.inject_var).grid(
-                row=0, column=1, sticky="w", pady=5, padx=(12, 0))
+        # ⚠️ 2026-08-26：封装页已改为独立文字水印入口（「封装/合并」页底部「文字水印」按钮），
+        # 不再从转换页注入 → 不再显示「注入到封装页」复选框（旧版它 grid 在 row0 col1，
+        # 与上方列表 LabelFrame 重叠，挡住列表内容）。inject_var 保留仅做数据兼容，无控件。
 
         # ---- 文字内容 ----
-        ttk.Label(main, text="文字内容:").grid(row=1, column=0, sticky="nw", pady=5)
+        ttk.Label(main, text="文字内容:").grid(row=2, column=0, sticky="nw", pady=5)
         self.text_var = tk.StringVar(value=s.get("text", ""))
         text_entry = ttk.Entry(main, textvariable=self.text_var, width=28)
-        text_entry.grid(row=1, column=1, columnspan=2, sticky="w", pady=5, padx=5)
+        text_entry.grid(row=2, column=1, columnspan=2, sticky="w", pady=5, padx=5)
 
         # ---- 字体 ----
-        ttk.Label(main, text="中文字体:").grid(row=2, column=0, sticky="w", pady=5)
+        ttk.Label(main, text="中文字体:").grid(row=3, column=0, sticky="w", pady=5)
         self.font_var = tk.StringVar(value=s.get("font_name", "微软雅黑"))
         font_combo = ttk.Combobox(main, textvariable=self.font_var, state="readonly",
                                   values=list(CN_FONT_MAP.keys()), width=18)
-        font_combo.grid(row=2, column=1, columnspan=2, sticky="w", pady=5, padx=5)
+        font_combo.grid(row=3, column=1, columnspan=2, sticky="w", pady=5, padx=5)
 
         # ---- 字号 ----
-        ttk.Label(main, text="字号:").grid(row=3, column=0, sticky="w", pady=5)
+        ttk.Label(main, text="字号:").grid(row=4, column=0, sticky="w", pady=5)
         self.size_var = tk.IntVar(value=s.get("font_size", 48))
         ttk.Spinbox(main, from_=8, to=200, textvariable=self.size_var, width=10).grid(
             row=3, column=1, sticky="w", pady=5, padx=5)
 
         # ---- 颜色 ----
-        ttk.Label(main, text="颜色:").grid(row=4, column=0, sticky="w", pady=5)
+        ttk.Label(main, text="颜色:").grid(row=5, column=0, sticky="w", pady=5)
         self.color_var = tk.StringVar(value=s.get("font_color", "#FFFFFF"))
         color_entry = ttk.Entry(main, textvariable=self.color_var, width=12)
-        color_entry.grid(row=4, column=1, sticky="w", pady=5, padx=5)
+        color_entry.grid(row=5, column=1, sticky="w", pady=5, padx=5)
         def pick_color():
             c = askcolor(self.color_var.get() or "#FFFFFF", parent=self)
             if c and c[1]:
@@ -4431,9 +4741,9 @@ class TextWatermarkDialog(tk.Toplevel):
             row=4, column=2, pady=5)
 
         # ---- 透明度 ----
-        ttk.Label(main, text="透明度:").grid(row=5, column=0, sticky="w", pady=5)
+        ttk.Label(main, text="透明度:").grid(row=6, column=0, sticky="w", pady=5)
         opacity_frame = ttk.Frame(main)
-        opacity_frame.grid(row=5, column=1, columnspan=2, sticky="w", pady=5, padx=5)
+        opacity_frame.grid(row=6, column=1, columnspan=2, sticky="w", pady=5, padx=5)
         self.opacity_var = tk.IntVar(value=int(s.get("opacity", 1.0) * 100))
         self.opacity_label = ttk.Label(opacity_frame, text=f"{self.opacity_var.get()}%", width=5)
         self.opacity_label.pack(side=tk.LEFT, padx=(0, 5))
@@ -4442,15 +4752,15 @@ class TextWatermarkDialog(tk.Toplevel):
         opacity_scale.pack(side=tk.LEFT)
 
         # ---- 描边 ----
-        ttk.Label(main, text="描边粗细:").grid(row=6, column=0, sticky="w", pady=5)
+        ttk.Label(main, text="描边粗细:").grid(row=7, column=0, sticky="w", pady=5)
         self.border_w_var = tk.IntVar(value=s.get("border_w", 0))
         ttk.Spinbox(main, from_=0, to=20, textvariable=self.border_w_var, width=10).grid(
             row=6, column=1, sticky="w", pady=5, padx=5)
 
-        ttk.Label(main, text="描边颜色:").grid(row=7, column=0, sticky="w", pady=5)
+        ttk.Label(main, text="描边颜色:").grid(row=8, column=0, sticky="w", pady=5)
         self.border_color_var = tk.StringVar(value=s.get("border_color", "#000000"))
         bc_entry = ttk.Entry(main, textvariable=self.border_color_var, width=12)
-        bc_entry.grid(row=7, column=1, sticky="w", pady=5, padx=5)
+        bc_entry.grid(row=8, column=1, sticky="w", pady=5, padx=5)
         def pick_border_color():
             c = askcolor(self.border_color_var.get() or "#000000", parent=self)
             if c and c[1]:
@@ -4461,7 +4771,7 @@ class TextWatermarkDialog(tk.Toplevel):
         # ---- 显示时段 / 循环 (enable 控制) ----
         # 用 pack 子框架排列，间隔完全由 padx 控制，避免 grid 列宽撑大间距
         seg_frame = ttk.Frame(main)
-        seg_frame.grid(row=8, column=0, columnspan=5, sticky="w", pady=(10,2))
+        seg_frame.grid(row=9, column=0, columnspan=5, sticky="w", pady=(10,2))
         ttk.Label(seg_frame, text="显示时段(秒):").pack(side=tk.LEFT, padx=(0,8))
         ttk.Label(seg_frame, text="起始:").pack(side=tk.LEFT, padx=(0,2))
         self.enable_start_var = tk.StringVar(value=s.get("enable_start", ""))
@@ -4475,7 +4785,7 @@ class TextWatermarkDialog(tk.Toplevel):
         ToolTip(ee, "文字水印结束显示的时间（秒），留空表示显示到结尾。与开始时间组合为显示区间。")
 
         cyc_frame = ttk.Frame(main)
-        cyc_frame.grid(row=9, column=0, columnspan=5, sticky="w", pady=2)
+        cyc_frame.grid(row=10, column=0, columnspan=5, sticky="w", pady=2)
         ttk.Label(cyc_frame, text="循环显示(秒):").pack(side=tk.LEFT, padx=(0,8))
         ttk.Label(cyc_frame, text="周期:").pack(side=tk.LEFT, padx=(0,2))
         self.enable_cycle_var = tk.StringVar(value=s.get("enable_cycle", ""))
@@ -4494,23 +4804,29 @@ class TextWatermarkDialog(tk.Toplevel):
         # 注意：x/y 必须用**独立** trace——合用一个回调时，同步 x 输入框会触发回调，
         # 用当时的旧 y 值把 overlay_y 覆盖掉（位置编辑器刚写回的 y 丢失），
         # 表现为「只有 x 数值框变化、y 一直是 10」。
-        tw_pos = self.settings
-        self.tw_x_var = tk.StringVar(value=tw_pos.get("overlay_x", "10"))
-        self.tw_y_var = tk.StringVar(value=tw_pos.get("overlay_y", "10"))
+        # 多实例（2026-08-26）：不再用闭包固定引用创建时的 dict，live 写当前 self.settings
+        self.tw_x_var = tk.StringVar(value=self.settings.get("overlay_x", "10"))
+        self.tw_y_var = tk.StringVar(value=self.settings.get("overlay_y", "10"))
 
         def _tw_sync_x(*_a):
-            tw_pos["overlay_x"] = self.tw_x_var.get().strip() or "10"
+            self.settings["overlay_x"] = self.tw_x_var.get().strip() or "10"
+            self._sync_item_to_container()   # 2026-08-26：实时写回容器，预览即时生效
+            if not self._tw_loading:
+                self._refresh_tw_tree()      # 列表「位置」列同步（加载期间跳过防递归）
             self._refresh()
 
         def _tw_sync_y(*_a):
-            tw_pos["overlay_y"] = self.tw_y_var.get().strip() or "10"
+            self.settings["overlay_y"] = self.tw_y_var.get().strip() or "10"
+            self._sync_item_to_container()
+            if not self._tw_loading:
+                self._refresh_tw_tree()
             self._refresh()
 
         self.tw_x_var.trace_add("write", _tw_sync_x)
         self.tw_y_var.trace_add("write", _tw_sync_y)
 
         xy_frame = ttk.Frame(main)
-        xy_frame.grid(row=10, column=0, columnspan=5, sticky="w", pady=(10, 2))
+        xy_frame.grid(row=11, column=0, columnspan=5, sticky="w", pady=(10, 2))
         x_label = ttk.Label(xy_frame, text="X位置:")
         x_label.pack(side=tk.LEFT, padx=(0, 2))
         ttk.Entry(xy_frame, textvariable=self.tw_x_var, width=16).pack(side=tk.LEFT, padx=(0, 8))
@@ -4526,7 +4842,7 @@ class TextWatermarkDialog(tk.Toplevel):
             "居中": ("(W-w)/2", "(H-h)/2"),
         }
         preset_frame = ttk.Frame(main)
-        preset_frame.grid(row=11, column=0, columnspan=5, sticky="w", pady=(0, 8))
+        preset_frame.grid(row=12, column=0, columnspan=5, sticky="w", pady=(0, 8))
         ttk.Label(preset_frame, text="预设位置:").pack(side=tk.LEFT, padx=(0, 4))
         for label, (px, py) in presets.items():
             ttk.Button(preset_frame, text=label, width=6,
@@ -4535,14 +4851,18 @@ class TextWatermarkDialog(tk.Toplevel):
 
         # ---- 旋转（FFmpeg drawtext 原生不支持旋转，启用后用透明层+rotate+overlay 实现）----
         rot_frame = ttk.Frame(main)
-        rot_frame.grid(row=12, column=0, columnspan=5, sticky="w", pady=(4, 2))
+        rot_frame.grid(row=13, column=0, columnspan=5, sticky="w", pady=(4, 2))
         ttk.Label(rot_frame, text="旋转角度:").pack(side=tk.LEFT, padx=(0, 4))
         self.rotate_var = tk.DoubleVar(value=float(s.get("rotate", 0.0) or 0.0))
         def _tw_sync_rotate(*_a):
+            # ⚠️ 2026-08-26 修复：旧代码误引用未定义的 tw_pos → 每次设置旋转角度都抛
+            # NameError，导致 _load_tw_form 在 rotate_var.set 处中断、后续字段全部加载失败
+            # （表现：列表项「无法修改内容」）。改回写 self.settings（当前选中项）。
             try:
-                tw_pos["rotate"] = float(self.rotate_var.get())
+                self.settings["rotate"] = float(self.rotate_var.get())
             except (ValueError, TypeError):
-                tw_pos["rotate"] = 0.0
+                self.settings["rotate"] = 0.0
+            self._sync_item_to_container()
             self._refresh()
         self.rotate_var.trace_add("write", _tw_sync_rotate)
         ttk.Spinbox(rot_frame, from_=-180, to=180, increment=1,
@@ -4558,16 +4878,18 @@ class TextWatermarkDialog(tk.Toplevel):
 
         # ---- 持续旋转（绕中心，与图片/视频水印同款；angle=转速*PI/180*t）----
         spin_frame = ttk.Frame(main)
-        spin_frame.grid(row=13, column=0, columnspan=5, sticky="w", pady=(2, 2))
+        spin_frame.grid(row=14, column=0, columnspan=5, sticky="w", pady=(2, 2))
         self.spin_enabled_var = tk.BooleanVar(value=bool(s.get("spin_enabled", False)))
         spin_cb = ttk.Checkbutton(spin_frame, text="持续旋转 (绕中心)", variable=self.spin_enabled_var)
         spin_cb.pack(side=tk.LEFT)
         def _tw_sync_spin(*_a):
-            tw_pos["spin_enabled"] = bool(self.spin_enabled_var.get())
+            # ⚠️ 2026-08-26 修复：旧代码误引用未定义的 tw_pos（见 _tw_sync_rotate 注释）
+            self.settings["spin_enabled"] = bool(self.spin_enabled_var.get())
             try:
-                tw_pos["spin_speed"] = float(self.spin_speed_var.get())
+                self.settings["spin_speed"] = float(self.spin_speed_var.get())
             except (ValueError, TypeError):
-                tw_pos["spin_speed"] = 60.0
+                self.settings["spin_speed"] = 60.0
+            self._sync_item_to_container()
             self._refresh()
         self.spin_enabled_var.trace_add("write", _tw_sync_spin)
         ttk.Label(spin_frame, text="转速(度/秒):").pack(side=tk.LEFT, padx=(12, 2))
@@ -4589,7 +4911,7 @@ class TextWatermarkDialog(tk.Toplevel):
             main, text="轨迹控制",
             command=lambda: open_trajectory_dialog(self.settings, self),
             width=28)
-        traj_btn.grid(row=14, column=0, columnspan=5, sticky="w", pady=(4, 2))
+        traj_btn.grid(row=15, column=0, columnspan=5, sticky="w", pady=(4, 2))
         ToolTip(
             traj_btn,
             "让文字水印沿预设轨迹动态移动：左右/上下往返、歪菱形循环、四角跳跃。\n"
@@ -4601,7 +4923,7 @@ class TextWatermarkDialog(tk.Toplevel):
         pos_btn = ttk.Button(
             main, text="打开位置编辑器（可视化拖拽）",
             command=self._open_position_editor, width=28)
-        pos_btn.grid(row=15, column=0, columnspan=5, sticky="w", pady=5)
+        pos_btn.grid(row=16, column=0, columnspan=5, sticky="w", pady=5)
         ToolTip(
             pos_btn,
             "直接弹出可视化窗口拖拽文字水印的位置，无需关闭本窗口。\n"
@@ -4613,9 +4935,31 @@ class TextWatermarkDialog(tk.Toplevel):
 
         # ---- 按钮 ----
         btn_frame = ttk.Frame(main)
-        btn_frame.grid(row=16, column=0, columnspan=5, pady=10)
+        btn_frame.grid(row=17, column=0, columnspan=5, pady=10)
         ttk.Button(btn_frame, text="确定", command=self.on_ok, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="取消", command=self.on_cancel, width=10).pack(side=tk.LEFT, padx=5)
+
+        # 2026-08-26 修复：文字内容/启用 实时同步到列表（原来只有 X/Y 挂了 trace，
+        # 改文字/勾选启用后列表不刷新，要保存重开才看得到，以为没生效）。
+        # 加载表单期间由 _tw_loading 守卫跳过（防 set→trace→刷新→set 死循环）。
+        for _v in (self.text_var, self.enabled_var):
+            try:
+                _v.trace_add("write", self._sync_tw_to_tree)
+            except Exception:
+                pass
+
+    def _sync_tw_to_tree(self, *args):
+        """表单变量 trace 回调：把当前选中项实时收集并刷新列表行。
+
+        2026-08-26 修复：文字内容/启用勾选即时反映到列表（不再需要保存重开）。
+        加载表单期间由 _tw_loading 守卫跳过，防止 set→trace→刷新→selection→set 死循环。"""
+        if getattr(self, "_tw_loading", False):
+            return
+        idx = self._current_tw_idx()
+        if idx is None or not (0 <= idx < len(self.items)):
+            return
+        self._collect_tw_form(idx)
+        self._refresh_tw_tree()
 
     def _refresh(self):
         """设置变化后刷新命令预览：优先用传入的回调（队列任务编辑），否则主界面 adv_frame。"""
@@ -4631,8 +4975,12 @@ class TextWatermarkDialog(tk.Toplevel):
         except Exception:
             pass
 
-    def on_ok(self):
-        s = self.settings
+    def _collect_tw_form(self, idx):
+        """把当前表单所有值写入 self.items[idx]（含 font_path 解析与 X/Y/旋转兜底）。
+
+        2026-08-26 修复：切换选中项/添加/删除/确定 前必须先把表单收集回当前项，
+        否则编辑过的内容（文字/字体/字号/颜色等）在切换时被静默丢弃。"""
+        s = self.items[idx]
         s["enabled"] = self.enabled_var.get()
         s["inject_to_packaging"] = self.inject_var.get()
         s["text"] = self.text_var.get().strip()
@@ -4647,31 +4995,266 @@ class TextWatermarkDialog(tk.Toplevel):
         s["enable_end"] = self.enable_end_var.get().strip()
         s["enable_cycle"] = self.enable_cycle_var.get().strip()
         s["enable_show"] = self.enable_show_var.get().strip()
+        # X/Y/rotate/spin 由 live trace 已实时写回，这里再兜底一次保证一致
+        s["overlay_x"] = self.tw_x_var.get().strip() or "10"
+        s["overlay_y"] = self.tw_y_var.get().strip() or "10"
+        s["rotate"] = self.rotate_var.get()
+        s["spin_enabled"] = bool(self.spin_enabled_var.get())
+        s["spin_speed"] = self.spin_speed_var.get()
+
+    def on_ok(self):
+        # 当前选中项表单写回列表（含所有字段），再统一写回容器
+        if self.items:
+            if self._tw_last_sel is not None and 0 <= self._tw_last_sel < len(self.items):
+                self._collect_tw_form(self._tw_last_sel)
+            else:
+                self._collect_tw_form(0)
         # 触发命令预览更新
+        self._write_back_items()  # 2026-08-26：多实例列表写回容器
         self._refresh()
         self.destroy()
 
     def on_cancel(self):
         self.destroy()
 
+    # ---------- 多文字水印列表 ----------
+    def _refresh_tw_tree(self):
+        sel = None
+        if self.tw_tree.selection():
+            sel = self.tw_tree.selection()[0]
+        self.tw_tree.delete(*self.tw_tree.get_children())
+        for i, it in enumerate(self.items):
+            _en = "☑" if it.get("enabled", True) else "☐"
+            _txt = (str(it.get("text", "")) or "(空)")[:14]
+            # 位置列直接读顶层 overlay_x/overlay_y（多实例每项就是 text_watermark 同构 dict，
+            # 不存在 text_watermark_position 子键——旧代码读子键恒为默认值，列表位置永不刷新）
+            _xy = f"({it.get('overlay_x','10')},{it.get('overlay_y','10')})"
+            self.tw_tree.insert("", "end", iid=str(i), values=(_en, _txt, _xy))
+        if sel is not None and self.tw_tree.exists(sel):
+            self.tw_tree.selection_set(sel)
+
+    def _current_tw_idx(self):
+        s = self.tw_tree.selection()
+        if not s:
+            return None
+        try:
+            return int(s[0])
+        except (ValueError, TypeError):
+            return None
+
+    def _load_tw_form(self):
+        self._tw_loading = True
+        try:
+            s = self.settings
+            try:
+                self.enabled_var.set(s.get("enabled", False))
+                self.inject_var.set(s.get("inject_to_packaging", False))
+                self.text_var.set(s.get("text", ""))
+                self.font_var.set(s.get("font_name", "微软雅黑"))
+                self.color_var.set(s.get("font_color", "#FFFFFF"))
+                self.border_color_var.set(s.get("border_color", "#000000"))
+                self.enable_start_var.set(s.get("enable_start", ""))
+                self.enable_end_var.set(s.get("enable_end", ""))
+                self.enable_cycle_var.set(s.get("enable_cycle", ""))
+                self.enable_show_var.set(s.get("enable_show", ""))
+                self.tw_x_var.set(s.get("overlay_x", "10"))
+                self.tw_y_var.set(s.get("overlay_y", "10"))
+                self.rotate_var.set(float(s.get("rotate", 0.0) or 0.0))
+                self.spin_enabled_var.set(bool(s.get("spin_enabled", False)))
+                self.spin_speed_var.set(float(s.get("spin_speed", 60.0) or 60.0))
+                # 2026-08-26 修复：字号/透明度/描边宽度漏加载 → 切换选中项后残留上一项的值，
+                # 点「确定」会用旧值覆盖新项（表现为「内容无法修改」）。
+                try:
+                    self.size_var.set(int(s.get("font_size", 48)))
+                except (ValueError, TypeError):
+                    pass
+                try:
+                    _op = int(float(s.get("opacity", 1.0)) * 100)
+                except (ValueError, TypeError):
+                    _op = 100
+                self.opacity_var.set(max(0, min(100, _op)))
+                self.opacity_label.config(text=f"{self.opacity_var.get()}%")
+                try:
+                    self.border_w_var.set(int(s.get("border_w", 0)))
+                except (ValueError, TypeError):
+                    pass
+            except Exception:
+                pass
+            self._refresh()
+        finally:
+            self._tw_loading = False
+
+    def _on_tw_select(self, ev):
+        idx = self._current_tw_idx()
+        if idx is None or idx >= len(self.items):
+            return
+        # 先收集上一个选中项的表单值（否则切换后上一项编辑丢失），再加载新选中项
+        if self._tw_last_sel is not None and 0 <= self._tw_last_sel < len(self.items) \
+                and self._tw_last_sel != idx:
+            self._collect_tw_form(self._tw_last_sel)
+        self.settings = self.items[idx]
+        self._load_tw_form()
+        self._tw_last_sel = idx
+
+    def _on_tw_click(self, ev):
+        try:
+            if self.tw_tree.identify_column(ev.x) == "#1":
+                iid = self.tw_tree.identify_row(ev.y)
+                if iid:
+                    idx = int(iid)
+                    # 先写回上一个选中项，避免其表单值把本次切换覆盖掉
+                    if self._tw_last_sel is not None and 0 <= self._tw_last_sel < len(self.items) \
+                            and self._tw_last_sel != idx:
+                        self._collect_tw_form(self._tw_last_sel)
+                    self.items[idx]["enabled"] = not self.items[idx].get("enabled", True)
+                    self.enabled_var.set(self.items[idx]["enabled"])  # 同步表单（启用列/总开关同源）
+                    self._refresh_tw_tree()
+                    self.tw_tree.selection_set(iid)
+                    self._tw_last_sel = idx
+                    self.settings = self.items[idx]
+                    self._load_tw_form()
+        except Exception:
+            pass
+
+    def _add_tw_item(self):
+        if self._tw_last_sel is not None and 0 <= self._tw_last_sel < len(self.items):
+            self._collect_tw_form(self._tw_last_sel)
+        base = dict(self.settings) if self.settings else {}
+        base["enabled"] = True
+        base["text"] = "新文字水印"
+        self.items.append(base)
+        self._refresh_tw_tree()
+        self.tw_tree.selection_set(str(len(self.items) - 1))
+        self.settings = self.items[-1]
+        self._tw_last_sel = len(self.items) - 1
+        self._load_tw_form()
+
+    def _del_tw_item(self):
+        idx = self._current_tw_idx()
+        if idx is None or not self.items:
+            return
+        if 0 <= idx < len(self.items):
+            self._collect_tw_form(idx)
+        del self.items[idx]
+        self._tw_last_sel = None
+        self._refresh_tw_tree()
+        if self.items:
+            self.tw_tree.selection_set("0")
+            self.settings = self.items[0]
+            self._tw_last_sel = 0
+            self._load_tw_form()
+        else:
+            self.settings = {}
+            self._load_tw_form()
+
+    def _move_tw_item(self, d):
+        idx = self._current_tw_idx()
+        if idx is None:
+            return
+        if 0 <= idx < len(self.items):
+            self._collect_tw_form(idx)
+        ni = idx + d
+        if ni < 0 or ni >= len(self.items):
+            return
+        self.items[idx], self.items[ni] = self.items[ni], self.items[idx]
+        self._refresh_tw_tree()
+        self.tw_tree.selection_set(str(ni))
+        self.settings = self.items[ni]
+        self._tw_last_sel = ni
+        self._load_tw_form()
+
+    def _write_back_items(self):
+        """把多实例列表写回容器（app.text_watermark_items 或任务 settings['text_watermark_items']）。"""
+        try:
+            items = [dict(i) for i in self.items]
+            if isinstance(self.items_container, dict):
+                self.items_container["text_watermark_items"] = items
+            else:
+                self.items_container.text_watermark_items = items
+        except Exception:
+            pass
+
+    def _sync_item_to_container(self):
+        """把当前选中项实时写回容器（仅就地更新，不重建列表），让命令预览/预览窗口
+        即时看到 X/Y/旋转/自旋等 live 改动，无需点「确定」。
+
+        2026-08-26 修复：多实例后 self.settings 是容器项的副本，live trace 只写副本，
+        容器直到 on_ok 才更新 →「坐标要保存后才能查看」。这里按当前索引就地 update。
+        - dict 容器（队列 task.settings / 封装页 _merge_tw）→ 写 text_watermark_items[i]
+          （容器无列表时写 text_watermark 单条兜底）；
+        - 对象容器（主界面 app）→ 写 text_watermark_items[i]（空则写 text_watermark_settings）。"""
+        try:
+            idx = self._current_tw_idx()
+            if idx is None or not (0 <= idx < len(self.items)):
+                idx = 0
+            if not (0 <= idx < len(self.items)):
+                return
+            it = self.items[idx]
+            if isinstance(self.items_container, dict):
+                items = self.items_container.get("text_watermark_items")
+                if isinstance(items, list) and idx < len(items):
+                    items[idx].update(it)
+                else:
+                    _single = self.items_container.get("text_watermark")
+                    if isinstance(_single, dict):
+                        _single.update(it)
+            else:
+                items = getattr(self.items_container, "text_watermark_items", None)
+                if isinstance(items, list) and idx < len(items):
+                    items[idx].update(it)
+                else:
+                    _single = getattr(self.items_container, "text_watermark_settings", None)
+                    if isinstance(_single, dict):
+                        _single.update(it)
+        except Exception:
+            pass
+
     def _open_position_editor(self):
         """直接在对话框内打开文字水印可视化位置编辑器（无需关闭本窗口）。
 
         位置编辑器本身是模态的（会接管输入），这里先释放本对话框的模态 grab，
         待编辑器关闭后再恢复，避免两个模态窗口抢夺输入焦点。
+
+        2026-08-26：编辑器统一以「当前选中项 self.settings」为读写目标——
+        - 封装页入口传入 position_editor_cb（直接编辑 self.settings）；
+        - 转换页/队列入口委托 parent._open_text_wm_position_editor，先同步当前项
+          到 parent.tw_settings，编辑器关闭后再取回，避免多实例后写到无关 dict。
         """
-        if not hasattr(self.parent, "_open_text_wm_position_editor"):
-            return
+        # 先把当前表单收集进当前项，保证编辑器基于最新内容
+        idx = self._current_tw_idx()
+        if idx is None and self.items:
+            idx = 0
+        if idx is not None and 0 <= idx < len(self.items):
+            self._collect_tw_form(idx)
+            self.settings = self.items[idx]
         try:
             self.grab_release()
         except Exception:
             pass
-        self.parent._open_text_wm_position_editor()
-        try:
-            self.grab_set()
-        except Exception:
-            pass
-        # 位置编辑器会把「绘制矩形的高度」反推的字体大小回写到 text_watermark_settings，
+        if self._pos_editor_cb is not None:
+            try:
+                self._pos_editor_cb(self)
+            finally:
+                try:
+                    self.grab_set()
+                except Exception:
+                    pass
+        elif hasattr(self.parent, "_open_text_wm_position_editor"):
+            # 转换页/队列：parent.tw_settings 即编辑器读写目标 → 同步过去、关闭后取回
+            _parent_tw = getattr(self.parent, "tw_settings", None)
+            if isinstance(_parent_tw, dict) and self.settings:
+                _parent_tw.clear()
+                _parent_tw.update(self.settings)
+            try:
+                self.parent._open_text_wm_position_editor()
+            finally:
+                try:
+                    self.grab_set()
+                except Exception:
+                    pass
+            if isinstance(_parent_tw, dict):
+                self.settings.update(_parent_tw)
+        # 编辑器会把「绘制矩形的高度」反推的字体大小回写到文字水印设置，
         # 此处必须把本对话框的 font_size 输入框同步刷新，否则点击「确定」时 on_ok 会用
         # 旧的 size_var 把回写值覆盖掉，导致「绘制矩形→回写字体大小」看起来像没生效。
         try:
@@ -4685,6 +5268,8 @@ class TextWatermarkDialog(tk.Toplevel):
             self.tw_y_var.set(str(self.settings.get("overlay_y", "10")))
         except Exception:
             pass
+        # 编辑器已写回当前项 → 同步容器，预览/命令即时生效
+        self._sync_item_to_container()
 
 class BlurFilterDialog(tk.Toplevel):
     """去水印/模糊设置窗口 - 支持从裁剪复制坐标"""
@@ -4697,7 +5282,7 @@ class BlurFilterDialog(tk.Toplevel):
         self.grab_set()
         self.resizable(False, False)
         
-        width, height = 430, 370
+        width, height = 430, 650
         center_window(self, width, height)
         
         self.create_widgets()
@@ -4707,19 +5292,43 @@ class BlurFilterDialog(tk.Toplevel):
         main = ttk.Frame(self, padding="10")
         main.pack(fill=tk.BOTH, expand=True)
         
-        # ---- 启用 ----
+        # ---- 启用（总开关）----
         self.enabled_var = tk.BooleanVar(value=self.filter_frame._blur_enabled.get())
         chk = ttk.Checkbutton(main, text="启用去水印/模糊", variable=self.enabled_var)
         chk.grid(row=0, column=0, columnspan=3, sticky="w", pady=5)
         ToolTip(chk, "勾选后将在视频滤镜链中插入去水印或模糊滤镜")
-        
-        # ---- 滤镜类型 ----
-        ttk.Label(main, text="滤镜类型:").grid(row=1, column=0, sticky="w", pady=5)
+
+        # ---- 多区域列表（2026-08-26：可添加多个 delogo/模糊项）----
+        list_frame = ttk.LabelFrame(main, text="多区域（可添加多个 delogo / 模糊项）", padding="3")
+        list_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=3)
+        self.tree = ttk.Treeview(list_frame, columns=("en", "type", "coord"),
+                                 show="headings", height=4)
+        self.tree.heading("en", text="启用")
+        self.tree.heading("type", text="类型")
+        self.tree.heading("coord", text="坐标 / 摘要")
+        self.tree.column("en", width=44, anchor="center")
+        self.tree.column("type", width=72)
+        self.tree.column("coord", width=210)
+        self.tree.pack(fill=tk.X, padx=3, pady=(3, 1))
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        self.tree.bind("<ButtonRelease-1>", self._on_tree_click)
+        tbl_row = ttk.Frame(list_frame)
+        tbl_row.pack(fill=tk.X, padx=3, pady=(0, 3))
+        ttk.Button(tbl_row, text="添加", width=5, command=self._add_blur_item).pack(side=tk.LEFT, padx=1)
+        ttk.Button(tbl_row, text="删除", width=5, command=self._del_blur_item).pack(side=tk.LEFT, padx=1)
+        ttk.Button(tbl_row, text="上移", width=5, command=lambda: self._move_blur_item(-1)).pack(side=tk.LEFT, padx=1)
+        ttk.Button(tbl_row, text="下移", width=5, command=lambda: self._move_blur_item(1)).pack(side=tk.LEFT, padx=1)
+        ttk.Label(tbl_row, text="点「启用」列可切换", foreground="gray").pack(side=tk.LEFT, padx=8)
+        self._last_sel = None
+        self.items = []
+
+        # ---- 滤镜类型（编辑当前选中项）----
+        ttk.Label(main, text="滤镜类型:").grid(row=2, column=0, sticky="w", pady=5)
         self.type_var = tk.StringVar(value=self.filter_frame._blur_type.get())
         type_combo = ttk.Combobox(main, textvariable=self.type_var,
                                   values=["delogo", "boxblur", "gblur"],
                                   state="readonly", width=12)
-        type_combo.grid(row=1, column=1, sticky="w", padx=5)
+        type_combo.grid(row=2, column=1, sticky="w", padx=5)
         type_combo.bind("<<ComboboxSelected>>", self.on_type_change)
         ToolTip(type_combo,
             "【滤镜类型说明】\n"
@@ -4735,7 +5344,7 @@ class BlurFilterDialog(tk.Toplevel):
 
         # 一键切换到局部模糊
         btn_region = ttk.Button(main, text="🎯 局部模糊", command=self.quick_region_blur)
-        btn_region.grid(row=1, column=2, sticky="w", padx=5)
+        btn_region.grid(row=2, column=2, sticky="w", padx=5)
         ToolTip(btn_region,
             "一键配置局部模糊：\n"
             "1. 勾选「启用去水印/模糊」；\n"
@@ -4747,7 +5356,7 @@ class BlurFilterDialog(tk.Toplevel):
 
         # ---- 强度参数 + 局部模糊开关 ----
         self.strength_frame = ttk.Frame(main)
-        self.strength_frame.grid(row=2, column=0, columnspan=3, sticky="w", pady=5)
+        self.strength_frame.grid(row=3, column=0, columnspan=3, sticky="w", pady=5)
         self.strength_label = ttk.Label(self.strength_frame, text="强度/半径:")
         self.strength_label.pack(side=tk.LEFT)
         self.strength_var = tk.StringVar(value=self.filter_frame._blur_strength.get())
@@ -4772,7 +5381,7 @@ class BlurFilterDialog(tk.Toplevel):
         
         # ---- 坐标区域 ----
         coord_frame = ttk.LabelFrame(main, text="区域坐标 (delogo / 局部模糊 有效)", padding="5")
-        coord_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=5)
+        coord_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=5)
 
         
         # 坐标输入行
@@ -4803,22 +5412,97 @@ class BlurFilterDialog(tk.Toplevel):
         #   导致永远找不到、状态从未真正切换过，这里改为直接持有引用。）
         self._coord_entries = [x_entry, y_entry, w_entry, h_entry]
 
-        # 复制裁剪坐标按钮
-        btn_copy = ttk.Button(coord_frame, text="📋 从裁剪复制坐标", 
-                              command=self.copy_from_crop)
-        btn_copy.pack(pady=5)
-        ToolTip(btn_copy, 
-                "点击后将直接复制裁剪设置中的坐标（左、上、宽、高）。\n"
-                "若当前不是 delogo 也未开启局部模糊，会自动切换为 delogo；\n"
-                "已开启局部模糊时则保持当前模糊类型不变。\n"
-                "使用前请先通过可视化裁剪工具获取目标区域的精确坐标。")
+        # 独立可视化选区入口（delogo / 局部模糊 各自可视化，可同时显示裁剪框辅助）
+        def _open_region_visual():
+            ff = self.filter_frame
+            app = getattr(ff, "app", None)
+            file_path = getattr(ff, "current_file", "") or ""
+            if not file_path or not os.path.exists(file_path):
+                if app is not None and app.input_file is not None:
+                    file_path = app.input_file.get().strip()
+            if not file_path or not os.path.exists(file_path):
+                messagebox.showwarning("提示", "请先选择要处理的视频文件")
+                return
+            helper = None
+            if ff.crop_enabled.get():
+                try:
+                    helper = (int(ff.crop_left.get()), int(ff.crop_top.get()),
+                              int(ff.crop_width.get()), int(ff.crop_height.get()))
+                except Exception:
+                    helper = None
+            if app is None or app.root is None:
+                return
+            # ⚠️ 本对话框 grab_set 模态会锁住焦点 → 打开可视化前必须释放，
+            # 否则可视化窗口无法拖拽画线
+            try:
+                self.grab_release()
+            except Exception:
+                pass
+            RegionVisualEditor(
+                app, file_path,
+                self.x_var, self.y_var, self.w_var, self.h_var,
+                frame_extractor=ff.extract_video_frame_scaled,
+                helper_rect=helper,
+                safe_border=(self.type_var.get() == "delogo"),
+                title="可视化选区 - delogo / 局部模糊",
+            )
+
+        btn_visual = ttk.Button(coord_frame, text="🎯 可视化选区…",
+                                command=_open_region_visual)
+        btn_visual.pack(pady=2)
+        ToolTip(btn_visual,
+                "打开独立可视化选区窗口：在画面上拖拽确定 delogo/局部模糊 区域。\n"
+                "已勾选「裁剪」时同时显示裁剪框（蓝色虚线）作为辅助，\n"
+                "避免选区超出裁剪范围。delogo 应用时自动四周留 1px 边界。\n"
+                "应用后坐标写回本窗口，点「保存」生效。")
         
+        # ---- 显示时段 / 循环控制（起始/结束/周期/单次，与文字水印同套 enable 表达式）----
+        time_frame = ttk.LabelFrame(main, text="显示时段 / 循环 (可选)", padding="4")
+        time_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=3)
+        seg_row = ttk.Frame(time_frame)
+        seg_row.pack(fill=tk.X, pady=1)
+        ttk.Label(seg_row, text="起始:").pack(side=tk.LEFT)
+        self.enable_start_var = tk.StringVar(value="")
+        es = ttk.Entry(seg_row, textvariable=self.enable_start_var, width=7)
+        es.pack(side=tk.LEFT, padx=(0, 8))
+        ToolTip(es, "该区域开始生效的时间（秒），留空表示从头开始。与「结束」组合成 between(t,start,end)。")
+        ttk.Label(seg_row, text="结束:").pack(side=tk.LEFT)
+        self.enable_end_var = tk.StringVar(value="")
+        ee = ttk.Entry(seg_row, textvariable=self.enable_end_var, width=7)
+        ee.pack(side=tk.LEFT)
+        ToolTip(ee, "该区域结束生效的时间（秒），留空表示到结尾。")
+        cyc_row = ttk.Frame(time_frame)
+        cyc_row.pack(fill=tk.X, pady=1)
+        ttk.Label(cyc_row, text="周期:").pack(side=tk.LEFT)
+        self.enable_cycle_var = tk.StringVar(value="")
+        ec = ttk.Entry(cyc_row, textvariable=self.enable_cycle_var, width=7)
+        ec.pack(side=tk.LEFT, padx=(0, 8))
+        ToolTip(ec, "循环周期（秒）：每隔该时长重复一次生效。需配合「单次」使用。\n注意：周期不能比「单次」时长短，否则一直生效。")
+        ttk.Label(cyc_row, text="单次:").pack(side=tk.LEFT)
+        self.enable_show_var = tk.StringVar(value="")
+        esh = ttk.Entry(cyc_row, textvariable=self.enable_show_var, width=7)
+        esh.pack(side=tk.LEFT)
+        ToolTip(esh, "单次生效时长（秒）：每个周期内仅前这么多秒生效（enable='lt(mod(t,周期),单次)'）。")
+
         # ---- 操作按钮 ----
         btn_frame = ttk.Frame(main)
-        btn_frame.grid(row=4, column=0, columnspan=3, pady=15)
+        btn_frame.grid(row=6, column=0, columnspan=3, pady=15)
         ttk.Button(btn_frame, text="应用", command=self.apply).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="取消", command=self.destroy).pack(side=tk.LEFT, padx=5)
-        
+
+        # 2026-08-26 修复：表单值实时同步到列表摘要。原来坐标/类型/强度只在
+        # 切换选中项或点「应用」时才写回，新加 delogo 填完坐标列表数值不变，
+        # 要保存重开才看得到。给各表单变量挂 trace，任一变化即时刷新当前项列表行。
+        self._loading_form = False
+        for _v in (self.x_var, self.y_var, self.w_var, self.h_var,
+                   self.type_var, self.strength_var, self.enabled_var, self.region_var,
+                   self.enable_start_var, self.enable_end_var,
+                   self.enable_cycle_var, self.enable_show_var):
+            try:
+                _v.trace_add("write", self._sync_current_to_tree)
+            except Exception:
+                pass
+
         self.update_coord_state()
     
     def _is_region_blur(self) -> bool:
@@ -4907,15 +5591,32 @@ class BlurFilterDialog(tk.Toplevel):
             except Exception:
                 ow = oh = None
             if ow and oh:
-                # delogo 完整宽/高必须为偶数：字面量 iw/ih（整宽/整高）时减 2（如 1920→1918）
+                # iw/ih 按原始尺寸求值（不再在此减 2：delogo 的边界安全化由
+                # _delogo_safe 统一处理——仅减宽高不解决 x=0/y=0 贴边失败）
                 if expr == "iw":
-                    return str(ow - 2)
+                    return str(ow)
                 if expr == "ih":
-                    return str(oh - 2)
+                    return str(oh)
                 val = safe_eval_expr(expr, {"iw": ow, "ih": oh})
                 if val is not None:
                     return str(val)
         return expr
+
+    def _delogo_safe(self, x, y, w, h, ow, oh):
+        """delogo 区域必须四周留 ≥1 像素边界，否则滤镜失败（实测 ffmpeg 8.1：
+        x/y=0 贴边、x+w≥iw、y+h≥ih 均报 Error reinitializing filters）。
+        对复制/框选来的坐标统一缩进到安全范围。返回 (x,y,w,h)。"""
+        if x < 1:
+            w -= (1 - x)
+            x = 1
+        if y < 1:
+            h -= (1 - y)
+            y = 1
+        if w > ow - x - 1:
+            w = ow - x - 1
+        if h > oh - y - 1:
+            h = oh - y - 1
+        return x, y, w, h
 
     def copy_from_crop(self, silent: bool = False):
         crop_w = self.filter_frame.crop_width.get().strip()
@@ -4935,10 +5636,38 @@ class BlurFilterDialog(tk.Toplevel):
             except (ValueError, TypeError):
                 pass
             return v
-        self.x_var.set(_nonzero(self._resolve_crop_coord(crop_x)))
-        self.y_var.set(_nonzero(self._resolve_crop_coord(crop_y)))
-        self.w_var.set(_nonzero(self._resolve_crop_coord(crop_w)))
-        self.h_var.set(_nonzero(self._resolve_crop_coord(crop_h)))
+        x = self._resolve_crop_coord(crop_x)
+        y = self._resolve_crop_coord(crop_y)
+        w = self._resolve_crop_coord(crop_w)
+        h = self._resolve_crop_coord(crop_h)
+        # delogo 区域必须四周留 ≥1px 边界（x/y=0 贴边或右/下越界 → 滤镜失败）。
+        # 框选整画面 (0,0,720,405) 会被缩进为 (1,1,718,403)；数字与 iw/ih 表达式统一处理。
+        if self.type_var.get() == "delogo":
+            app = getattr(self.filter_frame, "app", None)
+            file_path = ""
+            if app is not None:
+                inp = getattr(app, "input_file", None)
+                if inp is not None:
+                    file_path = inp.get().strip() if hasattr(inp, "get") else str(inp)
+                if not file_path:
+                    file_path = getattr(self.filter_frame, "current_file", "") or ""
+            if file_path and os.path.exists(file_path) and app is not None:
+                try:
+                    ow, oh = app._get_video_dimensions_cached(file_path)
+                except Exception:
+                    ow = oh = None
+                if ow and oh:
+                    try:
+                        xi, yi, wi, hi = int(x), int(y), int(w), int(h)
+                    except (ValueError, TypeError):
+                        pass  # 含无法求值的表达式 → 保持原样
+                    else:
+                        xi, yi, wi, hi = self._delogo_safe(xi, yi, wi, hi, ow, oh)
+                        x, y, w, h = str(xi), str(yi), str(wi), str(hi)
+        self.x_var.set(_nonzero(x))
+        self.y_var.set(_nonzero(y))
+        self.w_var.set(_nonzero(w))
+        self.h_var.set(_nonzero(h))
         if not self.enabled_var.get():
             self.enabled_var.set(True)
         # 已开启局部模糊时保持当前模糊类型，不再强制切回 delogo
@@ -4953,49 +5682,241 @@ class BlurFilterDialog(tk.Toplevel):
             self.filter_frame.app._append_info_ui(
                 "已从裁剪复制坐标，并自动切换到 delogo 模式" if switched else "已从裁剪复制坐标")
     
-    def load_settings(self):
-        self.enabled_var.set(self.filter_frame._blur_enabled.get())
-        self.type_var.set(self.filter_frame._blur_type.get())
-        # 如果类型是 delogo，不恢复强度值（保持空）
-        if self.type_var.get() == "delogo":
-            self.strength_var.set("")
+    # ---------- 多区域列表 ----------
+    def _refresh_blur_tree(self):
+        sel = None
+        if self.tree.selection():
+            sel = self.tree.selection()[0]
+        self.tree.delete(*self.tree.get_children())
+        for i, it in enumerate(self.items):
+            _en = "☑" if it.get("enabled", True) else "☐"
+            _t = it.get("type", "delogo")
+            _sum = f"({it.get('x','0')},{it.get('y','0')}) {it.get('w','100')}x{it.get('h','100')}"
+            _s = it.get("strength", "")
+            if _s and _t != "delogo":
+                _sum += f" r={_s}"
+            self.tree.insert("", "end", iid=str(i), values=(_en, _t, _sum))
+        if sel is not None and self.tree.exists(sel):
+            self.tree.selection_set(sel)
+
+    def _sync_current_to_tree(self, *args):
+        """表单变量 trace 回调：把当前选中项表单值写回列表并刷新（实时联动）。
+
+        2026-08-26 修复「新加 delogo 填完坐标列表数值不变」：坐标/类型/强度/
+        启用任一变化即时更新当前项的列表行。加载表单期间由 _loading_form 守卫
+        跳过（避免 set() → trace → 刷新 → selection 事件 → set() 死循环）。"""
+        if getattr(self, "_loading_form", False):
+            return
+        idx = self._current_item_idx()
+        if idx is None or not (0 <= idx < len(self.items)):
+            return
+        self._collect_form_to_item(idx)
+        self._refresh_blur_tree()
+        try:
+            self.tree.selection_set(str(idx))
+        except Exception:
+            pass
+
+    def _current_item_idx(self):
+        s = self.tree.selection()
+        if not s:
+            return None
+        try:
+            return int(s[0])
+        except (ValueError, TypeError):
+            return None
+
+    def _load_item_to_form(self, idx):
+        # 加载期间置守卫，避免 var.set() → trace(_sync_current_to_tree) → 刷新 → 死循环
+        self._loading_form = True
+        try:
+            it = self.items[idx]
+            # ⚠️ enabled_var 是「启用去水印/模糊」总开关，单项启用由列表「启用」列点击管理——
+            # 加载项时绝不覆盖总开关，否则点过启用列的项会被表单值覆盖回 True。
+            self.type_var.set(it.get("type", "delogo"))
+            self.strength_var.set(it.get("strength", ""))
+            self.x_var.set(it.get("x", "0"))
+            self.y_var.set(it.get("y", "0"))
+            self.w_var.set(it.get("w", "100"))
+            self.h_var.set(it.get("h", "100"))
+            self.region_var.set(it.get("region_only", False))
+            self.enable_start_var.set(it.get("enable_start", ""))
+            self.enable_end_var.set(it.get("enable_end", ""))
+            self.enable_cycle_var.set(it.get("enable_cycle", ""))
+            self.enable_show_var.set(it.get("enable_show", ""))
+            self.on_type_change()
+            self.update_strength_state()
+            self.update_coord_state()
+        finally:
+            self._loading_form = False
+
+    def _collect_form_to_item(self, idx):
+        it = self.items[idx]
+        # enabled 不收集：单项启用只由列表「启用」列点击切换（_on_tree_click），
+        # 表单保存（apply）不得用总开关覆盖它——这正是「取消启用后保存又恢复」的根因。
+        it["type"] = self.type_var.get()
+        it["strength"] = self.strength_var.get()
+        it["x"] = self.x_var.get()
+        it["y"] = self.y_var.get()
+        it["w"] = self.w_var.get()
+        it["h"] = self.h_var.get()
+        it["region_only"] = self.region_var.get()
+        # 显示时段 / 循环（起始/结束/周期/单次）
+        it["enable_start"] = self.enable_start_var.get().strip()
+        it["enable_end"] = self.enable_end_var.get().strip()
+        it["enable_cycle"] = self.enable_cycle_var.get().strip()
+        it["enable_show"] = self.enable_show_var.get().strip()
+
+    def _on_tree_select(self, ev):
+        idx = self._current_item_idx()
+        if idx is None:
+            return
+        # 先写回上一个选中项的表单值，再加载新选中项
+        if self._last_sel is not None and 0 <= self._last_sel < len(self.items):
+            self._collect_form_to_item(self._last_sel)
+        self._load_item_to_form(idx)
+        self._last_sel = idx
+
+    def _on_tree_click(self, ev):
+        try:
+            if self.tree.identify_column(ev.x) == "#1":
+                iid = self.tree.identify_row(ev.y)
+                if iid:
+                    idx = int(iid)
+                    self.items[idx]["enabled"] = not self.items[idx].get("enabled", True)
+                    self._refresh_blur_tree()
+                    self.tree.selection_set(iid)
+        except Exception:
+            pass
+
+    def _add_blur_item(self):
+        if self._last_sel is not None and 0 <= self._last_sel < len(self.items):
+            self._collect_form_to_item(self._last_sel)
+        self.items.append({"enabled": True, "type": "delogo", "x": "100", "y": "100",
+                           "w": "200", "h": "100", "strength": "", "region_only": False,
+                           "enable_start": "", "enable_end": "", "enable_cycle": "",
+                           "enable_show": ""})
+        self._refresh_blur_tree()
+        self.tree.selection_set(str(len(self.items) - 1))
+        self._last_sel = len(self.items) - 1
+        self._load_item_to_form(self._last_sel)
+
+    def _del_blur_item(self):
+        idx = self._current_item_idx()
+        if idx is None or not self.items:
+            return
+        del self.items[idx]
+        self._last_sel = None
+        self._refresh_blur_tree()
+        if self.items:
+            self.tree.selection_set("0")
+            self._last_sel = 0
+            self._load_item_to_form(0)
         else:
+            self.enabled_var.set(False)
+            self.type_var.set("delogo")
+            self.x_var.set("0"); self.y_var.set("0")
+            self.w_var.set("100"); self.h_var.set("100")
+            self.strength_var.set(""); self.region_var.set(False)
+            self.enable_start_var.set(""); self.enable_end_var.set("")
+            self.enable_cycle_var.set(""); self.enable_show_var.set("")
+            self.on_type_change()
+            self.update_strength_state()
+            self.update_coord_state()
+
+    def _move_blur_item(self, d):
+        idx = self._current_item_idx()
+        if idx is None:
+            return
+        if 0 <= idx < len(self.items):
+            self._collect_form_to_item(idx)
+        ni = idx + d
+        if ni < 0 or ni >= len(self.items):
+            return
+        self.items[idx], self.items[ni] = self.items[ni], self.items[idx]
+        self._refresh_blur_tree()
+        self.tree.selection_set(str(ni))
+        self._last_sel = ni
+        self._load_item_to_form(ni)
+
+    def load_settings(self):
+        # 多区域列表：优先 filter_frame._blur_items，无则旧键迁移
+        items = list(getattr(self.filter_frame, "_blur_items", None) or [])
+        if not items:
+            _fe = self.filter_frame._blur_enabled.get()
+            _fx = self.filter_frame._blur_x.get()
+            _fw = self.filter_frame._blur_w.get()
+            if _fe or _fx or _fw:
+                items = [{
+                    "enabled": _fe,
+                    "type": self.filter_frame._blur_type.get() or "delogo",
+                    "strength": self.filter_frame._blur_strength.get(),
+                    "x": _fx,
+                    "y": self.filter_frame._blur_y.get(),
+                    "w": _fw,
+                    "h": self.filter_frame._blur_h.get(),
+                    "region_only": self.filter_frame._blur_region_only.get(),
+                    "enable_start": "", "enable_end": "", "enable_cycle": "",
+                    "enable_show": "",
+                }]
+        self.items = [dict(i) for i in items]
+        self._last_sel = None
+        self._refresh_blur_tree()
+        if self.items:
+            self.tree.selection_set("0")
+            self._last_sel = 0
+            self._load_item_to_form(0)
+        else:
+            self.enabled_var.set(self.filter_frame._blur_enabled.get())
+            self.type_var.set(self.filter_frame._blur_type.get())
+            self.x_var.set(self.filter_frame._blur_x.get())
+            self.y_var.set(self.filter_frame._blur_y.get())
+            self.w_var.set(self.filter_frame._blur_w.get())
+            self.h_var.set(self.filter_frame._blur_h.get())
             self.strength_var.set(self.filter_frame._blur_strength.get())
-        self.x_var.set(self.filter_frame._blur_x.get())
-        self.y_var.set(self.filter_frame._blur_y.get())
-        self.w_var.set(self.filter_frame._blur_w.get())
-        self.h_var.set(self.filter_frame._blur_h.get())
-        self.region_var.set(self.filter_frame._blur_region_only.get())
-        self.update_strength_state()
-        self.update_coord_state()
-    
+            self.region_var.set(self.filter_frame._blur_region_only.get())
+            self.enable_start_var.set(""); self.enable_end_var.set("")
+            self.enable_cycle_var.set(""); self.enable_show_var.set("")
+            self.update_strength_state()
+            self.update_coord_state()
+
     def apply(self):
-        ftype = self.type_var.get()
-        region = self._is_region_blur()
-        if ftype == "delogo" or region:
-            label = "局部模糊" if region else "delogo"
-            for var, name in [(self.x_var, "X"), (self.y_var, "Y"),
-                              (self.w_var, "宽度"), (self.h_var, "高度")]:
-                if not var.get().strip():
-                    messagebox.showerror("错误", f"{label} 需要完整的区域坐标，{name} 不能为空")
-                    return
-        if ftype in ("boxblur", "gblur"):
-            # 对于 boxblur 或 gblur，如果强度为空则填入默认值
-            if not self.strength_var.get().strip():
-                default_map = {"boxblur": "5", "gblur": "2.0"}
-                self.strength_var.set(default_map.get(ftype, "5"))
-        self.filter_frame._blur_enabled.set(self.enabled_var.get())
-        self.filter_frame._blur_type.set(ftype)
-        self.filter_frame._blur_strength.set(self.strength_var.get())
-        self.filter_frame._blur_x.set(self.x_var.get())
-        self.filter_frame._blur_y.set(self.y_var.get())
-        self.filter_frame._blur_w.set(self.w_var.get())
-        self.filter_frame._blur_h.set(self.h_var.get())
-        self.filter_frame._blur_region_only.set(region)
-        if self.enabled_var.get() and region and getattr(self.filter_frame, "app", None):
-            self.filter_frame.app._append_info_ui(
-                f"[局部模糊] 已启用：区域 {self.w_var.get()}x{self.h_var.get()} @ "
-                f"({self.x_var.get()},{self.y_var.get()})，滤镜图排在其他滤镜之前")
+        # 当前选中项表单写回列表
+        idx = self._current_item_idx()
+        if idx is not None and 0 <= idx < len(self.items):
+            self._collect_form_to_item(idx)
+        # 校验所有启用项
+        for it in self.items:
+            if not it.get("enabled", True):
+                continue
+            ftype = it.get("type", "delogo")
+            region = it.get("region_only", False)
+            if ftype == "delogo" or region:
+                label = "局部模糊" if region else "delogo"
+                for nm in ("x", "y", "w", "h"):
+                    if not str(it.get(nm, "")).strip():
+                        messagebox.showerror("错误", f"{label} 需要完整的区域坐标，{nm.upper()} 不能为空")
+                        return
+            if ftype in ("boxblur", "gblur") and not str(it.get("strength", "")).strip():
+                it["strength"] = {"boxblur": "5", "gblur": "2.0"}.get(ftype, "5")
+        # 写回
+        self.filter_frame._blur_items = [dict(i) for i in self.items]
+        self.filter_frame._blur_enabled.set(self.enabled_var.get())  # 总开关
+        # 兼容：旧单键同步第一项（旧版读取路径/预览仍可用）
+        if self.items:
+            it0 = self.items[0]
+            self.filter_frame._blur_type.set(it0.get("type", "delogo"))
+            self.filter_frame._blur_strength.set(it0.get("strength", ""))
+            self.filter_frame._blur_x.set(it0.get("x", "0"))
+            self.filter_frame._blur_y.set(it0.get("y", "0"))
+            self.filter_frame._blur_w.set(it0.get("w", "100"))
+            self.filter_frame._blur_h.set(it0.get("h", "100"))
+            self.filter_frame._blur_region_only.set(it0.get("region_only", False))
+        if self.enabled_var.get() and getattr(self.filter_frame, "app", None):
+            _n = len([i for i in self.items if i.get("enabled", True)])
+            if _n:
+                self.filter_frame.app._append_info_ui(
+                    f"[去水印/模糊] 已启用 {_n} 个区域（{'、'.join(i.get('type','') for i in self.items if i.get('enabled', True))}）")
         if hasattr(self.filter_frame, 'app') and self.filter_frame.app:
             self.filter_frame.app.update_command_preview()
         self.destroy()
@@ -5292,13 +6213,19 @@ class AudioFrame(ttk.LabelFrame):
 
 # ================== 截取片段组件 ==================
 class TrimFrame(ttk.LabelFrame):
-    def __init__(self, parent, show_combo_seek=True, update_callback=None, **kwargs):
+    def __init__(self, parent, show_combo_seek=True, update_callback=None,
+                 app=None, file_source=None, **kwargs):
         kwargs.pop('update_callback', None)
         super().__init__(parent, text="截取片段", padding="5", **kwargs)
         self.show_combo_seek = show_combo_seek
         self.update_callback = update_callback
         self.combo_check = None
         self._setting = False
+        # 简易预览：app=主程序引用（拿 ffmpeg/ffprobe 路径），file_source=返回当前文件路径的
+        # 回调（None 则不显示「简易预览」按钮）。三处（转换页/队列编辑/封装页视频流编辑）
+        # 复用同一个 TrimFrame，各自传入自己的文件来源。
+        self.app = app
+        self.file_source = file_source
         self.create_widgets()
 
     def create_widgets(self):
@@ -5310,9 +6237,22 @@ class TrimFrame(ttk.LabelFrame):
                                           command=self.on_trim_toggle)
         self.trim_check.pack(side=tk.LEFT, padx=5)
         
-        info_label = ttk.Label(top_line, text="示例: 01:23:45 或 01:23:45.500 (留空表示到文件末尾)", 
-                               foreground="gray")
-        info_label.pack(side=tk.LEFT, padx=5)
+        # 简易预览入口（内置帧浏览器，纯 ffmpeg 依赖）：替代外部播放器获取精确截取时间
+        self.preview_btn = None
+        if self.app is not None and self.file_source is not None:
+            self.preview_btn = ttk.Button(top_line, text="简易预览", width=8,
+                                          command=self._open_simple_preview)
+            self.preview_btn.pack(side=tk.LEFT, padx=5)
+            ToolTip(self.preview_btn,
+                    "程序内置简易预览（纯 ffmpeg，无需 MPV / PotPlayer）：\n"
+                    "播放/暂停 / 进度条拖动 / 上一帧·下一帧微调。\n"
+                    "暂停在目标画面后点「设为起点/终点」，自动回填精确到毫秒的截取时间。\n\n"
+                    "注意：大文件（4K / 长时间视频）或个别特殊格式（如大型 MKV / 高码率 / 8K）"
+                    "加载可能较慢，极端情况下甚至无法预览。\n"
+                    "若预览失败或一直卡在加载中，请改用 MPV / PotPlayer 等专业播放器定位时间，"
+                    "再手动填入上方开始/结束时间框。",
+                    wraplength=420)
+        
         ToolTip(self.trim_check, 
                 "默认是 -ss 在 -i 之前的快速模式，快速无损截取请把音频视频都改为Copy\n\n"
                 "截取功能在普通转码模式下（无水印/画中画）表现稳定，支持快速截取（基于关键帧）和精准截取（基于解码帧）两种方式。\n\n"
@@ -5324,7 +6264,8 @@ class TrimFrame(ttk.LabelFrame):
                 "    · 子视频启用截取后，截取的片段会通过 loop 滤镜循环播放，直至主视频结束。\n"
                 "    · 若循环次数有限（自定义次数），通过 enable 表达式限制显示时间，水印会在显示指定次数后消失，主视频继续播放。\n"
                 "    · 若循环为无限或次数总时长超过主视频，水印将持续显示到视频结束。\n\n"
-                "若您不希望水印循环或需要更精细控制，建议先在「视频转码」标签页单独处理好子视频，再导入作为水印/画中画素材。",
+                "若您不希望水印循环或需要更精细控制，建议先在「视频转码」标签页单独处理好子视频，再导入作为水印/画中画素材。\n\n"
+                "示例: 01:23:45 或 01:23:45.500 (留空表示到文件末尾)",
                 wraplength=700)
 
         time_frame = ttk.Frame(self)
@@ -5451,6 +6392,33 @@ class TrimFrame(ttk.LabelFrame):
         self.trim_start_entry.config(state=state)
         self.trim_end_entry.config(state=state)
 
+    # ---------- 简易预览（内置帧浏览器，2026-08-25 方案 B） ----------
+    def _open_simple_preview(self):
+        """打开内置简易预览窗口，暂停后「设为起点/终点」自动回填截取时间。"""
+        if not self.app or not self.file_source:
+            return
+        try:
+            path = self.file_source()
+        except Exception:
+            path = None
+        if not path or not os.path.exists(path):
+            messagebox.showwarning("提示", "请先选择要预览的视频文件")
+            return
+        if not self.app.ffmpeg_cmd:
+            messagebox.showwarning("提示", "未找到 ffmpeg，无法预览")
+            return
+        # ⚠️ 释放调用方弹窗的模态 grab（SafeToplevel 等）——否则预览窗口被 grab
+        # 锁住焦点（点击/拖拽无效，与可视化选区同一问题），预览窗口自身置顶可交互。
+        try:
+            g = self.app.root.grab_current()
+            if g is not None:
+                g.grab_release()
+        except Exception:
+            pass
+        SimplePreviewer(self.app.root, self.app.ffmpeg_cmd, self.app.ffprobe_cmd, path,
+                        on_set_start=lambda s: self.trim_start.set(_format_preview_time(s)),
+                        on_set_end=lambda s: self.trim_end.set(_format_preview_time(s)))
+
     # ---------- 修改：get_settings 增加组合跳转字段 ----------
     def get_settings(self):
         res = {
@@ -5486,15 +6454,878 @@ class TrimFrame(ttk.LabelFrame):
         finally:
             self._setting = False
 
+# ================== 内置简易预览（方案 B，2026-08-25） ==================
+def _format_preview_time(sec: float) -> str:
+    """秒 → HH:MM:SS.mmm（3 位小数），供截取时间回填。"""
+    s = max(0.0, float(sec))
+    h = int(s // 3600)
+    m = int((s % 3600) // 60)
+    return f"{h:02d}:{m:02d}:{s % 60:06.3f}"
+
+
+class SimplePreviewer:
+    """内置简易预览：纯 ffmpeg 依赖（无需 mpv/PotPlayer），定位截取时间用。
+    - ffmpeg 解码 rawvideo rgb24 走 stdout（每帧 w*h*3 字节），双 -ss（输入粗 seek +
+      输出精 seek）首帧精确到目标网格帧（B 帧正确重排）。
+    - **时间 = anchor(seek 目标) + 帧计数/fps 推算**，确定性、无外部依赖。绝不读
+      ffmpeg stderr 传时间——实测其 stderr 为 4KB 块缓冲，showinfo 行不逐帧 flush，
+      会导致时间停住（"无法恢复播放"的根源）。
+    - **暂停 = 立即 kill ffmpeg 进程**（画面保留在 canvas，时间固定）——不做"停读
+      管道让 ffmpeg 挂起"（管道缓冲写满会死锁）。恢复播放 = 从当前位置重新双 -ss
+      seek 启动（与步进同一条已验证好用的路径，~200ms）。
+    - 步进（上一帧/下一帧）= 暂停态从 当前时间 ± 1/fps 重启，读一帧显示后即 kill 停住。
+    - 进度条拖动 = kill + 双 -ss 重启（250ms 防抖），拖动后进入播放态，时间立即精确。
+    - 线程模型：worker 线程只读原始字节，主线程 after() 创建 PhotoImage 显示（tk 非线程安全）。
+      所有管道读取均非阻塞+超时（_read_frame_data），worker 绝不可能卡死。
+    """
+    PREVIEW_WIDTH = 640
+
+    def __init__(self, root, ffmpeg_cmd, ffprobe_cmd, file_path,
+                 on_set_start=None, on_set_end=None):
+        self.root = root
+        self.ff = ffmpeg_cmd
+        self.ffprobe = ffprobe_cmd
+        self.file = file_path
+        self.on_set_start = on_set_start
+        self.on_set_end = on_set_end
+        self._stop = False
+        self._playing = True
+        self._step = 0            # 帧步进请求：1=下一帧, -1=上一帧
+        self._seek_target = None  # 待 seek 时间（秒），worker 取走即清
+        self._gen = 0             # 世代号：每次 kill（暂停/seek）递增，worker 检测到
+                                  # 变化即放弃当前 proc（防启动竞态下的孤儿进程）
+        self._anchor_us = 0       # 当前 proc 首帧绝对时间（= seek 目标，双 -ss 精确到网格帧）
+        self._frame_idx = 0       # 当前 proc 已显示帧数（时间推算用）
+        self._current_us = 0      # 当前帧微秒时间戳（progress 更新，GIL 原子读写）
+        self._frame_shown = False # 当前 proc 是否已显示过帧（暂停态重启后用于读首帧）
+        self._at_eof = False      # 播放到末尾标记（恢复播放时从头）
+        self._dur = None
+        self._fps = 25.0
+        self._vw, self._vh = 640, 360
+        self._frame_bytes = 0
+        self._proc = None
+        self._img = None          # PhotoImage 引用保持（替换即释放旧图）
+        self._seek_after = None   # 进度条拖动防抖
+        self._updating_scale = False  # 抑制 scale.set 触发的 command（防自我 seek 循环）
+        self._aspect = 16.0 / 9.0  # 视频宽高比（_probe 更新；初始默认 16:9）
+        self._build_ui()
+        self._probe()
+        threading.Thread(target=self._worker_loop, daemon=True).start()
+
+    # ---------- UI ----------
+    def _build_ui(self):
+        self.win = tk.Toplevel(self.root)
+        self.win.title("简易预览 - " + os.path.basename(self.file))
+        # 置顶：调用方（轨道设置弹窗）可能是模态/置顶，预览窗口必须盖住它可交互
+        try:
+            self.win.attributes("-topmost", True)
+        except Exception:
+            pass
+        # 窗口固定尺寸（不随拖动变化，避免画面频繁重启/按钮被挤出屏外）；
+        # 初始尺寸由 _fit_window 按屏幕自适应并居中，矮屏/高 DPI 下按钮必然可见。
+        self.win.resizable(False, False)
+        self.canvas = ttk.Label(self.win, text="正在加载预览…", anchor=tk.CENTER,
+                                background="black", foreground="white")
+        self.canvas.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.ctl_frame = ttk.Frame(self.win)
+        self.ctl_frame.pack(fill=tk.X, padx=6)
+        ctl = self.ctl_frame
+        self.btn_play = ttk.Button(ctl, text="暂停", width=6, command=self.toggle_play)
+        self.btn_play.pack(side=tk.LEFT)
+        ttk.Button(ctl, text="上一帧", width=6, command=lambda: self.request_step(-1)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(ctl, text="下一帧", width=6, command=lambda: self.request_step(1)).pack(side=tk.LEFT)
+        self.time_label = ttk.Label(ctl, text="00:00:00.000", width=14, anchor=tk.E)
+        self.time_label.pack(side=tk.LEFT, padx=(12, 4))
+        self.scale = ttk.Scale(ctl, from_=0, to=100, command=self._on_scale)
+        self.scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        ttk.Button(ctl, text="设为起点", command=self._set_start).pack(side=tk.LEFT, padx=2)
+        ttk.Button(ctl, text="设为终点", command=self._set_end).pack(side=tk.LEFT, padx=2)
+        # 状态提示行（设为起点/终点 的反馈，不关闭窗口可连续设置）
+        self.status_label = ttk.Label(self.win, text="", foreground="#007700")
+        self.status_label.pack(fill=tk.X, padx=8, pady=(0, 4))
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+
+    def _fit_window(self):
+        """窗口尺寸按屏幕自适应 + 居中：画面 + 控件区，保证不超出屏幕（按钮始终可见）。
+        窗口宽度至少容纳整行控件（竖屏视频画面窄时不被裁掉）。矮屏/高 DPI 下自动缩小。"""
+        try:
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+        except Exception:
+            sw, sh = 1920, 1080
+        try:
+            # 必须先 update_idletasks 让布局完成，否则 reqheight 返回小值 → 窗口高度算少 → 按钮被裁
+            self.win.update_idletasks()
+            ctl_h = self.ctl_frame.winfo_reqheight()
+            ctl_w = self.ctl_frame.winfo_reqwidth()
+        except Exception:
+            ctl_h = ctl_w = 0
+        if ctl_h < 24:
+            ctl_h = 40  # 兜底：按钮行最小高度（ttk 按钮约 28px + 边距）
+        # 宽度 = max(画面宽, 控件行所需宽) + 边距 → 竖屏视频控件也完整可见
+        win_w = min(max(self._vw + 24, ctl_w + 12), sw - 60)
+        win_h = min(self._vh + ctl_h + 24 + 20, sh - 120)  # +20 = 状态行
+        if win_w < 260:
+            win_w = 260
+        if win_h < 220:
+            win_h = 220
+        x = max(0, (sw - win_w) // 2)
+        y = max(0, (sh - win_h) // 2 - 40)  # 略偏上，避开任务栏
+        try:
+            self.win.geometry(f"{win_w}x{win_h}+{x}+{y}")
+        except Exception:
+            pass
+
+    def _probe(self):
+        try:
+            info = ffprobe_json(self.ffprobe, self.file)
+            if info and info.get("format"):
+                d = info["format"].get("duration")
+                if d:
+                    try:
+                        self._dur = float(d)
+                    except (ValueError, TypeError):
+                        pass
+            if info:
+                for s in info.get("streams", []):
+                    if s.get("codec_type") == "video":
+                        w, h = s.get("width"), s.get("height")
+                        if w and h:
+                            self._aspect = float(w) / float(h)
+                        if self._dur is None:
+                            d = s.get("duration")  # 流级时长（ffprobe_json 只带 streams）
+                            if d:
+                                try:
+                                    self._dur = float(d)
+                                except (ValueError, TypeError):
+                                    pass
+                        afr = s.get("avg_frame_rate")
+                        if afr and "/" in str(afr):
+                            try:
+                                a, b = str(afr).split("/", 1)
+                                b = float(b) or 1.0
+                                self._fps = float(a) / b
+                            except (ValueError, ZeroDivisionError):
+                                pass
+                        break
+        except Exception:
+            pass
+        if self._dur is None:
+            # ffprobe_json 只带 streams，容器级时长（format.duration）拿不到 →
+            # 单独查一次 format 段（长视频/部分 mp4 流级 duration 缺失，
+            # 否则时间轴会停留在默认 100 秒=1:40 的 bug）
+            try:
+                _cmd = [self.ffprobe, "-v", "error", "-show_entries",
+                        "format=duration", "-of", "json", self.file]
+                _flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                _res = subprocess.run(_cmd, capture_output=True, text=True,
+                                      encoding="utf-8", errors="replace",
+                                      creationflags=_flags, timeout=10)
+                if _res.returncode == 0:
+                    _d = json.loads(_res.stdout).get("format", {}).get("duration")
+                    if _d:
+                        self._dur = float(_d)
+            except Exception:
+                pass
+        if self._fps <= 0 or self._fps > 240:
+            self._fps = 25.0
+        if self._aspect <= 0:
+            self._aspect = 16.0 / 9.0
+        # 初始画面尺寸：按屏幕可用区自适应（宽≤700、高≤520，保持视频比例），
+        # 矮屏/高 DPI 下画面自动变小 → 窗口随之变小 → 按钮必然可见。
+        try:
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+        except Exception:
+            sw, sh = 1920, 1080
+        max_w = min(700, sw - 100)
+        max_h = min(520, sh - 140)
+        if self._aspect >= 1:
+            self._vw = int(min(max_w, max_h * self._aspect))
+            self._vh = int(self._vw / self._aspect)
+        else:
+            self._vh = int(min(max_h, max_w / self._aspect))
+            self._vw = int(self._vh * self._aspect)
+        self._vw = max(64, self._vw)
+        self._vh = max(64, self._vh)
+        self._frame_bytes = self._vw * self._vh * 3
+        self._frame_delay = 1.0 / min(self._fps, 15.0)  # 显示帧率上限 15fps（tkinter 瓶颈）
+        if self._dur:
+            self.scale.config(to=self._dur)
+        self._fit_window()
+
+    # ---------- 控制 ----------
+    def toggle_play(self):
+        if self._playing:
+            # 暂停：立即 kill ffmpeg（画面保留在 canvas、时间固定）。
+            # 不做"停读管道"——管道缓冲写满会死锁、进程 EOF 状态难判（恢复不了播放的根源）。
+            self._playing = False
+            self.btn_play.config(text="播放")
+            self._gen += 1  # 让 worker 放弃当前 proc（含启动竞态下的新 proc）
+            proc = self._proc
+            if proc:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            self._proc = None
+        else:
+            # 恢复：不直接 seek，由 worker 检测到 playing & proc None 后
+            # 从当前位置重启（EOF 后从头）——与步进同一条快路径
+            self._playing = True
+            self.btn_play.config(text="暂停")
+        self._ui_tick()
+
+    def request_step(self, d):
+        self._step = d
+
+    def _on_scale(self, val):
+        # 程序自己 scale.set（播放跟随）会触发 command → 必须抑制，否则自我 seek 死循环
+        if self._updating_scale:
+            return
+        if self._seek_after:
+            try:
+                self.win.after_cancel(self._seek_after)
+            except Exception:
+                pass
+        self._seek_after = self.win.after(250, lambda: self._do_seek(val))
+
+    def _do_seek(self, sec):
+        self._seek_after = None
+        try:
+            sec = float(sec)
+        except (ValueError, TypeError):
+            return
+        self._request_seek(max(0.0, sec))
+
+    def _request_seek(self, sec):
+        # 拖到最右/末尾时 clamp 到末帧之前：seek 到 ≥ 实际末帧时间无帧输出会直接 EOF
+        # （画面不动/时间条回退）。容器时长 _dur 通常比实际末帧大（mkv 末尾可能有
+        # 附加数据，实测 6.95GB mkv _dur=9850.59 但末帧仅 ~9850.3）→ 留 0.5 秒余量
+        # （比 2/fps≈0.08s 更稳），保证能取到最后一帧。
+        if self._dur:
+            _max = max(0.0, self._dur - max(0.5, 2.0 / max(self._fps, 1.0)))
+            if sec > _max:
+                sec = _max
+        self._seek_target = max(0.0, sec)
+        self._playing = True
+        self._at_eof = False
+        self._gen += 1  # kill 语义：让 worker 放弃当前 proc（含启动竞态下的新 proc）
+        self.btn_play.config(text="暂停")
+        proc = self._proc
+        if proc:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        # 关键：kill 后立即断开 _proc 引用 → 旧 progress 线程检测到
+        # self._proc is not proc → 停止写 _current_us，防止旧进程残留输出
+        # 覆盖新进程的精确时间（"时间条在最前面"的根因）。
+        self._proc = None
+
+    # ---------- 后台线程 ----------
+    def _worker_loop(self):
+        """永不退出的播放调度循环（除 close）。三种请求驱动：
+        1) _seek_target 有值（拖动/播放中 seek）→ 启动播放
+        2) _step 有值（暂停态步进）→ 从 ±1/fps 重启、读一帧显示后停
+        3) playing 且无进程（恢复播放/EOF 后重播）→ 从当前位置/头重启
+        进程要么在播放（worker 在读），要么不存在——没有"挂起等待"的隐藏状态。"""
+        while not self._stop:
+            if self._seek_target is not None:
+                start = self._seek_target
+                self._seek_target = None
+                self._run_proc(start, gen=self._gen)
+            elif self._step:
+                d = self._step
+                self._step = 0
+                start = max(0.0, self._current_us / 1e6 + d / self._fps)
+                self._run_proc(start, read_one=True, gen=self._gen)
+            elif self._playing and self._proc is None:
+                start = 0.0 if self._at_eof else self._current_us / 1e6
+                self._run_proc(start, gen=self._gen)
+            else:
+                time.sleep(0.05)
+
+    def _run_proc(self, start_sec, read_one=False, gen=None):
+        """启动一次 ffmpeg 会话并读帧，返回后清理进程。read_one=True（步进/暂停态
+        定位）时读一帧显示即停；否则持续播放到暂停/seek/EOF。"""
+        proc = self._launch_proc(start_sec)
+        if self._stop or proc is None:
+            return
+        self._proc = proc
+        self._frame_shown = False
+        self._anchor_us = int(start_sec * 1e6)  # 首帧绝对时间 = seek 目标（双 -ss 网格帧精确）
+        self._frame_idx = 0
+        self._read_frames(proc, read_one, gen)
+        if self._stop:
+            return
+        # 清理：read 返回后 proc 应已 EOF/被 kill；若还活着（被替换成孤儿）→ 杀掉
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        if self._proc is proc:
+            self._proc = None
+        # 播放态且无新请求且进程 EOF（读到文件末尾）→ 标记停止，等待下次播放（从头）。
+        # ⚠️ _read_frames 返回的原因不止 EOF：还有 _step（步进）、gen 变化（暂停/seek）。
+        # 必须全部排除，否则播放中步进会被误判成 EOF 取消播放（"点播放没反应"）。
+        # _at_eof 在此同步置位（不依赖主线程 after），避免用户立刻点播放时
+        # _on_eof 异步晚到覆盖。
+        if (self._playing and self._seek_target is None and self._step == 0
+                and gen == self._gen and not read_one and not self._stop):
+            self._playing = False
+            self._at_eof = True
+            self.win.after(0, self._on_eof)
+
+    def _read_frames(self, proc, read_one=False, gen=None):
+        fb = self._frame_bytes
+        while not self._stop:
+            if gen is not None and self._gen != gen:
+                return  # 期间发生 kill（暂停/seek）→ 放弃本 proc（防启动竞态孤儿）
+            if self._seek_target is not None or self._proc is not proc or self._step:
+                return  # 有 seek/步进请求或 proc 已被 kill/替换 → 外层统一处理
+            if not self._playing:
+                # 暂停态：只允许读一帧（步进/定位落点），已显示过则停
+                if read_one and not self._frame_shown:
+                    pass  # 重启后尚未显示 → 读首帧显示后停
+                else:
+                    return
+            try:
+                data = self._read_frame_data(proc, fb)
+            except Exception:
+                return
+            if data is None:
+                return  # EOF / 进程被杀 / 超时（ffmpeg 异常不输出时防 worker 假死）
+            # 帧时间 = anchor + 帧序号/fps 推算（CFR 视频精确；不依赖 ffmpeg stderr
+            # 缓冲——实测其 stderr 为 4KB 块缓冲，showinfo 行不逐帧 flush，是
+            # "时间停住/无法恢复播放"的根源，故彻底弃用 showinfo 解析）。
+            # 首帧显示时 _frame_idx=0 → current=anchor（= seek 目标，拖动后时间立即精确）
+            self._current_us = self._anchor_us + int(self._frame_idx * 1e6 / self._fps)
+            self._frame_idx += 1
+            self._frame_shown = True
+            self._at_eof = False
+            self.win.after(0, self._show_frame, data)
+            if read_one:
+                return  # 步进/暂停态定位：显示一帧即停
+            time.sleep(self._frame_delay)
+
+    def _read_frame_data(self, proc, fb, timeout=15.0):
+        """带超时读一帧：非阻塞轮询，**绝不无限阻塞**。ffmpeg 若异常不输出
+        （启动卡死/解码挂起），超时后放弃返回 None —— 这是"worker 假死、
+        之后步进/播放/拖动全部失效"的最终防线。返回完整帧字节或 None。
+        用 os.read 原始读取（BufferedReader 在非阻塞 fd 上会抛 BlockingIOError）。"""
+        try:
+            fd = proc.stdout.fileno()
+            os.set_blocking(fd, False)
+        except Exception:
+            # 非阻塞不可用（非 Windows）→ 回退阻塞读
+            try:
+                data = proc.stdout.read(fb)
+            except Exception:
+                return None
+            return data if data and len(data) >= fb else None
+        try:
+            data = b""
+            deadline = time.time() + timeout
+            while len(data) < fb:
+                if time.time() > deadline:
+                    return None
+                try:
+                    chunk = os.read(fd, fb - len(data))
+                except BlockingIOError:
+                    chunk = b""
+                except Exception:
+                    return None
+                if not chunk:
+                    if proc.poll() is not None:
+                        return None  # EOF / 被杀
+                    time.sleep(0.005)
+                    continue
+                data += chunk
+            return data
+        finally:
+            try:
+                os.set_blocking(fd, True)
+            except Exception:
+                pass
+
+    def _launch_proc(self, sec):
+        # ⚠️ 双 -ss 取精确帧：-ss 输入 seek（快，关键帧对齐）+ -ss 输出 seek（解码丢弃到
+        # 精确时间，B 帧正确重排）→ 首帧 = 目标网格帧，无 1~2 帧跳变（步进依赖此精度）。
+        # 时间不再读 stderr（ffmpeg stderr 4KB 块缓冲，showinfo 不逐帧 flush）——
+        # 由 _run_proc 的 anchor(=sec) + 帧计数/fps 推算，确定性无外部依赖。
+        # ⚠️ stderr 必须 DEVNULL：大文件/部分 MKV 的 ffmpeg 会输出大量 stderr 日志，
+        # 若 stderr=PIPE 且无人读取 → 4KB 管道缓冲写满 → ffmpeg 阻塞 → stdout 无帧
+        # → 预览永远卡"正在加载预览"（stderr 未读死锁，实测 6.95GB MKV 复现）。
+        pre = max(0.0, sec - 2.0 / self._fps)
+        post = max(0.0, sec - pre)
+        cmd = [self.ff, "-hide_banner",
+               "-ss", f"{pre:.6f}", "-i", self.file,
+               "-ss", f"{post:.6f}",
+               "-vf", f"scale={self._vw}:{self._vh}",
+               "-f", "rawvideo", "-pix_fmt", "rgb24", "-an", "pipe:1"]
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                creationflags=flags)
+
+    # ---------- 主线程 UI 更新 ----------
+    def _show_frame(self, rgb):
+        try:
+            ppm = b"P6\n%d %d\n255\n" % (self._vw, self._vh) + rgb
+            img = tk.PhotoImage(data=ppm)
+            self._img = img
+            self.canvas.config(image=img, text="")
+        except Exception:
+            pass
+        self._ui_tick()
+
+    def _ui_tick(self):
+        try:
+            self.time_label.config(text=_format_preview_time(self._current_us / 1e6))
+            if self._dur and not self._seek_after:
+                t = self._current_us / 1e6
+                v = float(self.scale.get())
+                if abs(v - t) > 0.1:
+                    self._updating_scale = True
+                    try:
+                        self.scale.set(t)  # 播放中进度条跟随（拖动时不抢）
+                    finally:
+                        self._updating_scale = False
+        except Exception:
+            pass
+
+    def _on_eof(self):
+        if self._stop:
+            return
+        if self._playing:
+            return  # 用户已在 EOF 后恢复播放/seek → 本 EOF 通知作废（竞态防护）
+        self._at_eof = True
+        self.btn_play.config(text="播放")
+        self._ui_tick()
+
+    # ---------- 回填（2026-08-25：不关闭窗口，可连续设置起点/终点） ----------
+    def _set_start(self):
+        t = self._current_us / 1e6
+        if self.on_set_start:
+            self.on_set_start(t)
+        self.status_label.config(text=f"✓ 起点已设 {_format_preview_time(t)}（可继续设终点，完成后关闭窗口）")
+
+    def _set_end(self):
+        t = self._current_us / 1e6
+        if self.on_set_end:
+            self.on_set_end(t)
+        self.status_label.config(text=f"✓ 终点已设 {_format_preview_time(t)}（可继续设起点，完成后关闭窗口）")
+
+    def close(self):
+        self._stop = True
+        proc = self._proc
+        if proc:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+
+# ================== 区域可视化编辑器（delogo / 遮罩独立选区） ==================
+class RegionVisualEditor:
+    """通用单/双框区域可视化编辑器：delogo 与遮罩各自独立的可视化选区入口。
+
+    - 画布显示视频帧，拖拽绘制主选区（红色实线），实时写回 x/y/w/h 变量；
+    - 可选显示裁剪框辅助（蓝色虚线，只读）——勾选了裁剪时同时显示两框，
+      避免 delogo/遮罩选到裁剪区域之外（与主视频/子视频位置辅助框同理）；
+    - 时间跳转重新取帧（复用调用方的 extract_video_frame_scaled）；
+    - safe_border=True（delogo）时应用前做四周留边安全化（x/y=0 或越界滤镜失败）。
+    """
+
+    def __init__(self, app, file_path,
+                 x_var, y_var, w_var, h_var,
+                 frame_extractor,
+                 helper_rect=None, helper_label="裁剪框",
+                 safe_border=False, title="可视化选区",
+                 on_apply=None):
+        self.app = app
+        self.root = app.root
+        self.ff = app.ffmpeg_cmd
+        self.file = file_path
+        self.x_var, self.y_var = x_var, y_var
+        self.w_var, self.h_var = w_var, h_var
+        self.extract = frame_extractor
+        self.helper_rect = helper_rect
+        self.helper_label = helper_label
+        self.safe_border = safe_border
+        self.title = title
+        self.on_apply = on_apply
+
+        # 原始尺寸
+        try:
+            ow, oh = app._get_video_dimensions_cached(file_path)
+        except Exception:
+            ow = oh = None
+        self.orig_w, self.orig_h = (ow or 1920), (oh or 1080)
+
+        # 显示尺寸（屏幕内）。2026-08-26：与裁剪可视化一致——窗口高度=画布高+小余量，
+        # 右侧按钮行不占画布空间，无需为它们加窗口高度（加高只会让画布 expand 撑出底部空白）
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        RIGHT = 270
+        avail_w = min(int(sw * 0.9), 1200) - RIGHT - 40
+        avail_h = min(int(sh * 0.85), 800) - 30
+        scale = min(1.0, avail_w / self.orig_w, avail_h / self.orig_h)
+        self.disp_w = max(1, int(self.orig_w * scale))
+        self.disp_h = max(1, int(self.orig_h * scale))
+        self.scale_x = self.orig_w / self.disp_w
+        self.scale_y = self.orig_h / self.disp_h
+        self.PAD = 10
+
+        # 状态
+        self.points = []          # [(x1,y1),(x2,y2)] 原始坐标
+        self.rect_id = None
+        self.drag_rect_id = None
+        self.drag_start = None
+        self.img = None
+
+        self._build_ui()
+        # 初始框：从现有变量恢复
+        self._load_from_vars()
+        self._initial_load(0.0)
+
+    # ---------- UI ----------
+    def _build_ui(self):
+        self.win = tk.Toplevel(self.root)
+        self.win.title(f"{self.title} (显示 {self.disp_w}x{self.disp_h}, 原始 {self.orig_w}x{self.orig_h})")
+        self.win.resizable(False, False)
+        try:
+            self.win.transient(self.root)
+            # 置顶：调用方（去水印/遮罩弹窗）可能仍是置顶/模态，本窗口必须盖住它可交互
+            self.win.attributes("-topmost", True)
+        except Exception:
+            pass
+        cw = self.disp_w + self.PAD * 2
+        ch = self.disp_h + self.PAD * 2
+        # 简单居中（窗口高=画布高+10，与裁剪可视化一致，画布 expand 后恰好占满，无底部空白）
+        try:
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            x = max(0, (sw - cw - 290) // 2)
+            y = max(0, (sh - ch - 30) // 2)
+            self.win.geometry(f"{cw + 290}x{ch + 10}+{x}+{y}")
+        except Exception:
+            pass
+        self.win.protocol("WM_DELETE_WINDOW", self.win.destroy)
+
+        main = ttk.Frame(self.win)
+        main.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        right = ttk.Frame(main, width=270)
+        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
+        right.pack_propagate(False)
+
+        self.canvas = tk.Canvas(main, bg='gray', width=cw, height=ch, highlightthickness=0)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._loading = self.canvas.create_text(cw // 2, ch // 2, text="正在加载画面…",
+                                                fill="#666666", font=("Arial", 12))
+
+        # 信息
+        self.info_var = tk.StringVar(value="👉 按住左键拖拽绘制选区")
+        tk.Label(right, textvariable=self.info_var, wraplength=250, justify=tk.LEFT,
+                 bg="#FFFFCC", relief=tk.SUNKEN, padx=5, pady=5).pack(pady=5, fill=tk.X)
+        # 辅助框提示
+        if self.helper_rect:
+            hx, hy, hw, hh = self.helper_rect
+            tk.Label(right, text=f"辅助:{self.helper_label} ({hx},{hy},{hw},{hh})",
+                     foreground="blue", wraplength=250, justify=tk.LEFT).pack(pady=2, fill=tk.X)
+
+        # 时间
+        row = ttk.Frame(right)
+        row.pack(fill=tk.X, pady=4)
+        ttk.Label(row, text="时间:").pack(side=tk.LEFT)
+        self.time_var = tk.StringVar(value="0")
+        ttk.Entry(row, textvariable=self.time_var, width=10).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row, text="取帧", command=self._refresh_frame).pack(side=tk.LEFT)
+
+        # 数值（实时显示 + 可编辑；2026-08-26：4 行改 2 行紧凑布局，腾空间给微调按钮）
+        nf = ttk.LabelFrame(right, text="选区坐标 (x / y / 宽 / 高)", padding=5)
+        nf.pack(fill=tk.X, pady=4)
+        nf_r1 = ttk.Frame(nf)
+        nf_r1.pack(fill=tk.X, pady=1)
+        nf_r2 = ttk.Frame(nf)
+        nf_r2.pack(fill=tk.X, pady=1)
+        for i, (lab, var, row) in enumerate([("X", self.x_var, nf_r1), ("Y", self.y_var, nf_r1),
+                                             ("宽", self.w_var, nf_r2), ("高", self.h_var, nf_r2)]):
+            ttk.Label(row, text=lab + ":").pack(side=tk.LEFT)
+            e = ttk.Entry(row, textvariable=var, width=6)
+            e.pack(side=tk.LEFT, padx=2)
+
+        # 微调按钮：移动 / 减 / 加 三行，各自带步进（2026-08-26 与裁剪可视化同套语义）
+        nudge_frame = ttk.LabelFrame(right, text="微调 (像素)", padding=3)
+        nudge_frame.pack(fill=tk.X, pady=4)
+        _nudge_step = {}
+        for _kind, _labels in [("move", [("上移", "up"), ("下移", "down"), ("左移", "left"), ("右移", "right")]),
+                               ("shrink", [("上减", "top"), ("下减", "bottom"), ("左减", "left"), ("右减", "right")]),
+                               ("grow", [("上加", "top"), ("下加", "bottom"), ("左加", "left"), ("右加", "right")])]:
+            _row = ttk.Frame(nudge_frame)
+            _row.pack(fill=tk.X, pady=1)
+            for _label, _dir in _labels:
+                ttk.Button(_row, text=_label, width=4,
+                           command=lambda k=_kind, d=_dir: self._nudge_rect(k, d, _nudge_step_get(_kind))).pack(
+                    side=tk.LEFT, padx=1)
+            ttk.Label(_row, text="步进:").pack(side=tk.LEFT, padx=(6, 2))
+            _sv = tk.StringVar(value="1")
+            _nudge_step[_kind] = _sv
+            ttk.Spinbox(_row, textvariable=_sv, from_=1, to=999, width=4).pack(side=tk.LEFT)
+
+        def _nudge_step_get(kind):
+            try:
+                return int(_nudge_step[kind].get())
+            except (ValueError, TypeError, KeyError):
+                return 1
+
+        # 清除/应用/取消
+        bf = ttk.Frame(right)
+        bf.pack(fill=tk.X, pady=8)
+        ttk.Button(bf, text="清除选区", command=self._clear).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bf, text="应用", command=self._apply).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bf, text="取消", command=self.win.destroy).pack(side=tk.LEFT, padx=2)
+
+        tip = "拖拽绘制主选区（红色）。辅助框（蓝色虚线）= 裁剪区域，仅供参考。"
+        tk.Label(right, text=tip, foreground="gray", wraplength=250, justify=tk.LEFT).pack(pady=6)
+
+        # 事件
+        self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
+        self.canvas.bind("<B1-Motion>", self._on_drag_motion)
+        self.canvas.bind("<ButtonRelease-1>", self._on_drag_end)
+
+    # ---------- 坐标转换 ----------
+    def _c2d(self, cx, cy):
+        x = self.canvas.canvasx(cx) - self.PAD
+        y = self.canvas.canvasy(cy) - self.PAD
+        return max(0, min(x, self.disp_w)), max(0, min(y, self.disp_h))
+
+    def _d2o(self, dx, dy):
+        return int(dx * self.scale_x), int(dy * self.scale_y)
+
+    def _o2d(self, ox, oy):
+        return ox / self.scale_x, oy / self.scale_y
+
+    # ---------- 画框 ----------
+    def _redraw(self):
+        if self.rect_id:
+            self.canvas.delete(self.rect_id)
+            self.rect_id = None
+        # 辅助框（只读）
+        self.canvas.delete("aux")
+        if self.helper_rect:
+            hx, hy, hw, hh = self.helper_rect
+            self.canvas.create_rectangle(
+                self._o2d(hx, hy)[0] + self.PAD, self._o2d(hx, hy)[1] + self.PAD,
+                self._o2d(hx + hw, hy)[0] + self.PAD, self._o2d(hx + hw, hy)[1] + self.PAD,
+                outline="blue", width=1, dash=(4, 2), tags="aux")
+        if len(self.points) == 2:
+            x1, y1 = self.points[0]
+            x2, y2 = self.points[1]
+            self.rect_id = self.canvas.create_rectangle(
+                self._o2d(x1, y1)[0] + self.PAD, self._o2d(x1, y1)[1] + self.PAD,
+                self._o2d(x2, y2)[0] + self.PAD, self._o2d(x2, y2)[1] + self.PAD,
+                outline="red", width=2)
+            self._sync_vars()
+        self._update_info()
+
+    def _sync_vars(self):
+        if len(self.points) != 2:
+            return
+        x1, y1 = self.points[0]
+        x2, y2 = self.points[1]
+        try:
+            self.x_var.set(str(int(min(x1, x2))))
+            self.y_var.set(str(int(min(y1, y2))))
+            self.w_var.set(str(int(abs(x2 - x1))))
+            self.h_var.set(str(int(abs(y2 - y1))))
+        except Exception:
+            pass
+
+    def _update_info(self):
+        if len(self.points) == 2:
+            self.info_var.set("✅ 选区已确定，可继续拖拽覆盖")
+        else:
+            self.info_var.set("👉 按住左键拖拽绘制选区")
+
+    def _load_from_vars(self):
+        """打开时从目标变量恢复旧框（任务1同款逻辑）。"""
+        try:
+            x = int(float(str(self.x_var.get()).strip() or 0))
+            y = int(float(str(self.y_var.get()).strip() or 0))
+            w = int(float(str(self.w_var.get()).strip() or 0))
+            h = int(float(str(self.h_var.get()).strip() or 0))
+            if w > 0 and h > 0:
+                self.points = [(x, y), (x + w, y + h)]
+        except (ValueError, TypeError):
+            pass
+
+    def _nudge_rect(self, kind, direction, step):
+        """微调矩形（2026-08-26，与裁剪可视化同套语义）：
+        - kind='move'   平移（up/down/left/right）
+        - kind='shrink' 收缩边界（top/bottom/left/right）
+        - kind='grow'   扩大边界（top/bottom/left/right）
+        操作后 _redraw 自动写回 x/y/w/h 变量。"""
+        if len(self.points) != 2 or not step:
+            return
+        x1, y1 = self.points[0]
+        x2, y2 = self.points[1]
+        l = min(x1, x2); r = max(x1, x2)
+        t = min(y1, y2); b = max(y1, y2)
+        if kind == "move":
+            if direction == "left":   l -= step; r -= step
+            elif direction == "right": l += step; r += step
+            elif direction == "up":    t -= step; b -= step
+            elif direction == "down":  t += step; b += step
+        elif kind == "shrink":
+            if direction == "left":   l += step
+            elif direction == "right": r -= step
+            elif direction == "top":   t += step
+            elif direction == "bottom": b -= step
+        elif kind == "grow":
+            if direction == "left":   l -= step
+            elif direction == "right": r += step
+            elif direction == "top":   t -= step
+            elif direction == "bottom": b += step
+        else:
+            return
+        l = max(0, min(l, self.orig_w)); t = max(0, min(t, self.orig_h))
+        r = max(0, min(r, self.orig_w)); b = max(0, min(b, self.orig_h))
+        if r <= l or b <= t:
+            return
+        self.points = [(l, t), (r, b)]
+        self._redraw()
+
+    # ---------- 拖拽 ----------
+    def _on_drag_start(self, ev):
+        self.drag_start = self._c2d(ev.x, ev.y)
+        if self.drag_rect_id:
+            self.canvas.delete(self.drag_rect_id)
+            self.drag_rect_id = None
+        if self.rect_id:
+            self.canvas.delete(self.rect_id)
+            self.rect_id = None
+
+    def _on_drag_motion(self, ev):
+        if self.drag_start is None:
+            return
+        cur = self._c2d(ev.x, ev.y)
+        if self.drag_rect_id:
+            self.canvas.delete(self.drag_rect_id)
+        sx, sy = self.drag_start
+        self.drag_rect_id = self.canvas.create_rectangle(
+            sx + self.PAD, sy + self.PAD, cur[0] + self.PAD, cur[1] + self.PAD,
+            outline="yellow", width=2, dash=(4, 2))
+
+    def _on_drag_end(self, ev):
+        if self.drag_start is None:
+            return
+        sx, sy = self.drag_start
+        ex, ey = self._c2d(ev.x, ev.y)
+        ox1, oy1 = self._d2o(sx, sy)
+        ox2, oy2 = self._d2o(ex, ey)
+        if abs(ox2 - ox1) > 0 and abs(oy2 - oy1) > 0:
+            self.points = [(ox1, oy1), (ox2, oy2)]
+        else:
+            self.points = []
+        if self.drag_rect_id:
+            self.canvas.delete(self.drag_rect_id)
+            self.drag_rect_id = None
+        self.drag_start = None
+        self._redraw()
+
+    # ---------- 帧 ----------
+    def _initial_load(self, sec):
+        try:
+            w, h, data = self.extract(self.file, frame_sec=sec,
+                                      target_width=self.disp_w, target_height=self.disp_h)
+            if w is None or h is None:
+                return
+            self._show_img(data)
+        except Exception:
+            pass
+
+    def _show_img(self, data):
+        try:
+            img = tk.PhotoImage(data=data)
+            self.canvas.delete("bg_img")
+            self.canvas.create_image(self.PAD, self.PAD, anchor=tk.NW, image=img, tags="bg_img")
+            self.canvas.image = img
+            self.img = img
+            try:
+                self.canvas.delete(self._loading)
+            except Exception:
+                pass
+            self._redraw()  # 图像显示后画框（图像会盖住先画的）
+        except Exception:
+            pass
+
+    def _refresh_frame(self):
+        sec = time_to_seconds(self.time_var.get().strip() or "0") or 0.0
+        try:
+            w, h, data = self.extract(self.file, frame_sec=sec,
+                                      target_width=self.disp_w, target_height=self.disp_h)
+            if w is not None and h is not None:
+                self._show_img(data)
+                self.info_var.set(f"✅ 已更新画面 ({sec:.2f}s)")
+        except Exception:
+            pass
+
+    # ---------- 操作 ----------
+    def _clear(self):
+        self.points = []
+        self._redraw()
+
+    def _apply(self):
+        if len(self.points) != 2:
+            messagebox.showwarning("提示", "请先拖拽绘制一个选区")
+            return
+        x1, y1 = self.points[0]
+        x2, y2 = self.points[1]
+        x, y = int(min(x1, x2)), int(min(y1, y2))
+        w, h = int(abs(x2 - x1)), int(abs(y2 - y1))
+        if w <= 0 or h <= 0:
+            messagebox.showerror("错误", "选区尺寸无效")
+            return
+        if self.safe_border:
+            # delogo 四周留 ≥1px 边界（x/y=0 贴边或越界 → 滤镜失败）
+            if x < 1:
+                w -= (1 - x)
+                x = 1
+            if y < 1:
+                h -= (1 - y)
+                y = 1
+            if w > self.orig_w - x - 1:
+                w = self.orig_w - x - 1
+            if h > self.orig_h - y - 1:
+                h = self.orig_h - y - 1
+            if w <= 0 or h <= 0:
+                messagebox.showerror("错误", "选区贴近画面边缘，无法安全应用（delogo 需四周留边）")
+                return
+        self.x_var.set(str(x))
+        self.y_var.set(str(y))
+        self.w_var.set(str(w))
+        self.h_var.set(str(h))
+        if self.on_apply:
+            try:
+                self.on_apply()
+            except Exception:
+                pass
+        self.win.destroy()
+
+
 # ================== 公共组件：循环与绿幕 ==================
 class LoopChromaFrame(ttk.LabelFrame):
     """循环播放与绿幕抠像设置组件 - 左右并排（grid布局）"""
     def __init__(self, master, filt_frame=None, **kwargs):
         super().__init__(master, text="循环/绿幕控制", padding="5", **kwargs)
         self.filt_frame = filt_frame
-        self._create_widgets()
-
-    def _create_widgets(self):
+        # 控件构建已内联在下方（历史残留的 _create_widgets 调用无定义，已移除）
         # 使用 grid 布局，将窗口分为左右两列，权重相等
         self.columnconfigure(0, weight=1)
         self.columnconfigure(1, weight=1)
@@ -5864,7 +7695,47 @@ class LoopChromaFrame(ttk.LabelFrame):
             if not t_enabled.get():
                 t_enabled.set(True)
 
-        ttk.Button(coord_frame, text="📋 从裁剪复制坐标", command=copy_from_crop).pack(pady=4)
+        # 独立可视化选区入口：画面上拖拽确定遮罩区域，勾选裁剪时显示裁剪框辅助。
+        # 遮罩作用于「当前子视频」（水印/画中画），文件取 filt_frame.current_file，
+        # 而非主视频（app.input_file）——主视频没有遮罩滤镜。
+        def _open_mask_visual():
+            ff = self.filt_frame
+            app = getattr(ff, "app", None)  # LoopChromaFrame 自身无 app，必须从 filt_frame 取
+            file_path = getattr(ff, "current_file", "") or ""
+            if not file_path or not os.path.exists(file_path):
+                if app is not None and app.input_file is not None:
+                    file_path = app.input_file.get().strip()
+            if not file_path or not os.path.exists(file_path):
+                messagebox.showwarning("提示", "请先选择子视频文件（水印/画中画）")
+                return
+            helper = None
+            if ff.crop_enabled.get():
+                try:
+                    helper = (int(ff.crop_left.get()), int(ff.crop_top.get()),
+                              int(ff.crop_width.get()), int(ff.crop_height.get()))
+                except Exception:
+                    helper = None
+            if app is None or app.root is None:
+                return
+            # 本弹窗 grab_set + topmost 会锁住焦点/盖住可视化窗口 → 打开前释放
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            try:
+                win.attributes("-topmost", False)
+            except Exception:
+                pass
+            RegionVisualEditor(
+                app, file_path,
+                t_x, t_y, t_w, t_h,
+                frame_extractor=ff.extract_video_frame_scaled,
+                helper_rect=helper,
+                safe_border=False,
+                title="可视化选区 - 遮罩 / 透明蒙版",
+            )
+
+        ttk.Button(coord_frame, text="🎯 可视化选区…", command=_open_mask_visual).pack(pady=2)
 
         # 操作按钮
         btn_frame = ttk.Frame(main)
@@ -6720,7 +8591,8 @@ class OverlayPositionFrame(ttk.LabelFrame):
 # ================== 高级选项组件 ==================
 class AdvancedFrame(ttk.LabelFrame):
     def __init__(self, parent, update_callback=None, app=None, show_adaptive=True, watermark_dict=None,
-                 tw_settings=None, tw_canvas_file=None, tw_full_settings=None, **kwargs):
+                 tw_settings=None, tw_canvas_file=None, tw_full_settings=None,
+                 tw_settings_container=None, **kwargs):
         super().__init__(parent, text="高级选项 (硬件解码/自定义参数)", padding="5", **kwargs)
         self.update_callback = update_callback
         self.app = app
@@ -6737,11 +8609,11 @@ class AdvancedFrame(ttk.LabelFrame):
             self.tw_settings = tw_settings
         else:
             self.tw_settings = self.app.text_watermark_settings if self.app is not None else {}
-        # 「注入到封装页」复选框显示条件：仅转换主界面（tw_settings 未显式传入）显示，
-        # 队列任务编辑（传了任务自己的 dict）隐藏
-        self.tw_show_inject = (tw_settings is None)
         # 文字水印位置编辑器画布基准文件：默认主界面输入文件；队列任务编辑传 task.input
         self.tw_canvas_file = tw_canvas_file
+        # 多文字水印容器（2026-08-26）：None → 主界面（app.text_watermark_items）；
+        # 队列任务编辑传 task.settings（写 task.settings["text_watermark_items"]）
+        self.tw_settings_container = tw_settings_container
         # 队列任务编辑时传任务完整 settings，用于按渲染设置（裁剪/缩放/旋转）算画布
         self.tw_full_settings = tw_full_settings
 
@@ -7067,8 +8939,8 @@ class AdvancedFrame(ttk.LabelFrame):
             return
         TextWatermarkDialog(self, self.app,
                             settings_target=self.tw_settings,
-                            refresh_cb=self.update_callback,
-                            show_inject=self.tw_show_inject)
+                            settings_container=self.tw_settings_container,
+                            refresh_cb=self.update_callback)
 
     def open_watermark_editor(self):
         """打开图片/视频水印的参数编辑窗口（缩放、裁剪、旋转、位置等）。
@@ -7175,74 +9047,11 @@ class AdvancedFrame(ttk.LabelFrame):
         return 1280, 720
 
     def _open_text_wm_position_editor(self):
-        """为文字水印打开可视化位置编辑器"""
+        """为文字水印打开可视化位置编辑器（转换页/队列共用实现）"""
         tw = self.tw_settings
         canvas_w, canvas_h = self._tw_canvas_size()
-        # 估算文字尺寸
-        text = tw.get("text", "")
-        fs = tw.get("font_size", 48)
-        wm_w = max(len(text) * int(fs * 0.7), int(fs * 0.7))
-        wm_h = int(fs * 1.3)
-        x_var = tk.StringVar(value=tw.get("overlay_x", "10"))
-        y_var = tk.StringVar(value=tw.get("overlay_y", "10"))
-        def on_apply(nx, ny, nw, nh, ncw, nch):
-            x_var.set(str(nx))
-            y_var.set(str(ny))
-            tw["overlay_x"] = str(nx)
-            tw["overlay_y"] = str(ny)
-            # 矩形高度反推字体大小（wm_h = fs * 1.3 → fs = nh / 1.3）
-            if nh > 0:
-                new_fs = max(8, int(round(nh / 1.3)))
-                old_fs = int(tw.get("font_size", 48))
-                if new_fs != old_fs:
-                    tw["font_size"] = new_fs
-                    self.app._append_info_ui(f"[文字水印] 字体大小已更新: {old_fs} → {new_fs}")
-            if self.update_callback:
-                self.update_callback()
-            self.app._append_info_ui(f"[文字水印] 位置已设置: ({nx}, {ny})")
-        title = "可视化编辑文字水印位置"
-        # 文字水印静态旋转角度（-180..180），旋转后为 hypot 正方形包围盒
-        try:
-            _tw_ra = float(tw.get("rotate", 0) or 0)
-        except (ValueError, TypeError):
-            _tw_ra = 0.0
-        _tw_spin = bool(tw.get("spin_enabled", False))
-        _eff_w, _eff_h = wm_w, wm_h
-        if _tw_ra != 0 or _tw_spin:
-            _tw_d = int(round(((wm_w * wm_w + wm_h * wm_h) ** 0.5)))
-            _eff_w = _eff_h = _tw_d
-        # 初始坐标：safe_eval_expr 可能返回 0（合法位置），必须用 None 判断而非 `or 10`，
-        # 否则 y=0 会被 `0 or 10` 顶成 10，看起来「y 没返回数值」。
-        _init_x = safe_eval_expr(x_var.get(), {"W": canvas_w, "H": canvas_h, "w": _eff_w, "h": _eff_h})
-        _init_y = safe_eval_expr(y_var.get(), {"W": canvas_w, "H": canvas_h, "w": _eff_w, "h": _eff_h})
-
-        def apply_tw_angle(new_angle):
-            tw["rotate"] = float(new_angle or 0.0)
-            # 同步回写文字水印对话框内的「旋转角度」数值框（对话框实例存于 app.text_wm_dialog）
-            _dlg = getattr(self.app, "text_wm_dialog", None)
-            if _dlg is not None:
-                try:
-                    if _dlg.winfo_exists():
-                        _dlg.rotate_var.set(float(new_angle or 0.0))
-                except Exception:
-                    pass
-            if hasattr(self, "rotate_var"):
-                try:
-                    self.rotate_var.set(float(new_angle or 0.0))
-                except Exception:
-                    pass
-            if self.update_callback:
-                self.update_callback()
-            self.app._append_info_ui(f"[文字水印] 旋转角度已更新: {new_angle}°")
-
-        self.app._generic_overlay_editor(
-            self, canvas_w, canvas_h,
-            10 if _init_x is None else _init_x,
-            10 if _init_y is None else _init_y,
-            wm_w, wm_h, on_apply, title, None,
-            bg_draw_func=None, rect_label='文字水印',
-            min_visible_pixels=0, show_scale_tip=False,
-            rotate_angle=_tw_ra, angle_cb=apply_tw_angle)
+        _open_tw_position_editor_impl(self.app, tw, canvas_w, canvas_h,
+                                      self.update_callback, self)
 
 
     def _get_wm_templates_path(self):
@@ -7951,9 +9760,12 @@ class FFmpegBatchGUI:
 
         self.use_mpv = tk.BooleanVar(value=False)
         self.mpv_path = tk.StringVar(value="mpv")
-        # mpv 可用性标志：None=未检测 / True / False。
+        # mpv 可用性标志：None=未静态检测 / True / False（静态=路径可解析+文件存在，不启动子进程）。
         # 只判断「二进制能否启动」——滤镜图错误（lavfi-complex 报错）是运行期错误，绝不走回退。
         self._mpv_usable = None
+        # 是否已做过子进程级验证（mpv --version）。启动/改设置只做静态路径检查，
+        # 子进程验证推迟到首次预览（_mpv_ready），避免启动时无谓启动 mpv 进程（~100ms）。
+        self._mpv_verified = False
         # 启动时检测一次 + 中途修改 use_mpv/mpv_path 重新检测（load_player_settings 的 set 也会触发）
         self.use_mpv.trace_add("write", self._refresh_mpv_flag)
         self.mpv_path.trace_add("write", self._refresh_mpv_flag)
@@ -8002,6 +9814,7 @@ class FFmpegBatchGUI:
         self._concat_params_cache = {}
         
         self._merge_preview_after_id = None   # 合并命令预览防抖 ID
+        self._merge_refresh_paused = tk.BooleanVar(value=False)  # 临时关闭命令刷新（设置滤镜期间免卡顿）
         
         self._clipboard_filter_params = None   # 存储复制的参数字典
         self._clipboard_va_filter = None       # V→A 专用：视频截取/变速/倒放快照（映射到音频键名）
@@ -8126,6 +9939,15 @@ class FFmpegBatchGUI:
             "concat_enabled": False,     # 末端 concat 图片/视频
             "concat_path": "",           # 追加文件（图片或视频）
             "concat_sec": 5.0,           # 图片显示秒数
+        }
+        # 多文字水印列表（2026-08-26）：每项为 text_watermark 同构 dict。空列表 → 用单条
+        self.text_watermark_items = []
+        # 封装页独立文字水印容器（2026-08-26）：封装页有自己的文字水印入口，
+        # 不再从转换页注入。text_watermark = 单条（兼容旧读写），
+        # text_watermark_items = 多条列表（TextWatermarkDialog 写回目标）。
+        self._merge_tw = {
+            "text_watermark": dict(self.text_watermark_settings),
+            "text_watermark_items": [],
         }
         # ---------------------------------
 
@@ -9373,8 +11195,16 @@ class FFmpegBatchGUI:
                     global_filters.append(enhance_filter)
 
             # ========== 文字水印 ==========
+            # 2026-08-26 多实例：_tw_rotate = 任一启用项需旋转子图；非旋转路径渲染全部非旋转项
             tw_settings = settings.get("text_watermark", {})
-            _tw_enabled, _tw_rotate = text_watermark_active(tw_settings)
+            _tw_items = settings.get("text_watermark_items") or []
+            _tw_active = [i for i in _tw_items
+                          if i.get("enabled", True) and str(i.get("text", "") or "").strip()]
+            if not _tw_active:
+                _tw_active = [tw_settings] if (tw_settings.get("enabled", False)
+                                               and str(tw_settings.get("text", "") or "").strip()) else []
+            _tw_enabled = bool(_tw_active)
+            _tw_rotate = any(text_watermark_needs_subgraph(i) for i in _tw_active)
             if _tw_rotate:
                 # 旋转：global_filters 先接到临时标签，文字子图（透明层+rotate+overlay）接在后面
                 global_filter_str = ",".join(global_filters) if global_filters else "null"
@@ -9383,10 +11213,10 @@ class FFmpegBatchGUI:
                     tw_in = "[v_pre]"
                 else:
                     tw_in = "[vout]"
-                filter_parts.append(build_text_watermark_filtergraph(tw_settings, main_label=tw_in, out_label="[v_tw]"))
+                filter_parts.append(build_text_watermark_chain(settings, main_label=tw_in, out_label="[v_tw]"))
                 map_v = "[v_tw]"
             else:
-                dt = build_drawtext_filter(tw_settings)
+                dt = build_drawtext_chain_vf(tw_settings, _tw_items)
                 if dt:
                     global_filters.append(dt)
                 if global_filters:
@@ -9760,6 +11590,16 @@ class FFmpegBatchGUI:
     
             # 叠加（不添加 shortest=1）
             blend_mode = (sub_settings.get('blend_mode', 'normal') or 'normal').strip().lower()
+            if blend_mode != 'normal':
+                # 降级判定（用户拍板 2026-08-25）：pad 画布大于主视频渲染尺寸 → blend 窗口
+                # 轨迹一旦进入黑边区就脱离主视频像素、与黑混合无意义 → 强制普通叠加。
+                # pad ≤ 主视频（画布是裁剪窗口，无黑边）→ blend 保留。
+                _dgp = self._blend_downgrade_pad(main_settings, main_file_path)
+                if _dgp:
+                    self._append_info_ui(
+                        f"[混合模式] pad 画布 {_dgp[0]}x{_dgp[1]} 大于主视频渲染尺寸，"
+                        f"blend({blend_mode}) 已降级为普通叠加（脱离主视频像素的混合无意义）")
+                    blend_mode = 'normal'
             if sub_settings.get('overlay_enabled', True):
                 x = sub_settings.get('overlay_x', '0').strip() or '0'
                 y = sub_settings.get('overlay_y', '0').strip() or '0'
@@ -9920,28 +11760,51 @@ class FFmpegBatchGUI:
         return complex_filter, f"[{current_v}]"
 
     def _compute_output_canvas(self, main_settings, main_file_path):
-        """计算最终输出画布尺寸（优先 pad 画布，否则主视频渲染尺寸）。
+        """计算最终输出画布尺寸（优先 pad 画布，否则主视频【渲染后】尺寸）。
 
         供快照缩放与画布尺寸参考使用：主视频启用 pad 后，实际输出画布是
         pad 画布（含主视频偏移），而非主视频自身的渲染尺寸。
-        """
-        pad_enabled = main_settings.get('pad_enabled', False)
-        if pad_enabled:
-            pw = (main_settings.get('pad_width', '') or '').strip()
-            ph = (main_settings.get('pad_height', '') or '').strip()
-            if pw and ph:
-                try:
-                    cw = int(float(pw)); ch = int(float(ph))
-                    if cw > 0 and ch > 0:
-                        return max(2, cw), max(2, ch)
-                except ValueError:
-                    pass
+        ⚠️ 2026-08-25 修复：非 pad 分支改用 _main_render_size（含 crop/scale），
+        旧实现返回源尺寸——主视频链内 scale 后 crop 上下文 iw/ih 与 mw/mh 不一致，
+        blend 轨迹 clamp/静态越界判断会错。"""
+        pg = _pad_canvas_geometry(main_settings)
+        if pg:
+            return max(2, pg[0]), max(2, pg[1])
+        w, h = self._main_render_size(main_settings, main_file_path)
+        if w is None or h is None:
+            return 1280, 720
+        return max(2, w), max(2, h)
+
+    def _main_render_size(self, main_settings, main_file_path):
+        """主视频滤镜链后的实际渲染尺寸：源旋转尺寸 + crop/scale。
+        与 build_video_filter_chain 的链序（裁剪→旋转→缩放）一致。
+        用于 blend 降级判定、画布计算（修复 scale 后 mw/mh 与 crop 上下文一致）。"""
         orig_w, orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, main_file_path, main_settings)
-        if orig_w is None or orig_h is None:
-            orig_w, orig_h = self._get_video_dimensions_cached(main_file_path)
-            if orig_w is None or orig_h is None:
-                orig_w, orig_h = 1280, 720
-        return compute_rendered_size(orig_w, orig_h, main_settings)
+        if not orig_w or not orig_h:
+            return None, None
+        try:
+            w, h = compute_rendered_size(orig_w, orig_h, main_settings)
+        except Exception:
+            return orig_w, orig_h
+        if not w or not h:
+            return orig_w, orig_h
+        return max(2, int(w)), max(2, int(h))
+
+    def _blend_downgrade_pad(self, main_settings, main_file_path) -> Optional[Tuple[int, int]]:
+        """blend 降级判定（用户拍板 2026-08-25）：pad 启用且画布任一轴大于主视频
+        渲染尺寸 → 返回 (pad_w, pad_h)（需降级），否则 None。
+        pad 比主视频大时画布有黑边区，blend 窗口轨迹一旦进入黑边区就脱离主视频
+        像素、与黑色混合无意义（除非时刻计算与其他子视频像素的 blend，未实现）→
+        强制降级普通叠加。pad ≤ 主视频（画布只是裁剪窗口，无黑边）→ 保留 blend。"""
+        pg = _pad_canvas_geometry(main_settings)
+        if not pg:
+            return None
+        mw, mh = self._main_render_size(main_settings, main_file_path)
+        if not mw:
+            return None
+        if pg[0] > mw or pg[1] > mh:
+            return (pg[0], pg[1])
+        return None
 
     def _overlay_content_size(self, sub_file, sub_settings):
         """子视频「内容盒」渲染尺寸（未旋转 w×h，考虑元数据/用户旋转、裁剪、缩放）。
@@ -10293,7 +12156,7 @@ class FFmpegBatchGUI:
         为什么不用 os.path.isfile/os.access(X_OK)：Windows 下 .exe 的 X_OK 恒真，
         且文件在但缺 DLL/运行库（mpv 同目录 dll 或 VC 运行时）时照样启动失败——
         这类「文件在但用不了」只有实际跑一次才知道。--version 是「mpv 无法使用」
-        的最可靠判据（~几十 ms，仅在启动/改路径时各跑一次）。
+        的最可靠判据（~几十 ms，惰性化后仅在首次预览或路径变更后的首次预览各跑一次）。
 
         注意边界：这里只判「二进制可用性」。滤镜图错误（--lavfi-complex 报错）是
         mpv 起来之后才发生的运行期错误（进程退出码非零、Popen 不抛异常），
@@ -10319,20 +12182,40 @@ class FFmpegBatchGUI:
             return False
 
     def _refresh_mpv_flag(self, *args):
-        """重算 mpv 可用标志：启动时 + use_mpv/mpv_path 变更时（trace）调用。"""
+        """重算 mpv 可用标志（静态）：启动时 + use_mpv/mpv_path 变更时（trace）调用。
+        只做路径级检查（不启动子进程），子进程验证由 _mpv_ready 在首次预览时补齐，
+        避免启动时无谓启动 mpv 进程。"""
         if not self.use_mpv.get():
             self._mpv_usable = False
+            self._mpv_verified = True    # 关闭状态无需再做子进程验证
         else:
-            self._mpv_usable = self._check_mpv_usable()
+            self._mpv_usable = self._static_mpv_check()
+            self._mpv_verified = False   # 路径可能变了，下次预览需重新验证
+
+    def _static_mpv_check(self) -> bool:
+        """静态检查 mpv 路径是否可解析（PATH/绝对路径 + 文件存在），不启动进程。"""
+        raw = self.mpv_path.get().strip()
+        if not raw:
+            return False
+        exe = raw
+        if not os.path.isabs(exe):
+            found = find_executable(exe) or shutil.which(exe)
+            if not found:
+                return False
+            exe = found
+        return os.path.isfile(exe)
 
     def _mpv_ready(self, log=True) -> bool:
         """统一入口：use_mpv 开启 且 mpv 二进制可用 → True。
         False 时按需打一条「回退」日志（调用方决定场景：可回退的走 ffplay，
-        不可回退的（lavfi-complex 复杂图）自行提示）。"""
+        不可回退的（lavfi-complex 复杂图）自行提示）。
+        首次调用（或路径变更后）在此补做子进程级验证——mpv --version 约 100ms，
+        只付一次，避免启动时拖慢。"""
         if not self.use_mpv.get():
             return False
-        if self._mpv_usable is None:
+        if self._mpv_usable is None or not self._mpv_verified:
             self._mpv_usable = self._check_mpv_usable()
+            self._mpv_verified = True
         if not self._mpv_usable and log:
             raw = self.mpv_path.get().strip()
             self._append_info_ui(
@@ -10424,6 +12307,7 @@ class FFmpegBatchGUI:
                 # 注意：滤镜图错误时 mpv 进程能启动、只是退出码非零，Popen 不抛异常，
                 # 永远不会进到这里（滤镜错误绝不回退）。
                 self._mpv_usable = False
+                self._mpv_verified = True   # 已实测失败，后续预览直接回退不再重试子进程
                 raw = self.mpv_path.get().strip()
                 self._append_info_ui(f"[预览] mpv 启动失败（{raw}）：{e}，已回退 ffplay")
                 fb = _build_ffplay()
@@ -10564,8 +12448,17 @@ class FFmpegBatchGUI:
                 self._append_info_ui(f"[预览] 水印虚拟框: 位置({x_val:.1f}, {y_val:.1f}) 尺寸{eff_w}x{eff_h}")
     
         # ----- 3. 文字水印判定：旋转/spin/轨迹需复杂图，普通 drawtext 走 -vf 链 -----
+        # 2026-08-26 多实例：_tw_rotate = 任一启用项需要旋转子图（不只看首条）；
+        # 普通 -vf 路径由 build_drawtext_chain_vf 渲染所有非旋转项。
         tw_settings = settings.get("text_watermark", {})
-        _tw_enabled, _tw_rotate = text_watermark_active(tw_settings)
+        _tw_items = settings.get("text_watermark_items") or []
+        _tw_active = [i for i in _tw_items
+                      if i.get("enabled", True) and str(i.get("text", "") or "").strip()]
+        if not _tw_active:
+            _tw_active = [tw_settings] if (tw_settings.get("enabled", False)
+                                           and str(tw_settings.get("text", "") or "").strip()) else []
+        _tw_enabled = bool(_tw_active)
+        _tw_rotate = any(text_watermark_needs_subgraph(i) for i in _tw_active)
 
         # ----- 4. 自适应缩放参数（旋转路径并入复杂图；普通路径追加 vf） -----
         orig_w, orig_h = get_video_rotated_dimensions(self.ffprobe_cmd, file_path, settings)
@@ -10634,7 +12527,9 @@ class FFmpegBatchGUI:
                     _mdim = self._get_video_dimensions_cached(file_path)
                     _main_w = _mdim[0] or 1280
                     _main_h = _mdim[1] or 720
-                    adapted_wm2 = self._adapt_sub_settings(wm_settings, _main_w, _main_h,
+                    # 源尺寸副本：自适应按主视频内容缩放，不随 pad 画布变（用户拍板 2026-08-25）
+                    _src_main_w, _src_main_h = _main_w, _main_h
+                    adapted_wm2 = self._adapt_sub_settings(wm_settings, _src_main_w, _src_main_h,
                                                            _wm_ow, _wm_oh) if wm_settings.get("adaptive", False) else wm_settings
                     _ow2, _oh2 = get_video_rotated_dimensions(self.ffprobe_cmd, wm_file, adapted_wm2)
                     if _ow2 is None or _oh2 is None:
@@ -10646,6 +12541,31 @@ class FFmpegBatchGUI:
                     adapted_wm2 = wm_settings
                     wm_w2, wm_h2 = 320, 240
                     _main_w, _main_h = 1280, 720
+                    _src_main_w, _src_main_h = _main_w, _main_h
+                # ---- 主视频画布偏移（pad）：复杂图分支补渲染（与成片/合并页预览一致）+ 画布基准 ----
+                _pg = _pad_canvas_geometry(settings)
+                if _pg:
+                    _pwc, _phc, _pox, _poy = _pg
+                    # 画布限时防无限延长：manual_t（用户 -t）优先，否则主视频时长；都没有 → shortest=1
+                    _pad_dur2 = ""
+                    if manual_t is not None:
+                        _pad_dur2 = f":duration={manual_t:.3f}"
+                    else:
+                        try:
+                            _main_dur2 = self._get_media_duration(file_path)
+                            if _main_dur2 and _main_dur2 > 0:
+                                _pad_dur2 = f":duration={_main_dur2:.3f}"
+                        except Exception:
+                            pass
+                    fc_parts.append(f"color=c=black:s={_pwc}x{_phc}{_pad_dur2}[canvas]")
+                    if _pad_dur2:
+                        fc_parts.append(f"[canvas]{cur}overlay={_pox}:{_poy}[v_main_pad]")
+                    else:
+                        fc_parts.append(f"[canvas]{cur}overlay={_pox}:{_poy}:shortest=1[v_main_pad]")
+                    cur = "[v_main_pad]"
+                    # 画布基准更新：blend clamp/基准求值按 pad 画布（overlay 目标流=v_main_pad）
+                    _main_w, _main_h = _pwc, _phc
+                    self._append_info_ui(f"[预览] 主视频画布偏移：{_pwc}x{_phc} @ ({_pox},{_poy})")
                 # movie 源：路径统一正斜杠 + 冒号转义 \\:（movie 滤镜参数解析中 \ 是转义符，
                 # Windows 反斜杠路径必须转成正斜杠，否则 \U \A 等会被当作无效转义）；
                 # 含 [ ] ' , ; 等 filtergraph 特殊字符的路径先用临时硬链接/副本规避
@@ -10763,6 +12683,15 @@ class FFmpegBatchGUI:
                             _ov_expr = f"lt(t,{_main_dur:.3f})"
                 _blend2 = (str(adapted_wm2.get('blend_mode', 'normal') or 'normal')).strip().lower()
                 if _blend2 != 'normal':
+                    # 降级判定（用户拍板）：pad 画布大于主视频渲染尺寸 → blend 脱离主视频
+                    # 像素、与黑混合无意义 → 强制普通叠加（走下方 normal 分支，W/H=pad 画布）
+                    _dgp = self._blend_downgrade_pad(settings, file_path)
+                    if _dgp:
+                        self._append_info_ui(
+                            f"[混合模式] pad 画布 {_dgp[0]}x{_dgp[1]} 大于主视频渲染尺寸，"
+                            f"blend({_blend2}) 已降级为普通叠加（脱离主视频像素的混合无意义）")
+                        _blend2 = 'normal'
+                if _blend2 != 'normal':
                     # 区域化 blend（与正式命令/合并页预览共用 _make_blend_region）：
                     # 旋转（自旋转/静态角度）时区域=对角线 d（需求2：不切旋转内容）；
                     # 轨迹动态跟随（方案C：h/v/diamond/corners 全支持，crop 窗口跟动效）。
@@ -10849,7 +12778,7 @@ class FFmpegBatchGUI:
             # 旋转时走透明层子图（eof_action=pass）；非旋转直接 drawtext 片段（enable 由
             # _build_drawtext_enable 生成：显示时段 between / 循环 lt(mod(t,L),D)）。
             if _tw_enabled:
-                tw_frag = build_text_watermark_filtergraph(tw_settings, main_label=cur, out_label="[v_tw]")
+                tw_frag = build_text_watermark_chain(settings, main_label=cur, out_label="[v_tw]")
                 if tw_frag:
                     if manual_t is not None:
                         tw_frag = tw_frag.replace(":format=auto",
@@ -10883,7 +12812,7 @@ class FFmpegBatchGUI:
                 vf_parts.append(f"{cur}drawbox={drawbox_expr}[v1]")
                 cur = "[v1]"
             tw_out = "[v_tw]" if scale_expr else ""
-            tw_frag = build_text_watermark_filtergraph(tw_settings, main_label=cur, out_label=tw_out)
+            tw_frag = build_text_watermark_chain(settings, main_label=cur, out_label=tw_out)
             if tw_frag:
                 if manual_t is not None:
                     tw_frag = tw_frag.replace(":format=auto",
@@ -10900,7 +12829,7 @@ class FFmpegBatchGUI:
         if not lavfi_complex_str and not filter_chain:
             if drawbox_expr:
                 filter_parts.append(f"drawbox={drawbox_expr}")
-            dt = build_drawtext_filter(tw_settings)
+            dt = build_drawtext_chain_vf(tw_settings, _tw_items)
             if dt:
                 filter_parts.append(dt)
                 self._append_info_ui("[预览] 已添加文字水印 drawtext")
@@ -11512,19 +13441,27 @@ class FFmpegBatchGUI:
                     reverse=settings.get('reverse_enabled', False),
                 )
                 # 文字水印（旋转时走透明层+rotate+overlay，需 filter_complex）
+                # 2026-08-26 多实例：_tw_rotate = 任一启用项需旋转；-vf 路径渲染全部非旋转项
                 tw_settings = settings.get("text_watermark", {})
-                _tw_enabled, _tw_rotate = text_watermark_active(tw_settings)
+                _tw_items = settings.get("text_watermark_items") or []
+                _tw_active = [i for i in _tw_items
+                              if i.get("enabled", True) and str(i.get("text", "") or "").strip()]
+                if not _tw_active:
+                    _tw_active = [tw_settings] if (tw_settings.get("enabled", False)
+                                                   and str(tw_settings.get("text", "") or "").strip()) else []
+                _tw_enabled = bool(_tw_active)
+                _tw_rotate = any(text_watermark_needs_subgraph(i) for i in _tw_active)
                 if _tw_rotate:
                     base_vf = vf if (vf and vf != "null") else "null"
-                    fc = f"[0:v]{base_vf}[v_tw_base];" + build_text_watermark_filtergraph(
-                        tw_settings, main_label="[v_tw_base]", out_label="[v_tw]")
+                    fc = f"[0:v]{base_vf}[v_tw_base];" + build_text_watermark_chain(
+                        settings, main_label="[v_tw_base]", out_label="[v_tw]")
                     cmd_list.extend(["-filter_complex", fc])
                     cmd_list.extend(["-map", "[v_tw]"])
                     if settings.get("audio_enabled", True):
                         cmd_list.extend(["-map", "0:a?"])
                         cmd_list.extend(["-map", "0:s?"])
                 else:
-                    dt = build_drawtext_filter(tw_settings)
+                    dt = build_drawtext_chain_vf(tw_settings, _tw_items)
                     if dt:
                         vf = f"{vf},{dt}" if vf != "null" else dt
                     if vf != "null":
@@ -11725,7 +13662,7 @@ class FFmpegBatchGUI:
         )
         # 追加文字水印（在 overlay 之后；旋转时走透明层+rotate+overlay 子图）
         tw_settings = settings.get("text_watermark", {})
-        tw_frag = build_text_watermark_filtergraph(tw_settings, main_label=final_v_label, out_label="[v_dtext]")
+        tw_frag = build_text_watermark_chain(settings, main_label=final_v_label, out_label="[v_dtext]")
         if tw_frag:
             complex_filter = f"{complex_filter};{tw_frag}"
             final_v_label = "[v_dtext]"
@@ -11824,6 +13761,13 @@ class FFmpegBatchGUI:
         settings["enhance"] = self.video_filter.get_enhance_settings()
         # 添加文字水印设置（深拷贝）
         settings["text_watermark"] = copy.deepcopy(self.text_watermark_settings)
+        # 多文字水印列表（2026-08-26）：优先列表，空则迁移单条（旧预设兼容）
+        if getattr(self, "text_watermark_items", None):
+            settings["text_watermark_items"] = copy.deepcopy(self.text_watermark_items)
+        elif self.text_watermark_settings.get("enabled") or self.text_watermark_settings.get("text"):
+            settings["text_watermark_items"] = [copy.deepcopy(self.text_watermark_settings)]
+        else:
+            settings["text_watermark_items"] = []
         # 添加末端处理设置（深拷贝；转换页/队列各自独立，队列 add_task 快照此值）
         settings["end_handling"] = copy.deepcopy(self._trans_end_handling)
         return settings
@@ -12059,8 +14003,9 @@ class FFmpegBatchGUI:
                                 rotate_angle=0.0,       # 初始旋转角度（度）；>0 时启用旋转显示与旋转手柄
                                 angle_cb=None,          # 应用时回调 angle_cb(new_angle)，用于写回 rotate_angle
                                 angle_editable=True,    # False=只读显示角度（不显示旋转手柄，如主视频档位旋转）
-                                rot_square=True         # True=锚点为旋转后正方形包围盒左上角（子视频自由角度）；
+                                rot_square=True,        # True=锚点为旋转后正方形包围盒左上角（子视频自由角度）；
                                                         # False=锚点为内容矩形左上角（主视频 transpose 档位）
+                                show_nudge=True         # 2026-08-26：是否显示「微调(像素)」按钮行。文字/图片水印、
                                 ):
         """
         通用叠加/偏移可视化编辑器（核心重构函数）
@@ -12548,6 +14493,59 @@ class FFmpegBatchGUI:
             draw_btn.pack(side=tk.LEFT, padx=5)
             draw_abort_btn = ttk.Button(draw_btn_frame, text="取消绘制", command=abort_draw, state="disabled")
             draw_abort_btn.pack(side=tk.LEFT, padx=5)
+
+        # 微调按钮：移动 / 减 / 加 三行，各自带步进（2026-08-26 与裁剪可视化同套语义）。
+        # show_nudge=False 时整段跳过。
+        if show_nudge:
+            nudge_frame = ttk.LabelFrame(win, text="微调 (像素)", padding=3)
+            nudge_frame.pack(pady=(2, 2))
+
+            def nudge_rect(kind, direction, step):
+                nonlocal current_x, current_y, current_w, current_h
+                if draw_mode_active:
+                    return
+                if kind == "move":
+                    if direction == "left":   current_x -= step
+                    elif direction == "right": current_x += step
+                    elif direction == "up":    current_y -= step
+                    elif direction == "down":  current_y += step
+                elif kind == "shrink":
+                    if direction == "left":   current_x += step; current_w -= step
+                    elif direction == "right": current_w -= step
+                    elif direction == "top":   current_y += step; current_h -= step
+                    elif direction == "bottom": current_h -= step
+                elif kind == "grow":
+                    if direction == "left":   current_x -= step; current_w += step
+                    elif direction == "right": current_w += step
+                    elif direction == "top":   current_y -= step; current_h += step
+                    elif direction == "bottom": current_h += step
+                else:
+                    return
+                if current_w < 1: current_w = 1
+                if current_h < 1: current_h = 1
+                clamp_rect()
+                update_rect_position()
+
+            _nstep = {}
+            for _kind, _labels in [("move", [("上移", "up"), ("下移", "down"), ("左移", "left"), ("右移", "right")]),
+                                   ("shrink", [("上减", "top"), ("下减", "bottom"), ("左减", "left"), ("右减", "right")]),
+                                   ("grow", [("上加", "top"), ("下加", "bottom"), ("左加", "left"), ("右加", "right")])]:
+                _nr = ttk.Frame(nudge_frame)
+                _nr.pack(fill=tk.X, pady=1)
+                for _label, _dir in _labels:
+                    ttk.Button(_nr, text=_label, width=4,
+                               command=lambda k=_kind, d=_dir: nudge_rect(k, d, _nstep_get(_kind))).pack(
+                        side=tk.LEFT, padx=1)
+                ttk.Label(_nr, text="步进:").pack(side=tk.LEFT, padx=(6, 2))
+                _sv = tk.StringVar(value="1")
+                _nstep[_kind] = _sv
+                ttk.Spinbox(_nr, textvariable=_sv, from_=1, to=999, width=4).pack(side=tk.LEFT)
+
+            def _nstep_get(kind):
+                try:
+                    return int(_nstep[kind].get())
+                except (ValueError, TypeError, KeyError):
+                    return 1
     
         # 通用操作按钮
         action_frame = ttk.Frame(win)
@@ -12617,7 +14615,7 @@ class FFmpegBatchGUI:
         if not allow_resize and 'draw_btn_frame' in locals():
             draw_btn_frame.pack_forget()
     
-        center_window(win, disp_w + 20, disp_h + 240)
+        center_window(win, disp_w + 20, disp_h + (330 if show_nudge else 240))
         win.wait_window()
         parent.lift()
         parent.focus_force()
@@ -12726,7 +14724,8 @@ class FFmpegBatchGUI:
             allow_negative_offset=True,   # 允许负偏移
             rect_color='deepskyblue',      # 蓝色
             rect_label='主视频',
-            min_visible_pixels=10
+            min_visible_pixels=10,
+            show_nudge=False   # 封装页主视频位置编辑器：虚拟画布，无微调按钮
         )
 
     # ---------- 水印位置可视化编辑器 ----------
@@ -12809,7 +14808,8 @@ class FFmpegBatchGUI:
                                      on_apply, title, aspect, bg_draw_func=None,rect_label='水印',
                                      min_visible_pixels=0,show_scale_tip=True,
                                      allow_negative_offset=free_layout,
-                                     rotate_angle=_wm_ra, angle_cb=apply_wm_angle)
+                                     rotate_angle=_wm_ra, angle_cb=apply_wm_angle,
+                                     show_nudge=False)   # 图片水印位置编辑器：无微调按钮
     
     # ---------- 从视频位置可视化编辑器 ----------
     def open_visual_overlay_editor(self, track_idx, ov_x_var=None, ov_y_var=None, ov_angle_var=None,
@@ -12931,7 +14931,8 @@ class FFmpegBatchGUI:
             show_scale_tip=True,
             allow_negative_offset=free_layout,
             rotate_angle=_ra,
-            angle_cb=apply_angle
+            angle_cb=apply_angle,
+            show_nudge=False   # 画中画/子视频位置编辑器：无微调按钮
         )
 
     # ---------- 预设管理 ----------
@@ -13814,7 +15815,7 @@ class FFmpegBatchGUI:
             # 截取片段页面
             page_trim = ttk.Frame(notebook)
             notebook.add(page_trim, text="截取片段")
-            trim_frame = TrimFrame(page_trim)
+            trim_frame = TrimFrame(page_trim, app=self, file_source=lambda: task.input)
             trim_frame.pack(fill=tk.X, padx=5, pady=5)
             trim_frame.set_settings(task.settings)
             
@@ -13913,6 +15914,7 @@ class FFmpegBatchGUI:
                 show_adaptive=True,
                 watermark_dict=watermark_dict,
                 tw_settings=task.settings["text_watermark"],
+                tw_settings_container=task.settings,
                 tw_canvas_file=task.input,
                 tw_full_settings=task.settings,
             )
@@ -13987,7 +15989,8 @@ class FFmpegBatchGUI:
                             wm_w, wm_h, on_tw_apply, "可视化编辑文字水印位置", None,
                             bg_draw_func=None, rect_label='文字水印',
                             min_visible_pixels=0, show_scale_tip=False,
-                            rotate_angle=_tw2_ra, angle_cb=apply_tw2_angle)
+                            rotate_angle=_tw2_ra, angle_cb=apply_tw2_angle,
+                            show_nudge=False)   # 队列任务文字水印位置编辑器：无微调按钮
                         return
                     messagebox.showwarning("提示", "请先在任务设置中输入水印文件路径，或启用文字水印")
                     return
@@ -14241,6 +16244,8 @@ class FFmpegBatchGUI:
 
     # ==================== 封装/合并模块 ====================
     def create_merge_tab(self, parent):
+        # 2026-08-26：记录封装页宿主控件，供封装页文字水印对话框（模态 Toplevel）作父窗口
+        self._merge_tab_widget = parent
         # 主视频文件行
         f1 = ttk.Frame(parent)
         f1.pack(fill=tk.X, pady=5)
@@ -14326,7 +16331,9 @@ class FFmpegBatchGUI:
         btn_frame.pack(fill=tk.X, pady=5)
         ttk.Button(btn_frame, text="添加外部音轨", command=lambda: self.merge_add_external("audio")).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="添加外部字幕", command=lambda: self.merge_add_external("subtitle")).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="清空轨道", command=self.merge_clear_tracks).pack(side=tk.LEFT, padx=2)
+        # 2026-08-26：底部「清空轨道」与列表上方工具栏的「清空」重复 → 改为封装页
+        # 独立的「文字水印」入口（封装页不再从转换页注入文字水印）
+        ttk.Button(btn_frame, text="文字水印", command=self.open_merge_text_watermark_dialog).pack(side=tk.LEFT, padx=2)
         self.pip_enabled = tk.BooleanVar(value=False)
         pip_chk = ttk.Checkbutton(btn_frame, text="启用画中画", variable=self.pip_enabled)
         pip_chk.pack(side=tk.LEFT, padx=5)
@@ -14565,9 +16572,22 @@ class FFmpegBatchGUI:
         self.merge_btn.pack(side=tk.LEFT, padx=5)
 
         btn_refresh_merge = tk.Button(opt_action_frame, text="刷新命令", 
-                                      command=self.merge_update_command_preview,
+                                      command=self._do_merge_update_command_preview,
                                       height=1, width=12, relief=tk.RAISED)
         btn_refresh_merge.pack(side=tk.LEFT, padx=5)
+        # 临时关闭刷新：设置滤镜/数据流期间免去命令重建卡顿（勾选后自动刷新暂停，
+        # 手动「刷新命令」仍即时生效；播放预览/快照不受影响）
+        self._merge_refresh_paused_ck = tk.Checkbutton(opt_action_frame, text="临时关闭刷新",
+                                                       variable=self._merge_refresh_paused)
+        self._merge_refresh_paused_ck.pack(side=tk.LEFT, padx=2)
+        ToolTip(self._merge_refresh_paused_ck,
+                "勾选后：设置各个滤镜/数据流参数时不再自动重新生成命令预览。\n\n"
+                "· 每个参数变化都会触发一次命令重建（多轨道+复杂滤镜时较耗时），\n"
+                "  连续设置滤镜/水印/轨道参数会反复重建，造成界面卡顿。\n"
+                "· 勾选后暂停自动刷新，可连续调整多个设置而不再卡顿；\n"
+                "  全部设置完成后取消勾选，命令预览自动恢复更新（最终结果正确）。\n"
+                "· 期间仍可随时点「刷新命令」手动查看当前命令。\n"
+                "· 播放预览 / 快照预览 / 合并执行 均不受影响（独立于命令预览）。")
         
         btn_copy = tk.Button(opt_action_frame, text="复制命令", command=self.merge_copy_command,
                              height=1, width=12, relief=tk.RAISED)
@@ -15925,6 +17945,9 @@ class FFmpegBatchGUI:
             "merge_verify": self.merge_verify.get(),
             "merge_delete_source": self.merge_delete_source.get(),
             "end_handling": dict(self._merge_end_handling),
+            # 封装页独立文字水印（2026-08-26；轨道 enc_settings 里的注入键不落盘）
+            "text_watermark": dict(self._merge_tw.get("text_watermark") or {}),
+            "text_watermark_items": copy.deepcopy(self._merge_tw.get("text_watermark_items") or []),
             "tracks": []
         }
         for track in self.merge_tracks:
@@ -15932,6 +17955,8 @@ class FFmpegBatchGUI:
                 continue
             enc_settings_copy = track.enc_settings.copy()
             enc_settings_copy.pop("_file_path", None)  # 移除临时字段
+            enc_settings_copy.pop("text_watermark", None)       # 封装页文字水印统一存 state 级
+            enc_settings_copy.pop("text_watermark_items", None)
             track_dict = {
                 "type": track.type,
                 "codec": track.codec,
@@ -15995,6 +18020,14 @@ class FFmpegBatchGUI:
                 for _k, _v in _eh.items():
                     if _k in self._merge_end_handling:
                         self._merge_end_handling[_k] = _v
+
+            # 封装页独立文字水印（缺失时保持当前默认）
+            _twm = state.get("text_watermark")
+            if isinstance(_twm, dict):
+                self._merge_tw["text_watermark"] = dict(_twm)
+            _twmi = state.get("text_watermark_items")
+            if isinstance(_twmi, list):
+                self._merge_tw["text_watermark_items"] = [dict(i) for i in _twmi]
     
             # 恢复轨道
             self.merge_tracks = []
@@ -17147,18 +19180,58 @@ class FFmpegBatchGUI:
         return ",".join(parts)
 
 
-    def _apply_text_watermark_injection(self, video_tracks):
-        """「注入到封装页」开关：开启且已启用文字水印时，把全局文字水印设置写入主视频
-        轨道 enc_settings，供封装页 3 个模式（普通/画中画/串行）命令构建使用；
-        否则清除该键，保证转码页设置不会污染封装页（默认关闭）。"""
+    def _apply_merge_text_watermark(self, video_tracks):
+        """封装页独立文字水印（2026-08-26 起封装页不再从转换页注入）：
+
+        把封装页自己的文字水印（self._merge_tw，由「封装/合并」页底部「文字水印」
+        按钮编辑）写入主视频轨道 enc_settings，供封装页 3 个模式（普通/画中画/串行）
+        命令构建与各预览使用；无启用项时清除该键，避免污染。"""
         if not video_tracks:
             return
-        tw = self.text_watermark_settings
         main = video_tracks[0]
-        if tw.get("inject_to_packaging") and tw.get("enabled") and (tw.get("text", "") or "").strip():
-            main.enc_settings["text_watermark"] = copy.deepcopy(tw)
+        items = self._merge_tw.get("text_watermark_items") or []
+        if not items:
+            _tw0 = self._merge_tw.get("text_watermark") or {}
+            if _tw0.get("enabled") or _tw0.get("text"):
+                items = [_tw0]
+        if items:
+            main.enc_settings["text_watermark_items"] = copy.deepcopy(items)
+            main.enc_settings["text_watermark"] = copy.deepcopy(items[0])
         else:
+            main.enc_settings.pop("text_watermark_items", None)
             main.enc_settings.pop("text_watermark", None)
+
+    def open_merge_text_watermark_dialog(self):
+        """封装页独立文字水印入口（2026-08-26）：编辑 self._merge_tw，
+        不再走转换页的「注入到封装页」。对话框关闭后刷新封装命令预览。"""
+        parent = getattr(self, "_merge_tab_widget", None) or self.notebook
+        TextWatermarkDialog(parent, self,
+                            settings_target=self._merge_tw.get("text_watermark") or {},
+                            settings_container=self._merge_tw,
+                            refresh_cb=self.merge_update_command_preview,
+                            position_editor_cb=self._open_merge_text_wm_position_editor)
+
+    def _open_merge_text_wm_position_editor(self, dlg):
+        """封装页文字水印位置编辑器：直接编辑对话框当前选中项（dlg.settings）。
+
+        画布优先取封装页当前主视频轨道渲染尺寸，其次封装页主视频输入文件，兜底 1280x720。"""
+        tw = dlg.settings
+        canvas_w = canvas_h = None
+        try:
+            main_track = next((t for t in self.merge_tracks if t.enabled and t.type == "video"), None)
+            if main_track is not None:
+                canvas_w, canvas_h = self._get_canvas_size(main_track)
+        except Exception:
+            canvas_w = canvas_h = None
+        if not canvas_w or not canvas_h:
+            try:
+                canvas_w, canvas_h = self._get_video_dimensions_cached(self.merge_video.get().strip())
+            except Exception:
+                canvas_w = canvas_h = None
+        if not canvas_w or not canvas_h:
+            canvas_w, canvas_h = 1280, 720
+        _open_tw_position_editor_impl(self, tw, int(canvas_w), int(canvas_h),
+                                      self.merge_update_command_preview, dlg)
 
     def _build_normal_cmd(self, enabled_tracks, output_norm, only_audio=False):
         """
@@ -17204,7 +19277,7 @@ class FFmpegBatchGUI:
                 return []
             main_video = video_tracks[0]
             # 注入到封装页（按需）：把全局文字水印带入封装普通模式
-            self._apply_text_watermark_injection(video_tracks)
+            self._apply_merge_text_watermark(video_tracks)
 
             # 在添加输入之前插入硬件解码参数（使用主视频设置）
             self._add_hwaccel_params(cmd, main_video.enc_settings)
@@ -17224,14 +19297,22 @@ class FFmpegBatchGUI:
                 video_reverse = False
                 self._append_info_ui("[封装] 主视频为流复制模式，已自动禁用视频倒放")
 
-            # 文字水印旋转判定（提前，决定是否走 filter_complex 并跳过原始视频 -map）
+            # 文字水印旋转判定（提前，决定是否走 filter_complex 并跳过原始视频 -map）。
+            # 2026-08-26 多实例：_tw_rotate 按「首个启用项」判定；多条启用项（>1）一律走
+            # filter_complex 链（build_text_watermark_chain 逐项处理旋转/非旋转）。
             _tw = v_settings.get("text_watermark", {})
-            _tw_enabled, _tw_rotate = text_watermark_active(_tw)
-            if not _tw_rotate:
+            _tw_items = v_settings.get("text_watermark_items") or []
+            _tw_active = [i for i in _tw_items
+                          if i.get("enabled", True) and str(i.get("text", "") or "").strip()]
+            _tw_any = bool(_tw_active)
+            _tw_multi = len(_tw_active) > 1
+            _tw0 = _tw_active[0] if _tw_active else _tw
+            _tw_enabled, _tw_rotate = text_watermark_active(_tw0)
+            if not (_tw_rotate or _tw_multi):
                 cmd.extend(["-map", f"{v_idx}:v:{main_video._type_index}"])
 
             # 文字水印需要滤镜，流复制无法支持 → 强制重编码
-            if vcodec == "copy" and _tw.get("enabled", False):
+            if vcodec == "copy" and _tw_any:
                 vcodec = "libx265"
                 v_settings["encoder"] = vcodec
                 self._append_info_ui("[封装] 文字水印需要重新编码，已自动改为 libx265。")
@@ -17247,17 +19328,17 @@ class FFmpegBatchGUI:
                     reverse=video_reverse,
                     clip_duration=self._get_media_duration(main_video.file_path)
                 )
-                if _tw_rotate:
-                    # 旋转：主视频先接出临时标签，文字子图（透明层+rotate+overlay）接在后面。
+                if _tw_rotate or _tw_multi:
+                    # 旋转或多条文字水印：主视频先接出临时标签，文字链接在后面。
                     # 时间基准统一：主视频 PTS 归零（文字子图 color 源从 0 开始，防止 overlay 前几帧黑屏）
                     main_vlabel = f"[{v_idx}:v:{main_video._type_index}]"
                     base_vf = video_filters if (video_filters and video_filters != "null") else "null"
-                    fc = f"{main_vlabel}setpts=PTS-STARTPTS,{base_vf}[v_tw_base];" + build_text_watermark_filtergraph(
-                        _tw, main_label="[v_tw_base]", out_label="[v_tw]")
+                    fc = f"{main_vlabel}setpts=PTS-STARTPTS,{base_vf}[v_tw_base];" + build_text_watermark_chain(
+                        main_video.enc_settings, main_label="[v_tw_base]", out_label="[v_tw]")
                     cmd.extend(["-filter_complex", fc])
                     cmd.extend(["-map", "[v_tw]"])
                 else:
-                    dt = build_drawtext_filter(_tw)
+                    dt = build_drawtext_filter(_tw0)
                     if dt:
                         video_filters = f"{video_filters},{dt}" if video_filters and video_filters != "null" else dt
                     if video_filters and video_filters != "null":
@@ -17461,7 +19542,7 @@ class FFmpegBatchGUI:
             return []
         main_video = video_tracks[0]
         # 注入到封装页（按需）：把全局文字水印带入封装画中画模式
-        self._apply_text_watermark_injection(video_tracks)
+        self._apply_merge_text_watermark(video_tracks)
         sub_videos = video_tracks[1:]
     
         # 画中画模式下强制使用精准截取（由滤镜处理）
@@ -17502,7 +19583,7 @@ class FFmpegBatchGUI:
         )
         # 追加文字水印（在 overlay 之后；旋转时走透明层+rotate+overlay 子图）
         tw_settings = main_video.enc_settings.get("text_watermark", {})
-        tw_frag = build_text_watermark_filtergraph(tw_settings, main_label=final_v_label, out_label="[v_dtext]")
+        tw_frag = build_text_watermark_chain(main_video.enc_settings, main_label=final_v_label, out_label="[v_dtext]")
         if tw_frag:
             complex_filter = f"{complex_filter};{tw_frag}"
             final_v_label = "[v_dtext]"
@@ -17607,7 +19688,7 @@ class FFmpegBatchGUI:
         audio_tracks = [t for t in enabled_tracks if t.type == "audio"]
         main_video = video_tracks[0]
         # 注入到封装页（按需）：把全局文字水印带入封装串行模式
-        self._apply_text_watermark_injection(video_tracks)
+        self._apply_merge_text_watermark(video_tracks)
 
         # 判断使用哪种模式
         vcodec = main_video.enc_settings.get("encoder", "copy")
@@ -17616,7 +19697,12 @@ class FFmpegBatchGUI:
         use_copy_mode = (vcodec == "copy") and (acodec == "copy" or not audio_tracks)
 
         # 文字水印或图片水印需要滤镜，流复制无法支持 → 强制重编码
-        if use_copy_mode and main_video.enc_settings.get("text_watermark", {}).get("enabled", False):
+        # 2026-08-26 多实例：任一启用项有文字即需重编码（不只看首条 enabled）
+        _tw_items_c = main_video.enc_settings.get("text_watermark_items") or []
+        _tw_any_c = any(i.get("enabled", True) and str(i.get("text", "") or "").strip()
+                        for i in _tw_items_c) or bool(
+            main_video.enc_settings.get("text_watermark", {}).get("enabled", False))
+        if use_copy_mode and _tw_any_c:
             self._append_info_ui("[串联] 文字水印需要重新编码，自动切换到重新编码模式。")
             use_copy_mode = False
 
@@ -18036,21 +20122,27 @@ class FFmpegBatchGUI:
             if sub_path:
                 safe_sub_path = sub_path.replace("'", "\\'")
                 global_video_filters.append(f"subtitles=filename='{safe_sub_path}'")
-        # 文字水印（跟随主视频设置；旋转时走透明层+rotate+overlay 子图）
+        # 文字水印（跟随主视频设置；旋转时走透明层+rotate+overlay 子图）。
+        # 2026-08-26 多实例：多条启用项一律走 filter_complex 链（逐项处理旋转）。
         tw_settings = main_video.enc_settings.get("text_watermark", {})
-        _tw_enabled, _tw_rotate = text_watermark_active(tw_settings)
-        if _tw_rotate:
-            # 旋转：global_video_filters 先接到临时标签，文字子图接在后面
+        _tw_c_items = main_video.enc_settings.get("text_watermark_items") or []
+        _tw_c_active = [i for i in _tw_c_items
+                        if i.get("enabled", True) and str(i.get("text", "") or "").strip()]
+        _tw_c_multi = len(_tw_c_active) > 1
+        _tw_c0 = _tw_c_active[0] if _tw_c_active else tw_settings
+        _tw_enabled, _tw_rotate = text_watermark_active(_tw_c0)
+        if _tw_rotate or _tw_c_multi:
+            # 旋转/多条：global_video_filters 先接到临时标签，文字子图接在后面
             video_global_chain = ",".join(global_video_filters) if global_video_filters else "null"
             if global_video_filters:
                 filter_parts.append(f"[vout]{video_global_chain}[v_pre]")
                 tw_in = "[v_pre]"
             else:
                 tw_in = "[vout]"
-            filter_parts.append(build_text_watermark_filtergraph(tw_settings, main_label=tw_in, out_label="[v_tw]"))
+            filter_parts.append(build_text_watermark_chain(main_video.enc_settings, main_label=tw_in, out_label="[v_tw]"))
             vmap = "[v_tw]"
         else:
-            dt = build_drawtext_filter(tw_settings)
+            dt = build_drawtext_filter(_tw_c0)
             if dt:
                 global_video_filters.append(dt)
             if global_video_filters:
@@ -18378,13 +20470,18 @@ class FFmpegBatchGUI:
 
 
     def merge_update_command_preview(self, output_override=None):
+        # 「临时关闭刷新」勾选时：自动触发（trace/各设置变化）一律跳过——设置滤镜期间
+        # 免去每次停顿都重建命令的卡顿。播放预览/快照独立于本函数，不受影响；
+        # 手动点「刷新命令」按钮走 _do_merge_update_command_preview 跳过本开关。
+        if getattr(self, "_merge_refresh_paused", None) and self._merge_refresh_paused.get():
+            return
         # 取消之前排队的更新
         if hasattr(self, '_merge_preview_after_id') and self._merge_preview_after_id:
             self.root.after_cancel(self._merge_preview_after_id)
             self._merge_preview_after_id = None
     
-        # 延迟执行真正的更新（100ms 足够覆盖连续操作）
-        self._merge_preview_after_id = self.root.after(100, self._do_merge_update_command_preview, output_override)
+        # 延迟执行真正的更新（300ms 足够覆盖连续操作）
+        self._merge_preview_after_id = self.root.after(300, self._do_merge_update_command_preview, output_override)
     
     def _do_merge_update_command_preview(self, output_override=None):
         self._merge_preview_after_id = None
@@ -18866,26 +20963,27 @@ class FFmpegBatchGUI:
         # 统一时长上限：结束时长优先（pad 画布 duration / 子视频 enable 都按它）
         _main_limit = _main_end_dur if (_main_end_dur and _main_end_dur > 0) else _main_dur
         # ---- 主视频画布偏移（pad）----
-        if _ms.get("pad_enabled", False):
-            _pw = str(_ms.get("pad_width", "") or "").strip()
-            _ph = str(_ms.get("pad_height", "") or "").strip()
-            if _pw and _ph:
-                _ox = str(_ms.get("offset_x", "0") or "0").strip() or "0"
-                _oy = str(_ms.get("offset_y", "0") or "0").strip() or "0"
-                # 画布必须限制时长：color 默认无限源，主视频播完后会只剩黑画布继续输出
-                # （movie 子视频 loop=0 已播完消失）。有主视频时长 → color:duration=主视频时长，
-                # 画布与主视频同长一起结束；拿不到时长 → overlay shortest=1（任一输入结束即结束，
-                # 基于实际流时长；eof_action=pass 实测此 ffmpeg 版本不生效会卡死）。
-                _pad_dur = ""
-                if _main_limit and _main_limit > 0:
-                    _pad_dur = f":duration={_main_limit:.3f}"
-                parts.append(f"color=c=black:s={_pw}x{_ph}{_pad_dur}[canvas]")
-                if _pad_dur:
-                    parts.append(f"[canvas]{cur}overlay={_ox}:{_oy}[v_main_pad]")
-                else:
-                    parts.append(f"[canvas]{cur}overlay={_ox}:{_oy}:shortest=1[v_main_pad]")
-                cur = "[v_main_pad]"
-                self._append_info_ui(f"[预览] 主视频画布偏移：{_pw}x{_ph} @ ({_ox},{_oy})")
+        _pg = _pad_canvas_geometry(_ms)
+        if _pg:
+            _pwc, _phc, _ox, _oy = _pg
+            # 画布必须限制时长：color 默认无限源，主视频播完后会只剩黑画布继续输出
+            # （movie 子视频 loop=0 已播完消失）。有主视频时长 → color:duration=主视频时长，
+            # 画布与主视频同长一起结束；拿不到时长 → overlay shortest=1（任一输入结束即结束，
+            # 基于实际流时长；eof_action=pass 实测此 ffmpeg 版本不生效会卡死）。
+            _pad_dur = ""
+            if _main_limit and _main_limit > 0:
+                _pad_dur = f":duration={_main_limit:.3f}"
+            parts.append(f"color=c=black:s={_pwc}x{_phc}{_pad_dur}[canvas]")
+            if _pad_dur:
+                parts.append(f"[canvas]{cur}overlay={_ox}:{_oy}[v_main_pad]")
+            else:
+                parts.append(f"[canvas]{cur}overlay={_ox}:{_oy}:shortest=1[v_main_pad]")
+            cur = "[v_main_pad]"
+            # ⚠️ 画布基准更新（2026-08-25）：overlay 目标流已是 pad 画布，_main_w/_main_h
+            # 必须同步为 pad 尺寸——轨迹 clamp / 基准位置求值 ctx / _blend_static_geometry
+            # 全用它，否则轨迹被锁死主视频源尺寸、普通叠加基准位置也错位。
+            _main_w, _main_h = _pwc, _phc
+            self._append_info_ui(f"[预览] 主视频画布偏移：{_pwc}x{_phc} @ ({_ox},{_oy})")
 
         # ---- 多 blend 子视频区域隔离（需求3）：主视频 split 出原始帧副本 ----
         # 非 normal blend 子视频 ≥2 个时，blend 主区域从主视频【原始帧】副本取
@@ -19024,6 +21122,15 @@ class FFmpegBatchGUI:
             # blend 混合模式（区域隔离 + RGBA 剥离，与正式命令 _build_overlay_filter_complex 共用 _make_blend_region）
             _blend_mode = (str(_s.get('blend_mode', 'normal') or 'normal')).strip().lower()
             if _blend_mode != 'normal':
+                # 降级判定（用户拍板 2026-08-25）：pad 画布大于主视频渲染尺寸 → blend
+                # 窗口进入黑边区即脱离主视频像素、与黑混合无意义 → 强制普通叠加
+                _dgp = self._blend_downgrade_pad(_ms, main_file)
+                if _dgp:
+                    self._append_info_ui(
+                        f"[混合模式] pad 画布 {_dgp[0]}x{_dgp[1]} 大于主视频渲染尺寸，"
+                        f"blend({_blend_mode}) 已降级为普通叠加（脱离主视频像素的混合无意义）")
+                    _blend_mode = 'normal'
+            if _blend_mode != 'normal':
                 # 自旋转/静态角度时子视频链输出为 hypot 正方形画布 → blend 区域必须用对角线
                 # 边长 d 扩大（否则旋转甩出的部分被原始矩形切掉，需求2）。非旋转用原始渲染尺寸。
                 _rotated = (_rad != 0 or (_spin and _spd != 0))
@@ -19125,9 +21232,9 @@ class FFmpegBatchGUI:
 
         # ---- 注入到封装页的文字水印（普通/复杂，与正式命令 _build_pip_cmd 一致）----
         # 实时预览不经过 merge_build_cmd_list 的注入，这里按同一开关逻辑补一次
-        self._apply_text_watermark_injection([main_video])
+        self._apply_merge_text_watermark([main_video])
         _tw_pip = main_video.enc_settings.get("text_watermark", {})
-        _tw_frag = build_text_watermark_filtergraph(_tw_pip, main_label=cur, out_label="[v_tw]")
+        _tw_frag = build_text_watermark_chain(main_video.enc_settings, main_label=cur, out_label="[v_tw]")
         if _tw_frag:
             # 旋转子图含 color 无限源：eof_action=pass 主视频结束即停（与转换页预览一致）
             _tw_frag = _tw_frag.replace(":format=auto", ":format=auto:eof_action=pass")
@@ -19163,6 +21270,7 @@ class FFmpegBatchGUI:
         except Exception as e:
             # 兜底：Popen 抛 OSError=mpv 进程起不来（不可用），标记标志供后续预览直接回退/提示
             self._mpv_usable = False
+            self._mpv_verified = True   # 已实测失败，后续预览直接回退不再重试子进程
             self._append_info_ui(f"[预览] mpv 启动失败: {e}（已标记 mpv 不可用，请检查路径或用快照预览）")
 
     def _merge_preview_right_menu(self):
@@ -19243,11 +21351,13 @@ class FFmpegBatchGUI:
         if not indices:
             return
         self._move_selected_tracks(indices, direction=1)
-    
+
     def _move_selected_tracks(self, indices, direction):
         """
         将选中的轨道整体上移（direction=-1）或下移（direction=1）。
         仅当选中轨道连续时支持整体移动，否则只移动第一个选中项。
+        移动即时生效；命令预览刷新由 merge_update_command_preview 的
+        300ms 防抖统一合并（2026-08-25 用户拍板：不做移动级防抖）。
         """
         if not indices:
             return
@@ -19488,9 +21598,13 @@ class FFmpegBatchGUI:
                         else:
                             filters = drawbox_chain
 
-            # ---- 文字水印 drawtext（仅主视频） ----
+            # ---- 文字水印 drawtext（仅主视频；封装页自有文字水印先注入该轨道，
+            #      多条非旋转项逗号串联；旋转项在单轨 -vf 预览跳过） ----
             if is_main_video:
-                dt = build_drawtext_filter(track.enc_settings.get("text_watermark", {}))
+                self._apply_merge_text_watermark([track])
+                _tw_trk = track.enc_settings.get("text_watermark", {})
+                _tw_trk_items = track.enc_settings.get("text_watermark_items") or []
+                dt = build_drawtext_chain_vf(_tw_trk, _tw_trk_items)
                 if dt:
                     if filters and filters != "null":
                         filters = f"{filters},{dt}"
@@ -19757,9 +21871,9 @@ class FFmpegBatchGUI:
         )
         # 注入到封装页的文字水印（普通/复杂，与正式命令 _build_pip_cmd 一致）：
         # 快照不经过 merge_build_cmd_list 的注入，这里按同一开关逻辑补一次
-        self._apply_text_watermark_injection([track])
+        self._apply_merge_text_watermark([track])
         _tw_settings = track.enc_settings.get("text_watermark", {})
-        _tw_frag = build_text_watermark_filtergraph(_tw_settings, main_label=final_v_label, out_label="[v_dtext]")
+        _tw_frag = build_text_watermark_chain(track.enc_settings, main_label=final_v_label, out_label="[v_dtext]")
         if _tw_frag:
             complex_filter = f"{complex_filter};{_tw_frag}"
             final_v_label = "[v_dtext]"
@@ -20043,7 +22157,7 @@ class FFmpegBatchGUI:
             clip_duration=self._get_media_duration(file_path)
         )
         base_vf = base_vf if (base_vf and base_vf != "null") else "null"
-        tw_frag = build_text_watermark_filtergraph(tw_settings, main_label="[v_tw_base]", out_label="[v_tw]")
+        tw_frag = build_text_watermark_chain(settings, main_label="[v_tw_base]", out_label="[v_tw]")
         if not tw_frag:
             raise ValueError("文字水印滤镜构建失败")
         fc = f"[0:v]{base_vf}[v_tw_base];{tw_frag}"
@@ -20184,8 +22298,8 @@ class FFmpegBatchGUI:
                     main_file_path=main_file
                 )
                 if tw_active:
-                    tw_frag = build_text_watermark_filtergraph(
-                        tw_settings, main_label=final_v_label, out_label="[v_tw_sheet]")
+                    tw_frag = build_text_watermark_chain(
+                        main_settings, main_label=final_v_label, out_label="[v_tw_sheet]")
                     if tw_frag:
                         complex_filter = f"{complex_filter};{tw_frag}"
                         final_v_label = "[v_tw_sheet]"
@@ -20335,7 +22449,8 @@ class FFmpegBatchGUI:
             # ---- 页面3：截取片段 ----
             page_trim = ttk.Frame(notebook)
             notebook.add(page_trim, text="截取片段")
-            trim_frame = TrimFrame(page_trim, show_combo_seek=False)
+            trim_frame = TrimFrame(page_trim, show_combo_seek=False, app=self,
+                                   file_source=(lambda: file_path) if file_path else None)
             trim_frame.pack(fill=tk.X, padx=5, pady=5)
             trim_frame.set_settings(initial_settings)
 
@@ -24187,7 +26302,8 @@ class FFmpegBatchGUI:
         # 截取片段页
         trim_page = ttk.Frame(param_notebook)
         param_notebook.add(trim_page, text="截取片段")
-        self.trim_frame = TrimFrame(trim_page, update_callback=self.update_command_preview)
+        self.trim_frame = TrimFrame(trim_page, update_callback=self.update_command_preview,
+                                    app=self, file_source=lambda: self.input_file.get())
         self.trim_frame.pack(fill=tk.X, padx=5, pady=5)
     
         # 分段拼接页
