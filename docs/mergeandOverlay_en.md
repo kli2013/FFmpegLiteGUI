@@ -26,7 +26,7 @@ The Merge page (Mux / Merge / PiP) is one of the core modules. It combines multi
 ### 1.3 Mode selection & params
 
 **Mux mode**
-- Merge main video with external audio/subtitles; stream-copy or re-encode. Main video can take full filters (crop, scale, rotate, enhance…). Audio tracks set codec, bitrate, sample rate, volume independently.
+- Merge main video with external audio/subtitles; stream-copy or re-encode. Main video can take full filters (crop, scale, rotate, enhance…), **including subtitle burn-in** ("Burn subtitles" checkbox + character encoding; restored 2026-08-28; copy auto-switches to re-encode). Audio tracks set codec, bitrate, sample rate, volume independently.
 - Has a separate **audio-only** mode (left of the "start merge" button) — different from the transcode page's audio-only; here it simply mixes a few audios (e.g. narration + main) into one track.
 
 **Enable PiP**
@@ -52,7 +52,7 @@ The Merge page (Mux / Merge / PiP) is one of the core modules. It combines multi
   - **Video**: crop, rotate, flip, deinterlace, enhance (denoise/sharpen/color), trim, reverse, speed.
   - **Audio**: trim, reverse, speed, silence generation (auto-fill).
   - **Forced uniform at each segment's end**: resolution, pixel format, fps, SAR (from the main video) — so concat never errors.
-  - **Global stage (after join) keeps only**: subtitle burn-in (video). To drop a segment's audio in Concat mode, don't uncheck enable — choose **generate silent stream** in that video's audio-binding tab.
+  - **Global stage (after join) keeps only**: subtitle burn-in (main video), text watermark (drawtext, main video). To drop a segment's audio in Concat mode, don't uncheck enable — choose **generate silent stream** in that video's audio-binding tab. (2026-08-28 restored: the mux page's burn-in UI is fully back — all three modes support burn-in + charenc.)
 
 When the main video encoder is non-`copy`, every video track (main + all subs) is double-click editable with these independent filters:
 
@@ -72,8 +72,18 @@ After each segment, the chain forcibly appends:
 These guarantee identical specs before `concat` — no join errors.
 
 **Global stage (after join)**
-- **Video**: only the main video's subtitle burn-in (if any).
+- **Video**: only the main video's subtitle burn-in (if any, with charenc) and text watermark (drawtext). **Burn-in restored 2026-08-28**: the mux burn-in UI is fully back — normal-mux / PiP / serial-concat all support it.
 - **Audio**: volume control removed; Concat mode offers no overall or per-track volume.
+
+### 1.7 End handling (multi-view split / end concat / border, since 2026-08-25, border 2026-08-27)
+
+The **"End handling"** button on the mux page toolbar (the Transcode page's Advanced tab and queue task editing have the same dialog; the three settings are independent) processes the **very end of the filter chain** — this is **not** the same as "serial concat" above: serial concat stitches multiple **input** segments in order; end handling operates on the **current output**. Three independent blocks, combinable:
+
+1. **Multi-view split grid** — split the output into 2–5 cells: rows×cols (e.g. 1×3 horizontal, 2×2 grid). ffmpeg `split` + `hstack`/`vstack`.
+2. **End concat (append image/video)** — append an image (QR code / end card, display seconds) or a video. Images auto-scale with black bars; video should be pre-matched. **Forces re-encode.**
+3. **Border (pad canvas expand)** — top/bottom/left/right margins (px) + color (`#RRGGBB` or name). **Border position** dropdown: `after split (grid outer frame, default)` / `before split (border per cell)` — the latter borders each cell before stitching (cell borders back-to-back, visually a 2× margin line); identical when split is off. ffmpeg `pad` (HandBrake Pad); odd sizes round up to even; pure-copy auto-switches to re-encode.
+
+**Preview support**: text command preview always reflects it; the mux page live preview (mpv lavfi) supports the full grid + border (incl. multi-row grids); the Transcode play preview supports border and single-row/column grids (multi-row grids hint to use complex/live preview).
 
 ### 1.4 Chapters & metadata
 - **Copy source chapters** — keep the main video's chapter marks (`-map_chapters 0`).
@@ -284,6 +294,20 @@ Besides static positioning, a watermark / PiP sub-video can also **move along a 
 - **Stackable with continuous rotation**: spin + movement are independent.
 - **Implementation**: x/y use `t`-based ffmpeg eval expressions (triangle wave / piecewise linear interpolation / st-ld variable slots) — no external trajectory editor needed; the base coordinates `overlay_x/overlay_y` are preserved, so you can switch back to static at any time.
 
+### 11.4 List waypoints (time-segment table, embedded panel since 2026-08-27)
+
+Besides the four presets, the trajectory dialog has an **"Enable list waypoints"** checkbox (when checked, the preset dropdown above is ignored — list waypoints take priority). When checked, the embedded panel enables; **each row = one time segment on the video timeline**, rows follow in time order for second-level control of the watermark's behavior:
+
+- **Time segment** — each row's start + duration (or start/end); the end row can only be the last one (static positioning, no segment).
+- **Move** — per row: start coords → end coords (canvas absolute pixels); the watermark moves linearly from start to end during that segment; the row-end position auto-becomes the next row's start (continuous, smooth).
+- **Hide** — when checked, the watermark is fully hidden during that segment (overlay not rendered — not black/frozen).
+- **Self-rotation** — spin while moving (overrides the global rotation); each segment can set its own speed.
+- **End action** — e.g. freeze at segment end (position stops, sub-video/self-rotation keeps going).
+- Row coords can be set by dragging in the visual editor via the "start/end" buttons; the panel shows total duration with a red vertical line marking the end row.
+- **Max 15 rows** (far below ffmpeg's long-expression crash threshold of ~95–100 segments); over-limit is warned.
+
+**Implementation**: `build_waypoint_expr` compiles the whole table into overlay x/y eval expressions (per-frame `t` evaluation, `lt`/`mod` segmentation, `st`/`ld` variable slots) — no temp files; blend mode also supports it (dynamic crop window follows). **Orthogonal to loop control (show window / cycle show)**: the table governs "where/when-hidden", loop control governs "when-visible" — combinable.
+
 ---
 
 ## Appendix — filter independence/linkage across the four modes (incl. Transcode)
@@ -295,7 +319,7 @@ Four working modes: ① Transcode ② Mux ③ PiP ④ Concat. Below, video filte
 | Video filters (crop/scale/rotate/enhance/deint/speed/reverse…) | single video, own settings | main video own ✅ independent | main + each sub own ✅ independent | each segment own ✅ independent (+forced normalize) |
 | Audio creative (volume/EQ/fade/denoise/loudness/channel/speed) | own ✅ independent | per-track own ✅ independent | per-track own ✅ independent | per-track own ✅ independent |
 | Audio reverse | independent checkbox ✅ (not following video) | ✅ fully independent (no fallback to main) | ✅ fully independent | ✅ fully independent (external track independent; embedded audio only trims/resets, no longer follows video reverse/speed) |
-| Subtitle burn-in `subtitles` | single video | global (final picture) | main video only (global) | main video only (global) |
+| Subtitle burn-in `subtitles` | single video | global (main video, final picture) | main video only (global) | main video only (global) |
 | Text watermark `drawtext` | single video | global | global (main) | global (main) |
 | Forced spec normalize (scale/format/fps/sar) | none | none | none | ✅ intentional global (join required) |
 
@@ -303,7 +327,7 @@ Four working modes: ① Transcode ② Mux ③ PiP ④ Concat. Below, video filte
 - One video, one (or zero) audio. Video reverse, audio reverse, audio speed, volume, EQ, fade… each its own checkbox/slider, no linkage. Audio reverse ("Audio reverse (independent of video)") defaults off; video reverse affects picture only. Check both to reverse together. No master "link/unlink" switch (by design — simplest). Intentional globals: subtitle burn-in & text watermark act on the only video; preview disables reverse (player limit).
 
 **② Mux**
-- Video: main video own settings, independent. Audio: each external track's codec/volume/EQ/speed/fade/reverse is per-track independent; "Audio reverse (independent of video, this track only)" controls itself only. Intentional globals: subtitle burn-in (`subtitles=`), text watermark (`drawtext`). Tooltip notes "sub-videos can apply all filters except subtitle".
+- Video: main video own settings, independent. Audio: each external track's codec/volume/EQ/speed/fade/reverse is per-track independent; "Audio reverse (independent of video, this track only)" controls itself only. Intentional globals: subtitle burn-in (`subtitles=`, main video, into the final picture), text watermark (`drawtext`). Tooltip notes "sub-videos can apply all filters except subtitle". (2026-08-28 restored: normal mux also supports main-video burn-in + charenc.)
 
 **③ PiP**
 - Video: main + each sub own filter chain, independent. Audio: each track fully independent; audio reverse pure-independent. Intentional globals: only main video's subtitle burn-in & text watermark (sub-videos can't burn subtitles — a compositing-layer limit, not an omission).
@@ -316,4 +340,4 @@ Four working modes: ① Transcode ② Mux ③ PiP ④ Concat. Below, video filte
 **Summary**
 - Video & audio creative filters: all four modes are per-track independent.
 - Audio reverse / speed: all four modes are now fully independent — no "audio follows video" fallback remains (Mux dropped "audio reverse falls back to main"; Concat dropped "embedded audio falls back to segment video reverse/speed"). Each audio track's reverse/speed is decided solely by its own audio-track settings.
-- The only remaining "following" is the intentional global: subtitle burn-in, text watermark, and Concat's forced spec normalize. These are meant to be global, not linkage.
+- The only remaining "following" is the intentional global: subtitle burn-in, text watermark, and Concat's forced spec normalize. These are meant to be global, not linkage. All three mux-page modes (normal-mux / PiP / serial-concat) support subtitle burn-in with charenc (restored & completed 2026-08-28).
