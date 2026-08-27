@@ -78,10 +78,14 @@ Presets save and reuse common parameter sets so you don't reconfigure every time
 **Rotate / flip** — 0° / 90° CW / 180° / 90° CCW; vertical and horizontal flip.
 
 **Advanced enhancement** (separate window)
-- **Denoise** (`hqdn3d`): spatial & temporal strength.
-- **Sharpen** (`unsharp`).
+- **Denoise (algorithm selectable, since 2026-08-27)**: spatial & temporal strength.
+  - **`hqdn3d` (light)** — spatio-temporal denoise, very fast; for mild/compression noise.
+  - **`nlmeans` (high quality)** — non-local means, strongest denoise (low-light/high-ISO footage) but 10–50× slower, noticeably slow at 1080p; only spatial strength applies (temporal ignored).
+- **Sharpen (algorithm selectable)**: strength.
+  - **`unsharp` (USM)** — classic, all-round.
+  - **`cas` (contrast adaptive)** — more natural details, great after upscaling/frame interpolation.
 - **IVTC** — 60i → 24p (`fieldmatch`+`decimate`).
-- **Deblock** — strength 1–8.
+- **Deblock** — strength dropdown `weak` / `medium` / `strong` + block-size dropdown `4` / `8` (maps to ffmpeg `deblock=filter=strong:block=8` etc.; old numeric strength maps to weak).
 - **Color matrix** (`colormatrix`): `bt709:bt2020`, `bt2020:bt709`, `bt601:bt709`, `bt709:bt601`.
 - **Color correction** (`eq`): brightness / contrast / saturation / gamma sliders.
 - **Hue** (`hue`): hue angle and color saturation.
@@ -90,6 +94,7 @@ Presets save and reuse common parameter sets so you don't reconfigure every time
 - **`delogo`** — smart-interpolation logo/watermark removal. Frame the region with the visual crop tool, then "Copy coordinates from crop" fills `x:y:w:h` in one click.
 - **Local blur** (region only) — `boxblur` / `gblur` on a chosen rectangle. The tool builds the `split → crop → blur → overlay` chain automatically; a "🎯 Local blur" button enables it and copies crop coordinates. Coordinates are in the **original frame** space (the chain is placed before other filters).
 - **Global blur** — enable blur but do **not** check "region only".
+- **Multi-region list (2026-08-26: handle several watermarks/blur regions at once)** — the delogo/blur window can hold **multiple items** (mixed `delogo` / `boxblur` / `gblur`), for frames with several logos/subtitle watermarks at once. Each item sets type, region coords (x/y/w/h, original frame) and strength independently; a Treeview list + form with live write-back (add/delete/reorder). Command generation iterates the list and emits one filter per item (several delogo / local-blur chains auto-stitched). Old data is auto-migrated: without a list, the old single-region fields are used (old presets/snapshots unaffected).
 
 **Deinterlace** — `none`, `bwdif`, `yadif`, `kerndeint`, `pp=lb`, `fieldorder`.
 
@@ -101,7 +106,7 @@ Presets save and reuse common parameter sets so you don't reconfigure every time
 - **Video reverse** — only the picture.
 - **Audio reverse (independent of video)** — a separate checkbox on the audio tab; checking it reverses audio alone, no longer following the main video. Check both to reverse audio+video together.
 
-**Subtitle burn-in** — pick an external subtitle (`srt`/`ass`/`ssa`/`vtt`) and burn it into the picture (hard subtitle). Requires re-encode; copy mode won't work. To keep subtitles as a separate stream, use the mux page instead.
+**Subtitle burn-in** — check "Burn subtitles" to enable, then pick an external subtitle (`srt`/`ass`/`ssa`/`vtt`) and burn it into the picture (hard subtitle). **Character encoding** dropdown (2026-08-27): `auto` (UTF-8) / `utf-8` / `gb18030` / `gbk` / `big5`. SRT files saved by Chinese Windows Notepad are usually GBK/GB18030 — pick the matching encoding or the text will be garbled (maps to ffmpeg `subtitles` filter's `charenc`; `auto` injects nothing). Requires re-encode; copy mode won't work. To keep subtitles as a separate stream, use the mux page instead — the mux page also offers burn-in (all three modes' video-stream editors have the "Burn subtitles" row, restored 2026-08-28); tracks and burn-in can coexist.
 
 ### 3.3 Audio (tab "Audio")
 
@@ -123,6 +128,7 @@ Presets save and reuse common parameter sets so you don't reconfigure every time
 - **Enable trim** — set start / end (`HH:MM:SS.ms`, `MM:SS.ms`, or plain seconds). Start defaults to `0`; empty end means to the file end.
 - **Frame-accurate** — `trim`+`setpts` for frame precision, but forces re-encode (copy → `libx265`). Off = fast mode (`-ss` before `-i`, keyframe-based, less precise).
 - **Combined seek** (fast precise trim for long videos) — for a single clean video (no overlay/watermark/PiP). Jumps to the keyframe before the target, then decodes precisely to the target frame. A post-seek threshold (default 30 s) is adjustable. Exclusive with frame-accurate; auto-disabled with watermark/PiP (multiple `-i` would misplace the second `-ss`).
+- **Simple time preview (built-in, pure ffmpeg, no external player)** — the trim tab's "Simple time preview" button opens a built-in preview window that does **not** depend on MPV/PotPlayer. Play/pause the picture; at the target frame click **"Set start"** / **"Set end"** and it auto-fills the start/end times above (millisecond precision, main-video timeline) — no manual time typing. Keyframe jumps (forward/back) with a status bar showing the current time. The same built-in preview also appears in the delogo/blur window, text-watermark window, sub-video settings and segment join (each fills back its own times).
 
   > ⚠️ **Multi-input `-ss` trap:** with one input, a trailing `-ss` works; with two inputs, the second `-ss` becomes the *second* input's leading `-ss`.
   > ```bash
@@ -174,6 +180,14 @@ Selecting a hardware item **auto-syncs** the hardware-decode and video-encoder d
 - **Watermark preset** — save current watermark params as a template.
 - Watermark mode forces frame-accurate trim and switches copy → `libx265` (must re-encode).
 - **Text watermark** — content, font, size, color, opacity, stroke, show window / loop (`enable`). Its position editor is independent from the image/video watermark editor.
+
+**End handling** (since 2026-08-25; border since 2026-08-27) — the **"End handling"** button on the Advanced tab (the same button in queue task editing applies to that task) opens a window with three independent blocks processed at the **very end of the filter chain**:
+
+1. **Multi-view split grid** — split the output into 2–5 cells: rows×cols (e.g. 1×3 horizontal, 2×2 grid). Implemented with ffmpeg `split` + `hstack`/`vstack` (rows stitched then stacked).
+2. **End concat (append image/video)** — append an image (e.g. QR code / end card, display seconds configurable) or a video to the end of the output. Images auto-scale to the output size with black bars centered; video should be pre-matched. **Forces re-encode** (filters required).
+3. **Border (pad canvas expand)** — add a border around the final canvas; combinable with split/concat. Top/bottom/left/right margins independent (pixels); color `#RRGGBB` or a color name. **Border position** dropdown: `after split (grid outer frame, default)` = one border around the whole grid; `before split (border per cell)` = each cell bordered first then stitched (cell borders back-to-back, visually a 2× margin line); identical when split is off. Implemented with ffmpeg `pad` (same as HandBrake Pad); odd output sizes round up to even (yuv420p); pure-copy encoding auto-switches to re-encode.
+
+**Preview support**: the text command preview always reflects it; the play preview (mpv/ffplay) and snapshot preview show the border and single-row/column grids; multi-row grids (e.g. 2×2) in the normal play preview show a hint — use complex preview / live preview to see them.
 
 ---
 
