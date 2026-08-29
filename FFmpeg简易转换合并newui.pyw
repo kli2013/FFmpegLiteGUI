@@ -4399,6 +4399,9 @@ class VideoFilterFrame(ttk.LabelFrame):
         super().__init__(parent, text="视频滤镜 (裁剪/旋转/缩放/反交错/像素格式/变速/倒放)", padding="5", **kwargs)
         self.app = app
         self.current_file = None
+        # 上下文主视频（叠加层/画布基准）：edit_video_settings 透传 canvas_file；
+        # None=回退转换页 app.input_file。与 current_file（本文件自身）语义区分。
+        self.canvas_file = None
         self.current_track = None
         self.override_settings = None
         self.get_trim_settings_callback = None
@@ -6749,11 +6752,14 @@ class TextWatermarkDialog(tk.Toplevel):
         队列任务编辑传入任务编辑窗口的 update_preview。
     """
     def __init__(self, parent, app, settings_target=None, refresh_cb=None,
-                 settings_container=None, position_editor_cb=None):
+                 settings_container=None, position_editor_cb=None, canvas_file=None):
         super().__init__(parent)
         self.withdraw()
         self.app = app
         self.parent = parent
+        # 上下文主视频（叠加层时间线基准，时间预览/轨迹/位置编辑器共用）：
+        # 队列任务编辑=task.input、封装页=merge_video/主轨道；None=回退转换页 app.input_file。
+        self.canvas_file = (canvas_file or "").strip()
         self.settings = settings_target if settings_target is not None else app.text_watermark_settings
         self.tw_refresh = refresh_cb
         # 位置编辑器回调（封装页独立文字水印入口传入）：None → 委托 parent._open_text_wm_position_editor
@@ -7053,8 +7059,8 @@ class TextWatermarkDialog(tk.Toplevel):
         _tw_ffm = _tw_fprobe = None
         if getattr(self, "app", None) is not None:
             try:
-                if getattr(self.app, "input_file", None):
-                    _tw_vf = self.app.input_file.get().strip()
+                # 轨迹预览基准=上下文主视频（叠加层时间线；与简易时间预览同链）
+                _tw_vf = self._context_main_video()
             except Exception:
                 _tw_vf = ""
             _tw_ffm = getattr(self.app, "ffmpeg_cmd", None)
@@ -7395,8 +7401,12 @@ class TextWatermarkDialog(tk.Toplevel):
         _f = ""   # 2026-08-27：try 外初始化，供下方 main_video_file 透传（异常时回退空→纯黑）
         try:
             _f = ""
-            if getattr(app, "input_file", None):
-                _f = app.input_file.get().strip()
+            # 上下文主视频优先（队列=task.input / 封装=merge_video或主轨），再回退转换页
+            if getattr(self, "canvas_file", ""):
+                _f = str(self.canvas_file).strip()
+            if not _f or not os.path.exists(_f):
+                if getattr(app, "input_file", None):
+                    _f = app.input_file.get().strip()
             if not _f or not os.path.exists(_f):
                 if getattr(app, "merge_video", None):
                     _f = app.merge_video.get().strip()
@@ -7509,12 +7519,33 @@ class TextWatermarkDialog(tk.Toplevel):
         # 编辑器已写回当前项 → 同步容器，预览/命令即时生效
         self._sync_item_to_container()
 
+    def _context_main_video(self):
+        """当前对话框上下文的主视频（叠加层时间线基准，时间预览/轨迹/位置编辑器共用）：
+        canvas_file（队列=task.input / 封装=merge_video或主轨）→ 转换页 input_file → 封装页 merge_video。"""
+        if getattr(self, "canvas_file", ""):
+            return str(self.canvas_file).strip()
+        app = getattr(self, "app", None)
+        if app is None:
+            return ""
+        try:
+            if hasattr(app, "input_file"):
+                p = app.input_file.get().strip()
+                if p and os.path.exists(p):
+                    return p
+            if getattr(app, "merge_video", None):
+                p = app.merge_video.get().strip()
+                if p and os.path.exists(p):
+                    return p
+        except Exception:
+            pass
+        return ""
+
     def _open_simple_preview_tw(self):
         """简易时间预览（纯帧浏览器）：回填文字水印 显示时段 起/止（秒）。
         不关闭窗口可连续设置；字段为秒数（between(t,start,end) 用 float 解析）。"""
         if not self.app:
             return
-        path = self.app.input_file.get().strip() if hasattr(self.app, "input_file") else ""
+        path = self._context_main_video()
         if not path or not os.path.exists(path):
             messagebox.showerror("错误", "主输入文件不存在")
             return
@@ -7598,11 +7629,20 @@ class BlurFilterDialog(tk.Toplevel):
     def _open_simple_preview_blur(self):
         """简易时间预览（纯帧浏览器）：回填当前 delogo/模糊项 显示时段 起/止（秒，主视频时间线）。
         不关闭窗口可连续设置；字段为秒数（between(t,start,end) 用 float 解析）。"""
-        app = getattr(self.filter_frame, "app", None)
+        ff = self.filter_frame
+        app = getattr(ff, "app", None)
         if app is None:
             messagebox.showwarning("提示", "未找到主应用，无法预览")
             return
-        path = app.input_file.get().strip() if hasattr(app, "input_file") else ""
+        # 去水印/模糊加工「文件本身」（与截取 file_source 同语义）：队列=任务文件、
+        # 封装页轨道=轨道文件；转换页 current_file 为空 → 回退转换页主视频。
+        path = ""
+        try:
+            path = (getattr(ff, "current_file", None) or "").strip()
+        except Exception:
+            path = ""
+        if not path or not os.path.exists(path):
+            path = app.input_file.get().strip() if hasattr(app, "input_file") else ""
         if not path or not os.path.exists(path):
             messagebox.showerror("错误", "主输入文件不存在")
             return
@@ -10981,7 +11021,16 @@ class LoopChromaFrame(ttk.LabelFrame):
         if app is None:
             messagebox.showwarning("提示", "未找到主应用，无法预览")
             return
-        path = app.input_file.get().strip() if hasattr(app, "input_file") else ""
+        # 子视频是叠加层：显示时段 enable 吃「主视频」时间线（输出时间线 t），主视频取
+        # edit_video_settings 透传的 canvas_file（队列=task.input / 封装=merge_video），
+        # 空则回退转换页主视频。⚠️ 不能用 current_file——那是子视频轨道文件本身。
+        path = ""
+        try:
+            path = (getattr(ff, "canvas_file", None) or "").strip()
+        except Exception:
+            path = ""
+        if not path or not os.path.exists(path):
+            path = app.input_file.get().strip() if hasattr(app, "input_file") else ""
         if not path or not os.path.exists(path):
             messagebox.showerror("错误", "主输入文件不存在")
             return
@@ -12469,7 +12518,8 @@ class AdvancedFrame(ttk.LabelFrame):
         TextWatermarkDialog(self, self.app,
                             settings_target=self.tw_settings,
                             settings_container=self.tw_settings_container,
-                            refresh_cb=self.update_callback)
+                            refresh_cb=self.update_callback,
+                            canvas_file=getattr(self, "tw_canvas_file", None))
 
     def open_watermark_editor(self):
         """打开图片/视频水印的参数编辑窗口（缩放、裁剪、旋转、位置等）。
@@ -13612,8 +13662,10 @@ class FFmpegBatchGUI:
 
     def _ensure_main_video(self, disable_scale=False):
         """确保 self.merge_video 已设置：若未设置，则从列表中取第一个启用的视频轨道。
-        如果 disable_scale=True，则将该视频轨道的缩放禁用（仅当自动设置时）。
+        如果 disable_scale=True，则将该主视频轨道的画中画水印残留（缩放+叠加）全部清回默认，
+        使其作为底图不被缩放/叠加。无论主视频是刚刚自动设置还是早已设置都会清理。
         """
+        main_track = None
         if not self.merge_video.get().strip():
             enabled_videos = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
             if enabled_videos:
@@ -13621,21 +13673,29 @@ class FFmpegBatchGUI:
                 self._suppress_main_video_trace = True
                 self.merge_video.set(normalize_path(enabled_videos[0].file_path))
                 self._suppress_main_video_trace = False
-    
-                if disable_scale:
-                    # 禁用主视频的缩放
-                    main_track = enabled_videos[0]
-                    main_track.enc_settings["scale_enabled"] = False
-             #       main_track.enc_settings["scale_width"] = ""
-             #       main_track.enc_settings["scale_height"] = ""
-                    # 刷新列表，显示变化
-                    self.merge_update_track_list()
-    
+                main_track = enabled_videos[0]
                 self._append_info_ui(f"[自动] 主视频未设置，自动设为: {os.path.basename(enabled_videos[0].file_path)}")
-                return True
             else:
                 self.merge_video.set("")
                 return False
+        else:
+            # 主视频已设置：定位对应轨道，供 disable_scale 清理残留
+            norm = normalize_path(self.merge_video.get())
+            for t in self.merge_tracks:
+                if t.enabled and t.type == "video" and normalize_path(t.file_path) == norm:
+                    main_track = t
+                    break
+
+        if disable_scale and main_track is not None:
+            # 主视频是底图，彻底清除画中画水印残留（与 Track 默认一致：12844/12855 行）
+            main_track.enc_settings["scale_enabled"] = False
+            main_track.enc_settings["scale_width"] = ""
+            main_track.enc_settings["scale_height"] = ""
+            main_track.enc_settings["overlay_enabled"] = False
+            main_track.enc_settings["overlay_x"] = ""
+            main_track.enc_settings["overlay_y"] = ""
+            main_track.overlay_enabled = False
+            self.merge_update_track_list()
         return True
 
 
@@ -13872,7 +13932,7 @@ class FFmpegBatchGUI:
         """返回默认的命令模板字典"""
         return {
             "生成静音音频 (anullsrc)": 'ffmpeg -y -f lavfi -i anullsrc=r=44100:cl=stereo -t 10 "{output_dir}silence.wav"',
-            "提取关键帧 (关键帧截图)": 'ffmpeg -y -i "{input}" -vf "select=eq(pict_type\\\\,I)" -vsync vfr "{output_dir}thumb_%04d.png"',
+            "提取关键帧 (关键帧截图)": 'ffmpeg -y -i "{input}" -vf "select=eq(pict_type\\\\,I)" -fps_mode vfr "{output_dir}thumb_%04d.png"',
             "查看媒体信息 (ffprobe)": 'ffprobe -v error -show_format -show_streams "{input}"',
             "快速转码测试 (10秒)": 'ffmpeg -y -i "{input}" -c:v libx264 -preset ultrafast -t 10 "{output_dir}output_test.mp4"',
             "生成测试视频 (彩条)": 'ffmpeg -y -f lavfi -i testsrc=duration=10:size=640x480:rate=30 -c:v libx264 "{output_dir}test.mp4"',
@@ -13902,7 +13962,7 @@ class FFmpegBatchGUI:
             "60帧插值": 'ffmpeg -y -i \"{input}\" -filter_complex \"[0:v]minterpolate=\'mi_mode=mci:mc_mode=aobmc:vsbmc=1:fps=60\'\" \"{output_dir}60fps_interpolated.mp4\"',
             "设置画面比例": 'ffmpeg -y -i \"{input}\" -aspect 16:9 \"{output_dir}aspect_16x9.mp4\"',
             "视频流时间戳偏移": 'ffmpeg -y -itsoffset 1 -i \"{input}\" -c copy -map 0:v -map 1:a \"{output_dir}offset_video.mp4\"',
-            "提取画面内容不同的帧(0.1-0.3)": 'ffmpeg -y -i \"{input}\" -vf \"select=gt(scene\\,0.1)\" -vsync 0 \"{output_dir}%04d.jpg\"',
+            "提取画面内容不同的帧(0.1-0.3)": 'ffmpeg -y -i \"{input}\" -vf \"select=gt(scene\\,0.1)\" -fps_mode passthrough \"{output_dir}%04d.jpg\"',
             "静态图像制作视频": 'ffmpeg -y -loop 1 -i \"{input}\" -i audio.mp3 -c:v libx264 -tune stillimage -c:a aac -shortest \"{output_dir}still_video.mp4\"',
             "音频响度标准化": 'ffmpeg -y -i \"{input}\" -filter:a \"loudnorm=I=-23:LRA=7:TP=-2\" -c:v copy \"{output_dir}normalized.mp4\"',
             "静音特定音频通道": 'ffmpeg -y -i \"{input}\" -af \"pan=stereo|c0=c0|c1=0*c1\" -c:v copy \"{output_dir}right_channel_muted.mp4\"',
@@ -17640,7 +17700,7 @@ class FFmpegBatchGUI:
     
         # ---- 视频编码参数 ----
         cmd_list = self._build_video_encoding_params(cmd_list, settings)
-        cmd_list.extend(["-vsync", "cfr"])
+        cmd_list.extend(["-fps_mode", "cfr"])
     
         # ---- 音频处理 ----
         # 检测主视频是否有音频流（走缓存）
@@ -23526,6 +23586,23 @@ class FFmpegBatchGUI:
             main.enc_settings.pop("text_watermark_items", None)
             main.enc_settings.pop("text_watermark", None)
 
+    def _merge_context_main_video(self):
+        """封装页上下文主视频（叠加层时间线基准）：顶部「主视频文件」框优先，
+        空/无效时取轨道列表第一条启用视频（画中画直接拖轨道未填框的场景）。"""
+        try:
+            p = self.merge_video.get().strip()
+            if p and os.path.exists(p):
+                return p
+        except Exception:
+            pass
+        try:
+            main_track = next((t for t in self.merge_tracks if t.enabled and t.type == "video"), None)
+            if main_track is not None and main_track.file_path and os.path.exists(main_track.file_path):
+                return main_track.file_path
+        except Exception:
+            pass
+        return ""
+
     def open_merge_text_watermark_dialog(self):
         """封装页独立文字水印入口（2026-08-26）：编辑 self._merge_tw，
         不再走转换页的「注入到封装页」。对话框关闭后刷新封装命令预览。"""
@@ -23534,7 +23611,8 @@ class FFmpegBatchGUI:
                             settings_target=self._merge_tw.get("text_watermark") or {},
                             settings_container=self._merge_tw,
                             refresh_cb=self.merge_update_command_preview,
-                            position_editor_cb=self._open_merge_text_wm_position_editor)
+                            position_editor_cb=self._open_merge_text_wm_position_editor,
+                            canvas_file=self._merge_context_main_video())
 
     def _open_merge_text_wm_position_editor(self, dlg):
         """封装页文字水印位置编辑器：直接编辑对话框当前选中项（dlg.settings）。
@@ -25861,7 +25939,7 @@ class FFmpegBatchGUI:
         self.merge_update_command_preview()
     
     def merge_clear_tracks(self):
-        if self.merge_tracks and messagebox.askyesno("确认", "确定清空所有轨道吗？"):
+        if (self.merge_tracks or self.merge_video.get().strip() or self.merge_output.get().strip()) and messagebox.askyesno("确认", "确定清空所有轨道吗？"):
             self.merge_tracks.clear()
             self.merge_video.set("")
             self.merge_output.set("")
@@ -26900,6 +26978,8 @@ class FFmpegBatchGUI:
             filt_frame = VideoFilterFrame(page_filt, app=self)
             if file_path:
                 filt_frame.current_file = file_path
+            # 上下文主视频透传（子视频显示时段/叠加层时间线基准；None=回退 app.input_file）
+            filt_frame.canvas_file = canvas_file
             # 设置轨道或覆盖设置
             if track_obj is not None:
                 filt_frame.set_track(track_obj)
@@ -27452,7 +27532,8 @@ class FFmpegBatchGUI:
             parent=self.root,
             show_loop_chroma=show_loop,
             track_obj=track,   # 传递轨道对象
-            is_concat_mode=self.concat_enabled.get()
+            is_concat_mode=self.concat_enabled.get(),
+            canvas_file=self._merge_context_main_video()   # 子视频显示时段预览=封装页主视频
         )
     
     
