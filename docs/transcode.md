@@ -454,3 +454,12 @@ FFmpeg 内置的 `delogo` 滤镜专为去除 logo 或水印设计，它通过**�
 
 ---
 
+简易位置 示例
+<video src="https://github.com/user-attachments/assets/01579c4c-1045-4799-9cab-c04ea90a65d3" controls width="100%"></video>
+
+位置 、尺寸、旋转 示例
+<video src="https://github.com/user-attachments/assets/667daea7-d0f6-4d41-bc29-c2dae5c78ffa" controls width="100%"></video>
+
+
+
+
