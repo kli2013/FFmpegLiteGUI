@@ -14047,7 +14047,8 @@ class SimplePreviewer:
         buf = b""
         try:
             fd = proc.stderr.fileno()
-            os.set_blocking(fd, False)
+            if hasattr(os, "set_blocking"):  # 3.8 Windows 无此 API；管道本就阻塞读，跳过等价
+                os.set_blocking(fd, False)
             while not self._stop:
                 if gen != self._a_gen:
                     return
@@ -14970,7 +14971,8 @@ class SimplePreviewer:
         idx = 0
         fb = self._frame_bytes
         fd = proc.stdout.fileno()
-        os.set_blocking(fd, False)
+        if hasattr(os, "set_blocking"):  # 3.8 Windows 无此 API；管道本就阻塞读，跳过等价
+            os.set_blocking(fd, False)
         buf = b""
         deadline = time.perf_counter() + 20.0
         try:
