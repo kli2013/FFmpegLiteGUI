@@ -380,16 +380,25 @@ def _make_range_sync(entry_var, target_var, fmt):
     return slider_changed, entry_changed
 
 
-def _make_edge_adjuster(points, orig_w, orig_h, redraw, grow):
+def _make_edge_adjuster(get_points, set_points, orig_w, orig_h, redraw, grow):
     """生成裁剪边界 收缩/扩大 闭包（edge_adjust/grow_adjust 共用）。
 
     grow=False 收缩（边界朝内），grow=True 扩大（边界朝外）；其余逻辑同构。
+
+    ⚠️ 2026-09-06 修复（可视化裁剪「上减/上加」两排按钮静默失效）：
+    旧签名是 (points, ...)，闭包捕获的是**列表对象**。而调用方多处用
+    `points = [...]` 重新绑定（on_drag_end / Alt 搬移 / clear_rect /
+    auto_detect / on_extract_success / 初始加载已有裁剪），重新绑定后闭包里
+    拿到的仍是初次那个空列表 → len != 2 直接 return，按钮点了没反应。
+    （「上移」排是嵌套 def，读的是闭包变量而非旧对象，所以一直是好的。）
+    改为 getter/setter 回调传递后，调用方怎么重绑定都能拿到当前矩形。
     """
     s = -1 if grow else 1
     def adjust(edge, delta):
-        if len(points) != 2:
+        pts = get_points()
+        if not pts or len(pts) != 2:
             return
-        x1, y1 = points[0]; x2, y2 = points[1]
+        x1, y1 = pts[0]; x2, y2 = pts[1]
         l = min(x1, x2); r = max(x1, x2)
         t = min(y1, y2); b = max(y1, y2)
         if edge == 'left':   l += s * delta
@@ -400,7 +409,7 @@ def _make_edge_adjuster(points, orig_w, orig_h, redraw, grow):
         r = min(orig_w, r); b = min(orig_h, b)
         if r <= l or b <= t:
             return
-        points[0] = (l, t); points[1] = (r, b)
+        set_points([(l, t), (r, b)])
         redraw()
     return adjust
 
@@ -6382,7 +6391,17 @@ class VideoFilterFrame(ttk.LabelFrame):
                     )
                 update_info()
 
-            edge_adjust = _make_edge_adjuster(points, orig_w, orig_h, redraw_crop_rect, grow=False)
+            def _set_points(new_pts):
+                """（2026-09-06）points 的唯一写回入口。
+
+                窗口内 on_drag_end / Alt 搬移 / 数值框 / 自动检测黑边 / 初始加载
+                已有裁剪 都会重新绑定 points。工厂闭包只要拿 getter+setter 就与
+                重绑定解耦，这里作为统一出口，避免将来又长出原地写点的分叉。"""
+                nonlocal points
+                points = list(new_pts)
+
+            edge_adjust = _make_edge_adjuster(lambda: points, _set_points,
+                                              orig_w, orig_h, redraw_crop_rect, grow=False)
 
             def shift_adjust(direction, delta):
                 """平移矩形: direction='up'|'down'|'left'|'right'"""
@@ -6399,10 +6418,11 @@ class VideoFilterFrame(ttk.LabelFrame):
                 r = min(orig_w, r); b = min(orig_h, b)
                 if r <= l or b <= t:
                     return
-                points[0] = (l, t); points[1] = (r, b)
+                _set_points([(l, t), (r, b)])
                 redraw_crop_rect()
 
-            grow_adjust = _make_edge_adjuster(points, orig_w, orig_h, redraw_crop_rect, grow=True)
+            grow_adjust = _make_edge_adjuster(lambda: points, _set_points,
+                                              orig_w, orig_h, redraw_crop_rect, grow=True)
     
             # ----- 拖拽事件 -----
             def _alt_held(event):
@@ -6478,7 +6498,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                     cur_dx, cur_dy = canvas_to_display(event.x, event.y)
                     np0, np1 = _moved_points(cur_dx - move_start_display[0],
                                              cur_dy - move_start_display[1])
-                    points = [np0, np1]
+                    _set_points([np0, np1])
                     move_start_display = None
                     move_orig_points = None
                     redraw_crop_rect()
@@ -6490,7 +6510,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                 ox1, oy1 = display_to_original(sx, sy)
                 ox2, oy2 = display_to_original(ex, ey)
                 if abs(ox2 - ox1) > 0 and abs(oy2 - oy1) > 0:
-                    points = [(ox1, oy1), (ox2, oy2)]
+                    _set_points([(ox1, oy1), (ox2, oy2)])
                     if rect_id:
                         canvas.delete(rect_id)
                     dx1, dy1 = original_to_display(ox1, oy1)
@@ -6602,7 +6622,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                         nonlocal points, rect_id
                         if rect_id:
                             canvas.delete(rect_id)
-                        points = [(x, y), (x + w, y + h)]
+                        _set_points([(x, y), (x + w, y + h)])
                         dx1, dy1 = original_to_display(x, y)
                         dx2, dy2 = original_to_display(x + w, y + h)
                         rect_id = canvas.create_rectangle(
@@ -6793,8 +6813,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                 h = max(1, min(h, orig_h))
                 l = max(0, min(l, orig_w - w))
                 t = max(0, min(t, orig_h - h))
-                points[0] = (l, t)
-                points[1] = (l + w, t + h)
+                _set_points([(l, t), (l + w, t + h)])
                 redraw_crop_rect()          # 内部会调 update_info → _sync_box_from_rect 回显规范值
 
             for _e in (_be_w, _be_h, _be_x, _be_y):
@@ -6915,7 +6934,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                     h = int(self.crop_height.get())
                     x = int(self.crop_left.get())
                     y = int(self.crop_top.get())
-                    points = [(x, y), (x + w, y + h)]
+                    _set_points([(x, y), (x + w, y + h)])
                     dx1, dy1 = original_to_display(x, y)
                     dx2, dy2 = original_to_display(x + w, y + h)
                     rect_id = canvas.create_rectangle(
@@ -25007,6 +25026,72 @@ class FFmpegBatchGUI:
         except Exception as e:
             messagebox.showerror("保存失败", str(e))
 
+    def export_convert_project(self):
+        """导出转换页项目到 .fflgproject（全量设置快照，含视频/文字水印，带 convert 标记）"""
+        file_path = filedialog.asksaveasfilename(
+            title="导出转换项目",
+            defaultextension=".fflgproject",
+            filetypes=[("fflgproject 项目文件", "*.fflgproject"), ("JSON 文件", "*.json"), ("所有文件", "*.*")]
+        )
+        if not file_path:
+            return
+        # get_current_settings 已含全部设置（编码/滤镜/音频/裁剪/高级/输出/分段/
+        # 音频截取/末端处理/视频水印 watermark/文字水印 text_watermark+items）
+        state = self.get_current_settings()
+        state["version"] = "1.0"
+        state["project_type"] = "convert"   # 独有标识：封装页项目没有此键（向后兼容）
+        input_file = self.input_file.get().strip()
+        if input_file:
+            state["input_file"] = input_file
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(state, f, indent=2, ensure_ascii=False)
+            self._append_info_ui(f"✅ 转换项目已导出到: {os.path.basename(file_path)}")
+        except Exception as e:
+            self._append_info_ui(f"❌ 导出转换项目失败: {e}")
+            messagebox.showerror("导出失败", str(e))
+
+    def import_convert_project(self):
+        """从 .fflgproject 加载转换页项目（须带 convert 标记；无标记=封装页项目）"""
+        file_path = filedialog.askopenfilename(
+            title="导入转换项目",
+            filetypes=[("fflgproject 项目文件", "*.fflgproject"), ("JSON 文件", "*.json"), ("所有文件", "*.*")]
+        )
+        if not file_path:
+            return
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+        except Exception as e:
+            self._append_info_ui(f"❌ 读取转换项目失败: {e}")
+            messagebox.showerror("读取失败", str(e))
+            return
+        if not isinstance(state, dict) or state.get("project_type") != "convert":
+            messagebox.showwarning(
+                "无法导入",
+                "这不是转换页面的项目文件（缺少转换页标识）。\n"
+                "它可能是封装页面的项目，请在封装页面用「📂 加载项目」打开。")
+            return
+        # 项目语义=完整快照：水印也要恢复。主预设链刻意不恢复水印（见
+        # load_settings_into_ui 注释），这里必须手动恢复，且 watermark_settings /
+        # text_watermark_settings 被高级选项页以引用持有（17073/17080），只能
+        # 原地 clear+update，不能重绑，否则 UI 引用脱钩失效。
+        wm = state.get("watermark")
+        if isinstance(wm, dict):
+            self.watermark_settings.clear()
+            self.watermark_settings.update(copy.deepcopy(wm))
+        tw = state.get("text_watermark")
+        if isinstance(tw, dict):
+            self.text_watermark_settings.clear()
+            self.text_watermark_settings.update(copy.deepcopy(tw))
+        if "text_watermark_items" in state:
+            # 列表是动态 getattr 访问（TextWatermarkDialog 每次现取），可安全重绑
+            self.text_watermark_items = copy.deepcopy(state["text_watermark_items"] or [])
+        if state.get("input_file"):
+            self.input_file.set(state["input_file"])
+        self.load_settings_into_ui(state)
+        self._append_info_ui(f"✅ 转换项目已导入: {os.path.basename(file_path)}")
+
     # ---------- 预览与 UI 辅助 ----------
     def preview_current_file(self, with_snapshot: bool = False):
         path = self.input_file.get().strip()
@@ -28098,7 +28183,16 @@ class FFmpegBatchGUI:
             self._append_info_ui(f"❌ 读取项目文件失败: {e}")
             messagebox.showerror("读取失败", str(e))
             return
-        
+
+        # 转换页项目互斥识别（2026-09-06）：带 convert 标记的是转换页项目，
+        # 旧版封装页项目没有此键，照常加载（向后兼容）
+        if isinstance(state, dict) and state.get("project_type") == "convert":
+            messagebox.showwarning(
+                "无法加载",
+                "这是转换页面的项目文件（含转换页标识），\n"
+                "请在转换页「参数预设」区用「导入项目」打开。")
+            return
+
         # 恢复状态
         self._restore_merge_state_dict(state)
         self._append_info_ui(f"✅ 项目已加载: {os.path.basename(file_path)}")
@@ -36869,6 +36963,10 @@ class FFmpegBatchGUI:
         btn_export.pack(side=tk.LEFT, padx=5)
         btn_import = ttk.Button(preset_frame, text="导入预设(恢复)", command=self.import_presets)
         btn_import.pack(side=tk.LEFT, padx=5)
+        btn_export_project = ttk.Button(preset_frame, text="导出项目", command=self.export_convert_project)
+        btn_export_project.pack(side=tk.LEFT, padx=5)
+        btn_import_project = ttk.Button(preset_frame, text="导入项目", command=self.import_convert_project)
+        btn_import_project.pack(side=tk.LEFT, padx=5)
     
         # 参数笔记本
         param_notebook = ttk.Notebook(settings_frame)
