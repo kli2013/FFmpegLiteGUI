@@ -2738,6 +2738,73 @@ def _majority_audio_params(params):
 
 
 # ================== 滤镜链构建 ==================
+
+# ---------------------------------------------------------------------------
+# 区域滤镜（delogo / 局部模糊 / 局部反色 同族）：矩形选区 → 处理 → 贴回原位
+# ---------------------------------------------------------------------------
+# 并行子图模板：split=2[bg][fg];[fg]crop=..,<滤镜>[bl];[bg][bl]overlay=X:Y
+# 新增一个区域效果只需往 _REGION_EFFECT_FILTERS 里加一条，不必再动下面的生成逻辑。
+#
+# tpl      滤镜串模板，{s} 会被强度值替换；不含 {s} = 无强度参数
+# default  强度默认值（有 {s} 时必填）
+# neighbor True = 邻域运算（卷积类），走「外扩 bleed」链消除区域边缘的硬接缝
+# bleed    外扩像素量 k
+# tag      标签前缀（同一 blur_items 内多项并存时不撞标签；n=negate、b=局部模糊）
+#
+# ⚠️ 边缘接缝（2026-09-07 实测 n9.0.1）：卷积类滤镜在 crop 子图上跑时区域边界取不到
+# 真实邻域，与「整帧跑同一滤镜」的结果差 **11.2 dB**（肉眼可见的方块边）；外扩 k px
+# 处理完再裁回原尺寸后为 **64.9 dB**（几乎无差）。点运算（negate/hflip/lut…）本来
+# 就没有接缝，不必外扩（白白多两次 crop）。
+_REGION_EFFECT_FILTERS = {
+    # --- 点运算：逐像素，无接缝 ---
+    "negate":  {"tpl": "negate",                   "tag": "n"},
+    "hflip":   {"tpl": "hflip",                    "tag": "e"},
+    "vflip":   {"tpl": "vflip",                    "tag": "e"},
+    "swapuv":  {"tpl": "swapuv",                   "tag": "e"},
+    "desat":   {"tpl": "hue=s=0",                  "tag": "e"},
+    "eq_bright": {"tpl": "eq=brightness={s}",      "tag": "e", "default": "-0.3"},
+    "black":   {"tpl": "lutyuv=y=0:u=128:v=128",   "tag": "e"},
+    "white":   {"tpl": "lutyuv=y=255:u=128:v=128", "tag": "e"},
+    # --- 邻域运算：卷积类，必须外扩 ---
+    # （sobel 已删：输出是梯度幅值图，效果强弱完全取决于区域纹理，平滑内容下
+    #   近似均匀暗块、肉眼无感（2026-09-07 实测，scale 参数亦无视觉改善），不可靠。）
+    "unsharp": {"tpl": "unsharp=5:5:{s}", "tag": "e", "default": "1.5", "neighbor": True, "bleed": 8},
+    "avgblur": {"tpl": "avgblur={s}",     "tag": "e", "default": "5", "neighbor": True, "bleed": 24},
+    "median":  {"tpl": "median={s}",      "tag": "e", "default": "3", "neighbor": True, "bleed": 8},
+}
+
+# 局部模糊（boxblur/gblur）同样是卷积类，局部模式下一并外扩
+_REGION_BLUR_BLEED = {"boxblur": 24, "gblur": 24}
+
+
+def _region_enable_suffix(enable_expr: str, filter_str: str) -> str:
+    """区域滤镜的 enable 时间窗后缀。
+
+    ⚠️ 实测（n9.0.1）：**无参滤镜必须用等号** —— `hflip:enable='gt(t,1)'` 直接解析失败
+    （No option name near 'gt(t,1)'），`hflip=enable='gt(t,1)'` 才有效；带参滤镜两者皆可。
+    统一按「滤镜串里有没有 =」选分隔符，避免每加一个无参滤镜就踩一次这个坑。
+    """
+    if not enable_expr:
+        return ""
+    return (":" if "=" in filter_str else "=") + f"enable='{enable_expr}'"
+
+
+def _region_bleed_geom(x: str, y: str, w: str, h: str, k: int):
+    """区域外扩几何，返回 (外扩 crop 串, 裁回 crop 串)。
+
+    贴边区域没法真的外扩（x-k<0、或右侧越过画面），一律交给 min/max 表达式让 ffmpeg
+    自己钳制；裁回偏移随之取「实际外扩量」min(x,k)，所以贴边既不会错位，也不会因为
+    crop 尺寸越界直接失败（实测：不贴边 / 贴左上 / 贴右下 / 满幅 四种场景均通过）。
+    """
+    bx = f"max({x}-{k}\\,0)"
+    by = f"max({y}-{k}\\,0)"
+    ox = f"min({x}\\,{k})"
+    oy = f"min({y}\\,{k})"
+    bw = f"min({w}+{ox}+{k}\\,iw-{bx})"
+    bh = f"min({h}+{oy}+{k}\\,ih-{by})"
+    return f"crop={bw}:{bh}:{bx}:{by}", f"crop={w}:{h}:{ox}:{oy}"
+
+
 def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = True, include_speed: bool = True,
                               include_trim: bool = True, include_format: bool = True, include_scale: bool = True,
                               enhance_settings=None, reverse=False, graph_id: str = "",
@@ -2849,6 +2916,34 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
 
             if blur_type == "delogo":
                 filters.append(f"delogo=x={x}:y={y}:w={w}:h={h}{_sfx_en}")
+            elif blur_type in _REGION_EFFECT_FILTERS:
+                # 区域效果（2026-09-07）：局部反色 / 镜像 / 去色 / 纯色 / 锐化 / 描边 …
+                # 全部走同一条并行子图，恒局部（不看 region_only）。新增类型只改
+                # _REGION_EFFECT_FILTERS，不必动这里。
+                _spec = _REGION_EFFECT_FILTERS[blur_type]
+                _tpl = _spec["tpl"]
+                if "{s}" in _tpl:
+                    _sv = str(strength).strip() or str(_spec.get("default", ""))
+                    _f = _tpl.format(s=_sv)
+                else:
+                    _f = _tpl
+                # ⚠️ 无参滤镜（negate/hflip…）必须 =enable=，冒号写法 ffmpeg 解析失败
+                _f += _region_enable_suffix(_enable_expr, _f)
+                _sfx = graph_id or ""
+                _idx = blur_items.index(_bi) if blur_items else 0
+                _sfx += f"{_spec.get('tag', 'e')}{_idx}"
+                _bg, _fg, _bl = f"rb{_sfx}bg", f"rb{_sfx}fg", f"rb{_sfx}bl"
+                if _spec.get("neighbor"):
+                    # 卷积类：外扩 k px 处理完再裁回原尺寸，消除区域边缘的硬接缝
+                    _outer, _inner = _region_bleed_geom(x, y, w, h, int(_spec.get("bleed", 8)))
+                    _sub = f"{_outer},{_f},{_inner}"
+                else:
+                    _sub = f"crop={w}:{h}:{x}:{y},{_f}"
+                filters.append(
+                    f"split=2[{_bg}][{_fg}];"
+                    f"[{_fg}]{_sub}[{_bl}];"
+                    f"[{_bg}][{_bl}]overlay={x}:{y}"
+                )
             elif blur_type in ("boxblur", "gblur"):
                 if blur_type == "boxblur":
                     _blur_f = f"boxblur={strength}:{strength}{_sfx_en}"
@@ -2858,13 +2953,15 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
                     # 局部模糊：把原帧一分为二，一路裁出目标区域做模糊，再叠回原位。
                     # 生成的是带标签的分支子图，因此本函数返回值可能含 ';'。
                     # 多条时用序号后缀避免标签冲突。
+                    # 2026-09-07：卷积类同样外扩，消除区域边缘的硬接缝（11dB → 65dB）。
                     _sfx = graph_id or ""
                     _idx = blur_items.index(_bi) if blur_items else 0
                     _sfx += f"b{_idx}"
                     _bg, _fg, _bl = f"rb{_sfx}bg", f"rb{_sfx}fg", f"rb{_sfx}bl"
+                    _outer, _inner = _region_bleed_geom(x, y, w, h, _REGION_BLUR_BLEED.get(blur_type, 24))
                     filters.append(
                         f"split=2[{_bg}][{_fg}];"
-                        f"[{_fg}]crop={w}:{h}:{x}:{y},{_blur_f}[{_bl}];"
+                        f"[{_fg}]{_outer},{_blur_f},{_inner}[{_bl}];"
                         f"[{_bg}][{_bl}]overlay={x}:{y}"
                     )
                 else:
@@ -4313,6 +4410,78 @@ def get_video_dimensions(ffprobe_cmd: str, file_path: str) -> Tuple[Optional[int
     except:
         pass
     return None, None
+
+def get_video_pixel_aspect(ffprobe_cmd: str, file_path: str) -> Optional[Tuple[int, int]]:
+    """获取像素宽高比 SAR（sample aspect ratio），如 (9, 16)；方形像素/读取失败返回 None。
+
+    背景（2026-09-07）：HandBrake 默认 Loose anamorphic 会在 crop 后写 SAR 保住源显示
+    比例，出现「编码 1080x1080、播放器按 9:16 拉伸成 1080x1920」的文件。ffmpeg 滤镜
+    坐标始终按编码像素网格（不受 SAR 影响），但 ffprobe width/height 不含此信息，
+    可视化裁剪等「所见即所得」界面需要单独读取来做显示拉伸。
+    """
+    if not ffprobe_cmd or not os.path.exists(file_path):
+        return None
+    cmd = [ffprobe_cmd, "-v", "error", "-select_streams", "v:0",
+           "-show_entries", "stream=sample_aspect_ratio", "-of", "csv=p=0", file_path]
+    try:
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=_GLOBAL_SETTINGS["ffprobe_timeout"], creationflags=flags)
+        lines = (result.stdout or "").strip().splitlines()
+        if not lines:
+            return None
+        parts = lines[0].strip().split(":")
+        if len(parts) != 2:
+            return None  # "N/A" 等非 num:den 形式
+        num, den = int(parts[0]), int(parts[1])
+        if num <= 0 or den <= 0 or num == den:
+            return None
+        return num, den
+    except:
+        return None
+
+def _sar_effective_after_prefilter(sar_pair, pre_filter):
+    """背景预处理滤镜含奇数个 transpose（90°/270° 旋转）时交换 SAR 拉伸轴。
+
+    实测 n9.0.1：crop 保留 SAR（裁出区域照样按源方向拉伸显示）；
+    transpose=1/2 交换 SAR（9:16→16:9，像素转了 90° 拉伸轴必随之转）；
+    180° = transpose 两次（偶数）不换轴；hflip/vflip 不改 SAR。
+    位置编辑器画布是旋转后坐标空间（compute_rendered_size 已交换宽高），
+    拉伸轴必须随旋转交换，否则竖拉/横拉方向与播放器显示相反。
+    """
+    if not sar_pair:
+        return sar_pair
+    try:
+        _nt = len(re.findall(r"transpose=[12]", pre_filter or ""))
+        if _nt % 2 == 1:
+            return (sar_pair[1], sar_pair[0])
+    except Exception:
+        pass
+    return sar_pair
+
+def get_video_display_geometry(ffprobe_cmd: str, file_path: str):
+    """编码尺寸 + 播放显示几何（SAR 拉伸后）。
+
+    返回 (w, h, full_w, full_h, sar_num, sar_den)；方形像素/读取失败时
+    full == w/h、sar 两个 None。坐标空间恒为编码像素，full 只用于「显示」：
+    可视化编辑器按 full 等比缩放入屏幕，坐标用 x/y 独立因子反算回编码网格
+    （所见即所得：预览拉伸 → 裁剪/选区落在编码网格 → 转出继承 SAR → 播放器同样拉伸）。
+    """
+    w, h = get_video_dimensions(ffprobe_cmd, file_path)
+    if w is None or h is None:
+        return None, None, None, None, None, None
+    fw, fh = w, h
+    sn = sd = None
+    sar = get_video_pixel_aspect(ffprobe_cmd, file_path)
+    if sar is not None:
+        sn, sd = sar
+        if sd > sn:
+            # 竖向拉伸（如 9:16）：播放器保持宽度、拉高
+            fh = max(1, int(round(h * sd / sn)))
+        else:
+            # 横向拉伸：播放器保持高度、拉宽
+            fw = max(1, int(round(w * sn / sd)))
+    return w, h, fw, fh, sn, sd
 
 def get_video_rotated_dimensions(ffprobe_cmd: str, file_path: str, settings: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
     """获取考虑元数据旋转和用户旋转后的尺寸"""
@@ -6240,7 +6409,28 @@ class VideoFilterFrame(ttk.LabelFrame):
             orig_w, orig_h = 1920, 1080
             self.app._append_info_ui("[裁剪] 无法获取原始尺寸，使用默认值")
     
-        # ----- 计算显示尺寸 -----
+        # ----- 非方形像素（SAR）检测（2026-09-07）：HandBrake crop 等场景会写 SAR
+        # 保住源显示比例，出现「编码 1080x1080、播放器按 9:16 拉伸成 1080x1920」的文件。
+        # 处理：预览帧按播放显示比例拉伸（ffmpeg scale 直接非等比输出到 disp 尺寸），
+        # 坐标映射走 scale_x/scale_y 反算回编码像素网格（x/y 独立因子，天然支持非等比），
+        # 裁剪结果所见即所得；转换端与坐标语义均不变。-----
+        _sar = get_video_pixel_aspect(self.app.ffprobe_cmd, input_file)
+        full_w, full_h = orig_w, orig_h
+        sar_note = ""
+        if _sar is not None:
+            _sn, _sd = _sar
+            if _sd > _sn:
+                # 竖向拉伸（如 9:16）：播放器保持宽度、拉高 → 1080x1080 显示为 1080x1920
+                full_h = max(1, int(round(orig_h * _sd / _sn)))
+            else:
+                # 横向拉伸：播放器保持高度、拉宽
+                full_w = max(1, int(round(orig_w * _sn / _sd)))
+            sar_note = f", 播放显示 SAR {_sn}:{_sd}"
+            self.app._append_info_ui(
+                "[裁剪] 检测到非方形像素 (SAR {0}:{1})：编码 {2}x{3}，播放器显示约 {4}x{5}；"
+                "预览已按显示比例拉伸，裁剪坐标仍按编码像素换算".format(_sn, _sd, orig_w, orig_h, full_w, full_h))
+
+        # ----- 计算显示尺寸（按播放显示比例 full_w x full_h 等比缩放进可用区域） -----
         screen_w = self.app.root.winfo_screenwidth()
         screen_h = self.app.root.winfo_screenheight()
         max_w = int(screen_w * 0.9)
@@ -6251,15 +6441,15 @@ class VideoFilterFrame(ttk.LabelFrame):
         WINDOW_MARGIN = 20     # 右边菜单控件和图片区的间隔
         avail_w = max_w - RIGHT_PANEL_WIDTH - WINDOW_MARGIN - PADDING * 2
         avail_h = max_h - EXTRA_HEIGHT - PADDING * 2
-    
-        scale = min(1.0, avail_w / orig_w, avail_h / orig_h)
-        disp_w = int(orig_w * scale)
-        disp_h = int(orig_h * scale)
+
+        scale = min(1.0, avail_w / full_w, avail_h / full_h)
+        disp_w = int(full_w * scale)
+        disp_h = int(full_h * scale)
         if disp_w < 1:
             disp_w = 1
         if disp_h < 1:
             disp_h = 1
-        self.app._append_info_ui(f"[裁剪] 原始尺寸: {orig_w}x{orig_h}, 显示尺寸: {disp_w}x{disp_h}")
+        self.app._append_info_ui(f"[裁剪] 原始尺寸: {orig_w}x{orig_h}, 显示尺寸: {disp_w}x{disp_h}" + (f" (SAR {_sn}:{_sd} 拉伸预览)" if sar_note else ""))
     
         # ----- 坐标缩放因子（用于坐标系转换） -----
         scale_x = orig_w / disp_w
@@ -6302,7 +6492,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             total_h = min(720, max_h)
     
         with self.app.SafeToplevel(self.app.root) as win:
-            win.title(f"可视化裁剪 - 拖拽绘制矩形 (显示 {disp_w}x{disp_h}, 原始 {orig_w}x{orig_h})")
+            win.title(f"可视化裁剪 - 拖拽绘制矩形 (显示 {disp_w}x{disp_h}, 原始 {orig_w}x{orig_h}{sar_note})")
             win.transient(self.app.root)
             center_window(win, total_w, total_h, offset_y=15)
     
@@ -10261,7 +10451,10 @@ class BlurFilterDialog(tk.Toplevel):
         ttk.Label(main, text="滤镜类型:").grid(row=2, column=0, sticky="w", pady=5)
         self.type_var = tk.StringVar(value=self.filter_frame._blur_type.get())
         type_combo = ttk.Combobox(main, textvariable=self.type_var,
-                                  values=["delogo", "boxblur", "gblur"],
+                                  values=["delogo", "boxblur", "gblur", "negate",
+                                          "hflip", "vflip", "swapuv", "desat", "eq_bright",
+                                          "unsharp", "avgblur", "median",
+                                          "black", "white"],
                                   state="readonly", width=12)
         type_combo.grid(row=2, column=1, sticky="w", padx=5)
         type_combo.bind("<<ComboboxSelected>>", self.on_type_change)
@@ -10269,12 +10462,21 @@ class BlurFilterDialog(tk.Toplevel):
             "【滤镜类型说明】\n"
             "• delogo：智能去水印滤镜，需指定区域坐标（用周围像素填充），本身就只作用于选定区域。\n"
             "• boxblur / gblur：模糊滤镜，默认作用于整个画面；\n"
-            "  勾选下方「仅模糊选定区域」后即变为局部模糊，只糊坐标框内的部分。\n\n"
+            "  勾选下方「仅模糊选定区域」后即变为局部模糊，只糊坐标框内的部分。\n"
+            "• negate：局部反色，把坐标框内的画面逐通道反相(255-x)，恒作用于选定区域\n"
+            "  （无强度参数；与子视频混合模式里的 negation 公式完全不同）。\n"
+            "• 其余类型统称「区域效果」，与 negate 一样恒作用于坐标框内，无需勾选局部模糊：\n"
+            "  hflip / vflip 局部水平 / 垂直镜像（盖水印时比 delogo 插值更自然）；\n"
+            "  swapuv 局部交换 U/V（色差故障风）；desat 局部去色；eq_bright 局部明暗；\n"
+            "  black / white 局部纯黑 / 纯白遮盖；unsharp 局部锐化；\n"
+            "  avgblur / median 局部均値模糊 / 中值（去小斑点、小 logo）。\n\n"
             "【局部模糊如何实现】\n"
             "程序会自动生成分支滤镜图（不再需要手写快速命令）：\n"
             "  split=2[bg][fg];[fg]crop=宽:高:X:Y,boxblur=..[bl];[bg][bl]overlay=X:Y\n"
             "该子图会被放在滤镜链最前面，先于裁剪 / 旋转 / 缩放 / 亮度等滤镜执行，\n"
-            "因此这里填的坐标始终以【原始画面】为准，不会被后续裁剪或缩放带偏。"
+            "因此这里填的坐标始终以【原始画面】为准，不会被后续裁剪或缩放带偏。\n"
+            "卷积类（模糊 / 锐化 / 描边 / 中值）会自动向外多裁一圈、处理完再裁回，\n"
+            "避免区域边缘出现方块接缝（实测边缘误差由 11dB 降到 65dB）。"
         )
 
         # 一键切换到局部模糊
@@ -10297,10 +10499,14 @@ class BlurFilterDialog(tk.Toplevel):
         self.strength_var = tk.StringVar(value=self.filter_frame._blur_strength.get())
         self.strength_entry = ttk.Entry(self.strength_frame, textvariable=self.strength_var, width=8)
         self.strength_entry.pack(side=tk.LEFT, padx=5)
-        ToolTip(self.strength_entry, 
+        ToolTip(self.strength_entry,
                 "boxblur：半径（整数，默认5）\n"
                 "gblur：sigma（浮点数，默认2.0）\n"
-                "delogo：此参数无效")
+                "avgblur / median：半径（整数，默认 5 / 3）\n"
+                "unsharp：锐化强度（浮点数，默认1.5）\n"
+                "eq_bright：亮度（-1.0 ~ 1.0，默认 -0.3，负数压暗、正数提亮）\n"
+                "delogo 与无参数的区域效果（negate / hflip / vflip / swapuv /\n"
+                "desat / black / white）：此参数无效")
 
         self.region_var = tk.BooleanVar(value=self.filter_frame._blur_region_only.get())
         self.region_chk = ttk.Checkbutton(self.strength_frame, text="仅模糊选定区域（局部模糊）",
@@ -10441,6 +10647,21 @@ class BlurFilterDialog(tk.Toplevel):
 
         self.update_coord_state()
     
+    # 区域效果类型（2026-09-07）：恒局部（不走「仅模糊选定区域」开关），坐标恒解锁。
+    # 与生成端 _REGION_EFFECT_FILTERS 一一对应，加类型时两边一起改。
+    _REGION_EFFECTS = ("negate", "hflip", "vflip", "swapuv", "desat", "eq_bright",
+                       "unsharp", "avgblur", "median", "black", "white")
+
+    # 有强度参数的类型：type -> (强度框标签, 默认值)。不在此表里的类型强度框禁用。
+    _STRENGTH_SPEC = {
+        "boxblur": ("半径:", "5"),
+        "gblur": ("sigma:", "2.0"),
+        "unsharp": ("强度:", "1.5"),
+        "avgblur": ("半径:", "5"),
+        "median": ("半径:", "3"),
+        "eq_bright": ("亮度:", "-0.3"),
+    }
+
     def _is_region_blur(self) -> bool:
         """当前是否处于「局部模糊」状态（仅 boxblur/gblur 有意义）"""
         return bool(self.region_var.get()) and self.type_var.get() in ("boxblur", "gblur")
@@ -10448,36 +10669,37 @@ class BlurFilterDialog(tk.Toplevel):
     def update_strength_state(self):
         """仅更新标签文字与可编辑状态，不改动用户已填的数值。"""
         ftype = self.type_var.get()
-        if ftype == "delogo":
-            self.strength_label.config(text="参数:")
+        _spec = self._STRENGTH_SPEC.get(ftype)
+        if _spec:
+            self.strength_label.config(text=_spec[0])
+            self.strength_entry.config(state="normal")
+        else:
+            # delogo 沿用「参数:」，其余无强度的区域效果统一「无:」
+            self.strength_label.config(text="参数:" if ftype == "delogo" else "无:")
             self.strength_entry.config(state="disabled")
-        elif ftype == "boxblur":
-            self.strength_label.config(text="半径:")
-            self.strength_entry.config(state="normal")
-        elif ftype == "gblur":
-            self.strength_label.config(text="sigma:")
-            self.strength_entry.config(state="normal")
     
     def update_coord_state(self):
-        # delogo 需要坐标；boxblur/gblur 只有开启局部模糊时才需要坐标
-        need_coord = (self.type_var.get() == "delogo") or self._is_region_blur()
+        ftype = self.type_var.get()
+        # delogo 与所有区域效果都需要坐标；boxblur/gblur 只有开启局部模糊时才需要
+        need_coord = (ftype == "delogo") or (ftype in self._REGION_EFFECTS) or self._is_region_blur()
         state = "normal" if need_coord else "disabled"
         for entry in getattr(self, "_coord_entries", []):
             entry.config(state=state)
-        # delogo 本身就是区域滤镜，局部模糊开关对它无意义
+        # delogo 本身就是区域滤镜，局部模糊开关对它无意义；区域效果恒局部，同款
         if hasattr(self, "region_chk"):
-            self.region_chk.config(state="disabled" if self.type_var.get() == "delogo" else "normal")
+            self.region_chk.config(
+                state="disabled" if (ftype == "delogo" or ftype in self._REGION_EFFECTS) else "normal")
     
     def on_type_change(self, event=None):
         ftype = self.type_var.get()
-        if ftype == "delogo":
-            # delogo 不需要强度参数，清空；也不适用局部模糊开关
+        _spec = self._STRENGTH_SPEC.get(ftype)
+        if _spec:
+            # 切换类型时始终填入该类型的默认值，保证下拉选项与强度值联动
+            self.strength_var.set(_spec[1])
+        else:
+            # delogo 与无强度的区域效果：强度清空；区域效果恒局部，开关不适用
             self.strength_var.set("")
             self.region_var.set(False)
-        elif ftype in ("boxblur", "gblur"):
-            # 切换类型时始终填入该类型的默认值，保证下拉选项与强度值联动
-            default_map = {"boxblur": "5", "gblur": "2.0"}
-            self.strength_var.set(default_map.get(ftype, "5"))
         self.update_strength_state()
         self.update_coord_state()
 
@@ -10629,7 +10851,7 @@ class BlurFilterDialog(tk.Toplevel):
             _t = it.get("type", "delogo")
             _sum = f"({it.get('x','0')},{it.get('y','0')}) {it.get('w','100')}x{it.get('h','100')}"
             _s = it.get("strength", "")
-            if _s and _t != "delogo":
+            if _s and _t in self._STRENGTH_SPEC:
                 _sum += f" r={_s}"
             self.tree.insert("", "end", iid=str(i), values=(_en, _t, _sum))
         if sel is not None and self.tree.exists(sel):
@@ -10841,14 +11063,20 @@ class BlurFilterDialog(tk.Toplevel):
                 continue
             ftype = it.get("type", "delogo")
             region = it.get("region_only", False)
-            if ftype == "delogo" or region:
-                label = "局部模糊" if region else "delogo"
+            if ftype == "delogo" or ftype in self._REGION_EFFECTS or region:
+                if ftype == "delogo":
+                    label = "delogo"
+                elif region:
+                    label = "局部模糊"
+                else:
+                    label = ftype
                 for nm in ("x", "y", "w", "h"):
                     if not str(it.get(nm, "")).strip():
                         messagebox.showerror("错误", f"{label} 需要完整的区域坐标，{nm.upper()} 不能为空")
                         return
-            if ftype in ("boxblur", "gblur") and not str(it.get("strength", "")).strip():
-                it["strength"] = {"boxblur": "5", "gblur": "2.0"}.get(ftype, "5")
+            _spec = self._STRENGTH_SPEC.get(ftype)
+            if _spec and not str(it.get("strength", "")).strip():
+                it["strength"] = _spec[1]
         # 写回
         self.filter_frame._blur_items = [dict(i) for i in self.items]
         self.filter_frame._blur_enabled.set(self.enabled_var.get())  # 总开关
@@ -15270,6 +15498,30 @@ class RegionVisualEditor:
             ow = oh = None
         self.orig_w, self.orig_h = (ow or 1920), (oh or 1080)
 
+        # SAR（非方形像素，2026-09-07）：显示基准改用播放显示几何（如 1080x1080 显示为
+        # 1080x1920），坐标仍经 scale_x/scale_y 反算回编码像素网格，所见即所得。
+        try:
+            _sar = get_video_pixel_aspect(app.ffprobe_cmd, file_path)
+        except Exception:
+            _sar = None
+        _fw, _fh = self.orig_w, self.orig_h
+        self.sar_note = ""
+        if _sar is not None:
+            _sn, _sd = _sar
+            if _sd > _sn:
+                _fh = max(1, int(round(self.orig_h * _sd / _sn)))
+            else:
+                _fw = max(1, int(round(self.orig_w * _sn / _sd)))
+            self.sar_note = f", 播放显示 SAR {_sn}:{_sd}"
+            try:
+                app._append_info_ui(
+                    "[选区] 检测到非方形像素 (SAR {0}:{1})：编码 {2}x{3}，播放器显示约 {4}x{5}；"
+                    "预览已按显示比例拉伸，坐标仍按编码像素换算".format(
+                        _sn, _sd, self.orig_w, self.orig_h, _fw, _fh))
+            except Exception:
+                pass
+        self.full_w, self.full_h = _fw, _fh
+
         # 显示尺寸（屏幕内）。2026-08-26：与裁剪可视化一致——窗口高度=画布高+小余量，
         # 右侧按钮行不占画布空间，无需为它们加窗口高度（加高只会让画布 expand 撑出底部空白）
         sw = self.root.winfo_screenwidth()
@@ -15277,9 +15529,9 @@ class RegionVisualEditor:
         RIGHT = 270
         avail_w = min(int(sw * 0.9), 1200) - RIGHT - 40
         avail_h = min(int(sh * 0.85), 800) - 30
-        scale = min(1.0, avail_w / self.orig_w, avail_h / self.orig_h)
-        self.disp_w = max(1, int(self.orig_w * scale))
-        self.disp_h = max(1, int(self.orig_h * scale))
+        scale = min(1.0, avail_w / self.full_w, avail_h / self.full_h)
+        self.disp_w = max(1, int(self.full_w * scale))
+        self.disp_h = max(1, int(self.full_h * scale))
         self.scale_x = self.orig_w / self.disp_w
         self.scale_y = self.orig_h / self.disp_h
         self.PAD = 10
@@ -15299,7 +15551,7 @@ class RegionVisualEditor:
     # ---------- UI ----------
     def _build_ui(self):
         self.win = tk.Toplevel(self.root)
-        self.win.title(f"{self.title} (显示 {self.disp_w}x{self.disp_h}, 原始 {self.orig_w}x{self.orig_h})")
+        self.win.title(f"{self.title} (显示 {self.disp_w}x{self.disp_h}, 原始 {self.orig_w}x{self.orig_h}{self.sar_note})")
         self.win.resizable(False, False)
         try:
             self.win.transient(self.root)
@@ -23606,14 +23858,17 @@ class FFmpegBatchGUI:
         # 使用统一顺序计算（crop -> rotate -> scale）
         return self.compute_final_size_with_order(w, h, settings)
     
-    def _to_canvas_coords(self, x, y, scale):
-        return int(x * scale), int(y * scale)
-    
-    def _to_real_coords(self, cx, cy, scale):
-        return int(round(cx / scale)), int(round(cy / scale))
+    def _to_canvas_coords(self, x, y, scale, scale_y=None):
+        # scale_y：SAR 拉伸预览时 y 轴独立因子（2026-09-07）；None=与 x 同（正常文件不变）
+        return int(x * scale), int(y * (scale if scale_y is None else scale_y))
+
+    def _to_real_coords(self, cx, cy, scale, scale_y=None):
+        _sy = scale if scale_y is None else scale_y
+        return int(round(cx / scale)), int(round(cy / _sy))
     
     def _draw_background(self, canvas, canvas_w, canvas_h, scale, main_track, sub_tracks,
-                         offset_x, offset_y, main_render_size, current_edit_track=None, tag="bg"):
+                         offset_x, offset_y, main_render_size, current_edit_track=None, tag="bg",
+                         scale_y=None):
         canvas.delete(tag)
         if main_render_size:
             main_w, main_h = main_render_size
@@ -23628,8 +23883,8 @@ class FFmpegBatchGUI:
         vis_right = min(canvas_w, right)
         vis_bottom = min(canvas_h, bottom)
         if vis_right > vis_left and vis_bottom > vis_top:
-            cx1, cy1 = self._to_canvas_coords(vis_left, vis_top, scale)
-            cx2, cy2 = self._to_canvas_coords(vis_right, vis_bottom, scale)
+            cx1, cy1 = self._to_canvas_coords(vis_left, vis_top, scale, scale_y)
+            cx2, cy2 = self._to_canvas_coords(vis_right, vis_bottom, scale, scale_y)
             canvas.create_rectangle(cx1, cy1, cx2, cy2, outline="deepskyblue", width=2, dash=(4, 4), fill="", tags=tag)
             canvas.create_text(cx1 + 5, cy1 + 5, anchor="nw", text="主视频", fill="deepskyblue", font=("Arial", 9), tags=tag)
         sub_order = {sub: idx+1 for idx, sub in enumerate(sub_tracks)}
@@ -23661,12 +23916,12 @@ class FFmpegBatchGUI:
                 # 画旋转后的内容多边形（内容矩形以内容中心=旋转正方形中心为中心绕 rotate_angle 旋转）
                 cx, cy = x_val + sw / 2.0, y_val + sh / 2.0
                 pts = rotate_rect_polygon(cx - sw / 2.0, cy - sh / 2.0, sw, sh, _ra_sub)
-                cpts = [tuple(self._to_canvas_coords(px, py, scale)) for px, py in pts]
+                cpts = [tuple(self._to_canvas_coords(px, py, scale, scale_y)) for px, py in pts]
                 canvas.create_polygon(cpts, outline="lightgreen", width=2, dash=(4, 4), fill="", tags=tag)
                 tx, ty = min(p[0] for p in cpts) + 5, min(p[1] for p in cpts) + 5
             else:
-                cx1, cy1 = self._to_canvas_coords(x_val, y_val, scale)
-                cx2, cy2 = self._to_canvas_coords(x_val + sw, y_val + sh, scale)
+                cx1, cy1 = self._to_canvas_coords(x_val, y_val, scale, scale_y)
+                cx2, cy2 = self._to_canvas_coords(x_val + sw, y_val + sh, scale, scale_y)
                 canvas.create_rectangle(cx1, cy1, cx2, cy2, outline="lightgreen", width=2, dash=(4, 4), fill="", tags=tag)
                 tx, ty = cx1 + 5, cy1 + 5
             canvas.create_text(tx, ty, anchor="nw", text=str(sub_order[sub]),
@@ -23734,9 +23989,6 @@ class FFmpegBatchGUI:
             coord_mode: 'top_left'（左上角坐标）或 'offset'（偏移量）
         """
         max_display_w, max_display_h = 800, 600
-        scale = min(max_display_w / canvas_w, max_display_h / canvas_h, 1.0)
-        disp_w = int(canvas_w * scale)
-        disp_h = int(canvas_h * scale)
 
         # 解析 App 引用：本函数既被 AdvancedFrame(self.app 存在) 调用，
         # 也被 FFmpegBatchGUI(self 即 App 本体，无 .app 属性) 调用，故统一用 getattr 兼容
@@ -23744,6 +23996,46 @@ class FFmpegBatchGUI:
 
         # ---- 主视频背景帧（可选）状态 ----
         bg_file = main_video_file
+
+        # ---- SAR（非方形像素）显示拉伸（2026-09-07）：HandBrake crop 等会写 SAR
+        # 保住源显示比例，播放器把编码 1080x1080 拉成 1080x1920 显示。坐标空间仍是
+        # 画布编码像素；预览按播放显示比例拉伸，to_canvas/to_real 拆 x/y 双因子反算。
+        # 正常文件（SAR=1:1 或读取失败）_sar_pair=None，一切与旧逻辑完全一致。----
+        _sar_pair = None
+        _sar_note = ""
+        if bg_file and os.path.exists(bg_file):
+            try:
+                _sar_pair = get_video_pixel_aspect(app.ffprobe_cmd, bg_file)
+            except Exception:
+                _sar_pair = None
+            # 主视频链含 90°/270° 旋转（transpose）时画面坐标轴已转，拉伸轴随之交换
+            # （画布是旋转后空间；不交换则竖拉/横拉方向与播放器相反——实测 transpose
+            # 会交换 SAR 而 crop 保留，见 _sar_effective_after_prefilter）
+            _sar_pair = _sar_effective_after_prefilter(_sar_pair, bg_pre_filter)
+            if _sar_pair is not None:
+                _sn, _sd = _sar_pair
+                _sar_note = f" (SAR {_sn}:{_sd} 拉伸预览)"
+
+        def _sar_stretch(cw, ch):
+            """画布编码尺寸 → 播放显示几何（SAR 拉伸；方形像素原样返回）"""
+            if not _sar_pair:
+                return cw, ch
+            _sn, _sd = _sar_pair
+            if _sd > _sn:
+                return cw, max(1, int(round(ch * _sd / _sn)))
+            return max(1, int(round(cw * _sn / _sd))), ch
+
+        _sar_fw, _sar_fh = _sar_stretch(canvas_w, canvas_h)
+        scale = min(max_display_w / _sar_fw, max_display_h / _sar_fh, 1.0)
+        disp_w = int(_sar_fw * scale)
+        disp_h = int(_sar_fh * scale)
+        # x/y 因子均为「显示 px / 编码 px」（to_canvas 乘、to_real 除），恒从 disp/canvas 反推。
+        # ⚠️ 不可直接用 scale 当 x 因子：scale 按显示几何(_sar_fw/_sar_fh)算出，竖向拉伸时
+        # _sar_fw==canvas_w 故碰巧相等，横向拉伸（SAR 随 transpose 换轴，2026-09-07 修复）
+        # 时 x 因子=disp_w/canvas_w≠scale——背景帧按 scale 提取会整体压窄、画布右侧留黑边，
+        # 矩形 x 坐标换算同样错。正常文件 scale_x == scale_y == scale（等比，行为不变）。
+        scale_x = disp_w / canvas_w
+        scale_y = disp_h / canvas_h
         bg_off_x = main_offset[0] if main_offset else 0
         bg_off_y = main_offset[1] if main_offset else 0
         bg_rw = main_render_size[0] if main_render_size else canvas_w
@@ -23769,7 +24061,7 @@ class FFmpegBatchGUI:
         bg_thread = [None]
 
         win = tk.Toplevel(parent)
-        win.title(title)
+        win.title(title + _sar_note)
         win.transient(parent)
         win.grab_set()
         win.withdraw()
@@ -23798,10 +24090,10 @@ class FFmpegBatchGUI:
     
         # ---- 辅助函数 ----
         def to_canvas(ox, oy):
-            return int(ox * scale), int(oy * scale)
-    
+            return int(ox * scale_x), int(oy * scale_y)
+
         def to_real(cx, cy):
-            return int(round(cx / scale)), int(round(cy / scale))
+            return int(round(cx / scale_x)), int(round(cy / scale_y))
 
         # ---- 主视频背景帧（可选）：后台线程取帧，主线程绘制，置于最底层 ----
         def _draw_bg_frame():
@@ -23811,8 +24103,8 @@ class FFmpegBatchGUI:
             if not bg_file or not os.path.exists(bg_file):
                 return
             nonlocal bg_img_obj, bg_img_id, bg_loading_id, bg_cur_time
-            _tw = max(1, int(round(bg_rw * scale)))
-            _th = max(1, int(round(bg_rh * scale)))
+            _tw = max(1, int(round(bg_rw * scale_x)))
+            _th = max(1, int(round(bg_rh * scale_y)))
             try:
                 if bg_loading_id is None:
                     bg_loading_id = canvas.create_text(
@@ -23848,8 +24140,8 @@ class FFmpegBatchGUI:
                             canvas.delete(bg_img_id)
                         except Exception:
                             pass
-                    _ox = int(round(bg_off_x * scale))
-                    _oy = int(round(bg_off_y * scale))
+                    _ox = int(round(bg_off_x * scale_x))
+                    _oy = int(round(bg_off_y * scale_y))
                     bg_img_id = canvas.create_image(_ox, _oy, anchor=tk.NW,
                                                     image=_img, tags="bg_frame")
                     bg_img_obj = _img
@@ -24056,23 +24348,26 @@ class FFmpegBatchGUI:
     
         # ---- 画布尺寸应用 ----
         def _apply_canvas_size():
-            nonlocal current_canvas_w, current_canvas_h, scale, disp_w, disp_h, rect_id, text_id, bg_img_id, bg_loading_id
+            nonlocal current_canvas_w, current_canvas_h, scale, scale_x, scale_y, disp_w, disp_h, rect_id, text_id, bg_img_id, bg_loading_id
             try:
                 new_w = int(canvas_w_var.get())
                 new_h = int(canvas_h_var.get())
                 if new_w <= 0 or new_h <= 0:
                     raise ValueError
                 current_canvas_w, current_canvas_h = new_w, new_h
-                scale = min(max_display_w / current_canvas_w, max_display_h / current_canvas_h, 1.0)
-                disp_w = int(current_canvas_w * scale)
-                disp_h = int(current_canvas_h * scale)
+                _nfw, _nfh = _sar_stretch(current_canvas_w, current_canvas_h)
+                scale = min(max_display_w / _nfw, max_display_h / _nfh, 1.0)
+                disp_w = int(_nfw * scale)
+                disp_h = int(_nfh * scale)
+                scale_x = disp_w / current_canvas_w
+                scale_y = disp_h / current_canvas_h
                 win.geometry(f"{disp_w + 20}x{disp_h + 240}")
                 canvas.config(width=disp_w, height=disp_h)
                 canvas.delete("all")
                 bg_img_id = None
                 bg_loading_id = None
                 if bg_draw_func:
-                    bg_draw_func(canvas, scale)
+                    bg_draw_func(canvas, scale_x, scale_y)
                 _draw_bg_frame()  # 画布尺寸变化后按新 scale 重新取帧
                 clamp_rect()
                 if rect_id:
@@ -24110,8 +24405,8 @@ class FFmpegBatchGUI:
                 return
             dx_pixel = event.x - drag_mouse_start[0]
             dy_pixel = event.y - drag_mouse_start[1]
-            dx = dx_pixel / scale
-            dy = dy_pixel / scale
+            dx = dx_pixel / scale_x
+            dy = dy_pixel / scale_y
             new_x = int(drag_start_x + dx)
             new_y = int(drag_start_y + dy)
             if new_x != current_x or new_y != current_y:
@@ -24322,7 +24617,7 @@ class FFmpegBatchGUI:
         canvas.pack(pady=10)
     
         if bg_draw_func:
-            bg_draw_func(canvas, scale)
+            bg_draw_func(canvas, scale_x, scale_y)
         # 主视频背景帧：构造即异步取帧（pad 时按 offset 摆放，超出部分黑色）
         _draw_bg_frame()
 
@@ -24615,11 +24910,12 @@ class FFmpegBatchGUI:
             self._append_info_ui(f"[可视化-主] 已设置画布 {new_canvas_w}x{new_canvas_h}, 偏移 ({new_x}, {new_y})")
     
         # 背景绘制函数（显示其他子视频虚线框）
-        def draw_bg(canvas, scale):
+        def draw_bg(canvas, scale_x, scale_y=None):
             # 主视频内容矩形（用于绘制主视频边界）
             main_render_size = (main_render_w, main_render_h)
-            self._draw_background(canvas, canvas_w, canvas_h, scale, main_track, sub_tracks,
-                                  off_x, off_y, main_render_size, current_edit_track=None, tag="bg")
+            self._draw_background(canvas, canvas_w, canvas_h, scale_x, main_track, sub_tracks,
+                                  off_x, off_y, main_render_size, current_edit_track=None, tag="bg",
+                                  scale_y=scale_y)
     
         # 调用通用编辑器
         self._generic_overlay_editor(
@@ -24843,14 +25139,15 @@ class FFmpegBatchGUI:
         extra_info = f"主视频偏移: X={offset_x}, Y={offset_y}"
 
         # ----- 定义背景绘制函数（现在内部只需使用 offset_x/offset_y 而不需定义 extra_info）-----
-        def draw_bg(canvas, scale):
+        def draw_bg(canvas, scale_x, scale_y=None):
             # 获取主视频渲染尺寸
             main_render_size = self._get_video_render_size(main_track)
             if main_render_size is None:
                 main_render_size = (canvas_w, canvas_h)
             sub_tracks = enabled_videos[1:]
-            self._draw_background(canvas, canvas_w, canvas_h, scale, main_track, sub_tracks,
-                                  offset_x, offset_y, main_render_size, current_edit_track=track, tag="bg")
+            self._draw_background(canvas, canvas_w, canvas_h, scale_x, main_track, sub_tracks,
+                                  offset_x, offset_y, main_render_size, current_edit_track=track, tag="bg",
+                                  scale_y=scale_y)
     
         title = f"可视化编辑叠加位置 - {os.path.basename(track.file_path)}"
         aspect = None
