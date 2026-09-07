@@ -1013,10 +1013,20 @@ def _extract_frame_scaled(ffmpeg_cmd, input_file, frame_sec=0.0,
     cmd += ["pipe:1"]
     try:
         flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        # 2026-09-08：stderr DEVNULL→PIPE + communicate(timeout=30)。
+        # 旧写法 stdout.read() 无超时，ffmpeg 异常挂住时线程永久阻塞；
+        # communicate 同时泵两根管道，stderr 充满也不会反向卡死 stdout。
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 creationflags=flags)
-        data = proc.stdout.read()
-        proc.wait(timeout=15)
+        try:
+            data, _err = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+                proc.communicate()
+            except Exception:
+                pass
+            return None, None, None
         if proc.returncode != 0 or not data:
             return None, None, None
         w, h = _ppm_dimensions_from_bytes(data)
@@ -2805,6 +2815,60 @@ def _region_bleed_geom(x: str, y: str, w: str, h: str, k: int):
     return f"crop={bw}:{bh}:{bx}:{by}", f"crop={w}:{h}:{ox}:{oy}"
 
 
+def _build_chroma_filter(chroma_settings) -> str:
+    """绿幕/纯色抠像滤镜串（chromakey / colorkey），未启用返回 ""。
+
+    公共拼装函数：抠像可能插在滤镜链两处——默认在缩放后（小图抠，性能优）；
+    与区域滤镜（delogo/局部效果）同时启用时前置到链首（保证抠像取样以原始画面
+    为准，区域内的颜色处理不再破坏抠像）。两个插入点共用同一份参数拼装。
+    """
+    if not chroma_settings or not chroma_settings.get("chroma_enabled", False):
+        return ""
+    color = str(chroma_settings.get("chroma_color", "green") or "green")
+    if color.startswith("#"):
+        color = "0x" + color[1:].upper()
+    try:
+        similarity = float(chroma_settings.get("chroma_similarity", 0.2))
+    except (ValueError, TypeError):
+        similarity = 0.2
+    if similarity <= 0:
+        similarity = 0.00001
+    try:
+        blend = float(chroma_settings.get("chroma_blend", 0.1))
+    except (ValueError, TypeError):
+        blend = 0.1
+    filter_type = str(chroma_settings.get("chroma_filter_type", "chromakey") or "chromakey")
+    if filter_type == "colorkey":
+        return f"format=rgb24,colorkey={color}:{similarity}:{blend}"
+    return f"chromakey={color}:{similarity}:{blend}"
+
+
+def _effective_blur_items(settings: Dict[str, Any]) -> list:
+    """去水印/模糊多区域列表统一出口：blur_items 优先，无列表时回退旧单键。"""
+    items = settings.get("blur_items")
+    if items:
+        return items
+    return [{
+        "enabled": True,
+        "type": settings.get("blur_type", "delogo"),
+        "x": str(settings.get("blur_x", "0")).strip(),
+        "y": str(settings.get("blur_y", "0")).strip(),
+        "w": str(settings.get("blur_w", "100")).strip(),
+        "h": str(settings.get("blur_h", "100")).strip(),
+        "strength": settings.get("blur_strength", "5"),
+        "region_only": settings.get("blur_region_only", False),
+        "full_frame": False,
+        "enable_start": "", "enable_end": "", "enable_cycle": "", "enable_show": "",
+    }]
+
+
+def _has_region_fx(settings: Dict[str, Any]) -> bool:
+    """是否启用了任意去水印/模糊/区域效果项（抠像前置判定用）。"""
+    if not settings.get("blur_enabled", False):
+        return False
+    return any(it.get("enabled", True) for it in _effective_blur_items(settings))
+
+
 def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = True, include_speed: bool = True,
                               include_trim: bool = True, include_format: bool = True, include_scale: bool = True,
                               enhance_settings=None, reverse=False, graph_id: str = "",
@@ -2825,11 +2889,19 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
     顺序优化：
     精准截取 → 局部模糊/去水印 → 裁剪 → 旋转/翻转 → 缩放 → IVTC（反胶卷过带） → 反交错 →
     去块滤波 → 降噪 → 锐化 → 色彩空间转换 → 颜色校正+色相 → 像素格式 → 变速 → 倒放
+    绿幕/纯色抠像默认插在缩放之后（小图抠）；与去水印/区域效果同时启用时改前置到
+    链首（精准截取/loop 之后、去水印之前），保证抠像取样以原始画面为准。
 
     注意：「局部模糊」会生成带标签的分支子图（split/overlay），返回值可能是包含 ';' 的
     完整 filtergraph，而不再是单纯的逗号串。-vf 与 filter_complex 均支持该语法。
     """
     filters = []
+
+    # 绿幕/纯色抠像滤镜串（公共拼装，见 _build_chroma_filter）：默认插在缩放后；
+    # 与区域滤镜（delogo/局部效果）同时启用时前置到链首——区域链里带颜色处理的
+    # 类型会改写区域色度，抠像若排在区域链之后会吃到被改过的像素 → 抠不干净。
+    _chroma_f = _build_chroma_filter(chroma_settings)
+    _chroma_front = bool(_chroma_f) and _has_region_fx(settings)
 
     # 提前确定硬件滤镜模式与「帧是否已在显存」（供像素格式处理使用）
     _filter_mode = settings.get("hw_filter_mode")
@@ -2883,22 +2955,20 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
         if loop_size is not None and loop_size > 0:
             filters.append(f"loop=loop=-1:size={int(loop_size)}:start=0")
 
+    # ----- 绿幕/纯色抠像（前置模式：与区域滤镜同开时排到滤镜链最前）-----
+    # 区域链（delogo/局部效果）中带颜色处理的类型会改写区域色度；抠像若排在区域链之后，
+    # 取样吃到的是被改过的像素 → 抠不干净。两者同开时把抠图提到区域链之前（仅在
+    # trim/loop 之后），取样以原始画面为准。
+    # ⚠️ 2026-09-07 实测 n9.0.1：chromakey/colorkey 输出带 alpha，其后接 delogo / eq /
+    # negate / boxblur / lutyuv 及区域子图(split/overlay)，alpha 全程保留（自动插入的
+    # 格式转换不丢透明），前置无副作用。
+    if _chroma_front:
+        filters.append(_chroma_f)
+
     # ----- 去水印/模糊（必须排在裁剪/旋转/缩放之前，坐标才与原始帧一致）-----
     if settings.get("blur_enabled", False):
-        # 多区域列表（2026-08-26）：遍历 blur_items 生成多条；无列表时用旧单键
-        blur_items = settings.get("blur_items")
-        if not blur_items:
-            blur_items = [{
-                "enabled": True,
-                "type": settings.get("blur_type", "delogo"),
-                "x": str(settings.get("blur_x", "0")).strip(),
-                "y": str(settings.get("blur_y", "0")).strip(),
-                "w": str(settings.get("blur_w", "100")).strip(),
-                "h": str(settings.get("blur_h", "100")).strip(),
-                "strength": settings.get("blur_strength", "5"),
-                "region_only": settings.get("blur_region_only", False),
-                "enable_start": "", "enable_end": "", "enable_cycle": "", "enable_show": "",
-            }]
+        # 多区域列表（2026-08-26）：遍历 blur_items 生成多条；无列表时回退旧单键（统一出口）
+        blur_items = _effective_blur_items(settings)
         for _bi in blur_items:
             if not _bi.get("enabled", True):
                 continue
@@ -2929,21 +2999,28 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
                     _f = _tpl
                 # ⚠️ 无参滤镜（negate/hflip…）必须 =enable=，冒号写法 ffmpeg 解析失败
                 _f += _region_enable_suffix(_enable_expr, _f)
-                _sfx = graph_id or ""
-                _idx = blur_items.index(_bi) if blur_items else 0
-                _sfx += f"{_spec.get('tag', 'e')}{_idx}"
-                _bg, _fg, _bl = f"rb{_sfx}bg", f"rb{_sfx}fg", f"rb{_sfx}bl"
-                if _spec.get("neighbor"):
-                    # 卷积类：外扩 k px 处理完再裁回原尺寸，消除区域边缘的硬接缝
-                    _outer, _inner = _region_bleed_geom(x, y, w, h, int(_spec.get("bleed", 8)))
-                    _sub = f"{_outer},{_f},{_inner}"
+                if _bi.get("full_frame", False):
+                    # 全帧时间段效果（2026-09-07）：不框区域，直接主链追加。
+                    # 时间段（enable）照常生效 → 「5~8 秒亮度高一点」这类需求；
+                    # 卷积类全帧无裁剪边界 → 无需 bleed。delogo/boxblur/gblur 不走此路
+                    #（delogo 必须框区域；boxblur/gblur 不勾「仅应用到选定区域」即全帧）。
+                    filters.append(_f)
                 else:
-                    _sub = f"crop={w}:{h}:{x}:{y},{_f}"
-                filters.append(
-                    f"split=2[{_bg}][{_fg}];"
-                    f"[{_fg}]{_sub}[{_bl}];"
-                    f"[{_bg}][{_bl}]overlay={x}:{y}"
-                )
+                    _sfx = graph_id or ""
+                    _idx = blur_items.index(_bi) if blur_items else 0
+                    _sfx += f"{_spec.get('tag', 'e')}{_idx}"
+                    _bg, _fg, _bl = f"rb{_sfx}bg", f"rb{_sfx}fg", f"rb{_sfx}bl"
+                    if _spec.get("neighbor"):
+                        # 卷积类：外扩 k px 处理完再裁回原尺寸，消除区域边缘的硬接缝
+                        _outer, _inner = _region_bleed_geom(x, y, w, h, int(_spec.get("bleed", 8)))
+                        _sub = f"{_outer},{_f},{_inner}"
+                    else:
+                        _sub = f"crop={w}:{h}:{x}:{y},{_f}"
+                    filters.append(
+                        f"split=2[{_bg}][{_fg}];"
+                        f"[{_fg}]{_sub}[{_bl}];"
+                        f"[{_bg}][{_bl}]overlay={x}:{y}"
+                    )
             elif blur_type in ("boxblur", "gblur"):
                 if blur_type == "boxblur":
                     _blur_f = f"boxblur={strength}:{strength}{_sfx_en}"
@@ -3069,28 +3146,13 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
         elif method == "exact" and w and h:
             filters.append(f"scale={w}:{h}")
 
-    # ----- 绿幕/纯色抠像（子视频水印/画中画）-----
+    # ----- 绿幕/纯色抠像（子视频水印/画中画，默认位置）-----
     # 插在缩放之后 → 小图抠（性能）；且颜色校正/色相/反色在其后 → 不影响抠像。
+    # 仅当未与区域滤镜（delogo/局部效果）同时启用时在此插入；同时启用时已在链首
+    # 前置（见 _chroma_front），保证抠像取样以原始画面为准。
     # 只有画中画/水印子视频传 chroma_settings（非 None 即启用抠像）；主视频/普通转码不传。
-    if chroma_settings and chroma_settings.get("chroma_enabled", False):
-        color = str(chroma_settings.get("chroma_color", "green") or "green")
-        if color.startswith("#"):
-            color = "0x" + color[1:].upper()
-        try:
-            similarity = float(chroma_settings.get("chroma_similarity", 0.2))
-        except (ValueError, TypeError):
-            similarity = 0.2
-        if similarity <= 0:
-            similarity = 0.00001
-        try:
-            blend = float(chroma_settings.get("chroma_blend", 0.1))
-        except (ValueError, TypeError):
-            blend = 0.1
-        filter_type = str(chroma_settings.get("chroma_filter_type", "chromakey") or "chromakey")
-        if filter_type == "colorkey":
-            filters.append(f"format=rgb24,colorkey={color}:{similarity}:{blend}")
-        else:
-            filters.append(f"chromakey={color}:{similarity}:{blend}")
+    if _chroma_f and not _chroma_front:
+        filters.append(_chroma_f)
     
     # ----- 去块滤波（2026-08-27：强度 weak/medium/strong + 块尺寸 4/8，覆盖 HandBrake 式 strength/blocksize） -----
     if enhance_settings and enhance_settings.get("deblock_enabled", False):
@@ -3167,8 +3229,9 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
             filters.append(f"hue={':'.join(hue_parts)}")
 
     # ----- 反色（negate）-----
-    # 放在颜色校正/色相之后、像素格式之前（靠后）。绿幕 chromakey 已在缩放后插入（本函数内），
-    # negate 天然在抠图之后生效，不影响抠像——子视频调用点不再需要 include_negate=False + 外部补丁。
+    # 放在颜色校正/色相之后、像素格式之前（靠后）。绿幕 chromakey 无论默认位置（缩放后）
+    # 还是前置模式（链首）都先于 negate，negate 天然在抠图之后生效，不影响抠像——
+    # 子视频调用点不再需要 include_negate=False + 外部补丁。
     if include_negate and enhance_settings and enhance_settings.get("negate_enabled", False):
         filters.append("negate")
 
@@ -6089,11 +6152,39 @@ class VideoFilterFrame(ttk.LabelFrame):
 
         try:
             flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            # 2026-09-08：stderr DEVNULL→PIPE + communicate(timeout=30)。
+            # 旧写法 stdout.read() 无超时，ffmpeg 异常挂住时线程永久阻塞；
+            # 失败时 stderr 尾部 / 空输出原因上浮到信息面板（曾因「截取」起始时间
+            # 残留超出新视频时长 → -ss 越过 EOF → rc=0 空输出，用户只见报错不知因）。
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, creationflags=flags)
-            data = proc.stdout.read()
-            proc.wait(timeout=10)
+                                    stderr=subprocess.PIPE, creationflags=flags)
+            try:
+                data, err_data = proc.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.communicate()
+                except Exception:
+                    pass
+                self.app._append_info_ui(
+                    f"[裁剪辅助] 取帧超时(30s): {os.path.basename(input_file)} @ {frame_sec:.2f}s")
+                return None, None, None
             if proc.returncode != 0 or not data:
+                if proc.returncode != 0:
+                    _tail = ""
+                    if err_data:
+                        _lines = [ln.strip() for ln in err_data.decode("utf-8", "replace").splitlines() if ln.strip()]
+                        if _lines:
+                            _tail = _lines[-1][:200]
+                    self.app._append_info_ui(
+                        f"[裁剪辅助] 取帧失败: {os.path.basename(input_file)} @ {frame_sec:.2f}s, "
+                        f"ffmpeg 返回码 {proc.returncode}" + (f" | {_tail}" if _tail else ""))
+                else:
+                    # rc=0 但 0 字节：-ss 越过 EOF（取帧时间 ≥ 视频时长），典型成因是
+                    # 换了新主视频后旧「截取」起始时间残留。只提示不改行为。
+                    self.app._append_info_ui(
+                        f"[裁剪辅助] 取帧无输出帧: {os.path.basename(input_file)} @ {frame_sec:.2f}s —— "
+                        "取帧时间可能超出视频时长，请检查「截取」是否残留开启（起始时间超出本视频）")
                 return None, None, None
             w, h = _ppm_dimensions_from_bytes(data)
             _frame_cache_put(_ck, (w, h, data))
@@ -6400,8 +6491,20 @@ class VideoFilterFrame(ttk.LabelFrame):
                         initial_time = sec
                         self.app._append_info_ui(f"[裁剪] 使用主界面截取起始时间: {sec:.2f}s")
     
+        # ----- 初始取帧时间钳制（2026-09-08）-----
+        # 换新主视频后旧「截取」起始时间会残留（各来源都不随加载重置），initial_time
+        # 可能超出新视频时长 → ffmpeg -ss 越过 EOF → rc=0 但输出 0 字节 → 取帧必败。
+        # 实测定版：-ss ≥ 时长 → 空输出；-ss = 时长-0.1 → 正常出帧。钳到末帧前 0.1s，
+        # 只日志提示不弹窗（时间类校验铁律）。
+        _dur = self.app._get_media_duration(input_file)
+        if _dur is not None and initial_time > max(0.0, _dur - 0.1):
+            self.app._append_info_ui(
+                f"[裁剪] 初始取帧时间 {initial_time:.2f}s 超出视频时长 {_dur:.2f}s"
+                "（旧「截取」设置残留），已钳制到末帧附近")
+            initial_time = max(0.0, _dur - 0.1)
+
         current_time = initial_time
-    
+
         # ----- 获取原始视频尺寸（用于计算显示比例） -----
         orig_w, orig_h = self.app._get_video_dimensions_cached(input_file)
         if orig_w is None or orig_h is None:
@@ -6853,7 +6956,9 @@ class VideoFilterFrame(ttk.LabelFrame):
                 total_duration = self.app._get_media_duration(input_file)
                 if total_duration is not None and sec > total_duration:
                     messagebox.showwarning("警告", f"输入时间 {sec:.2f}s 超过视频总时长 {total_duration:.2f}s，将跳转到末尾")
-                    sec = total_duration
+                    # 2026-09-08：-ss 精确等于时长也会越过 EOF 取到 0 帧（实测 30s 视频：
+                    # t=30 空输出 / t=29.9 正常），留 0.1s 余量。
+                    sec = max(0.0, total_duration - 0.1)
                 current_time = sec
             
                 refresh_btn.config(state=tk.DISABLED, text="提取中...")
@@ -10461,35 +10566,37 @@ class BlurFilterDialog(tk.Toplevel):
         ToolTip(type_combo,
             "【滤镜类型说明】\n"
             "• delogo：智能去水印滤镜，需指定区域坐标（用周围像素填充），本身就只作用于选定区域。\n"
-            "• boxblur / gblur：模糊滤镜，默认作用于整个画面；\n"
-            "  勾选下方「仅模糊选定区域」后即变为局部模糊，只糊坐标框内的部分。\n"
-            "• negate：局部反色，把坐标框内的画面逐通道反相(255-x)，恒作用于选定区域\n"
-            "  （无强度参数；与子视频混合模式里的 negation 公式完全不同）。\n"
-            "• 其余类型统称「区域效果」，与 negate 一样恒作用于坐标框内，无需勾选局部模糊：\n"
+            "• boxblur / gblur：模糊滤镜；勾「仅应用到选定区域」=局部模糊，不勾=全帧模糊。\n"
+            "• 其余类型统称「区域效果」：勾「仅应用到选定区域」时恒作用于坐标框内：\n"
+            "  negate 局部反色（把坐标框内画面逐通道反相 255-x，无强度参数；\n"
+            "  与子视频混合模式里的 negation 公式完全不同）；\n"
             "  hflip / vflip 局部水平 / 垂直镜像（盖水印时比 delogo 插值更自然）；\n"
             "  swapuv 局部交换 U/V（色差故障风）；desat 局部去色；eq_bright 局部明暗；\n"
             "  black / white 局部纯黑 / 纯白遮盖；unsharp 局部锐化；\n"
-            "  avgblur / median 局部均値模糊 / 中值（去小斑点、小 logo）。\n\n"
-            "【局部模糊如何实现】\n"
-            "程序会自动生成分支滤镜图（不再需要手写快速命令）：\n"
+            "  avgblur / median 局部均値模糊 / 中值（去小斑点、小 logo）。\n"
+            "  不勾（全帧）时配合「显示时段」即时间段效果：\n"
+            "  例：eq_bright + 不勾 + 显示时段 5~8 = 仅 5~8 秒整幅画面提亮。\n\n"
+            "【局部滤镜如何实现】\n"
+            "勾「仅应用到选定区域」时，程序会自动生成分支滤镜图（不再需要手写快速命令）：\n"
             "  split=2[bg][fg];[fg]crop=宽:高:X:Y,boxblur=..[bl];[bg][bl]overlay=X:Y\n"
             "该子图会被放在滤镜链最前面，先于裁剪 / 旋转 / 缩放 / 亮度等滤镜执行，\n"
-            "因此这里填的坐标始终以【原始画面】为准，不会被后续裁剪或缩放带偏。\n"
+            "因此这里填的坐标始终以【原始画面】为准，不会被后续裁剪或缩放带偏；\n"
+            "若同时启用绿幕抠图，抠图会自动排在本区域链之前，区域颜色处理不影响抠像。\n"
             "卷积类（模糊 / 锐化 / 描边 / 中值）会自动向外多裁一圈、处理完再裁回，\n"
             "避免区域边缘出现方块接缝（实测边缘误差由 11dB 降到 65dB）。"
         )
 
-        # 一键切换到局部模糊
-        btn_region = ttk.Button(main, text="🎯 局部模糊", command=self.quick_region_blur)
+        # 一键切换到局部应用
+        btn_region = ttk.Button(main, text="🎯 局部应用", command=self.quick_region_blur)
         btn_region.grid(row=2, column=2, sticky="w", padx=5)
         ToolTip(btn_region,
-            "一键配置局部模糊：\n"
+            "一键把当前效果配置为「仅应用到选定区域」（局部滤镜）：\n"
             "1. 勾选「启用去水印/模糊」；\n"
             "2. 若当前是 delogo，自动切换为 boxblur；\n"
-            "3. 勾选「仅模糊选定区域」并解锁坐标框；\n"
+            "3. 勾选「仅应用到选定区域」并解锁坐标框；\n"
             "4. 坐标为空时自动从「裁剪」设置带入。\n\n"
             "应用后命令里的 -vf 会自动变成带分支的滤镜图，\n"
-            "局部模糊排在最前，其余滤镜（裁剪/亮度等）在其之后执行。")
+            "局部滤镜排在最前（先于裁剪/旋转/缩放），坐标以原始画面为准。")
 
         # ---- 强度参数 + 局部模糊开关 ----
         self.strength_frame = ttk.Frame(main)
@@ -10508,23 +10615,26 @@ class BlurFilterDialog(tk.Toplevel):
                 "delogo 与无参数的区域效果（negate / hflip / vflip / swapuv /\n"
                 "desat / black / white）：此参数无效")
 
+        # 统一的 局部/全帧 开关（2026-09-07 由「仅模糊选定区域」+「全帧」双开关合并）：
+        # 勾=仅作用选定区域（局部滤镜，旧行为）；不勾=整幅画面（全帧，仍受显示时段控制）。
+        # 数据侧：boxblur/gblur 走 region_only；区域效果类型不勾时写 full_frame=True。
         self.region_var = tk.BooleanVar(value=self.filter_frame._blur_region_only.get())
-        self.region_chk = ttk.Checkbutton(self.strength_frame, text="仅模糊选定区域（局部模糊）",
+        self.region_chk = ttk.Checkbutton(self.strength_frame, text="仅应用到选定区域(局部滤镜)",
                                           variable=self.region_var, command=self.on_region_toggle)
         self.region_chk.pack(side=tk.LEFT, padx=(15, 0))
         ToolTip(self.region_chk,
-            "勾选后 boxblur / gblur 只作用于下方坐标框圈定的区域，\n"
-            "程序会自动生成 split → crop → 模糊 → overlay 的分支滤镜图。\n"
-            "该子图永远排在裁剪 / 旋转 / 缩放 / 亮度等滤镜之前，坐标以原始画面为准。\n\n"
-            "delogo 本身就是区域滤镜，无需勾选（此时该项不可用）。")
+            "勾选：效果只作用于下方坐标框圈定的区域（局部滤镜）。\n"
+            "程序自动生成 split → crop → 滤镜 → overlay 的分支滤镜图，\n"
+            "该子图恒排在裁剪 / 旋转 / 缩放之前，坐标以原始画面为准。\n\n"
+            "不勾：作用于整幅画面（全帧），无需填坐标，仍受「显示时段」控制。\n"
+            "delogo 本身就是区域滤镜，恒作用选定区域（此项不可用）。")
 
         self.update_strength_state()  # 初始化状态
-        
+
         # ---- 坐标区域 ----
-        coord_frame = ttk.LabelFrame(main, text="区域坐标 (delogo / 局部模糊 有效)", padding="5")
+        coord_frame = ttk.LabelFrame(main, text="区域坐标 (仅应用到选定区域时有效)", padding="5")
         coord_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=5)
 
-        
         # 坐标输入行
         row1 = ttk.Frame(coord_frame)
         row1.pack(fill=tk.X, pady=2)
@@ -10581,14 +10691,14 @@ class BlurFilterDialog(tk.Toplevel):
                 frame_extractor=ff.extract_video_frame_scaled,
                 helper_rect=helper,
                 safe_border=(self.type_var.get() == "delogo"),
-                title="可视化选区 - delogo / 局部模糊",
+                title="可视化选区 - delogo / 局部滤镜",
             )
 
         btn_visual = ttk.Button(coord_frame, text="🎯 可视化选区…",
                                 command=_open_region_visual)
         btn_visual.pack(pady=2)
         ToolTip(btn_visual,
-                "打开独立可视化选区窗口：在画面上拖拽确定 delogo/局部模糊 区域。\n"
+                "打开独立可视化选区窗口：在画面上拖拽确定 delogo/局部滤镜 区域。\n"
                 "已勾选「裁剪」时同时显示裁剪框（蓝色虚线）作为辅助，\n"
                 "避免选区超出裁剪范围。delogo 应用时自动四周留 1px 边界。\n"
                 "应用后坐标写回本窗口，点「保存」生效。")
@@ -10647,7 +10757,8 @@ class BlurFilterDialog(tk.Toplevel):
 
         self.update_coord_state()
     
-    # 区域效果类型（2026-09-07）：恒局部（不走「仅模糊选定区域」开关），坐标恒解锁。
+    # 区域效果类型（2026-09-07）：走统一的「仅应用到选定区域」开关——
+    # 勾=恒局部（旧行为，坐标解锁）；不勾=全帧时间段效果（坐标禁用）。
     # 与生成端 _REGION_EFFECT_FILTERS 一一对应，加类型时两边一起改。
     _REGION_EFFECTS = ("negate", "hflip", "vflip", "swapuv", "desat", "eq_bright",
                        "unsharp", "avgblur", "median", "black", "white")
@@ -10680,16 +10791,21 @@ class BlurFilterDialog(tk.Toplevel):
     
     def update_coord_state(self):
         ftype = self.type_var.get()
-        # delogo 与所有区域效果都需要坐标；boxblur/gblur 只有开启局部模糊时才需要
-        need_coord = (ftype == "delogo") or (ftype in self._REGION_EFFECTS) or self._is_region_blur()
+        # delogo 恒区域；区域效果勾「仅应用到选定区域」时需坐标（不勾=全帧免坐标）；
+        # boxblur/gblur 仅勾局部时需坐标
+        if ftype == "delogo":
+            need_coord = True
+        elif ftype in self._REGION_EFFECTS:
+            need_coord = bool(self.region_var.get())
+        else:
+            need_coord = self._is_region_blur()
         state = "normal" if need_coord else "disabled"
         for entry in getattr(self, "_coord_entries", []):
             entry.config(state=state)
-        # delogo 本身就是区域滤镜，局部模糊开关对它无意义；区域效果恒局部，同款
+        # 统一开关仅 delogo 不可用（恒区域）；其余类型都用它切换 局部/全帧
         if hasattr(self, "region_chk"):
-            self.region_chk.config(
-                state="disabled" if (ftype == "delogo" or ftype in self._REGION_EFFECTS) else "normal")
-    
+            self.region_chk.config(state="disabled" if ftype == "delogo" else "normal")
+
     def on_type_change(self, event=None):
         ftype = self.type_var.get()
         _spec = self._STRENGTH_SPEC.get(ftype)
@@ -10697,8 +10813,10 @@ class BlurFilterDialog(tk.Toplevel):
             # 切换类型时始终填入该类型的默认值，保证下拉选项与强度值联动
             self.strength_var.set(_spec[1])
         else:
-            # delogo 与无强度的区域效果：强度清空；区域效果恒局部，开关不适用
+            # delogo 与无强度的区域效果：强度清空
             self.strength_var.set("")
+        # delogo 恒区域，开关关掉；其余类型保留当前 局部/全帧 选择（换类型不打断）
+        if ftype == "delogo":
             self.region_var.set(False)
         self.update_strength_state()
         self.update_coord_state()
@@ -10707,7 +10825,8 @@ class BlurFilterDialog(tk.Toplevel):
         self.update_coord_state()
 
     def quick_region_blur(self):
-        """一键切换到「局部模糊」：启用 + boxblur + 区域模式 + 自动补坐标"""
+        """一键切换到「局部应用」：启用 + 勾「仅应用到选定区域」+ 自动补坐标
+        （delogo 会自动换成 boxblur，其余类型保持不动只勾局部）"""
         self.enabled_var.set(True)
         if self.type_var.get() == "delogo":
             self.type_var.set("boxblur")
@@ -10722,8 +10841,9 @@ class BlurFilterDialog(tk.Toplevel):
         self.update_coord_state()
         if getattr(self.filter_frame, "app", None):
             self.filter_frame.app._append_info_ui(
-                "已切换为局部模糊：应用后 -vf 将自动生成 split→crop→模糊→overlay 滤镜图，"
-                "并排在裁剪/旋转/缩放/亮度等滤镜之前（坐标以原始画面为准）")
+                "已切换为局部应用（仅作用选定区域）：应用后 -vf 将自动生成 "
+                "split→crop→滤镜→overlay 滤镜图，"
+                "并排在裁剪/旋转/缩放等滤镜之前（坐标以原始画面为准）")
     
     def _resolve_crop_coord(self, expr):
         """把裁剪坐标表达式（可能含 iw/ih，如 iw/2、ih-100）按输入文件原始尺寸换算成数字。
@@ -10849,7 +10969,10 @@ class BlurFilterDialog(tk.Toplevel):
         for i, it in enumerate(self.items):
             _en = "☑" if it.get("enabled", True) else "☐"
             _t = it.get("type", "delogo")
-            _sum = f"({it.get('x','0')},{it.get('y','0')}) {it.get('w','100')}x{it.get('h','100')}"
+            if it.get("full_frame", False) and _t in self._REGION_EFFECTS:
+                _sum = "全帧"
+            else:
+                _sum = f"({it.get('x','0')},{it.get('y','0')}) {it.get('w','100')}x{it.get('h','100')}"
             _s = it.get("strength", "")
             if _s and _t in self._STRENGTH_SPEC:
                 _sum += f" r={_s}"
@@ -10906,7 +11029,11 @@ class BlurFilterDialog(tk.Toplevel):
             _tk_setv(self.y_var, it.get("y", "0"))
             _tk_setv(self.w_var, it.get("w", "100"))
             _tk_setv(self.h_var, it.get("h", "100"))
-            _tk_setv(self.region_var, it.get("region_only", False))
+            if it.get("type", "delogo") in self._REGION_EFFECTS:
+                # 区域效果：勾=局部（旧行为，full_frame 缺省/False），不勾=全帧（full_frame=True）
+                _tk_setv(self.region_var, not bool(it.get("full_frame", False)))
+            else:
+                _tk_setv(self.region_var, it.get("region_only", False))
             _tk_setv(self.enable_start_var, it.get("enable_start", ""))
             _tk_setv(self.enable_end_var, it.get("enable_end", ""))
             _tk_setv(self.enable_cycle_var, it.get("enable_cycle", ""))
@@ -10927,7 +11054,10 @@ class BlurFilterDialog(tk.Toplevel):
         it["y"] = self.y_var.get()
         it["w"] = self.w_var.get()
         it["h"] = self.h_var.get()
+        # 存储映射：区域效果类型用 full_frame 表达（不勾局部=全帧）；其余类型恒 False
+        _ftype = self.type_var.get()
         it["region_only"] = self.region_var.get()
+        it["full_frame"] = (not self.region_var.get()) if _ftype in self._REGION_EFFECTS else False
         # 显示时段 / 循环（起始/结束/周期/单次）
         it["enable_start"] = self.enable_start_var.get().strip()
         it["enable_end"] = self.enable_end_var.get().strip()
@@ -10966,6 +11096,7 @@ class BlurFilterDialog(tk.Toplevel):
             self._collect_form_to_item(self._last_sel)
         self.items.append({"enabled": True, "type": "delogo", "x": "100", "y": "100",
                            "w": "200", "h": "100", "strength": "", "region_only": False,
+                           "full_frame": False,
                            "enable_start": "", "enable_end": "", "enable_cycle": "",
                            "enable_show": ""})
         self._refresh_blur_tree()
@@ -11028,6 +11159,7 @@ class BlurFilterDialog(tk.Toplevel):
                     "w": _fw,
                     "h": self.filter_frame._blur_h.get(),
                     "region_only": self.filter_frame._blur_region_only.get(),
+                    "full_frame": False,
                     "enable_start": "", "enable_end": "", "enable_cycle": "",
                     "enable_show": "",
                 }]
@@ -11063,11 +11195,13 @@ class BlurFilterDialog(tk.Toplevel):
                 continue
             ftype = it.get("type", "delogo")
             region = it.get("region_only", False)
-            if ftype == "delogo" or ftype in self._REGION_EFFECTS or region:
+            # 全帧仅对区域效果类型有效；勾了全帧不需要坐标
+            full = bool(it.get("full_frame", False)) and ftype in self._REGION_EFFECTS
+            if not full and (ftype == "delogo" or ftype in self._REGION_EFFECTS or region):
                 if ftype == "delogo":
                     label = "delogo"
                 elif region:
-                    label = "局部模糊"
+                    label = "局部滤镜"
                 else:
                     label = ftype
                 for nm in ("x", "y", "w", "h"):
@@ -14604,8 +14738,8 @@ class SimplePreviewer:
             self._draw_wave()
 
     def _draw_wave(self):
-        """重绘大波形画布（音频模式，主线程）：min/max 包络，限 ~1500 条竖线保 Tk 流畅。
-        支持视图窗口 (t0,t1)：只画可见桶段，放大后线数更少、局部细节更清晰。"""
+        """重绘大波形画布（音频模式，主线程）：min/max 包络填充多边形（连续无间隙）。
+        支持视图窗口 (t0,t1)：只画可见桶段，放大后局部细节更清晰（不再出现离散竖条）。"""
         try:
             cv = self.wave_cv
             w = cv.winfo_width()
@@ -14624,10 +14758,12 @@ class SimplePreviewer:
                 # 可见桶范围（桶 i 的中心时间 = (i+0.5)/N * dur）
                 i0 = max(0, int(t0 / self._dur * N) - 1)
                 i1 = min(N, int(t1 / self._dur * N) + 2)
-                vis = max(1, i1 - i0)
-                step = max(1, vis // 1500)
                 inv = w / span
-                for i in range(i0, i1, step):
+                # 填充包络：上沿(max)左→右、下沿(min)右→左合成一个多边形，
+                # 任意缩放都连续不断裂（取代原逐桶 1px 竖线 → 消除放大后的离散竖条）。
+                top = []   # (x, y_top)
+                bot = []   # (x, y_bottom)
+                for i in range(i0, i1):
                     pk = self._wave_peaks[i]
                     if pk is None:
                         continue
@@ -14640,8 +14776,20 @@ class SimplePreviewer:
                     y2 = mid - min(32767, max(-32768, mn)) / 32768.0 * amp
                     if y2 - y1 < 1:
                         y2 = y1 + 1
-                    cv.create_line(x, y1, x, y2, fill="#1f6feb")
+                    top.append((x, y1))
+                    bot.append((x, y2))
                     drawn += 1
+                if len(top) >= 2:
+                    pts = []
+                    for (x, y) in top:
+                        pts.append(x); pts.append(y)
+                    for (x, y) in reversed(bot):
+                        pts.append(x); pts.append(y)
+                    cv.create_polygon(pts, fill="#9ec5ff",
+                                      outline="#1f6feb", width=1, tags="wave")
+                elif top:
+                    x, y1 = top[0]; _, y2 = bot[0]
+                    cv.create_line(x, y1, x, y2, fill="#1f6feb", width=1, tags="wave")
             if drawn == 0:
                 if self._wave_peaks is not None and not self._wave_done:
                     tip = "波形生成中…（长文件需数秒到数十秒）"
@@ -14713,8 +14861,10 @@ class SimplePreviewer:
             n = len(self._wave_peaks)
             i0 = max(0, int(t0 / self._dur * n) - 1)
             i1 = min(n, int(t1 / self._dur * n) + 2)
-            step = max(1, (i1 - i0) // 1500)
-            for i in range(i0, i1, step):
+            # 填充包络（与大波形同款）：上沿左→右、下沿右→左合成多边形，连续无间隙。
+            top = []   # (x, y_top=max)
+            bot = []   # (x, y_bottom=min)
+            for i in range(i0, i1):
                 pk = self._wave_peaks[i]
                 if pk is None:
                     continue
@@ -14727,6 +14877,18 @@ class SimplePreviewer:
                 y2 = mid - max(-1.0, min(1.0, mn / 32768.0)) * amp
                 if y2 - y1 < 1:
                     y2 = y1 + 1
+                top.append((x, y1))
+                bot.append((x, y2))
+            if len(top) >= 2:
+                pts = []
+                for (x, y) in top:
+                    pts.append(x); pts.append(y)
+                for (x, y) in reversed(bot):
+                    pts.append(x); pts.append(y)
+                cv.create_polygon(pts, fill="#cfe3ff",
+                                  outline="#1f6feb", width=1, tags="static")
+            elif top:
+                x, y1 = top[0]; _, y2 = bot[0]
                 cv.create_line(x, y1, x, y2, fill="#1f6feb", width=1, tags="static")
         # 关键帧刻度（复用关键帧模块的预扫描表；只画视野内）
         if self._keyframes:
@@ -37776,13 +37938,30 @@ class SegmentEditor:
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vbar.pack(side=tk.RIGHT, fill=tk.Y)
 
+        # 2026-09-08 修复双击编辑失效：这行绑定原先写在 _set_initial_pane_size() 末尾，
+        # 而那个方法一开头 `if len(paned.panes()) < 2: return` 会直接 return
+        # （右栏命令框收进按钮弹窗后 paned 只剩单 pane）→ 绑定从未执行，双击自然无反应。
+        # 事件绑定必须紧跟控件创建，绝不塞进几何/尺寸类方法里。
+        self.tree.bind("<Double-1>", self.on_tree_double_click)
+        # 单击表头/空白区 → 取消选择（未选中时「简易时间预览」会载入全部片段的标记）
+        self.tree.bind("<Button-1>", self.on_tree_click_clear_selection)
+
         op_frame = ttk.Frame(left_frame)
         op_frame.pack(fill=tk.X, pady=2)
+        ttk.Button(op_frame, text="编辑", command=self.edit_selected).pack(side=tk.LEFT, padx=2)
         ttk.Button(op_frame, text="删除选中", command=self.delete_selected).pack(side=tk.LEFT, padx=2)
         ttk.Button(op_frame, text="上移", command=self.move_up).pack(side=tk.LEFT, padx=2)
         ttk.Button(op_frame, text="下移", command=self.move_down).pack(side=tk.LEFT, padx=2)
         ttk.Button(op_frame, text="清空所有", command=self.clear_all).pack(side=tk.LEFT, padx=2)
-        ttk.Button(op_frame, text="简易时间预览", command=self.open_simple_preview_segment).pack(side=tk.LEFT, padx=2)
+        b_prev = ttk.Button(op_frame, text="简易时间预览",
+                            command=self.open_simple_preview_segment)
+        b_prev.pack(side=tk.LEFT, padx=2)
+        ToolTip(b_prev,
+                "打开简易时间预览（波形/画面定位 + 打点）。\n"
+                "• 选中某个片段时：只载入该片段的标记，且「设为起点/终点」会回写该片段。\n"
+                "• 未选中任何片段时：载入全部片段的标记（批量复制用），但不回写。\n"
+                "取消选择：单击列表的表头或下方空白区即可（不必重开窗口）。",
+                wraplength=480)
 
         # 右栏「外部命令输入」已收进「外部命令」按钮弹窗（2026-08-28），见 open_external_cmd_dialog
 
@@ -37873,23 +38052,30 @@ class SegmentEditor:
                 "  - 导出脚本：保存为 .bat/.sh 文件，手动运行。\n"
                 "  - 发送到队列：自动添加到任务列表，一键执行。\n"
                 "精确模式截取方式由「精确方式」单选框决定（常驻，不再弹窗）：\n"
-                "  · trim 滤镜：单个 ffmpeg 命令一次解码、多段精确裁剪（优雅、单队列任务）。\n"
-                "  · 双 -ss（组合跳转）：逐段发送（适合超长视频，解码更快）。\n"
+                "  · trim 滤镜：单个 ffmpeg 命令一次解码、多段精确裁剪（优雅、单队列任务）；"
+                "勾选「分开队列」则改为每段一条独立任务。\n"
+                "  · 双 -ss（组合跳转）：逐段发送，无法合并（此时「分开队列」自动勾选并置灰）。\n"
                 "输出文件自动命名为：原文件名_seg序号.mp4。",
                 wraplength=800
         )
         ttk.Label(row1, text="精确方式:").pack(side=tk.LEFT, padx=(12, 2))
+        # 2026-09-08：精确方式切换需联动「分开队列」（双-ss 恒逐段 → 锁定勾选并置灰）
         ttk.Radiobutton(row1, text="trim 滤镜", variable=self.precise_mode_var,
-                        value="trim").pack(side=tk.LEFT)
+                        value="trim", command=self._on_precise_mode_change).pack(side=tk.LEFT)
         ttk.Radiobutton(row1, text="双-ss", variable=self.precise_mode_var,
-                        value="combo").pack(side=tk.LEFT, padx=(4, 0))
+                        value="combo", command=self._on_precise_mode_change).pack(side=tk.LEFT, padx=(4, 0))
         cb_split = ttk.Checkbutton(row1, text="分开队列", variable=self.quick_split_queue_var)
         cb_split.pack(side=tk.LEFT, padx=(12, 0))
+        self.cb_split = cb_split
         ToolTip(cb_split,
-                "片段异常多时，合并单命令会因每个分段重复一遍输入路径而长度爆炸"
-                "（这是非滤镜命令，不受 25000 字符阈值限制，合并逻辑无法自动兜底）。\n"
-                "勾选后每个分段作为独立队列任务发送，单条命令只含一个输入，彻底避免爆炸；\n"
-                "代价：队列会多出 N 条任务。常规片段数请保持不勾选（合并更干净）。",
+                "只影响「发送到队列」；「导出为脚本」恒为「一段一条命令」，与本项无关。\n"
+                "• 快速 (copy)：不勾选=合成 1 条队列任务（命令里每段重复一次输入路径，"
+                "片段极多时命令长度会爆炸）；勾选=每段 1 条独立队列任务。\n"
+                "• 精确 · trim 滤镜：不勾选=合成 1 条单解码 filter_complex 命令（队列 1 条，最省）；"
+                "勾选=每段 1 条独立队列任务（逐段解码，慢一些，但命令短、不会因合并失败而回退）。\n"
+                "• 精确 · 双 -ss：依赖输入级 -ss，多段无法合并，恒为逐段发送；"
+                "此时本项自动勾选并置灰（置灰期间对「快速」同样生效）。\n"
+                "常规片段数保持不勾选即可（合并更干净）。",
                 wraplength=680)
 
         # 第 2 行：发送到队列 / 导出为脚本 + 取消/确定
@@ -37900,7 +38086,15 @@ class SegmentEditor:
         ttk.Button(row2, text="快速", command=self.send_quick_to_queue, width=6).pack(side=tk.LEFT, padx=5)
         ttk.Button(row2, text="精确", command=self.send_precise_to_queue, width=6).pack(side=tk.LEFT, padx=5)
 
-        ttk.Label(row2, text=" 导出为脚本").pack(side=tk.LEFT, padx=(10, 5))
+        lbl_export = ttk.Label(row2, text=" 导出为脚本")
+        lbl_export.pack(side=tk.LEFT, padx=(10, 5))
+        ToolTip(lbl_export,
+                "导出为脚本时**恒为分开**：脚本就是一行一条命令顺序执行，"
+                "合并成单命令反而更难排查和复用。\n"
+                "所以「分开队列」勾选与否都不影响导出的脚本内容，它只作用于「发送到队列」。\n"
+                "• 快速：每段一条 `ffmpeg -ss 开始 -to 结束 -i 输入 -c copy 输出`。\n"
+                "• 精确：每段一条按右侧「精确方式」生成的完整编码命令（trim 滤镜 / 双 -ss）。",
+                wraplength=680)
         ttk.Button(row2, text="快速", command=self.export_quick_script, width=6).pack(side=tk.LEFT, padx=5)
         ttk.Button(row2, text="精确", command=self.export_precise_script, width=6).pack(side=tk.LEFT, padx=5)
 
@@ -37908,6 +38102,9 @@ class SegmentEditor:
         ttk.Button(row2, text="取消", command=self.on_cancel).pack(side=tk.RIGHT, padx=5)
         ttk.Button(row2, text="确定", command=self.on_ok).pack(side=tk.RIGHT, padx=5)
 
+
+        # 双-ss 初始为默认模式时，同步一次「分开队列」的锁定态（默认 trim → 无需置灰）
+        self._on_precise_mode_change()
 
         self.window.after(100, lambda: self._set_initial_pane_size(paned))
 
@@ -37922,10 +38119,40 @@ class SegmentEditor:
         total_width = self.window.winfo_width()
         if total_width > 100:
             paned.sashpos(0, int(total_width * 0.75))
+        # ⚠️ 双击绑定已于 2026-09-08 移出本方法（原先在这里，因上面的 return 而从未生效）。
 
-        # 绑定双击编辑
-        self.tree.bind("<Double-1>", self.on_tree_double_click)
+    def _on_precise_mode_change(self):
+        """「精确方式」单选联动「分开队列」复选框（2026-09-08）。
 
+        双 -ss（combo）：依赖输入级 -ss，多段无法合并成单命令，恒为逐段发送 →
+        把「分开队列」强制勾选并置灰，让 UI 状态如实反映实际行为（避免用户以为没生效）。
+        trim：恢复置灰前用户自己选的值（_split_user_value），交还控制权。
+
+        ⚠️ 置灰用 configure(state=...)：ttk.Checkbutton 有 -state 选项，且项目约定禁用
+        ttk 控件一律走 configure / config（与 region_chk 等处一致），不用 .state([...])。
+        另外 ttk.Checkbutton 的 command 在 variable 翻转「之后」才执行，所以这里不用 command 联动，
+        改由 Radiobutton 的 command 显式驱动。
+        """
+        cb = getattr(self, "cb_split", None)
+        if cb is None:
+            return
+        combo = (self.precise_mode_var.get() == "combo")
+        try:
+            if combo:
+                # 只在第一次进入 combo 时记录用户原值，避免来回切换时被锁定的 True 覆盖
+                if not getattr(self, "_split_locked_by_combo", False):
+                    self._split_user_value = bool(self.quick_split_queue_var.get())
+                    self._split_locked_by_combo = True
+                self.quick_split_queue_var.set(True)
+                cb.configure(state="disabled")
+            else:
+                if getattr(self, "_split_locked_by_combo", False):
+                    self._split_locked_by_combo = False
+                    self.quick_split_queue_var.set(bool(getattr(self, "_split_user_value", False)))
+                cb.configure(state="normal")
+        except Exception:
+            # 置灰失败不能影响模式切换本身（UI 状态只是提示，发送逻辑各自独立判定）
+            pass
 
     def send_quick_to_queue(self):
         input_file = self.app.input_file.get().strip()
@@ -38069,6 +38296,24 @@ class SegmentEditor:
             settings_list.append(s)
 
         resolved = [self.app._resolve_path_conflict(p, show_dialog=False) for p in out_paths]
+
+        # ---- 分开队列（2026-09-08 修复）：trim 模式此前完全没读「分开队列」，
+        # 无论勾选与否都只发一条合并命令，勾选形同虚设。现在勾选=逐段发送独立队列任务：
+        # 每段单独解码（比单解码慢），但命令短、不受合并失败回退影响。
+        if self.quick_split_queue_var.get():
+            count = 0
+            for i, s in enumerate(settings_list):
+                # 用冲突消解后的文件名，保证与合并模式下落盘的名字一致
+                s["custom_output_name"] = os.path.basename(resolved[i])
+                if self.app.add_task(input_file, s):
+                    count += 1
+            self.app.update_task_list()
+            self.app._append_info_ui(
+                f"已添加 {count} 个精确分段任务到队列（模式：trim，分开队列）")
+            messagebox.showinfo("成功",
+                f"已添加 {count} 个精确分段任务到队列（模式：trim，分开队列）")
+            return
+
         merged = self._build_precise_multi_command(input_file, resolved, settings_list)
 
         if merged is None:
@@ -38565,12 +38810,47 @@ class SegmentEditor:
             return self.app._get_media_duration(path)
         return None
 
-    # ---------- 双击编辑 ----------
+    # ---------- 列表交互：单击取消选择 / 双击编辑 ----------
+    def on_tree_click_clear_selection(self, event):
+        """单击表头 / 列分隔线 / 列表下方空白区 → 取消选择（2026-09-08）。
+
+        用途：「简易时间预览」在**未选中任何片段**时会载入全部片段的标记（批量用），
+        而 Treeview 的默认行为点空白并不清空选中，以前只能重开窗口才能回到「全选标记」状态。
+
+        ⚠️ 只在确实点到了「非行」区域时才清空：行内的选中交给 Tk 自己的 class 绑定处理。
+        （widget 级 bind 先于 class 绑定执行，若在这里误清会被随后的 class 选中覆盖。）
+        """
+        try:
+            region = self.tree.identify_region(event.x, event.y)
+        except Exception:
+            region = ""
+        row = self.tree.identify_row(event.y)
+        if region in ("heading", "separator") or not row:
+            sel = self.tree.selection()
+            if sel:
+                self.tree.selection_remove(*sel)
+
     def on_tree_double_click(self, event):
+        """双击列表行 → 编辑该片段。
+
+        用 identify_row(event.y) 定位而不是直接取 selection()：点在表头或空白区时
+        identify_row 返回空，此时直接返回，避免「点空白却改了上次选中的片段」。
+        """
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        self.tree.selection_set(row)
+        self.edit_selected()
+
+    def edit_selected(self):
+        """编辑当前选中片段（双击行 / 「编辑」按钮共用入口）。"""
         selected = self.tree.selection()
         if not selected:
+            messagebox.showinfo("提示", "请先选中一个片段")
             return
         idx = int(selected[0])
+        if idx < 0 or idx >= len(self.segments):
+            return
         seg = self.segments[idx]
 
         dialog = EditSegmentDialog(self.window, "编辑片段",
@@ -38607,6 +38887,8 @@ class SegmentEditor:
             seg["speed"] = dialog.speed
             seg["reverse"] = dialog.reverse
             self.refresh_tree()
+            # 刷新后保持选中刚编辑的那行（iid 即索引字符串，与 move_up/down 写法一致）
+            self.tree.selection_set(str(idx))
 
     # ---------- 外部命令导入 ----------
     def open_external_cmd_dialog(self):
