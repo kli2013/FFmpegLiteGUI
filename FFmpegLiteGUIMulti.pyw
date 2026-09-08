@@ -52,6 +52,26 @@ def _(msg):
         return msg
     return TRANS.get(msg, msg)
 
+def _lang_search_dirs():
+    """lang 文件夹候选目录（按优先级）。
+
+    2026-09-08 修复：PyInstaller onedir（文件夹版，6.x 起）把数据文件统一放进
+    <exe目录>/_internal，lang/ 打包后位于 _internal/lang；而 get_script_dir()
+    frozen 时返回 exe 所在目录 → 旧逻辑只查 exe 目录，文件夹版找不到语言包，
+    英文界面静默回退中文。
+    候选顺序：
+      1. 脚本/exe 目录 —— 源码运行；以及手动把 lang 放 exe 旁的发布方式（老行为保留）
+      2. sys._MEIPASS —— PyInstaller 运行时数据根：onefile=解压临时目录，
+         onedir=<exe>/_internal。非冻结环境不存在该属性，用 getattr 取。
+    ⚠️ 不改 get_script_dir() 本身：ffmpeg_presets.json / editlog.txt / 字体缓存
+    等是「可写配置」，放 exe 旁边是对的，只读的语言包才需要去 _internal 找。
+    """
+    dirs = [get_script_dir()]
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass and meipass not in dirs:
+        dirs.append(meipass)
+    return dirs
+
 def load_language(lang):
     """加载语言包到全局 TRANS。lang='zh' 或文件缺失时清空（回退中文）。"""
     global TRANS, _CURRENT_LANG
@@ -60,10 +80,12 @@ def load_language(lang):
     if _CURRENT_LANG == "zh":
         return
     try:
-        lang_path = os.path.join(get_script_dir(), "lang", f"{_CURRENT_LANG}.json")
-        if os.path.exists(lang_path):
-            with open(lang_path, "r", encoding="utf-8") as f:
-                TRANS = json.load(f)
+        for _dir in _lang_search_dirs():
+            lang_path = os.path.join(_dir, "lang", f"{_CURRENT_LANG}.json")
+            if os.path.exists(lang_path):
+                with open(lang_path, "r", encoding="utf-8") as f:
+                    TRANS = json.load(f)
+                break
     except Exception:
         TRANS = {}
 
