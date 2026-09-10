@@ -145,7 +145,7 @@ With PiP enabled, editing the main video track opens a window with an **"Overlay
 
 ## 3. Other conveniences
 
-- **Save / load project** — all tracks, settings, layout to a `.fflgproject` file (JSON inside; editable in a text editor).
+- **Save / load project** — all tracks, settings, layout to a `.fflgproject` file (JSON inside; editable in a text editor). **Not interchangeable with the Transcode page's "Export / import project"**: the mux-page project file carries no `project_type` key, while the Transcode one carries `project_type = "convert"`. Opening the wrong kind shows a hint to use the other page instead of silently loading wrong data.
 - **Sort** — by name or mtime (Concat mode only).
 - **Drag-and-drop add** — auto type detection.
 - **Track edit** — double-click any track for video filters, audio params, subtitle language/title. In Concat re-encode mode, sub-video crop/scale/rotate filters now work, but speed/reverse/subtitle are global.
@@ -307,6 +307,51 @@ Besides the four presets, the trajectory dialog has an **"Enable list waypoints"
 - **Max 15 rows** (far below ffmpeg's long-expression crash threshold of ~95–100 segments); over-limit is warned.
 
 **Implementation**: `build_waypoint_expr` compiles the whole table into overlay x/y eval expressions (per-frame `t` evaluation, `lt`/`mod` segmentation, `st`/`ld` variable slots) — no temp files; blend mode also supports it (dynamic crop window follows). **Orthogonal to loop control (show window / cycle show)**: the table governs "where/when-hidden", loop control governs "when-visible" — combinable.
+
+---
+
+## 12. New per-track parameters (2026-09-07 ~ 2026-09-10)
+
+The mux page's video-track editor (double-click main or sub video → **Filters** tab) **shares the same filter panel as the Transcode page**, so everything below is available per track — one independent copy for the main video and for each sub-video. Output color marks and GOP are injected on both the main-video and sub-video output-parameter paths.
+
+### 12.1 GOP / keyframe interval (2026-09-09)
+- Location: the `GOP:` box + "frames" on the same row as **Frame rate**; maps to ffmpeg `-g`.
+- Blank = encoder default (x264/x265 ≈ 250 frames). For random seeking enter `fps × target seconds` (30 fps → 30–60 for a keyframe every 1–2 s).
+- Smaller = more accurate seeking but bigger file. Re-encode only; ignored with `copy`.
+
+### 12.2 Output color marks (2026-09-09)
+- Location: **"Output color marks"** block in the right column of the "Advanced enhancement" window: four dropdowns **primaries / transfer / matrix / range**, writing the output file's color **metadata** (`-color_primaries` / `-color_trc` / `-colorspace` / `-color_range`).
+- **Follow source = don't touch it** (inherit the source tags; if the source has none or wrong ones, the output inherits the same gap). Not re-stamping marks after a re-encode is a common cause of HDR clips looking washed out / off-color in some players.
+- Marks only — no pixel conversion (use the "Color matrix" filter for that).
+- Measured pitfall: libx264 / libx265 / libsvtav1 **silently drop** `-color_primaries` / `-color_trc`, so those three go through private params (`-x264-params colorprim=:transfer=` / `-x265-params` / `-svtav1-params color-primaries=:transfer-characteristics=`) which reliably land; matrix / range use the generic options.
+
+### 12.3 HDR→SDR tone mapping (2026-09-09)
+- Location: **"HDR→SDR tone mapping"** block in the right column of the "Advanced enhancement" window: enable checkbox + algorithm dropdown `hable` (good all-rounder) / `mobius` (keeps highlight detail) / `reinhard` (softer contrast).
+- Chain: `zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=<algo>:desat=0,zscale=tin=linear:t=bt709:m=bt709:p=bt709:r=tv,format=<pix_fmt>`.
+- **Requires HDR10 (PQ) / HLG tags on the source**; untagged HDR sources can't be force-converted with this build (zimg "no path between colorspaces"). A source already tagged SDR passes through with no side effect.
+- With tone mapping on, clicking "Save and close" fills any still-"Follow source" color mark with bt709 primaries / bt709 transfer / bt709 matrix / tv range; manually changed values are left alone.
+
+### 12.4 Region-effect family (2026-09-07: delogo-family registry + bleed padding)
+The type dropdown in the video track's **"Remove logo / blur"** window gained a whole family of **region effects** beyond `delogo` / `boxblur` / `gblur`, driven by the `_REGION_EFFECT_FILTERS` registry (adding a type touches only the registry and the UI constant, not the generation logic):
+
+| Type | Effect | Strength param | Class |
+|------|--------|----------------|-------|
+| `negate` | local negative | none | point |
+| `hflip` / `vflip` | local horizontal / vertical mirror (often more natural than delogo interpolation when covering a watermark) | none | point |
+| `swapuv` | local U/V swap (chroma glitch look) | none | point |
+| `desat` | local desaturate `hue=s=0` | none | point |
+| `eq_bright` | local brightness `eq=brightness=` | brightness (default −0.3) | point |
+| `black` / `white` | local solid black / white cover `lutyuv=` | none | point |
+| `unsharp` | local sharpen | strength (default 1.5) | neighborhood (convolution) |
+| `avgblur` | local average blur | radius (default 5) | neighborhood (convolution) |
+| `median` | local median (removes small specks / tiny logos) | radius (default 3) | neighborhood (convolution) |
+
+- **Region / full frame: one switch** — check "Apply to selected region only" to act inside the coordinate box (`delogo` is always local, switch greyed out); leave it unchecked for a full-frame + show-window **time-segment effect**. Orthogonal to "show window / cycle show", freely combinable.
+- **Bleed padding** — convolution types running on a cropped sub-image can't reach a real neighborhood at the border: the result differs from the full-frame run by 11.2 dB (visible square edge). Expanding by k px first (24 for blurs, 8 for unsharp/median) and cropping back drops it to 64.9 dB. Edge-touching / full-frame regions use `max(x−k,0)` / `min(…, iw−bx)` expressions so ffmpeg clamps — no shift, no out-of-range crop failure. Point operations have no seam and skip padding.
+- Parameterless filters need an **equals sign** for `enable` (`hflip=enable='…'`); only filters with parameters accept a colon — the program decides automatically.
+
+### 12.5 Division of labour with the Transcode page
+Enqueue precheck / post-encode verify / size estimate, and the Transcode page's "Export / import project", **exist only on the Transcode page queue** (the mux page has no task queue). Items 12.1–12.4 above are the same shared panel on both pages.
 
 ---
 
