@@ -37,6 +37,11 @@ Presets save and reuse common parameter sets so you don't reconfigure every time
 - **Delete preset** — select then delete (with confirmation).
 - **Export all presets (backup)** — dump the whole library to JSON.
 - **Import presets (restore)** — from JSON, choose replace or merge.
+- **Export / import Transcode project (new 2026-09, side by side with presets)** — the **"Export project"** / **"Import project"** buttons on the right of the preset row save and restore a **full snapshot of the whole Transcode page** (`.fflgproject`, JSON under the hood):
+  - **Differs from a preset**: a preset answers only "how to encode" and strips dynamic items (watermark, segments, trim, trajectories…). A project stores the **complete state** — encoding / filters / audio / crop / advanced / output / trim / segment join / audio trim / end handling, **plus the image-video watermark `watermark` and the text watermark `text_watermark` + `text_watermark_items`**, and the input file path.
+  - The file carries `project_type = "convert"`; the mux page's "Save / load project" has **no such key**, so the two pages reject each other's files (opening the wrong one shows a hint to use the other page instead of silently loading wrong data).
+  - On import the watermark dicts are written back in place (`clear()` + `update()`) because the Advanced tab holds them by reference — rebinding would detach the UI. The text-watermark list can be rebound safely.
+  - Good for archiving a whole setup (including watermarks) together with the input file, moving to another machine, or as a batch template.
 
 ---
 
@@ -67,6 +72,12 @@ Presets save and reuse common parameter sets so you don't reconfigure every time
 
 **Frame rate** — keep source or set a custom value.
 
+**GOP / keyframe interval (new 2026-09-09)** — the `GOP:` box + "frames" on the same row, mapping to ffmpeg `-g`: how many frames between full keyframes (I-frames).
+- Blank = encoder default (x264/x265 ≈ 250 frames, i.e. 10 s at 25 fps — smallest file, slowest seeking).
+- For editing / random seeking: enter `fps × target seconds` (30 fps → 30–60 for a keyframe every 1–2 s; 60 fps → 60–120).
+- Smaller = more accurate seeking but bigger file. A trailing partial group is auto-handled by the encoder as a short GOP — a legal structure, no need to pad it.
+- Re-encode only; ignored with `copy`.
+
 **Scale** — three modes: width (height auto), height (width auto), exact W×H (may stretch). A swap (⇄) button exchanges the two values.
 
 **Crop**
@@ -89,12 +100,56 @@ Presets save and reuse common parameter sets so you don't reconfigure every time
 - **Color matrix** (`colormatrix`): `bt709:bt2020`, `bt2020:bt709`, `bt601:bt709`, `bt709:bt601`.
 - **Color correction** (`eq`): brightness / contrast / saturation / gamma sliders.
 - **Hue** (`hue`): hue angle and color saturation.
+- **HDR→SDR tone mapping (new 2026-09-09, own block in the right column)** — builds the classic zscale+tonemap chain `zscale=t=linear:npl=100 → format=gbrpf32le → zscale=p=bt709 → tonemap=tonemap=<algo>:desat=0 → zscale=tin=linear:t=bt709:m=bt709:p=bt709:r=tv → format=<pix_fmt>`.
+  - Algorithm dropdown: `hable` (good all-rounder) / `mobius` (keeps highlight detail) / `reinhard` (softer contrast).
+  - **Prerequisite**: the source must carry **HDR10 (PQ) / HLG tags**. Untagged HDR sources cannot be force-converted with this build (forcing zscale `min`/`tin`/`pin` triggers zimg "no path between colorspaces", and this build's `setparams` has no color options). A source already tagged SDR passes through with no side effect.
+  - Output pixel format follows the "Pixel format" setting (default 8-bit `yuv420p`, the usual choice for HDR→SDR).
+  - **Auto-tagging on save**: with tone mapping on, clicking "Save and close" fills any still-"Follow source" color mark with bt709 primaries / bt709 transfer / bt709 matrix / tv range. Manually changed values are respected and left alone.
+- **Output color marks (new 2026-09-09, own block in the right column)** — four dropdowns: **primaries / transfer / matrix / range**; they write the output file's color **metadata** (`-color_primaries` / `-color_trc` / `-colorspace` / `-color_range`).
+  - **Follow source = don't touch it** (inherit the source tags; if the source has none or wrong ones, the output inherits the same gap). Not re-stamping marks after a re-encode is a common cause of HDR clips looking washed out / off-color in some players.
+  - Marks only — **no pixel conversion** (use the "Color matrix" filter above for that).
+  - Measured pitfall (local ffmpeg n9.0.1): `-color_primaries` / `-color_trc` are **silently dropped** by the libx264 / libx265 / libsvtav1 wrappers (same with a side-data-free y4m input, so it isn't frame side-data overwriting), while `-colorspace` / `-color_range` work. Those three encoders therefore go through private params: `-x264-params colorprim=:transfer=`, `-x265-params`, `-svtav1-params color-primaries=:transfer-characteristics=`; other encoders still use the generic options (whether they land depends on the ffmpeg build).
+  - Illegal values (old presets / hand-edited config) are ignored with a log line instead of breaking the whole command.
 
 **Remove logo / blur** (separate window)
 - **`delogo`** — smart-interpolation logo/watermark removal. Frame the region with the visual crop tool, then "Copy coordinates from crop" fills `x:y:w:h` in one click.
 - **Local blur** (region only) — `boxblur` / `gblur` on a chosen rectangle. The tool builds the `split → crop → blur → overlay` chain automatically; a "🎯 Local blur" button enables it and copies crop coordinates. Coordinates are in the **original frame** space (the chain is placed before other filters).
 - **Global blur** — enable blur but do **not** check "region only".
 - **Multi-region list (2026-08-26: handle several watermarks/blur regions at once)** — the delogo/blur window can hold **multiple items** (mixed `delogo` / `boxblur` / `gblur`), for frames with several logos/subtitle watermarks at once. Each item sets type, region coords (x/y/w/h, original frame) and strength independently; a Treeview list + form with live write-back (add/delete/reorder). Command generation iterates the list and emits one filter per item (several delogo / local-blur chains auto-stitched). Old data is auto-migrated: without a list, the old single-region fields are used (old presets/snapshots unaffected).
+
+**Region-effect family (2026-09-07: delogo-family registry + bleed padding to kill seams)**
+
+Besides `delogo` and the blurs, the type dropdown holds a whole family of **region effects**, all driven by the code registry `_REGION_EFFECT_FILTERS` (adding one is a single registry entry — the generation logic doesn't change):
+
+| Type | Effect | Strength param | Class |
+|------|--------|----------------|-------|
+| `negate` | local negative (per-channel 255−x; completely different formula from the sub-video blend mode "negation") | none | point |
+| `hflip` / `vflip` | local horizontal / vertical mirror (often looks more natural than delogo interpolation when covering a watermark) | none | point |
+| `swapuv` | local U/V swap (chroma glitch look) | none | point |
+| `desat` | local desaturate `hue=s=0` | none | point |
+| `eq_bright` | local brightness `eq=brightness=` | brightness (default −0.3, negative = darker) | point |
+| `black` / `white` | local solid black / white cover `lutyuv=y=0/255:u=128:v=128` | none | point |
+| `unsharp` | local sharpen `unsharp=5:5:<strength>` | strength (default 1.5) | neighborhood (convolution) |
+| `avgblur` | local average blur | radius (default 5) | neighborhood (convolution) |
+| `median` | local median (removes small specks / tiny logos) | radius (default 3) | neighborhood (convolution) |
+
+**Region / full frame: one switch**
+- Check **"Apply to selected region only (local filter)"** → acts inside the coordinate box (box unlocked). `delogo` is the exception: it is a region filter by nature, so the switch is permanently disabled for it.
+- **Unchecked** → full-frame effect (box disabled); combined with the "show window" it becomes a **time-segment effect**. E.g. `eq_bright` + unchecked + show window 5–8 s = the whole picture brightens only during seconds 5–8.
+- The full-frame path doesn't crop, so convolution types have no boundary problem and need no bleed padding. The switch is **orthogonal** to "show window / cycle show" — freely combinable.
+
+**Bleed padding kills the seam (measured 2026-09-07, local n9.0.1)**
+- Problem: convolution filters (blur / sharpen / median) running on a cropped sub-image can't reach a real neighborhood at the region border — the result differs from "run the same filter on the full frame" by **11.2 dB** (a visible square edge).
+- Fix: crop `k` extra pixels on each side first (24 for blurs, 8 for unsharp/median), process, then crop back to the original size — error drops to **64.9 dB** (essentially identical). Local `boxblur` / `gblur` use the same bleed chain.
+- Regions touching an edge or covering the full frame can't really expand: geometry is written as `max(x−k,0)` / `min(w+ox+k, iw−bx)` expressions so ffmpeg clamps it, and the crop-back offset uses the **actually expanded amount** `min(x,k)`. Result: top-left, bottom-right and full-frame cases neither shift nor fail on out-of-range crop.
+- Point operations (negate / hflip / lut…) never had a seam, so they skip the padding (it would just add two needless crops).
+
+**Generated form** (local mode, same shape as local blur; two extra crops when bleeding)
+```
+split=2[rb…bg][rb…fg];[rb…fg]crop=<expand>,<filter>,<crop-back>[rb…bl];[rb…bg][rb…bl]overlay=x:y
+```
+- Parameterless filters need an **equals sign** for `enable` (`hflip=enable='gt(t,1)'`); only filters with parameters accept a colon — the program picks the separator by checking whether the filter string contains `=`.
+- `sobel` used to be in this family and was removed: its output is a gradient-magnitude image whose strength depends entirely on the region's texture — over smooth content it is nearly a uniform dark block with no visible effect, so it isn't reliable.
 
 **Deinterlace** — `none`, `bwdif`, `yadif`, `kerndeint`, `pp=lb`, `fieldorder`.
 
@@ -114,6 +169,10 @@ Presets save and reuse common parameter sets so you don't reconfigure every time
 - **Keep audio** (default on).
 - **Extract audio only** — output audio only; container switches to an audio format (`mp3`, `aac`, `m4a`, `flac`, `opus`, `wav`, `ac3`). Auto-checks "keep audio"; unchecking restores the previous state.
 - **Output container** — audio wrapper format.
+- **Audio tracks (how to treat a multi-track source, new 2026-09)** — `First track only` / `All · re-encode same params` / `All · keep as-is`. No difference for a single-track source.
+  - `First track only` (default, matches the old behaviour): keeps the 1st audio track, drops the rest. When the source has several tracks, **enqueue precheck raises a yellow warning** so you don't lose a bilingual/commentary track by accident.
+  - `All · re-encode same params`: keeps every source track and **re-encodes them all** with this page's codec / filter settings.
+  - `All · keep as-is`: every source track goes through `-c:a copy`, **ignoring the audio filters on this page** (max fidelity, but no bitrate / volume / filter changes).
 
 **Encode params**
 - Encoder: `copy`, `aac`, `libmp3lame`, `opus`, `ac3`, `flac`, `alac`, `pcm_s16le`…
@@ -197,6 +256,39 @@ Selecting a hardware item **auto-syncs** the hardware-decode and video-encoder d
 - **Task list ops** — start queue (parallel, with max parallel count; hardware encoding has its own concurrency cap), stop queue (no new tasks, running ones finish), remove selected, clear all, clear done/failed. Export to `.bat` (Windows) / `.sh` (Linux/macOS). Preview selected (applies filters & trim, but **disables reverse**). **Double-click** edits a task (all params; saved changes update it).
 - **Parallel & hardware limits** — parallel tasks 1–5; hardware concurrency 1–4.
 - **Stop all** — sends `q` to every running FFmpeg; force-kills after 3 s if still alive. For emergency stops on runaway encodes.
+
+### 4.1 Enqueue precheck / post-encode verify / size estimate (new 2026-09-08)
+
+All three share one background `ffprobe` pass and never block enqueueing. Results go to the log and the list only — **no popups, no queue blocking**.
+
+**Enqueue precheck** (right after enqueueing; a single background thread works the queue in order): the source is probed once and rated:
+
+| Level | In the list | Meaning |
+|-------|-------------|---------|
+| `bad` (red) | status column gets `⛔n`, whole row red | hard problem, will almost certainly go wrong |
+| `warn` (yellow) | status column gets `⚠n`, whole row orange | compatibility risk: it runs, but the result may not be what you expect |
+| `info` (grey) | details column only | a hint; not counted, no row colour |
+
+Rules (6+1, finalised 2026-09-08):
+- 🔴 `opus` / `flac` audio **copied into MP4/MOV** (poor compatibility; opus already auto-falls-back to aac at run time)
+- 🔴 ffprobe failed, or media duration is 0 (file probably incomplete / damaged)
+- 🟡 **VFR source + video stream copy** (`r_frame_rate` vs `avg_frame_rate` differ by >5%): stream copy doesn't rewrite timestamps, so some players stutter or drift out of sync
+- 🟡 **SAR ≠ 1 combined with crop / scale**: crop/scale work in pixel counts, so stretching is likely
+- 🟡 **Source rotation metadata + manual rotation on top**: the two rotations stack and the final orientation may surprise you
+- 🟡 **Multiple audio tracks** while the track mode is still "First track only" (no warning once an "All" mode is selected)
+- ⚪ Output file already exists (it will be overwritten)
+
+Custom-command tasks are skipped. The red/orange row colour retires once a task reaches a terminal state.
+
+**Post-encode verify** (after return code 0, light tier): a zero return code doesn't guarantee a good file, so a light check runs:
+1. Output exists and is non-zero; 2. `ffprobe` can parse streams; 3. Output duration vs expected duration (`task.total_sec`, already including speed / segments) — below 98% of expected is flagged "possibly truncated", above 110% "duration anomaly".
+Only on a suspected hit does it run a **full decode deep scan** (`-v error -i x -f null -`, timeout `min(900, max(90, expected×3+60))` s, up to 3 lines reported).
+When flagged, the status column shows **"Suspicious"** (yellow) and the details column lists the reason. A verify exception is only logged — **the queue keeps going**.
+
+**Size estimate** (computed along the way, pure arithmetic): once precheck has the probe, output size is estimated and appended to the status column as `·~123MB` (hidden while encoding), plus one `[estimate]` log line.
+- **Only in bitrate mode**: `rate_control_type = bitrate` and a non-`copy` video encoder. CRF / CQ / Global Quality have unknown bitrate → no estimate; video stream copy has no `-b:v` to compute from → no estimate.
+- Formula: `(video bitrate + audio bitrate) × duration`; audio counts only when `audio_codec` isn't `copy`; duration is the max parseable `duration` across streams.
+- Pure arithmetic without container overhead, usually within ±10%. If it can't be computed it stays blank (silent, no guessing).
 
 ---
 
