@@ -2088,11 +2088,15 @@ def _log_time_order_warn(app, where=""):
 
 def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
                      grab_win=None, video_file=None, ffmpeg_cmd=None, ffprobe_cmd=None,
-                     app=None):
+                     app=None, allow_angle=True, allow_empty=False):
     """列表轨迹面板（2026-08-27 内嵌版，替代原独立弹窗 _waypoints_dialog）。
 
     host: 承载面板的父 frame；waypoints: list[dict]，面板内直接修改（引用传递）。
     grab_win: 持有模态锁的父 Toplevel（打开行编辑/时间预览前释放锁、关闭后恢复）。
+    allow_angle: False=列表隐藏「起始/结尾角度、起始/结尾缩放」四列（displaycolumns 裁剪，
+    行数据 values 照常存 11 列不破坏对齐），行编辑弹窗同藏角度/缩放输入行。用于链路
+    不消费 ra/rb/sa/sb 的调用方（如遮罩轨迹）——显示无效数值会误导用户。
+    allow_empty: True=允许删到最后一行（空列表=无轨迹）；False=至少保留 1 行（水印原行为）。
     返回 (set_enabled, refresh)：set_enabled 由「启用列表轨迹」勾选驱动整面板置灰/启用；
     refresh 供勾选时种子默认行后刷新。
     沿用原弹窗 UI 约定：弹窗禁用 -topmost；含字面花括号处已转义。"""
@@ -2129,10 +2133,19 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
     cols = ("idx", "start", "mode", "end", "btime", "dur", "ea", "ra", "rb", "za", "zb")
     headers = (_("行"), _("起始坐标"), _("移动方式"), _("结尾坐标"), _("开始时间"), _("结束时间"), _("到期行为"), _("起始角度"), _("结尾角度"), _("起始缩放"), _("结尾缩放"))
     widths = (34, 130, 70, 130, 62, 62, 62, 54, 54, 54, 54)
-    tree = ttk.Treeview(frm, columns=cols, show="headings", height=6)
+    # allow_angle=False（遮罩）：displaycolumns 裁掉角度/缩放四列——列定义保留（values
+    # 仍按 cols 存 11 项），只是不显示；行数据写入逻辑零改动。
+    if allow_angle:
+        _disp_cols = cols
+    else:
+        _disp_cols = tuple(c for c in cols if c not in ("ra", "rb", "za", "zb"))
+    tree = ttk.Treeview(frm, columns=cols, show="headings", height=6,
+                        displaycolumns=_disp_cols)
     for c, h, wdt in zip(cols, headers, widths):
         tree.heading(c, text=h)
-        _stretch = (c in ("rb", "zb"))
+        # 弹性列：角度/缩放列在位时给 rb/zb；被 displaycolumns 裁掉时切给末列 ea，
+        # 避免窗口拉宽右侧留白。
+        _stretch = (c in ("rb", "zb")) if allow_angle else (c == "ea")
         tree.column(c, width=wdt, anchor=tk.CENTER if c != "start" and c != "end" else tk.W,
                     stretch=_stretch)
     vsb = ttk.Scrollbar(frm, orient=tk.VERTICAL, command=tree.yview)
@@ -2268,11 +2281,16 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
         idx = _selected()
         if idx is None:
             return
-        if len(waypoints) <= 1:
+        # allow_empty=True（遮罩轨迹）：空列表在链路里 = 无轨迹（形状全程静止），
+        # 允许删到最后一行；其余调用方（水印）保留「至少 1 行」守卫，行为不变。
+        if len(waypoints) <= 1 and not allow_empty:
             messagebox.showinfo(_("提示"), _("至少保留 1 行（终点，静态定位）"))
             return
         del waypoints[idx]
-        _refresh(min(idx, len(waypoints) - 1))
+        if waypoints:
+            _refresh(min(idx, len(waypoints) - 1))
+        else:
+            _refresh(None)   # 空列表：不选中任何行，时间框随之清空
     def _move(delta):
         idx = _selected()
         if idx is None:
@@ -2343,32 +2361,36 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
                      state="readonly", width=14).grid(row=r, column=1, sticky="w", padx=6)
         r += 1
 
-        ttk.Label(ef, text=_("起始角度(度):")).grid(row=r, column=0, sticky="e", pady=2)
-        _rta = tk.StringVar(value=f"{_wp_num(w, 'ra', 0):g}")
-        ttk.Entry(ef, textvariable=_rta, width=10).grid(row=r, column=1, sticky="w", padx=6)
-        r += 1
+        # allow_angle=False（遮罩）：角度/缩放链路不消费，输入行整块不建——
+        # 下方 _ok() 的解析+写回段同步判 allow_angle，原有 ra/rb/sa/sb 键原值保留。
+        _rta = _rtb = _zma = _zmb = None
+        if allow_angle:
+            ttk.Label(ef, text=_("起始角度(度):")).grid(row=r, column=0, sticky="e", pady=2)
+            _rta = tk.StringVar(value=f"{_wp_num(w, 'ra', 0):g}")
+            ttk.Entry(ef, textvariable=_rta, width=10).grid(row=r, column=1, sticky="w", padx=6)
+            r += 1
 
-        ttk.Label(ef, text=_("结尾角度(度):")).grid(row=r, column=0, sticky="e", pady=2)
-        _rtb = tk.StringVar(value=f"{_wp_num(w, 'rb', 0):g}")
-        ttk.Entry(ef, textvariable=_rtb, width=10).grid(row=r, column=1, sticky="w", padx=6)
-        r += 1
+            ttk.Label(ef, text=_("结尾角度(度):")).grid(row=r, column=0, sticky="e", pady=2)
+            _rtb = tk.StringVar(value=f"{_wp_num(w, 'rb', 0):g}")
+            ttk.Entry(ef, textvariable=_rtb, width=10).grid(row=r, column=1, sticky="w", padx=6)
+            r += 1
 
-        # 2026-09-04 列表轨迹缩放：sa/sb = 段起点/结尾缩放倍率，段内线性插值。
-        # 语义：坐标（起始/结尾坐标）一律指**缩放后**内容盒的左上角 → 缩放锚点=左上角，
-        # 与既有「坐标=左上角」一致，x/y 表达式零补偿。终点行只用起始缩放（sb 忽略）。
-        ttk.Label(ef, text=_("起始缩放(倍):")).grid(row=r, column=0, sticky="e", pady=2)
-        _zma = tk.StringVar(value=f"{_wp_num(w, 'sa', 1.0):g}")
-        ttk.Entry(ef, textvariable=_zma, width=10).grid(row=r, column=1, sticky="w", padx=6)
-        r += 1
+            # 2026-09-04 列表轨迹缩放：sa/sb = 段起点/结尾缩放倍率，段内线性插值。
+            # 语义：坐标（起始/结尾坐标）一律指**缩放后**内容盒的左上角 → 缩放锚点=左上角，
+            # 与既有「坐标=左上角」一致，x/y 表达式零补偿。终点行只用起始缩放（sb 忽略）。
+            ttk.Label(ef, text=_("起始缩放(倍):")).grid(row=r, column=0, sticky="e", pady=2)
+            _zma = tk.StringVar(value=f"{_wp_num(w, 'sa', 1.0):g}")
+            ttk.Entry(ef, textvariable=_zma, width=10).grid(row=r, column=1, sticky="w", padx=6)
+            r += 1
 
-        ttk.Label(ef, text=_("结尾缩放(倍):")).grid(row=r, column=0, sticky="e", pady=2)
-        _zmb = tk.StringVar(value=f"{_wp_num(w, 'sb', 1.0):g}")
-        ttk.Entry(ef, textvariable=_zmb, width=10).grid(row=r, column=1, sticky="w", padx=6)
-        r += 1
+            ttk.Label(ef, text=_("结尾缩放(倍):")).grid(row=r, column=0, sticky="e", pady=2)
+            _zmb = tk.StringVar(value=f"{_wp_num(w, 'sb', 1.0):g}")
+            ttk.Entry(ef, textvariable=_zmb, width=10).grid(row=r, column=1, sticky="w", padx=6)
+            r += 1
 
-        ttk.Label(ef, text=_("1.0=原始尺寸；坐标指缩放后内容盒的左上角"),
-                  foreground="#5F5E5A").grid(row=r, column=0, columnspan=2, sticky="w", pady=(2, 0))
-        r += 1
+            ttk.Label(ef, text=_("1.0=原始尺寸；坐标指缩放后内容盒的左上角"),
+                      foreground="#5F5E5A").grid(row=r, column=0, columnspan=2, sticky="w", pady=(2, 0))
+            r += 1
 
         def _parse_pt(s):
             try:
@@ -2390,26 +2412,29 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
             if pa is None:
                 messagebox.showinfo(_("提示"), _("起始坐标格式应为 x, y（如 30, 30）"))
                 return
-            try:
-                _ra_v = float(_rta.get().strip())
-            except (ValueError, TypeError):
-                _ra_v = 0.0
-            try:
-                _rb_v = float(_rtb.get().strip())
-            except (ValueError, TypeError):
-                _rb_v = 0.0
-            try:
-                _za_v = float(_zma.get().strip())
-            except (ValueError, TypeError):
-                _za_v = 1.0
-            try:
-                _zb_v = float(_zmb.get().strip())
-            except (ValueError, TypeError):
-                _zb_v = 1.0
-            w["ra"] = _ra_v
-            w["rb"] = _rb_v
-            w["sa"] = _za_v
-            w["sb"] = _zb_v
+            # allow_angle=False（遮罩）：无输入控件 → 不解析不写回，w 里的 ra/rb/sa/sb
+            # 原键原值保留（行编辑只改坐标/时间/方式，不碰链路不消费的字段）。
+            if allow_angle:
+                try:
+                    _ra_v = float(_rta.get().strip())
+                except (ValueError, TypeError):
+                    _ra_v = 0.0
+                try:
+                    _rb_v = float(_rtb.get().strip())
+                except (ValueError, TypeError):
+                    _rb_v = 0.0
+                try:
+                    _za_v = float(_zma.get().strip())
+                except (ValueError, TypeError):
+                    _za_v = 1.0
+                try:
+                    _zb_v = float(_zmb.get().strip())
+                except (ValueError, TypeError):
+                    _zb_v = 1.0
+                w["ra"] = _ra_v
+                w["rb"] = _rb_v
+                w["sa"] = _za_v
+                w["sb"] = _zb_v
             if _m != "end":
                 pb = _parse_pt(_sb.get())
                 if pb is None:
@@ -2421,9 +2446,11 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
                 except (ValueError, TypeError):
                     messagebox.showinfo(_("提示"), _("时间应为秒数"))
                     return
-            if _e0 <= _s0:
-                _log_time_order_warn(app, _("[轨迹] "))
-                return
+                # ⚠️ 2026-09-11 修复：本判据原写在 if 块【外】→ 移动方式选「终点」时
+                #    _s0/_e0 从未赋值，点「确定」必抛 UnboundLocalError（终点行无时段，不判）。
+                if _e0 <= _s0:
+                    _log_time_order_warn(app, _("[轨迹] "))
+                    return
             # 2026-09-03 修复：原 save 代码被上面的 return 压成死代码，
             # 导致普通行点「确定」不落盘、列表不刷新（只能保存工程再重开才看到）。
             # 这里统一把字段写回航点并刷新列表。
@@ -2447,7 +2474,8 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
 
         ttk.Button(ef, text=_("确定"), command=_ok, width=8).grid(row=r, column=0, sticky="e", padx=(0, 3), pady=(10, 0))
         ttk.Button(ef, text=_("取消"), command=_close, width=8).grid(row=r, column=1, sticky="w", padx=(3, 0), pady=(10, 0))
-        center_window(ed, 300, 340)
+        # 窗口高随角度/缩放输入行有无自适应（隐藏 5 行 ≈ 150px，含提示行）
+        center_window(ed, 300, 340 if allow_angle else 190)
         _grab_release()   # 打开子窗先释放父锁，避免嵌套锁链
         ed.grab_set()
 
@@ -2760,7 +2788,8 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
 
 
 def _trajectory_dialog(parent, initial, commit, edit_cb=None, canvas_w=1280, canvas_h=720,
-                       video_file=None, ffmpeg_cmd=None, ffprobe_cmd=None, app=None):
+                       video_file=None, ffmpeg_cmd=None, ffprobe_cmd=None, app=None,
+                       show_presets=True, allow_angle=True, allow_empty=False):
     """轨迹控制弹窗公共实现（图片/视频水印与文字水印共用）。
     initial: dict，含 move_mode / move_cycle / move_dwell / move_margin / move_waypoints 初值；
     commit: callable(dict)，点「确定」时把规范化后的新值写回（写 tk 变量或 settings dict 均可）。
@@ -2768,6 +2797,12 @@ def _trajectory_dialog(parent, initial, commit, edit_cb=None, canvas_w=1280, can
     「可视化编辑坐标」回调（None 时列表编辑按钮禁用）。which∈{start,end}；cur_angle=当前选中点
     角度（起点=ra / 终点=rb）；apply_xy(nx,ny)/apply_angle(na) 写回该航点坐标/角度。
     canvas_w/h: 可视化编辑器的画布尺寸（主视频渲染尺寸）。
+    show_presets: False=隐藏「运动轨迹」预设动效区（下拉+周期+每点停留+边距）。用于链路
+    只消费航点、不消费 move_mode 预设的调用方（如遮罩轨迹）——摆设 UI 会误导用户。
+    allow_angle: False=列表隐藏「起始/结尾角度、起始/结尾缩放」四列，行编辑弹窗同藏
+    （用于链路不消费 ra/rb/sa/sb 的调用方，如遮罩轨迹）。
+    allow_empty: True=列表允许删到最后一行（空列表 = 无轨迹/形状全程静止）。遮罩轨迹用；
+    False=至少保留 1 行（水印列表轨迹原行为，防误删成空）。
     2026-08-27 合并版（用户拍板方案 B）：运动轨迹+周期并成一行；「启用列表轨迹」勾选驱动
     waypoints（勾选后上方下拉自动忽略）；列表轨迹面板常驻（未勾选时整面板置灰禁用），
     不再嵌套「列表轨迹控制」子窗，弹窗层级 4 层 → 1 层。"""
@@ -2806,47 +2841,57 @@ def _trajectory_dialog(parent, initial, commit, edit_cb=None, canvas_w=1280, can
     frm.grid_columnconfigure(0, weight=1)
 
     # ---- 第 0 行：运动轨迹 + 周期（corners 时原位切换为 每点停留+边距）----
-    row0 = ttk.Frame(frm)
-    row0.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-    ttk.Label(row0, text=_("运动轨迹:")).pack(side=tk.LEFT)
-    cb = ttk.Combobox(row0, textvariable=mode_disp, values=[d for _v, d in MODES],
-                      state="readonly", width=18)
-    cb.pack(side=tk.LEFT, padx=6)
+    # show_presets=False（遮罩轨迹）：整块不创建——链路只消费航点，预设动效是摆设 UI。
+    # 下游 _sync_params/_apply 对 cb/tip_label/cyc_frm/dwell_frm 的引用全部判 show_presets。
+    cb = cyc_frm = dwell_frm = tip_label = None
+    if show_presets:
+        row0 = ttk.Frame(frm)
+        row0.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Label(row0, text=_("运动轨迹:")).pack(side=tk.LEFT)
+        cb = ttk.Combobox(row0, textvariable=mode_disp, values=[d for _v, d in MODES],
+                          state="readonly", width=18)
+        cb.pack(side=tk.LEFT, padx=6)
 
-    cyc_frm = ttk.Frame(row0)
-    ttk.Label(cyc_frm, text=_("周期(秒):")).pack(side=tk.LEFT)
-    cyc_var = tk.DoubleVar(value=float(initial.get("move_cycle", 4.0) or 4.0))
-    cyc_sb = ttk.Spinbox(cyc_frm, from_=0.5, to=600, increment=0.5, width=7, textvariable=cyc_var)
-    cyc_sb.pack(side=tk.LEFT, padx=(2, 0))
-    ToolTip(cyc_sb,
-            """这里的周期管的是速度：周期越短，水印移动越快。
+        cyc_frm = ttk.Frame(row0)
+        ttk.Label(cyc_frm, text=_("周期(秒):")).pack(side=tk.LEFT)
+        cyc_var = tk.DoubleVar(value=float(initial.get("move_cycle", 4.0) or 4.0))
+        cyc_sb = ttk.Spinbox(cyc_frm, from_=0.5, to=600, increment=0.5, width=7, textvariable=cyc_var)
+        cyc_sb.pack(side=tk.LEFT, padx=(2, 0))
+        ToolTip(cyc_sb,
+                """这里的周期管的是速度：周期越短，水印移动越快。
 往返 = 单程来回一次的时间；菱形 = 走完一圈的时间；
 四角跳跃不受此周期影响（用下方「每点停留」控制）。
 往返无需幅度参数：左右往返自动横跨整个画面宽度（0→W），
 上下往返自动纵跨整个画面高度（0→H）。""",
-            wraplength=340)
-    cyc_frm.pack(side=tk.LEFT, padx=(10, 0))
+                wraplength=340)
+        cyc_frm.pack(side=tk.LEFT, padx=(10, 0))
 
-    dwell_frm = ttk.Frame(row0)
-    ttk.Label(dwell_frm, text=_("每点停留(秒):")).pack(side=tk.LEFT)
-    dwell_var = tk.DoubleVar(value=float(initial.get("move_dwell", 2.0) or 2.0))
-    ttk.Spinbox(dwell_frm, from_=0.2, to=600, increment=0.2, width=7,
-                textvariable=dwell_var).pack(side=tk.LEFT, padx=(2, 10))
-    ttk.Label(dwell_frm, text=_("边距:")).pack(side=tk.LEFT)
-    margin_var = tk.StringVar(value=initial.get("move_margin", "W*0.03") or "W*0.03")
-    margin_entry = ttk.Entry(dwell_frm, textvariable=margin_var, width=10)
-    margin_entry.pack(side=tk.LEFT, padx=2)
-    ToolTip(margin_entry,
-            """四角跳跃时水印离屏幕边缘的距离。
+        dwell_frm = ttk.Frame(row0)
+        ttk.Label(dwell_frm, text=_("每点停留(秒):")).pack(side=tk.LEFT)
+        dwell_var = tk.DoubleVar(value=float(initial.get("move_dwell", 2.0) or 2.0))
+        ttk.Spinbox(dwell_frm, from_=0.2, to=600, increment=0.2, width=7,
+                    textvariable=dwell_var).pack(side=tk.LEFT, padx=(2, 10))
+        ttk.Label(dwell_frm, text=_("边距:")).pack(side=tk.LEFT)
+        margin_var = tk.StringVar(value=initial.get("move_margin", "W*0.03") or "W*0.03")
+        margin_entry = ttk.Entry(dwell_frm, textvariable=margin_var, width=10)
+        margin_entry.pack(side=tk.LEFT, padx=2)
+        ToolTip(margin_entry,
+                """四角跳跃时水印离屏幕边缘的距离。
 可填像素数（如 20）或相对式（如 W*0.03 = 主画面宽度 3%）。""",
-            wraplength=320)
+                wraplength=320)
 
+        tip_label = ttk.Label(frm, text="", foreground="gray")
+        tip_label.grid(row=1, column=0, sticky="ew", pady=(0, 2))
 
-    tip_label = ttk.Label(frm, text="", foreground="gray")
-    tip_label.grid(row=1, column=0, sticky="ew", pady=(0, 2))
+        # ---- 间隔条 ----
+        ttk.Separator(frm, orient=tk.HORIZONTAL).grid(row=2, column=0, sticky="ew", pady=(2, 6))
 
-    # ---- 间隔条 ----
-    ttk.Separator(frm, orient=tk.HORIZONTAL).grid(row=2, column=0, sticky="ew", pady=(2, 6))
+    if not show_presets:
+        # 隐藏预设动效区时 margin/cycle/dwell 三个 var 仍需存在（_apply 统一读回写 commit，
+        # NameError 不在 except 捕获范围内）：取 initial 原值透传，不建 UI 控件。
+        margin_var = tk.StringVar(value=initial.get("move_margin", "W*0.03") or "W*0.03")
+        cyc_var = tk.DoubleVar(value=float(initial.get("move_cycle", 4.0) or 4.0))
+        dwell_var = tk.DoubleVar(value=float(initial.get("move_dwell", 2.0) or 2.0))
 
     # ---- 勾选框：启用列表轨迹 ----
     chk_frm = ttk.Frame(frm)
@@ -2873,7 +2918,7 @@ def _trajectory_dialog(parent, initial, commit, edit_cb=None, canvas_w=1280, can
     set_panel_enabled, refresh_panel = _waypoints_panel(
         panel_host, _wps, edit_cb, canvas_w, canvas_h,
         grab_win=win, video_file=video_file, ffmpeg_cmd=ffmpeg_cmd, ffprobe_cmd=ffprobe_cmd,
-        app=app)
+        app=app, allow_angle=allow_angle, allow_empty=allow_empty)
 
     def _ensure_wps():
         """勾选时若列表为空则种子默认行，并写回 initial（WYSIWYG）。"""
@@ -2894,11 +2939,10 @@ def _trajectory_dialog(parent, initial, commit, edit_cb=None, canvas_w=1280, can
         wp_on = wp_var.get()
         if wp_on:
             _ensure_wps()
-        cb.config(state="disabled" if wp_on else "readonly")
+        if show_presets:
+            cb.config(state="disabled" if wp_on else "readonly")
         set_panel_enabled(wp_on)
-        if wp_on:
-            tip_label.config(text="")
-        else:
+        if not wp_on and show_presets:
             mv = mode_val.get()
             if mv == "corners":
                 cyc_frm.pack_forget()
@@ -2909,7 +2953,8 @@ def _trajectory_dialog(parent, initial, commit, edit_cb=None, canvas_w=1280, can
                 cyc_frm.pack(side=tk.LEFT, padx=(10, 0))
                 tip_label.config(text="")
     wp_chk.config(command=_sync_params)
-    cb.bind("<<ComboboxSelected>>", _sync_params)
+    if show_presets:   # cb 仅在预设动效区创建；隐藏时 None，bind 会 AttributeError
+        cb.bind("<<ComboboxSelected>>", _sync_params)
     _sync_params()
 
     def _apply():
@@ -3135,6 +3180,191 @@ def _mask_shape_movie_path(path):
     return p.replace(":", "\\\\:")
 
 
+# 2026-09-11：遮罩「多形状列表」滤镜拼装（方案 B / Option 1）。
+# 单一 matte 平面：底色涂满 → 每个形状各成一路独立源（矩形=color= 纯色画布，PNG=movie 载图）
+# 缩放后 overlay 到同一块底 matte；非自己时段由 build_waypoint_expr 的 mode=hide 输出
+# x/y=-100000 把形状移出画面（瞬切，与 Shotcut 同构）。全程只 format=rgba 一次、blend=multiply 一次，
+# 规避「多段 rgba 串联」格式协商坑（tests/_probe_mask_multi_overlay.py 已验证 alpha 无 6% 残留）。
+# 依赖（均为模块级）：build_waypoint_expr / _mask_shape_movie_path / _timeline_convert /
+# _trim_speed_from_settings / MASK_TRAJ_CANVAS_W/H。
+def _build_mask_multi_shape_filters(settings, graph_id="", motion_trim_start=None,
+                                    motion_speed_factor=None):
+    """遮罩多形状 → 返回滤镜段字符串（已含 format=rgba,split … alphamerge），或 None。
+
+    settings["mask_shapes"] 为列表，每项为 dict：
+      mode: "outside"(只露矩形/矩形外透明) | "inside"(矩形透明/矩形处挖孔)  ← 每行独立
+      x,y,w,h: 矩形坐标 / 外部形状图目标尺寸（最终渲染帧像素）
+      feather: 羽化 sigma（0=硬边）
+      enabled: 是否启用（False 跳过）
+      t_start,t_end: 激活时间窗（输出时间线秒；t_end<=0 视为全程）
+      png 专用: png_path(非空即"外部形状图"), png_type("bw"|"alpha"), png_invert
+      可选轨迹: traj_enabled + waypoints（启用时轨迹自管可见性，忽略 t_start/t_end）
+
+    合成规则（2026-09-11：每行独立方向，单 matte 叠加）：
+      底 matte 取【首个形状】的方向为基准色，其余形状按列表顺序 overlay（后盖先）——
+        · 纯全 outside → 黑底 + 若干白矩形 = 可见区并集
+        · 纯全 inside  → 白底 + 若干黑矩形 = 整幅可见、矩形处挖孔
+        · 混用 → 列表顺序叠加：先「只露」后「矩形透明」= 在可见区上挖洞（上移/下移调层序）
+    """
+    _shapes = settings.get("mask_shapes")
+    if not isinstance(_shapes, list):
+        return None
+    _shapes = [s for s in _shapes if isinstance(s, dict) and s.get("enabled", True)]
+    if not _shapes:
+        return None
+
+    _sfx = graph_id or ""
+
+    def _mode_of(_s):
+        _m = str(_s.get("mode", settings.get("mask_mode", "outside")) or "outside").strip()
+        return _m if _m in ("outside", "inside") else "outside"
+
+    def _q(_e):
+        """给 overlay 的 x/y 表达式加单引号（幂等）。
+
+        ⚠️ 2026-09-11 探针修复：表达式的实参含逗号（gte(t,0)/lt(t,1e+09)），
+        滤镜图解析器会把未加引号的逗号当成「下一个滤镜」→ Error parsing filterchain。
+        静止窗口分支返回的是裸表达式（轨迹分支自己已带引号），这里统一补引号。
+        """
+        _s = str(_e)
+        if len(_s) >= 2 and _s[0] == "'" and _s[-1] == "'":
+            return _s
+        return "'" + _s + "'"
+
+    # outside：该矩形涂白（声明可见区）；inside：涂黑（声明透明区/挖孔）
+    _base_c = "white" if _mode_of(_shapes[0]) == "inside" else "black"
+
+    _a, _as, _ml = f"mk{_sfx}a", f"mk{_sfx}as", f"mk{_sfx}ml"
+    _bgl = f"mk{_sfx}bgl"
+    seg = (
+        f"format=rgba,split=3[{_a}][{_as}][{_ml}];"
+        # ⚠️ 底色画完后必须 `extractplanes=g`（G 平面逐字节拷贝）再喂 overlay：
+        #   本函数一路可能含 movie=（外部形状图），只要图里有 rgb 源，ffmpeg 的格式协商就会把
+        #   尾部 format=gray 走成 limited-range 的 RGB→Y = 黑变 16 → 形状外 alpha=16（约 6% 漏光，
+        #   子视频整帧浮出一层浅影）。extractplanes=g 是纯平面拷贝（黑=0 精确），与老单形状
+        #   PNG 路径同款修法（见 build_video_filter_chain 内「底色用 lutyuv/gbrp+extractplanes」注释）。
+        #   2026-09-11 探针 tests/_probe_mask_time_overlap.py 复现并修正。
+        f"[{_ml}]format=gbrp,drawbox=x=0:y=0:w=iw:h=ih:color={_base_c}:t=fill,extractplanes=g[{_bgl}];"
+    )
+    _matte_in = _bgl
+    _emitted = 0
+
+    try:
+        _cvw = int(float(settings.get("mask_traj_canvas_w", 0) or 0)) or MASK_TRAJ_CANVAS_W
+        _cvh = int(float(settings.get("mask_traj_canvas_h", 0) or 0)) or MASK_TRAJ_CANVAS_H
+    except (ValueError, TypeError):
+        _cvw, _cvh = MASK_TRAJ_CANVAS_W, MASK_TRAJ_CANVAS_H
+
+    if motion_trim_start is not None:
+        _ts0 = float(motion_trim_start)
+        _sp0 = float(motion_speed_factor) if motion_speed_factor is not None else 1.0
+    else:
+        _ts0, _sp0 = _trim_speed_from_settings(settings)
+    if not _sp0 or _sp0 <= 0:
+        _sp0 = 1.0
+
+    for _i, _sh in enumerate(_shapes):
+        # 类型由「外部图路径是否有值」自动判定（UI 不再给类型下拉）：有路径=外部，空=矩形
+        _raw = str(_sh.get("png_path", "") or "").strip()
+        _typ = "png" if _raw else "rect"
+        # 该行自己的着色：outside→白（可见），inside→黑（透明/挖孔）
+        _shape_c = "black" if _mode_of(_sh) == "inside" else "white"
+        try:
+            _w = max(2, int(float(_sh.get("w", 100))))
+            _h = max(2, int(float(_sh.get("h", 100))))
+        except (ValueError, TypeError):
+            _w = _h = 100
+        try:
+            _feather = float(_sh.get("feather", 0) or 0)
+        except (ValueError, TypeError):
+            _feather = 0.0
+
+        # ---- 形状源（矩形=color= 纯色画布；外部图=movie 载图）----
+        _sl2 = f"mk{_sfx}sl{_i}"
+        if _typ == "png":
+            _ptype = _sh.get("png_type", "bw") or "bw"
+            if _ptype not in ("bw", "alpha"):
+                _ptype = "bw"
+            _safe = _mask_shape_movie_path(_raw)
+            if not _safe:
+                continue  # 路径不可用，跳过该项（不阻断其余形状）
+            _load = "format=rgba,alphaextract" if _ptype == "alpha" else "format=gbrp,extractplanes=g"
+            if _sh.get("png_invert"):
+                _load += ",negate"
+            if _mode_of(_sh) == "inside":
+                _load += ",negate"
+            _sl = f"mk{_sfx}sl{_i}src"
+            seg += f"movie={_safe}[{_sl}];[{_sl}]{_load},scale={_w}:{_h},format=gbrp[{_sl2}];"
+            _emitted += 1
+        else:
+            seg += f"color=c={_shape_c}:s={_w}x{_h},format=gbrp[{_sl2}];"
+            _emitted += 1
+
+        # ---- 位置表达式（轨迹 or 静止时间窗）----
+        _xe, _ye = _mask_shape_pos_expr(_sh, _cvw, _cvh, _ts0, _sp0)
+
+        # ---- 羽化（软边）----
+        _node = f"[{_sl2}]"
+        if _feather > 0:
+            _gl = f"mk{_sfx}g{_i}"
+            seg += f"[{_sl2}]gblur=sigma={_feather:.1f}[{_gl}];"
+            _node = f"[{_gl}]"
+
+        # ---- overlay 到累积 matte ----
+        _cur = f"mk{_sfx}m{_i}"
+        seg += f"[{_matte_in}]{_node}overlay=x={_q(_xe)}:y={_q(_ye)}[{_cur}];"
+        _matte_in = _cur
+
+    # 唯一一次 format=gray + blend=multiply（主 alpha × matte）+ alphamerge
+    _msk, _aa, _am = f"mk{_sfx}msk", f"mk{_sfx}aa", f"mk{_sfx}am"
+    if _emitted == 0:
+        # 所有形状均无效（如 PNG 路径缺失）且被跳过 → 回退让调用方走旧单形状/无遮罩
+        return None
+    seg += (
+        f"[{_matte_in}]format=gray[{_msk}];"
+        f"[{_as}]alphaextract[{_aa}];"
+        f"[{_aa}][{_msk}]blend=all_mode=multiply[{_am}];"
+        f"[{_a}][{_am}]alphamerge"
+    )
+    return seg
+
+
+def _mask_shape_pos_expr(sh, cvw, cvh, ts0, sp0):
+    """单形状的 overlay x/y 表达式：轨迹形状走 build_waypoint_expr（自管可见性），
+    静止形状用合成航点把 t_start~t_end 框成「窗口内显示在 (x,y)、窗口外 hide 移出」。"""
+    # 轨迹优先：航点自带 show/hide，忽略 t_start/t_end
+    if sh.get("traj_enabled") and isinstance(sh.get("waypoints"), list):
+        _wps = [w for w in sh["waypoints"] if isinstance(w, dict)]
+        if _wps:
+            _xe, _ye, _, _ = build_waypoint_expr(
+                _wps, sw=str(cvw), sh=str(cvh), trim_start=ts0, speed_factor=sp0)
+            if _xe and _ye:
+                return f"'({_xe})*main_w/{cvw}'", f"'({_ye})*main_h/{cvh}'"
+    # 静止窗口：合成单段航点（mode=move + end_action=hide）
+    try:
+        _t0 = float(sh.get("t_start", 0) or 0)
+        _t1 = float(sh.get("t_end", 1e9) or 1e9)
+    except (ValueError, TypeError):
+        _t0, _t1 = 0.0, 1e9
+    if _t1 <= _t0:
+        _t1 = _t0 + 0.04
+    try:
+        _ts_out, _dur_out = _timeline_convert(_t0, _t1 - _t0, ts0, sp0)
+    except (ValueError, TypeError):
+        _ts_out, _dur_out = _t0, _t1 - _t0
+    try:
+        _x = float(sh.get("x", 0) or 0)
+        _y = float(sh.get("y", 0) or 0)
+    except (ValueError, TypeError):
+        _x = _y = 0.0
+    _wps = [{
+        "start": _ts_out, "dur": max(0.04, _dur_out), "mode": "move",
+        "xa": _x, "ya": _y, "xb": _x, "yb": _y, "end_action": "hide",
+    }]
+    _xe, _ye, _, _ = build_waypoint_expr(_wps)
+    return _xe or "0", _ye or "0"
+
+
 def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = True, include_speed: bool = True,
                               include_trim: bool = True, include_format: bool = True, include_scale: bool = True,
                               enhance_settings=None, reverse=False, graph_id: str = "",
@@ -3311,6 +3541,7 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
                     filters.append(_blur_f)
 
 
+    # ----- 遮罩 / 透明蒙版：实现见「negate 之后」的链尾区块（2026-09-10 两迁：裁剪前 → 缩放后 → 链尾，抠图兼容）-----
     # ----- 裁剪 -----
     if settings.get("crop_enabled", False):
         w = settings.get("crop_width", "").strip()
@@ -3387,177 +3618,6 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
             filters.append(f"scale=-2:{h}")
         elif method == "exact" and w and h:
             filters.append(f"scale={w}:{h}")
-
-    # ----- 遮罩 / 透明蒙版（最终渲染帧空间，WYSIWYG）-----
-    # 2026-09-10：从「裁剪前（原始帧）」移到「缩放之后」——遮罩现在落在 crop/rotate/scale
-    # 之后的最终渲染帧上，与画布/显示/转换三同一坐标系；编辑器拖出的坐标直接可用，零换算。
-    # ⚠️ 锁色：matte 分支用 format=gray，ffmpeg 自动格式协商会把 scale 输出从 yuv420p 降级为
-    #   gray → 主输入在 alphamerge 前丢失色彩（整帧发灰）。故在 split 之前插 format=rgba 锁死主
-    #   输入像素格式；matte 的 gray 仅限 [m] 分支局部使用，互不影响（fix: tests/_repro_mask_gray2）。
-    if settings.get("mask_enabled", False):
-        _sfx = graph_id or ""
-        mx = str(settings.get("mask_x", "0")).strip() or "0"
-        my = str(settings.get("mask_y", "0")).strip() or "0"
-        mw = str(settings.get("mask_w", "100")).strip() or "0"
-        mh = str(settings.get("mask_h", "100")).strip() or "0"
-        _mode = settings.get("mask_mode", "outside")  # outside=只露矩形(矩形外透明); inside=矩形透明(矩形外正常)
-        # 边缘羽化：matte 生成后追加 gblur 柔化边缘（0=硬边）。2026-09-10 接上对话框 feather 项
-        # （此前对话框有 UI/tooltip 但滤镜未消费 mask_feather → 羽化不生效，本次补齐）。
-        try:
-            _feather = float(str(settings.get("mask_feather", "0")).strip() or "0")
-        except (ValueError, TypeError):
-            _feather = 0.0
-        _a, _msk = f"mk{_sfx}a", f"mk{_sfx}msk"
-        # ---- 动态轨迹挡板（2026-09-10 重建）：启用「遮罩轨迹」且有航点时，matte 走 split=3 ——
-        # 一路整帧涂底色；一路 crop 出挡板矩形块、整面涂反向色；再 overlay 按 build_waypoint_expr
-        # 轨迹表达式移动挡板 → 可选 gblur → format=gray → alphamerge。
-        # 挡板移到哪，哪边按 mask_mode 显/隐（outside=擦除式揭示，inside=遮挡式擦除）。
-        _traj_on = bool(settings.get("mask_traj_enabled", False))
-        _raw_wps = settings.get("mask_waypoints")
-        _wps = [w for w in _raw_wps if isinstance(w, dict)] if isinstance(_raw_wps, list) else []
-        try:
-            _cvw = int(float(settings.get("mask_traj_canvas_w", 0) or 0))
-        except (ValueError, TypeError):
-            _cvw = 0
-        try:
-            _cvh = int(float(settings.get("mask_traj_canvas_h", 0) or 0))
-        except (ValueError, TypeError):
-            _cvh = 0
-        if not _cvw:
-            _cvw = MASK_TRAJ_CANVAS_W
-        if not _cvh:
-            _cvh = MASK_TRAJ_CANVAS_H
-        # ---- 形状图（2026-09-10）：载入自制黑白图/透明底挡块图当 matte（心形/星星等多边形）----
-        # 链型：format=rgba,split=2 → 一路 lutyuv 涂底色（outside=黑 inside=白）；movie 载形状图
-        # → alpha 源取不透明度（透明底挡块，颜色无关）/ 亮度图取灰度 → scale 到「矩形坐标」宽高
-        # → (反转 negate / inside 再 negate) → overlay 贴上 → 可选 gblur 羽化 → format=gray → alphamerge。
-        # ⚠️ 底色用 lutyuv 不用 drawbox：movie 引入 rgb 源后格式协商会把 drawbox 拖进 yuva420p，
-        #   drawbox 的 black 在 yuv 上=limited 16 → PNG 区域外整圈 alpha=16 漏光
-        #   （tests/_verify_mask_png 探针复现）；lutyuv 是查表滤镜恒保持 gray，0 恒 0。
-        # ⚠️ movie 单帧 EOF 后 overlay 默认 eof_action=repeat 静止停留（t=2.5s 实测 alpha 不变）。
-        # 形状与轨迹挡板两种 matte 语义不叠加：形状图生效时轨迹本轮不参与（日志提示）。
-        _png_built = False
-        _png_on = bool(settings.get("mask_png_enabled", False))
-        _png_raw = str(settings.get("mask_png_path", "") or "").strip()
-        if _png_on and _png_raw:
-            _ptype = str(settings.get("mask_png_type", "bw") or "bw").strip()
-            if _ptype not in ("bw", "alpha"):
-                _ptype = "bw"
-            try:
-                _sw = max(2, int(float(str(settings.get("mask_w", "100")).strip() or "100")))
-                _sh = max(2, int(float(str(settings.get("mask_h", "100")).strip() or "100")))
-            except (ValueError, TypeError):
-                _sw = _sh = 100
-            _safe_png = _mask_shape_movie_path(_png_raw)
-            if _safe_png:
-                _pg = f"mk{_sfx}pgn"
-                _shp = f"mk{_sfx}shp"
-                _bgl = f"mk{_sfx}bg"
-                _ml = f"mk{_sfx}m"
-                # 底色：outside=只露形状（黑底=透明）；inside=形状透明（白底=显示）
-                _base_y = "255" if _mode == "inside" else "0"
-                _load = f"movie={_safe_png}[{_pg}];[{_pg}]"
-                _load += ("format=rgba,alphaextract" if _ptype == "alpha" else "format=gray")
-                if bool(settings.get("mask_png_invert", False)):
-                    _load += ",negate"
-                if _mode == "inside":
-                    _load += ",negate"
-                # overlay x/y：启用轨迹且有航点 → 形状沿轨迹移动（心形探照灯/擦除），与矩形挡板
-                # 同款等比还原（*main_w/cvw）与同段时间换算（motion_trim_start/speed 或
-                # _trim_speed_from_settings）；否则静止在「矩形坐标」。表达式含逗号必须单引号包。
-                _png_ox, _png_oy, _png_traj_on = mx, my, False
-                if _traj_on and _wps:
-                    if motion_trim_start is not None:
-                        _pts = float(motion_trim_start)
-                        _psp = float(motion_speed_factor) if motion_speed_factor is not None else 1.0
-                    else:
-                        _pts, _psp = _trim_speed_from_settings(settings)
-                    _pxe, _pye, _pws, _pwz = build_waypoint_expr(
-                        _wps, sw=str(_cvw), sh=str(_cvh), trim_start=_pts, speed_factor=_psp)
-                    if _pxe and _pye:
-                        _png_ox = f"'({_pxe})*main_w/{_cvw}'"
-                        _png_oy = f"'({_pye})*main_h/{_cvh}'"
-                        _png_traj_on = True
-                _png_seg = (
-                    f"format=rgba,split=2[{_a}][{_ml}];"
-                    f"[{_ml}]format=gray,lutyuv=y={_base_y}[{_bgl}];"
-                    f"{_load},scale={_sw}:{_sh},format=gray[{_shp}];"
-                    f"[{_bgl}][{_shp}]overlay=x={_png_ox}:y={_png_oy}"
-                )
-                if _feather > 0:
-                    _png_seg += f",gblur=sigma={_feather:.1f}"
-                _png_seg += f",format=gray[{_msk}];[{_a}][{_msk}]alphamerge"
-                filters.append(_png_seg)
-                _png_built = True
-                if _png_traj_on:
-                    print(f"[遮罩] 形状图沿轨迹移动：{_png_raw}（路线={_ptype}，大小={_sw}x{_sh}，模式={_mode}，{len(_wps)} 航点）")
-                else:
-                    print(f"[遮罩] 形状图生效（静止）：{_png_raw}（路线={_ptype}，矩形={mx},{my},{_sw}x{_sh}，模式={_mode}）")
-            else:
-                print(f"[遮罩] 形状图路径不可用（不存在/含特殊字符且硬链接失败），回退矩形：{_png_raw}")
-        _dyn_built = False
-        if not _png_built and _traj_on and _wps:
-            # 段时间换算与裁剪简易位置同款（2026-08-29：段时间=主视频原始时间 → 换算输出时间线）
-            if motion_trim_start is not None:
-                _ts0 = float(motion_trim_start)
-                _sp0 = float(motion_speed_factor) if motion_speed_factor is not None else 1.0
-            else:
-                _ts0, _sp0 = _trim_speed_from_settings(settings)
-            _xe, _ye, _ws, _wz = build_waypoint_expr(
-                _wps, sw=str(_cvw), sh=str(_cvh), trim_start=_ts0, speed_factor=_sp0)
-            if _xe and _ye:
-                # 航点画布（cvw×cvh = 打开遮罩窗口时的最终渲染帧尺寸）→ 实际帧等比还原：
-                # x*W/cvw、y*H/cvh，行程比例恒正确、与素材分辨率解耦（见 MASK_TRAJ_CANVAS_* 注释）。
-                # x/y 表达式为纯数字累加 → 整体包一层括号乘系数即可，无变量歧义。
-                # ⚠️ overlay 的 x/y 变量表里没有 iw/ih（那是 crop/drawbox 的），必须用 main_w/main_h。
-                _xf = f"({_xe})*main_w/{_cvw}"
-                _yf = f"({_ye})*main_h/{_cvh}"
-                # 挡板尺寸同构还原；min 防挡板比帧大（轨迹挡板可拖出画布，但不能大于帧）
-                _pw = f"min({mw}*iw/{_cvw},iw)"
-                _ph = f"min({mh}*ih/{_cvh},ih)"
-                if _mode == "inside":
-                    # 矩形透明、矩形外正常：底=white（显示），黑挡板盖住处=透明
-                    _base_c, _plate_c = "white", "black"
-                else:
-                    # 只露矩形（矩形外透明）：底=black（透明），白挡板扫过处=显示（擦除式揭示）
-                    _base_c, _plate_c = "black", "white"
-                _m0, _p0 = f"mk{_sfx}m0", f"mk{_sfx}p0"
-                _plt = f"mk{_sfx}plt"
-                _seg1 = (
-                    f"format=rgba,"
-                    f"split=3[{_a}][{_m0}][{_p0}];"
-                    f"[{_m0}]format=gray,drawbox=x=0:y=0:w=iw:h=ih:color={_base_c}:t=fill[{_msk}];"
-                    f"[{_p0}]crop='{_pw}':'{_ph}':0:0,format=gray,"
-                    f"drawbox=x=0:y=0:w=iw:h=ih:color={_plate_c}:t=fill[{_plt}];"
-                )
-                # overlay x/y 用单引号包表达式（航点累加表达式内含逗号）；
-                # 隐藏段 x=-100000 → 挡板自动移出画面（hide/freeze 语义由 build_waypoint_expr 负责）
-                _seg2 = f"[{_msk}][{_plt}]overlay=x='{_xf}':y='{_yf}'"
-                if _feather > 0:
-                    _seg2 += f",gblur=sigma={_feather:.1f}"
-                _seg2 += f",format=gray[{_msk}];"
-                _seg3 = f"[{_a}][{_msk}]alphamerge"
-                filters.append(_seg1 + _seg2 + _seg3)
-                _dyn_built = True
-        if not _dyn_built and not _png_built:
-            # 静态矩形（轨迹未启用 / 无航点 / 表达式构建失败时的兜底，行为与旧版一致）
-            if _mode == "inside":
-                # 矩形透明、矩形外正常：matte = 白底 + 黑矩形
-                _draw = (f"drawbox=x=0:y=0:w=iw:h=ih:color=white:t=fill,"
-                         f"drawbox=x={mx}:y={my}:w={mw}:h={mh}:color=black:t=fill")
-            else:
-                # 只露矩形（矩形外透明）：matte = 黑底 + 白矩形
-                _draw = (f"drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill,"
-                         f"drawbox=x={mx}:y={my}:w={mw}:h={mh}:color=white:t=fill")
-            if _feather > 0:
-                _draw += f",gblur=sigma={_feather:.1f}"
-            _m = f"mk{_sfx}m"
-            filters.append(
-                f"format=rgba,"
-                f"split=2[{_a}][{_m}];"
-                f"[{_m}]format=gray,{_draw}[{_msk}];"
-                f"[{_a}][{_msk}]alphamerge"
-            )
 
     # ----- 绿幕/纯色抠像（子视频水印/画中画，默认位置）-----
     # 插在缩放之后 → 小图抠（性能）；且颜色校正/色相/反色在其后 → 不影响抠像。
@@ -3669,6 +3729,233 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
     if include_negate and enhance_settings and enhance_settings.get("negate_enabled", False):
         filters.append("negate")
 
+
+    # ----- 遮罩 / 透明蒙版（最终渲染帧空间，WYSIWYG）-----
+    # 2026-09-10 两迁记录：裁剪前（原始帧）→ 缩放之后 → 链尾（本位置，抠图兼容见下）。
+    # 遮罩始终落在 crop/rotate/scale 之后的最终渲染帧上，与画布/显示/转换三同一坐标系；
+    # 编辑器拖出的坐标直接可用，零换算（中间滤镜均不改尺寸，链尾坐标系不变）。
+    # ⚠️ 锁色：matte 分支用 format=gray，ffmpeg 自动格式协商会把 scale 输出从 yuv420p 降级为
+    #   gray → 主输入在 alphamerge 前丢失色彩（整帧发灰）。故在 split 之前插 format=rgba 锁死主
+    #   输入像素格式；matte 的 gray 仅限 [m] 分支局部使用，互不影响（fix: tests/_repro_mask_gray2）。
+    # 2026-09-10 抠图兼容（与绿幕 chromakey/colorkey 同开）：整段移到「negate 之后、像素
+    # 格式之前」的链尾——绿幕无论默认位置（缩放后）还是前置模式（delogo 同开时链首）都
+    # 已在前；下方 3 处 alphamerge 前加 alpha 相乘（alphaextract+blend=multiply），拿到的
+    # 既有 alpha 即抠图结果 → 最终 alpha = 抠图 × 遮罩 matte（交集）。无抠图时 format=rgba
+    # 补 alpha=255，乘法=matte 本身，与旧「替换」语义逐帧等效——一条链兼容全部组合，
+    # 消除「谁后到谁通吃」（旧链序绿幕默认位置遮罩失效 / 前置位置抠图失效）。
+    # delogo/区域效果只改像素不改 alpha（见 3218 行实测背书注释），与 matte 相乘零冲突。
+    if settings.get("mask_enabled", False):
+        # 2026-09-11：多形状列表优先（mask_shapes 非空且至少一项有效）→ Option 1 单 matte 链路；
+        # 否则走下方原有单形状逻辑（PNG / 轨迹挡板 / 静态矩形），完全不变。
+        _multi_seg = _build_mask_multi_shape_filters(
+            settings, graph_id, motion_trim_start, motion_speed_factor)
+        if _multi_seg:
+            filters.append(_multi_seg)
+        else:
+            # ⚠️ 2026-09-11：本行是 mask 分支尾部所有标签（mk{_sfx}a/msk/aa/am）的唯一来源；
+            #   漏掉它 → 单形状回退路径（mask_shapes 空/无效）引用未绑定 _sfx 直接抛
+            #   UnboundLocalError（base 多形状重构 f2f1a18 曾真实发生）。切勿删除。
+            #   守门：tests/_probe_mask_single_fallback.py ＋ tests/_test_mask_base_multi_parity.py。
+            _sfx = graph_id or ""
+            mx = str(settings.get("mask_x", "0")).strip() or "0"
+            my = str(settings.get("mask_y", "0")).strip() or "0"
+            mw = str(settings.get("mask_w", "100")).strip() or "0"
+            mh = str(settings.get("mask_h", "100")).strip() or "0"
+            _mode = settings.get("mask_mode", "outside")  # outside=只露矩形(矩形外透明); inside=矩形透明(矩形外正常)
+            # 边缘羽化：matte 生成后追加 gblur 柔化边缘（0=硬边）。2026-09-10 接上对话框 feather 项
+            # （此前对话框有 UI/tooltip 但滤镜未消费 mask_feather → 羽化不生效，本次补齐）。
+            try:
+                _feather = float(str(settings.get("mask_feather", "0")).strip() or "0")
+            except (ValueError, TypeError):
+                _feather = 0.0
+            _a, _msk = f"mk{_sfx}a", f"mk{_sfx}msk"
+            _aa, _am = f"mk{_sfx}aa", f"mk{_sfx}am"   # alpha 相乘链标签（抠图兼容 2026-09-10）
+            # ---- 动态轨迹挡板（2026-09-10 重建）：启用「遮罩轨迹」且有航点时，matte 走 split=3 ——
+            # 一路整帧涂底色；一路 crop 出挡板矩形块、整面涂反向色；再 overlay 按 build_waypoint_expr
+            # 轨迹表达式移动挡板 → 可选 gblur → format=gray → alphamerge。
+            # 挡板移到哪，哪边按 mask_mode 显/隐（outside=擦除式揭示，inside=遮挡式擦除）。
+            _traj_on = bool(settings.get("mask_traj_enabled", False))
+            _raw_wps = settings.get("mask_waypoints")
+            _wps = [w for w in _raw_wps if isinstance(w, dict)] if isinstance(_raw_wps, list) else []
+            try:
+                _cvw = int(float(settings.get("mask_traj_canvas_w", 0) or 0))
+            except (ValueError, TypeError):
+                _cvw = 0
+            try:
+                _cvh = int(float(settings.get("mask_traj_canvas_h", 0) or 0))
+            except (ValueError, TypeError):
+                _cvh = 0
+            if not _cvw:
+                _cvw = MASK_TRAJ_CANVAS_W
+            if not _cvh:
+                _cvh = MASK_TRAJ_CANVAS_H
+            # ---- 形状图（2026-09-10）：载入自制黑白图/透明底挡块图当 matte（心形/星星等多边形）----
+            # 链型：format=rgba,split=2 → 一路 lutyuv 涂底色（outside=黑 inside=白）；movie 载形状图
+            # → alpha 源取不透明度（透明底挡块，颜色无关）/ 亮度图取灰度 → scale 到「矩形坐标」宽高
+            # → (反转 negate / inside 再 negate) → overlay 贴上 → 可选 gblur 羽化 → format=gray → alphamerge。
+            # ⚠️ 底色用 lutyuv 不用 drawbox：movie 引入 rgb 源后格式协商会把 drawbox 拖进 yuva420p，
+            #   drawbox 的 black 在 yuv 上=limited 16 → PNG 区域外整圈 alpha=16 漏光
+            #   （tests/_verify_mask_png 探针复现）；lutyuv 是查表滤镜恒保持 gray，0 恒 0。
+            # ⚠️ movie 单帧 EOF 后 overlay 默认 eof_action=repeat 静止停留（t=2.5s 实测 alpha 不变）。
+            # 形状与轨迹挡板两种 matte 语义不叠加：形状图生效时轨迹本轮不参与（日志提示）。
+            _png_built = False
+            _png_on = bool(settings.get("mask_png_enabled", False))
+            _png_raw = str(settings.get("mask_png_path", "") or "").strip()
+            if _png_on and _png_raw:
+                _ptype = str(settings.get("mask_png_type", "bw") or "bw").strip()
+                if _ptype not in ("bw", "alpha"):
+                    _ptype = "bw"
+                try:
+                    _sw = max(2, int(float(str(settings.get("mask_w", "100")).strip() or "100")))
+                    _sh = max(2, int(float(str(settings.get("mask_h", "100")).strip() or "100")))
+                except (ValueError, TypeError):
+                    _sw = _sh = 100
+                _safe_png = _mask_shape_movie_path(_png_raw)
+                if _safe_png:
+                    _pg = f"mk{_sfx}pgn"
+                    _shp = f"mk{_sfx}shp"
+                    _bgl = f"mk{_sfx}bg"
+                    _ml = f"mk{_sfx}m"
+                    _as = f"mk{_sfx}as"
+                    # 底色：outside=只露形状（黑底=透明）；inside=形状透明（白底=显示）
+                    # gbrp 域画底（RGB 白=255/黑=0 精确）→ extractplanes=g 取 full-range 灰度。
+                    # ⚠️ gray 域 matte 会被下游 blend 协商转 limited-range YUV（白→235/黑→16），
+                    # alphamerge 把它当 full-range alpha → 挡板外 6% 透明残留（2026-09-10 E 系列实测）。
+                    _base_c = "white" if _mode == "inside" else "black"
+                    _load = f"movie={_safe_png}[{_pg}];[{_pg}]"
+                    # rgb 路线：gbrp 取 G 平面（PNG 白=255 精确，gray 域转换会得 limited 白 235）；
+                    # alpha 路线：alpha 平面天生 full-range，原样保留
+                    _load += ("format=rgba,alphaextract" if _ptype == "alpha" else "format=gbrp,extractplanes=g")
+                    if bool(settings.get("mask_png_invert", False)):
+                        _load += ",negate"
+                    if _mode == "inside":
+                        _load += ",negate"
+                    # overlay x/y：启用轨迹且有航点 → 形状沿轨迹移动（心形探照灯/擦除），与矩形挡板
+                    # 同款等比还原（*main_w/cvw）与同段时间换算（motion_trim_start/speed 或
+                    # _trim_speed_from_settings）；否则静止在「矩形坐标」。表达式含逗号必须单引号包。
+                    _png_ox, _png_oy, _png_traj_on = mx, my, False
+                    if _traj_on and _wps:
+                        if motion_trim_start is not None:
+                            _pts = float(motion_trim_start)
+                            _psp = float(motion_speed_factor) if motion_speed_factor is not None else 1.0
+                        else:
+                            _pts, _psp = _trim_speed_from_settings(settings)
+                        _pxe, _pye, _pws, _pwz = build_waypoint_expr(
+                            _wps, sw=str(_cvw), sh=str(_cvh), trim_start=_pts, speed_factor=_psp)
+                        if _pxe and _pye:
+                            _png_ox = f"'({_pxe})*main_w/{_cvw}'"
+                            _png_oy = f"'({_pye})*main_h/{_cvh}'"
+                            _png_traj_on = True
+                    _png_seg = (
+                        f"format=rgba,"
+                        # ⚠️ split 多出一条腿给 alphaextract（拓扑隔离）：同一 split 输出同时喂
+                        # alphaextract(→blend) 和 alphamerge 两条腿会触发 FFmpeg 协商 bug
+                        # （alphamerge 报两腿尺寸不匹配=源尺寸，真机 2026-09-10 实测），
+                        # split 多一腿隔离后正常
+                        f"split=3[{_a}][{_as}][{_ml}];"
+                        f"[{_ml}]format=gbrp,drawbox=x=0:y=0:w=iw:h=ih:color={_base_c}:t=fill,extractplanes=g[{_bgl}];"
+                        f"{_load},scale={_sw}:{_sh},format=gray[{_shp}];"
+                        f"[{_bgl}][{_shp}]overlay=x={_png_ox}:y={_png_oy}"
+                    )
+                    if _feather > 0:
+                        _png_seg += f",gblur=sigma={_feather:.1f}"
+                    # alpha 相乘（抠图兼容 2026-09-10）：无抠图时 format=rgba 已补 alpha=255
+                    # → 255×M/255=M 与旧替换语义等效；同开抠图时 = 抠图 alpha × 遮罩 matte（交集）。
+                    _png_seg += (
+                        f",format=gray[{_msk}];"
+                        f"[{_as}]alphaextract[{_aa}];"
+                        f"[{_aa}][{_msk}]blend=all_mode=multiply[{_am}];"
+                        f"[{_a}][{_am}]alphamerge"
+                    )
+                    filters.append(_png_seg)
+                    _png_built = True
+                    if _png_traj_on:
+                        print(f"[遮罩] 形状图沿轨迹移动：{_png_raw}（路线={_ptype}，大小={_sw}x{_sh}，模式={_mode}，{len(_wps)} 航点）")
+                    else:
+                        print(f"[遮罩] 形状图生效（静止）：{_png_raw}（路线={_ptype}，矩形={mx},{my},{_sw}x{_sh}，模式={_mode}）")
+                else:
+                    print(f"[遮罩] 形状图路径不可用（不存在/含特殊字符且硬链接失败），回退矩形：{_png_raw}")
+            _dyn_built = False
+            if not _png_built and _traj_on and _wps:
+                # 段时间换算与裁剪简易位置同款（2026-08-29：段时间=主视频原始时间 → 换算输出时间线）
+                if motion_trim_start is not None:
+                    _ts0 = float(motion_trim_start)
+                    _sp0 = float(motion_speed_factor) if motion_speed_factor is not None else 1.0
+                else:
+                    _ts0, _sp0 = _trim_speed_from_settings(settings)
+                _xe, _ye, _ws, _wz = build_waypoint_expr(
+                    _wps, sw=str(_cvw), sh=str(_cvh), trim_start=_ts0, speed_factor=_sp0)
+                if _xe and _ye:
+                    # 航点画布（cvw×cvh = 打开遮罩窗口时的最终渲染帧尺寸）→ 实际帧等比还原：
+                    # x*W/cvw、y*H/cvh，行程比例恒正确、与素材分辨率解耦（见 MASK_TRAJ_CANVAS_* 注释）。
+                    # x/y 表达式为纯数字累加 → 整体包一层括号乘系数即可，无变量歧义。
+                    # ⚠️ overlay 的 x/y 变量表里没有 iw/ih（那是 crop/drawbox 的），必须用 main_w/main_h。
+                    _xf = f"({_xe})*main_w/{_cvw}"
+                    _yf = f"({_ye})*main_h/{_cvh}"
+                    # 挡板尺寸同构还原；min 防挡板比帧大（轨迹挡板可拖出画布，但不能大于帧）
+                    _pw = f"min({mw}*iw/{_cvw},iw)"
+                    _ph = f"min({mh}*ih/{_cvh},ih)"
+                    if _mode == "inside":
+                        # 矩形透明、矩形外正常：底=white（显示），黑挡板盖住处=透明
+                        _base_c, _plate_c = "white", "black"
+                    else:
+                        # 只露矩形（矩形外透明）：底=black（透明），白挡板扫过处=显示（擦除式揭示）
+                        _base_c, _plate_c = "black", "white"
+                    _m0, _p0 = f"mk{_sfx}m0", f"mk{_sfx}p0"
+                    _as = f"mk{_sfx}as"
+                    _plt = f"mk{_sfx}plt"
+                    _seg1 = (
+                        f"format=rgba,"
+                        # ⚠️ split 多出一条腿给 alphaextract（拓扑隔离），同 S2 形状图段注释
+                        f"split=4[{_a}][{_as}][{_m0}][{_p0}];"
+                        # gbrp 域画 matte（RGB 白=255/黑=0 精确）；overlay 同在 gbrp 域，
+                        # 尾部 format=gray 转出 full-range 灰度进 blend（gray 域 matte 会被
+                        # blend 协商转 limited YUV 白→235/黑→16，2026-09-10 E 系列实测）
+                        f"[{_m0}]format=gbrp,drawbox=x=0:y=0:w=iw:h=ih:color={_base_c}:t=fill[{_msk}];"
+                        f"[{_p0}]crop='{_pw}':'{_ph}':0:0,format=gbrp,"
+                        f"drawbox=x=0:y=0:w=iw:h=ih:color={_plate_c}:t=fill[{_plt}];"
+                    )
+                    # overlay x/y 用单引号包表达式（航点累加表达式内含逗号）；
+                    # 隐藏段 x=-100000 → 挡板自动移出画面（hide/freeze 语义由 build_waypoint_expr 负责）
+                    _seg2 = f"[{_msk}][{_plt}]overlay=x='{_xf}':y='{_yf}'"
+                    if _feather > 0:
+                        _seg2 += f",gblur=sigma={_feather:.1f}"
+                    _seg2 += f",format=gray[{_msk}];"
+                    # alpha 相乘（同形状图段注释）：抠图 alpha × 遮罩 matte = 交集
+                    _seg3 = (
+                        f"[{_as}]alphaextract[{_aa}];"
+                        f"[{_aa}][{_msk}]blend=all_mode=multiply[{_am}];"
+                        f"[{_a}][{_am}]alphamerge"
+                    )
+                    filters.append(_seg1 + _seg2 + _seg3)
+                    _dyn_built = True
+            if not _dyn_built and not _png_built:
+                # 静态矩形（轨迹未启用 / 无航点 / 表达式构建失败时的兜底，行为与旧版一致）
+                if _mode == "inside":
+                    # 矩形透明、矩形外正常：matte = 白底 + 黑矩形
+                    _draw = (f"drawbox=x=0:y=0:w=iw:h=ih:color=white:t=fill,"
+                             f"drawbox=x={mx}:y={my}:w={mw}:h={mh}:color=black:t=fill")
+                else:
+                    # 只露矩形（矩形外透明）：matte = 黑底 + 白矩形
+                    _draw = (f"drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill,"
+                             f"drawbox=x={mx}:y={my}:w={mw}:h={mh}:color=white:t=fill")
+                if _feather > 0:
+                    _draw += f",gblur=sigma={_feather:.1f}"
+                _m = f"mk{_sfx}m"
+                _as = f"mk{_sfx}as"
+                filters.append(
+                    f"format=rgba,"
+                    # ⚠️ split 多出一条腿给 alphaextract（拓扑隔离），同 S2 形状图段注释
+                    f"split=3[{_a}][{_as}][{_m}];"
+                    # gbrp 域画 matte（RGB 白=255/黑=0 精确）→ format=gray 转出 full-range 灰度；
+                    # gray 域 matte 会被 blend 协商转 limited YUV（白→235/黑→16），
+                    # alphamerge 当 full-range alpha → 挡板外 6% 透明残留（2026-09-10 E 系列实测）
+                    f"[{_m}]format=gbrp,{_draw},format=gray[{_msk}];"
+                    # alpha 相乘（同形状图段注释）：抠图 alpha × 遮罩 matte = 交集
+                    f"[{_as}]alphaextract[{_aa}];"
+                    f"[{_aa}][{_msk}]blend=all_mode=multiply[{_am}];"
+                    f"[{_a}][{_am}]alphamerge"
+                )
 
     # ----- 像素格式 -----
     if include_format and settings.get("pix_fmt_enabled", True):
@@ -16878,8 +17165,9 @@ class RegionVisualEditor:
         self.win.resizable(False, False)
         try:
             self.win.transient(self.root)
-            # 置顶：调用方（去水印/遮罩弹窗）可能仍是置顶/模态，本窗口必须盖住它可交互
-            self.win.attributes("-topmost", True)
+            # 禁 -topmost（项目铁律）：置顶会压掉本窗自身的 ToolTip。
+            # 唯一调用方（去水印/局部滤镜弹窗）打开本窗前已 grab_release()，
+            # 本窗作为后建的 transient 天然盖在其上，无需置顶。
         except Exception:
             pass
         cw = self.disp_w + self.PAD * 2
@@ -17484,6 +17772,9 @@ class LoopChromaFrame(ttk.LabelFrame):
         self.mask_png_path = tk.StringVar(value="")
         self.mask_png_invert = tk.BooleanVar(value=False)
         self.mask_png_type = tk.StringVar(value="bw")
+        # 2026-09-11：遮罩多形状列表（每条 = 一个形状 + 时段窗口）。空列表→走旧单形状逻辑。
+        # 与 delogo 多区域列表同构：每条 shape 独立 type/坐标/羽化/时段，统一叠加到一块 matte。
+        self.mask_shapes = []
 
     def _pick_ui_font(self, size=9, bold=False):
         """跨平台选 UI 字体（与主窗口同款逻辑）：优先能正立显示对勾的字体，
@@ -17546,14 +17837,15 @@ class LoopChromaFrame(ttk.LabelFrame):
             self.chroma_color.set(color_code)
 
     def open_mask_dialog(self):
-        """遮罩 / 透明蒙版 设置弹窗：启用、方向、矩形坐标（可从裁剪复制）、羽化、轨迹、形状图"""
+        """遮罩 / 透明蒙版 设置弹窗：启用、方向、矩形坐标（可从裁剪复制）"""
         win = tk.Toplevel(self)
         win.withdraw()  # 先隐藏，构建完成后再由 center_window 居中显示（避免左上角闪一下）
         win.title(_("遮罩 / 透明蒙版"))
         try:
             win.transient(self.winfo_toplevel())
             win.grab_set()
-            win.attributes('-topmost', True)
+            # 禁 -topmost（项目铁律）：置顶会把非置顶的 ToolTip 压到窗体后面 → 提示显示不全。
+            # transient + grab_set 已足够模态，无需置顶。
         except Exception:
             pass
 
@@ -17641,62 +17933,281 @@ class LoopChromaFrame(ttk.LabelFrame):
 
         main = ttk.Frame(win, padding=10)
         main.pack(fill=tk.BOTH, expand=True)
+        # 2026-09-11 重构：delogo 式「上列表 + 下参数」单弹窗（原独立多形状弹窗已删）。
+        # 时段(秒)：止<=0 或留空 = 全程常显；勾「轨迹」后由航点接管（时段两框置灰）。
+        t_t0 = tk.StringVar(value="0")
+        t_t1 = tk.StringVar(value="0")
+        t_ptype_hint = tk.StringVar(value="")
 
-        # 启用
-        ttk.Checkbutton(main, text=_("启用遮罩"), variable=t_enabled).grid(
-            row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        # ---------- 工具 / 状态 ----------
+        def _to_f(s, d=0.0):
+            try:
+                return float(str(s).strip())
+            except (ValueError, TypeError):
+                return d
 
-        # 遮罩方向
-        ttk.Label(main, text=_("遮罩方向:")).grid(row=1, column=0, sticky="w", pady=2)
-        mode_frame = ttk.Frame(main)
-        mode_frame.grid(row=1, column=1, sticky="w", pady=2)
-        ttk.Radiobutton(mode_frame, text=_("遮罩区域外（只露矩形）"),
-                        variable=t_mode, value="outside").pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Radiobutton(mode_frame, text=_("遮罩区域内（矩形透明）"),
-                        variable=t_mode, value="inside").pack(side=tk.LEFT)
+        def _fmt_t(v):
+            try:
+                f = float(v)
+            except (ValueError, TypeError):
+                return "?"
+            return ("%g" % f)
 
-        # 矩形坐标
-        coord_frame = ttk.LabelFrame(main, text=_("矩形坐标 (x / y / 宽 / 高，最终渲染帧)"), padding=5)
-        coord_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=6)
+        def _type_str(it):
+            return _("外部") if str(it.get("png_path", "") or "").strip() else _("矩形")
 
-        row1 = ttk.Frame(coord_frame)
-        row1.pack(fill=tk.X, pady=2)
-        ttk.Label(row1, text="X:").pack(side=tk.LEFT)
-        ttk.Entry(row1, textvariable=t_x, width=7).pack(side=tk.LEFT, padx=2)
-        ttk.Label(row1, text="Y:").pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Entry(row1, textvariable=t_y, width=7).pack(side=tk.LEFT, padx=2)
-        ttk.Label(row1, text=_("宽:")).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Entry(row1, textvariable=t_w, width=7).pack(side=tk.LEFT, padx=2)
-        ttk.Label(row1, text=_("高:")).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Entry(row1, textvariable=t_h, width=7).pack(side=tk.LEFT, padx=2)
+        def _dir_str(it):
+            return _("透明") if str(it.get("mode", "outside")) == "inside" else _("只露")
 
-        def copy_from_crop():
-            # ⚠️ 2026-09-10：遮罩现在排在 crop/rotate/scale「之后」（坐标=最终渲染帧），
-            #    裁剪的左/上偏移在最终帧里已不存在（裁剪本身定义的就是整帧），故只复制裁剪
-            #    【尺寸】作为挡板大小，位置置 (0,0)。若你想要别的位置，复制后再手动改 x/y。
-            ff = self.filt_frame
-            if ff is None:
-                messagebox.showwarning(_("提示"), _("未找到裁剪设置，无法复制坐标。"))
+        def _summary(it):
+            _w = int(round(_to_f(it.get("w", 0), 0.0)))
+            _h = int(round(_to_f(it.get("h", 0), 0.0)))
+            _p = str(it.get("png_path", "") or "").strip()
+            if _p:
+                _base = "%s %dx%d" % (os.path.basename(_p)[:18], _w, _h)
+            else:
+                _base = "%dx%d@(%s,%s)" % (_w, _h, _fmt_t(it.get("x", 0)), _fmt_t(it.get("y", 0)))
+            if it.get("traj_enabled"):
+                _n = len([w for w in (it.get("waypoints") or []) if isinstance(w, dict)])
+                _tail = _("[轨迹 %d 点]") % _n
+            else:
+                _t1 = _to_f(it.get("t_end", 0), 0.0)
+                _t0 = _to_f(it.get("t_start", 0), 0.0)
+                _tail = _("[全程]") if _t1 <= 0 else "[%s~%ss]" % (_fmt_t(_t0), _fmt_t(_t1))
+            return _base + " " + _tail
+
+        items = []
+        _loading = {"v": False}     # _load_form 期间抑制 trace，防止旧形状值串到新形状
+        _last_sel = {"v": None}     # 回环保卫：刷新回声不改表单
+        _edit_on = {"v": True}      # 无形状时整片编辑区置灰
+
+        def _sel_idx():
+            _s = tree.selection()
+            if not _s:
+                return None
+            try:
+                return int(_s[0])
+            except (ValueError, TypeError):
+                return None
+
+        def _refresh():
+            _sel = _sel_idx()
+            tree.delete(*tree.get_children())
+            for _i, _it in enumerate(items):
+                tree.insert("", "end", iid=str(_i),
+                            values=("✓" if _it.get("enabled", True) else "—",
+                                    _type_str(_it), _dir_str(_it), _summary(_it)))
+            if _sel is not None and 0 <= _sel < len(items):
+                tree.selection_set(str(_sel))
+
+        def _update_row(idx):
+            _iid = str(idx)
+            if tree.exists(_iid) and 0 <= idx < len(items):
+                _it = items[idx]
+                tree.item(_iid, values=("✓" if _it.get("enabled", True) else "—",
+                                        _type_str(_it), _dir_str(_it), _summary(_it)))
+
+        def _collect_form(idx):
+            if idx is None or not (0 <= idx < len(items)):
                 return
-            cw = ff.crop_width.get().strip()
-            ch = ff.crop_height.get().strip()
-            if not cw or not ch:
-                messagebox.showwarning(_("提示"),
-                    _("裁剪未启用或参数为空，请先在「视频滤镜」中启用裁剪并设置区域。"))
-                return
-            t_x.set("0")
-            t_y.set("0")
-            t_w.set(cw)
-            t_h.set(ch)
-            if not t_enabled.get():
-                t_enabled.set(True)
+            _it = items[idx]
+            _m = str(t_mode.get() or "outside")
+            _it["mode"] = _m if _m in ("outside", "inside") else "outside"
+            _it["x"] = _to_f(t_x.get(), 0.0)
+            _it["y"] = _to_f(t_y.get(), 0.0)
+            _it["w"] = _to_f(t_w.get(), 0.0)
+            _it["h"] = _to_f(t_h.get(), 0.0)
+            _it["feather"] = _to_f(t_feather.get(), 0.0)
+            _it["t_start"] = _to_f(t_t0.get(), 0.0)
+            _it["t_end"] = _to_f(t_t1.get(), 0.0)
+            _it["png_path"] = t_png_path.get().strip()
+            _pt = str(t_png_type.get() or "bw")
+            _it["png_type"] = _pt if _pt in ("bw", "alpha") else "bw"
+            _it["png_invert"] = bool(t_png_invert.get())
+            _it["traj_enabled"] = bool(t_traj.get())
+            _it["type"] = "png" if _it["png_path"] else "rect"
 
-        # 独立可视化选区入口：画面上拖拽确定遮罩区域，勾选裁剪时显示裁剪框辅助。
-        # 遮罩作用于「当前子视频」（水印/画中画），文件取 filt_frame.current_file，
-        # 而非主视频（app.input_file）——主视频没有遮罩滤镜。
-        # 遮罩可视化编辑器（🎯 选区 + 轨迹起始/结尾坐标）共用的「背景帧预处理」——
-        # 让编辑器背景帧反映子视频真实的 裁剪/旋转/翻转（与正式命令链一致），不再是 delogo 式原帧。
-        # ⚠️ 不含 scale：编辑器自身按画布(_cw×_ch)缩放到显示尺寸，与正式链 crop→rotate→scale→遮罩 同源。
+        def _load_form(idx):
+            if idx is None or not (0 <= idx < len(items)):
+                return
+            _it = items[idx]
+            _loading["v"] = True
+            try:
+                _tk_setv(t_mode, str(_it.get("mode", "outside")))
+                _tk_setv(t_x, _fmt_t(_it.get("x", 0)))
+                _tk_setv(t_y, _fmt_t(_it.get("y", 0)))
+                _tk_setv(t_w, _fmt_t(_it.get("w", 100)))
+                _tk_setv(t_h, _fmt_t(_it.get("h", 100)))
+                _tk_setv(t_feather, _fmt_t(_it.get("feather", 0)))
+                _tk_setv(t_t0, _fmt_t(_it.get("t_start", 0)))
+                _tk_setv(t_t1, _fmt_t(_it.get("t_end", 0)))
+                _tk_setv(t_png_path, str(_it.get("png_path", "") or ""))
+                _tk_setv(t_png_type, str(_it.get("png_type", "bw")))
+                _tk_setv(t_png_invert, bool(_it.get("png_invert", False)))
+                _tk_setv(t_traj, bool(_it.get("traj_enabled", False)))
+                if not str(_it.get("png_path", "") or "").strip():
+                    _tk_setv(t_ptype_hint, "")
+            finally:
+                _loading["v"] = False
+            try:
+                _n = len([w for w in (_it.get("waypoints") or []) if isinstance(w, dict)])
+                _wp_lbl.configure(text=(_("（%d 个航点）") % _n))
+            except Exception:
+                pass
+            _sync_state()
+
+        def _clear_form():
+            _loading["v"] = True
+            try:
+                _tk_setv(t_mode, "outside")
+                _tk_setv(t_x, "0"); _tk_setv(t_y, "0")
+                _tk_setv(t_w, "100"); _tk_setv(t_h, "100")
+                _tk_setv(t_feather, "0")
+                _tk_setv(t_t0, "0"); _tk_setv(t_t1, "0")
+                _tk_setv(t_png_path, "")
+                _tk_setv(t_png_type, "bw")
+                _tk_setv(t_png_invert, False)
+                _tk_setv(t_traj, False)
+                _tk_setv(t_ptype_hint, "")
+            finally:
+                _loading["v"] = False
+
+        def _apply_now(*_):
+            # ttk.Entry/Combobox 无 command= → 用 textvariable write trace 触达回写
+            if _loading["v"]:
+                return
+            _idx = _sel_idx()
+            if _idx is None:
+                return
+            _collect_form(_idx)
+            _update_row(_idx)   # 只改该行显示：不刷新整表、不改选中 → 无回声、不冲光标
+
+        def _sync_state():
+            _on = _edit_on["v"]
+            for _w in _edit_widgets:
+                try:
+                    _w.configure(state=("normal" if _on else "disabled"))
+                except Exception:
+                    pass
+            if _on and t_traj.get():
+                for _w in (e_t0, e_t1):
+                    try:
+                        _w.configure(state="disabled")
+                    except Exception:
+                        pass
+            try:
+                if not _on:
+                    _time_hint.configure(text=_("秒（未选中形状）"))
+                elif t_traj.get():
+                    _time_hint.configure(text=_("秒（已由轨迹接管，此处被忽略）"))
+                else:
+                    _time_hint.configure(text=_("秒（止=0 或留空 = 全程常显）"))
+            except Exception:
+                pass
+
+        def _on_traj_change(*_):
+            _sync_state()
+            _apply_now()
+
+        def _on_tree_select(ev=None):
+            _idx = _sel_idx()
+            if _idx is None:
+                return
+            if _idx == _last_sel["v"]:
+                return   # 刷新回声（同一行）：表单本就是这行数据，不回读
+            _prev = _last_sel["v"]
+            if _prev is not None and 0 <= _prev < len(items):
+                _collect_form(_prev)
+                _update_row(_prev)
+            _last_sel["v"] = _idx
+            _edit_on["v"] = True
+            _load_form(_idx)
+
+        def _on_tree_click(ev):
+            try:
+                if tree.identify_column(ev.x) == "#1":
+                    _iid = tree.identify_row(ev.y)
+                    if _iid:
+                        _i = int(_iid)
+                        if 0 <= _i < len(items):
+                            items[_i]["enabled"] = not items[_i].get("enabled", True)
+                            _update_row(_i)
+                            tree.selection_set(_iid)
+            except Exception:
+                pass
+
+        def _add():
+            _idx = _sel_idx()
+            if _idx is not None:
+                _collect_form(_idx)
+            items.append({
+                "enabled": True, "mode": "outside", "x": 0.0, "y": 0.0,
+                "w": 100.0, "h": 100.0, "feather": 0.0,
+                "t_start": 0.0, "t_end": 0.0, "png_path": "",
+                "png_type": "bw", "png_invert": False,
+                "traj_enabled": False, "waypoints": []})
+            _refresh()
+            _n = len(items) - 1
+            _last_sel["v"] = _n
+            _edit_on["v"] = True
+            tree.selection_set(str(_n))
+            _load_form(_n)
+
+        def _del():
+            _idx = _sel_idx()
+            if _idx is None:
+                return
+            del items[_idx]
+            _last_sel["v"] = None
+            _refresh()
+            if items:
+                _last_sel["v"] = 0
+                _edit_on["v"] = True
+                tree.selection_set("0")
+                _load_form(0)
+            else:
+                _edit_on["v"] = False
+                _clear_form()
+                _sync_state()
+
+        def _move(d):
+            _idx = _sel_idx()
+            if _idx is None:
+                return
+            _collect_form(_idx)
+            _j = _idx + d
+            if not (0 <= _j < len(items)):
+                return
+            items[_idx], items[_j] = items[_j], items[_idx]
+            _last_sel["v"] = _j
+            _refresh()
+            tree.selection_set(str(_j))
+            _load_form(_j)
+
+        def _migrate_row():
+            """首开（列表为空）时从旧单形状字段搬 1 行，老存档不破。"""
+            _png = (str(self.mask_png_path.get() or "").strip()
+                    if self.mask_png_enabled.get() else "")
+            _md = str(self.mask_mode.get() or "outside")
+            return {
+                "enabled": True,
+                "mode": _md if _md in ("outside", "inside") else "outside",
+                "x": _to_f(self.mask_x.get(), 0.0),
+                "y": _to_f(self.mask_y.get(), 0.0),
+                "w": _to_f(self.mask_w.get(), 100.0),
+                "h": _to_f(self.mask_h.get(), 100.0),
+                "feather": _to_f(self.mask_feather.get(), 0.0),
+                "t_start": 0.0, "t_end": 0.0,
+                "png_path": _png,
+                "png_type": (self.mask_png_type.get()
+                             if self.mask_png_type.get() in ("bw", "alpha") else "bw"),
+                "png_invert": bool(self.mask_png_invert.get()),
+                "traj_enabled": bool(self.mask_traj_enabled.get()),
+                "waypoints": [dict(w) for w in (self.mask_waypoints or [])
+                              if isinstance(w, dict)],
+            }
+
+        # ---------- 背景帧预处理 / 可视化选区 ----------
         def _mask_bg_pre_filter():
             _ff = self.filt_frame
             if _ff is None:
@@ -17716,21 +18227,17 @@ class LoopChromaFrame(ttk.LabelFrame):
                 return None
 
         def _open_mask_visual():
-            ff = self.filt_frame
-            app = getattr(ff, "app", None)  # LoopChromaFrame 自身无 app，必须从 filt_frame 取
-            file_path = getattr(ff, "current_file", "") or ""
+            _ff = self.filt_frame
+            app = getattr(_ff, "app", None)  # LoopChromaFrame 自身无 app，必须从 filt_frame 取
+            file_path = getattr(_ff, "current_file", "") or ""
             if not file_path or not os.path.exists(file_path):
                 if app is not None and app.input_file is not None:
                     file_path = app.input_file.get().strip()
             if not file_path or not os.path.exists(file_path):
                 messagebox.showwarning(_("提示"), _("请先选择子视频文件（水印/画中画）"))
                 return
-            helper = _crop_box_to_helper_rect(
-                ff.crop_enabled, ff.crop_left, ff.crop_top,
-                ff.crop_width, ff.crop_height, file_path=file_path, app=app)
             if app is None or app.root is None:
                 return
-            # 本弹窗 grab_set + topmost 会锁住焦点/盖住可视化窗口 → 打开前释放
             try:
                 win.grab_release()
             except Exception:
@@ -17739,18 +18246,11 @@ class LoopChromaFrame(ttk.LabelFrame):
                 win.attributes("-topmost", False)
             except Exception:
                 pass
-            # 2026-09-10：改用 open_watermark_overlay_editor（与轨迹起始/结尾坐标同一编辑器），
-            # 背景帧过 _mask_bg_pre_filter 反映子视频真实 裁剪/旋转/翻转 → WYSIWYG（画布=显示=转换
-            # 三同一坐标系），不再是 delogo 式原帧。RegionVisualEditor 的画布按整帧尺寸算、与遮罩的
-            # 最终渲染帧坐标系不匹配 → 弃用。on_apply 直接写回「矩形坐标」x/y/w/h。
-            _bw = _bh = 10.0
-            try:
-                _bw = max(10.0, float(str(t_w.get()).strip() or "10"))
-                _bh = max(10.0, float(str(t_h.get()).strip() or "10"))
-            except (ValueError, TypeError):
-                pass
-            _vx = tk.StringVar(value=str(int(round(float(t_x.get() or 0)))))
-            _vy = tk.StringVar(value=str(int(round(float(t_y.get() or 0)))))
+            _bw = max(10.0, _to_f(t_w.get(), 10.0))
+            _bh = max(10.0, _to_f(t_h.get(), 10.0))
+            _vx = tk.StringVar(value=str(int(round(_to_f(t_x.get(), 0.0)))))
+            _vy = tk.StringVar(value=str(int(round(_to_f(t_y.get(), 0.0)))))
+
             def _vis_on_apply(nx, ny, nw, nh, ncw, nch):
                 try:
                     t_x.set(str(int(round(float(nx)))))
@@ -17760,6 +18260,7 @@ class LoopChromaFrame(ttk.LabelFrame):
                         t_h.set(str(int(round(float(nh)))))
                 except Exception:
                     pass
+
             app.open_watermark_overlay_editor(
                 _cw, _ch, _bw, _bh, _vx, _vy,
                 scale_enabled_var=None, scale_w_var=None, scale_h_var=None,
@@ -17768,135 +18269,29 @@ class LoopChromaFrame(ttk.LabelFrame):
                 bg_pre_filter=_mask_bg_pre_filter(),
                 on_apply=_vis_on_apply,
                 initial_time=0.0,
-                aspect_ratio=None,  # 遮罩挡板宽高独立：自由绘制矩形（默认 auto 会锁挡板宽高比）
+                aspect_ratio=None,   # 遮罩挡板宽高独立：自由绘制矩形
+                # ⚠️ 遮罩不支持角度（钉死防误改）：遮罩链只消费 x/y，转动手柄所见非所得。
+                angle_editable=False,
             )
 
-        ttk.Button(coord_frame, text=_("🎯 可视化选区…"), command=_open_mask_visual).pack(pady=2)
-
-        # ---- 边缘羽化（2026-09-10）：0=硬边；>0 时 matte 追加 gblur → 挡板边缘渐变 =「慢慢显现」----
-        feather_frame = ttk.Frame(main)
-        feather_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(2, 4))
-        ttk.Label(feather_frame, text=_("边缘羽化:")).pack(side=tk.LEFT)
-        _fe = ttk.Entry(feather_frame, textvariable=t_feather, width=7)
-        _fe.pack(side=tk.LEFT, padx=2)
-        ttk.Label(feather_frame, text=_("px（0=硬边）")).pack(side=tk.LEFT, padx=(4, 0))
-        ToolTip(_fe,
-                _("挡板边缘的柔和过渡宽度（像素）。\n"
-                "0 = 硬边，切得很干脆；8~40 = 边缘渐显，就是「慢慢显现」的感觉。\n"
-                "实现：matte 生成后追加 gblur=sigma=N 羽化。\n"
-                "⚠️ 做「全屏挡板擦除」时，把矩形设得比画面略大（四边各多出约 2 倍羽化值），\n"
-                "   否则画面四边一开始就会漏出半透明。"))
-
-        # ---- 形状图（2026-09-10）：载入自制形状图当 matte（心形/星星等多边形）----
-        # 与矩形遮罩共用「矩形坐标」（形状边界框）与 🎯 可视化选区；羽化同样生效。
-        # 载入时用 ffprobe 探测 pix_fmt 自动选路线（有 alpha → 透明底挡块；否则黑白亮度图），
-        # 探测失败保守按黑白亮度图，用户可用单选手动改。pal8（8位调色板）可能带透明也可能
-        # 不带、无法从 pix_fmt 判断 → 保守归入黑白亮度（可在 UI 手改「透明底挡块」）。
-        def _png_pick():
-            p = filedialog.askopenfilename(
-                title=_("选择形状图（黑白图或透明底挡块，格式不限）"),
-                filetypes=[(_("图片"), "*.png *.jpg *.jpeg *.bmp *.webp *.gif *.tif *.tiff"),
-                           (_("所有文件"), "*.*")])
-            if not p:
-                return
-            t_png_path.set(p)
-            _plbl.config(text=os.path.basename(p))
-            _plbl_tooltip_text = p
-            try:
-                _plbl.tooltip_text = p
-            except Exception:
-                pass
-            # 自动探测路线：ffprobe 读 pix_fmt（弹窗顶部已备好 _fprobe）
-            detected = ""
-            try:
-                if _fprobe:
-                    _r = subprocess.run(
-                        [_fprobe, "-v", "error", "-select_streams", "v:0",
-                         "-show_entries", "stream=pix_fmt",
-                         "-of", "default=noprint_wrappers=1:nokey=1", p],
-                        capture_output=True, timeout=5,
-                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
-                    _pf = _r.stdout.decode("utf-8", "replace").strip().splitlines()
-                    _pf = _pf[0].strip().lower() if _pf else ""
-                    if _pf in _MASK_SHAPE_ALPHA_PIXFMTS:
-                        detected = "alpha"
-                    elif _pf:
-                        detected = "bw"
-            except Exception:
-                detected = ""
-            if detected:
-                t_png_type.set(detected)
-                _ptype_lbl.config(text=_("（已自动检测：{0}）").format(
-                    _("透明底挡块") if detected == "alpha" else _("黑白亮度图")))
-            else:
-                t_png_type.set("bw")
-                _ptype_lbl.config(text=_("（未检测到，按黑白亮度图；可手动改）"))
-
-        png_frame = ttk.LabelFrame(main, text=_("形状图（心形/星星等自制形状）"), padding=5)
-        png_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 6))
-
-        ttk.Checkbutton(png_frame, text=_("使用形状图"), variable=t_png_enabled).pack(anchor="w")
-        _prow = ttk.Frame(png_frame)
-        _prow.pack(fill=tk.X, pady=2)
-        ttk.Button(_prow, text=_("载入形状图…"), command=_png_pick).pack(side=tk.LEFT)
-        _plbl = ttk.Label(_prow, text=(os.path.basename(t_png_path.get()) if t_png_path.get() else _("（未载入）")),
-                          foreground="gray")
-        _plbl.pack(side=tk.LEFT, padx=(6, 0))
-        _tt_row2 = ttk.Frame(png_frame)
-        _tt_row2.pack(fill=tk.X)
-        ttk.Label(_tt_row2, text=_("素材类型:")).pack(side=tk.LEFT)
-        ttk.Radiobutton(_tt_row2, text=_("黑白亮度图（白显黑透）"),
-                        variable=t_png_type, value="bw").pack(side=tk.LEFT, padx=(4, 8))
-        ttk.Radiobutton(_tt_row2, text=_("透明底挡块（按不透明度）"),
-                        variable=t_png_type, value="alpha").pack(side=tk.LEFT)
-        _ptype_lbl = ttk.Label(_tt_row2, text="", foreground="gray")
-        _ptype_lbl.pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Checkbutton(png_frame, text=_("黑白反转（素材黑白语义相反时勾选）"),
-                        variable=t_png_invert).pack(anchor="w")
-        ToolTip(_plbl, _("已载入的形状图文件（悬停显示完整路径）。\n"
-                       "形状位置/大小 = 上方「矩形坐标」，可用 🎯 可视化选区拖拽；边缘羽化同样生效。"))
-        ToolTip(_tt_row2,
-                _("两条 matte 路线：\n"
-                "· 黑白亮度图：白=显示、黑=透明（jpg/bmp 天然走这条）\n"
-                "· 透明底挡块：按 alpha 通道取形状，挡块颜色不限（透明背景 PNG/WEBP）\n"
-                "载入时自动检测并选中，检测不准可手动改（8位调色板 PNG 可能测不出透明）。"))
-        ToolTip(png_frame,
-                _("用自制形状图代替矩形挡板：白（或不透明）处显示子视频，黑（或透明）处透出主视频。\n"
-                "· 「只露形状」= 心形窗口效果；「形状透明」= 心形挖孔效果\n"
-                "· 与矩形坐标/可视化选区/边缘羽化共用同一套参数\n"
-                "· 勾「启用轨迹」后形状沿轨迹移动（心形探照灯/擦除），航点=形状左上角"))
-
-        # ---- 遮罩轨迹（2026-09-10）：矩形挡板沿轨迹移动 ----
-        traj_frame = ttk.LabelFrame(main, text=_("遮罩轨迹（挡板沿轨迹移动）"), padding=5)
-        traj_frame.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(0, 6))
-
+        # ---------- 轨迹（起始/结尾坐标）回调 ----------
         def _mask_edit_cb(row_idx, which, cur_x, cur_y, cur_angle,
                           apply_xy, apply_angle, t0=0.0):
             """「起始坐标… / 结尾坐标…」入口：可视化摆放挡板在该航点起点/终点的位置。
 
-            ⚠️ 必须传这个回调——_trajectory_dialog 里 edit_cb is None 时那两个按钮是**永久
-            置灰**的（与是否勾选「启用列表轨迹」无关）。文字水印/画中画都传了，遮罩漏了。
-            画布 = _cw×_ch（**子视频真实尺寸**）→ 与航点坐标、挡板宽高同构，拖出来的坐标
-            直接写回航点，无需任何换算；背景帧也用子视频文件 _sub_file。
+            ⚠️ 必须传这个回调——_trajectory_dialog 里 edit_cb is None 时那两个按钮永久置灰。
             """
             if _app is None:
                 apply_xy(cur_x, cur_y)
                 return
-            # 挡板显示尺寸：与画布同构，直接用「矩形坐标」的宽高（子视频像素）
-            try:
-                _bw = float(str(t_w.get()).strip() or "0")
-                _bh = float(str(t_h.get()).strip() or "0")
-            except (ValueError, TypeError):
-                _bw = _bh = 0.0
-            _bw = max(10.0, min(float(_cw), _bw if _bw > 0 else 10.0))
-            _bh = max(10.0, min(float(_ch), _bh if _bh > 0 else 10.0))
+            _bw = max(10.0, min(float(_cw), _to_f(t_w.get(), 0.0) or 10.0))
+            _bh = max(10.0, min(float(_ch), _to_f(t_h.get(), 0.0) or 10.0))
             vx = tk.StringVar(value=f"{int(round(cur_x or 0)):d}")
             vy = tk.StringVar(value=f"{int(round(cur_y or 0)):d}")
 
             def _on_apply(nx, ny, nw, nh, ncw, nch):
                 vx.set(str(int(round(nx))))
                 vy.set(str(int(round(ny))))
-                # 编辑器里重绘挡板尺寸 → 直接写回「矩形坐标」宽高（与画布同构，无需换算）
                 try:
                     if nw and nh:
                         t_w.set(str(int(round(float(nw)))))
@@ -17904,27 +18299,28 @@ class LoopChromaFrame(ttk.LabelFrame):
                 except Exception:
                     pass
 
-            # free_layout=True：擦除场景要求挡板能移出画面（起点/终点在画布外）
             _app.open_watermark_overlay_editor(
                 _cw, _ch, _bw, _bh, vx, vy,
                 scale_enabled_var=None, scale_w_var=None, scale_h_var=None,
                 watermark_dict=None, filt_frame=None, parent=self, free_layout=True,
                 main_video_file=_sub_file,
-                # 2026-09-10：背景帧过 _mask_bg_pre_filter 反映子视频真实 裁剪/旋转/翻转
-                # → 与 🎯 选区按钮同一 WYSIWYG 坐标系（画布=显示=转换），不再 delogo 式原帧。
                 bg_pre_filter=_mask_bg_pre_filter(),
-                init_angle=(cur_angle or 0.0), angle_cb=apply_angle,
                 on_apply=_on_apply, on_drag_commit=apply_xy,
                 initial_time=t0,
-                aspect_ratio=None)  # 遮罩挡板宽高独立：自由绘制矩形（默认 auto 会锁挡板宽高比）
+                aspect_ratio=None,
+                angle_editable=False)
             try:
                 apply_xy(float(vx.get()), float(vy.get()))
             except (ValueError, TypeError):
                 pass
 
         def _open_mask_traj():
-            """复用公共轨迹弹窗编辑遮罩航点（结构与子视频 move_waypoints 相同）。"""
-            # 本弹窗 grab_set + topmost 会锁住焦点/盖住轨迹窗 → 打开前释放（同 _open_mask_visual）
+            _idx = _sel_idx()
+            if _idx is None:
+                return
+            _collect_form(_idx)
+            _cur = items[_idx]
+            _wps0 = [dict(w) for w in (_cur.get("waypoints") or []) if isinstance(w, dict)]
             try:
                 win.grab_release()
             except Exception:
@@ -17935,95 +18331,347 @@ class LoopChromaFrame(ttk.LabelFrame):
                 pass
 
             def _commit_traj(v):
-                _nw = list(v.get("move_waypoints") or [])
-                t_wps[:] = _nw
+                _nw = [w for w in (v.get("move_waypoints") or []) if isinstance(w, dict)]
+                _cur["waypoints"] = _nw
                 if _nw and not t_traj.get():
                     t_traj.set(True)
                 try:
-                    _wp_lbl.config(text=_("（{0} 个航点）").format(len(_nw)))
+                    _wp_lbl.configure(text=_("（%d 个航点）") % len(_nw))
                 except Exception:
                     pass
+                _update_row(_idx)
 
             _trajectory_dialog(
                 win,
-                {"move_mode": "waypoints", "move_cycle": 4.0, "move_dwell": 2.0,
-                 "move_margin": "W*0.03", "move_waypoints": list(t_wps)},
+                # ⚠️ 2026-09-11 修复：原来恒传 "waypoints" → 轨迹弹窗一打开就「启用列表轨迹」
+                #    勾着并种子 1 行（用户实测「打开就是一个启用的带初始一条的」）。
+                #    改为回显真实状态：已有航点、或本形状已勾「轨迹」才预启用；否则干净打开。
+                {"move_mode": ("waypoints" if (_wps0 or t_traj.get()) else ""),
+                 "move_cycle": 4.0, "move_dwell": 2.0,
+                 "move_margin": "W*0.03", "move_waypoints": list(_wps0)},
                 _commit_traj,
-                # ⚠️ edit_cb 必须传：为 None 时列表里的「起始坐标…/结尾坐标…」按钮会永久置灰
+                # ⚠️ edit_cb 必须传：为 None 时列表里的「起始坐标…/结尾坐标…」按钮永久置灰
                 edit_cb=_mask_edit_cb,
-                # 画布/背景帧 = 子视频真实尺寸与文件（航点、挡板宽高与之同构）
                 canvas_w=_cw, canvas_h=_ch,
                 video_file=_sub_file, ffmpeg_cmd=_ffm, ffprobe_cmd=_fprobe,
-                app=_app)
+                app=_app,
+                # 遮罩链只消费航点 x/y：预设动效/角度/缩放链路不消费 → 隐藏
+                show_presets=False, allow_angle=False, allow_empty=True)
 
-        ttk.Checkbutton(traj_frame, text=_("启用轨迹（矩形沿轨迹移动）"),
-                        variable=t_traj).pack(anchor="w")
-        _traj_row = ttk.Frame(traj_frame)
-        _traj_row.pack(fill=tk.X, pady=(4, 0))
-        _tb = ttk.Button(_traj_row, text=_("编辑航点…"), command=_open_mask_traj)
-        _tb.pack(side=tk.LEFT)
-        _wp_lbl = ttk.Label(_traj_row, text=_("（{0} 个航点）").format(len(t_wps)))
-        _wp_lbl.pack(side=tk.LEFT, padx=(6, 0))
-        # 画布尺寸显式显示：用户能立刻确认是不是拿到了子视频真实尺寸（而不是兜底 1280×720）
-        _cv_lbl = ttk.Label(_traj_row,
-                            text=_("画布 {0}×{1}").format(_cw, _ch)
-                                 + (_("（兜底）") if (_cw, _ch) == (MASK_TRAJ_CANVAS_W,
-                                                             MASK_TRAJ_CANVAS_H)
-                                    and _sub_file else ""),
-                            foreground="gray")
-        _cv_lbl.pack(side=tk.RIGHT)
-        ToolTip(_cv_lbl,
-                _("航点/挡板宽高所在的画布 = 子视频真实尺寸（与「矩形坐标」同坐标系）。\n"
-                "若显示「兜底」说明没探到子视频尺寸——请先选好子视频文件（水印/画中画）。"))
-        ToolTip(_tb,
-                _("给这块挡板指定移动路线（复用画中画同款航点列表）。\n"
-                "· 全屏矩形 +「矩形透明」= 挡板移开，扫过处永久显现（擦除）\n"
-                "· 小矩形   +「只露矩形」= 只有框内看得见子视频（探照灯）\n"
-                "· 载入形状图后，轨迹同样驱动形状（心形探照灯/擦除），航点=形状左上角\n"
-                "· 航点就画在「子视频真实尺寸」的画布上（与矩形宽高同坐标系），滤镜侧再按实际帧尺寸还原\n"
-                "⚠️ 擦除效果要求轨迹方向单调（一直往同一边走）：中途折返时，\n"
-                "   挡板折回的地方会把子视频重新挡住。"))
-
-        # 操作按钮
-        btn_frame = ttk.Frame(main)
-        btn_frame.grid(row=6, column=0, columnspan=2, pady=10)
-
-        def do_save():
-            self.mask_enabled.set(t_enabled.get())
-            self.mask_x.set(t_x.get().strip() or "0")
-            self.mask_y.set(t_y.get().strip() or "0")
-            self.mask_w.set(t_w.get().strip() or "0")
-            self.mask_h.set(t_h.get().strip() or "0")
-            self.mask_mode.set(t_mode.get())
-            # 2026-09-10：羽化 + 轨迹写回
-            self.mask_feather.set(t_feather.get().strip() or "0")
-            self.mask_traj_enabled.set(t_traj.get())
-            self.mask_waypoints = list(t_wps)
-            # 2026-09-10：形状图写回（type 只存 bw/alpha 两个具体值，canonical 英文）
-            self.mask_png_enabled.set(t_png_enabled.get())
-            self.mask_png_path.set(t_png_path.get().strip())
-            self.mask_png_invert.set(t_png_invert.get())
-            _t_pt = t_png_type.get()
-            self.mask_png_type.set(_t_pt if _t_pt in ("bw", "alpha") else "bw")
-            # 航点坐标系必须与航点一起存，否则下次打开按新素材尺寸解释旧坐标会错位
-            self.mask_traj_canvas_w.set(int(_cw))
-            self.mask_traj_canvas_h.set(int(_ch))
+        # ---------- 外部形状图 ----------
+        def _pick_png():
+            p = filedialog.askopenfilename(
+                title=_("选择形状图（黑白图或透明底挡块，格式不限）"),
+                filetypes=[(_("图片"), "*.png *.jpg *.jpeg *.bmp *.webp *.gif *.tif *.tiff"),
+                           (_("所有文件"), "*.*")])
+            if not p:
+                return
+            t_png_path.set(p)
+            detected = ""
             try:
-                # ⚠️ self.app 在本类不存在（app 挂在 filt_frame 上）→ 用上面解析好的 _app，
-                # 否则这里会 AttributeError 被 except 吞掉，命令预览静默不刷新。
+                if _fprobe:
+                    _r = subprocess.run(
+                        [_fprobe, "-v", "error", "-select_streams", "v:0",
+                         "-show_entries", "stream=pix_fmt",
+                         "-of", "default=noprint_wrappers=1:nokey=1", p],
+                        capture_output=True, timeout=5,
+                        creationflags=(subprocess.CREATE_NO_WINDOW
+                                       if sys.platform == "win32" else 0))
+                    _pf = _r.stdout.decode("utf-8", "replace").strip().splitlines()
+                    _pf = _pf[0].strip().lower() if _pf else ""
+                    if _pf in _MASK_SHAPE_ALPHA_PIXFMTS:
+                        detected = "alpha"
+                    elif _pf:
+                        detected = "bw"
+            except Exception:
+                detected = ""
+            if detected:
+                t_png_type.set(detected)
+                t_ptype_hint.set(_("（已自动检测：%s）")
+                                 % (_("透明底挡块") if detected == "alpha" else _("黑白亮度图")))
+            else:
+                t_png_type.set("bw")
+                t_ptype_hint.set(_("（未检测到，按黑白亮度图；可手动改）"))
+
+        def _clear_png():
+            t_png_path.set("")
+            t_ptype_hint.set("")
+
+        # ---------- 保存 ----------
+        def _do_save():
+            _idx = _sel_idx()
+            if _idx is not None:
+                _collect_form(_idx)
+            _out = []
+            for _it in items:
+                _d = {
+                    "enabled": bool(_it.get("enabled", True)),
+                    "mode": (_it.get("mode", "outside")
+                             if _it.get("mode", "outside") in ("outside", "inside")
+                             else "outside"),
+                    "x": _to_f(_it.get("x", 0), 0.0),
+                    "y": _to_f(_it.get("y", 0), 0.0),
+                    "w": _to_f(_it.get("w", 100), 100.0),
+                    "h": _to_f(_it.get("h", 100), 100.0),
+                    "feather": _to_f(_it.get("feather", 0), 0.0),
+                    "t_start": _to_f(_it.get("t_start", 0), 0.0),
+                    "t_end": _to_f(_it.get("t_end", 0), 0.0),
+                    "png_path": str(_it.get("png_path", "") or "").strip(),
+                    "png_type": (_it.get("png_type", "bw")
+                                 if _it.get("png_type", "bw") in ("bw", "alpha") else "bw"),
+                    "png_invert": bool(_it.get("png_invert", False)),
+                    "traj_enabled": bool(_it.get("traj_enabled", False)),
+                    "waypoints": [dict(w) for w in (_it.get("waypoints") or [])
+                                  if isinstance(w, dict)],
+                }
+                _d["type"] = "png" if _d["png_path"] else "rect"
+                _out.append(_d)
+            self.mask_shapes = _out
+            # 无形状 → 关闭总开关（避免旧单形状 0 尺寸矩形复活成黑屏）
+            if _out:
+                self.mask_enabled.set(bool(t_enabled.get()))
+            else:
+                if t_enabled.get():
+                    print(_("[遮罩] 未添加任何形状 → 已自动关闭遮罩"))
+                self.mask_enabled.set(False)
+            # 镜像行 0 → 旧单形状字段（兼容旧路径 / 旧存档）
+            if _out:
+                _sh0 = _out[0]
+                self.mask_x.set(_fmt_t(_sh0["x"]))
+                self.mask_y.set(_fmt_t(_sh0["y"]))
+                self.mask_w.set(_fmt_t(_sh0["w"]))
+                self.mask_h.set(_fmt_t(_sh0["h"]))
+                self.mask_mode.set(_sh0["mode"])
+                self.mask_feather.set(_fmt_t(_sh0["feather"]))
+                self.mask_png_enabled.set(bool(_sh0["png_path"]))
+                self.mask_png_path.set(_sh0["png_path"])
+                self.mask_png_type.set(_sh0["png_type"])
+                self.mask_png_invert.set(_sh0["png_invert"])
+                self.mask_traj_enabled.set(_sh0["traj_enabled"])
+                self.mask_waypoints = [dict(w) for w in _sh0["waypoints"]]
+            # 航点坐标系必须与航点一起存
+            try:
+                self.mask_traj_canvas_w.set(int(_cw))
+                self.mask_traj_canvas_h.set(int(_ch))
+            except Exception:
+                pass
+            try:
                 if _app is not None and hasattr(_app, "merge_update_command_preview"):
                     _app.merge_update_command_preview()
             except Exception:
                 pass
             win.destroy()
 
-        ttk.Button(btn_frame, text=_("保存"), command=do_save, width=8).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text=_("取消"), command=win.destroy, width=8).pack(side=tk.LEFT, padx=5)
+        # ================= 总开关 =================
+        # ⚠️ 2026-09-11 补回：本次「上列表+下参数」重构时把这个控件漏掉了（t_enabled 变量
+        #    还在，但没有任何控件能改它）→ _do_save 永远写回 mask_enabled=False →
+        #    build_video_filter_chain 里 `if settings.get("mask_enabled")` 恒假，命令里
+        #    永远不走遮罩路线（用户实测复现）。必须先于形状列表创建+pack 才显示在顶部。
+        chk_enable = ttk.Checkbutton(main, text=_("启用遮罩（作用于当前子视频）"),
+                                     variable=t_enabled)
+        chk_enable.pack(anchor="w", pady=(0, 6))
+        ToolTip(chk_enable,
+                _("遮罩总开关。\n"
+                "勾选后点「保存」才会把遮罩写进转换命令。\n"
+                "形状列表为空时保存会自动关闭它（避免 0 尺寸矩形把画面刷黑）。"))
+
+        # ================= 形状列表 =================
+        list_lf = ttk.LabelFrame(main, text=_("形状列表（可加多个；点「启用」列切换单项）"),
+                                 padding=6)
+        list_lf.pack(fill=tk.X, pady=(0, 4))
+        ToolTip(list_lf,
+                _("可叠加多个形状，按列表顺序合成（后行盖前行，用「上移/下移」调层序）。\n"
+                "· 时段：每个形状各自的显示窗口。时段重叠时多个形状【同时】显示（并行），\n"
+                "  后一个的时段不会把前一个砍短。\n"
+                "· 重叠处：同方向取并集（几块都亮 / 孔各挖各的）；\n"
+                "  混用方向时后行盖前行（先「只露矩形」再「矩形透明」= 在可见区上挖洞）。"))
+        tree = ttk.Treeview(list_lf, columns=("en", "type", "dir", "coord"),
+                            show="headings", height=6, selectmode="browse")
+        tree.heading("en", text=_("启用"))
+        tree.heading("type", text=_("类型"))
+        tree.heading("dir", text=_("方向"))
+        tree.heading("coord", text=_("坐标 / 摘要"))
+        tree.column("en", width=44, anchor="center")
+        tree.column("type", width=52, anchor="center")
+        tree.column("dir", width=52, anchor="center")
+        tree.column("coord", width=260)
+        tree.pack(fill=tk.X)
+        tree.bind("<<TreeviewSelect>>", _on_tree_select)
+        tree.bind("<ButtonRelease-1>", _on_tree_click)
+        _tbl_row = ttk.Frame(list_lf)
+        _tbl_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(_tbl_row, text=_("添加"), width=6, command=_add).pack(side=tk.LEFT, padx=1)
+        ttk.Button(_tbl_row, text=_("删除"), width=6, command=_del).pack(side=tk.LEFT, padx=1)
+        ttk.Button(_tbl_row, text=_("上移"), width=6, command=lambda: _move(-1)).pack(side=tk.LEFT, padx=1)
+        ttk.Button(_tbl_row, text=_("下移"), width=6, command=lambda: _move(1)).pack(side=tk.LEFT, padx=1)
+        ttk.Label(_tbl_row, text=_("点「启用」列可切换"),
+                  foreground="gray").pack(side=tk.LEFT, padx=8)
+
+        # ================= 编辑选中形状 =================
+        edit_lf = ttk.LabelFrame(main, text=_("编辑选中形状"), padding=6)
+        edit_lf.pack(fill=tk.X, pady=4)
+
+        # 方向（每行独立）：outside=只露矩形（矩形外透明）/ inside=矩形透明（矩形处挖孔）
+        _dir_row = ttk.Frame(edit_lf)
+        _dir_row.pack(fill=tk.X, pady=2)
+        ttk.Label(_dir_row, text=_("方向:")).pack(side=tk.LEFT)
+        _rd_out = ttk.Radiobutton(_dir_row, text=_("只露矩形（矩形外透明）"),
+                                  variable=t_mode, value="outside")
+        _rd_out.pack(side=tk.LEFT, padx=(4, 8))
+        _rd_in = ttk.Radiobutton(_dir_row, text=_("矩形透明（矩形处挖孔）"),
+                                 variable=t_mode, value="inside")
+        _rd_in.pack(side=tk.LEFT)
+        ToolTip(_rd_in,
+                _("每行方向独立（可混用）：\n"
+                "· 只露矩形 = 只有矩形内看得见子视频（矩形外透明）\n"
+                "· 矩形透明 = 整幅可见、矩形处挖孔\n"
+                "· 混用时按列表顺序叠加（后行盖前行）：\n"
+                "  先「只露」再「矩形透明」= 在可见区上挖洞。用「上移/下移」调层序。"))
+
+        _coord_lf = ttk.LabelFrame(edit_lf, text=_("坐标 (x / y / 宽 / 高，最终渲染帧)"), padding=5)
+        _coord_lf.pack(fill=tk.X, pady=3)
+        _c1 = ttk.Frame(_coord_lf)
+        _c1.pack(fill=tk.X, pady=2)
+        ttk.Label(_c1, text="X:").pack(side=tk.LEFT)
+        e_x = ttk.Entry(_c1, textvariable=t_x, width=6)
+        e_x.pack(side=tk.LEFT, padx=2)
+        ttk.Label(_c1, text="Y:").pack(side=tk.LEFT, padx=(8, 0))
+        e_y = ttk.Entry(_c1, textvariable=t_y, width=6)
+        e_y.pack(side=tk.LEFT, padx=2)
+        ttk.Label(_c1, text=_("宽:")).pack(side=tk.LEFT, padx=(8, 0))
+        e_w = ttk.Entry(_c1, textvariable=t_w, width=6)
+        e_w.pack(side=tk.LEFT, padx=2)
+        ttk.Label(_c1, text=_("高:")).pack(side=tk.LEFT, padx=(8, 0))
+        e_h = ttk.Entry(_c1, textvariable=t_h, width=6)
+        e_h.pack(side=tk.LEFT, padx=2)
+        _btn_vis = ttk.Button(_coord_lf, text=_("🎯 可视化选区…"), command=_open_mask_visual)
+        _btn_vis.pack(pady=(2, 0))
+
+        # 羽化（2026-09-11：轨迹/编辑航点已移到底部「时段」下方——二者与时段互斥，放相邻更好）
+        _f_row = ttk.Frame(edit_lf)
+        _f_row.pack(fill=tk.X, pady=2)
+        ttk.Label(_f_row, text=_("边缘羽化:")).pack(side=tk.LEFT)
+        e_feather = ttk.Entry(_f_row, textvariable=t_feather, width=6)
+        e_feather.pack(side=tk.LEFT, padx=2)
+        ttk.Label(_f_row, text=_("px（0=硬边）")).pack(side=tk.LEFT, padx=(0, 10))
+        ToolTip(e_feather,
+                _("挡板边缘的柔和过渡宽度（像素）。\n"
+                "0 = 硬边；8~40 = 边缘渐显（慢慢显现）。\n"
+                "实现：matte 生成后追加 gblur=sigma=N 羽化。\n"
+                "⚠️ 做「全屏挡板擦除」时把矩形设得比画面略大（四边各多出约 2 倍羽化值）。"))
+
+        # 外部形状图（留空=普通矩形；有值=外部形状）
+        _png_lf = ttk.LabelFrame(edit_lf,
+                                 text=_("外部形状图（留空 = 普通矩形；有值 = 外部形状）"),
+                                 padding=5)
+        _png_lf.pack(fill=tk.X, pady=3)
+        _p1 = ttk.Frame(_png_lf)
+        _p1.pack(fill=tk.X)
+        e_png = ttk.Entry(_p1, textvariable=t_png_path, width=32)
+        e_png.pack(side=tk.LEFT, padx=(0, 4))
+        _btn_pl = ttk.Button(_p1, text=_("载入…"), command=_pick_png)
+        _btn_pl.pack(side=tk.LEFT)
+        _btn_pc = ttk.Button(_p1, text=_("清除"), command=_clear_png)
+        _btn_pc.pack(side=tk.LEFT, padx=(4, 0))
+        ToolTip(e_png,
+                _("外部形状图（心形/星星等自制形状）：白（或不透明）处显示子视频，黑（或透明）处透出主视频。\n"
+                "· 「只露矩形」= 形状窗口效果；「矩形透明」= 形状挖孔\n"
+                "· 形状位置/大小 = 上方「坐标」，可用 🎯 可视化选区；羽化同样生效。"))
+        _p2 = ttk.Frame(_png_lf)
+        _p2.pack(fill=tk.X, pady=(3, 0))
+        ttk.Label(_p2, text=_("素材类型:")).pack(side=tk.LEFT)
+        _rd_bw = ttk.Radiobutton(_p2, text=_("黑白亮度图（白显黑透）"),
+                                 variable=t_png_type, value="bw")
+        _rd_bw.pack(side=tk.LEFT, padx=(4, 8))
+        _rd_al = ttk.Radiobutton(_p2, text=_("透明底挡块（按不透明度）"),
+                                 variable=t_png_type, value="alpha")
+        _rd_al.pack(side=tk.LEFT)
+        _ptype_lbl = ttk.Label(_p2, textvariable=t_ptype_hint, foreground="gray")
+        _ptype_lbl.pack(side=tk.LEFT, padx=(6, 0))
+        ToolTip(_rd_al,
+                _("两条 matte 路线：\n"
+                "· 黑白亮度图：白=显示、黑=透明（jpg/bmp 天然走这条）\n"
+                "· 透明底挡块：按 alpha 通道取形状，挡块颜色不限（透明背景 PNG/WEBP）\n"
+                "载入时自动检测并选中，检测不准可手动改（8位调色板 PNG 可能测不出透明）。"))
+        _p3 = ttk.Frame(_png_lf)
+        _p3.pack(fill=tk.X, pady=(3, 0))
+        _chk_inv = ttk.Checkbutton(_p3, text=_("黑白反转（素材黑白语义相反时勾选）"),
+                                   variable=t_png_invert)
+        _chk_inv.pack(anchor="w")
+
+        # 时段（勾轨迹置灰 = 由航点接管）
+        _t_row = ttk.Frame(edit_lf)
+        _t_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(_t_row, text=_("时段:")).pack(side=tk.LEFT)
+        e_t0 = ttk.Entry(_t_row, textvariable=t_t0, width=7)
+        e_t0.pack(side=tk.LEFT, padx=2)
+        ttk.Label(_t_row, text="~").pack(side=tk.LEFT)
+        e_t1 = ttk.Entry(_t_row, textvariable=t_t1, width=7)
+        e_t1.pack(side=tk.LEFT, padx=2)
+        _time_hint = ttk.Label(_t_row, text=_("秒（止=0 或留空 = 全程常显）"), foreground="gray")
+        _time_hint.pack(side=tk.LEFT, padx=6)
+        ToolTip(e_t0,
+                _("该形状的显示时段（秒，输出时间线）。\n"
+                "止 <= 0 或留空 = 全程常显。\n"
+                "勾选「轨迹」后本时段被忽略（可见性由航点接管）。"))
+
+        # 轨迹（与上方「时段」互斥：勾选后时段被忽略、两框置灰）
+        # 2026-09-11 布局调整：从「羽化」行移到这里——和时段相邻，互斥关系一眼可见。
+        _traj_row = ttk.Frame(edit_lf)
+        _traj_row.pack(fill=tk.X, pady=(3, 0))
+        _chk_traj = ttk.Checkbutton(_traj_row, text=_("轨迹（沿轨迹移动）"), variable=t_traj)
+        _chk_traj.pack(side=tk.LEFT)
+        _btn_traj = ttk.Button(_traj_row, text=_("编辑航点…"), command=_open_mask_traj)
+        _btn_traj.pack(side=tk.LEFT, padx=(6, 0))
+        _wp_lbl = ttk.Label(_traj_row, text="", foreground="gray")
+        _wp_lbl.pack(side=tk.LEFT, padx=(4, 0))
+        ToolTip(_chk_traj,
+                _("勾选后本形状沿「航点」移动，可见性也由航点接管。\n"
+                "勾选后上方「时段」两框自动置灰（被忽略）。"))
+
+        # 底部按钮
+        _btns = ttk.Frame(main)
+        _btns.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(_btns, text=_("保存"), width=8, command=_do_save).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(_btns, text=_("取消"), width=8, command=win.destroy).pack(side=tk.RIGHT, padx=5)
+
+        # 编辑区控件集合（无形状时统一置灰）
+        _edit_widgets = [_rd_out, _rd_in, e_x, e_y, e_w, e_h, e_feather, _chk_traj,
+                         _btn_traj, e_png, _btn_pl, _btn_pc, _rd_bw, _rd_al, _chk_inv,
+                         e_t0, e_t1, _btn_vis]
+
+        # form 改动即写回当前形状（ttk.Entry 无 command=，用 write trace）
+        for _v in (t_mode, t_x, t_y, t_w, t_h, t_feather, t_t0, t_t1,
+                   t_png_path, t_png_type, t_png_invert):
+            _v.trace_add("write", _apply_now)
+        t_traj.trace_add("write", _on_traj_change)
+
+        # ---------- 初始化 ----------
+        items = [dict(_s) for _s in (self.mask_shapes or []) if isinstance(_s, dict)]
+        if not items:
+            items = [_migrate_row()]
+        for _it in items:
+            _it.setdefault("enabled", True)
+            _it.setdefault("mode", "outside")
+            _it.setdefault("png_type", "bw")
+            _it.setdefault("png_invert", False)
+            _it.setdefault("traj_enabled", False)
+            if not isinstance(_it.get("waypoints"), list):
+                _it["waypoints"] = []
+        _refresh()
+        if items:
+            _edit_on["v"] = True
+            _last_sel["v"] = 0
+            tree.selection_set("0")
+            _load_form(0)
+        else:
+            _edit_on["v"] = False
+        _sync_state()
 
         win.update_idletasks()
         try:
-            # 2026-09-10：羽化 + 轨迹 + 形状图三块，窗口加高
-            center_window(win, 460, 560)
+            # 2026-09-11：上列表 + 下参数（方向/坐标/羽化轨迹/外部图/时段），窗口加高
+            center_window(win, 480, 660)
         except Exception:
             pass
 
@@ -18063,6 +18711,8 @@ class LoopChromaFrame(ttk.LabelFrame):
             "mask_png_path": self.mask_png_path.get(),
             "mask_png_invert": self.mask_png_invert.get(),
             "mask_png_type": self.mask_png_type.get(),
+            # 2026-09-11：遮罩多形状列表（空列表→旧单形状逻辑）
+            "mask_shapes": list(self.mask_shapes),
         }
     
     def set_settings(self, settings):
@@ -18117,6 +18767,8 @@ class LoopChromaFrame(ttk.LabelFrame):
         except (ValueError, TypeError):
             self.mask_traj_canvas_w.set(0)
             self.mask_traj_canvas_h.set(0)
+        # 2026-09-11：遮罩多形状列表（旧工程无此项→空列表→走旧单形状逻辑）
+        self.mask_shapes = [s for s in (settings.get("mask_shapes") or []) if isinstance(s, dict)]
 
     def set_duration_info(self, duration_sec: Optional[float]):
         """设置时长显示信息"""
@@ -22646,10 +23298,24 @@ class FFmpegBatchGUI:
                                 ov_suffix=(":eof_action=pass" if _has_window else "")))
                             current_v = f"v_out_{i}"
                         else:
-                            # 子视频完全在画布外，跳过混合（保持主画面，不报错）
+                            # 子视频完全在画布外，跳过混合（保持主画面，不报错）。
+                            # ⚠️ current_sub 必须消费（nullsink），否则子视频链输出悬空
+                            # → filtergraph "unconnected" 报错（同下方叠加关闭分支）。
                             filter_parts.append(f"[{current_v}]null[{current_v}]")
+                            filter_parts.append(f"[{current_sub}]nullsink")
             else:
+                # 叠加关闭：主视频直通 + 必须消费子视频流。子视频链（循环内）是无条件
+                # 生成的——绿幕/遮罩/缩放等滤镜都在里面；不消费会悬空，filtergraph 直接报
+                # "Filter 'format:default' has output 0 (v_temp_N) unconnected"，
+                # 转换/预览全炸（2026-09-10 用户实测：绿幕+遮罩轨道未勾「启用叠加」）。
+                # ⚠️ 本 else 必须缩进在上方 if（overlay_enabled）之下（12 空格）——base 曾误写成
+                # 8 空格挂成 for-else：单子视频歪打正着（循环尾消费了 current_sub），但
+                # 多子视频时非末位关叠加的流照样悬空、且勾了叠加也误报日志（2026-09-10 修正）。
                 filter_parts.append(f"[{current_v}]null[{current_v}]")
+                filter_parts.append(f"[{current_sub}]nullsink")
+                self._append_info_ui(
+                    _("[封装] 子视频 {0} 未勾选「启用叠加」：其滤镜链（绿幕/遮罩/缩放等）"
+                      "已生成但不会叠加显示；如需显示请到轨道编辑勾选「启用叠加」").format(i + 1))
     
         complex_filter = ";".join(filter_parts)
         return complex_filter, f"[{current_v}]"
@@ -26800,7 +27466,7 @@ class FFmpegBatchGUI:
                                       main_offset=(0, 0), main_render_size=None,
                                       bg_pre_filter=None, angle_cb=None, init_angle=None,
                                       on_apply=None, initial_time=None, on_drag_commit=None,
-                                      aspect_ratio="auto"):
+                                      aspect_ratio="auto", angle_editable=True):
         """
         水印可视化编辑器，支持回写位置和缩放尺寸，以及更新水印字典和滤镜框架。
         free_layout=True 时放开边界（子视频可拖出画布、可比主视频大）。
@@ -26808,6 +27474,8 @@ class FFmpegBatchGUI:
         aspect_ratio: "auto"（默认）=按水印/挡板当前宽高比锁定「绘制新矩形」的比例；
                       None=自由矩形（遮罩挡板宽高独立，2026-09-10 修「只能画正方形」）。
                       ⚠️ 参数必须放签名末尾——旧调用点有按位置传参（同 _generic_overlay_editor 约定）。
+        angle_editable: False=不显示旋转手柄、禁角度编辑（遮罩轨迹：链路不消费 ra/rb，
+                        显示可旋转 UI 会所见非所得）。透传 _generic_overlay_editor 同名参数。
         """
         # 水印静态旋转角度（rotate_angle），旋转后为 hypot 正方形包围盒
         try:
@@ -26897,6 +27565,7 @@ class FFmpegBatchGUI:
                                      min_visible_pixels=0,show_scale_tip=True,
                                      allow_negative_offset=free_layout,
                                      rotate_angle=_wm_ra, angle_cb=apply_wm_angle,
+                                     angle_editable=angle_editable,   # False=无旋转手柄（遮罩：链路不消费角度）
                                      show_nudge=False,   # 图片水印位置编辑器：无微调按钮
                                      # ⚠️ 2026-08-27 修复：背景帧来源参数化——旧代码硬编码
                                      # 转换页 input_file，封装页场景（画布=merge_video）背景帧
@@ -29606,6 +30275,8 @@ class FFmpegBatchGUI:
         menu.add_command(label=_("上移轨道"), command=self.merge_move_up_selected)
         menu.add_command(label=_("下移轨道"), command=self.merge_move_down_selected)
         menu.add_command(label=_("克隆轨道"), command=self.merge_clone_selected)
+        # 替换素材：只换源文件，布局与滤镜整块保留（不自动改任何参数，异常只日志提示）
+        menu.add_command(label=_("替换素材"), command=self.merge_replace_track_source)
         menu.add_command(label=_("删除轨道"), command=self.merge_delete_selected)
 #        menu.add_command(label="清空轨道", command=self.merge_clear_tracks)
 #        menu.add_command(label="串行合并排序", command=self._merge_sort_ask)
@@ -33424,6 +34095,111 @@ class FFmpegBatchGUI:
         # 只编辑第一个选中项
         self.merge_edit_track_settings(indices[0])
     
+    def merge_replace_track_source(self):
+        """右键「替换素材」：只换选中轨道的源文件，enc_settings 整块保留
+        （位置 / 缩放 / 旋转 / 裁剪 / 滤镜 / 截取 / 转场 一律不动）。
+
+        2026-09-11 从 base port（用户拍板：先只做单轨右键替换；校验只做日志提示，
+        **绝不自动改动任何参数**——剪映式「换源后自动适配」不做）。
+
+        ⚠️ 主视频两处存源：self.merge_video 变量 + 主视频轨的 file_path，二者靠
+           **路径相等**配对（_ensure_main_video 用 normalize_path 比对）。
+           只改一处 → 主视频轨会「自己叠自己」或路径失配，故换主视频轨必须两处同改。
+
+        ⚠️ 设 self.merge_video 必须抑制 trace：merge_video 的 write trace 指向
+           merge_load_video_info，它会 self.merge_tracks = [] 后按新文件流
+           重建全部轨道 → 子视频被清空。参照 _ensure_main_video 用
+           _suppress_main_video_trace 门卫。
+
+        布局为何能保留：子视频 overlay_x/y 默认是相对表达式 W-w-10 / H-h-10
+        （Track 初始化），crop_width 默认 iw/2 → 换源后自适应新尺寸。
+        """
+        indices = self._get_selected_track_indices()
+        if not indices:
+            messagebox.showinfo(_("提示"), _("请先选中轨道"))
+            return
+        idx = indices[0]
+        if not (0 <= idx < len(self.merge_tracks)):
+            return
+        track = self.merge_tracks[idx]
+
+        path = filedialog.askopenfilename(
+            title=_("替换素材 - 轨道 {0}（{1}）：仅换源文件，保留位置/缩放/旋转/滤镜").format(idx + 1, track.type),
+            filetypes=[(_("媒体文件"), "*.png *.jpg *.jpeg *.bmp *.webp *.gif *.mp4 *.mkv *.avi *.mov "
+                                    "*.flv *.webm *.ts *.m4a *.aac *.mp3 *.wav *.flac *.ogg *.opus *.ass *.srt"),
+                       (_("视频文件"), "*.mp4 *.mkv *.avi *.mov *.flv *.webm *.ts *.png *.jpg *.jpeg *.bmp *.webp *.gif"),
+                       (_("音频文件"), "*.m4a *.aac *.mp3 *.wav *.flac *.ogg *.opus"),
+                       (_("所有文件"), "*.*")])
+        if not path:
+            return
+        path = normalize_path(path)
+        if not os.path.exists(path):
+            self._append_info_ui(f"[替换素材] 所选文件不存在，未做改动：{path}")
+            return
+
+        old_path = track.file_path or ""
+        if old_path and normalize_path(old_path) == path:
+            self._append_info_ui("[替换素材] 与当前源相同，未做改动")
+            return
+
+        enc = track.enc_settings if isinstance(track.enc_settings, dict) else {}
+        warns = []
+
+        # ---- 校验（只提示，不改参数）----
+        if track.type == "subtitle":
+            pass  # 字幕轨不做流校验（字幕文件未必有 ffprobe 意义上的流）
+        else:
+            info = self._get_cached_stream_info(path)   # 顺带预热缓存
+            streams = (info or {}).get("streams", [])
+            if not streams:
+                warns.append("无法解析媒体信息或没有任何流（ffprobe 失败 / 文件损坏）")
+            else:
+                _want = "video" if track.type == "video" else "audio"
+                if not any(s.get("codec_type") == _want for s in streams):
+                    warns.append(f"新源没有 {_want} 流")
+                _has_audio = any(s.get("codec_type") == "audio" for s in streams)
+                if track.type == "audio" and not _has_audio:
+                    warns.append("新源无音频流，该音频轨将无输出")
+                elif track.type == "video" and not _has_audio:
+                    # 视频轨音源=自身时才引用 0:a:?；silence / external 不受影响
+                    if enc.get("audio_source_type", "self") == "self":
+                        warns.append("新源无音频流，而本轨音源=自身（audio_source_type=self），命令可能失败")
+                if track.type == "video" and enc.get("chroma_enabled", False):
+                    warns.append("本轨已启用绿幕抠像，抠像颜色 / 相似度需按新素材重调")
+            # 时长相关（绝对秒参数不会自动适配）
+            _new_dur = self._get_media_duration(path)
+            _old_dur = self._get_media_duration(old_path) if old_path else None
+            if _new_dur:
+                if enc.get("trim_enabled", False):
+                    try:
+                        _te = float(str(enc.get("trim_end", "") or "").strip())
+                    except (ValueError, TypeError):
+                        _te = None
+                    if _te is not None and _te > _new_dur:
+                        warns.append(f"截取片段结束 {_te:.2f}s 超出新源时长 {_new_dur:.2f}s，输出会被静默截断")
+                if _old_dur and abs(_old_dur - _new_dur) > 0.01:
+                    warns.append(f"时长 {_old_dur:.2f}s → {_new_dur:.2f}s（转场 / 淡入淡出 / 轨迹等绝对秒参数不自动适配）")
+
+        # ---- 换源：enc_settings 整块不动 ----
+        track.file_path = path
+
+        # 主视频两处同步（见 docstring 门卫说明）
+        _mv = self.merge_video.get().strip()
+        if _mv and old_path and normalize_path(_mv) == normalize_path(old_path):
+            self._suppress_main_video_trace = True
+            try:
+                self.merge_video.set(path)
+            finally:
+                self._suppress_main_video_trace = False
+
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+        self._append_info_ui(
+            f"[替换素材] 轨道 {idx + 1}：{os.path.basename(old_path) or '(空)'} → "
+            f"{os.path.basename(path)}（布局与滤镜已保留）")
+        for _w in warns:
+            self._append_info_ui(f"[替换素材] ⚠️ {_w}")
+
     def merge_preview_selected(self, with_snapshot: bool = False):
         indices = self._get_selected_track_indices()
         if not indices:
@@ -34755,16 +35531,25 @@ class FFmpegBatchGUI:
     def _show_pip_contact_sheet_async(self, track, sub_videos):
         """画中画主视频缩略图：seek 分段抽帧（只解码 8 帧，8K 秒出）+ 子视频合成（与成片一致）。"""
         try:
-            input_files, file_index = self._prepare_tracks_and_inputs([track] + list(sub_videos))
+            # 调用本身要保留：_prepare_tracks_and_inputs 会顺带 ffprobe 计算并写入各轨道的
+            # _type_index（滤镜链取流要用）；但其返回的 file_index **不可**用于子视频索引。
+            self._prepare_tracks_and_inputs([track] + list(sub_videos))
         except Exception as e:
             self._append_info_ui(f"[缩略图] 画中画合成缩略图命令构建失败: {e}")
             return
         sub_infos = []
-        for sv in sub_videos:
+        for i, sv in enumerate(sub_videos):
             sv_settings = sv.enc_settings.copy()
             if sv_settings.get("encoder") == "copy":
                 sv_settings["encoder"] = "libx265"
-            sub_infos.append((file_index[sv.file_path], sv.file_path, sv_settings))
+            # 子视频索引必须是「1..n 顺序编号」，绝不能用 file_index[路径]！
+            # _seek_frame_ppm 是按「-i 主 → 顺序 -i 子」拼命令的，输入编号天然是
+            # 0=主、1..n=子（对照：单文件水印缩略图写的就是硬编码 (1, wm_file, ...)）。
+            # 而 file_index 是**按路径去重**的索引——主/子同一路径时去重后只剩一个，子视频会
+            # 拿到 0 与主视频撞车：子链实际吃主视频流 [0:v]、为子准备的 -i 完全悬空，且 setpts
+            # 注入两次命中主链（PTS 变 2t）、子链一次都没注入。异路径时两者数值巧合相等，
+            # 故长期未暴露（2026-09-10 定位，实测 ffmpeg 仍 rc=0，属「静默画错」不是报错）。
+            sub_infos.append((i + 1, sv.file_path, sv_settings))
         title = f"缩略图（画中画合成） · {os.path.basename(track.file_path)}"
         self._show_seek_sheet_async(track.file_path, track.enc_settings, sub_infos,
                                     title, _("正在生成缩略图…"))
@@ -35041,12 +35826,31 @@ class FFmpegBatchGUI:
         cmd += ["-frames:v", "1", "-f", "image2pipe", "-vcodec", "ppm", "pipe:1"]
         try:
             flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            # stderr 必须接住：此前是 DEVNULL，抽帧失败时原因全部丢掉，UI 只会笼统显示
+            # 「缩略图生成失败」，现场完全无法定位（2026-09-10 用户报「同路径创建缩略图
+            # 失败」却查无实证）。失败原因存 _seek_frame_last_err，由调用方汇总进日志。
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, creationflags=flags)
-            data = proc.stdout.read()
-            proc.wait(timeout=30)
+                                    stderr=subprocess.PIPE, creationflags=flags)
+            # 必须 communicate 而不是 stdout.read() + wait()：stderr 改 PIPE 后，若只
+            # 读 stdout，ffmpeg 写满 stderr 管道会阻塞在写、我们阻塞在读 → 死锁。
+            # communicate 并发读两个管道，timeout 超时直接 kill。
+            try:
+                data, err_b = proc.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                data, err_b = proc.communicate()
             if proc.returncode != 0 or not data:
+                _raw_err = (err_b or b"").decode("utf-8", "replace")
+                # 剥掉 ffmpeg 每次都打的版本 banner（一大坨、对定位毫无帮助），只留真正的
+                # 报错行；万一过滤完为空（例如输出只有 banner）就退回原始尾部，保证有内容
+                # 可看（2026-09-10：不过滤的话日志里全是 libavcodec 63.x 之类噪音）。
+                _skip = ("ffmpeg version", "built with", "configuration:",
+                         "libav", "libsw")
+                _keep = [l for l in _raw_err.splitlines()
+                         if l.strip() and not l.strip().startswith(_skip)]
+                self._seek_frame_last_err = "\n".join(_keep[-6:]) or _raw_err.strip()[-500:]
                 return None
+            self._seek_frame_last_err = ""
             return data
         except Exception:
             return None
@@ -35163,13 +35967,27 @@ class FFmpegBatchGUI:
             if frames:
                 sheet = self._tile_ppm_4x2(frames)
                 if sheet:
+                    if len(frames) < 8:
+                        # 部分失败也要让用户知道：8 格里有几格是补灰的，不是真实画面
+                        self.root.after(0, lambda n=len(frames): self._append_info_ui(
+                            _("[缩略图] 仅成功抽取 {0}/8 帧，缺失格已补灰").format(n)))
                     def _ok(s=sheet):
                         _show_win()
                         self._display_contact_sheet(s)
                     self.root.after(0, _ok)
                     return
-            self.root.after(0, lambda: (_show_win(),
-                                         ui["status"].config(text=_("缩略图生成失败"))))
+            # 一帧都没抽到：把 ffmpeg 的真实报错带上（此前只有一句「缩略图生成失败」，
+            # 原因被 stderr=DEVNULL 吞掉，无法定位——详见 _seek_frame_ppm 的注释）。
+            _detail = getattr(self, "_seek_frame_last_err", "") or ""
+
+            def _fail():
+                _show_win()
+                ui["status"].config(text=_("缩略图生成失败"))
+                self._append_info_ui(
+                    _("[缩略图] 抽帧失败：ffmpeg 未返回任何画面")
+                    + (f"\nffmpeg 输出（尾部）：\n{_detail}" if _detail
+                       else _("（ffmpeg 未输出错误信息）")))
+            self.root.after(0, _fail)
 
         threading.Thread(target=worker, daemon=True).start()
 
