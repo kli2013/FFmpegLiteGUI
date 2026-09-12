@@ -6,7 +6,7 @@ This project has one main line: **batch transcoding + a watermarking workflow**.
 
 ## Main line vs. side features
 
-The feature list looks scattered, but its origin is simple: I started digging into FFmpeg's `overlay` filter because I wanted to watermark videos. Almost everything else — the visual position/rotate/scale editor, dynamic trajectories, masks, chroma-key, canvas, picture-in-picture, start/end dual-state editing — grew out of pushing that one goal further.
+The feature list looks scattered, but its origin is simple: I first dug into FFmpeg's `overlay` filter not for watermarking, but for side-by-side tiling — only later did I realize watermarking rides the exact same road, and I kept going deeper from there. The visual position/rotate/scale editor, dynamic trajectories, masks, chroma-key, canvas, picture-in-picture, start/end dual-state editing — all of it grew out of that one line of work.
 
 | Module | Role | Notes |
 |--------|------|-------|
