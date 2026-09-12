@@ -17,6 +17,14 @@ The feature list looks scattered, but its origin is simple: I started digging in
 
 Using these side features for other purposes (localized mosaic, motion overlays, lightweight NLE-style work) is perfectly fine — they work and are maintained. They are just **not the design goal**: a bonus if you need them, harmless if you don't.
 
+## Why I built this
+
+Before this tool, my workflow was: batch conversion and cropping via .bat scripts, complex edits in Shotcut.
+
+The turning point was jobs like side-by-side tiling: in Shotcut you change the project resolution, pin the left video's position to 0, set the right video's x to the left video's width — every step by hand, and it compounds fast with more clips. So I built this: drop two videos in, align height (or width), tile, export.
+
+It's been a long time since I last opened Shotcut.
+
 ## Update rhythm
 
 - **If you only do batch transcoding, there is no need to chase every update.** Most changelog entries polish the watermark / PiP side features; the transcoding core stays stable. Check back once in a while (every month or two) to see if a fix matters to you — there is no need to swap files after every commit.
@@ -25,4 +33,4 @@ Using these side features for other purposes (localized mosaic, motion overlays,
 
 ## When something breaks
 
-The transcoding core has been stable for years; real bugs tend to live in edge cases (unusual container/codec combinations). Side features iterate under one rule: features must compose, never conflict — and every change is verified against "the transcode pipeline must not regress". When filing an issue, include the full FFmpeg command line and its error output; that makes fixes much faster.
+The transcoding core has barely changed; real bugs tend to live in edge cases (unusual container/codec combinations). Side features iterate under one rule: features must compose, never conflict — and every change is verified against "the transcode pipeline must not regress". When filing an issue, include the full FFmpeg command line and its error output; that makes fixes much faster.
