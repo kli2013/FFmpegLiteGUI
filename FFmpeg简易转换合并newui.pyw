@@ -296,6 +296,32 @@ def safe_eval_expr(expr: str, context: Dict[str, int]) -> Optional[int]:
 # 契约表见 docs/visual_editors.md）。新增交互先查契约表；改公共行为改完逐套过表。
 
 RK_PAD = 10  # 灰边像素宽（可视化裁剪窗口 / _generic_overlay_editor 同款）
+# 2026-09-12：「起始 / 结尾」双端类窗口（start_end 非 None）自动改用略宽的辅助灰边。
+# 目的：画布外圈留一点灰色余地，视觉上把图像区和窗口边框分开；
+# 窗口可显示区按「可视化裁剪窗口的画布区 − 2*PAD」自适应放大，这 2*PAD 就是灰边。
+# ⚠️ 不要一味调大：超出图像区的部分本来就不会被绘制（幽灵框/矩形都钳在图像区内），
+#    灰边给多了纯属浪费屏幕，故 50 → 20（2026-09-12 用户实测反馈）。
+# 其余窗口（PiP/水印/主视频偏移…）不受影响，仍用 RK_PAD。可用 pad= 参数显式覆盖。
+RK_PAD_WIDE = 20
+# 2026-09-12：「默认摆放」的内缩量——单位是【内容像素】，与 canvas_w/canvas_h 同域。
+# 语义：水印/画中画/挡板等子元素「默认摆右下角」= (W-w-INSET, H-h-INSET)；
+#       通用编辑器「重置位置」的右下角归位同理（W/H 是画布内容尺寸，不是控件像素）。
+# ⚠️ 与 RK_PAD/RK_PAD_WIDE 【不是一回事】，两者量纲不同，绝不可互相替换：
+#    · RK_PAD* 是【显示层像素】——画布外圈灰边、to_canvas/to_real 的 ±PAD、画布物理尺寸；
+#      （editor 内部变量 PAD 由 pad 参数或场景自适应：普通 10、起始/结尾类 20）
+#    · 本常量是【内容像素】——最终写进 overlay_x/y 或矩形坐标的数值。
+#    2026-09-12 实踩：把「默认摆放」绑到 PAD 上 → 遮罩窗口（带起始/结尾、PAD=20）
+#    重置跑到 (-20,-20)；PAD 还会随「窗口是否带起始/结尾」浮动，摆放位置跟着乱变。
+RK_PLACE_INSET = 10
+# 2026-09-12：「起始 / 结尾」双端窗口里【非活动端幽灵框】的描边/填充/标签颜色。
+# 为什么不用活动端同一个 rect_color：原先两端都是红色，只靠线宽 1/2 + 点密度
+# stipple gray25/gray50 区分——1px 线宽下肉眼几乎分不出哪端正在被编辑，两端靠拢
+# 或交叠时更是只能猜。改用与红互补的青色（色相环对位，彩色画面/黑画布上都醒目）。
+# 自适应规则：start_end 非 None → 默认取本常量；可用 ghost_color= 显式覆盖。
+# ⚠️ 绝不要写成 'deepskyblue'：rect_color 被复用为语义开关
+#    （allow_negative_offset and rect_color=='deepskyblue' = 主视频画布偏移模式，见
+#    _generic_overlay_editor 内 reset_position），幽灵色与之同值会误导后续阅读。
+RK_SE_GHOST_COLOR = '#00d0ff'
 
 
 def rk_clamp_inside(x, y, w, h, W, H):
@@ -1825,6 +1851,25 @@ def build_crop_pos_expr(segments, base_x, base_y, trim_start=0.0, speed_factor=1
     return ex_x, ex_y
 
 
+def _canvas_defers_mask(settings) -> bool:
+    """画布模式下遮罩必须「延后」到画布段之后应用 —— 共享判据（唯一真源）。
+
+    背景（2026-09-12 方案 A）：遮罩坐标的基准尺寸 = 打开遮罩窗口时的**最终渲染帧**
+    （crop→rotate→scale 之后，见 _open_mask_dialog 里 compute_final_size_with_order）。
+    画布模式把 crop/rotate/scale 全关、改由画布段接管，于是链尾遮罩实际作用在
+    「画布之前的内容帧」（原始 W×H）上 —— 坐标空间对不上，表现为「开了画布模式遮罩就失效」。
+    修法：画布模式下 build_video_filter_chain 跳过遮罩段，改由 build_canvas_filtergraph
+    在画布段产出之后补上，使其重新落在最终渲染帧上。
+
+    ⚠️ 本判据被两处消费，必须完全一致，否则会出现「双重遮罩」或「遮罩丢失」：
+      ① build_video_filter_chain —— 为 True 时跳过链尾遮罩段；
+      ② build_canvas_filtergraph —— 为 True 时在画布段之后追加遮罩段。
+    """
+    return (bool(settings.get("canvas_mode"))
+            and bool(settings.get("canvas_segments"))
+            and bool(settings.get("mask_enabled", False)))
+
+
 def _resolve_crop_size(settings, W, H):
     """画布模式合并裁剪：若启用裁剪且宽高可解析为正整数，返回 (cw, ch) 作为画布/内容尺寸；否则 None。
 
@@ -1858,7 +1903,7 @@ def build_canvas_filtergraph(settings, W, H, trim_start=0.0, speed_factor=1.0,
                             filter_trim_start=0.0, trim_duration=None,
                             src_label=None, out_label="v_canvas",
                             canvas_color="black", base_vf=None, tag="",
-                            force_rgba=False):
+                            force_rgba=False, append_mask=True):
     """画布模式（Shotcut 式「位置、尺寸、旋转」）滤镜图生成。
 
     主视频作为内容，在固定 = 主视频原始尺寸的黑色画布上 移动 + 缩放 + 旋转，
@@ -2064,14 +2109,25 @@ def build_canvas_filtergraph(settings, W, H, trim_start=0.0, speed_factor=1.0,
     # ⚠️ bg=color=c=black 是无限源；overlay 默认 eof_action=repeat 会无限循环 → 输出永不结束。
     # shortest=1：当较短输入(v2=内容, 已被 trim 截断为有限时长)结束时, overlay 立即结束 → 精确截断。
     # （此 ffmpeg 版本实测 eof_action=pass/endall 对无限 bg 不生效会卡死, shortest=1 最稳妥。）
+    # 遮罩延后融合（2026-09-12 方案 A）：画布模式下遮罩段已从 base chain 摘除
+    # （见 _canvas_defers_mask），改由这里在画布段产出之后追加 —— 使其作用在
+    # **最终渲染帧**（画布窗口）而非画布之前的内容帧，坐标空间才与遮罩编辑器一致。
+    # 做法：画布段输出到临时标签，遮罩段产出再回到 out_label —— 调用方零感知。
+    _mask_deferred = bool(append_mask) and _canvas_defers_mask(settings)
+    _canvas_out = (out_label + "_pre") if _mask_deferred else out_label
     ov_part = (f"[bg{_t}]{_v2_lbl}overlay=x='(main_w-overlay_w)/2+({px_expr})'"
-               f":y='(main_h-overlay_h)/2+({py_expr})':shortest=1[{out_label}]")
+               f":y='(main_h-overlay_h)/2+({py_expr})':shortest=1[{_canvas_out}]")
     if _rgba:
         bg_part = f"color=c={canvas_color}:s={cw}x{ch}[bg0{_t}];[bg0{_t}]format=rgba[bg{_t}];"
     else:
         bg_part = f"color=c={canvas_color}:s={cw}x{ch}[bg{_t}];"
 
     graph = f"{base_part}{bg_part}{scale_part};{rot_part};{ov_part}"
+    if _mask_deferred:
+        _mseg = _build_mask_filter_block(
+            settings, _t or "cv", _canvas_out, out_label, ts, sp)
+        if _mseg:
+            graph += ";" + _mseg
     return graph
 
 
@@ -2232,10 +2288,11 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
             cx, cy = _wp_num(w, "xa"), _wp_num(w, "ya")
         else:
             cx, cy = (_wp_num(w, "xa"), _wp_num(w, "ya")) if which == "start" else (_wp_num(w, "xb"), _wp_num(w, "yb"))
+        _active = [which]   # 可变活动端（内部「起始/结尾」翻转用）
         def _apply_xy(nx, ny):
             if is_end:
                 w["xa"], w["ya"] = float(nx), float(ny)
-            elif which == "start":
+            elif _active[0] == "start":
                 w["xa"], w["ya"] = float(nx), float(ny)
             else:
                 w["xb"], w["yb"] = float(nx), float(ny)
@@ -2244,7 +2301,7 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
             _v = float(na or 0.0)
             if is_end:
                 w["ra"], w["rb"] = _v, _v
-            elif which == "start":
+            elif _active[0] == "start":
                 w["ra"] = _v
             else:
                 w["rb"] = _v
@@ -2256,7 +2313,8 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
         if (not is_end) and which == "end":
             _t0 = _wp_num(w, "start") + _wp_num(w, "dur")
         try:
-            edit_cb(row_idx, which, cx, cy, _cur_angle, _apply_xy, _apply_angle, _t0)
+            edit_cb(row_idx, which, cx, cy, _cur_angle, _apply_xy, _apply_angle,
+                    _t0, active_flag=_active, w=w)
         except Exception as e:
             messagebox.showerror("错误", f"无法打开可视化编辑器：{e}")
 
@@ -3371,11 +3429,249 @@ def _mask_shape_pos_expr(sh, cvw, cvh, ts0, sp0):
     return _xe or "0", _ye or "0"
 
 
+def _build_mask_filter_block(settings, graph_id="", in_label=None, out_label=None,
+                             motion_trim_start=None, motion_speed_factor=None):
+    """遮罩（透明蒙版）滤镜段独立化 —— 返回段字符串，或 None（未启用 / 无有效形状）。
+
+    2026-09-12 方案 A：本函数体 = 原 build_video_filter_chain 链尾的遮罩区块（逐字搬迁，
+    只把 `filters.append(seg)` 改成「收集到 _out_seg」，并新增输入/输出标签包装）。
+    搬迁动机：遮罩坐标基准 = 打开遮罩窗口时的**最终渲染帧**（crop→rotate→scale 之后）。
+    画布模式把 crop/rotate/scale 交给画布段，链尾遮罩会落在「画布前的内容帧」→ 坐标错位，
+    表现为「一开画布模式遮罩就失效」。故画布模式下由 build_canvas_filtergraph 在画布段
+    产出之后调用本函数（in_label=画布输出、out_label=最终标签），重新落回最终渲染帧。
+
+    in_label=None → 段首不带输入标签（接链内隐式流，即 build_video_filter_chain 的用法）；
+    out_label=None → 段尾不带输出标签（同上）。两者都 None 时行为与搬迁前逐字节一致。
+
+    回退链（与搬迁前一致）：多形状列表 → 单形状 PNG → 轨迹挡板 → 静态矩形。
+    """
+    if not settings.get("mask_enabled", False):
+        return None
+    _pre = ("[" + in_label + "]") if in_label else ""
+    _post = ("[" + out_label + "]") if out_label else ""
+    _out_seg = None
+    # 2026-09-11：多形状列表优先（mask_shapes 非空且至少一项有效）→ Option 1 单 matte 链路；
+    # 否则走下方原有单形状逻辑（PNG / 轨迹挡板 / 静态矩形），完全不变。
+    _multi_seg = _build_mask_multi_shape_filters(
+        settings, graph_id, motion_trim_start, motion_speed_factor)
+    if _multi_seg:
+        _out_seg = _multi_seg
+    else:
+        # ⚠️ 2026-09-11：本行是 mask 分支尾部所有标签（mk{_sfx}a/msk/aa/am）的唯一来源；
+        #   漏掉它 → 单形状回退路径（mask_shapes 空/无效）引用未绑定 _sfx 直接抛
+        #   UnboundLocalError（base 多形状重构 f2f1a18 曾真实发生）。切勿删除。
+        #   守门：tests/_probe_mask_single_fallback.py ＋ tests/_test_mask_base_multi_parity.py。
+        _sfx = graph_id or ""
+        mx = str(settings.get("mask_x", "0")).strip() or "0"
+        my = str(settings.get("mask_y", "0")).strip() or "0"
+        mw = str(settings.get("mask_w", "100")).strip() or "0"
+        mh = str(settings.get("mask_h", "100")).strip() or "0"
+        _mode = settings.get("mask_mode", "outside")  # outside=只露矩形(矩形外透明); inside=矩形透明(矩形外正常)
+        # 边缘羽化：matte 生成后追加 gblur 柔化边缘（0=硬边）。2026-09-10 接上对话框 feather 项
+        # （此前对话框有 UI/tooltip 但滤镜未消费 mask_feather → 羽化不生效，本次补齐）。
+        try:
+            _feather = float(str(settings.get("mask_feather", "0")).strip() or "0")
+        except (ValueError, TypeError):
+            _feather = 0.0
+        _a, _msk = f"mk{_sfx}a", f"mk{_sfx}msk"
+        _aa, _am = f"mk{_sfx}aa", f"mk{_sfx}am"   # alpha 相乘链标签（抠图兼容 2026-09-10）
+        # ---- 动态轨迹挡板（2026-09-10 重建）：启用「遮罩轨迹」且有航点时，matte 走 split=3 ——
+        # 一路整帧涂底色；一路 crop 出挡板矩形块、整面涂反向色；再 overlay 按 build_waypoint_expr
+        # 轨迹表达式移动挡板 → 可选 gblur → format=gray → alphamerge。
+        # 挡板移到哪，哪边按 mask_mode 显/隐（outside=擦除式揭示，inside=遮挡式擦除）。
+        _traj_on = bool(settings.get("mask_traj_enabled", False))
+        _raw_wps = settings.get("mask_waypoints")
+        _wps = [w for w in _raw_wps if isinstance(w, dict)] if isinstance(_raw_wps, list) else []
+        try:
+            _cvw = int(float(settings.get("mask_traj_canvas_w", 0) or 0))
+        except (ValueError, TypeError):
+            _cvw = 0
+        try:
+            _cvh = int(float(settings.get("mask_traj_canvas_h", 0) or 0))
+        except (ValueError, TypeError):
+            _cvh = 0
+        if not _cvw:
+            _cvw = MASK_TRAJ_CANVAS_W
+        if not _cvh:
+            _cvh = MASK_TRAJ_CANVAS_H
+        # ---- 形状图（2026-09-10）：载入自制黑白图/透明底挡块图当 matte（心形/星星等多边形）----
+        # 链型：format=rgba,split=2 → 一路 lutyuv 涂底色（outside=黑 inside=白）；movie 载形状图
+        # → alpha 源取不透明度（透明底挡块，颜色无关）/ 亮度图取灰度 → scale 到「矩形坐标」宽高
+        # → (反转 negate / inside 再 negate) → overlay 贴上 → 可选 gblur 羽化 → format=gray → alphamerge。
+        # ⚠️ 底色用 lutyuv 不用 drawbox：movie 引入 rgb 源后格式协商会把 drawbox 拖进 yuva420p，
+        #   drawbox 的 black 在 yuv 上=limited 16 → PNG 区域外整圈 alpha=16 漏光
+        #   （tests/_verify_mask_png 探针复现）；lutyuv 是查表滤镜恒保持 gray，0 恒 0。
+        # ⚠️ movie 单帧 EOF 后 overlay 默认 eof_action=repeat 静止停留（t=2.5s 实测 alpha 不变）。
+        # 形状与轨迹挡板两种 matte 语义不叠加：形状图生效时轨迹本轮不参与（日志提示）。
+        _png_built = False
+        _png_on = bool(settings.get("mask_png_enabled", False))
+        _png_raw = str(settings.get("mask_png_path", "") or "").strip()
+        if _png_on and _png_raw:
+            _ptype = str(settings.get("mask_png_type", "bw") or "bw").strip()
+            if _ptype not in ("bw", "alpha"):
+                _ptype = "bw"
+            try:
+                _sw = max(2, int(float(str(settings.get("mask_w", "100")).strip() or "100")))
+                _sh = max(2, int(float(str(settings.get("mask_h", "100")).strip() or "100")))
+            except (ValueError, TypeError):
+                _sw = _sh = 100
+            _safe_png = _mask_shape_movie_path(_png_raw)
+            if _safe_png:
+                _pg = f"mk{_sfx}pgn"
+                _shp = f"mk{_sfx}shp"
+                _bgl = f"mk{_sfx}bg"
+                _ml = f"mk{_sfx}m"
+                _as = f"mk{_sfx}as"
+                # 底色：outside=只露形状（黑底=透明）；inside=形状透明（白底=显示）
+                # gbrp 域画底（RGB 白=255/黑=0 精确）→ extractplanes=g 取 full-range 灰度。
+                # ⚠️ gray 域 matte 会被下游 blend 协商转 limited-range YUV（白→235/黑→16），
+                # alphamerge 把它当 full-range alpha → 挡板外 6% 透明残留（2026-09-10 E 系列实测）。
+                _base_c = "white" if _mode == "inside" else "black"
+                _load = f"movie={_safe_png}[{_pg}];[{_pg}]"
+                # rgb 路线：gbrp 取 G 平面（PNG 白=255 精确，gray 域转换会得 limited 白 235）；
+                # alpha 路线：alpha 平面天生 full-range，原样保留
+                _load += ("format=rgba,alphaextract" if _ptype == "alpha" else "format=gbrp,extractplanes=g")
+                if bool(settings.get("mask_png_invert", False)):
+                    _load += ",negate"
+                if _mode == "inside":
+                    _load += ",negate"
+                # overlay x/y：启用轨迹且有航点 → 形状沿轨迹移动（心形探照灯/擦除），与矩形挡板
+                # 同款等比还原（*main_w/cvw）与同段时间换算（motion_trim_start/speed 或
+                # _trim_speed_from_settings）；否则静止在「矩形坐标」。表达式含逗号必须单引号包。
+                _png_ox, _png_oy, _png_traj_on = mx, my, False
+                if _traj_on and _wps:
+                    if motion_trim_start is not None:
+                        _pts = float(motion_trim_start)
+                        _psp = float(motion_speed_factor) if motion_speed_factor is not None else 1.0
+                    else:
+                        _pts, _psp = _trim_speed_from_settings(settings)
+                    _pxe, _pye, _pws, _pwz = build_waypoint_expr(
+                        _wps, sw=str(_cvw), sh=str(_cvh), trim_start=_pts, speed_factor=_psp)
+                    if _pxe and _pye:
+                        _png_ox = f"'({_pxe})*main_w/{_cvw}'"
+                        _png_oy = f"'({_pye})*main_h/{_cvh}'"
+                        _png_traj_on = True
+                _png_seg = (
+                    f"format=rgba,"
+                    # ⚠️ split 多出一条腿给 alphaextract（拓扑隔离）：同一 split 输出同时喂
+                    # alphaextract(→blend) 和 alphamerge 两条腿会触发 FFmpeg 协商 bug
+                    # （alphamerge 报两腿尺寸不匹配=源尺寸，真机 2026-09-10 实测），
+                    # split 多一腿隔离后正常
+                    f"split=3[{_a}][{_as}][{_ml}];"
+                    f"[{_ml}]format=gbrp,drawbox=x=0:y=0:w=iw:h=ih:color={_base_c}:t=fill,extractplanes=g[{_bgl}];"
+                    f"{_load},scale={_sw}:{_sh},format=gray[{_shp}];"
+                    f"[{_bgl}][{_shp}]overlay=x={_png_ox}:y={_png_oy}"
+                )
+                if _feather > 0:
+                    _png_seg += f",gblur=sigma={_feather:.1f}"
+                # alpha 相乘（抠图兼容 2026-09-10）：无抠图时 format=rgba 已补 alpha=255
+                # → 255×M/255=M 与旧替换语义等效；同开抠图时 = 抠图 alpha × 遮罩 matte（交集）。
+                _png_seg += (
+                    f",format=gray[{_msk}];"
+                    f"[{_as}]alphaextract[{_aa}];"
+                    f"[{_aa}][{_msk}]blend=all_mode=multiply[{_am}];"
+                    f"[{_a}][{_am}]alphamerge"
+                )
+                _out_seg = _png_seg
+                _png_built = True
+                if _png_traj_on:
+                    print(f"[遮罩] 形状图沿轨迹移动：{_png_raw}（路线={_ptype}，大小={_sw}x{_sh}，模式={_mode}，{len(_wps)} 航点）")
+                else:
+                    print(f"[遮罩] 形状图生效（静止）：{_png_raw}（路线={_ptype}，矩形={mx},{my},{_sw}x{_sh}，模式={_mode}）")
+            else:
+                print(f"[遮罩] 形状图路径不可用（不存在/含特殊字符且硬链接失败），回退矩形：{_png_raw}")
+        _dyn_built = False
+        if not _png_built and _traj_on and _wps:
+            # 段时间换算与裁剪简易位置同款（2026-08-29：段时间=主视频原始时间 → 换算输出时间线）
+            if motion_trim_start is not None:
+                _ts0 = float(motion_trim_start)
+                _sp0 = float(motion_speed_factor) if motion_speed_factor is not None else 1.0
+            else:
+                _ts0, _sp0 = _trim_speed_from_settings(settings)
+            _xe, _ye, _ws, _wz = build_waypoint_expr(
+                _wps, sw=str(_cvw), sh=str(_cvh), trim_start=_ts0, speed_factor=_sp0)
+            if _xe and _ye:
+                # 航点画布（cvw×cvh = 打开遮罩窗口时的最终渲染帧尺寸）→ 实际帧等比还原：
+                # x*W/cvw、y*H/cvh，行程比例恒正确、与素材分辨率解耦（见 MASK_TRAJ_CANVAS_* 注释）。
+                # x/y 表达式为纯数字累加 → 整体包一层括号乘系数即可，无变量歧义。
+                # ⚠️ overlay 的 x/y 变量表里没有 iw/ih（那是 crop/drawbox 的），必须用 main_w/main_h。
+                _xf = f"({_xe})*main_w/{_cvw}"
+                _yf = f"({_ye})*main_h/{_cvh}"
+                # 挡板尺寸同构还原；min 防挡板比帧大（轨迹挡板可拖出画布，但不能大于帧）
+                _pw = f"min({mw}*iw/{_cvw},iw)"
+                _ph = f"min({mh}*ih/{_cvh},ih)"
+                if _mode == "inside":
+                    # 矩形透明、矩形外正常：底=white（显示），黑挡板盖住处=透明
+                    _base_c, _plate_c = "white", "black"
+                else:
+                    # 只露矩形（矩形外透明）：底=black（透明），白挡板扫过处=显示（擦除式揭示）
+                    _base_c, _plate_c = "black", "white"
+                _m0, _p0 = f"mk{_sfx}m0", f"mk{_sfx}p0"
+                _as = f"mk{_sfx}as"
+                _plt = f"mk{_sfx}plt"
+                _seg1 = (
+                    f"format=rgba,"
+                    # ⚠️ split 多出一条腿给 alphaextract（拓扑隔离），同 S2 形状图段注释
+                    f"split=4[{_a}][{_as}][{_m0}][{_p0}];"
+                    # gbrp 域画 matte（RGB 白=255/黑=0 精确）；overlay 同在 gbrp 域，
+                    # 尾部 format=gray 转出 full-range 灰度进 blend（gray 域 matte 会被
+                    # blend 协商转 limited YUV 白→235/黑→16，2026-09-10 E 系列实测）
+                    f"[{_m0}]format=gbrp,drawbox=x=0:y=0:w=iw:h=ih:color={_base_c}:t=fill[{_msk}];"
+                    f"[{_p0}]crop='{_pw}':'{_ph}':0:0,format=gbrp,"
+                    f"drawbox=x=0:y=0:w=iw:h=ih:color={_plate_c}:t=fill[{_plt}];"
+                )
+                # overlay x/y 用单引号包表达式（航点累加表达式内含逗号）；
+                # 隐藏段 x=-100000 → 挡板自动移出画面（hide/freeze 语义由 build_waypoint_expr 负责）
+                _seg2 = f"[{_msk}][{_plt}]overlay=x='{_xf}':y='{_yf}'"
+                if _feather > 0:
+                    _seg2 += f",gblur=sigma={_feather:.1f}"
+                _seg2 += f",format=gray[{_msk}];"
+                # alpha 相乘（同形状图段注释）：抠图 alpha × 遮罩 matte = 交集
+                _seg3 = (
+                    f"[{_as}]alphaextract[{_aa}];"
+                    f"[{_aa}][{_msk}]blend=all_mode=multiply[{_am}];"
+                    f"[{_a}][{_am}]alphamerge"
+                )
+                _out_seg = _seg1 + _seg2 + _seg3
+                _dyn_built = True
+        if not _dyn_built and not _png_built:
+            # 静态矩形（轨迹未启用 / 无航点 / 表达式构建失败时的兜底，行为与旧版一致）
+            if _mode == "inside":
+                # 矩形透明、矩形外正常：matte = 白底 + 黑矩形
+                _draw = (f"drawbox=x=0:y=0:w=iw:h=ih:color=white:t=fill,"
+                         f"drawbox=x={mx}:y={my}:w={mw}:h={mh}:color=black:t=fill")
+            else:
+                # 只露矩形（矩形外透明）：matte = 黑底 + 白矩形
+                _draw = (f"drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill,"
+                         f"drawbox=x={mx}:y={my}:w={mw}:h={mh}:color=white:t=fill")
+            if _feather > 0:
+                _draw += f",gblur=sigma={_feather:.1f}"
+            _m = f"mk{_sfx}m"
+            _as = f"mk{_sfx}as"
+            _out_seg = (
+                f"format=rgba,"
+                # ⚠️ split 多出一条腿给 alphaextract（拓扑隔离），同 S2 形状图段注释
+                f"split=3[{_a}][{_as}][{_m}];"
+                # gbrp 域画 matte（RGB 白=255/黑=0 精确）→ format=gray 转出 full-range 灰度；
+                # gray 域 matte 会被 blend 协商转 limited YUV（白→235/黑→16），
+                # alphamerge 当 full-range alpha → 挡板外 6% 透明残留（2026-09-10 E 系列实测）
+                f"[{_m}]format=gbrp,{_draw},format=gray[{_msk}];"
+                # alpha 相乘（同形状图段注释）：抠图 alpha × 遮罩 matte = 交集
+                f"[{_as}]alphaextract[{_aa}];"
+                f"[{_aa}][{_msk}]blend=all_mode=multiply[{_am}];"
+                f"[{_a}][{_am}]alphamerge"
+            )
+    if _out_seg is None:
+        return None
+    return _pre + _out_seg + _post
+
+
 def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = True, include_speed: bool = True,
                               include_trim: bool = True, include_format: bool = True, include_scale: bool = True,
                               enhance_settings=None, reverse=False, graph_id: str = "",
                               include_fade: bool = True, clip_duration=None,
                               include_negate: bool = True,
+                              include_mask: bool = True,
                               chroma_settings=None, loop_size=None, force_scale=None,
                               motion_trim_start=None, motion_speed_factor=None,
                               window_start=None, window_end=None, window_loop_count=None) -> str:
@@ -3749,218 +4045,25 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
     # 补 alpha=255，乘法=matte 本身，与旧「替换」语义逐帧等效——一条链兼容全部组合，
     # 消除「谁后到谁通吃」（旧链序绿幕默认位置遮罩失效 / 前置位置抠图失效）。
     # delogo/区域效果只改像素不改 alpha（见 3218 行实测背书注释），与 matte 相乘零冲突。
-    if settings.get("mask_enabled", False):
-        # 2026-09-11：多形状列表优先（mask_shapes 非空且至少一项有效）→ Option 1 单 matte 链路；
-        # 否则走下方原有单形状逻辑（PNG / 轨迹挡板 / 静态矩形），完全不变。
-        _multi_seg = _build_mask_multi_shape_filters(
-            settings, graph_id, motion_trim_start, motion_speed_factor)
-        if _multi_seg:
-            filters.append(_multi_seg)
-        else:
-            # ⚠️ 2026-09-11：本行是 mask 分支尾部所有标签（mk{_sfx}a/msk/aa/am）的唯一来源；
-            #   漏掉它 → 单形状回退路径（mask_shapes 空/无效）引用未绑定 _sfx 直接抛
-            #   UnboundLocalError（base 多形状重构 f2f1a18 曾真实发生）。切勿删除。
-            #   守门：tests/_probe_mask_single_fallback.py ＋ tests/_test_mask_base_multi_parity.py。
-            _sfx = graph_id or ""
-            mx = str(settings.get("mask_x", "0")).strip() or "0"
-            my = str(settings.get("mask_y", "0")).strip() or "0"
-            mw = str(settings.get("mask_w", "100")).strip() or "0"
-            mh = str(settings.get("mask_h", "100")).strip() or "0"
-            _mode = settings.get("mask_mode", "outside")  # outside=只露矩形(矩形外透明); inside=矩形透明(矩形外正常)
-            # 边缘羽化：matte 生成后追加 gblur 柔化边缘（0=硬边）。2026-09-10 接上对话框 feather 项
-            # （此前对话框有 UI/tooltip 但滤镜未消费 mask_feather → 羽化不生效，本次补齐）。
-            try:
-                _feather = float(str(settings.get("mask_feather", "0")).strip() or "0")
-            except (ValueError, TypeError):
-                _feather = 0.0
-            _a, _msk = f"mk{_sfx}a", f"mk{_sfx}msk"
-            _aa, _am = f"mk{_sfx}aa", f"mk{_sfx}am"   # alpha 相乘链标签（抠图兼容 2026-09-10）
-            # ---- 动态轨迹挡板（2026-09-10 重建）：启用「遮罩轨迹」且有航点时，matte 走 split=3 ——
-            # 一路整帧涂底色；一路 crop 出挡板矩形块、整面涂反向色；再 overlay 按 build_waypoint_expr
-            # 轨迹表达式移动挡板 → 可选 gblur → format=gray → alphamerge。
-            # 挡板移到哪，哪边按 mask_mode 显/隐（outside=擦除式揭示，inside=遮挡式擦除）。
-            _traj_on = bool(settings.get("mask_traj_enabled", False))
-            _raw_wps = settings.get("mask_waypoints")
-            _wps = [w for w in _raw_wps if isinstance(w, dict)] if isinstance(_raw_wps, list) else []
-            try:
-                _cvw = int(float(settings.get("mask_traj_canvas_w", 0) or 0))
-            except (ValueError, TypeError):
-                _cvw = 0
-            try:
-                _cvh = int(float(settings.get("mask_traj_canvas_h", 0) or 0))
-            except (ValueError, TypeError):
-                _cvh = 0
-            if not _cvw:
-                _cvw = MASK_TRAJ_CANVAS_W
-            if not _cvh:
-                _cvh = MASK_TRAJ_CANVAS_H
-            # ---- 形状图（2026-09-10）：载入自制黑白图/透明底挡块图当 matte（心形/星星等多边形）----
-            # 链型：format=rgba,split=2 → 一路 lutyuv 涂底色（outside=黑 inside=白）；movie 载形状图
-            # → alpha 源取不透明度（透明底挡块，颜色无关）/ 亮度图取灰度 → scale 到「矩形坐标」宽高
-            # → (反转 negate / inside 再 negate) → overlay 贴上 → 可选 gblur 羽化 → format=gray → alphamerge。
-            # ⚠️ 底色用 lutyuv 不用 drawbox：movie 引入 rgb 源后格式协商会把 drawbox 拖进 yuva420p，
-            #   drawbox 的 black 在 yuv 上=limited 16 → PNG 区域外整圈 alpha=16 漏光
-            #   （tests/_verify_mask_png 探针复现）；lutyuv 是查表滤镜恒保持 gray，0 恒 0。
-            # ⚠️ movie 单帧 EOF 后 overlay 默认 eof_action=repeat 静止停留（t=2.5s 实测 alpha 不变）。
-            # 形状与轨迹挡板两种 matte 语义不叠加：形状图生效时轨迹本轮不参与（日志提示）。
-            _png_built = False
-            _png_on = bool(settings.get("mask_png_enabled", False))
-            _png_raw = str(settings.get("mask_png_path", "") or "").strip()
-            if _png_on and _png_raw:
-                _ptype = str(settings.get("mask_png_type", "bw") or "bw").strip()
-                if _ptype not in ("bw", "alpha"):
-                    _ptype = "bw"
-                try:
-                    _sw = max(2, int(float(str(settings.get("mask_w", "100")).strip() or "100")))
-                    _sh = max(2, int(float(str(settings.get("mask_h", "100")).strip() or "100")))
-                except (ValueError, TypeError):
-                    _sw = _sh = 100
-                _safe_png = _mask_shape_movie_path(_png_raw)
-                if _safe_png:
-                    _pg = f"mk{_sfx}pgn"
-                    _shp = f"mk{_sfx}shp"
-                    _bgl = f"mk{_sfx}bg"
-                    _ml = f"mk{_sfx}m"
-                    _as = f"mk{_sfx}as"
-                    # 底色：outside=只露形状（黑底=透明）；inside=形状透明（白底=显示）
-                    # gbrp 域画底（RGB 白=255/黑=0 精确）→ extractplanes=g 取 full-range 灰度。
-                    # ⚠️ gray 域 matte 会被下游 blend 协商转 limited-range YUV（白→235/黑→16），
-                    # alphamerge 把它当 full-range alpha → 挡板外 6% 透明残留（2026-09-10 E 系列实测）。
-                    _base_c = "white" if _mode == "inside" else "black"
-                    _load = f"movie={_safe_png}[{_pg}];[{_pg}]"
-                    # rgb 路线：gbrp 取 G 平面（PNG 白=255 精确，gray 域转换会得 limited 白 235）；
-                    # alpha 路线：alpha 平面天生 full-range，原样保留
-                    _load += ("format=rgba,alphaextract" if _ptype == "alpha" else "format=gbrp,extractplanes=g")
-                    if bool(settings.get("mask_png_invert", False)):
-                        _load += ",negate"
-                    if _mode == "inside":
-                        _load += ",negate"
-                    # overlay x/y：启用轨迹且有航点 → 形状沿轨迹移动（心形探照灯/擦除），与矩形挡板
-                    # 同款等比还原（*main_w/cvw）与同段时间换算（motion_trim_start/speed 或
-                    # _trim_speed_from_settings）；否则静止在「矩形坐标」。表达式含逗号必须单引号包。
-                    _png_ox, _png_oy, _png_traj_on = mx, my, False
-                    if _traj_on and _wps:
-                        if motion_trim_start is not None:
-                            _pts = float(motion_trim_start)
-                            _psp = float(motion_speed_factor) if motion_speed_factor is not None else 1.0
-                        else:
-                            _pts, _psp = _trim_speed_from_settings(settings)
-                        _pxe, _pye, _pws, _pwz = build_waypoint_expr(
-                            _wps, sw=str(_cvw), sh=str(_cvh), trim_start=_pts, speed_factor=_psp)
-                        if _pxe and _pye:
-                            _png_ox = f"'({_pxe})*main_w/{_cvw}'"
-                            _png_oy = f"'({_pye})*main_h/{_cvh}'"
-                            _png_traj_on = True
-                    _png_seg = (
-                        f"format=rgba,"
-                        # ⚠️ split 多出一条腿给 alphaextract（拓扑隔离）：同一 split 输出同时喂
-                        # alphaextract(→blend) 和 alphamerge 两条腿会触发 FFmpeg 协商 bug
-                        # （alphamerge 报两腿尺寸不匹配=源尺寸，真机 2026-09-10 实测），
-                        # split 多一腿隔离后正常
-                        f"split=3[{_a}][{_as}][{_ml}];"
-                        f"[{_ml}]format=gbrp,drawbox=x=0:y=0:w=iw:h=ih:color={_base_c}:t=fill,extractplanes=g[{_bgl}];"
-                        f"{_load},scale={_sw}:{_sh},format=gray[{_shp}];"
-                        f"[{_bgl}][{_shp}]overlay=x={_png_ox}:y={_png_oy}"
-                    )
-                    if _feather > 0:
-                        _png_seg += f",gblur=sigma={_feather:.1f}"
-                    # alpha 相乘（抠图兼容 2026-09-10）：无抠图时 format=rgba 已补 alpha=255
-                    # → 255×M/255=M 与旧替换语义等效；同开抠图时 = 抠图 alpha × 遮罩 matte（交集）。
-                    _png_seg += (
-                        f",format=gray[{_msk}];"
-                        f"[{_as}]alphaextract[{_aa}];"
-                        f"[{_aa}][{_msk}]blend=all_mode=multiply[{_am}];"
-                        f"[{_a}][{_am}]alphamerge"
-                    )
-                    filters.append(_png_seg)
-                    _png_built = True
-                    if _png_traj_on:
-                        print(f"[遮罩] 形状图沿轨迹移动：{_png_raw}（路线={_ptype}，大小={_sw}x{_sh}，模式={_mode}，{len(_wps)} 航点）")
-                    else:
-                        print(f"[遮罩] 形状图生效（静止）：{_png_raw}（路线={_ptype}，矩形={mx},{my},{_sw}x{_sh}，模式={_mode}）")
-                else:
-                    print(f"[遮罩] 形状图路径不可用（不存在/含特殊字符且硬链接失败），回退矩形：{_png_raw}")
-            _dyn_built = False
-            if not _png_built and _traj_on and _wps:
-                # 段时间换算与裁剪简易位置同款（2026-08-29：段时间=主视频原始时间 → 换算输出时间线）
-                if motion_trim_start is not None:
-                    _ts0 = float(motion_trim_start)
-                    _sp0 = float(motion_speed_factor) if motion_speed_factor is not None else 1.0
-                else:
-                    _ts0, _sp0 = _trim_speed_from_settings(settings)
-                _xe, _ye, _ws, _wz = build_waypoint_expr(
-                    _wps, sw=str(_cvw), sh=str(_cvh), trim_start=_ts0, speed_factor=_sp0)
-                if _xe and _ye:
-                    # 航点画布（cvw×cvh = 打开遮罩窗口时的最终渲染帧尺寸）→ 实际帧等比还原：
-                    # x*W/cvw、y*H/cvh，行程比例恒正确、与素材分辨率解耦（见 MASK_TRAJ_CANVAS_* 注释）。
-                    # x/y 表达式为纯数字累加 → 整体包一层括号乘系数即可，无变量歧义。
-                    # ⚠️ overlay 的 x/y 变量表里没有 iw/ih（那是 crop/drawbox 的），必须用 main_w/main_h。
-                    _xf = f"({_xe})*main_w/{_cvw}"
-                    _yf = f"({_ye})*main_h/{_cvh}"
-                    # 挡板尺寸同构还原；min 防挡板比帧大（轨迹挡板可拖出画布，但不能大于帧）
-                    _pw = f"min({mw}*iw/{_cvw},iw)"
-                    _ph = f"min({mh}*ih/{_cvh},ih)"
-                    if _mode == "inside":
-                        # 矩形透明、矩形外正常：底=white（显示），黑挡板盖住处=透明
-                        _base_c, _plate_c = "white", "black"
-                    else:
-                        # 只露矩形（矩形外透明）：底=black（透明），白挡板扫过处=显示（擦除式揭示）
-                        _base_c, _plate_c = "black", "white"
-                    _m0, _p0 = f"mk{_sfx}m0", f"mk{_sfx}p0"
-                    _as = f"mk{_sfx}as"
-                    _plt = f"mk{_sfx}plt"
-                    _seg1 = (
-                        f"format=rgba,"
-                        # ⚠️ split 多出一条腿给 alphaextract（拓扑隔离），同 S2 形状图段注释
-                        f"split=4[{_a}][{_as}][{_m0}][{_p0}];"
-                        # gbrp 域画 matte（RGB 白=255/黑=0 精确）；overlay 同在 gbrp 域，
-                        # 尾部 format=gray 转出 full-range 灰度进 blend（gray 域 matte 会被
-                        # blend 协商转 limited YUV 白→235/黑→16，2026-09-10 E 系列实测）
-                        f"[{_m0}]format=gbrp,drawbox=x=0:y=0:w=iw:h=ih:color={_base_c}:t=fill[{_msk}];"
-                        f"[{_p0}]crop='{_pw}':'{_ph}':0:0,format=gbrp,"
-                        f"drawbox=x=0:y=0:w=iw:h=ih:color={_plate_c}:t=fill[{_plt}];"
-                    )
-                    # overlay x/y 用单引号包表达式（航点累加表达式内含逗号）；
-                    # 隐藏段 x=-100000 → 挡板自动移出画面（hide/freeze 语义由 build_waypoint_expr 负责）
-                    _seg2 = f"[{_msk}][{_plt}]overlay=x='{_xf}':y='{_yf}'"
-                    if _feather > 0:
-                        _seg2 += f",gblur=sigma={_feather:.1f}"
-                    _seg2 += f",format=gray[{_msk}];"
-                    # alpha 相乘（同形状图段注释）：抠图 alpha × 遮罩 matte = 交集
-                    _seg3 = (
-                        f"[{_as}]alphaextract[{_aa}];"
-                        f"[{_aa}][{_msk}]blend=all_mode=multiply[{_am}];"
-                        f"[{_a}][{_am}]alphamerge"
-                    )
-                    filters.append(_seg1 + _seg2 + _seg3)
-                    _dyn_built = True
-            if not _dyn_built and not _png_built:
-                # 静态矩形（轨迹未启用 / 无航点 / 表达式构建失败时的兜底，行为与旧版一致）
-                if _mode == "inside":
-                    # 矩形透明、矩形外正常：matte = 白底 + 黑矩形
-                    _draw = (f"drawbox=x=0:y=0:w=iw:h=ih:color=white:t=fill,"
-                             f"drawbox=x={mx}:y={my}:w={mw}:h={mh}:color=black:t=fill")
-                else:
-                    # 只露矩形（矩形外透明）：matte = 黑底 + 白矩形
-                    _draw = (f"drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill,"
-                             f"drawbox=x={mx}:y={my}:w={mw}:h={mh}:color=white:t=fill")
-                if _feather > 0:
-                    _draw += f",gblur=sigma={_feather:.1f}"
-                _m = f"mk{_sfx}m"
-                _as = f"mk{_sfx}as"
-                filters.append(
-                    f"format=rgba,"
-                    # ⚠️ split 多出一条腿给 alphaextract（拓扑隔离），同 S2 形状图段注释
-                    f"split=3[{_a}][{_as}][{_m}];"
-                    # gbrp 域画 matte（RGB 白=255/黑=0 精确）→ format=gray 转出 full-range 灰度；
-                    # gray 域 matte 会被 blend 协商转 limited YUV（白→235/黑→16），
-                    # alphamerge 当 full-range alpha → 挡板外 6% 透明残留（2026-09-10 E 系列实测）
-                    f"[{_m}]format=gbrp,{_draw},format=gray[{_msk}];"
-                    # alpha 相乘（同形状图段注释）：抠图 alpha × 遮罩 matte = 交集
-                    f"[{_as}]alphaextract[{_aa}];"
-                    f"[{_aa}][{_msk}]blend=all_mode=multiply[{_am}];"
-                    f"[{_a}][{_am}]alphamerge"
-                )
+    # ----- 遮罩 / 透明蒙版（最终渲染帧空间，WYSIWYG）-----
+    # 2026-09-10 两迁记录：裁剪前（原始帧）→ 缩放之后 → 链尾（本位置，抠图兼容见下）。
+    # 遮罩始终落在 crop/rotate/scale 之后的最终渲染帧上，与显示/转换同一坐标系；
+    # 编辑器拖出的坐标直接可用，零换算（中间滤镜均不改尺寸，链尾坐标系不变）。
+    # ⚠️ 锁色：matte 分支用 format=gray，ffmpeg 自动格式协商会把 scale 输出从 yuv420p 降级为
+    #   gray → 主输入在 alphamerge 前丢失色彩（整帧发灰）。故在 split 之前插 format=rgba 锁死主
+    #   输入像素格式；matte 的 gray 仅限 [m] 分支局部使用，互不影响（fix: tests/_repro_mask_gray2）。
+    # ⚠️ 2026-09-12 画布模式（方案 A）：画布模式下遮罩**不在这里**生成 —— 画布把 crop/rotate/scale
+    #   全交给画布段，此处若照旧作用在「画布前的内容帧」会与遮罩坐标（按最终渲染帧）错位，
+    #   表现为「一开画布模式遮罩就失效」。改由 build_canvas_filtergraph 在画布段产出之后追加，
+    #   判据共用 _canvas_defers_mask（两处必须一致，否则双重遮罩 / 遮罩丢失）。
+    # 段内容（多形状 → 单形状 PNG → 轨迹挡板 → 静态矩形）见 _build_mask_filter_block。
+    if include_mask and settings.get("mask_enabled", False) \
+            and not _canvas_defers_mask(settings):
+        _mseg = _build_mask_filter_block(
+            settings, graph_id, None, None, motion_trim_start, motion_speed_factor)
+        if _mseg:
+            filters.append(_mseg)
+
 
     # ----- 像素格式 -----
     if include_format and settings.get("pix_fmt_enabled", True):
@@ -3968,7 +4071,8 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
         if not _hw_active or not _native:
             # 遮罩启用时，本滤镜链已写入 alpha，必须用 rgba 保留透明通道
             # （否则默认的 yuv420p 会把刚生成的透明区丢掉）
-            if settings.get("mask_enabled", False):
+            # ⚠️ 画布模式下遮罩已延后（_canvas_defers_mask）→ 本链不写 alpha，走普通像素格式。
+            if settings.get("mask_enabled", False) and not _canvas_defers_mask(settings):
                 filters.append("format=rgba")
             else:
                 filters.append(f"format={settings.get('pix_fmt', 'yuv420p')}")
@@ -9075,6 +9179,35 @@ class VideoFilterFrame(ttk.LabelFrame):
                 _dim = (None, None)
             _cw = (_dim[0] if _dim and _dim[0] else pic_w)
             _ch = (_dim[1] if _dim and _dim[1] else pic_h)
+            # 起始/结尾双端（条件调用）：构造 start_end，still 段起始==结尾→can_compare=False 隐藏切换+幽灵
+            _se_idx = _idx
+            _se_can = (_seg_move_mode(dlg_segs[_se_idx]) != "still")
+            def _se_geom(end):
+                """给定端返回画布坐标几何 (x,y,w,h,angle)，与 _open_generic_editor 的换算同口径。"""
+                _w = dlg_segs[_se_idx]
+                _md = _seg_move_mode(_w)
+                _e = (end == "end")
+                if _e and _md != "still":
+                    # ⚠️ 2026-09-12 修复：结尾端必须读 ex/ey（此前误读 sx/sy → 表现为
+                    # 「结尾记住了大小 scale_end、却跟随起始坐标」，写回时又把 ex/ey 污染成起始值）。
+                    _sx, _sy = _seg_num(_w, "ex"), _seg_num(_w, "ey")
+                    _sc, _ang = _seg_num(_w, "scale_end", 1), _seg_num(_w, "rot_end")
+                else:
+                    # start 端；不动段退化为 ex/ey/scale_end/rot_end（_set_kf 同款同步写）
+                    if _md == "still":
+                        _sx, _sy = _seg_num(_w, "ex"), _seg_num(_w, "ey")
+                        _sc, _ang = _seg_num(_w, "scale_end", 1), _seg_num(_w, "rot_end")
+                    else:
+                        _sx, _sy = _seg_num(_w, "sx"), _seg_num(_w, "sy")
+                        _sc, _ang = _seg_num(_w, "scale_start", 1), _seg_num(_w, "rot_start")
+                _rw = pic_w * _sc
+                _rh = pic_h * _sc
+                return ((canvas_w / 2.0 + _sx) - _rw / 2.0,
+                        (canvas_h / 2.0 + _sy) - _rh / 2.0, _rw, _rh, _ang)
+            def _se_switch(end):
+                edit_end.set(end == "end")
+            start_end = {"active": ("end" if edit_end.get() else "start"),
+                         "read": _se_geom, "on_switch": _se_switch, "can_compare": _se_can}
             win.grab_release()
             try:
                 def _on_apply(nx, ny, nw, nh, ncw, nch):
@@ -9111,6 +9244,10 @@ class VideoFilterFrame(ttk.LabelFrame):
                     # 遮罩等其他位置类将来传同一常量即可复用，避免各处维护一份。
                     corner_dirs=CORNER_DIR_PRESETS,
                     corner_src_w=_cw, corner_src_h=_ch,
+                    start_end=start_end,
+                    # 2026-09-12：矩形=片段内容盒（可自由负偏移、clamp 全放开），
+                    # 「重置位置」应归位图像区左上角 (0,0)，而非水印式的「右下角留边距」。
+                    reset_origin=True,
                 )
             finally:
                 win.grab_set()
@@ -9650,12 +9787,23 @@ class VideoFilterFrame(ttk.LabelFrame):
                 cx, cy = _seg_num(w, "ex"), _seg_num(w, "ey")
                 t0 = _seg_num(w, "start") + _seg_num(w, "dur")
 
+            _active = [which]   # 可变活动端（内部「起始/结尾」翻转用）
             def _apply(nx, ny):
-                if which == "start":
+                if _active[0] == "start":
                     w["sx"], w["sy"] = float(nx), float(ny)
                 else:
                     w["ex"], w["ey"] = float(nx), float(ny)
                 _refresh()
+            # 起始/结尾双端（条件调用）：构造 start_end，still 段起始==结尾→隐藏切换+幽灵
+            _se_can = (_seg_move_mode(w) != "still")
+            def _se_geom(end):
+                if end == "end":
+                    return (_seg_num(w, "ex"), _seg_num(w, "ey"), crop_w, crop_h, 0.0)
+                return (_seg_num(w, "sx"), _seg_num(w, "sy"), crop_w, crop_h, 0.0)
+            def _se_switch(end):
+                _active[0] = end
+            start_end = {"active": which, "read": _se_geom,
+                         "on_switch": _se_switch, "can_compare": _se_can}
 
             # 复用通用叠加/偏移编辑器（取代原 _crop_pos_coord_editor 单独实现）：
             # 固定尺寸裁剪框=crop_w×crop_h，在 orig_w×orig_h 背景帧上拖拽；不绘制矩形内斜纹。
@@ -9686,6 +9834,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                     bg_pre_filter=None,
                     on_drag_commit=lambda nx, ny, *_a: _apply(nx, ny),
                     draw_diagonal=False,
+                    start_end=start_end,
                 )
             finally:
                 win.grab_set()
@@ -11310,7 +11459,8 @@ class TextWatermarkDialog(tk.Toplevel):
         except Exception:
             pass
 
-    def _edit_tw_wp_point(self, row_idx, which, cur_x, cur_y, cur_angle, apply_xy, apply_angle, t0=0.0):
+    def _edit_tw_wp_point(self, row_idx, which, cur_x, cur_y, cur_angle, apply_xy, apply_angle, t0=0.0,
+                          active_flag=None, w=None):
         """列表轨迹行的坐标可视化编辑（文字水印：单框，起点/终点各一个入口按钮）。
         2026-09-02：旋转手柄拖拽经 angle_cb 写回航点 ra/rb（选起点→ra，选终点→rb）。"""
         app = getattr(self, "app", None)
@@ -11395,6 +11545,18 @@ class TextWatermarkDialog(tk.Toplevel):
                         except Exception: pass
             except Exception:
                 pass
+        # 起始/结尾双端（条件调用）：仅当调用方传入 w + active_flag 时启用
+        start_end = None
+        if w is not None and active_flag is not None:
+            _se_can = (w.get("xa") != w.get("xb") or w.get("ya") != w.get("yb"))
+            def _se_read(end):
+                if end == "end":
+                    return (w.get("xb", 0), w.get("yb", 0), wm_w, wm_h, w.get("rb", 0))
+                return (w.get("xa", 0), w.get("ya", 0), wm_w, wm_h, w.get("ra", 0))
+            def _se_switch(end):
+                active_flag[0] = end
+            start_end = {"active": ("end" if active_flag[0] == "end" else "start"),
+                         "read": _se_read, "on_switch": _se_switch, "can_compare": _se_can}
         app.open_watermark_overlay_editor(
             mw, mh, max(wm_w, 10), max(wm_h, 10), vx, vy,
             scale_enabled_var=None, scale_w_var=None, scale_h_var=None,
@@ -11405,7 +11567,8 @@ class TextWatermarkDialog(tk.Toplevel):
             angle_cb=apply_angle,   # 2026-09-02：旋转手柄拖拽 → 写回航点 ra/rb
             on_apply=_wp_on_apply,  # 2026-09-02：重绘尺寸 → 写回对象全局尺寸并刷新
             on_drag_commit=apply_xy,  # 2026-09-03：拖拽松手即把坐标写回航点并实时刷新列表
-            initial_time=t0)        # 背景帧=该航点自身时间（起始/结尾），与位置尺寸旋转列表一致
+            initial_time=t0,        # 背景帧=该航点自身时间（起始/结尾），与位置尺寸旋转列表一致
+            start_end=start_end)
         try:
             apply_xy(float(vx.get()), float(vy.get()))
         except (ValueError, TypeError):
@@ -18113,7 +18276,8 @@ class LoopChromaFrame(ttk.LabelFrame):
 
         # ---------- 轨迹（起始/结尾坐标）回调 ----------
         def _mask_edit_cb(row_idx, which, cur_x, cur_y, cur_angle,
-                          apply_xy, apply_angle, t0=0.0):
+                          apply_xy, apply_angle, t0=0.0,
+                          active_flag=None, w=None):
             """「起始坐标… / 结尾坐标…」入口：可视化摆放挡板在该航点起点/终点的位置。
 
             ⚠️ 必须传这个回调——_trajectory_dialog 里 edit_cb is None 时那两个按钮永久置灰。
@@ -18136,6 +18300,19 @@ class LoopChromaFrame(ttk.LabelFrame):
                 except Exception:
                     pass
 
+            # 起始/结尾双端（条件调用）：仅当调用方传入 w + active_flag 时启用
+            # （active_flag 由 _open_editor 的 _active 可变列表提供，翻转即切写回目标端）
+            start_end = None
+            if w is not None and active_flag is not None:
+                _se_can = (w.get("xa") != w.get("xb") or w.get("ya") != w.get("yb"))
+                def _se_read(end):
+                    if end == "end":
+                        return (w.get("xb", 0), w.get("yb", 0), _bw, _bh, w.get("rb", 0))
+                    return (w.get("xa", 0), w.get("ya", 0), _bw, _bh, w.get("ra", 0))
+                def _se_switch(end):
+                    active_flag[0] = end
+                start_end = {"active": ("end" if active_flag[0] == "end" else "start"),
+                             "read": _se_read, "on_switch": _se_switch, "can_compare": _se_can}
             _app.open_watermark_overlay_editor(
                 _cw, _ch, _bw, _bh, vx, vy,
                 scale_enabled_var=None, scale_w_var=None, scale_h_var=None,
@@ -18149,7 +18326,8 @@ class LoopChromaFrame(ttk.LabelFrame):
                 # 2026-09-12：八向飞入/飞出预设（与画布编辑器共用同一份常量）。
                 # 偏移基准 = 遮罩画布尺寸 _cw x _ch（挡板保持原尺寸，只挪位置）。
                 corner_dirs=CORNER_DIR_PRESETS,
-                corner_src_w=_cw, corner_src_h=_ch)
+                corner_src_w=_cw, corner_src_h=_ch,
+                start_end=start_end)
             try:
                 apply_xy(float(vx.get()), float(vy.get()))
             except (ValueError, TypeError):
@@ -18879,7 +19057,8 @@ class OverlayPositionFrame(ttk.LabelFrame):
                 "注意：旋转包围盒为对角线尺寸，水印不宜过大，否则会被主画面边缘裁切。",
                 wraplength=420)
 
-    def _edit_wp_point(self, row_idx, which, cur_x, cur_y, cur_angle, apply_xy, apply_angle, t0=0.0):
+    def _edit_wp_point(self, row_idx, which, cur_x, cur_y, cur_angle, apply_xy, apply_angle, t0=0.0,
+                       active_flag=None, w=None):
         """列表轨迹行的坐标可视化编辑（单框，起点/终点各一个入口按钮）。
         2026-09-02：旋转手柄拖拽经 angle_cb 写回航点 ra/rb（选起点→ra，选终点→rb）。
         t0：背景帧取帧时间（该航点自身 start / start+dur），与「位置、尺寸、旋转」关键帧一致。"""
@@ -19104,6 +19283,19 @@ class OverlayPositionFrame(ttk.LabelFrame):
                         except Exception: pass
             try: self.app._append_info_ui(f"[轨迹] 尺寸已更新: {nw}x{nh}")
             except Exception: pass
+        # 起始/结尾双端（条件调用）：仅当调用方传入 w + active_flag 时启用
+        # （active_flag 由 _open_editor 的 _active 可变列表提供，翻转即切写回目标端）
+        start_end = None
+        if w is not None and active_flag is not None:
+            _se_can = (w.get("xa") != w.get("xb") or w.get("ya") != w.get("yb"))
+            def _se_read(end):
+                if end == "end":
+                    return (w.get("xb", 0), w.get("yb", 0), wm_w, wm_h, w.get("rb", 0))
+                return (w.get("xa", 0), w.get("ya", 0), wm_w, wm_h, w.get("ra", 0))
+            def _se_switch(end):
+                active_flag[0] = end
+            start_end = {"active": ("end" if active_flag[0] == "end" else "start"),
+                         "read": _se_read, "on_switch": _se_switch, "can_compare": _se_can}
         app.open_watermark_overlay_editor(
             mw, mh, max(wm_w, 10), max(wm_h, 10), vx, vy,
             scale_enabled_var=None, scale_w_var=None, scale_h_var=None,
@@ -19120,7 +19312,8 @@ class OverlayPositionFrame(ttk.LabelFrame):
             angle_cb=apply_angle,   # 2026-09-02：旋转手柄拖拽 → 写回航点 ra/rb
             on_apply=_wp_on_apply,  # 2026-09-02：重绘尺寸 → 写回对象全局尺寸并刷新
             on_drag_commit=apply_xy,  # 2026-09-03：拖拽松手即把坐标写回航点并实时刷新列表
-            initial_time=t0)        # 背景帧=该航点自身时间（起始/结尾），与位置尺寸旋转列表一致
+            initial_time=t0,        # 背景帧=该航点自身时间（起始/结尾），与位置尺寸旋转列表一致
+            start_end=start_end)
         try:
             apply_xy(float(vx.get()), float(vy.get()))
         except (ValueError, TypeError):
@@ -24341,9 +24534,9 @@ class FFmpegBatchGUI:
                 x_val = safe_eval_expr(x_expr, ctx)
                 y_val = safe_eval_expr(y_expr, ctx)
                 if x_val is None:
-                    x_val = main_w - wm_w - 10
+                    x_val = main_w - wm_w - RK_PLACE_INSET
                 if y_val is None:
-                    y_val = main_h - wm_h - 10
+                    y_val = main_h - wm_h - RK_PLACE_INSET
                 if wm_w <= main_w:
                     x_val = max(0, min(x_val, main_w - wm_w))
                 if wm_h <= main_h:
@@ -26420,6 +26613,25 @@ class FFmpegBatchGUI:
                                                        # 画布编辑器飞入/飞出、遮罩预设位置等均可复用。
                                 corner_src_w=None,     # 偏移基准宽（None=用 content_src_w）
                                 corner_src_h=None,     # 偏移基准高（None=用 content_src_h）
+                                start_end=None,        # 2026-09-12：起始/结尾双端可视化（条件调用）。
+                                                     # 传 dict 才启用内部「起始/结尾」RadioButton + 画另一端幽灵；
+                                                     # dict: {"active":"start"|"end",
+                                                     #        "read":f(which)->(x,y,w,h,angle),
+                                                     #        "on_switch":f(which)->None,
+                                                     #        "can_compare":bool}
+                                                     # None=不创建、行为完全不变；PiP/水印/画布/主视频偏移均不传。
+                                pad=None,            # 2026-09-12：画布四周辅助灰边像素宽（自适应）。
+                                                     # None=按场景自动：起始/结尾类窗口用 RK_PAD_WIDE(=20)，
+                                                     # 其余用 RK_PAD(=10)；显式传整数则强制该值。
+                                reset_origin=False,  # 2026-09-12：「重置位置」语义（条件调用）。
+                                                     # False=水印/画中画/挡板等默认摆右下角，
+                                                     #        内缩 RK_PLACE_INSET 个【内容像素】（并 max(0,..) 钳非负）。
+                                                     # True=矩形是「内容盒/裁剪框」类（画布编辑器）：
+                                                     #        重置归位图像区左上角 (0,0)，不引入任何边距。
+                                ghost_color=None,    # 2026-09-12：起始/结尾双端里【非活动端幽灵框】的颜色。
+                                                     # None=自适应：start_end 非 None 用 RK_SE_GHOST_COLOR
+                                                     #       （互补青色），其余窗口沿用 rect_color（旧行为不变）。
+                                                     # 显式传颜色字符串则强制该值。仅影响幽灵框，不动 rect_color。
                                 ):
         """
         通用叠加/偏移可视化编辑器（核心重构函数）
@@ -26449,11 +26661,43 @@ class FFmpegBatchGUI:
             aspect_ratio: 绘制新矩形时是否强制保持宽高比（水印/叠加常用）
             coord_mode: 'top_left'（左上角坐标）或 'offset'（偏移量）
         """
-        max_display_w, max_display_h = 800, 600
-
         # 解析 App 引用：本函数既被 AdvancedFrame(self.app 存在) 调用，
         # 也被 FFmpegBatchGUI(self 即 App 本体，无 .app 属性) 调用，故统一用 getattr 兼容
         app = getattr(self, 'app', self)
+
+        # ---- 辅助灰边像素宽（2026-09-12 参数化 + 自适应）----
+        # 平时 RK_PAD(=10)；「起始 / 结尾」类窗口（start_end 非 None）自动用 RK_PAD_WIDE(=20)。
+        # ⚠️ 灰边不要给太大：图像区之外本来就不绘制任何东西（矩形/幽灵都被钳在图像区内），
+        #    灰边给多了纯浪费屏幕（2026-09-12 用户实测：50 太大 → 20）。
+        # 调用方传 pad=<int> 可显式覆盖（None=自适应）。PAD 用于画布尺寸与坐标换算。
+        PAD = int(pad) if pad is not None else (RK_PAD_WIDE if start_end is not None else RK_PAD)
+
+        # ---- 非活动端幽灵框颜色（2026-09-12）----
+        # 显式 ghost_color 优先；否则「起始/结尾」双端窗口用互补青色，其余窗口沿用 rect_color
+        # （= 与改动前逐像素一致，PiP/水印/主视频偏移/画布等窗口零变化）。
+        GHOST_COLOR = ghost_color or (RK_SE_GHOST_COLOR if start_end is not None else rect_color)
+
+        # ---- 目标显示区（2026-09-12）----
+        # 参照可视化裁剪窗口 open_crop_editor 的画布可用区（画布约占屏幕 90%）：
+        #   · 本窗口「图像区 + 2*PAD 灰边」总量 = 裁剪窗口的画布区；
+        #   · 于是图像区比裁剪窗口少 2*PAD（PAD=20 → 少 40；PAD=10 → 少 20）。
+        # 布局改左右两栏后纵向不再是瓶颈，画布可以更高更大；其余窗口
+        # （PiP/水印/主视频偏移…）保持旧上限 800×600，行为完全不变。
+        RIGHT_PANEL_WIDTH = 320   # 控件右栏定宽（照可视化裁剪窗口 RIGHT_PANEL_WIDTH 思路）
+        try:
+            _scr_w = parent.winfo_screenwidth()
+            _scr_h = parent.winfo_screenheight()
+        except Exception:
+            _scr_w, _scr_h = 1280, 800
+        if start_end is not None:
+            # 与 open_crop_editor 同口径：RIGHT_PANEL 280 + 间隔 20 + PADDING*2 → 宽减 320；
+            # EXTRA_HEIGHT 10 + PADDING*2 → 高减 30。
+            _crop_avail_w = int(_scr_w * 0.9) - 320
+            _crop_avail_h = int(_scr_h * 0.9) - 30
+            max_display_w = max(320, _crop_avail_w - 2 * PAD)
+            max_display_h = max(240, _crop_avail_h - 2 * PAD)
+        else:
+            max_display_w, max_display_h = 800, 600
 
         # ---- 主视频背景帧（可选）状态 ----
         bg_file = main_video_file
@@ -26527,14 +26771,24 @@ class FFmpegBatchGUI:
         win.grab_set()
         win.withdraw()
         # 2026-09-11：最小宽高保护——子视频过小时画布随之变小、窗口被压窄，
-        # 下方控件行（微调/绘制/应用/取消…）会被挤压遮挡。统一在共享编辑器设下限，
-        # 遮罩/水印/画中画三种场景的小素材都受益。
-        win.minsize(420, 340)
+        # 控件会被挤压遮挡。统一在共享编辑器设下限。
+        # 2026-09-12：两栏布局后，宽度下限要含右栏（≈320）+ 最小画布区，故 420→600；
+        # 高度下限保证右栏控件（画布尺寸/绘制/微调/缩放/应用）可完整显示。
+        win.minsize(600, 520)
 
         # ---- 内部状态 ----
         current_x, current_y, current_w, current_h = rect_x, rect_y, rect_w, rect_h
         current_angle = float(rotate_angle or 0.0)
         current_canvas_w, current_canvas_h = canvas_w, canvas_h
+        # 起始/结尾双端（条件调用）：初始几何按活动端从调用方实时读取（read 返回画布坐标），
+        # 保证活动端与 rect_x/y/w/h 一致；翻转时由 _switch_end 重载。
+        if start_end is not None:
+            try:
+                _sx, _sy, _sw, _sh, _sa = start_end["read"](start_end["active"])
+                current_x, current_y, current_w, current_h = _sx, _sy, _sw, _sh
+                current_angle = float(_sa or 0.0)
+            except Exception:
+                pass
         scale_pct = None           # 缩放倍率滑块（content_src_* 提供时启用）
         scale_entry = None         # 缩放% 数字输入框（与滑块双向同步）
         # _sync_scale_display 写 scale_pct 会反过来触发 ttk.Scale 的 command → 再进
@@ -26544,6 +26798,9 @@ class FFmpegBatchGUI:
         rect_id = None
         text_id = None
         coord_disp_id = None
+        ghost_id = None           # 起始/结尾双端：非活动端幽灵矩形
+        se_var = None             # 起始/结尾双端：RadioButton 选中态变量（切换时回写）
+        ghost_label_id = None     # 幽灵端的小标签（「起始」/「结尾」）
         draw_rect_temp = None
         draw_start = None
         draw_mode_active = False
@@ -26568,7 +26825,11 @@ class FFmpegBatchGUI:
         # 图像区从 (PAD, PAD) 开始。to_canvas/to_real 是「图像坐标 ↔ 画布坐标」唯一换算收口：
         # to_canvas 输出恒 +PAD、to_real 输入恒 -PAD；事件坐标与 canvas.bbox 同为画布系，
         # 与 to_canvas 输出做差/比较时 PAD 自动抵消，无需逐点再换算。
-        PAD = RK_PAD  # 灰边像素宽（2026-09-10 收编 _rect_kit，与其他编辑器同源）
+        # （PAD 已在函数开头按 pad / start_end 自适应求得：普通 RK_PAD=10、起始/结尾类 RK_PAD_WIDE=20。
+        #  ⚠️ 量纲铁律（2026-09-12 修正）：本函数内凡是【显示层】的量（画布物理尺寸、to_canvas/
+        #     to_real 的 ±PAD、图像/背景粘贴位置、浮动坐标文字、窗口尺寸）必须引用 PAD；
+        #     凡是写进 canvas_w/h【内容坐标】的量（默认摆放内缩、重置归位边距）必须用
+        #     RK_PLACE_INSET——两者量纲不同，互换了就会错位（PAD 还会随窗口是否带起始/结尾浮动）。
 
         def to_canvas(ox, oy):
             return int(ox * scale_x) + PAD, int(oy * scale_y) + PAD
@@ -26643,6 +26904,11 @@ class FFmpegBatchGUI:
                                 canvas.tag_raise(_t)
                             except Exception:
                                 pass
+                    # 背景帧同样是不透明整帧：重排幽灵，防参考框被背景帧盖住（2026-09-12）
+                    try:
+                        _restack_ghost()
+                    except Exception:
+                        pass
                     try:
                         bg_refresh_btn.config(state=tk.NORMAL, text="重新获取帧")
                     except Exception:
@@ -26827,6 +27093,132 @@ class FFmpegBatchGUI:
             _sync_scale_display()
             _schedule_content_render()
 
+        # ---- 起始/结尾双端（条件调用）：画另一端幽灵 + 内部翻转 ----
+        def polygon_for(ox, oy, ow, oh, oang):
+            """任意几何的旋转多边形（画布坐标）；polygon_canvas 用 current_* 同款数学。"""
+            pts = rotate_rect_polygon(ox, oy, ow, oh, oang)
+            return [tuple(to_canvas(px, py)) for px, py in pts]
+
+        def _restack_ghost():
+            """把幽灵框（se_ghost）抬到黑色底衬 / 背景帧 / 内容合成图之上、活动矩形之下。
+
+            ⚠️ 关键（2026-09-12 修复「互相的参考框被黑画布裁切」）：content_img / bg_frame
+            都是后创建的不透明整帧（多为黑底）。若幽灵先画、随后 content_img 调
+            `tag_lower(content_img_id, "rect")`，黑帧会正好落在幽灵之上把它整块盖住 →
+            看起来像被黑画布裁掉。故每次重建黑层（取背景帧 / 内容合成）后都要重新抬一次。
+            """
+            if ghost_id is None and ghost_label_id is None:
+                return
+            for _gid in (ghost_id, ghost_label_id):
+                if _gid is None:
+                    continue
+                try:
+                    canvas.tag_raise(_gid)          # 先抬到最顶
+                except Exception:
+                    pass
+                try:
+                    canvas.tag_lower(_gid, "rect")  # 再压到活动矩形之下（仍高于黑层）
+                except Exception:
+                    pass
+
+        def _draw_ghost():
+            """画非活动端为浅色幽灵（描边+斜纹），便于同画布对比起始/结尾位置。
+
+            ⚠️ 颜色用 GHOST_COLOR（2026-09-12 起=互补青色），**不再用** rect_color：
+            两端同红时只剩线宽 1/2 + 点密度 gray25/gray50 可辨，实际看不出哪端在被编辑。
+            """
+            nonlocal ghost_id, ghost_label_id
+            for _gid in (ghost_id, ghost_label_id):
+                if _gid is not None:
+                    try:
+                        canvas.delete(_gid)
+                    except Exception:
+                        pass
+            ghost_id = ghost_label_id = None
+            if start_end is None or not start_end.get("can_compare", True):
+                return
+            _other = "end" if start_end["active"] == "start" else "start"
+            try:
+                gx, gy, gw, gh, gang = start_end["read"](_other)
+            except Exception:
+                return
+            # 与活动端重合（如 still 段）→ 不画
+            if (gx, gy, gw, gh, gang) == (current_x, current_y, current_w, current_h, current_angle):
+                return
+            gp = polygon_for(gx, gy, gw, gh, gang)
+            ghost_id = canvas.create_polygon(gp, outline=GHOST_COLOR, width=1,
+                                             fill=GHOST_COLOR, stipple="gray25", tags="se_ghost")
+            bx, by = gp[0][0], gp[0][1]
+            ghost_label_id = canvas.create_text(bx + 6, by + 6, anchor="nw",
+                                                text=("起始" if _other == "start" else "结尾"),
+                                                fill=GHOST_COLOR, font=("Arial", 9), tags="se_ghost")
+            # 统一走 _restack_ghost：抬到黑层之上、活动矩形之下（防被黑画布盖住）
+            _restack_ghost()
+
+        def _sync_angle_cb():
+            """把 `current_angle` 立即同步给调用方（`angle_cb(current_angle)`）。
+
+            ⚠️ 2026-09-12 关键修复（「结尾的旋转角度没保存」根因）：
+            不同调用方的 angle_cb 语义不同——
+              · 航点/遮罩/文字水印：angle_cb 直接写数据（ra/rb），随手柄松手即落盘；
+              · 画布编辑器 `_open_generic_editor`：angle_cb 只把角度写进 `captured` 缓冲，
+                **真正的落盘在 on_apply 里读该缓冲**（`_set_kf(..., captured[0])`）。
+            于是缓冲必须与「当前活动端」时刻保持一致。而以下几处会改 `current_angle`
+            却不经过旋转手柄：切换起始/结尾（重载另一端角度）、重置位置（角度归零）。
+            缓冲不同步 → 紧接着任何 on_apply 都会把「另一端的角度」写进当前端 →
+            表现为切换端后当前端的旋转角度被另一端覆盖 / 像没保存。
+            故：凡 `current_angle` 变动处，都必须在紧邻的 on_apply 前后调用本函数。
+            """
+            if angle_cb is not None:
+                try:
+                    angle_cb(float(current_angle))
+                except Exception:
+                    pass
+
+        def _switch_end(which):
+            """内部「起始/结尾」切换：先把当前端编辑回写，再翻转活动端并重载几何 + 重画幽灵。"""
+            nonlocal current_x, current_y, current_w, current_h, current_angle, se_var
+            if start_end is None or which not in ("start", "end"):
+                return
+            # ⚠️ 切换前必须先回写当前端（角度 angle_cb + 坐标 on_drag_commit + 尺寸/刷新 on_apply），
+            # 否则通过滑块/微调/输入框/旋转手柄做的调整在切换瞬间丢失（表现为「恢复到弹出时状态」）。
+            # 此时 active_flag 仍指向当前端，回写路由正确。
+            _sync_angle_cb()   # ← 必须早于 on_apply：画布编辑器的 on_apply 要读 captured 缓冲
+            if on_drag_commit is not None:
+                try:
+                    on_drag_commit(current_x, current_y)
+                except Exception:
+                    pass
+            if on_apply is not None:
+                try:
+                    on_apply(current_x, current_y, current_w, current_h,
+                             current_canvas_w, current_canvas_h)
+                except Exception:
+                    pass
+            start_end["active"] = which
+            if se_var is not None:
+                try:
+                    se_var.set(which)
+                except Exception:
+                    pass
+            try:
+                start_end["on_switch"](which)   # 调用方翻 edit_end 标记（写回路由随之切换）
+            except Exception:
+                pass
+            try:
+                gx, gy, gw, gh, gang = start_end["read"](which)
+            except Exception:
+                return
+            current_x, current_y, current_w, current_h = gx, gy, gw, gh
+            current_angle = float(gang or 0.0)
+            # ⚠️ 关键：重载后立即把新端角度同步进调用方缓冲，否则缓冲仍是上一端的角度，
+            # 之后任何 on_apply 都会把它写进新端（「结尾角度被起始角度覆盖」的根因）。
+            _sync_angle_cb()
+            clamp_rect()
+            update_rect_position()
+            _sync_scale_display()   # 切换端后把新端尺寸/倍率同步回滑块（防滑块显示旧值）
+            _draw_ghost()
+
         # ---- 内容帧渲染（2026-09-12）：照抄原始画布编辑器 _render() 的「ffmpeg 合成整帧」，
         # 全程 ffmpeg + tk.PhotoImage，无 PIL / 无第三方库（同时间铁律）。
         # 仅当 content_file 提供时启用；其余调用方（PiP/水印/简易位置）不传，行为不变。
@@ -26898,6 +27290,9 @@ class FFmpegBatchGUI:
                             canvas.tag_raise(_t)
                         except Exception:
                             pass
+                # ⚠️ 合成图是不透明黑底整帧，刚被压到「rect」之下 → 正好落在幽灵之上。
+                # 必须重排幽灵，否则参考框被黑画布整块盖住（2026-09-12 修复）。
+                _restack_ghost()
             except Exception:
                 pass
 
@@ -26964,7 +27359,12 @@ class FFmpegBatchGUI:
                 disp_h = int(_nfh * scale)
                 scale_x = disp_w / current_canvas_w
                 scale_y = disp_h / current_canvas_h
-                win.geometry(f"{disp_w + 20 + 2 * PAD}x{disp_h + 240 + 2 * PAD}")
+                # 两栏布局：宽=画布宽+右栏宽，高=画布高（下限 720、钳屏幕）
+                _nw_w = min(disp_w + 2 * PAD + RIGHT_PANEL_WIDTH + 40,
+                            int(win.winfo_screenwidth() * 0.95))
+                _nw_h = min(max(disp_h + 2 * PAD + 24, 720),
+                            int(win.winfo_screenheight() * 0.94))
+                win.geometry(f"{_nw_w}x{_nw_h}")
                 canvas.config(width=disp_w + 2 * PAD, height=disp_h + 2 * PAD)
                 canvas.delete("all")
                 bg_img_id = None
@@ -26981,6 +27381,7 @@ class FFmpegBatchGUI:
                     canvas.delete(rect_id)
                     canvas.delete(text_id)
                 rect_id, text_id = create_rect()
+                _draw_ghost()
                 _schedule_content_render()
                 update_coord_display()
                 status_var.set(f"画布已调整为 {current_canvas_w}x{current_canvas_h}")
@@ -27195,38 +27596,81 @@ class FFmpegBatchGUI:
         # ---- 重置位置 ----
         def reset_position():
             nonlocal current_x, current_y, current_angle
-            # 如果是主视频模式（允许负偏移且为蓝色），重置到左上角 (0,0)
-            if allow_negative_offset and rect_color == 'deepskyblue':
+            # 「重置位置」两种语义（2026-09-12 定稿）：
+            #   ① 归位 (0,0)：
+            #      · 主视频/画布偏移模式（allow_negative_offset 且 rect_color=deepskyblue）→ 偏移归零；
+            #      · reset_origin=True（画布编辑器：矩形=片段内容盒）→ 内容盒贴图像区左上角。
+            #   ② 右下角默认摆放：水印/画中画/挡板等子元素 → 距图像区右下角内缩 RK_PLACE_INSET。
+            # ⚠️ 内缩量是【内容像素】（与 current_canvas_w/h 同域），必须用 RK_PLACE_INSET，
+            #    不能引用 PAD：PAD 是【显示层像素】且随「窗口是否带起始/结尾」在 10/20 浮动，
+            #    绑上去会让重置位置莫名其妙地跟着窗口类型变（2026-09-12 遮罩重置跑到 (-20,-20)）。
+            # ⚠️ 且必须 max(0,...) 钳到图像区左上角：矩形尺寸 ≥ 画布时（满屏挡板/内容盒），
+            #    canvas - w - inset 恒为负；画布编辑器/遮罩窗口 allow_negative_offset=True，
+            #    clamp_rect 走「完全放开」分支不会钳回 → 直接落负值就跑到图像区外（看着错位）。
+            if (allow_negative_offset and rect_color == 'deepskyblue') or reset_origin:
                 current_x = 0
                 current_y = 0
             else:
-                # 否则（子视频/水印）重置到右下角（保留 10px 边距）
-                current_x = current_canvas_w - current_w - 10
-                current_y = current_canvas_h - current_h - 10
+                current_x = max(0, current_canvas_w - current_w - RK_PLACE_INSET)
+                current_y = max(0, current_canvas_h - current_h - RK_PLACE_INSET)
             if angle_editable:
                 current_angle = 0.0  # 重置位置的同时把旋转角度归零
             clamp_rect()
             update_rect_position()
+            # 角度归零也要落盘（否则调用方仍留着旧角度，画布编辑器的 captured 缓冲更会不同步）
+            _sync_angle_cb()
             status_var.set("已重置位置" + ("，角度已归零" if angle_editable else ""))
     
-        # ---- 应用与取消 ----
-        def apply():
+        # ---- 应用与取消（2026-09-12 修复：关闭即提交当前活动端，杜绝「结束没记住」）----
+        # 本编辑器是「实时编辑单点几何」模型：切换端时已自动保存另一端（见 _switch_end），
+        # 但当前活动端的改动只在拖拽松手(on_drag_commit) / 尺寸刷新(on_apply) / 旋转(angle_cb)
+        # 触发时落盘；若直接点「取消」或点窗口×关闭，当前端改动会丢失。
+        # 为避免「起始记住了 结束没记住」，统一在关闭（应用 / 取消 / 点×）时提交当前端。
+        def _commit_current():
+            """把当前活动端（旋转 angle_cb + 坐标 on_drag_commit + 尺寸/刷新 on_apply）写回。"""
             clamp_rect()
-            on_apply(current_x, current_y, current_w, current_h,
-                     current_canvas_w, current_canvas_h)
-            if angle_cb is not None:
-                angle_cb(current_angle)
+            # ⚠️ 顺序铁律：angle_cb 必须早于 on_apply。画布编辑器的 on_apply 是
+            # `_set_kf(..., captured[0])`，读的是 angle_cb 写入的缓冲；反过来则永远慢一拍，
+            # 关闭时提交的角度是「上一次」的（2026-09-12 「结尾角度没保存」根因之一）。
+            _sync_angle_cb()
+            if on_drag_commit is not None:
+                try:
+                    on_drag_commit(current_x, current_y)
+                except Exception:
+                    pass
+            if on_apply is not None:
+                try:
+                    on_apply(current_x, current_y, current_w, current_h,
+                             current_canvas_w, current_canvas_h)
+                except Exception:
+                    pass
+
+        def apply():
+            _commit_current()
             win.destroy()
-    
+
         def cancel():
+            # ⚠️ 与「应用」同口径提交：切换端已保存另一端，关闭时再保存当前端，
+            # 避免「结束没记住」。若确需彻底放弃改动，应另行提供「重置」语义，此处保持提交。
+            _commit_current()
             win.destroy()
     
         # ---- 创建 GUI 控件 ----
+        # 2026-09-12：改为「画布在左 + 控件右栏」两栏布局（照抄 open_crop_editor 可视化裁剪窗口）——
+        # 画布下方不再纵向堆叠按钮/提示，控件统一进右侧定宽栏，空间更宽松、便于继续加功能按钮。
+        # （RIGHT_PANEL_WIDTH 已在函数开头定义：右栏定宽）
+        main_pane = ttk.Frame(win)
+        main_pane.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        right_frame = ttk.Frame(main_pane, width=RIGHT_PANEL_WIDTH)
+        right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
+        right_frame.pack_propagate(False)   # 定宽：内部控件不撑宽右栏
+        canvas_frame = ttk.Frame(main_pane)
+        canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         # PADDING 灰边：画布四周留 PAD 像素灰（bg="gray"），图像区垫黑色矩形保持
         # 「画布内黑色」的 pad 模式语义不变（pad 黑边仍黑，灰只出现在图像区外）。
-        canvas = tk.Canvas(win, width=disp_w + 2 * PAD, height=disp_h + 2 * PAD,
+        canvas = tk.Canvas(canvas_frame, width=disp_w + 2 * PAD, height=disp_h + 2 * PAD,
                            bg="gray", highlightthickness=1)
-        canvas.pack(pady=10)
+        canvas.pack(expand=True)
 
         def _draw_pad_black():
             """图像区黑色垫层（PAD 环露灰）。tag_lower 压到最底，避免盖住 bg_draw_func 框。"""
@@ -27246,8 +27690,8 @@ class FFmpegBatchGUI:
         # ---- 主视频背景帧时间控制（可选）----
         bg_refresh_btn = None
         if bg_file:
-            bg_ctrl = ttk.Frame(win)
-            bg_ctrl.pack(pady=(2, 0))
+            bg_ctrl = ttk.Frame(right_frame)
+            bg_ctrl.pack(anchor="w", pady=(2, 0))
             ttk.Label(bg_ctrl, text="帧时间(秒):").pack(side=tk.LEFT)
             bg_time_var = tk.StringVar(value=f"{bg_cur_time:.2f}")
             ttk.Entry(bg_ctrl, textvariable=bg_time_var, width=12).pack(side=tk.LEFT, padx=4)
@@ -27270,52 +27714,70 @@ class FFmpegBatchGUI:
             bg_refresh_btn.pack(side=tk.LEFT, padx=4)
 
         status_var = tk.StringVar(value="红色矩形可拖拽移动。")
-        ttk.Label(win, textvariable=status_var, justify=tk.LEFT).pack(pady=5)
+        ttk.Label(right_frame, textvariable=status_var, justify=tk.LEFT,
+                  wraplength=RIGHT_PANEL_WIDTH - 12).pack(anchor="w", pady=5)
     
         coord_var = tk.StringVar(value="")
-        coord_label = ttk.Label(win, textvariable=coord_var, font=("", 10))
-        coord_label.pack(pady=2)
+        coord_label = ttk.Label(right_frame, textvariable=coord_var, font=("", 10))
+        coord_label.pack(anchor="w", pady=2)
         if extra_info:
-            extra_label = ttk.Label(win, text=extra_info, foreground="orange")
-            extra_label.pack(pady=2)
+            extra_label = ttk.Label(right_frame, text=extra_info, foreground="orange",
+                                    wraplength=RIGHT_PANEL_WIDTH - 12, justify=tk.LEFT)
+            extra_label.pack(anchor="w", pady=2)
     
-        # 画布尺寸控件（主视频模式）
+        # 画布尺寸控件（主视频模式）——右栏纵向排列（窄栏不横排）
         if show_canvas_controls:
-            canvas_ctrl_frame = ttk.Frame(win)
-            canvas_ctrl_frame.pack(pady=5)
-            ttk.Label(canvas_ctrl_frame, text="画布宽度:").pack(side=tk.LEFT)
+            canvas_ctrl_frame = ttk.Frame(right_frame)
+            canvas_ctrl_frame.pack(anchor="w", pady=5, fill=tk.X)
+            _cw_row = ttk.Frame(canvas_ctrl_frame)
+            _cw_row.pack(anchor="w")
+            ttk.Label(_cw_row, text="画布宽度:").pack(side=tk.LEFT)
             canvas_w_var = tk.StringVar(value=str(canvas_w))
-            ttk.Entry(canvas_ctrl_frame, textvariable=canvas_w_var, width=8).pack(side=tk.LEFT, padx=5)
-            ttk.Label(canvas_ctrl_frame, text="画布高度:").pack(side=tk.LEFT)
+            ttk.Entry(_cw_row, textvariable=canvas_w_var, width=8).pack(side=tk.LEFT, padx=5)
+            _ch_row = ttk.Frame(canvas_ctrl_frame)
+            _ch_row.pack(anchor="w")
+            ttk.Label(_ch_row, text="画布高度:").pack(side=tk.LEFT)
             canvas_h_var = tk.StringVar(value=str(canvas_h))
-            ttk.Entry(canvas_ctrl_frame, textvariable=canvas_h_var, width=8).pack(side=tk.LEFT, padx=5)
-            ttk.Button(canvas_ctrl_frame, text="应用画布尺寸", command=_apply_canvas_size).pack(side=tk.LEFT, padx=5)
+            ttk.Entry(_ch_row, textvariable=canvas_h_var, width=8).pack(side=tk.LEFT, padx=5)
+            ttk.Button(canvas_ctrl_frame, text="应用画布尺寸",
+                       command=_apply_canvas_size).pack(anchor="w", pady=(3, 0))
     
         # 绘制矩形控件（子视频/水印模式）
         # 2026-09-12：八向位置预设下拉与绘制按钮同占一行——调用方启用该功能不需要再新增一行。
         # corner_dirs=None 时整块不创建，其余调用方（PiP/水印/简易位置）行为不变。
         if allow_resize or corner_dirs:
-            draw_btn_frame = ttk.Frame(win)
-            draw_btn_frame.pack(pady=5)
+            draw_btn_frame = ttk.Frame(right_frame)
+            draw_btn_frame.pack(anchor="w", pady=5, fill=tk.X)
             if allow_resize:
-                draw_btn = ttk.Button(draw_btn_frame, text="绘制新矩形", command=enter_draw_mode)
-                draw_btn.pack(side=tk.LEFT, padx=5)
-                draw_abort_btn = ttk.Button(draw_btn_frame, text="取消绘制", command=abort_draw, state="disabled")
+                _draw_row = ttk.Frame(draw_btn_frame)
+                _draw_row.pack(anchor="w")
+                draw_btn = ttk.Button(_draw_row, text="绘制新矩形", command=enter_draw_mode)
+                draw_btn.pack(side=tk.LEFT, padx=(0, 5))
+                draw_abort_btn = ttk.Button(_draw_row, text="取消绘制", command=abort_draw, state="disabled")
                 draw_abort_btn.pack(side=tk.LEFT, padx=5)
             if corner_dirs:
-                ttk.Label(draw_btn_frame, text="方向:").pack(side=tk.LEFT, padx=(12, 0))
+                _corner_row = ttk.Frame(draw_btn_frame)
+                _corner_row.pack(anchor="w", pady=(3, 0))
+                ttk.Label(_corner_row, text="方向:").pack(side=tk.LEFT)
                 _corner_names, _corner_w = corner_dir_choices(corner_dirs)
-                corner_combo = ttk.Combobox(draw_btn_frame, width=_corner_w, state="readonly",
+                corner_combo = ttk.Combobox(_corner_row, width=_corner_w, state="readonly",
                                             values=_corner_names)
                 corner_combo.current(0)
                 corner_combo.pack(side=tk.LEFT, padx=2)
                 corner_combo.bind("<<ComboboxSelected>>", lambda e: _on_corner())
 
+        # ---- 起始/结尾双端（条件调用）：内部 RadioButton 翻转 + 画另一端幽灵 ----
+        # 仅 can_compare=True 时显示（still 等单端场景隐藏按钮，也不画幽灵）。
+        # ⚠️ 2026-09-12：原套 ttk.LabelFrame("起始 / 结尾") 外壳被用户判「太难看」已删除，
+        # Radiobutton 改为直接挂缩放行左侧（有缩放行时）或独立普通行（无缩放行时），不再包外壳。
+        if start_end is not None and start_end.get("can_compare", True):
+            se_var = tk.StringVar(value=start_end["active"])
+
         # 微调按钮：移动 / 减 / 加 三行，各自带步进（2026-08-26 与裁剪可视化同套语义）。
         # show_nudge=False 时整段跳过。
         if show_nudge:
-            nudge_frame = ttk.LabelFrame(win, text="微调 (像素)", padding=3)
-            nudge_frame.pack(pady=(2, 2))
+            nudge_frame = ttk.LabelFrame(right_frame, text="微调 (像素)", padding=3)
+            nudge_frame.pack(anchor="w", pady=(2, 2))
 
             def nudge_rect(kind, direction, step):
                 nonlocal current_x, current_y, current_w, current_h
@@ -27418,37 +27880,51 @@ class FFmpegBatchGUI:
                 except Exception:
                     pass
 
-        if content_src_w and content_src_h:
-            scale_frame = ttk.LabelFrame(win, text="缩放 (倍率)", padding=3)
-            scale_frame.pack(pady=(2, 2))
-            scale_pct = tk.DoubleVar(
-                value=round(current_w / content_src_w * 100.0, 1))
-            sc_slider = ttk.Scale(scale_frame, from_=5, to=500, orient=tk.HORIZONTAL,
-                                  length=200, variable=scale_pct,
-                                  command=lambda v: _on_scale_slider(float(v)))
-            sc_slider.pack(side=tk.LEFT, padx=4)
-            scale_entry = ttk.Entry(scale_frame, width=7)
-            scale_entry.pack(side=tk.LEFT, padx=2)
-            scale_entry.bind("<Return>", lambda e: _on_scale_entry())
-            scale_entry.bind("<FocusOut>", lambda e: _on_scale_entry())
-            ttk.Label(scale_frame, text="%").pack(side=tk.LEFT)
-            # 注：八向位置预设下拉不在此行——已移到「绘制新矩形/取消绘制」同一行（见上方 draw_btn_frame）。
+        # ---- 起始/结尾切换 + 缩放（右栏纵向排布，2026-09-12 迁入右栏）----
+        # 切换 Radiobutton 是独立普通 Frame，绝不塞进「缩放」LabelFrame 内部。
+        # 右栏窄（RIGHT_PANEL_WIDTH），故切换与缩放各占一行（切换在上、缩放在下）。
+        if se_var is not None or (content_src_w and content_src_h):
+            if se_var is not None:
+                se_row = ttk.Frame(right_frame)
+                se_row.pack(anchor="w", pady=(2, 0))
+                for _w in ("start", "end"):
+                    ttk.Radiobutton(se_row, text=("起始" if _w == "start" else "结尾"),
+                                    variable=se_var, value=_w,
+                                    command=lambda w=_w: _switch_end(w)).pack(side=tk.LEFT, padx=4)
+            if content_src_w and content_src_h:
+                scale_frame = ttk.LabelFrame(right_frame, text="缩放 (倍率)", padding=3)
+                scale_frame.pack(anchor="w", pady=(2, 2))
+                scale_pct = tk.DoubleVar(
+                    value=round(current_w / content_src_w * 100.0, 1))
+                sc_slider = ttk.Scale(scale_frame, from_=5, to=500, orient=tk.HORIZONTAL,
+                                      length=200, variable=scale_pct,
+                                      command=lambda v: _on_scale_slider(float(v)))
+                sc_slider.pack(side=tk.LEFT, padx=4)
+                scale_entry = ttk.Entry(scale_frame, width=7)
+                scale_entry.pack(side=tk.LEFT, padx=2)
+                scale_entry.bind("<Return>", lambda e: _on_scale_entry())
+                scale_entry.bind("<FocusOut>", lambda e: _on_scale_entry())
+                ttk.Label(scale_frame, text="%").pack(side=tk.LEFT)
+                # 注：八向位置预设下拉不在此行——已移到「绘制新矩形/取消绘制」同一行（见上方 draw_btn_frame）。
 
-        # 通用操作按钮
-        action_frame = ttk.Frame(win)
-        action_frame.pack(pady=10)
-        ttk.Button(action_frame, text="应用", command=apply).pack(side=tk.LEFT, padx=10)
-        ttk.Button(action_frame, text="取消", command=cancel).pack(side=tk.LEFT, padx=10)
-        ttk.Button(action_frame, text="重置位置", command=reset_position).pack(side=tk.LEFT, padx=10)
+        # 通用操作按钮（右栏底部）
+        action_frame = ttk.Frame(right_frame)
+        action_frame.pack(anchor="w", pady=10, side=tk.BOTTOM)
+        ttk.Button(action_frame, text="应用", command=apply).pack(side=tk.LEFT, padx=5)
+        ttk.Button(action_frame, text="取消", command=cancel).pack(side=tk.LEFT, padx=5)
+        ttk.Button(action_frame, text="重置位置", command=reset_position).pack(side=tk.LEFT, padx=5)
+        # 点窗口×关闭 = 提交当前端后关闭（与应用同口径，避免未点「应用」导致结束端丢失）
+        try:
+            win.protocol("WM_DELETE_WINDOW", apply)
+        except Exception:
+            pass
 
         if show_scale_tip:
             tip_text = "提示：重新绘制矩形时，如果比例不对，请先返回上一个界面取消「缩放」的勾选，已保存的上一次缩放会干扰裁剪属性。"
-            tip_label = ttk.Label(win, text=tip_text, foreground="gray", 
-                                  justify=tk.LEFT, wraplength=win.winfo_width() - 30)
-            tip_label.pack(fill=tk.X, padx=10, pady=5)
-            def update_wraplength(event):
-                tip_label.config(wraplength=win.winfo_width() - 30)
-            win.bind("<Configure>", update_wraplength)
+            # 迁入右栏：右栏定宽，wraplength 直接用面板宽，静态折行即可（不再随窗口宽度动态计算）
+            tip_label = ttk.Label(right_frame, text=tip_text, foreground="gray",
+                                  justify=tk.LEFT, wraplength=RIGHT_PANEL_WIDTH - 12)
+            tip_label.pack(fill=tk.X, padx=4, pady=5)
 
         # 绑定事件
         canvas.tag_bind("rect", "<Button-1>", start_move)
@@ -27515,6 +27991,11 @@ class FFmpegBatchGUI:
         # 初始化
         clamp_rect()
         rect_id, text_id = create_rect()
+        _draw_ghost()
+        # 起始/结尾类窗口：把初始活动端的角度同步进调用方缓冲（画布编辑器的
+        # captured 必须与当前端一致，后续任何 on_apply 才不会写错另一端角度）。
+        if start_end is not None:
+            _sync_angle_cb()
         _schedule_content_render()
         update_coord_display()
         if rect_color == 'deepskyblue':
@@ -27532,10 +28013,16 @@ class FFmpegBatchGUI:
         if not allow_resize and not corner_dirs and 'draw_btn_frame' in locals():
             draw_btn_frame.pack_forget()
     
-        # 2026-09-10：PADDING 灰边后画布各 +2*PAD，窗口宽随画布补 +2*PAD（原 disp_w+20
-        # 的左右 pady 被画布增宽吃掉）。
-        center_window(win, disp_w + 20 + 2 * PAD,
-                      disp_h + (330 if show_nudge else 240) + 2 * PAD)
+        # 2026-09-12：两栏布局后，窗口宽 = 画布宽 + 右栏宽（不再为「下方控件区」留高度）。
+        # 高度：起始/结尾类窗口的画布已按「可视化裁剪窗口画布区」口径放大（见函数开头），
+        # 窗口随之变高；其余窗口画布仍按 800×600 上限，窗口高度下限 720（保证右栏控件完整显示），
+        # 并统一钳进屏幕内。
+        _scr_w = win.winfo_screenwidth()
+        _scr_h = win.winfo_screenheight()
+        _win_w = min(disp_w + 2 * PAD + RIGHT_PANEL_WIDTH + 40, int(_scr_w * 0.95))
+        _win_h = max(disp_h + 2 * PAD + 24, 720)
+        _win_h = min(_win_h, int(_scr_h * 0.94))
+        center_window(win, _win_w, _win_h)
         win.wait_window()
         parent.lift()
         parent.focus_force()
@@ -27658,7 +28145,12 @@ class FFmpegBatchGUI:
                                       bg_pre_filter=None, angle_cb=None, init_angle=None,
                                       on_apply=None, initial_time=None, on_drag_commit=None,
                                       aspect_ratio="auto", angle_editable=True,
-                                      corner_dirs=None, corner_src_w=None, corner_src_h=None):
+                                      corner_dirs=None, corner_src_w=None, corner_src_h=None,
+                                      start_end=None,     # 2026-09-12：起始/结尾双端（透传 _generic_overlay_editor）
+                                      pad=None,           # 2026-09-12：辅助灰边宽（透传；None=自适应，
+                                                          # 起始/结尾类窗口自动用 RK_PAD_WIDE=20）
+                                      reset_origin=False,  # 2026-09-12：「重置位置」语义（透传）
+                                      ghost_color=None):   # 2026-09-12：幽灵框颜色（透传；None=自适应青色）
         """
         水印可视化编辑器，支持回写位置和缩放尺寸，以及更新水印字典和滤镜框架。
         free_layout=True 时放开边界（子视频可拖出画布、可比主视频大）。
@@ -27691,12 +28183,17 @@ class FFmpegBatchGUI:
         _wm_spin = bool((watermark_dict or {}).get("spin_enabled", False))
         # 解析当前坐标：overlay_x/y 的 w/h 恒为内容盒（wm_w/wm_h，2026-08-26 统一）；
         # 旋转时 d×d 正方形由编辑器内部自动居中（锚点=内容盒左上角），不再按 d 求值。
+        # 默认摆放（x/y 表达式无法解析时）→ 右下角，内缩 RK_PLACE_INSET。
+        # ⚠️ 内缩量是【内容像素】(与 canvas_w/h 同域)，用 RK_PLACE_INSET 而不是辅助灰边 PAD：
+        #    PAD 是显示层像素且随「窗口是否带起始/结尾」在 10/20 浮动（遮罩窗口带双端 → 20），
+        #    绑上去会让默认摆放位置跟着窗口类型变（2026-09-12 修正）。
+        #    max(0,...) 防「水印/挡板比画布大」时落负值。
         rect_x = safe_eval_expr(x_var.get(), {"W": canvas_w, "H": canvas_h, "w": wm_w, "h": wm_h})
         if rect_x is None:
-            rect_x = canvas_w - wm_w - 10
+            rect_x = max(0, canvas_w - wm_w - RK_PLACE_INSET)
         rect_y = safe_eval_expr(y_var.get(), {"W": canvas_w, "H": canvas_h, "w": wm_w, "h": wm_h})
         if rect_y is None:
-            rect_y = canvas_h - wm_h - 10
+            rect_y = max(0, canvas_h - wm_h - RK_PLACE_INSET)
         if not free_layout:
             rect_x = max(0, min(rect_x, canvas_w - wm_w))
             rect_y = max(0, min(rect_y, canvas_h - wm_h))
@@ -27776,7 +28273,11 @@ class FFmpegBatchGUI:
                                      # 2026-09-12：八向位置预设（条件调用）——遮罩 起始/结尾坐标 用
                                      corner_dirs=corner_dirs,
                                      corner_src_w=corner_src_w,
-                                     corner_src_h=corner_src_h)
+                                     corner_src_h=corner_src_h,
+                                     start_end=start_end,
+                                     pad=pad,
+                                     reset_origin=reset_origin,
+                                     ghost_color=ghost_color)  # 2026-09-12：幽灵框颜色（透传）
     
     # ---------- 从视频位置可视化编辑器 ----------
     def open_visual_overlay_editor(self, track_idx, ov_x_var=None, ov_y_var=None, ov_angle_var=None,
@@ -27813,12 +28314,14 @@ class FFmpegBatchGUI:
         # （否则初始显示偏左上 (d-w)/2，与实际成片/复杂预览不一致）。
         x_expr = track.enc_settings.get('overlay_x', '0')
         y_expr = track.enc_settings.get('overlay_y', '0')
+        # 默认摆放 → 右下角内缩 RK_PLACE_INSET【内容像素】（与 canvas_w/h 同域）。
+        # ⚠️ 不用 RK_PAD：那是画布灰边（显示层像素），与最终写进 overlay_x/y 的坐标不同域。
         rect_x = safe_eval_expr(x_expr, {"W": canvas_w, "H": canvas_h, "w": curr_w, "h": curr_h})
         if rect_x is None:
-            rect_x = canvas_w - curr_w - 10
+            rect_x = max(0, canvas_w - curr_w - RK_PLACE_INSET)
         rect_y = safe_eval_expr(y_expr, {"W": canvas_w, "H": canvas_h, "w": curr_w, "h": curr_h})
         if rect_y is None:
-            rect_y = canvas_h - curr_h - 10
+            rect_y = max(0, canvas_h - curr_h - RK_PLACE_INSET)
         if not free_layout:
             rect_x = max(0, min(rect_x, canvas_w - curr_w))
             rect_y = max(0, min(rect_y, canvas_h - curr_h))

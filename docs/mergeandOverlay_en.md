@@ -467,12 +467,30 @@ The mask rectangle is no longer just a fixed transparent region — it is **a sh
 - Coordinates are always the **final rendered frame** of the sub-video (after crop→rotate→scale) — the local coords of "the sub-video you actually see". To do a full-screen wipe, scale the sub-video to the main video's size (then local coords ≡ frame coords).
 - **Waypoint canvas = sub-video final rendered size** (after crop→rotate→scale, computed by `compute_final_size_with_order`, consistent with "single source of truth = final_render_size"): waypoints, shutter W/H, and the visual canvas share **one coordinate system**, so dragged coords are the final coords. The window shows the current canvas size (e.g. "canvas 1920×1080"); if it says "fallback", the sub-video size wasn't probed — pick the sub-video file first.
   - That size is saved with the waypoints into the project (`mask_traj_canvas_w/h`). At filter-build time the mask already sits after crop/rotate/scale, so `W`/`H` exactly equal this canvas size → the restore ratio is always 1 and the travel matches precisely; only old projects or an unprobed size fall back to 1280×720.
+    > ⚠️ **Exception (2026-09-12)**: with **canvas mode** on, the mask segment no longer stays at the tail of the chain — it is appended **after the canvas composite** (see the note in §13.3), so the coordinate basis becomes the canvas size.
 
 ### 13.3 Filter chain
 
 Without a trajectory it is still the original double-`drawbox` static matte — behaviour unchanged, word for word (zero regression). With a trajectory it becomes a dynamic matte:
 
 > The mask filter's position in the sub-video chain **moved from "before crop (original-frame coords)" to "after crop→rotate→scale, before format=rgba"** (corrected 2026-09-10). Reason: the mask coordinate space must match the "final rendered frame", or the canvas (final size) and the filter (original frame) disagree and the dragged shutter position shifts wholesale. The static rectangle's `mask_x/y/w/h` and the trajectory waypoints now both land on the final rendered frame, isomorphic with `open_mask_dialog`'s canvas.
+
+> ⚠️ **Canvas-mode exception (corrected 2026-09-12)**: the rule above — "the mask always sits after crop/rotate/scale" — does **not** hold in **canvas mode**.
+> Canvas mode pastes the content onto a larger canvas (`build_canvas_filtergraph`), while the mask used to stay at the **tail of the pre-chain** →
+> the mask acted while the content was still cropped to its original size, yet its coordinates were written back in terms of the **final canvas size** →
+> the symptom was "turning canvas mode on makes the mask stop working / the shutter shifts wholesale".
+>
+> Fix: the former tail mask block was extracted into `_build_mask_filter_block()` (optional in/out labels; with both `None` it is byte-for-byte identical to before),
+> and in canvas mode `build_canvas_filtergraph` **appends the mask segment after the canvas overlay**:
+> `… → {out}_pre` (canvas composite) → `_build_mask_filter_block` → `{out}`. The mask coordinate basis thus equals the canvas size, matching what the editor shows.
+>
+> The predicate is centralised in `_canvas_defers_mask(settings)` (`canvas_mode and canvas_segments and mask_enabled`);
+> `build_video_filter_chain(..., include_mask=False)` is the escape hatch that skips the tail mask.
+> ⚠️ Both consumers must **always agree**, or you get a "double mask" or a "lost mask".
+>
+> Verified by `tests/_verify_canvas_mask_merge.py` (old vs new module diffed in one process — 5 non-canvas scenarios byte-identical = zero regression)
+> plus `tests/_verify_canvas_mask_ffmpeg.py` (real ffmpeg: alpha=255 inside the rectangle, 0 outside; the old version reads luma 0 at the same point = bug reproduced).
+> Known boundary: if the sub-video canvas has a "second-pass render scale", the mask still precedes that scale.
 
 ```
 split=3[a][b][c];
