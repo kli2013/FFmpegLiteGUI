@@ -2146,6 +2146,110 @@ def _log_time_order_warn(app, where=""):
     return False
 
 
+def _attach_state_clipboard_menu(tree, *, edit_row, get_state, apply_state, can_edit=None):
+    """给列表 Treeview 挂右键菜单：「编辑 | 复制起始 / 复制结尾 / 粘贴到起始 / 粘贴到结尾」。
+
+    面向航点/关键帧类列表的「两段之间首尾坐标保持连通」工作流：
+    选中上一行右键「复制结尾」→ 选中下一行右键「粘贴到起始」，两步完成连通；
+    源端/目标端直接写在菜单项里，无需任何「当前编辑端」切换。
+
+    参数（由调用方按各自行数据模型实现，本函数不关心字段名）：
+      edit_row:    () -> None。「编辑」项回调（各窗口现有 _open_row_editor）。
+      get_state:   (idx, which) -> (x, y, scale, angle) 或 None；which ∈ {"start","end"}。
+      apply_state: (idx, which, x, y, scale, angle) -> None。写回 + 该行刷新（各窗口自定）。
+      can_edit:    (idx, which) -> bool。该端是否可操作（still 段结尾与起始同值、航点
+                   终点行无结尾坐标——对应菜单项置灰）。缺省恒 True。
+
+    剪贴板由本函数内部持有：**各窗口独立，不跨窗口共享**（行数据模型不同，共享无意义）。
+    右键落在行上时自动选中该行（与合并轨道右键菜单同体验）；列表被 set_enabled 整体
+    置灰（如轨迹面板「启用列表轨迹」未勾）时右键不响应。
+    返回 {"menu","copy","paste","refresh"} 仅供无头测试驱动，调用方可忽略。
+    """
+    if can_edit is None:
+        def can_edit(idx, which):
+            return True
+
+    def _can(idx, which):
+        try:
+            return bool(can_edit(idx, which))
+        except Exception:
+            return False
+
+    _clip = [None]   # {"x","y","scale","angle"}
+
+    menu = tk.Menu(tree, tearoff=0)
+    I_EDIT, I_CA, I_CB, I_PA, I_PB = 0, 2, 3, 4, 5   # entry 1 = 分隔线
+
+    def _sel_idx():
+        sel = tree.selection()
+        if not sel:
+            return None
+        try:
+            return int(sel[0])
+        except (ValueError, TypeError):
+            return None
+
+    def _refresh_menu():
+        idx = _sel_idx()
+        has_clip = _clip[0] is not None
+        if idx is None:
+            ok = {I_EDIT: False, I_CA: False, I_CB: False, I_PA: False, I_PB: False}
+        else:
+            ok = {I_EDIT: True,
+                  I_CA: _can(idx, "start"), I_CB: _can(idx, "end"),
+                  I_PA: _can(idx, "start") and has_clip,
+                  I_PB: _can(idx, "end") and has_clip}
+        for entry, enabled in ok.items():
+            menu.entryconfigure(entry, state="normal" if enabled else "disabled")
+
+    def _do_copy(which):
+        idx = _sel_idx()
+        if idx is None or not _can(idx, which):
+            return
+        kv = get_state(idx, which)
+        if not kv:
+            return
+        _clip[0] = {"x": kv[0], "y": kv[1], "scale": kv[2], "angle": kv[3]}
+
+    def _do_paste(which):
+        idx = _sel_idx()
+        if idx is None or _clip[0] is None or not _can(idx, which):
+            return
+        s = _clip[0]
+        apply_state(idx, which, s["x"], s["y"], s["scale"], s["angle"])
+
+    menu.add_command(label="编辑", command=lambda: edit_row())
+    menu.add_separator()
+    menu.add_command(label="复制起始", command=lambda: _do_copy("start"))
+    menu.add_command(label="复制结尾", command=lambda: _do_copy("end"))
+    menu.add_command(label="粘贴到起始", command=lambda: _do_paste("start"))
+    menu.add_command(label="粘贴到结尾", command=lambda: _do_paste("end"))
+
+    def _popup(ev):
+        try:
+            if "disabled" in tree.state():
+                return
+        except Exception:
+            pass
+        try:
+            row = tree.identify_row(ev.y)
+            if row:
+                tree.selection_set(row)   # 右键落在行上：自动选中该行再操作
+        except Exception:
+            pass
+        try:
+            _refresh_menu()
+            menu.tk_popup(ev.x_root, ev.y_root)
+        finally:
+            try:
+                menu.grab_release()
+            except Exception:
+                pass
+
+    tree.bind("<Button-3>", _popup)
+    return {"menu": menu, "copy": _do_copy, "paste": _do_paste, "refresh": _refresh_menu}
+
+
 def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
                      grab_win=None, video_file=None, ffmpeg_cmd=None, ffprobe_cmd=None,
                      app=None, allow_angle=True, allow_empty=False):
@@ -2828,6 +2932,45 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
     tree.bind("<<TreeviewSelect>>", _on_tree_select)
     frm.bind("<Configure>", lambda *a: _draw_preview())
 
+    # ---------- 列表右键：编辑 + 复制/粘贴行状态（起始/结尾） ----------
+    # 2026-09-12：跨行保持两段连通（上一行结尾 → 下一行起始）。缩放/角度随状态一起带走。
+    # 终点行(mode=end)无独立结尾坐标 → 结尾两项置灰；hide/spin 行数据结构完整，照常可用。
+    def _wp_state_get(idx, which):
+        if idx < 0 or idx >= len(waypoints):
+            return None
+        w = waypoints[idx]
+        if which == "end":
+            return (_wp_num(w, "xb"), _wp_num(w, "yb"),
+                    _wp_num(w, "sb", 1.0), _wp_num(w, "rb", 0.0))
+        return (_wp_num(w, "xa"), _wp_num(w, "ya"),
+                _wp_num(w, "sa", 1.0), _wp_num(w, "ra", 0.0))
+
+    def _wp_state_apply(idx, which, x, y, sc, ang):
+        if idx < 0 or idx >= len(waypoints):
+            return
+        w = waypoints[idx]
+        if which == "end":
+            w["xb"], w["yb"] = x, y
+            w["sb"] = sc
+            w["rb"] = ang
+        else:
+            w["xa"], w["ya"] = x, y
+            w["sa"] = sc
+            w["ra"] = ang
+        _refresh(idx)   # 与本面板坐标写回路径一致（整表重建+保持选中）
+
+    def _wp_state_can(idx, which):
+        if which != "end":
+            return True
+        try:
+            return waypoints[idx].get("mode") != "end"
+        except IndexError:
+            return False
+
+    _attach_state_clipboard_menu(tree, edit_row=_open_row_editor,
+                                 get_state=_wp_state_get, apply_state=_wp_state_apply,
+                                 can_edit=_wp_state_can)
+
     def set_enabled(flag):
         """「启用列表轨迹」勾选驱动：整面板置灰/启用（Treeview/按钮/时间输入框）。
         ⚠️ ttk 组件不支持 configure(state=...)，必须用 state([...]) 方法（TclError 实测）。"""
@@ -3081,6 +3224,43 @@ def _majority_audio_params(params):
     ch = Counter(p["ch"] for p in params).most_common(1)[0][0]
     fmt = Counter(p["fmt"] for p in params).most_common(1)[0][0]
     return {"sr": sr, "ch": ch, "fmt": fmt}
+
+
+def build_concat_norm_plan(target_w, target_h, target_pix_fmt, target_fps,
+                           has_xfade=False, global_norm=False):
+    """串行合并「规格归一」参数的落位方案，返回 (pre_norm, post_norm)。
+
+    pre_norm  = 必须写在**每段之前**的滤镜列表（concat 的硬门槛）
+    post_norm = 可统一写在**concat 之后一次**的滤镜列表
+
+    global_norm=False（默认 = 历史行为）：6 项全在 pre_norm，post_norm 为空，
+                      生成的命令与改动前逐字符一致。
+    global_norm=True（精简命令）：段前只留硬门槛，其余挪到 concat 后写一次，
+                     命令长度从 6×N 降到 2×N+3（xfade 时 3×N+2）。
+
+    ⚠️ 实测依据（ffmpeg n9.0.1，探针 tests/_probe_concat_global*.py，勿凭直觉改）：
+      · scale / setsar = 硬门槛：尺寸或 SAR 不一致时 concat 直接 rc≠0，自动协商救不了。
+        且 **scale 会为保持 DAR 而改写 SAR**（320x240→640x360 后 SAR 变 3:4），
+        故只要各段缩放比例不同，段前 setsar 就不可省。
+      · format / fps / settb = 可后置，输出与逐段归一**逐字段一致**
+        （含 yuv420p10le 源：PSNR=inf，concat 自动协商到最宽格式，不丢位深）。
+      · setpts **不在此函数内**：它只能段前（后置是整体平移，救不回段内偏移 →
+        实测总时长会多出偏移量），由调用方按本段链是否含 trim 决定。
+      · xfade 分支 fps **必须段前**：xfade 的 offset 按帧数算、吃帧率，
+        帧率不一致直接 `First input link main frame rate do not match` rc≠0。
+    """
+    fps_str = f"fps={target_fps:.6f}".rstrip('0').rstrip('.')
+    if not global_norm:
+        # 历史顺序：scale, format, fps, setsar, settb, setpts —— 6 项全部逐段写
+        return ([f"scale={target_w}:{target_h}", f"format={target_pix_fmt}", fps_str,
+                 "setsar=1", "settb=AVTB", "setpts=PTS-STARTPTS"], [])
+    pre = [f"scale={target_w}:{target_h}", "setsar=1"]
+    if has_xfade:
+        pre.append(fps_str)
+        post = [f"format={target_pix_fmt}", "settb=AVTB"]
+    else:
+        post = [f"format={target_pix_fmt}", fps_str, "settb=AVTB"]
+    return (pre, post)
 
 
 # ================== 滤镜链构建 ==================
@@ -8783,6 +8963,8 @@ class VideoFilterFrame(ttk.LabelFrame):
                 return
             s = _state_clipboard[0]
             _set_kf(s["x"], s["y"], s["scale"], s["angle"])
+            # 2026-09-12 修复：此前只写数据不刷新——切端粘贴后列表数值无反应、X/Y 框也不回填。
+            _refresh(kv[0])   # 默认 sync_entries=True：列表单行更新 + X/Y 框随当前端回填
             where = "结尾" if (edit_end.get() and _seg_move_mode(dlg_segs[kv[0]]) != "still") else "起始"
             try:
                 app._append_info_ui(f"[画布模式] 已把剪贴板状态粘贴到当前「{where}」")
@@ -8882,12 +9064,20 @@ class VideoFilterFrame(ttk.LabelFrame):
             _refresh(idx)
 
         # 状态复制 / 粘贴（起始 / 结尾 各自独立，可互拷）
+        # 2026-09-12：补「起始/结尾」编辑端显式单选（旧「开始帧/结尾帧」单选删除后的回归）。
+        # X/Y 输入框、八向预设、上面复制/粘贴按钮都按当前端路由，单选让「当前端」可见可控；
+        # 点「起始坐标…/结尾坐标…」或通用编辑器内切端也会自动同步显示（同一 BooleanVar）。
+        # 跨行复制/粘贴走列表右键菜单（_attach_state_clipboard_menu）。
         r_cp = _mk_row("状态")
         ttk.Button(r_cp, text="复制当前状态", command=lambda: _copy_state(),
                    width=12).pack(side=tk.LEFT, padx=2)
         ttk.Button(r_cp, text="粘贴状态", command=lambda: _paste_state(),
                    width=10).pack(side=tk.LEFT, padx=2)
-        ttk.Label(r_cp, text="(仅当前：起始/结尾各自独立)", foreground="gray").pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(r_cp, text="起始", value=False, variable=edit_end,
+                        command=lambda: _sync_xy_entries()).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Radiobutton(r_cp, text="结尾", value=True, variable=edit_end,
+                        command=lambda: _sync_xy_entries()).pack(side=tk.LEFT)
+        ttk.Label(r_cp, text="(单选=当前编辑端；列表右键可跨行复制)", foreground="gray").pack(side=tk.LEFT, padx=4)
 
         # X / Y 偏移 + 八向飞入/飞出预设
         # ⚠️ 2026-09-12：这两项**保留在画布编辑器内**（键盘直接改数、点下拉即填方向），
@@ -9472,6 +9662,48 @@ class VideoFilterFrame(ttk.LabelFrame):
             if 0 <= ri < len(dlg_segs):
                 _open_row_editor(ri)
         tree.bind("<Double-1>", _on_double)
+
+        # ---------- 列表右键：编辑 + 复制/粘贴行状态（起始/结尾） ----------
+        # 2026-09-12：跨行保持两段连通（上一行结尾 → 下一行起始）的快捷路径；
+        # 与「状态」行按钮并存（按钮作用于当前编辑端，右键直接指定源端/目标端免切换）。
+        def _cb_state_get(idx, which):
+            """读行状态 (x, y, scale, angle)——字段映射与 _kf_values/_set_kf 同口径。"""
+            if idx < 0 or idx >= len(dlg_segs):
+                return None
+            w = dlg_segs[idx]
+            if which == "end" and _seg_move_mode(w) != "still":
+                return (_seg_num(w, "ex"), _seg_num(w, "ey"),
+                        _seg_num(w, "scale_end", 1), _seg_num(w, "rot_end"))
+            return (_seg_num(w, "sx"), _seg_num(w, "sy"),
+                    _seg_num(w, "scale_start", 1), _seg_num(w, "rot_start"))
+
+        def _cb_state_apply(idx, which, x, y, sc, ang):
+            """写行状态——与 _set_kf 同口径（still 段起始结尾同步），随后刷新并回填 X/Y。"""
+            if idx < 0 or idx >= len(dlg_segs):
+                return
+            w = dlg_segs[idx]
+            md = _seg_move_mode(w)
+            if which == "end" and md != "still":
+                w["ex"], w["ey"] = x, y
+                w["scale_end"] = sc
+                w["rot_end"] = ang
+            else:
+                w["sx"], w["sy"] = x, y
+                w["scale_start"] = sc
+                w["rot_start"] = ang
+                if md == "still":
+                    w["ex"], w["ey"] = x, y
+                    w["scale_end"] = sc
+                    w["rot_end"] = ang
+            _refresh(idx)   # 默认 sync_entries=True：X/Y 框随当前端回填
+
+        def _cb_state_can(idx, which):
+            """still 段无独立结尾（写回强制同步）→ 结尾两项置灰（与通用编辑器 can_compare 同语义）。"""
+            return which != "end" or _seg_move_mode(dlg_segs[idx]) != "still"
+
+        _attach_state_clipboard_menu(tree, edit_row=_open_row_editor,
+                                     get_state=_cb_state_get, apply_state=_cb_state_apply,
+                                     can_edit=_cb_state_can)
 
         # ---------- 行操作 ----------
         def _add_row():
@@ -10242,6 +10474,38 @@ class VideoFilterFrame(ttk.LabelFrame):
         tree.bind("<Double-1>", _on_double)
         tree.bind("<<TreeviewSelect>>", _on_tree_select)
         frm.bind("<Configure>", lambda *a: _draw_preview())
+
+        # ---------- 列表右键：编辑 + 复制/粘贴行状态（起始/结尾） ----------
+        # 2026-09-12：跨行保持两段连通（上一行结尾 → 下一行起始）。
+        # 简易位置只消费坐标（无缩放/角度渲染），get_state 恒回 1.0/0.0、apply_state 只写坐标。
+        def _sp_state_get(idx, which):
+            if idx < 0 or idx >= len(dlg_segs):
+                return None
+            w = dlg_segs[idx]
+            if which == "end":
+                return (_seg_num(w, "ex"), _seg_num(w, "ey"), 1.0, 0.0)
+            return (_seg_num(w, "sx"), _seg_num(w, "sy"), 1.0, 0.0)
+
+        def _sp_state_apply(idx, which, x, y, sc, ang):
+            if idx < 0 or idx >= len(dlg_segs):
+                return
+            w = dlg_segs[idx]
+            md = _seg_move_mode(w)
+            if which == "end" and md != "still":
+                w["ex"], w["ey"] = x, y
+            else:
+                w["sx"], w["sy"] = x, y
+                if md == "still":
+                    w["ex"], w["ey"] = x, y   # still 段保持 ex/ey==sx/sy 的既有约定
+            _refresh(idx)
+
+        def _sp_state_can(idx, which):
+            """still 段结尾显示为「—」（无独立结尾）→ 结尾两项置灰。"""
+            return which != "end" or _seg_move_mode(dlg_segs[idx]) != "still"
+
+        _attach_state_clipboard_menu(tree, edit_row=_open_row_editor,
+                                     get_state=_sp_state_get, apply_state=_sp_state_apply,
+                                     can_edit=_sp_state_can)
 
         # ---- 确定/取消 ----
         okf = ttk.Frame(frm)
@@ -11548,7 +11812,7 @@ class TextWatermarkDialog(tk.Toplevel):
         # 起始/结尾双端（条件调用）：仅当调用方传入 w + active_flag 时启用
         start_end = None
         if w is not None and active_flag is not None:
-            _se_can = (w.get("xa") != w.get("xb") or w.get("ya") != w.get("yb"))
+            _se_can = (w.get("mode") != "end")   # 2026-09-12 修复：按数据模型判定——坐标相等(如粘贴连通)≠无第二端；仅终点行(mode=end)无独立结尾
             def _se_read(end):
                 if end == "end":
                     return (w.get("xb", 0), w.get("yb", 0), wm_w, wm_h, w.get("rb", 0))
@@ -18304,7 +18568,7 @@ class LoopChromaFrame(ttk.LabelFrame):
             # （active_flag 由 _open_editor 的 _active 可变列表提供，翻转即切写回目标端）
             start_end = None
             if w is not None and active_flag is not None:
-                _se_can = (w.get("xa") != w.get("xb") or w.get("ya") != w.get("yb"))
+                _se_can = (w.get("mode") != "end")   # 2026-09-12 修复：按数据模型判定——坐标相等(如粘贴连通)≠无第二端；仅终点行(mode=end)无独立结尾
                 def _se_read(end):
                     if end == "end":
                         return (w.get("xb", 0), w.get("yb", 0), _bw, _bh, w.get("rb", 0))
@@ -19287,7 +19551,7 @@ class OverlayPositionFrame(ttk.LabelFrame):
         # （active_flag 由 _open_editor 的 _active 可变列表提供，翻转即切写回目标端）
         start_end = None
         if w is not None and active_flag is not None:
-            _se_can = (w.get("xa") != w.get("xb") or w.get("ya") != w.get("yb"))
+            _se_can = (w.get("mode") != "end")   # 2026-09-12 修复：按数据模型判定——坐标相等(如粘贴连通)≠无第二端；仅终点行(mode=end)无独立结尾
             def _se_read(end):
                 if end == "end":
                     return (w.get("xb", 0), w.get("yb", 0), wm_w, wm_h, w.get("rb", 0))
@@ -20597,6 +20861,7 @@ class Task:
 # ---------------------------------------------------------------------------
 # 串行转场(xfade)可用 transition 类型（ffmpeg xfade 滤镜合法值）。
 # 逐轨独立选择；默认 fade（交叉溶解）。
+# 顺序即下拉顺序：前 23 项是历史遗留顺序（勿动），后续新增一律追加到末尾。
 XFADE_TRANSITIONS = [
     # 淡入淡出类
     "fade", "fadeblack", "fadewhite", "fadegrays",
@@ -20610,7 +20875,76 @@ XFADE_TRANSITIONS = [
     "circlecrop", "circleclose", "circleopen", "zoomin",
     # 其他特效
     "dissolve", "pixelize", "radial",
+    # —— 以下为补全项（ffmpeg xfade 0..57 全集，custom=-1 需 expr 故不列入）——
+    # 形状开合（横 / 纵 / 矩形）
+    "rectcrop", "vertopen", "vertclose", "horzopen", "horzclose",
+    # 对角
+    "diagtl", "diagtr", "diagbl", "diagbr",
+    # 切片 / 风车
+    "hlslice", "hrslice", "vuslice", "vdslice",
+    "hlwind", "hrwind", "vuwind", "vdwind",
+    # 四角擦除
+    "wipetl", "wipetr", "wipebl", "wipebr",
+    # 覆盖 / 揭开
+    "coverleft", "coverright", "coverup", "coverdown",
+    "revealleft", "revealright", "revealup", "revealdown",
+    # 挤压 / 快慢淡变 / 其它
+    "squeezeh", "squeezev", "fadefast", "fadeslow", "hblur", "distance",
 ]
+
+# 转场类型中文显示名（下拉只显示中文，存储/命令仍用上面的 canonical 英文值）。
+# 新增类型必须两处同时登记；未登记的类型显示原名（向后兼容旧工程 / 新类型）。
+XFADE_TRANSITIONS_ZH = {
+    # 淡入淡出类
+    "fade": "交叉溶解", "fadeblack": "经黑场", "fadewhite": "经白场", "fadegrays": "经灰场",
+    # 擦除类
+    "wipeleft": "向左擦除", "wiperight": "向右擦除", "wipeup": "向上擦除", "wipedown": "向下擦除",
+    # 滑动类
+    "slideleft": "向左滑动", "slideright": "向右滑动", "slideup": "向上滑动", "slidedown": "向下滑动",
+    # 平滑滑动
+    "smoothleft": "向左平滑", "smoothright": "向右平滑", "smoothup": "向上平滑", "smoothdown": "向下平滑",
+    # 形状与缩放
+    "circlecrop": "圆形裁剪", "circleclose": "圆形收缩", "circleopen": "圆形展开", "zoomin": "放大进入",
+    # 其他特效
+    "dissolve": "溶解", "pixelize": "像素化", "radial": "径向扫描",
+    # 形状开合
+    "rectcrop": "矩形裁剪", "vertopen": "纵向展开", "vertclose": "纵向合拢",
+    "horzopen": "横向展开", "horzclose": "横向合拢",
+    # 对角
+    "diagtl": "对角 左上起", "diagtr": "对角 右上起", "diagbl": "对角 左下起", "diagbr": "对角 右下起",
+    # 切片 / 风车
+    "hlslice": "水平左切片", "hrslice": "水平右切片", "vuslice": "垂直上切片", "vdslice": "垂直下切片",
+    "hlwind": "水平左风车", "hrwind": "水平右风车", "vuwind": "垂直上风车", "vdwind": "垂直下风车",
+    # 四角擦除
+    "wipetl": "向左上擦除", "wipetr": "向右上擦除", "wipebl": "向左下擦除", "wipebr": "向右下擦除",
+    # 覆盖 / 揭开
+    "coverleft": "向左覆盖", "coverright": "向右覆盖", "coverup": "向上覆盖", "coverdown": "向下覆盖",
+    "revealleft": "向左揭开", "revealright": "向右揭开", "revealup": "向上揭开", "revealdown": "向下揭开",
+    # 挤压 / 快慢淡变 / 其它
+    "squeezeh": "横向挤压", "squeezev": "纵向挤压",
+    "fadefast": "快速淡变", "fadeslow": "慢速淡变", "hblur": "横向模糊", "distance": "距离渐变",
+}
+
+
+def xfade_display_name(ttype):
+    """canonical 转场名 -> 中文显示名。未登记的类型原样返回（向后兼容旧工程 / 新类型）。"""
+    return XFADE_TRANSITIONS_ZH.get(ttype, ttype)
+
+
+def xfade_display_choices():
+    """下拉用的中文显示名列表，顺序与 XFADE_TRANSITIONS 一一对应（回写按索引取 canonical）。"""
+    return [XFADE_TRANSITIONS_ZH.get(t, t) for t in XFADE_TRANSITIONS]
+
+
+def xfade_canonical_by_index(idx):
+    """下拉索引 -> canonical 转场名（禁按显示文本反查：中文名会随翻译/改名变动）。"""
+    try:
+        i = int(idx)
+    except (TypeError, ValueError):
+        return "fade"
+    if 0 <= i < len(XFADE_TRANSITIONS):
+        return XFADE_TRANSITIONS[i]
+    return "fade"
 
 
 _COPY_FILTER_EXCLUDE_KEYS = frozenset({
@@ -25421,10 +25755,14 @@ class FFmpegBatchGUI:
 #             if arg in ("-vf", "-af", "-filter_complex"):
 #                print(f"[DEBUG] Found {arg} at index {idx}, value length: {len(cmd_list[idx+1]) if idx+1 < len(cmd_list) else 'missing'}")
 
+        # ffmpeg 7.1 起 -filter_complex_script / -vf_script / -af_script 被废弃，
+        # 9.0 起彻底删除（commit 07407fff6142f14dcb21b8a06d0d15db0e31135e）。
+        # 官方替代是「/」语法：其后参数作为「滤镜文件」路径（7.1+，含当前 9.0）。
+        #   -filter_complex -> -/filter_complex、-vf -> -/vf、-af -> -/af
         script_map = {
-            "-vf": "-vf_script",
-            "-af": "-af_script",
-            "-filter_complex": "-filter_complex_script",
+            "-vf": "-/vf",
+            "-af": "-/af",
+            "-filter_complex": "-/filter_complex",
         }
         new_cmd = []
         temp_files = []
@@ -28695,10 +29033,12 @@ class FFmpegBatchGUI:
             return
         self._updating_preview = True
         try:
-            # ---- 水印/画中画禁用组合跳转 ----
+            # ---- 水印禁用组合跳转 ----
+            # 2026-09-12：删去 pip_enabled 条件——「启用画中画」勾选只在封装页（合并 tab），
+            # 转换命令生成全程不消费它，勾了会误锁转换页截取/组合跳转（-双ss）。
+            # 页面隔离同 L34443 判例（2026-08-19：转换页水印不得影响封装页）的反向。
             watermark_enabled = self.watermark_settings.get("enabled", False)
-            pip_enabled = self.pip_enabled.get()
-            if watermark_enabled or pip_enabled:
+            if watermark_enabled:
                 if self.trim_frame.show_combo_seek and self.trim_frame.combo_seek.get():
                     self.trim_frame.combo_seek.set(False)
                     self._append_info_ui("[提示] 水印/画中画模式下已自动禁用组合跳转。")
@@ -28734,7 +29074,8 @@ class FFmpegBatchGUI:
             # ---- 同步精准截取 ----
             try:
                 watermark_enabled = self.watermark_settings.get("enabled", False)
-                if (watermark_enabled or self.pip_enabled.get()) and self.trim_frame.trim_enabled.get():
+                # 2026-09-12：删去 pip_enabled——同上，画中画只在封装页，转换页只看水印。
+                if watermark_enabled and self.trim_frame.trim_enabled.get():
                     if not self.trim_frame.precise_trim.get():
                         self.trim_frame.precise_trim.set(True)
                     self.trim_frame.precise_check.config(state='disabled')
@@ -30135,6 +30476,12 @@ class FFmpegBatchGUI:
 
         self.merge_manual_duration.trace_add('write', _debounced_manual_dur)
 
+        # 串行合并「参数归一」开关（2026-09-13 新增，实验期）：
+        # True = 把 format / fps / settb 从「每段都写」改成「concat 之后只写一次」，命令大幅缩短。
+        # 默认 False = 历史行为（每段 6 个归一滤镜），两条路径共存观察。
+        # 开关 UI 在「末端处理」弹窗最下方，仅串行合并模式下显示。
+        self.concat_norm_global = tk.BooleanVar(value=False)
+
         # ----- 末端处理设置（多画面拼接 split / 末端 concat 图片/视频 / 边框 pad） -----
         self._merge_end_handling = {
             "split_enabled": False,      # 多画面拼接
@@ -30516,6 +30863,32 @@ class FFmpegBatchGUI:
                 "• 输出尺寸为奇数时自动向上取偶（yuv420p 要求）\n"
                 "• 纯 copy 编码会自动切换重编码（滤镜必须）",
                 wraplength=400)
+
+        # ---------- 功能4：串行合并参数归一（2026-09-13 新增，仅封装页 + 串行合并模式显示） ----------
+        # 控制 concat 的「统一规格」参数写在哪里：逐段写（历史）vs concat 之后写一次（精简）。
+        # 新路径默认关闭，与历史路径共存观察。落位规则见 build_concat_norm_plan。
+        _merge_page = (target is None) or (target is self._merge_end_handling)
+        if _merge_page and getattr(self, "concat_enabled", None) is not None and self.concat_enabled.get():
+            f4 = ttk.LabelFrame(win, text="串行合并 · 参数归一（实验）", padding="6")
+            f4.pack(fill=tk.X, padx=10, pady=4)
+            ttk.Checkbutton(f4, text="精简命令：format / fps / settb 挪到 concat 之后（只写一次）",
+                            variable=self.concat_norm_global,
+                            command=lambda: self.merge_update_command_preview()).pack(anchor=tk.W)
+            ttk.Label(f4, text="每段 6 个归一滤镜 → 只留 scale+setsar（启用转场时保留 fps），输出规格不变。",
+                      foreground="gray").pack(anchor=tk.W, pady=(2, 0))
+            ToolTip(f4,
+                    "串行合并时 concat 要求各段规格一致，所以每段都要先「归一」。\n"
+                    "本开关只决定这些归一参数写在什么地方，不改变输出结果：\n\n"
+                    "· 不勾选（默认，历史行为）：每段都写\n"
+                    "  scale / format / fps / setsar / settb / setpts —— 10 段就是 60 个滤镜，命令很长。\n\n"
+                    "· 勾选（实验）：段前只留 concat 真正需要的 scale + setsar，\n"
+                    "  format / fps / settb 挪到 concat 之后统一写一次 —— 10 段只要 20+3 个。\n\n"
+                    "实测（ffmpeg n9.0.1）：两种写法输出的分辨率、像素格式、帧率、SAR、\n"
+                    "帧数、时长完全一致（含 10bit 源，逐像素 PSNR=inf）。\n"
+                    "启用转场（xfade）时 fps 会自动留在段前：xfade 的 offset 按帧数算，\n"
+                    "帧率不一致会直接报错，无法后置。\n\n"
+                    "实验期默认关闭，发现异常请取消勾选并反馈。",
+                    wraplength=460)
 
         # ---------- 确定 / 取消 ----------
         btm = ttk.Frame(win)
@@ -31093,7 +31466,7 @@ class FFmpegBatchGUI:
         self.merge_update_track_list()
         self.merge_update_command_preview()
         self._append_info_ui(
-            f"[转场] 已为 {len(targets)} 个视频轨道开启串行转场（类型 {ttype}，时长 {td:.2f}s，末段自动跳过）"
+            f"[转场] 已为 {len(targets)} 个视频轨道开启串行转场（类型 {xfade_display_name(ttype)}，时长 {td:.2f}s，末段自动跳过）"
         )
 
     def _copy_filter_from_selected(self):
@@ -31773,6 +32146,7 @@ class FFmpegBatchGUI:
 
             "pip_enabled": self.pip_enabled.get(),
             "concat_enabled": self.concat_enabled.get(),
+            "concat_norm_global": self._concat_norm_global_on(),
             "oneclick_fade_duration": self.oneclick_fade_duration.get(),
             "merge_only_audio": self.merge_only_audio.get(),
             "merge_manual_duration_enabled": self.merge_manual_duration_enabled.get(),
@@ -31864,6 +32238,8 @@ class FFmpegBatchGUI:
             self.merge_container.set(state.get("merge_container", "mkv"))
             self.pip_enabled.set(state.get("pip_enabled", False))
             self.concat_enabled.set(state.get("concat_enabled", False))
+            if hasattr(self, "concat_norm_global"):
+                self.concat_norm_global.set(state.get("concat_norm_global", False))
             self.oneclick_fade_duration.set(state.get("oneclick_fade_duration", "1.0"))
             self.merge_only_audio.set(state.get("merge_only_audio", False))
             self.merge_manual_duration_enabled.set(state.get("merge_manual_duration_enabled", False))
@@ -33777,11 +34153,26 @@ class FFmpegBatchGUI:
         return ",".join(parts)
 
 
-    def _build_concat_video_graph(self, video_tracks):
+    def _concat_norm_global_on(self):
+        """串行合并「参数归一」开关状态：True = 精简命令（format/fps/settb 挪到 concat 之后只写一次）。
+
+        开关在「末端处理」弹窗底部（仅封装页 + 串行合并模式下显示）。
+        默认 False = 历史命令（逐段 6 个归一滤镜），两条路径共存观察一段时间，
+        确认输出一致后再考虑反转默认值。开关缺失（转码页/队列等非封装页上下文）恒返回 False。
+        """
+        _v = getattr(self, "concat_norm_global", None)
+        return bool(_v is not None and _v.get())
+
+    def _build_concat_video_graph(self, video_tracks, global_norm=False):
         """构建串行合并「纯视频」filter_complex：主视频规格计算 + 逐轨滤镜 + 强制归一 + 逐轨转场/硬切拼接。
 
         供 _build_concat_reencode_mode（正式命令）与 _build_concat_contact_sheet_cmd（缩略图预览）复用，
         保证缩略图画面与最终成片的视频链完全一致（单一来源，避免两处逻辑漂移）。
+
+        global_norm：False（默认）= 历史行为，6 个归一滤镜逐段写；
+                     True = 精简命令，只把 concat 的硬门槛留在段前，其余挪到 concat 后写一次。
+                     由「末端处理 → 串行合并·参数归一（实验）」开关控制，落位规则见
+                     build_concat_norm_plan 的 docstring（有实测依据，勿凭直觉改）。
         返回 (filter_parts, v_labels, seg_durations, trans_effective, total_dur)：
           - filter_parts：视频侧 filter_complex 分句列表（末句输出标签 [vout]）
           - v_labels：各段视频标签 [v0]...[vn-1]
@@ -33846,6 +34237,13 @@ class FFmpegBatchGUI:
             trans_effective[i] = (_ttype, _td)
 
         # ----- 4. 逐轨视频滤镜 + 强制归一（与淡入淡出互斥） -----
+        # 归一参数的落位由 build_concat_norm_plan 决定（规则与实测依据见其 docstring）。
+        # global_norm=True 时段前只留硬门槛 scale/setsar（xfade 时额外留 fps），
+        # format/fps/settb 统一挪到 concat 之后只写一次 → 命令长度 6×N 降到 2×N+3。
+        _has_xfade = any(t is not None for t in trans_effective)
+        pre_norm, post_norm = build_concat_norm_plan(
+            main_target_w, main_target_h, target_pix_fmt, target_fps,
+            has_xfade=_has_xfade, global_norm=global_norm)
         filter_parts = []
         v_labels = []
         for i, track in enumerate(video_tracks):
@@ -33862,11 +34260,14 @@ class FFmpegBatchGUI:
                 enhance_settings=settings.get("enhance", {}),
                 reverse=settings.get("reverse_enabled", False),
                 graph_id=f"c{i}", include_fade=True, clip_duration=seg_durations[i])
-            forced = [
-                f"scale={main_target_w}:{main_target_h}",
-                f"format={target_pix_fmt}",
-                f"fps={target_fps:.6f}".rstrip('0').rstrip('.'),
-                "setsar=1", "settb=AVTB", "setpts=PTS-STARTPTS"]
+            forced = list(pre_norm)
+            # setpts 只能段前：后置是整体平移，救不回段内偏移（实测总时长会多出偏移量）。
+            # 历史路径 pre_norm 已含 setpts。精简路径下通常不必补——唯一会让段内 pts 起点非 0
+            # 的「精准截取」，build_video_filter_chain 自己已在 trim 后紧跟 setpts=PTS-STARTPTS
+            # （见 3910 行），未截取的段起点本就是 0（输入级 -ss 由 ffmpeg 自动归零）。
+            # 这里只在极端情况（链里有 trim 却没有 setpts）兜底补一次，避免重复也避免漏判。
+            if global_norm and "trim=" in video_filters and "setpts=" not in video_filters:
+                forced.append("setpts=PTS-STARTPTS")
             if video_filters and video_filters != "null":
                 full_vf = f"{video_filters},{','.join(forced)}"
             else:
@@ -33875,11 +34276,14 @@ class FFmpegBatchGUI:
             v_labels.append(f"[v{i}]")
 
         # ----- 5. 视频拼接 / 逐轨交叉溶解转场 -----
+        # 精简路径下拼接结果先进 [vcat]，后置归一后再回到 [vout]（调用方零感知）；
+        # 历史路径 post_norm 为空 → join_out 直接是 [vout]，输出与改动前逐字符一致。
         prev = v_labels[0]
         cumulative = seg_durations[0]
+        join_out = "[vcat]" if post_norm else "[vout]"
         for k in range(1, n):
             tr = trans_effective[k - 1]
-            out_label = "[vout]" if k == n - 1 else f"[vx{k}]"
+            out_label = join_out if k == n - 1 else f"[vx{k}]"
             if tr is not None:
                 _ttype, _td = tr
                 offset = max(0.0, cumulative - _td)
@@ -33891,7 +34295,9 @@ class FFmpegBatchGUI:
                 cumulative = cumulative + seg_durations[k]
             prev = out_label
         if n == 1:
-            filter_parts.append(f"{v_labels[0]}null[vout]")
+            filter_parts.append(f"{v_labels[0]}null{join_out}")
+        if post_norm:
+            filter_parts.append(f"{join_out}{','.join(post_norm)}[vout]")
 
         total_dur = sum(seg_durations) - sum(t[1] for t in trans_effective if t is not None)
         return filter_parts, v_labels, seg_durations, trans_effective, total_dur
@@ -33924,7 +34330,8 @@ class FFmpegBatchGUI:
     
         # ----- 3. 构建纯视频 filter_complex（复用公共函数 _build_concat_video_graph） -----
         n = len(video_tracks)
-        filter_parts, v_labels, seg_durations, trans_effective, total_dur = self._build_concat_video_graph(video_tracks)
+        filter_parts, v_labels, seg_durations, trans_effective, total_dur = self._build_concat_video_graph(
+            video_tracks, global_norm=self._concat_norm_global_on())
         n_trans = sum(1 for t in trans_effective if t is not None)
         if n_trans:
             self._append_info_ui(f"[串联-编] 使用逐轨 xfade 交叉溶解转场（{n_trans} 处）")
@@ -36261,7 +36668,8 @@ class FFmpegBatchGUI:
         """串行合并主视频缩略图：复用 _build_concat_video_graph 生成视频 filter_complex
         （与正式成片完全一致），再抽帧拼 4x2 网格单图。
         只做视频、忽略音频/BGM，用于预览「拼接+转场后」的最终画面。"""
-        filter_parts, v_labels, seg_durations, trans_effective, total_dur = self._build_concat_video_graph(video_tracks)
+        filter_parts, v_labels, seg_durations, trans_effective, total_dur = self._build_concat_video_graph(
+            video_tracks, global_norm=self._concat_norm_global_on())
 
         # 总时长（用于抽帧间隔）
         interval = max(total_dur / 8.0, 0.5) if total_dur > 0 else 10.0
@@ -36834,6 +37242,13 @@ class FFmpegBatchGUI:
                 _tr_type_init = "fade"
             transition_enabled_var = tk.BooleanVar(value=initial_settings.get("transition_enabled", False))
             transition_type_var = tk.StringVar(value=_tr_type_init)
+            # 下拉只显示中文，变量里仍存 canonical 英文（保存 / 命令用）。
+            # 单向同步：canonical → 中文显示（「一键转场」等处直接 set canonical 也能刷新下拉）
+            transition_type_zh_var = tk.StringVar(value=xfade_display_name(_tr_type_init))
+            transition_type_var.trace_add(
+                "write",
+                lambda *_a: transition_type_zh_var.set(
+                    xfade_display_name(transition_type_var.get().strip() or "fade")))
             transition_duration_var = tk.StringVar(value=str(initial_settings.get("transition_duration", "1.0") or "1.0"))
             if not is_watermark and (track_obj is None or (hasattr(track_obj, 'type') and track_obj.type == "video")):
                 page_fade = ttk.Frame(notebook)
@@ -36855,9 +37270,14 @@ class FFmpegBatchGUI:
                     tr_cb = ttk.Checkbutton(tr_row, text="启用串行转场",
                                             variable=transition_enabled_var)
                     tr_cb.pack(side=tk.LEFT)
-                    tr_combo = ttk.Combobox(tr_row, textvariable=transition_type_var,
-                                            values=XFADE_TRANSITIONS, state="readonly", width=12)
+                    tr_combo = ttk.Combobox(tr_row, textvariable=transition_type_zh_var,
+                                            values=xfade_display_choices(), state="readonly", width=12)
                     tr_combo.pack(side=tk.LEFT, padx=(8, 0))
+                    # 按索引回写 canonical（禁按显示文本反查：中文名会随文案调整变动）
+                    tr_combo.current(XFADE_TRANSITIONS.index(_tr_type_init))
+                    tr_combo.bind("<<ComboboxSelected>>",
+                                  lambda _e: transition_type_var.set(
+                                      xfade_canonical_by_index(tr_combo.current())))
                     ttk.Label(tr_row, text="转场时长:").pack(side=tk.LEFT, padx=(8, 0))
                     ttk.Entry(tr_row, textvariable=transition_duration_var, width=6).pack(side=tk.LEFT, padx=(2, 0))
                     ttk.Label(tr_row, text="秒").pack(side=tk.LEFT)
