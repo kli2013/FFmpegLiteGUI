@@ -561,3 +561,6 @@ split=2[rb…bg][rb…fg];[rb…fg]crop=<外扩>,<滤镜>,<裁回>[rb…bl];[rb�
 位置 、尺寸、旋转 示例
 <video src="https://github.com/user-attachments/assets/667daea7-d0f6-4d41-bc29-c2dae5c78ffa" controls width="100%"></video>
 
+10秒打水印
+<video src="https://github.com/user-attachments/assets/866d3453-9b77-40b4-9145-66cefae44ed4" controls width="100%"></video>
+
