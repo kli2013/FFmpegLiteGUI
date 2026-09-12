@@ -35,7 +35,7 @@ jobs:
         shell: pwsh
         run: |
           if ("${{ github.event.inputs.version }}" -ne "") {
-            $VER = "${{ github.event.inputs.version }}"
+            $VER = "${{ github.event.inputs.version }}-$(git rev-parse --short HEAD)"
           } else {
             $VER = git describe --tags --always --dirty 2>$null
             if (-not $VER) { $VER = "continuous-${{ github.run_number }}" }
@@ -48,10 +48,13 @@ jobs:
         run: |
           if (Test-Path version.txt) {
             $cleanVer = "${{ env.VERSION }}".TrimStart('v')
-            if ($cleanVer -match '^\d+\.\d+\.\d+') {
-              $verParts = $cleanVer.Split('.')
+            # 只用 x.y.z 段做文件版本：剥离 -<hash> / -dirty 这类后缀
+            $baseVer = ($cleanVer -split '[-+]')[0]
+            if ($baseVer -match '^\d+\.\d+\.\d+') {
+              $verParts = $baseVer.Split('.')
               $verTuple = ($verParts[0..2] | ForEach-Object { $_ }) -join ','
               $verTuple += ",0"
+              $cleanVer = $baseVer
             } else {
               $verTuple = "1,0,0,0"
               $cleanVer = "1.0.0"
@@ -73,10 +76,13 @@ jobs:
         run: |
           if (Test-Path version1.txt) {
             $cleanVer = "${{ env.VERSION }}".TrimStart('v')
-            if ($cleanVer -match '^\d+\.\d+\.\d+') {
-              $verParts = $cleanVer.Split('.')
+            # 只用 x.y.z 段做文件版本：剥离 -<hash> / -dirty 这类后缀
+            $baseVer = ($cleanVer -split '[-+]')[0]
+            if ($baseVer -match '^\d+\.\d+\.\d+') {
+              $verParts = $baseVer.Split('.')
               $verTuple = ($verParts[0..2] | ForEach-Object { $_ }) -join ','
               $verTuple += ",0"
+              $cleanVer = $baseVer
             } else {
               $verTuple = "1,0,0,0"
               $cleanVer = "1.0.0"
@@ -143,7 +149,7 @@ jobs:
         shell: pwsh
         run: |
           if ("${{ github.event.inputs.version }}" -ne "") {
-            $VER = "${{ github.event.inputs.version }}"
+            $VER = "${{ github.event.inputs.version }}-$(git rev-parse --short HEAD)"
           } else {
             $VER = git describe --tags --always --dirty 2>$null
             if (-not $VER) { $VER = "continuous-${{ github.run_number }}" }
@@ -156,10 +162,13 @@ jobs:
         run: |
           if (Test-Path version.txt) {
             $cleanVer = "${{ env.VERSION }}".TrimStart('v')
-            if ($cleanVer -match '^\d+\.\d+\.\d+') {
-              $verParts = $cleanVer.Split('.')
+            # 只用 x.y.z 段做文件版本：剥离 -<hash> / -dirty 这类后缀
+            $baseVer = ($cleanVer -split '[-+]')[0]
+            if ($baseVer -match '^\d+\.\d+\.\d+') {
+              $verParts = $baseVer.Split('.')
               $verTuple = ($verParts[0..2] | ForEach-Object { $_ }) -join ','
               $verTuple += ",0"
+              $cleanVer = $baseVer
             } else {
               $verTuple = "1,0,0,0"
               $cleanVer = "1.0.0"
@@ -181,10 +190,13 @@ jobs:
         run: |
           if (Test-Path version1.txt) {
             $cleanVer = "${{ env.VERSION }}".TrimStart('v')
-            if ($cleanVer -match '^\d+\.\d+\.\d+') {
-              $verParts = $cleanVer.Split('.')
+            # 只用 x.y.z 段做文件版本：剥离 -<hash> / -dirty 这类后缀
+            $baseVer = ($cleanVer -split '[-+]')[0]
+            if ($baseVer -match '^\d+\.\d+\.\d+') {
+              $verParts = $baseVer.Split('.')
               $verTuple = ($verParts[0..2] | ForEach-Object { $_ }) -join ','
               $verTuple += ",0"
+              $cleanVer = $baseVer
             } else {
               $verTuple = "1,0,0,0"
               $cleanVer = "1.0.0"
@@ -251,7 +263,7 @@ jobs:
         shell: pwsh
         run: |
           if ("${{ github.event.inputs.version }}" -ne "") {
-            $VER = "${{ github.event.inputs.version }}"
+            $VER = "${{ github.event.inputs.version }}-$(git rev-parse --short HEAD)"
           } else {
             $VER = git describe --tags --always --dirty 2>$null
             if (-not $VER) { $VER = "continuous-${{ github.run_number }}" }
@@ -264,10 +276,13 @@ jobs:
         run: |
           if (Test-Path version.txt) {
             $cleanVer = "${{ env.VERSION }}".TrimStart('v')
-            if ($cleanVer -match '^\d+\.\d+\.\d+') {
-              $verParts = $cleanVer.Split('.')
+            # 只用 x.y.z 段做文件版本：剥离 -<hash> / -dirty 这类后缀
+            $baseVer = ($cleanVer -split '[-+]')[0]
+            if ($baseVer -match '^\d+\.\d+\.\d+') {
+              $verParts = $baseVer.Split('.')
               $verTuple = ($verParts[0..2] | ForEach-Object { $_ }) -join ','
               $verTuple += ",0"
+              $cleanVer = $baseVer
             } else {
               $verTuple = "1,0,0,0"
               $cleanVer = "1.0.0"
@@ -321,7 +336,7 @@ jobs:
         shell: pwsh
         run: |
           if ("${{ github.event.inputs.version }}" -ne "") {
-            $VER = "${{ github.event.inputs.version }}"
+            $VER = "${{ github.event.inputs.version }}-$(git rev-parse --short HEAD)"
           } else {
             $VER = git describe --tags --always --dirty 2>$null
             if (-not $VER) { $VER = "continuous-${{ github.run_number }}" }
@@ -334,10 +349,13 @@ jobs:
         run: |
           if (Test-Path version.txt) {
             $cleanVer = "${{ env.VERSION }}".TrimStart('v')
-            if ($cleanVer -match '^\d+\.\d+\.\d+') {
-              $verParts = $cleanVer.Split('.')
+            # 只用 x.y.z 段做文件版本：剥离 -<hash> / -dirty 这类后缀
+            $baseVer = ($cleanVer -split '[-+]')[0]
+            if ($baseVer -match '^\d+\.\d+\.\d+') {
+              $verParts = $baseVer.Split('.')
               $verTuple = ($verParts[0..2] | ForEach-Object { $_ }) -join ','
               $verTuple += ",0"
+              $cleanVer = $baseVer
             } else {
               $verTuple = "1,0,0,0"
               $cleanVer = "1.0.0"
@@ -408,7 +426,7 @@ jobs:
         shell: pwsh
         run: |
           if ("${{ github.event.inputs.version }}" -ne "") {
-            $VER = "${{ github.event.inputs.version }}"
+            $VER = "${{ github.event.inputs.version }}-$(git rev-parse --short HEAD)"
           } else {
             $VER = git describe --tags --always --dirty 2>$null
             if (-not $VER) { $VER = "continuous-${{ github.run_number }}" }
