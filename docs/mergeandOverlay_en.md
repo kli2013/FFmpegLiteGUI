@@ -16,7 +16,7 @@ The Merge page (Mux / Merge / PiP) is one of the core modules. It combines multi
 
 ### 1.1 Main video & track management
 - **Main video** — the base video file.
-- **Track list (Treeview)** — all added tracks (video/audio/subtitle) with enabled state, type, spec (resolution/duration/codec…), encode settings. Double-click to edit a track; drag-and-drop to add (auto type detection). Toolbar: enable/disable, edit, preview, move up/down, delete, clear, sort (by name or mtime), save/load project.
+- **Track list (Treeview)** — all added tracks (video/audio/subtitle) with enabled state, type, spec (resolution/duration/codec…), encode settings. Double-click to edit a track; drag-and-drop to add (auto type detection). Toolbar: enable/disable, edit, preview, move up/down, delete, clear, sort (by name or mtime), save/load project. Right-click menu on selected tracks: copy/paste/reset filter settings, copy/paste trim·speed·reverse (V→A), enable/disable, edit, preview (incl. snapshot/live), contact sheet, move up/down, clone, **Replace source**, delete, reset column widths — full list in §7.4.
 
 ### 1.2 Add external tracks
 - **External audio** — `mp3`, `aac`, `wav`, `flac`, `opus`, `ac3`…
@@ -227,10 +227,93 @@ Double-click any audio or subtitle track in the list to open its detailed settin
 - Clicking also refreshes the currently-open edit window's checkboxes / dropdown / duration boxes, so "Save" won't overwrite the just-applied settings.
 
 ### 7.4 Right-click menu operations overview
+
+> Invoked by right-clicking any row of the track list. Complete list below, grouped by function. Most items act on the **selected track(s)** (multi-select supported).
+
+**① Filter settings — copy / paste / reset**
+- **"Copy filter settings"** — copies filter params from the first selected track (a "copy all by default, explicit exclusions" strategy; only non-cross-transferable items are skipped).
+- **"Paste filter settings"** — applies the clipboard filter settings to the selected tracks (greyed out when the clipboard is empty).
+- **"Reset filter settings"** — resets the selected tracks' filters to defaults (clears all filters).
+
+**② Trim / speed / reverse (V→A)**
 - **"Copy trim/spd/rev (V→A)"** — copy the selected video track's trim/speed/reverse (enabled only when a video track is selected).
 - **"Paste trim/spd/rev (V→A)"** — apply those to selected audio tracks (enabled only with a clipboard; includes out-of-range safety guard).
-- **"Batch src-audio→video T/S/R (V → A)"** — see §6.3.
-- **"One-click fade in/out (all) / One-click transition (all)" buttons** — see §7.3 (now buttons + their own duration boxes inside the "Fade in/out" tab, not a right-click menu).
+- **"Batch src-audio→video T/S/R (V → A)"** — batch-applies to the source-linked audio among the selected tracks; out-of-range auto-clamped with a one-time summary (see §6.3).
+
+**③ Playback, preview & thumbnails**
+- **"Enable/Disable"** — toggle the selected tracks' enabled state.
+- **"Edit track"** — open the selected track's settings dialog (same as double-clicking the row).
+- **"Preview track"** — preview the selected track.
+- **"Preview track (snapshot – PiP composite)"** — render a still of the PiP-composited frame.
+- **"Live preview (PiP, may stutter)"** — mpv real-time composite preview (PiP mode only).
+- **"Create thumbnail"** — generate a contact sheet for the first selected video track (for the main video, simulates the composited / concatenated frame per the current mode).
+
+**④ Track order & structure**
+- **"Move up" / "Move down"** — reorder the selected tracks in the list.
+- **"Clone track"** — deep-copies the selected track (all filters / trim / overlay / transition settings) right after it; clones the first when several are selected.
+- **"Replace source"** — swaps **only the source file**, keeping layout & filters intact (see below).
+- **"Delete track"** — delete the selected tracks.
+- **"Reset column widths"** — restore the track list's default column widths.
+
+**⑤ Replace source (added 2026-09-11)**
+- **Core semantics: swap the source file only.** Select a track → right-click **"Replace source"** → pick a new file; only the track's source path changes — **position / scale / rotate / crop / filters / trim / transition (the whole encode-settings block) is preserved, with no automatic adaptation** (the CapCut-style "re-fit on swap" is deliberately NOT done).
+- **Main-video double write:** if you replace the main video track, the main-video variable is updated too, avoiding "self-overlay" or a path mismatch.
+- **Report-only, never mutate params:** after swapping, the new media is validated and findings are surfaced as **log lines only** (no popup, no parameter changes):
+  - the new source lacks the required stream type (video track with no video stream / audio track with no audio stream);
+  - a video track whose audio source is itself, but the new source has no audio stream (the command may fail);
+  - the track has chroma-key enabled (key colour / similarity need re-tuning for the new footage);
+  - the new source's duration differs (transition / fade / trajectory **absolute-second params are NOT auto-adapted**);
+  - the trim end exceeds the new source's duration (output gets silently truncated).
+- If the file does not exist or equals the current source → a single log line, no change.
+- Why the layout survives: sub-video positions default to relative expressions and crop sizes default relative to the source, so they adapt to the new size automatically.
+
+> Note: "One-click fade in/out (all) / One-click transition (all)" is no longer a right-click item — it lives as buttons inside the main video's "Fade in/out" tab (see §7.3).
+
+### 7.5 Appendix — the 24 transition types in detail (xfade transition)
+
+> The transition-type dropdown has 24 entries in 6 families. Below, what each looks like on screen, so you can pick by intent.
+
+**1. Fade**
+These control opacity or colour to cross over smoothly.
+
+- **fade** — the basic cross-fade. The previous picture fades out while the next fades in; the two overlap and blend during the transition.
+- **fadeblack** — fade through black. The previous picture dims to full black, then the next brightens out of the black.
+- **fadewhite** — fade through white. The previous picture brightens to full white, then the next emerges from the white.
+- **fadegrays** — fade through grey. Like the above but the previous picture dissolves to grey and the next emerges from the grey.
+
+**2. Wipe**
+Simulates a physical wiper sweeping across the screen: the previous picture is pushed away / wiped off, revealing the next.
+
+- **wipeleft** — wipe right-to-left. The previous picture exits to the left, the next appears in its wake.
+- **wiperight** — wipe left-to-right. The previous picture exits to the right.
+- **wipeup** — wipe bottom-to-top. The previous picture exits upward from the bottom.
+- **wipedown** — wipe top-to-bottom. The previous picture exits downward from the top.
+
+**3. Slide**
+Similar to wipe, but the slide family keeps each picture intact — like two cards sliding to swap places.
+
+- **slideleft** — slide left. The previous picture slides off to the left; the next slides in from the right.
+- **slideright** — slide right. The previous picture slides off to the right; the next slides in from the left.
+- **slideup** — slide up. The previous picture slides off upward; the next slides in from the bottom.
+- **slidedown** — slide down. The previous picture slides off downward; the next slides in from the top.
+
+**4. Smooth slide**
+Adds an ease-in/ease-out curve on top of a plain slide, so it accelerates and decelerates — visually more natural and fluid.
+
+- **smoothleft / smoothright / smoothup / smoothdown** — left / right / up / down smooth slides; same motion as the slide family but with a smoother rhythm.
+
+**5. Shape & zoom**
+These use a geometric shape or a zoom to switch content.
+
+- **circlecrop** — circular crop transition. A circular region grows or shrinks to reveal or hide the picture.
+- **circleclose** — circle closing. A circle contracts from the screen edges toward the centre, closing to switch to the next picture (or the next expands from a centre circle).
+- **circleopen** — circle opening. The reverse of circleclose: a circle grows from the centre outward, gradually revealing the next picture.
+- **zoomin** — zoom transition. The previous picture zooms in fast until it fills the screen, then switches to the next.
+
+**6. Others**
+- **dissolve** — the previous picture's pixels scatter away like sand or noise while the next surfaces — a dreamy / old-film feel.
+- **pixelize** — the previous picture turns into mosaic blocks until it is fully blocky, then resolves into the next.
+- **radial** — radial transition. From the screen centre, a radar-sweep / fan expansion gradually reveals the next picture.
 
 ---
 
@@ -239,8 +322,9 @@ Double-click any audio or subtitle track in the list to open its detailed settin
 The mask is a standalone feature (not a toggle on some filter). It applies to the **sub-video** and **text watermark** on the Mux page, making part of the sub-video transparent so the main video (or canvas) shows through. Entry point: on the video-track editor's **"Loop / Chroma"** tab, the **"Mask"** button to the right of the **Transparency** checkbox (spaced `padx=25` from it).
 
 ### 9.1 Open the mask dialog
-- Click **Mask** to open the settings box: an **Enable mask** checkbox, mask direction, rectangle coordinates (x / y / width / height, original frame), and Save/Cancel buttons.
-- Coordinates share the same source as the **Crop** editor: click **"📋 Copy coords from crop"** to fill in one click (values match the original frame; the mask block is placed before the crop filter).
+- Click **Mask** to open the settings box. **Since 2026-09-11 this is a single delogo-style dialog (list on top, params below)** that can hold several shapes (see §15): top **Enable mask** master switch → shape list (enabled / type / direction / coord summary; click the "enabled" cell to toggle one row) → edit-selected-shape panel (direction radio / X·Y·W·H + 🎯 visual region picker / edge feather / external shape image / time window / trajectory) → Save / Cancel.
+- Coordinate space = the sub-video's **final rendered frame** (after crop→rotate→scale), identical to the dialog's canvas — zero conversion. The old **"📋 Copy coords from crop"** button is gone (replaced by an independent region picker inside the list).
+- ⚠️ The master **"Enable mask"** switch must be checked and **Save** clicked for the mask block to enter the command; if the shape list is empty, Save auto-turns the master switch off (avoids a 0-size rectangle blacking out the whole frame).
 
 ### 9.2 Mask direction
 - **Outside the mask (show only rectangle)**: black background, white rectangle — opaque inside the rectangle, transparent outside; the main video shows through outside the rectangle.
@@ -248,7 +332,7 @@ The mask is a standalone feature (not a toggle on some filter). It applies to th
 
 ### 9.3 Scope & implementation
 - The mask applies to both **PiP sub-videos** and **text watermarks** (both share the same "Loop / Chroma" editor).
-- Internally uses `alphamerge`: writes the grayscale mask into the alpha channel (white = opaque, black = transparent). The bundled ffmpeg has no `mask` filter, so it goes `split=2[a][m];[m]format=gray,drawbox…;[a][msk]alphamerge`.
+- Internally uses `alphamerge`: writes the grayscale mask into the alpha channel (white = opaque, black = transparent). The bundled ffmpeg has no `mask` filter, so it goes `format=rgba,split=2[a][m];[m]format=gray,drawbox…[msk];[a][msk]alphamerge`. `format=rgba` before the split locks the main input's pixel format — otherwise the matte's `format=gray` lets ffmpeg's auto format negotiation downgrade the scale output to gray, greying out the whole frame (fixed 2026-09-10).
 - When the mask is enabled, the sub-video pipeline forces `format=rgba` to keep alpha; the transparent area is shown through by the main video/canvas during overlay — **no mov/alpha muxing needed** (transparency is consumed by the main video at composite time).
 
 ### 9.4 Note
@@ -355,6 +439,169 @@ Enqueue precheck / post-encode verify / size estimate, and the Transcode page's 
 
 ---
 
+## 13. Mask trajectory & edge feather (2026-09-10)
+
+The "Mask / transparent overlay" dialog (see §9) gained two blocks: **edge feather** and **mask trajectory**. Together they turn the formerly static rectangle into a **moving "reveal shutter"**.
+
+### 13.1 Unified mental model: the rectangle is a shutter pressed on the sub-video
+
+The mask rectangle is no longer just a fixed transparent region — it is **a shutter that can move**. Its size × direction decides the effect:
+
+| Rectangle size | Direction | Effect as it moves along a trajectory |
+|---|---|---|
+| Full screen (canvas size) | rectangle transparent (inside) | the shutter moves away, **permanently revealing** the sub-video where it passed (cumulative wipe) |
+| Small rectangle (window size) | show only rectangle (outside) | only inside the box is the sub-video visible (**searchlight**) |
+| Full screen | show only rectangle (outside) | reversed: from fully shown it gradually disappears |
+| Small rectangle | rectangle transparent (inside) | reversed: the box is cut out, showing the main video |
+
+> This model needs no "history accumulation" mechanism: occlusion is decided by the shutter's **current position**, so moving away undoes it — under a monotonic trajectory the visual result is equivalent to accumulation.
+
+### 13.2 Parameters
+
+- **Edge feather** (px, 0 = hard edge): 8–40 recommended; the larger, the softer the edge — visually a "gradual reveal". Implemented by appending `gblur=sigma=N` after the matte is built.
+  - ⚠️ For a full-screen shutter wipe, make the rectangle **slightly larger** than the frame (about 2× the feather on each side), or the frame edges leak semi-transparency from the start.
+- **Enable trajectory** + **Edit waypoints…**: reuses the same waypoint list as PiP (`build_waypoint_expr`) to give the shutter a movement path.
+  - ⚠️ A wipe requires the trajectory to be **monotonic** (always moving the same way): if it doubles back, the sub-video is covered again where the shutter returns.
+  - The list's **"Start coords… / End coords…"** open the visual editor to drag the shutter position directly; it uses `free_layout`, so the shutter can be dragged outside the canvas (a wipe inherently needs its start or end off-screen). Changing the shutter size in the editor is converted back into the rectangle W/H above.
+    > Implementation note: when `_trajectory_dialog`'s `edit_cb` is `None`, these two buttons are **permanently greyed out** (independent of whether "Enable list waypoints" is checked). The mask hookup once missed passing it; `_mask_edit_cb` was added, plus a static audit `tests/_test_traj_editcb_audit.py` to prevent regression.
+- Coordinates are always the **final rendered frame** of the sub-video (after crop→rotate→scale) — the local coords of "the sub-video you actually see". To do a full-screen wipe, scale the sub-video to the main video's size (then local coords ≡ frame coords).
+- **Waypoint canvas = sub-video final rendered size** (after crop→rotate→scale, computed by `compute_final_size_with_order`, consistent with "single source of truth = final_render_size"): waypoints, shutter W/H, and the visual canvas share **one coordinate system**, so dragged coords are the final coords. The window shows the current canvas size (e.g. "canvas 1920×1080"); if it says "fallback", the sub-video size wasn't probed — pick the sub-video file first.
+  - That size is saved with the waypoints into the project (`mask_traj_canvas_w/h`). At filter-build time the mask already sits after crop/rotate/scale, so `W`/`H` exactly equal this canvas size → the restore ratio is always 1 and the travel matches precisely; only old projects or an unprobed size fall back to 1280×720.
+
+### 13.3 Filter chain
+
+Without a trajectory it is still the original double-`drawbox` static matte — behaviour unchanged, word for word (zero regression). With a trajectory it becomes a dynamic matte:
+
+> The mask filter's position in the sub-video chain **moved from "before crop (original-frame coords)" to "after crop→rotate→scale, before format=rgba"** (corrected 2026-09-10). Reason: the mask coordinate space must match the "final rendered frame", or the canvas (final size) and the filter (original frame) disagree and the dragged shutter position shifts wholesale. The static rectangle's `mask_x/y/w/h` and the trajectory waypoints now both land on the final rendered frame, isomorphic with `open_mask_dialog`'s canvas.
+
+```
+split=3[a][b][c];
+[b]format=gray,drawbox=full-screen base colour[bg];
+[c]crop='min(W,iw)':'min(H,ih)':0:0,format=gray,drawbox=inverse colour[bx];
+[bg][bx]overlay=x='(<traj x>*W/canvas W)':y='(<traj y>*H/canvas H)'[,gblur=sigma=N][mk];
+[a][mk]alphamerge
+```
+
+> Why not keep using `drawbox` for positioning? Measured: `drawbox`'s x/y expressions have **no time variable** — `t` is the value of the *thickness* option, and `T` / `n` report `Undefined constant`. A dynamic matte must move to `overlay` (x/y explicitly accept `t`).
+>
+> ⚠️ `overlay`'s x/y expressions likewise have **no `iw` / `ih`** (measured `Undefined constant or missing '('`); the main input's size uses **`W` / `H`** (= `main_w` / `main_h`). Here the main input is that full-size grey base, so `W`/`H` are exactly the sub-video frame size.
+
+Timeline conversion matches "simple position" `crop_pos` and the watermark list trajectory: take the main video's trim/speed (`motion_trim_start`/`motion_speed_factor`, else `_trim_speed_from_settings`), segment time = main-video original time → converted to the output timeline.
+
+---
+
+## 14. Mask shape image (2026-09-10)
+
+The "Mask / transparent overlay" dialog gained a **shape image**: load a custom shape (heart, star, any polygon — **any format**: png/jpg/jpeg/bmp/webp/gif/tif, the `movie` filter eats them all) to use as the matte instead of a rectangle. It shares the rectangle's "rectangle coords" (the shape bounding box), the 🎯 visual region picker, and edge feather. **Checking "Enable trajectory" makes the shape move along the trajectory** (heart searchlight / wipe; waypoints = the shape's top-left corner, with the same proportional restore and time conversion as the rectangle shutter).
+
+### 14.1 Two matte routes (single-choice material type, auto-detected on load)
+
+- **Black/white luminance image**: `format=gray` takes luminance — white = show, black = transparent. jpg/bmp naturally take this route.
+- **Transparent-background block**: `format=rgba,alphaextract` takes the shape from the **alpha channel's opacity** — opaque = shape, transparent = background; **the block's colour is arbitrary** (a black block on a transparent background is the canonical asset).
+- Auto-detection: on load, ffprobe reads `pix_fmt`; with an alpha channel (rgba/bgra/gbrap/ya8/yuva* etc., see `_MASK_SHAPE_ALPHA_PIXFMTS`) → "transparent-background block"; otherwise "black/white luminance". If detection is wrong (e.g. an 8-bit palette pal8 may or may not carry tRANS — conservatively treated as luminance) you can change the radio manually.
+- **Invert black/white**: check when the asset's black/white semantics are reversed (applies `negate` to the shape route as a whole).
+
+### 14.2 Filter chain
+
+```
+format=rgba,split=2[a][m];
+[m]format=gray,lutyuv=y=0|255[bg];                     ← outside=0(black base) / inside=255(white base)
+movie=<shape image>[pg];                                ← path: \ -> forward slash, : double-escaped \:,
+[pg]format=rgba,alphaextract|format=gray                  with [ ] ' , ; -> hardlink rename in same dir
+    [,negate(invert)][,negate(inside)],scale=W:H,format=gray[shp];
+[bg][shp]overlay=x=X:y=Y[,gblur=sigma=N],format=gray[msk];   ← with trajectory, X/Y = trajectory expr
+[a][msk]alphamerge                                              same as rectangle: '(<traj x>)*main_w/canvas W'
+```
+
+Implementation notes (all measured pitfalls — see `tests/_verify_mask_png.py`):
+- **Use `lutyuv` for the base colour, not `drawbox`**: once `movie` introduces an rgb source, format negotiation drags `drawbox` into `yuva420p`, and drawbox's black on yuv = limited 16 → a full ring of alpha=16 leaks outside the shape; `lutyuv` is a LUT filter that stays gray, so 0 stays 0.
+- **After the movie's single-frame EOF, overlay defaults to `eof_action=repeat`** and holds still (measured: alpha unchanged at t=2.5 s) — no `loop` needed.
+- **Double colon escaping**: the filtergraph layer and the movie arg layer each eat one escape, so `C:/x.png` must be written as `movie=C\:/x.png` (the `\:`); the actual construction uses `.replace(":", "\\\\:")` (Python literal `\\:`); single escaping gets truncated by `avformat_open_input 'C'`.
+- Path sanitizing: `_mask_shape_movie_path` (module-level, since `build_video_filter_chain` can't reach `self._movie_path_safe`) — backslash→forward slash + double colon escape + hardlink fallback for special chars, registered in `_PREVIEW_LINKS` and cleaned up on exit.
+- Setting fields: `mask_png_enabled / mask_png_path / mask_png_invert / mask_png_type` (`type` participates in route selection → canonical English `bw|alpha`, a UI iron rule).
+
+---
+
+## 15. Mask multi-shape list (2026-09-11)
+
+The "Mask / transparent overlay" dialog was rebuilt as a **delogo-style single dialog**: a **shape list** on top, the **selected shape's params** below; the former standalone "Multi-shape list…" dialog is gone. A sub-video can stack any number of shapes (plain rectangles or external shape images), each with its own coords, direction, time window / trajectory, and feather.
+
+```
++ Mask / transparent overlay --------------------------+
+| [x] Enable mask (applies to the current sub-video)   |
+| + Shape list (add several; click "enabled" cell) --+ |
+| | on | type | dir  | coords / summary              | |
+| | v  | rect | only | 100x80@(0,0) [all]            | |
+| | v  | ext  | thru | heart.png [3~8s]              | |
+| +--------------------------------------------------+ |
+| [Add][Delete][Up][Down]      click "enabled" cell    |
+| -- Edit selected shape ---------------------------- |
+| Direction: (o)only rectangle  ( )rectangle thru      |
+| Coords (x / y / W / H, final frame) X[]Y[]W[]H[]     |
+|                    [Visual region...]                |
+| Edge feather:[   ]px (0=hard edge)                   |
+| External shape image [path.........][Load][Clear]    |
+|   material type (o)bw luminance ( )alpha block hint  |
+|   [ ]Invert black/white (when semantics reversed)    |
+| Time window: [  ] ~ [  ] s (end=0/blank = always)    |
+| [x] Trajectory (move along path)   [Edit waypoints]  |
+|                                      [Save] [Cancel] |
++------------------------------------------------------+
+```
+
+Editing works on a **local copy**: opening / cancelling doesn't touch stored data; on first open, if the list is empty but the old single-shape fields have values, they're migrated into one row; on Save, **row 0 is mirrored back into the old single-shape fields** (compat for old saves / old paths).
+
+### 15.1 Type: auto-determined, no choice
+
+- The "external shape image" field **blank** → plain rectangle (`color=` solid block).
+- With a path → external shape image (`movie=` loads the image).
+- The list's "type" column is display-only; there's no dropdown.
+
+### 15.2 Direction: per row
+
+Each row independently picks "only rectangle (outside)" or "rectangle transparent (inside)"; they can be mixed. The list's "direction" column mirrors it.
+
+### 15.3 Time window: shapes are **parallel**, never truncated (key point, most misunderstood)
+
+**Each shape's time window is independent; when windows overlap both shapes are active at once (parallel) — a later shape's window does NOT shorten an earlier one.**
+
+Example (real ffmpeg per-pixel probe `tests/_probe_mask_time_overlap.py`) — A = left rectangle 0~3s, B = right rectangle 2~4s:
+
+| Sample time | Left (A) | Right (B) | Note |
+|---|---|---|---|
+| t = 0.5s | 255 (bright) | 0 | only A |
+| t = 2.5s | **255** | **255** | **A and B both visible** ← parallel, not A cut to 2s |
+| t = 3.5s | 0 | 255 | only B (A ended on time) |
+| t = 4.5s | 0 | 0 | both ended |
+
+How overlaps composite → decided by **direction + list order** (**later row over earlier**, reorder with Up/Down):
+
+- **All "only rectangle"**: visible area is the **union** (all blocks bright).
+- **All "rectangle transparent"**: holes are the **union** (whole frame visible, each hole cut separately).
+- **Mixed**: later row over earlier. E.g. A "only" 0~3s + B "rectangle transparent" 2~4s → during 2~4s, B **punches a hole** in A's visible area (probe t=2.5 shows alpha=0 at the hole).
+
+> A single shape's **internals** (with a trajectory on) have their own rule: in the waypoint list, the first segment whose "end action ≠ keep" is the termination point; waypoints after it all go dead (see `build_waypoint_expr`). That's the shape's own business and doesn't affect others.
+
+### 15.4 Time window and trajectory are mutually exclusive
+
+- Checking **"Trajectory (move along path)"** makes that row's **time window ignored** and greys both boxes (visibility is delegated to the waypoints).
+- Essentially a "time window" is the degenerate special case of a "trajectory": one static waypoint + end-action hide. Hence they sit adjacent (both at the bottom).
+
+### 15.5 External shape image: the coords' **W / H are the render size** (the image is scaled)
+
+- For a **rectangle**: W/H = the rectangle size.
+- For an **external shape image**: the loaded image is **scaled to W × H** (`scale=W:H`), with the image's top-left at (x, y).
+- So swapping in a differently sized image, if W/H stay the same, **the on-screen size stays the same**; to keep the image's own aspect ratio, fill W/H by the image's aspect (no auto aspect-fit).
+- Probe-verified: load a 60×30 image with W/H = 40×20 → it occupies exactly **40×20** (alpha=0 beyond 40 wide / 20 high, including positions the original 30-high image would have hit).
+- "Material type" (bw luminance / alpha block — which channel the shape is taken from) is in §14; the 🎯 visual region picker and edge feather also apply to shape images.
+
+### 15.6 Implementation notes (fixes this round)
+
+- ⚠️ **An external shape image leaks `alpha=16` (≈6% tint, a faint sub-video layer over the whole frame) outside the shape**: as soon as a `movie=` (rgb source) appears in the graph, ffmpeg's format negotiation routes the trailing `format=gray` through limited-range RGB→Y, turning black into 16. Fix: after drawing the base colour add **`extractplanes=g`** (byte-exact copy of the G plane; black = 0 exactly), the same fix as the old single-shape PNG path (reproduced and fixed via probe on 2026-09-11).
+- The base is still **one matte**: `format=rgba,split=3` → base matte (base colour from the first shape's direction) + main alpha + shape sources; shapes `overlay` onto the same matte in list order (later over earlier) → one `format=gray` + `blend=all_mode=multiply` + `alphamerge`. The filter segment is generated by `_build_mask_multi_shape_filters`; an empty list falls back to the old single-shape logic (old projects keep working).
+
+---
+
 ## Appendix — filter independence/linkage across the four modes (incl. Transcode)
 
 Four working modes: ① Transcode ② Mux ③ PiP ④ Concat. Below, video filters, audio creative filters, audio reverse, and the intentionally-global filters.
@@ -379,8 +626,13 @@ Four working modes: ① Transcode ② Mux ③ PiP ④ Concat. Below, video filte
 
 **④ Concat**
 - Video: each segment (main + subs) own filter chain; at each segment's end, scale/format/fps/setsar are forcibly appended (from main video) — an intentional global required for join compatibility, no exception.
-- Audio: **external tracks** per-track independent (reverse/speed pure-independent, set in audio-track settings). **Embedded audio** is fully independent — only trim & base PTS reset, **no longer follows the segment video's reverse/speed**. If you reverse/speed a segment's video and want its embedded audio synced, add a separate audio track and check reverse/speed there; otherwise embedded audio plays forward at normal speed.
-- Intentional globals: subtitle burn-in (main only), text watermark (main only), forced spec normalize.
+- Audio:
+  - **External tracks**: per-track independent; audio reverse / speed are pure-independent (set in the audio-track settings).
+  - **Embedded audio**: **fully independent** — only trim and base PTS reset, **no longer follows that segment video's reverse/speed**. If you reverse/speed a segment's video and want its embedded audio synced, set reverse/speed yourself in a separate audio track; otherwise embedded audio plays forward at normal speed.
+  - **Per-segment audio duration clamp (prevents cumulative drift)**: concat joins in sequence, so each audio segment occupies = its processed duration. When a segment's audio gets "time offset align" (`adelay`, padding N s of silence at the head to lengthen it), speed, or trim, without a tail fix the A/V cumulative difference at each boundary grows with segment count (the more segments, the more skewed). So at the end of every audio segment's chain, append `atrim=0:T_i,apad=whole_dur=T_i` (`T_i` = the matching video segment's processed duration): over-long tails are cut, short ones padded with silence to exactly `T_i`, making **each audio segment's total duration identical to its video segment's** — cumulative drift gone. Both the external-track path and the (fallback) embedded-track path do this clamp; embedded audio also follows its video segment's speed/reverse so its natural duration already equals the video segment, avoiding silent truncation.
+    - **Audio transition (acrossfade)**: audio segments map 1:1 to video segments and follow the matching video segment's transition toggle via `acrossfade` (duration matching the video transition); the transition region is A/V-synced with no seam; adjacent audio segments without a transition stay hard-cut. Total audio duration = Σ video segment durations − Σ transition durations, fully aligned with video.
+  - **Global background music (BGM)**: only the **main video (first segment)**'s "Audio binding" tab offers a "Mix background music" toggle + file picker + volume slider (default 0.3). When enabled, the external audio **loops to fill the entire merged output**, lowered to the set volume, and **mixed under the existing audio** via `amix` (normalize=0, doesn't duck the original). Concat mode no longer uses 1:1 segment mapping for "independent external tracks" — that binding semantics was never implemented and a track/segment count mismatch would drop audio from some segments; it is now replaced by this global BGM.
+- Intentional globals: subtitle burn-in (main only), text watermark (main only), plus the forced spec normalize above.
 
 **Summary**
 - Video & audio creative filters: all four modes are per-track independent.

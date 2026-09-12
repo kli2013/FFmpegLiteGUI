@@ -1875,5 +1875,16 @@
   "时段:": "Time range:",
   "（%d 个航点）": "(%d waypoints)",
   "秒（未选中形状）": "sec (no shape selected)",
-  "秒（已由轨迹接管，此处被忽略）": "sec (handled by trajectory; ignored here)"
+  "秒（已由轨迹接管，此处被忽略）": "sec (handled by trajectory; ignored here)",
+  "恢复": "Reset",
+  "右": "Right",
+  "下": "Down",
+  "缩放 (倍率)": "Scale (ratio)",
+  "(方向=飞入/飞出角)": "(Direction = fly-in/out corner)",
+  "位置、尺寸、旋转（通用编辑器）": "Position, size, rotation (generic editor)",
+  "内容尺寸未知，无法打开通用编辑器": "Content size unknown; cannot open the generic editor",
+  "1.0=原始尺寸；坐标=居中后偏移": "1.0 = original size; coords are offset from center",
+  "[画布] ": "[Canvas] ",
+  "主输入文件不存在，无法时间预览": "Main input file missing; cannot open time preview",
+  "打开内置简易时间预览（纯 ffmpeg）：暂停后点「设为起点/终点」回填上方时段起/止（秒，输出时间线）。": "Open the built-in simple time preview (pure ffmpeg): pause, then click \"Set as start/end\" to fill the segment start/end above (seconds, output timeline)."
 }
