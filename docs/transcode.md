@@ -553,6 +553,8 @@ split=2[rb…bg][rb…fg];[rb…fg]crop=<外扩>,<滤镜>,<裁回>[rb…bl];[rb�
 
 ---
 
+## 示例
+
 简易位置 示例
 <video src="https://github.com/user-attachments/assets/01579c4c-1045-4799-9cab-c04ea90a65d3" controls width="100%"></video>
 
