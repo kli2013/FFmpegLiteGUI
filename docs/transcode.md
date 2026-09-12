@@ -564,3 +564,7 @@ split=2[rb…bg][rb…fg];[rb…fg]crop=<外扩>,<滤镜>,<裁回>[rb…bl];[rb�
 10秒打水印
 <video src="https://github.com/user-attachments/assets/866d3453-9b77-40b4-9145-66cefae44ed4" controls width="100%"></video>
 
+快速平铺
+<video src="https://github.com/user-attachments/assets/d4321056-ec49-4e90-a4b4-b26ef27997d2" controls width="100%"></video>
+
+
