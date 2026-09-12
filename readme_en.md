@@ -3,7 +3,7 @@
 
 # FFmpegLiteGUI
 
-> **Note:** The bundled build may lag behind the source. Feel free to fork and build it yourself — several automated build scripts are included.
+> **Note:** The bundled build may lag behind the source. Feel free to fork and build it yourself — several automated build scripts are included. [[about](docs/about_en.md)]
 
 ---
 
