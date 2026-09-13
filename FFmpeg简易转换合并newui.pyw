@@ -44418,16 +44418,45 @@ def _sync_peak_gain(peaks, cap=_SYNC_GAIN_MAX, target=_SYNC_GAIN_TARGET,
 # ============ 多流同步参考：局部音频匹配（2026-09-13 追加） ============
 # 用户原话：「有没有能按当前光标给当前和其他轨道打点的按钮, 现在我要每一条手动点,
 #            会有1-2帧偏差的, 手抖的话」
-# 做法：归一化互相关（NCC）金字塔搜索。纯 Python、零第三方依赖（项目铁律禁 numpy）。
-#   级1：250Hz 全窗粗搜（约 4ms 分辨率，毫秒级出结果）→ 定大致位置
+# 做法：**包络筛候选 + 波形定夺**（2026-09-14 重写）。纯 Python、零第三方
+#   依赖（项目铁律禁 numpy）。
+#   级0：20ms/帧的 RMS 能量包络上做 ZNCC 全窗打分 → 只保留「最佳−0.25」以内的
+#        候选（实测压到 ~5%），**不用来定夺**
+#   级1：250Hz 波形 ZNCC 在候选 ±2 帧内算分 → 定大致位置；分数过低则全窗兜底
 #   级2：1kHz 在 ±6 格内细化（约 1ms）
 #   级3：8kHz 在 ±8 样本内精搜（0.125ms）——远超人工点选的 1~2 帧误差
-# 只在「当前偏移 ± _SYNC_MATCH_WIN 秒」内搜索，不做全局搜索：
-# 全局搜索会被音乐/周期音的旁瓣骗走，局部搜索把候选限制在肉眼已确认过的位置附近。
+#
+# ⚠️ 为什么这么改：
+#   ① 旧版互相关**没有去均值**（NCC 而非 ZNCC）——任意两段「电平平稳且同号」
+#      的信号都会给出虚高的 r。静音/准静音正是这类信号，实机把「参考轨结尾静音」
+#      和「比对轨开头静音」对齐在了一起（用户 2026-09-14 反馈）。改 ZNCC 后
+#      静音窗口分母为 0，天然出局。
+#   ② 包络**只筛不定夺**（真机实测 2026-09-14）：0.3s 模板只有 15 个包络点，
+#      随机撞脸严重——同一对素材上波形层真值排第 1、包络层真值只排第 11。
+#      但包络便宜（0.1s vs 2.1s），当预筛正好：候选砍掉 95%，真值仍幸存。
+#   ③ 置信度用**全速率波形 ZNCC** 上报：真值处 ~0.99、错位置 ~0（实测），
+#      动态范围远好于包络相关度，早停阈值才有意义。
+#
+# 以「当前偏移」为猜测中心，按 _SYNC_WIN_LEVELS 逐级向外扩窗搜索：
+# 全局搜索会被音乐/周期音的旁瓣骗走，逐级扩窗既保住局部搜索的可靠性，
+# 又能覆盖「首次打点偏移未知、真实事件在几十秒外」的情况。
+# 2026-09-13 加三级扩窗（5→15→45）；2026-09-14 起上限可在界面上选，并把
+# 「够好就停」的阈值由 0.5 提到 _SYNC_MATCH_STRONG：
+#   0.5 太松——±5s 窗内只要有个凑合的假峰（对白/环境音很容易到 0.5）就提前
+#   break，后面 15s/45s 两级根本不会跑，真实事件压根没被找到。这正是
+#   「已经扩到 45 秒了却还是不好用」的根因（用户 2026-09-14 反馈）。
 _SYNC_MATCH_SR = 8000          # 匹配用采样率（与波形解码一致）
 _SYNC_MATCH_TPL = 0.30         # 模板时长（秒）
-_SYNC_MATCH_WIN = 5.0          # 搜索窗口（±秒，以当前偏移为猜测中心）
+_SYNC_MATCH_WIN = 5.0          # 搜索窗口首级（±秒，以当前偏移为猜测中心）
+_SYNC_WIN_LEVELS = (5.0, 15.0, 45.0)   # 逐级扩窗档位（默认跑到 ±45s）
+_SYNC_WIN_MAX_LEVEL = 120.0    # 界面上可选的最大窗口（±秒）
 _SYNC_MATCH_MIN_GAP = 0.12     # 「最佳−次佳」相关系数差下限，低于此值提示匹配不唯一
+_SYNC_MATCH_STRONG = 0.75      # 「够好就不必再扩窗」的相关系数下限（包络相关度）
+_SYNC_MATCH_WEAK = 0.35        # 包络相关度低于此值 → 标「匹配不唯一，请核对」
+_SYNC_ENV_FRAME = 0.02         # 能量包络帧长（秒）→ 8kHz 下 160 样本
+_SYNC_ENV_KEEP = 0.25          # 包络预筛：保留「最佳 − 0.25」以内的候选（真机实测：压到 ~5%，真值仍幸存）
+_SYNC_TPL_MIN_RMS = 90.0       # 模板能量门控（s16 满幅 32768，90 ≈ -51 dBFS）
+_SYNC_ENERGY_RATIO = 8.0       # 候选窗口与模板的电平比上限（±18 dB），超出即跳过
 
 
 def _sync_decode_pcm(ff_exe, file_path, t0, t1, sr=_SYNC_MATCH_SR):
@@ -44463,65 +44492,205 @@ def _sync_downsample(pcm, factor):
             for k in range(0, n - factor + 1, factor)]
 
 
-def _sync_ncc_search(tpl, hay, lo, hi):
-    """滑窗归一化互相关，返回 (best_lag, best, second)。
+def _sync_rms(pcm):
+    """s16 样本序列的 RMS（能量门控用）。空序列 → 0。"""
+    if not pcm:
+        return 0.0
+    acc = 0.0
+    for v in pcm:
+        acc += float(v) * v
+    return (acc / len(pcm)) ** 0.5
 
-    r(lag) = Σ tpl·hay[lag:] / sqrt(Σtpl² · Σhay[lag:]²)
-    分母的窗口能量用前缀平方和 O(1) 取得；tpl 为纯静音时返回 (None, -2.0, -2.0)。
+
+def _sync_envelope(pcm, frame):
+    """RMS 能量包络：每 frame 个样本压成一个数（帧内均方根）。
+
+    包络序列是「响度随时间怎么变」的粗描边——比原波形短约 frame 倍，且
+    **静音段的包络恒为 0**（ZNCC 分母为 0 → 自动出局），这正是拿它做粗搜的
+    原因（2026-09-14「静音对齐静音」事故的根因解法之一）。
+    """
+    n = len(pcm)
+    if n < frame or frame < 2:
+        return []
+    sq = [0.0] * (n + 1)
+    acc = 0.0
+    for i, v in enumerate(pcm):
+        acc += float(v) * v
+        sq[i + 1] = acc
+    inv = 1.0 / frame
+    return [((sq[k + frame] - sq[k]) * inv) ** 0.5
+            for k in range(0, n - frame + 1, frame)]
+
+
+def _sync_ncc_curve(tpl, hay, lo, hi, min_rms_ratio=0.0):
+    """滑窗 **零均值**归一化互相关（ZNCC / Pearson）的整条评分曲线。
+
+    返回 [r(lo), r(lo+1), ..., r(hi)]；被门控 / 平窗口排除的位置为 -2.0。
+
+    r(lag) = Σ(t−t̄)(h−h̄) / sqrt(Σ(t−t̄)² · Σ(h−h̄)²)
+
+    ⚠️ **必须去均值**：不去均值（NCC）时，任意两段「电平平稳且同号」的信号都会
+    给出虚高的 r——tpl=[1,2,1,2] vs hay=[1,1,1,1]：NCC=0.95，ZNCC 无定义（=0）。
+    静音 / 准静音恰恰是这类信号，2026-09-14 实机「把参考轨结尾静音与比对轨开头
+    静音对齐在一起」即此根因。去均值后平窗口分母为 0 → 直接出局。
+
+    min_rms_ratio > 0：启用能量门控，候选窗口与模板的电平比超出 [1/ratio, ratio]
+    直接跳过。ZNCC 把幅度归一化掉了，所以「响亮的人声模板」仍可能与「极安静的
+    底噪」形状相近；门控堵掉这路假匹配。
+
+    分母的窗口能量用前缀和 O(1) 取得；模板为直流 / 纯静音时返回空表。
     """
     L = len(tpl)
     hi = min(hi, len(hay) - L)
     if L < 8 or hi < lo:
-        return None, -2.0, -2.0
+        return []
+    s1 = 0.0
     e1 = 0.0
     for a in tpl:
+        s1 += a
         e1 += a * a
-    if e1 <= 0:
-        return None, -2.0, -2.0
-    pre = [0.0] * (len(hay) + 1)
-    acc = 0.0
+    den_t = e1 - s1 * s1 / L
+    if den_t <= 1e-9:
+        return []                        # 模板是直流/纯静音 → 无从比对
+    ms_t = e1 / L                        # 模板均方（含直流），能量门控用
+    pre = [0.0] * (len(hay) + 1)        # 前缀和
+    pre2 = [0.0] * (len(hay) + 1)       # 前缀平方和
+    acc = acc2 = 0.0
     for i, v in enumerate(hay):
-        acc += v * v
+        acc += v
+        acc2 += v * v
         pre[i + 1] = acc
-    best_lag, best, second = None, -2.0, -2.0
-    for lag in range(lo, hi + 1):
-        e2 = pre[lag + L] - pre[lag]
-        if e2 <= 0:
-            continue
-        num = 0.0
-        for a, b in zip(tpl, hay[lag:lag + L]):
-            num += a * b
-        r = num / ((e1 * e2) ** 0.5)
+        pre2[i + 1] = acc2
+    if min_rms_ratio > 0:
+        k2 = min_rms_ratio * min_rms_ratio
+        lo_ms = ms_t / k2                # 候选太安静 → 跳过
+        hi_ms = ms_t * k2                # 候选太响 → 跳过
+    else:
+        lo_ms = hi_ms = 0.0
+    rs = [-2.0] * (hi - lo + 1)
+    for k in range(hi - lo + 1):
+        lag = lo + k
+        s2 = pre[lag + L] - pre[lag]
+        e2 = pre2[lag + L] - pre2[lag]
+        if min_rms_ratio > 0:
+            ms_h = e2 / L
+            if ms_h < lo_ms or ms_h > hi_ms:
+                continue
+        den_h = e2 - s2 * s2 / L
+        if den_h <= 1e-9:
+            continue                     # 候选窗口是平的（静音/纯直流）→ 出局
+        num = -s1 * s2 / L               # 去均值：Σ(t−t̄)(h−h̄) = Σth − Σt·Σh/L
+        j = lag
+        for a in tpl:
+            num += a * hay[j]
+            j += 1
+        rs[k] = num / ((den_t * den_h) ** 0.5)
+    return rs
+
+
+def _sync_pick(rs, lo, excl=0):
+    """从评分曲线里取 (best_lag, best, second)。
+
+    excl > 0：「次佳」只取与最佳相隔 excl 以上的滞后期——相邻 lag 的相关系数
+    几乎一样，拿它当次佳会让 gap 恒等于 0，等于没有判据。
+    """
+    best, best_k = -2.0, -1
+    for k, r in enumerate(rs):
         if r > best:
-            second, best, best_lag = best, r, lag
-        elif r > second:
+            best, best_k = r, k
+    if best_k < 0:
+        return None, -2.0, -2.0
+    second = -2.0
+    for k, r in enumerate(rs):
+        if k == best_k:
+            continue
+        if excl > 0 and abs(k - best_k) <= excl:
+            continue
+        if r > second:
             second = r
-    return best_lag, best, second
+    return lo + best_k, best, second
+
+
+def _sync_ncc_search(tpl, hay, lo, hi, min_rms_ratio=0.0, excl=0):
+    """滑窗 ZNCC，返回 (best_lag, best, second)；细节见 _sync_ncc_curve。"""
+    return _sync_pick(_sync_ncc_curve(tpl, hay, lo, hi, min_rms_ratio), lo, excl)
 
 
 def _sync_match_point(tpl, hay, sr=_SYNC_MATCH_SR):
-    """在 hay 里找 tpl 的最佳起点（金字塔 NCC）。
+    """在 hay 里找 tpl 的最佳起点：**包络筛候选 + 波形定夺**（2026-09-14 重写）。
 
     返回 (lag_samples, score, gap)：
       lag_samples —— 以 sr 为单位的样本偏移（hay 起点 = 0）；失败 → None
-      score       —— 精搜峰值的相关系数（越接近 1 越可信）
-      gap         —— 粗搜层的「最佳 − 次佳」，越小越可能是周期音造成的假峰
+      score       —— 最终 8kHz 全速率的波形 ZNCC（置信度，越接近 1 越可信）
+      gap         —— 包络层的「最佳 − 次佳」（次佳取半个模板长以外），
+                     越小越可能是周期音造成的假峰
+
+    ⚠️ 包络只用来**筛候选、不定夺**（真机实测结论，见下）：
+      同一对素材（20s、真值延迟 2.37s、电平 0.7×）实测：
+        250Hz 波形 ZNCC —— 真值排第 1（0.571，次名 0.474）
+        20ms 包络 ZNCC  —— 真值只排第 11（0.786，榜首是错位置 0.885）
+      原因：0.3s 模板只有 15 个包络点，样本太少、随机撞脸严重；波形层有 75 个点。
+      → 包络便宜（0.1s vs 2.1s）、能把候选压到 ~5% 而真值仍幸存，正好当预筛；
+        最后谁对由波形说了算，且分数过低时自动退回全窗兜底（宁可慢，不能漏）。
     """
     L = len(tpl)
     if L < 64 or len(hay) <= L:
         return None, -2.0, 0.0
-    f0, f1 = 32, 8                       # 8000 → 250Hz / 1000Hz
-    t0, h0 = _sync_downsample(tpl, f0), _sync_downsample(hay, f0)
-    lag0, sc0, sec0 = _sync_ncc_search(t0, h0, 0, len(h0) - len(t0))
-    if lag0 is None:
-        return None, -2.0, 0.0
-    gap = (sc0 - sec0) if sec0 > -1.5 else 1.0
+    frame = max(4, int(_SYNC_ENV_FRAME * sr))     # 8kHz → 160 样本（20ms）
+    f0, f1 = 32, 8                                # 8000 → 250Hz / 1000Hz
+    keep, gap = None, 1.0
+    te, he = _sync_envelope(tpl, frame), _sync_envelope(hay, frame)
+    if len(te) >= 3 and len(he) > len(te):
+        top = len(he) - len(te)
+        rse = _sync_ncc_curve(te, he, 0, top, min_rms_ratio=_SYNC_ENERGY_RATIO)
+        if not rse:
+            # 能量门控把候选全拒了（设备间电平差超过 ±18dB）→ 放宽再筛一次
+            rse = _sync_ncc_curve(te, he, 0, top)
+        _le, be, se = _sync_pick(rse, 0, max(1, len(te) // 2))
+        if _le is not None:
+            gap = max(0.0, be - se) if se > -1.5 else 1.0
+            keep = [i for i, r in enumerate(rse) if r >= be - _SYNC_ENV_KEEP]
+    T, H = _sync_downsample(tpl, f0), _sync_downsample(hay, f0)
+    if len(H) <= len(T):
+        return None, -2.0, gap
+    span = max(4, (2 * frame) // f0)              # 包络只能定到 ±1 帧 → 放宽到 ±2
+    best_lag, best_sc, best_i = None, -2.0, None
+    scored = []                                   # [(250Hz分, 候选帧号, lag)]
+    for i in (keep or ()):
+        c = (i * frame) // f0
+        la, sc, _ = _sync_ncc_search(T, H, max(0, c - span),
+                                     min(len(H) - len(T), c + span))
+        if la is None:
+            continue
+        scored.append((sc, i, la))
+        if sc > best_sc:
+            best_lag, best_sc, best_i = la, sc, i
+    if best_i is not None:
+        # 「次佳」= 相隔一个模板长以外的候选区里的最高分。相邻 lag 的分数几乎
+        # 一样（实测 perfect 命中时 gap 只有 0.04），只有隔开一个模板长才算
+        # 真正的「另一个候选」，gap 才能当唯一性判据用。
+        second = -2.0
+        for sc, i, _ in scored:
+            if abs(i - best_i) <= len(te):
+                continue
+            if sc > second:
+                second = sc
+        gap = max(0.0, best_sc - second) if second > -1.5 else 1.0
+    if best_lag is None or best_sc < _SYNC_MATCH_WEAK:
+        # 候选被筛没了 / 分数太低 → 全窗兜底（旧行为，慢但不会漏）
+        la, sc, _ = _sync_ncc_search(T, H, 0, len(H) - len(T))
+        if la is not None and sc > best_sc:
+            best_lag, best_sc = la, sc
+    if best_lag is None:
+        return None, -2.0, gap
+    # 级2：1kHz 在 ±6 格内细化
     t1, h1 = _sync_downsample(tpl, f1), _sync_downsample(hay, f1)
-    c1 = lag0 * (f0 // f1)
+    c1 = best_lag * (f0 // f1)
     lag1, _, _ = _sync_ncc_search(t1, h1, max(0, c1 - 6),
                                   min(len(h1) - len(t1), c1 + 6))
     if lag1 is None:
         lag1 = c1
+    # 级3：8kHz 全速率在 ±8 样本内精搜 → 0.125ms
     c2 = lag1 * f1
     lag2, sc2, _ = _sync_ncc_search(tpl, hay, max(0, c2 - 8),
                                     min(len(hay) - L, c2 + 8))
@@ -44801,7 +44970,8 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         self.dot_btn.pack(side=tk.RIGHT, padx=(0, 6))
         ToolTip(self.dot_btn, "进入打点会话：按提示在每条轨道波形上点同一个事件（拍手声等），\n"
                               "这一轮写进「起始」格。再次点击 = 取消本次会话。\n"
-                              "提示：波形上点一下也能设定该轨光标，逐帧微调后用「设为起始」更准。")
+                              "提示：波形上点一下也能设定该轨光标，逐帧微调后用该轨轨头\n"
+                              "「打起始(all) / 打结尾(all)」一键写入全部轨更准。")
         btns_lbl = ttk.Button(top, text="自动对齐（待开发）")
         btns_lbl.state(["disabled"])
         btns_lbl.pack(side=tk.RIGHT, padx=(0, 6))
@@ -44813,8 +44983,8 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         self.hint_var = tk.StringVar(
             value="上下分道共享一条时间轴。① 波形上点一下 = 设该轨光标（粗点即可），"
                   "轨头「打起始(all) / 打结尾(all)」按已对齐的偏移一键写入全部轨；"
-                  "② 也可「−1帧 / +1帧」微调后按「设为起始 / 设为结尾」写入；"
-                  "③ 「时间预览」可边走带看精确定位（回填同一格）。汇总表每轨一行，可双击复制。")
+                  "② 也可「−1帧 / +1帧」微调后再按轨头同一个按钮写入；"
+                  "③ 「时间预览」可边走带看精确定位（只把该轨光标移到该时刻）。汇总表每轨一行，可双击复制。")
         ttk.Label(main, textvariable=self.hint_var,
                   foreground="#666666").pack(fill=tk.X, pady=(6, 6))
 
@@ -44941,25 +45111,34 @@ class MultiSyncReferenceDialog(tk.Toplevel):
                    command=lambda: self._nudge_cursor(1)).pack(side=tk.LEFT, padx=(0, 10))
         self.auto_btn = ttk.Button(ctl1b, text="自动找点", command=self._auto_find_all)
         self.auto_btn.pack(side=tk.LEFT)
+        # 搜索范围（2026-09-14）：原来写死「±5 秒」且偷偷分三级扩到 45 秒，
+        # 界面上完全看不出来，用户以为只能搜 5 秒。现在显式可选。
+        ttk.Label(ctl1b, text="±").pack(side=tk.LEFT, padx=(6, 1))
+        self.win_var = tk.StringVar(value="45")
+        self.win_box = ttk.Combobox(ctl1b, textvariable=self.win_var, width=4,
+                                    state="readonly", values=("5", "15", "45", "120"))
+        self.win_box.pack(side=tk.LEFT)
+        ttk.Label(ctl1b, text="秒").pack(side=tk.LEFT, padx=(1, 0))
+        ToolTip(self.win_box,
+                "自动找点的搜索范围上限（以当前偏移为中心，向两边各搜这么多秒）。\n"
+                "实际是逐级往外扩：±5 秒 → ±15 → ±45 → ±120，\n"
+                "小窗口里找到「足够像」的就停，不够像才继续往外扩。\n"
+                "偏差很小（目视已粗对齐）→ 选 5，最快最准；\n"
+                "偏差几十秒、不知道差在哪 → 选 45 或 120（越慢，越要核对）。")
         ToolTip(self.auto_btn,
                 "以「当前轨」光标处的音频为模板，在其余轨道上自动找出同一个事件\n"
-                "（局部归一化互相关，精度约 0.1ms，替代逐条手点、免除手抖误差）。\n"
-                "只在当前偏移 ±5 秒内搜索；匹配不唯一的轨道会标出来让你核对。")
-        self.set_start_btn = ttk.Button(
-            ctl1b, text="设为起始",
-            command=lambda: self._write_anchor_all(0))
-        self.set_start_btn.pack(side=tk.LEFT, padx=(10, 0))
-        ToolTip(self.set_start_btn,
-                "把当前光标处的这个事件写成**全部轨道**的「起始」：\n"
-                "当前轨用光标值，其余轨按当前偏移反算同一时刻（不吸附帧网格）。\n"
-                "只想一键写某条轨的光标时，用轨头「打起始(all)」更直接。")
-        self.set_end_btn = ttk.Button(
-            ctl1b, text="设为结尾",
-            command=lambda: self._write_anchor_all(1))
-        self.set_end_btn.pack(side=tk.LEFT, padx=2)
-        ToolTip(self.set_end_btn,
-                "把当前光标处的这个事件写成**全部轨道**的「结尾」（同上，按当前偏移反算）。")
-        ttk.Label(ctl1b, text="波形点一下设光标 → 逐帧微调 → 自动找点 → 一键写入全部轨",
+                "（能量包络预筛 + 波形零均值互相关，精度约 0.1ms）。\n"
+                "搜索范围 = 右边的下拉（默认 ±45 秒）。命中后状态栏会写明\n"
+                "「在 ± 多少秒内命中、相似度多少」，相似度低于 0.35 或存在另一个\n"
+                "同样像的候选区时，会单独标「匹配不唯一」让你核对。\n"
+                "⚠️ 光标若落在静音上会直接报错（静音只能跟静音对上，结果必错）——\n"
+                "   请把光标挪到有声音的地方再点本按钮。\n"
+                "命中只挪光标、不直接写锚点——看好再按该轨轨头「打起始(all) / 打结尾(all)」。")
+        # 「设为起始 / 设为结尾」两个按钮已于 2026-09-14 移除：它们调用的是
+        # `_write_anchor_all(k)`（i0 默认 = 当前轨），与当前轨轨头那个
+        # 「打起始(all) / 打结尾(all)」**完全同一个函数、同一个结果**，
+        # 只是一个写死成「当前轨」、一个每轨都有。留着纯属重复入口。
+        ttk.Label(ctl1b, text="波形点一下设光标 → 逐帧微调 → 自动找点 → 轨头「打xx(all)」写入全部轨",
                   foreground="gray").pack(side=tk.LEFT, padx=(10, 0))
 
         ctl2 = ttk.Frame(main)
@@ -45519,12 +45698,13 @@ class MultiSyncReferenceDialog(tk.Toplevel):
 
     # ---------- 每轨时间预览（精确读起始/结尾，用户 2026-09-13 要求） ----------
     def _open_track_preview(self, i):
-        """为该轨源文件打开「简易时间预览」，把读到的时刻回填进「起始/结尾」锚点格。
+        """为该轨源文件打开「简易时间预览」，用画面 / 声音精确定位**该轨的光标**。
 
         用户场景：结尾的那个点靠点波形对不准，希望在时间预览里一边看画面/听声一边
-        精确定位；并且**先**用它定好基准轨（参考轨）的起始与结束长度，再逐轨比对其余轨道。
-        预览里的「设为起点 / 设为终点」分别写进该轨的锚点 #1（起始）/ #2（结尾）→
-        立刻按锚点重算偏移与漂移，汇总表里可直接复制。
+        精确定位；定位完再用轨头「打起始(all) / 打结尾(all)」按已对齐的偏移一次打点。
+        预览里的「设为起点 / 设为终点」**只把该轨光标移到这个时刻**（2026-09-14 按
+        用户要求恢复旧行为，详见 `_set_anchor_from_preview`）：不写锚点格、不改偏移，
+        绝不打扰已对齐的状态。
 
         ⚠️ 传参铁律（见 time_preview.md）：file_path 必须是**该轨自己的源文件**——
         本窗口所有偏移都量在「各轨自身时间轴」上；且 use_output_context=False
@@ -45557,8 +45737,31 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             self.hint_var.set(f"[时间预览] 打开失败: {e}")
 
     def _set_anchor_from_preview(self, k, i, sec):
-        """时间预览「设为起点/终点」的回填入口（k=0 起始 / k=1 结尾）。"""
-        self._write_anchor(k, i, sec, src="时间预览")
+        """时间预览「设为起点/终点」：**只把该轨光标移到这个时刻**（2026-09-14）。
+
+        用户原话：「直接恢复以前的做法，只移动光标，其他什么都不要变」——不写
+        锚点格、不算偏移，预览只负责**精确定位**；打点走轨头「打起始(all) /
+        打结尾(all)」（按已对齐的偏移反算写入全部轨）。
+        ⚠️ 单轨写入的 `_write_anchor` / `_set_anchor_from_cursor` 目前无按钮
+        调用（底栏「设为起始 / 设为结尾」已于 2026-09-14 移除），仅保留备用。
+
+        ⚠️ 绝不能在这里写锚点格 / 调 `_apply_anchors()`：后者会按锚点重算**所有**
+        有值轨的 offsets，把此前「按光标对齐 / ±1帧 微调」调好的偏移整批冲掉
+        （实机表现：各轨波形与光标一起瞬移 = 用户说的「相当于按了一次同步光标，
+        把原来我对齐的又错位了」）。锚点/偏移的改动只由用户显式操作触发。
+        """
+        try:
+            t = float(sec)
+        except (TypeError, ValueError):
+            return
+        if not (0 <= i < self.n):
+            return
+        self.cursors[i] = max(0.0, t)
+        self.readout_vars[i].set(_sync_format_time(self.cursors[i]) + " s")
+        self._redraw_wave(i)
+        self.hint_var.set(
+            f"时间预览：已把「{self._track_disp(i)}」的光标移到 "
+            f"{_sync_format_time(self.cursors[i])} s（未打点、未改偏移）。")
 
     def _set_anchor_from_cursor(self, i, k):
         """把第 i 轨光标所在时刻写入「起始 / 结尾」格（用户 2026-09-13 要求：
@@ -45569,8 +45772,17 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         self._write_anchor(k, i, self.cursors[i], src="光标")
 
     def _write_anchor(self, k, i, sec, src="时间预览"):
-        """把秒数写进第 i 轨的「起始(k=0)/结尾(k=1)」槽位并全量重算。
+        """把秒数写进第 i 轨的「起始(k=0)/结尾(k=1)」槽位，并只挪**本轨**光标。
 
+        ⚠️ 2026-09-14 修复（用户实机：「时间预览的设为起点…相当于按了一次同步光标，
+        把原来我对齐的又错位了」「以前我在时间预览里设置起点 终点 只会动本轨道光标，
+        这样我就能用 xxx(all) 来打点」）：原实现写完锚点后无条件 `_apply_anchors()`
+        ——**全量**按锚点重算所有轨的偏移，会把此前「按光标对齐 / ±1帧 微调」调好的
+        偏移整批冲掉。offsets 一变，波形按 `tau+off` 重画、光标按 `cursors[i]+off`
+        重画 → 各轨一起瞬移，观感就是「按了一次同步光标」，已对齐状态被推翻。
+
+        所以这里**只落值、不重算偏移**。偏移的更新交给显式入口：
+        「按光标对齐」/ 轨头「打起始(all)·打结尾(all)」/「从截取读回」。
         不吸附帧网格：写入什么就是什么，保「时间预览 / 逐帧微调」的精度
         （与「按光标对齐」口径一致）。"""
         try:
@@ -45582,14 +45794,21 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             self._sync_dot_buttons()
         label = "起始" if k == 0 else "结尾"
         self._slot(label)["vals"][i] = v
-        self.cursors[i] = max(0.0, v)    # 顺带把该轨光标挪到这一刻，视觉上看得见
-        self._apply_anchors()
+        self.cursors[i] = max(0.0, v)    # 只挪本轨光标 → 随后可用「打起始(all)」
+        # ⚠️ 这里**绝不能**重算偏移（2026-09-14 修复，用户实机：「时间预览的设为
+        # 起点…相当于按了一次同步光标，把原来我对齐的又错位了」「以前我在时间预览
+        # 里设置起点 终点 只会动本轨道光标，这样我就能用 xxx(all) 来打点」）。
+        # 一旦调 `_apply_anchors()`，它会按锚点把**所有**有值轨的 offsets 整批重算，
+        # 把此前「按光标对齐 / ±1帧 微调」调好的偏移冲掉；offsets 一变，波形按
+        # `tau+off` 重画、光标按 `cursors[i]+off` 重画 → 各轨一起瞬移，已对齐的
+        # 状态被推翻。所以这里只落值、不重算：偏移的更新交给显式入口——
+        # 「按光标对齐」/ 轨头「打起始(all)·打结尾(all)」/「从截取读回」。
         self._redraw_all()
         self._refresh_table()
         idx = self._track_disp(i)
         self.hint_var.set(
             f"{src}已为「{idx}」设定{label} = {_sync_format_time(v)} s；"
-            f"偏移与漂移按锚点重算（结果见汇总表）。")
+            f"只挪了本轨光标，偏移未动（要按锚点重算偏移：用「按光标对齐」或轨头「打起始(all)」）。")
 
     # ---------- 微调 / 归零 / 手输 ----------
     def _eff_fps(self):
@@ -45619,8 +45838,8 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         """微调【当前轨光标】（区别于上面的偏移微调）。
 
         用户 2026-09-13：「现在我要每一条手动点, 会有1-2帧偏差的, 手抖的话」——
-        波形上点一下只能粗定位，这里给逐帧微调，配合「设为起始 / 设为结尾」
-        就能把锚点写在精确的帧上，不必指望鼠标恰好点在拍手声上。
+        波形上点一下只能粗定位，这里给逐帧微调，配合轨头「打起始(all) /
+        打结尾(all)」就能把锚点写在精确的帧上，不必指望鼠标恰好点在拍手声上。
         参考轨也允许微调（它只是光标，不影响偏移恒 0 的基准地位）。
         """
         i = self.active_i
@@ -45882,12 +46101,17 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             f"已把「{idx}」光标处的事件写成全部 {self.n} 条轨的{label}"
             f"（其余轨按当前偏移反算，不吸附帧网格）；偏移与漂移已按锚点重算，见汇总表。")
 
-    def _auto_match(self):
+    def _auto_match(self, wins=None):
         """以当前轨光标处音频为模板，互相关在其余轨道上找同一事件。
+
+        wins —— 逐级扩窗的档位序列（None=用 _SYNC_WIN_LEVELS 默认档）；
+        由界面上的「搜索范围」下拉决定上限，兼容旧的无参调用。
 
         返回 (t_hits, unsure, no_hit, err)：t_hits={轨索引: 命中时刻}（含当前轨
         自身），unsure=[(轨索引, 提示)]（低置信，时刻已写入 t_hits），
         no_hit=完全没拿到时刻的轨道提示列表，err=整体失败原因（None=成功）。
+        每轨的 (相似度, 次优差, 实际用到的窗口) 另存进 self._last_match_info
+        （不放返回值里，避免破坏既有 4 元组契约）。
         「自动找点」与「打起始/打结尾」一键化共用（用户 2026-09-13：
         「右上的那2个打起始打结尾不好用，每次都要把波形放到最大才能点准」）。
         """
@@ -45907,8 +46131,18 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             shift = t0 - t_start
         if len(tpl) < 256:
             return None, [], [], "当前轨光标附近没有可用音频（该处是否无声？）"
+        # 能量门控（2026-09-14）：光标落在静音/准静音上时，拿它当模板只会去对齐
+        # 别的静音段（实机把「参考轨结尾静音」和「比对轨开头静音」对上了）。
+        # 这里直接拒绝并说明电平，比给出一个看似合理实则荒谬的结果好得多。
+        tpl_rms = _sync_rms(tpl)
+        if tpl_rms < _SYNC_TPL_MIN_RMS:
+            return None, [], [], (
+                f"当前轨光标处几乎是静音（电平 {tpl_rms:.0f}/32768），"
+                f"拿它对去只会跟别的静音段对上——请把光标挪到有声音的位置再自动找点")
         T = t0 + self.offsets[i0]           # 该事件在参考轴上的位置
         t_hits, unsure, no_hit = {i0: t0}, [], []
+        self._last_match_info = {}          # {轨索引: (相似度, 次优差, 实际窗口)}
+        levels = tuple(wins) if wins else _SYNC_WIN_LEVELS
         for i in range(self.n):
             if i == i0:
                 continue
@@ -45920,12 +46154,14 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             guess = T - self.offsets[i]     # 当前偏移下的猜测位置
             # 逐级扩窗（2026-09-13 实机反馈「一键打起始打的时间不对」）：
             # 首次打点时 offsets 往往全 0/不可信，比对轨的真实事件可能在 guess
-            # 之外十几秒——±5s 窗口里没有目标，NCC 就会匹配到窗口内别的音频、
-            # 写入错值。改为 5→15→45s 逐级扩大；offsets 准时第一级高置信命中
+            # 之外十几秒——小窗口里没有目标，NCC 就会匹配到窗口内别的音频、
+            # 写入错值。改为按 levels 逐级扩大；offsets 准时第一级高置信命中
             # 即停（不多花成本）；低置信命中继续扩窗，最后取相关系数最高的一级
             # （错误窗口里的凑合匹配分低，会被正确窗口的高分覆盖）。
-            t_hit, t_sc, t_gap = None, -2.0, 0.0
-            for w in (_SYNC_MATCH_WIN, 15.0, 45.0):
+            # ⚠️ 早停阈值用 _SYNC_MATCH_STRONG（0.75），旧值 0.5 会让「小窗内
+            # 一个凑合的假峰」提前结束搜索，后面几级白给（2026-09-14 修）。
+            t_hit, t_sc, t_gap, t_win = None, -2.0, 0.0, 0.0
+            for w in levels:
                 lo = max(0.0, guess - w)
                 hay = _sync_decode_pcm(self.ff, pi, lo, guess + w)
                 if len(hay) <= len(tpl):
@@ -45935,14 +46171,17 @@ class MultiSyncReferenceDialog(tk.Toplevel):
                     continue
                 cand = lo + lag / float(_SYNC_MATCH_SR) + shift   # 模板起点 → 事件点
                 if sc > t_sc:
-                    t_hit, t_sc, t_gap = cand, sc, gap
-                if gap >= _SYNC_MATCH_MIN_GAP and sc >= 0.5:
+                    t_hit, t_sc, t_gap, t_win = cand, sc, gap, w
+                if gap >= _SYNC_MATCH_MIN_GAP and sc >= _SYNC_MATCH_STRONG:
                     break
             if t_hit is None:
                 no_hit.append(f"{idx}（未命中）")
                 continue
             t_hits[i] = t_hit
-            if t_gap < _SYNC_MATCH_MIN_GAP or t_sc < 0.3:
+            self._last_match_info[i] = (t_sc, t_gap, t_win)
+            # gap 现在算的是「另一个候选区」与最佳的分差（不再取相邻 lag），
+            # 是真判据：分差小 = 周期音/重复段落，命中位置不可信 → 必须提示核对。
+            if t_gap < _SYNC_MATCH_MIN_GAP or t_sc < _SYNC_MATCH_WEAK:
                 unsure.append((i, f"{idx}（匹配不唯一，请核对）→ {_sync_format_time(t_hit)}"))
         return t_hits, unsure, no_hit, None
 
@@ -45950,19 +46189,29 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         """以当前轨光标为锚，用局部归一化互相关在其余轨道上自动找出同一事件。
 
         用户 2026-09-13 追加需求。命中后写进各轨光标并重算偏移（波形随之平移对齐），
-        **不直接写锚点**：先让你看波形/试听确认，再按「设为起始 / 设为结尾」一次写入。
+        **不直接写锚点**：先让你看波形 / 用「取当前帧对比」看画面确认，
+        再按轨头「打起始(all) / 打结尾(all)」一次写入。
         """
-        t_hits, unsure, no_hit, err = self._auto_match()
+        t_hits, unsure, no_hit, err = self._auto_match(self._match_wins())
         if err is not None:
             # 状态栏上报不弹窗（无头测试红线 + 用户偏好 log/status bar 上报）
             self.hint_var.set("自动找点失败：" + err)
             return
         unsure_i = {i for i, _ in unsure}
-        hits, got_ref = [], (self.ref_i in t_hits)
+        hits, got_ref, wide = [], (self.ref_i in t_hits), False
         for i, t in t_hits.items():
             self.cursors[i] = t
             if i != self.active_i and i not in unsure_i:
-                hits.append(f"{self._track_disp(i)} → {_sync_format_time(t)}")
+                # 报出「实际搜了多远 + 多像」，别再让扩窗成为黑盒
+                info = getattr(self, "_last_match_info", {}).get(i)
+                if info:
+                    sc, _gap, win = info
+                    hits.append(f"{self._track_disp(i)} → {_sync_format_time(t)}"
+                                f"（±{win:g}s 内，相似度 {sc:.2f}）")
+                    if win >= 45.0:
+                        wide = True
+                else:
+                    hits.append(f"{self._track_disp(i)} → {_sync_format_time(t)}")
         low = [m for _, m in unsure] + no_hit
         if not got_ref:
             low.append("参考轨未命中，偏移仍按上一次的锚点体系")
@@ -45978,7 +46227,26 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         msg = "自动找点：" + ("；".join(hits) if hits else "无命中")
         if low:
             msg += "　⚠ " + "、".join(low)
+        if wide:
+            msg += "　（有轨道要扩到最大窗口才命中，请用「取当前帧对比」核对一下画面）"
         self.hint_var.set(msg)
+
+    def _match_wins(self):
+        """界面上选的搜索范围上限 → 逐级扩窗档位序列。
+
+        选 45 → (5, 15, 45)；选 120 → (5, 15, 45, 120)；选 5 → (5,)。
+        下拉还没建好（无头/早期调用）时退回默认档。
+        """
+        try:
+            mx = float(self.win_var.get())
+        except Exception:
+            return _SYNC_WIN_LEVELS
+        if mx <= 0:
+            return _SYNC_WIN_LEVELS
+        ws = [w for w in _SYNC_WIN_LEVELS if w <= mx]
+        if not ws or ws[-1] < mx:
+            ws = ws + [mx]
+        return tuple(ws)
 
     # ---------- 汇总表与复制 ----------
     def _track_disp(self, i):
