@@ -2212,5 +2212,11 @@
   "✓ 终点已设 {0}（可继续设起点，完成后关闭窗口）": "✓ End set to {0} (you can also set the start, then close the window)",
   "✓ 起点已设 {0}（可继续设终点，完成后关闭窗口）": "✓ Start set to {0} (you can also set the end, then close the window)",
   "已跳转到关键帧 {0}": "Jumped to keyframe {0}",
-  "配置来源: {0}  | 状态: {1}\n": "Config source: {0}  | Status: {1}\n"
+  "配置来源: {0}  | 状态: {1}\n": "Config source: {0}  | Status: {1}\n",
+  "平滑(原)": "Smooth (orig.)",
+  "线性": "Linear",
+  "缓入": "Ease in",
+  "缓出": "Ease out",
+  "缓入缓出": "Ease in-out",
+  "平移/线性 = 匀速插值；缓入/缓出/缓入缓出/平滑(原) = 缓动曲线（贯穿整条轨迹，多段路径不再每个点顿一下）；不动 = 静止。曲线越往后越「弹」。": "Translate/Linear = constant-velocity interpolation; Ease-in/Ease-out/Ease-in-out/Smooth (orig.) = easing curves (span the whole track, so multi-segment paths no longer pause at each point); Still = static. The further along the trajectory, the more 'springy' it feels."
 }

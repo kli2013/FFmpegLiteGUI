@@ -1771,30 +1771,64 @@ def build_waypoint_expr(waypoints, sw="w", sh="h", spin_speed=60.0,
     return x_expr, y_expr, angle_expr, zoom_expr
 
 
+# 轨迹「移动方式 / 缓动」统一下拉（2026-09-13 重构：缓动折进方式，所有轨迹窗口共用）。
+# 旧版把「平滑」写死 smoothstep，并另开一个独立的「缓动」下拉；现合并为同一下拉：
+#   平移/线性=线性插值（两个独立可选项，存储键不同：move / linear），
+#   缓入/缓出/缓入缓出/平滑(原)=缓动插值，不动=常量。
+# ⚠️ canonical key 恒为英文、与界面语言无关：下拉一律按「索引」取模式（不做显示文本匹配），
+#    显示名走 _traj_mode_display_map()（与 CORNER_DIR_PRESETS / _mark_disp 同一套双变量做法）。
+_TRAJ_MODE_ORDER = ["move", "smoothstep", "linear", "ease_in", "ease_out", "ease_in_out", "still"]
+# 历史数据可能存中文「移动/平滑」或英文「smooth」等，统一归一为上述 canonical key。
+_TRAJ_LEGACY_TO_KEY = {
+    "移动": "move", "平移": "move", "move": "move", "linear": "linear",
+    "线性": "linear",
+    "平滑": "smoothstep", "平滑(原)": "smoothstep", "smooth": "smoothstep", "smoothstep": "smoothstep",
+    "缓入": "ease_in", "ease_in": "ease_in",
+    "缓出": "ease_out", "ease_out": "ease_out",
+    "缓入缓出": "ease_in_out", "ease_in_out": "ease_in_out",
+    "不动": "still", "still": "still",
+}
+
+
+def _traj_mode_display_map():
+    """canonical key → 显示值（「平移/平滑(原)/线性/缓入/缓出/缓入缓出/不动」）。
+
+    ⚠️ 必须是函数、在对话框构建时求值，**不能写成模块级常量**：multi 的 _() 依赖全局 TRANS，
+    而 TRANS 要等启动后 load_language() 才装载——模块级调用会被冻在「导入时的中文」上，
+    英文界面里这个下拉仍显示中文。做成函数后，multi 里 _() 在开窗时求值 → 跟随当前语言。
+    """
+    return {
+        "move": "平移",
+        "smoothstep": "平滑(原)",
+        "linear": "线性",
+        "ease_in": "缓入",
+        "ease_out": "缓出",
+        "ease_in_out": "缓入缓出",
+        "still": "不动",
+    }
+
+
+def _traj_mode_choices():
+    """→ 与 _TRAJ_MODE_ORDER 同序的下拉显示名列表（combobox values）。"""
+    _disp = _traj_mode_display_map()
+    return [_disp.get(k, k) for k in _TRAJ_MODE_ORDER]
+
+
 def _seg_move_mode(w):
-    """简易位置行移动方式归一化：返回 'move'（线性）| 'smooth'（平滑）| 'still'（不动）。
+    """轨迹段移动方式归一化 → canonical key：
+    'move'（线性: 平移/线性）| 'smoothstep'（原平滑）|
+    'ease_in' | 'ease_out' | 'ease_in_out' | 'still'（不动）。
 
-    兼容三种历史写法：旧数据 move=True/False、新数据 move='move'/'smooth'/''，
-    以及**对话框里写回的字符串 'still'**。
-
-    ⚠️ 2026-09-02 修复（从统一尝试版回灌，该版标注 2026-08-31）：这里原本**不认
-    字符串 'still'**（只有 False/None/'' 才算不动），于是「方式」下拉选「不动」
-    后写回 w['move']='still'（见简易位置对话框 mode_map），本函数却返回 'move'：
-      • 列表 / 整行编辑弹窗 / 起点终点窗口 一律错显示成「移动」；
-      • 「结尾坐标」编辑没被禁用（调用方靠 != 'still' 判断），明明是不动段却让改结尾。
-    全项目多处都拿本函数的返回值跟 'still' 比较，所以统一在这里补分支，一处修好。
-    对既有数据无副作用：写 'still' 时 ex/ey 已被同步成 sx/sy，
-    build_crop_pos_expr 的 move 分支本来就插值成常量，与 still 分支同值。"""
+    兼容历史写法：move=True/False、'移动'/'平滑'/'不动' 中文、'move'/'smooth'/'still' 英文、
+    以及对话框写回的 canonical key。返回常量供 build_crop_pos_expr /
+    build_canvas_filtergraph / 各轨迹列表显示统一使用。"""
     v = w.get("move", True)
     if v is False or v is None or v == "":
         return "still"
     if isinstance(v, str):
-        if v == "still":
-            return "still"
-        if v == "smooth":
-            return "smooth"
-        if v == "move":
-            return "move"
+        k = _TRAJ_LEGACY_TO_KEY.get(v)
+        if k:
+            return k
     return "move"
 
 
@@ -1836,11 +1870,16 @@ def build_crop_pos_expr(segments, base_x, base_y, trim_start=0.0, speed_factor=1
         mode = _seg_move_mode(seg)
         if mode == "still":
             return f"{sx:g}"
-        if mode == "smooth":
-            # smoothstep：x²(3-2x)，x=min(1,(t-st)/d)；起止速度平滑（无阶跃）
-            mm = f"min(1,(t-{st:g})/{d:g})"
+        if mode in ("move", "linear"):
+            return f"{sx:g}+({ex}-{sx})*min(1,(t-{st:g})/{d:g})"
+        # 缓动（smoothstep / ease_in / ease_out / ease_in_out）：段内局部进度做 ease。
+        # ffmpeg 不会解牛顿，故贝塞尔曲线用 _ease_ladder_expr 压平成线性段（与 canvas 同思路）。
+        mm = f"min(1,(t-{st:g})/{d:g})"
+        if mode == "smoothstep":
+            # 原平滑 x²(3-2x)，与旧版逐字符等价（严格向后兼容）
             return f"{sx:g}+({ex}-{sx})*({mm}*{mm}*(3-2*{mm}))"
-        return f"{sx:g}+({ex}-{sx})*min(1,(t-{st:g})/{d:g})"
+        eased = _ease_ladder_expr(mm, mode, steps=32)
+        return f"{sx:g}+({ex}-{sx})*{eased}"
 
     ex_x = f"{bx:g}"
     ex_y = f"{by:g}"
@@ -1849,6 +1888,81 @@ def build_crop_pos_expr(segments, base_x, base_y, trim_start=0.0, speed_factor=1
         ex_x = f"if(lt(t,{st:g}),{ex_x},{term(seg, 'sx', 'ex')})"
         ex_y = f"if(lt(t,{st:g}),{ex_y},{term(seg, 'sy', 'ey')})"
     return ex_x, ex_y
+
+
+# >>> EASING HELPERS START
+# 轨迹缓动曲线（2026-09-13）：把「平滑」写死的 smoothstep 升级为可配置贝塞尔缓动。
+# 借鉴 jub0t/Concat 的 bezier_y_at_x（牛顿+二分）；ffmpeg 不会解牛顿，故 resample 压平。
+# 关键：缓动贯穿「整条轨迹」(全局 t0→tN)，而非每段各算各的——
+#   单段时与旧 smoothstep 完全等价（向后兼容）；多段时中间点非零速度，不再每点停。
+_EASE_PRESETS = {
+    "linear":      (0.0, 0.0, 1.0, 1.0),
+    "ease_in":     (0.42, 0.0, 1.0, 1.0),
+    "ease_out":    (0.0, 0.0, 0.58, 1.0),
+    "ease_in_out": (0.42, 0.0, 0.58, 1.0),
+    "smoothstep":  None,   # 原平滑 x²(3-2x)，严格向后兼容
+}
+
+
+def _bezier_y_at_x(x, p1x, p1y, p2x, p2y, eps=1e-6, max_iter=8):
+    """解三次贝塞尔：给定 x∈[0,1]，求 t 使 bezier_x(t)=x，再返回 bezier_y(t)。
+    牛顿迭代 + 二分兜底（照搬 jub0t/Concat 思路）。"""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    t = x
+    for _ in range(max_iter):
+        bx = 3 * (1 - t) ** 2 * t * p1x + 3 * (1 - t) * t ** 2 * p2x + t ** 3 - x
+        if abs(bx) < eps:
+            break
+        d = 3 * (1 - t) ** 2 * p1x + 6 * (1 - t) * t * (p2x - p1x) + 3 * t ** 2 * (1 - p2x)
+        if abs(d) < 1e-9:
+            break
+        t -= bx / d
+        if t < 0.0:
+            t = 0.0
+        elif t > 1.0:
+            t = 1.0
+    lo, hi = 0.0, 1.0
+    for _ in range(20):
+        mt = (lo + hi) / 2.0
+        bx = 3 * (1 - mt) ** 2 * mt * p1x + 3 * (1 - mt) * mt ** 2 * p2x + mt ** 3
+        if abs(bx - x) < eps:
+            t = mt
+            break
+        if bx < x:
+            lo = mt
+        else:
+            hi = mt
+    return 3 * (1 - t) ** 2 * t * p1y + 3 * (1 - t) * t ** 2 * p2y + t ** 3
+
+
+def _ease_value(frac, preset="smoothstep"):
+    """frac∈[0,1] → 缓动后的值∈[0,1]。"""
+    f = min(1.0, max(0.0, float(frac)))
+    if preset == "smoothstep" or preset not in _EASE_PRESETS:
+        return f * f * (3.0 - 2.0 * f)
+    cx1, cy1, cx2, cy2 = _EASE_PRESETS[preset]
+    return _bezier_y_at_x(f, cx1, cy1, cx2, cy2)
+
+
+def _ease_ladder_expr(var, preset="smoothstep", steps=24):
+    """把 ease(var) 压平成 ffmpeg 线性段表达式。
+    var 是含帧变量 t 的 ffmpeg 表达式串；返回与 ease(var) 等价的分段线性串。
+    段内线性插值逼近贝塞尔曲线（ffmpeg 不会解牛顿，必须压平）。"""
+    pts = [_ease_value(i / steps, preset) for i in range(steps + 1)]
+    inner = None
+    for i in range(steps - 1, -1, -1):
+        x0 = i / steps
+        x1 = (i + 1) / steps
+        seg = f"{pts[i]:g}+({pts[i + 1] - pts[i]:g})*(({var})-({x0:g}))/({x1 - x0:g})"
+        if inner is None:
+            inner = seg
+        else:
+            inner = f"if(lt({var},{x1:g}),{seg},{inner})"
+    return f"if(lt({var},0),0,if(gt({var},1),1,{inner}))"
+# >>> EASING HELPERS END
 
 
 def _canvas_defers_mask(settings) -> bool:
@@ -1903,7 +2017,7 @@ def build_canvas_filtergraph(settings, W, H, trim_start=0.0, speed_factor=1.0,
                             filter_trim_start=0.0, trim_duration=None,
                             src_label=None, out_label="v_canvas",
                             canvas_color="black", base_vf=None, tag="",
-                            force_rgba=False, append_mask=True):
+                            force_rgba=False, append_mask=True, ease=None):
     """画布模式（Shotcut 式「位置、尺寸、旋转」）滤镜图生成。
 
     主视频作为内容，在固定 = 主视频原始尺寸的黑色画布上 移动 + 缩放 + 旋转，
@@ -1986,10 +2100,26 @@ def build_canvas_filtergraph(settings, W, H, trim_start=0.0, speed_factor=1.0,
     def _st_dur(seg):
         return _timeline_convert(seg.get("start", 0), seg.get("dur", 0), ts, sp)
 
+    # 全局缓动基准（2026-09-13）：缓动贯穿「整条轨迹」(t0→tN)，而非每段各算各的。
+    # 单段时 t0=st, tN=st+d → 等价于旧逐段 smoothstep（向后兼容）；
+    # 多段时中间点被「带着非零速度穿过」，不再每点减速到 0（即旧「平滑」顿挫的根因）。
+    # 缓动曲线（2026-09-13 重构）：不再有独立 traj_ease 设置——曲线直接由每段 seg['move']
+    # 的 canonical key（smoothstep/ease_in/...）决定，多段可各有不同曲线；ease 参数仅作
+    # 旧接口兼容的整条轨迹强制覆盖（通常 None）。
+    _ease = ease if ease else None
+    _g_t0 = _st_dur(segs[0])[0]
+    _g_last = segs[-1]
+    _g_tN = _st_dur(_g_last)[0] + _st_dur(_g_last)[1]
+    _g_span = _g_tN - _g_t0
+    if _g_span <= 1e-9:
+        _g_span = 0.0
+
     def _interp(seg, k0, k1, mode=None):
-        """段内数值插值（still/线性/smooth），返回 ffmpeg 表达式字符串。
-        mode: 显式插值模式（'move'/'smooth'/'still'）；None 时按 _seg_move_mode 推断。
-        旋转字段传入 rot_mode（与位置/缩放解耦：rot_start≠rot_end 即动画，仍尊重 smooth 曲线）。"""
+        """段内数值插值（still/线性/eased），返回 ffmpeg 表达式字符串。
+        mode: 显式插值模式（canonical key）；None 时按 _seg_move_mode 推断。
+        旋转字段传入 rot_mode（与位置/缩放解耦）。
+        eased 模式走「全局贯穿缓动」：ease(g) 把整条轨迹映射成一条连续曲线，
+        段内只做线性重映射，故多段接缝处位置连续、不再每点停（旧「平滑」顿挫的根因）。"""
         v0 = _num(seg, k0); v1 = _num(seg, k1)
         st, d = _st_dur(seg)
         if d <= 0:
@@ -1998,10 +2128,28 @@ def build_canvas_filtergraph(settings, W, H, trim_start=0.0, speed_factor=1.0,
             mode = _seg_move_mode(seg)
         if mode == "still" or abs(v1 - v0) < 1e-9:
             return f"{v0:g}"
-        if mode == "smooth":
+        if mode in ("move", "linear"):
+            return f"{v0:g}+({v1}-{v0})*min(1,(t-{st:g})/{d:g})"
+        # eased：smoothstep / ease_in / ease_out / ease_in_out
+        # 若调用方强制传入 ease（旧接口），整条轨迹统一用该曲线；否则用每段自己的曲线
+        _preset = _ease if _ease else mode
+        if _g_span <= 0:
+            # 退化单段：与旧逐段 smoothstep 逐字符等价（向后兼容）
             mm = f"min(1,(t-{st:g})/{d:g})"
-            return f"{v0:g}+({v1}-{v0})*({mm}*{mm}*(3-2*{mm}))"
-        return f"{v0:g}+({v1}-{v0})*min(1,(t-{st:g})/{d:g})"
+            if _preset == "smoothstep":
+                return f"{v0:g}+({v1}-{v0})*({mm}*{mm}*(3-2*{mm}))"
+            eased = _ease_ladder_expr(mm, _preset, steps=32)
+            return f"{v0:g}+({v1}-{v0})*{eased}"
+        # 全局归一化时间 g=(t-T0)/span → ease(g)；段内局部进度 = (ease(g)-easeA)/(easeB-easeA)
+        gvar = f"((t-{_g_t0:g})/{_g_span:g})"
+        eased = _ease_ladder_expr(gvar, _preset, steps=32)
+        gA = (st - _g_t0) / _g_span
+        gB = (st + d - _g_t0) / _g_span
+        easeA = _ease_value(gA, _preset)
+        easeB = _ease_value(gB, _preset)
+        denom = easeB - easeA
+        local = "0" if abs(denom) < 1e-9 else f"({eased}-({easeA:g}))/({denom:g})"
+        return f"{v0:g}+({v1}-{v0})*{local}"
 
     def _nested(segs, term_fn, default):
         """按开始时间升序生成嵌套 if(lt(t,st),prev,term) 表达式（段前停在 default）。"""
@@ -2093,7 +2241,9 @@ def build_canvas_filtergraph(settings, W, H, trim_start=0.0, speed_factor=1.0,
     def _rot_mode(seg):
         if abs(_num(seg, "rot_end") - _num(seg, "rot_start")) < 1e-9:
             return "still"
-        return "smooth" if _seg_move_mode(seg) == "smooth" else "move"
+        _m = _seg_move_mode(seg)
+        # 旋转与位置/缩放同曲线：段为 eased 模式时旋转也走该曲线，否则线性
+        return _m if _m in ("smoothstep", "ease_in", "ease_out", "ease_in_out") else "move"
     ang_expr = _nested(segs, lambda s: f"({_interp(s,'rot_start','rot_end', _rot_mode(s))})*PI/180", 0.0)
     rot_part = (f"{_v1_lbl}rotate=angle='{ang_expr}'"
                 f":ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=black@0[v2{_t}]")
@@ -9043,20 +9193,22 @@ class VideoFilterFrame(ttk.LabelFrame):
         t_dur.bind("<KeyRelease>", lambda e: _on_time_entry())
         ttk.Button(r_t, text="时间预览", command=lambda: _open_time_preview()).pack(side=tk.LEFT, padx=8)
 
-        # 方式（只读显示）
+        # 方式（移动方式 + 缓动曲线合并为同一下拉，2026-09-13）
         r_md = _mk_row("方式")
-        mode_combo = ttk.Combobox(r_md, textvariable=cur_mode, values=["移动", "平滑", "不动"],
-                                  state="readonly", width=8)
+        mode_combo = ttk.Combobox(r_md, textvariable=cur_mode, values=_traj_mode_choices(),
+                                  state="readonly", width=12)
         mode_combo.pack(side=tk.LEFT)
+        ToolTip(mode_combo,
+                "平移/线性 = 匀速插值；缓入/缓出/缓入缓出/平滑(原) = 缓动曲线（贯穿整条轨迹，"
+                "多段路径不再每个点顿一下）；不动 = 静止。曲线越往后越「弹」。")
         mode_combo.bind("<<ComboboxSelected>>", lambda e: _apply_mode_from_combo())
         def _apply_mode_from_combo():
             idx = sel_idx.get()
             if idx < 0 or idx >= len(dlg_segs):
                 return
             w = dlg_segs[idx]
-            selected = cur_mode.get()
-            mode_map = {"移动": "move", "平滑": "smooth", "不动": "still"}
-            new_mode = mode_map.get(selected, "still")
+            _mi = mode_combo.current()
+            new_mode = _TRAJ_MODE_ORDER[_mi] if 0 <= _mi < len(_TRAJ_MODE_ORDER) else "move"
             w["move"] = new_mode
             # 如果是“不动”，将终点坐标同步为起点
             if new_mode == "still":
@@ -9294,8 +9446,13 @@ class VideoFilterFrame(ttk.LabelFrame):
             # 2026-09-03：时间/时长统一 3 位小数（用户要求从 :g 的 6 位有效数字改为定点 3 位），
             # 底层数据仍保留 float 精度（不影响抽帧/输出），仅显示口径收敛。
             return (i + 1, f"{st:.3f}-{en:.3f}",
-                    {"move": "移动", "smooth": "平滑", "still": "不动"}[md],
+                    _traj_mode_display_map().get(md, "平移"),
                     f"{sc:g}", f"{ra:g}", f"{rb:g}", off_s, off_e)
+
+        def _sync_mode_combo(idx):
+            """把「方式」下拉同步到指定行段的移动方式（修复：切换行时下拉始终显示该行模式）。"""
+            if 0 <= idx < len(dlg_segs):
+                cur_mode.set(_traj_mode_display_map().get(_seg_move_mode(dlg_segs[idx]), "平移"))
 
         def _refresh(select_idx="__keep__", sync_entries=True):
             """刷新列表。sync_entries=True 时顺带把当前关键帧偏移回填 X/Y 输入框。
@@ -9321,15 +9478,16 @@ class VideoFilterFrame(ttk.LabelFrame):
                 tree.see(str(prev))
             if sync_entries:
                 _sync_xy_entries()
+            _sync_mode_combo(prev if prev is not None else sel_idx.get())
 
-        def _selected():
-            sel = tree.selection()
-            if not sel:
-                return None
-            try:
-                return int(sel[0])
-            except (ValueError, TypeError):
-                return None
+            def _selected():
+                sel = tree.selection()
+                if not sel:
+                    return None
+                try:
+                    return int(sel[0])
+                except (ValueError, TypeError):
+                    return None
 
         def _on_select(ev=None):
             sel = tree.selection()
@@ -9339,6 +9497,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             if idx == sel_idx.get():
                 return
             sel_idx.set(idx)
+            _sync_mode_combo(idx)   # 切换行：下拉同步到该行移动方式
             _sync_xy_entries()   # 切换行：X/Y 框回填该行当前关键帧的偏移
 
         def _open_generic_editor():
@@ -9469,9 +9628,9 @@ class VideoFilterFrame(ttk.LabelFrame):
             r += 1
 
             ttk.Label(ef, text="移动方式:").grid(row=r, column=0, sticky="e", pady=2)
-            _md_init = {"move": "移动", "smooth": "平滑", "still": "不动"}[_seg_move_mode(w)]
+            _md_init = _traj_mode_display_map().get(_seg_move_mode(w), "平移")
             mdisp = tk.StringVar(value=_md_init)
-            mb = ttk.Combobox(ef, textvariable=mdisp, values=["移动", "平滑", "不动"],
+            mb = ttk.Combobox(ef, textvariable=mdisp, values=_traj_mode_choices(),
                               state="readonly", width=14)
             mb.grid(row=r, column=1, sticky="w", padx=6)
             r += 1
@@ -9547,7 +9706,8 @@ class VideoFilterFrame(ttk.LabelFrame):
             def _ok():
                 # ⚠️ 先全部解析+校验，通过后才统一写回——否则「结尾坐标填错」时
                 # 起始坐标/缩放/角度已被写进 w 形成半截状态（原简易位置版同款缺陷，此处修正）。
-                _md = {"移动": "move", "平滑": "smooth", "不动": "still"}[mdisp.get()]
+                _mi = mb.current()
+                _md = _TRAJ_MODE_ORDER[_mi] if 0 <= _mi < len(_TRAJ_MODE_ORDER) else "move"
                 move = (_md != "still")
                 pa = _parse_pt(sa.get())
                 if pa is None:
@@ -9969,7 +10129,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             endc = "—" if md == "still" else f"{int(round(_seg_num(w,'ex'))):d},{int(round(_seg_num(w,'ey'))):d}"
             btm = f"{_seg_num(w,'start'):.3f}"
             dtt = f"{_seg_num(w,'start') + _seg_num(w,'dur'):.3f}"
-            mdisp = {"move": "移动", "smooth": "平滑", "still": "不动"}[md]
+            mdisp = _traj_mode_display_map().get(md, "平移")
             return (i + 1, sta, mdisp, endc, btm, dtt)
 
         def _refresh(select_idx="__keep__"):
@@ -10139,9 +10299,9 @@ class VideoFilterFrame(ttk.LabelFrame):
             r += 1
 
             ttk.Label(ef, text="移动方式:").grid(row=r, column=0, sticky="e", pady=2)
-            _md_init = {"move": "移动", "smooth": "平滑", "still": "不动"}[_seg_move_mode(w)]
+            _md_init = _traj_mode_display_map().get(_seg_move_mode(w), "平移")
             mdisp = tk.StringVar(value=_md_init)
-            mb = ttk.Combobox(ef, textvariable=mdisp, values=["移动", "平滑", "不动"],
+            mb = ttk.Combobox(ef, textvariable=mdisp, values=_traj_mode_choices(),
                               state="readonly", width=14)
             mb.grid(row=r, column=1, sticky="w", padx=6)
             r += 1
@@ -10186,7 +10346,8 @@ class VideoFilterFrame(ttk.LabelFrame):
                 win.grab_set()
 
             def _ok():
-                _md = {"移动": "move", "平滑": "smooth", "不动": "still"}[mdisp.get()]
+                _mi = mb.current()
+                _md = _TRAJ_MODE_ORDER[_mi] if 0 <= _mi < len(_TRAJ_MODE_ORDER) else "move"
                 move = (_md != "still")
                 pa = _parse_pt(sa.get())
                 if pa is None:
@@ -10431,7 +10592,11 @@ class VideoFilterFrame(ttk.LabelFrame):
                 s0 = _seg_num(w, "start")
                 d0 = max(_seg_num(w, "dur", 1.0), 0.05)
                 md = _seg_move_mode(w)
-                col = {"move": "#85B7EB", "smooth": "#7FBF7F", "still": "#B4B2A9"}[md]
+                _md_colors = {"move": "#85B7EB", "linear": "#9AD0C2",
+                              "smoothstep": "#7FBF7F",
+                              "ease_in": "#C9A0DC", "ease_out": "#F0B36B",
+                              "ease_in_out": "#7FBF7F", "still": "#B4B2A9"}
+                col = _md_colors.get(md, "#85B7EB")
                 prev_cv.create_rectangle(x_of(s0), 8, max(x_of(s0 + d0), x_of(s0) + 4), 24,
                                          fill=col, outline="#5F5E5A")
                 ax = x_of(s0)
@@ -25918,14 +26083,25 @@ class FFmpegBatchGUI:
                 existing = cmd_list[j + 1]
                 cmd_list[j + 1] = self._merge_filter_chains(existing, new_filters, is_audio=False)
                 return
-        # 回退：如果有 -filter_complex ，追加到末尾（仅单路简单链）
+        # 回退：如果有 -filter_complex ，追加到末尾
         for j, arg in enumerate(cmd_list):
             if arg == "-filter_complex" and j + 1 < len(cmd_list):
+                existing = cmd_list[j + 1]
                 merged = ",".join(new_filters)
-                if cmd_list[j + 1]:
-                    cmd_list[j + 1] = cmd_list[j + 1] + "," + merged
-                else:
+                if not existing:
                     cmd_list[j + 1] = merged
+                elif existing.rstrip().endswith("]"):
+                    # 带输出标签的滤镜图（画布/文字水印旋转路径）：标签后接逗号非法。
+                    # 把末尾输出标签降级为临时标签 → 接新滤镜 → 恢复原标签，保持 -map 标签不变。
+                    m = re.match(r"^(.*)\[([A-Za-z_]\w*)\]\s*$", existing.rstrip())
+                    if m:
+                        body, tail = m.group(1), m.group(2)
+                        tmp = f"[{tail}__custom]"
+                        cmd_list[j + 1] = f"{body}{tmp};{tmp}{merged}[{tail}]"
+                    else:
+                        cmd_list.extend(["-vf", merged])
+                else:
+                    cmd_list[j + 1] = existing + "," + merged
                 return
         cmd_list.extend(["-vf", ",".join(new_filters)])
 
@@ -31065,15 +31241,9 @@ class FFmpegBatchGUI:
                 continue
             if a == "-map" and i + 1 < len(cmd_list):
                 tgt = cmd_list[i + 1]
-                if tgt.startswith("["):
-                    # 视频标签：filtergraph 中最后一个输出标签（排除 [a...] 音频）
-                    if vmap_idx is None and not (tgt.startswith("[a") or tgt.startswith("[A")):
-                        vmap_idx = i; vmap_val = tgt
-                elif ":" in tgt:
-                    parts = tgt.split(":")
-                    if len(parts) >= 2 and parts[1] == "v":
-                        if vmap_idx is None:
-                            vmap_idx = i; vmap_val = tgt
+                # 视频映射：[label]（排除 [a...] 音频）或 N:v / N:v? / N:v:M
+                if vmap_idx is None and self._is_video_map_target(tgt):
+                    vmap_idx = i; vmap_val = tgt
             if a == "-c:v" and i + 1 < len(cmd_list):
                 if cmd_list[i + 1] == "copy":
                     is_copy = True
@@ -31171,18 +31341,9 @@ class FFmpegBatchGUI:
             new_cmd[ins:ins] = ["-filter_complex", new_fc]
             # 插入后视频 -map 索引偏移 2；统一重新查找视频 -map 改为 [v_end_out]
             for k, a in enumerate(new_cmd):
-                if a == "-map" and k + 1 < len(new_cmd):
-                    tgt = new_cmd[k + 1]
-                    is_vid = False
-                    if tgt.startswith("[") and not (tgt.startswith("[a") or tgt.startswith("[A")):
-                        is_vid = True
-                    elif ":" in tgt:
-                        parts = tgt.split(":")
-                        if len(parts) >= 2 and parts[1] == "v":
-                            is_vid = True
-                    if is_vid:
-                        new_cmd[k + 1] = "[v_end_out]"
-                        break
+                if a == "-map" and self._is_video_map_target(new_cmd[k + 1] if k + 1 < len(new_cmd) else ""):
+                    new_cmd[k + 1] = "[v_end_out]"
+                    break
             if extra_in:
                 pos = max((k for k, a in enumerate(new_cmd) if a == "-i"), default=0)
                 if pos > 0 and pos + 1 < len(new_cmd):
@@ -31208,18 +31369,9 @@ class FFmpegBatchGUI:
         new_cmd[ins:ins] = ["-filter_complex", new_fc]
         # 插入后视频 -map 索引偏移 2；统一重新查找视频 -map 改为 [v_end_out]
         for k, a in enumerate(new_cmd):
-            if a == "-map" and k + 1 < len(new_cmd):
-                tgt = new_cmd[k + 1]
-                is_vid = False
-                if tgt.startswith("[") and not (tgt.startswith("[a") or tgt.startswith("[A")):
-                    is_vid = True
-                elif ":" in tgt:
-                    parts = tgt.split(":")
-                    if len(parts) >= 2 and parts[1] == "v":
-                        is_vid = True
-                if is_vid:
-                    new_cmd[k + 1] = "[v_end_out]"
-                    break
+            if a == "-map" and self._is_video_map_target(new_cmd[k + 1] if k + 1 < len(new_cmd) else ""):
+                new_cmd[k + 1] = "[v_end_out]"
+                break
         if extra_in:
             pos = max((k for k, a in enumerate(new_cmd) if a == "-i"), default=0)
             if pos > 0 and pos + 1 < len(new_cmd):
@@ -31232,6 +31384,17 @@ class FFmpegBatchGUI:
                     break
         new_cmd = self._ensure_end_video_map(new_cmd)
         return self._adjust_end_concat_duration(new_cmd, main_dur, concat_sec, concat_path, concat_on)
+
+    @staticmethod
+    def _is_video_map_target(tgt):
+        """-map 目标是否指向视频流：`[label]`（排除 [a…]/[A…] 音频标签）或 `0:v` / `0:v?` / `1:v:2`。
+        ⚠️ 必须容忍可选流后缀 `?`——转码页普通路径映射写的是 `-map 0:v?`，本方法曾用
+        `parts[1] == "v"` 精确比对，导致 `0:v?` 被误判为"非视频映射"。"""
+        if tgt.startswith("["):
+            return not (tgt.startswith("[a") or tgt.startswith("[A"))
+        if ":" in tgt:
+            return tgt.split(":")[1].rstrip("?") == "v"
+        return False
 
     def _find_end_output_pos(self, new_cmd):
         """找输出文件路径在命令中的位置（倒序第一个非选项参数，跳过 -filter_complex/-vf
@@ -31255,15 +31418,8 @@ class FFmpegBatchGUI:
         不动；否则在输出文件前显式补 `-map [v_end_out] -map 0:a?`（视频用合成结果、
         音频保持源可选流）。"""
         for k, a in enumerate(new_cmd):
-            if a == "-map" and k + 1 < len(new_cmd):
-                tgt = new_cmd[k + 1]
-                if tgt.startswith("["):
-                    if not (tgt.startswith("[a") or tgt.startswith("[A")):
-                        return new_cmd  # 已有视频 -map
-                elif ":" in tgt:
-                    parts = tgt.split(":")
-                    if len(parts) >= 2 and parts[1] == "v":
-                        return new_cmd
+            if a == "-map" and self._is_video_map_target(new_cmd[k + 1] if k + 1 < len(new_cmd) else ""):
+                return new_cmd  # 已有视频 -map
         out_idx = self._find_end_output_pos(new_cmd)
         new_cmd[out_idx:out_idx] = ["-map", "[v_end_out]", "-map", "0:a?"]
         return new_cmd
@@ -32465,7 +32621,7 @@ class FFmpegBatchGUI:
                 # 递归遍历文件夹
                 for root, dirs, files in os.walk(item):
                     for f in files:
-                        expanded.append(os.path.join(root, f))
+                        expanded.append(normalize_path(os.path.join(root, f)))
             else:
                 expanded.append(item)
         return expanded
@@ -38753,7 +38909,7 @@ class FFmpegBatchGUI:
     # -------------------- 拖放处理 --------------------
     def on_files_dropped(self, event):
         """根窗口拖放：仅处理添加到队列（输入/输出框由独立回调处理）"""
-        files = self.root.tk.splitlist(event.data)
+        files = [normalize_path(f) for f in self.root.tk.splitlist(event.data)]
         self._append_info_ui(f"拖拽了 {len(files)} 个文件/文件夹")
         current_tab = self.notebook.index(self.notebook.select())
     
@@ -38773,7 +38929,7 @@ class FFmpegBatchGUI:
                     self._append_info_ui(f"扫描目录: {item}")
                     for root_dir, _, filenames in os.walk(item):
                         for filename in filenames:
-                            file_path = os.path.join(root_dir, filename)
+                            file_path = normalize_path(os.path.join(root_dir, filename))
                             if os.path.splitext(file_path)[1].lower() in video_exts:
                                 self.add_task(file_path)
                     self._append_info_ui(f"目录扫描完成: {item}")
@@ -38798,9 +38954,9 @@ class FFmpegBatchGUI:
         files = self.root.tk.splitlist(event.data)
         if not files:
             return
-        first_file = files[0]
+        first_file = normalize_path(files[0])
         if os.path.exists(first_file):
-            self.input_file.set(normalize_path(first_file))
+            self.input_file.set(first_file)
             if not self.output_dir.get():
                 self.output_dir.set(os.path.dirname(first_file))
             self._append_info_ui(f"已设置输入文件: {os.path.basename(first_file)}")
@@ -38814,12 +38970,12 @@ class FFmpegBatchGUI:
         files = self.root.tk.splitlist(event.data)
         if not files:
             return
-        path = files[0]
+        path = normalize_path(files[0])
         if os.path.isdir(path):
-            self.output_dir.set(normalize_path(path))
+            self.output_dir.set(path)
             self._append_info_ui(f"已设置输出目录: {path}")
         else:
-            self.output_dir.set(normalize_path(os.path.dirname(path)))
+            self.output_dir.set(os.path.dirname(path))
             self._append_info_ui(f"已提取输出目录: {os.path.dirname(path)}")
         self.update_command_preview()
         return "break"
@@ -40615,7 +40771,7 @@ class FFmpegBatchGUI:
             self._append_info_ui("[流提取] 已清空文件列表")
     
     def extract_on_drop(self, event):
-        files = self.root.tk.splitlist(event.data)
+        files = [normalize_path(f) for f in self.root.tk.splitlist(event.data)]
         self._batch_update = True
         try:
             for f in files:
@@ -42275,7 +42431,15 @@ class SegmentEditor:
                 alabel = None
                 agraph = None
             else:
-                alabel = "0:a?"
+                # 沿用该段实际的音频映射（0:a?=首轨 / 0:a=全部原样保留 / 0:a:N），
+                # 不能写死 0:a?，否则「全部·原样保留」在精确合并里会退化为只留首音轨。
+                alabel = None
+                for j, m in enumerate(c):
+                    if m == "-map" and j + 1 < len(c) and c[j + 1].startswith("0:a"):
+                        alabel = c[j + 1]
+                        break
+                if alabel is None:
+                    alabel = "0:a?"
                 agraph = None
 
             enc = self._extract_encode_opts(c)
@@ -42285,9 +42449,7 @@ class SegmentEditor:
         merged = [cmds[0][0], "-y", "-i", input_path, "-filter_complex", fc_all]
         for k, (vgraph, vlabel, agraph, alabel, enc) in enumerate(parsed):
             merged += ["-map", vlabel]
-            if alabel == "0:a?":
-                merged += ["-map", "0:a?"]
-            elif alabel is None:
+            if alabel is None:
                 merged += ["-an"]
             else:
                 merged += ["-map", alabel]
