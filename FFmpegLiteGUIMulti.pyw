@@ -21,6 +21,7 @@ from typing import List, Tuple, Optional, Dict, Any, Callable
 import shlex
 import tempfile
 import time
+import array
 import struct
 import types
 
@@ -4147,6 +4148,15 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
         filters.append(_chroma_f)
 
     # ----- 去水印/模糊（必须排在裁剪/旋转/缩放之前，坐标才与原始帧一致）-----
+    # 显示时段换算基准（2026-09-13 修复）：本链 trim+setpts 已把滤镜 t 归零，delogo/
+    # 区域效果的 enable 窗口若直接用源时间会整体右偏 trim 起点（如 trim=6.567 起、
+    # 窗口 between(t,6.567,20) 的前 6.567s 永不命中）。基准解析与 crop_pos 同源
+    # （motion_trim_start 优先，否则取 settings 的 trim_start）。
+    # ⚠️ 只减 trim 不除 speed：区域链位在变速 setpts 之前（链尾 drawtext 才做全换算）。
+    if motion_trim_start is not None:
+        _blur_tbase = float(motion_trim_start)
+    else:
+        _blur_tbase, _ = _trim_speed_from_settings(settings)
     if settings.get("blur_enabled", False):
         # 多区域列表（2026-08-26）：遍历 blur_items 生成多条；无列表时回退旧单键（统一出口）
         blur_items = _effective_blur_items(settings)
@@ -4162,7 +4172,7 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
             region_only = _bi.get("region_only", False)
 
             # 显示时段 / 循环控制（与文字水印同套 enable 表达式；2026-08-26 新增）
-            _enable_expr = _build_drawtext_enable(_bi)
+            _enable_expr = _build_drawtext_enable(_bi, trim_start=_blur_tbase)
             _sfx_en = f":enable='{_enable_expr}'" if _enable_expr else ""
 
             if blur_type == "delogo":
@@ -4496,7 +4506,27 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
             filters.append(f"fade=t=in:st=0:d={fin_s:.3f}")
         if fout_s > 0:
             if clip_duration and clip_duration > 0:
-                st = max(0.0, clip_duration - fout_s)
+                # 淡出起点按输出时长定位（fade 在变速 setpts 之后，t=输出时间线）。
+                # clip_duration 语义=源全时长；本链自身的 截取/变速 会缩短输出，
+                # 2026-09-13 前直接用 clip_duration → 截取后淡出点落在输出之外（淡出丢失）。
+                _od = clip_duration
+                if include_trim and settings.get("precise_trim", False) and settings.get("trim_enabled", False):
+                    _fs_raw = settings.get("trim_start", "").strip()
+                    _fe_raw = settings.get("trim_end", "").strip()
+                    _fs = time_to_seconds(_fs_raw) if _fs_raw else 0.0
+                    _fe = time_to_seconds(_fe_raw) if _fe_raw else None
+                    if _fe is not None and _fe > _fs:
+                        _od = _fe - _fs
+                    else:
+                        _od = max(0.0, _od - _fs)
+                if settings.get("speed_enabled", False):
+                    try:
+                        _fsp = float(settings.get("speed_factor", "1.0") or "1.0")
+                        if _fsp > 0 and _fsp != 1.0:
+                            _od = _od / _fsp
+                    except ValueError:
+                        pass
+                st = max(0.0, _od - fout_s)
                 filters.append(f"fade=t=out:st={st:.3f}:d={fout_s:.3f}")
             # 未知时长时无法精确定位淡出起点，跳过淡出（淡入仍生效）
 
@@ -6336,6 +6366,20 @@ AUDIO_CONTAINER_MATRIX = {
 _AUDIO_FALLBACK_CONTAINERS = ["mka", "mkv", "wav", "mp4", "mov", "flac", "m4a", "mp3"]
 
 
+def audio_stream_suffix(n):
+    """输出音频流的「按轨说明符」后缀，供 -filter:a:N / -c:a:N / -b:a:N 等使用。
+
+    为什么必须是 ':{n}' 而不是 ':a:{n}'（2026-09-13 真机实测，修掉两个 bug）：
+    1) 前缀本身已含 ':a'（build_audio_encoder_args 内部硬编码 "-c:a"/"-b:a"/
+       "-q:a"/"-ar:a"）。旧调用点传 ':a:{n}' → 拼出 `-c:a:a:0`，ffmpeg 直接报
+       「Stream type specified multiple times」并拒绝打开输出文件（rc=-22）。
+    2) 按轨音频滤镜只能用 `-filter:a:N`，**不可用 `-af:a:N`**。实测 -af 的流
+       说明符会被忽略（等价于全局 -af，多条里最后一条套到全部音轨），多音轨时
+       各轨 trim/volume/speed 互相串味，而且完全静默、ffmpeg 不报任何错。
+    """
+    return f":{n}"
+
+
 def build_audio_encoder_args(acodec, settings, stream_tag="", skip_ar=False):
     """统一拼装单条音频输出流参数，处理无损 / auto 边界。
 
@@ -6349,7 +6393,7 @@ def build_audio_encoder_args(acodec, settings, stream_tag="", skip_ar=False):
 
     settings 兼容两套键名：主面板用 audio_bitrate/audio_samplerate，
     合并轨道级 enc_settings 用 bitrate/samplerate。
-    stream_tag 例：'' 或 ':a:0' 或 ':1'（拼成 -b:a:0 / -ar:a:0）。
+    stream_tag 例：'' 或 ':0'（拼成 -b:a:0 / -ar:a:0）；按轨时用 audio_stream_suffix(n)。
     """
     if acodec == "copy":
         return ["-c:a" + stream_tag, "copy"]
@@ -6376,7 +6420,7 @@ def build_audio_encoder_args(acodec, settings, stream_tag="", skip_ar=False):
     if sr is None:
         sr = settings.get("samplerate", AUDIO_AUTO)
     if sr and sr != AUDIO_AUTO and not skip_ar:
-        args += ["-ar" + stream_tag, str(sr)]
+        args += ["-ar:a" + stream_tag, str(sr)]
     return args
 
 
@@ -22899,12 +22943,27 @@ class FFmpegBatchGUI:
             if fin_s > 0:
                 af_filters.append(f"afade=t=in:st=0:d={fin_s:.3f}")
             if fout_s > 0:
-                total = self._get_media_duration(input_path) if input_path else None
-                if total:
-                    st = max(0.0, total - fout_s)
+                # 2026-09-13 修复：本函数链首 atrim+asetpts 已把 t 归零（atempo 变速紧随
+                # 其后），淡出起点须按「截取后时长（再除变速）」定位；此前用源全时长，
+                # 截取后淡出点落在输出之外 → 淡出丢失。未走 atrim 时保持源全时长口径。
+                if start_sec is not None and duration > 0:
+                    _ad = duration
+                    if settings.get("audio_speed_enabled", False):
+                        try:
+                            _asp = float(settings.get("audio_speed_factor", "1.0") or "1.0")
+                            if _asp > 0 and _asp != 1.0:
+                                _ad = _ad / _asp
+                        except ValueError:
+                            pass
+                    st = max(0.0, _ad - fout_s)
                     af_filters.append(f"afade=t=out:st={st:.3f}:d={fout_s:.3f}")
                 else:
-                    af_filters.append(f"afade=t=out:st=0:d={fout_s:.3f}")
+                    total = self._get_media_duration(input_path) if input_path else None
+                    if total:
+                        st = max(0.0, total - fout_s)
+                        af_filters.append(f"afade=t=out:st={st:.3f}:d={fout_s:.3f}")
+                    else:
+                        af_filters.append(f"afade=t=out:st=0:d={fout_s:.3f}")
         if settings.get('audio_reverse', False):
             af_filters.append("areverse")
 
@@ -26219,9 +26278,9 @@ class FFmpegBatchGUI:
         cmd_list.extend(["-vf", ",".join(new_filters)])
 
     def _merge_af_into_cmd(self, cmd_list, new_filters):
-        """找到 cmd_list 中的 -af 并合并 new_filters 进去。"""
+        """找到 cmd_list 中的音频滤镜选项（-af，或转换页按轨的 -filter:a:N）并合并进去。"""
         for j, arg in enumerate(cmd_list):
-            if arg == "-af" and j + 1 < len(cmd_list):
+            if (arg == "-af" or arg.startswith("-filter:a")) and j + 1 < len(cmd_list):
                 existing = cmd_list[j + 1]
                 cmd_list[j + 1] = self._merge_filter_chains(existing, new_filters, is_audio=True)
                 return
@@ -31618,6 +31677,8 @@ class FFmpegBatchGUI:
         menu.add_command(label=_("预览轨道（快照 - 画中画合成）"), command=lambda: self.merge_preview_selected(with_snapshot=True))
         menu.add_command(label=_("实时预览（画中画，可能卡顿）"), command=self.merge_preview_pip_live)
         menu.add_command(label=_("创建缩略图"), command=self._contact_sheet_selected_track)
+        # 多流同步参考（2026-09-13）：只测量各视频轨的时间偏移，不改任何轨道数据
+        menu.add_command(label=_("多流同步参考"), command=self.open_multi_sync_reference)
         menu.add_command(label=_("上移轨道"), command=self.merge_move_up_selected)
         menu.add_command(label=_("下移轨道"), command=self.merge_move_down_selected)
         menu.add_command(label=_("克隆轨道"), command=self.merge_clone_selected)
@@ -31631,6 +31692,31 @@ class FFmpegBatchGUI:
         menu.add_separator()
         menu.add_command(label=_("恢复列宽"), command=self.merge_reset_column_widths)
         menu.post(x, y)
+
+    def open_multi_sync_reference(self):
+        """右键「多流同步参考」：把选中的视频轨送进多流比对窗口。
+
+        只测量（显示各轨相对偏移 + 漂移，供手动填写截取），绝不改动轨道数据。
+        至少 2 条、最多 _SYNC_MAX_TRACKS 条；参考轨默认取第一条。
+        """
+        indices = self._get_selected_track_indices()
+        vids = [i for i in indices
+                if i < len(self.merge_tracks) and self.merge_tracks[i].type == "video"]
+        if len(vids) < _SYNC_MIN_TRACKS:
+            messagebox.showinfo(_("提示"), _("请先选中至少 2 个视频轨道（可用 Ctrl / Shift 多选）"))
+            return
+        if len(vids) > _SYNC_MAX_TRACKS:
+            messagebox.showinfo(_("提示"),
+                                _('一次最多比对 {0} 条轨道，当前选中 {1} 条，请分批处理').format(_SYNC_MAX_TRACKS, len(vids)))
+            return
+        if not getattr(self, "ffmpeg_cmd", None):
+            messagebox.showwarning(_("提示"), _("未找到 ffmpeg，无法生成波形"))
+            return
+        tracks = [self.merge_tracks[i] for i in vids]
+        try:
+            MultiSyncReferenceDialog(self.root, self, tracks)
+        except Exception as e:
+            messagebox.showerror(_("错误"), _('打开多流同步参考失败：{0}').format(e))
     
     def _merge_popup_more_menu(self):
         x = self.root.winfo_pointerx()
@@ -33307,10 +33393,11 @@ class FFmpegBatchGUI:
             enc = "aac"
             self._append_info_ui(_("音频截取启用，轨道 {0} 编码器已从 copy 改为 {1}").format(audio_map_count+1, enc))
 
+        sfx = audio_stream_suffix(audio_map_count)
         af_filter = f"atrim=start={start_sec:.3f}:duration={duration:.3f},asetpts=PTS-STARTPTS"
-        cmd.extend([f"-af:a:{audio_map_count}", af_filter])
+        cmd.extend(["-filter:a" + sfx, af_filter])
         # 走 build_audio_encoder_args 统一处理 auto/无损/opus(-strict -2) 边界（与 base 一致）
-        cmd.extend(build_audio_encoder_args(enc, audio.enc_settings, stream_tag=f":a:{audio_map_count}"))
+        cmd.extend(build_audio_encoder_args(enc, audio.enc_settings, stream_tag=sfx))
         return True
 
 
@@ -33345,11 +33432,12 @@ class FFmpegBatchGUI:
                 include_reverse=track_reverse
             )
             enc = audio.enc_settings.get("encoder", "copy")
+            sfx = audio_stream_suffix(audio_map_count)
             if af_str:
                 if enc == "copy":
                     enc = "aac"
                     self._append_info_ui(_("音频轨 {0} 应用了滤镜，编码器自动改为 aac").format(audio_map_count+1))
-                cmd.extend([f"-af:a:{audio_map_count}", af_str])
+                cmd.extend(["-filter:a" + sfx, af_str])
             enc, fb = self._opus_copy_fallback(enc, audio)
             if fb:
                 self._append_info_ui(f"音频轨 {audio_map_count+1} {fb}")
@@ -33358,7 +33446,7 @@ class FFmpegBatchGUI:
             else:
                 # 走 build_audio_encoder_args 统一处理 auto/无损/opus(-strict -2) 边界（与 base 一致）
                 cmd.extend(build_audio_encoder_args(
-                    enc, audio.enc_settings, stream_tag=f":a:{audio_map_count}",
+                    enc, audio.enc_settings, stream_tag=sfx,
                     skip_ar=bool(audio_soxr_resample_filter(audio.enc_settings))))
             audio_map_count += 1
         if audio_map_count == 0:
@@ -33916,7 +34004,10 @@ class FFmpegBatchGUI:
                     cmd.extend(["-filter_complex", fc])
                     cmd.extend(["-map", "[v_tw]"])
                 else:
-                    dt = build_drawtext_filter(_tw0)
+                    # 显示时段=主视频原始时间 → 按截取/变速换算输出时间线（与转换页同套，
+                    # 2026-09-13 前漏传 trim_start/speed_factor，截取后窗口整体右偏）
+                    _ts0, _sp0 = _trim_speed_from_settings(v_settings)
+                    dt = build_drawtext_filter(_tw0, trim_start=_ts0, speed_factor=_sp0)
                     if dt:
                         video_filters = f"{video_filters},{dt}" if video_filters and video_filters != "null" else dt
                     if video_filters and video_filters != "null":
@@ -33952,20 +34043,20 @@ class FFmpegBatchGUI:
                     include_reverse=track_reverse
                 )
                 enc = audio.enc_settings.get("encoder", "copy")
+                sfx = audio_stream_suffix(audio_map_count)
                 if af_str:
                     if enc == "copy":
                         enc = "aac"
-                        self._append_info_ui(_("音频轨 {0} 应用了滤镜，编码器自动改为 aac").format(audio_map_count+1))
-                    cmd.extend([f"-af:a:{audio_map_count}", af_str])
+                        self._append_info_ui(f"音频轨 {audio_map_count+1} 应用了滤镜，编码器自动改为 aac")
+                    cmd.extend(["-filter:a" + sfx, af_str])
                 enc, fb = self._opus_copy_fallback(enc, audio)
                 if fb:
                     self._append_info_ui(f"音频轨 {audio_map_count+1} {fb}")
                 if enc == "copy":
                     cmd.extend([f"-c:a:{audio_map_count}", "copy"])
                 else:
-                    # 走 build_audio_encoder_args 统一处理 auto/无损/opus(-strict -2) 边界（与 base 一致）
                     cmd.extend(build_audio_encoder_args(
-                        enc, audio.enc_settings, stream_tag=f":a:{audio_map_count}",
+                        enc, audio.enc_settings, stream_tag=sfx,
                         skip_ar=bool(audio_soxr_resample_filter(audio.enc_settings))))
     
                 # ---- 音频元数据 ----
@@ -34013,7 +34104,6 @@ class FFmpegBatchGUI:
                 if enc == "copy":
                     cmd.extend(["-c:a", "copy"])
                 else:
-                    # 走 build_audio_encoder_args 统一处理 auto/无损/opus(-strict -2) 边界（与 base 一致）
                     cmd.extend(build_audio_encoder_args(
                         enc, audio.enc_settings,
                         skip_ar=bool(audio_soxr_resample_filter(audio.enc_settings))))
@@ -34059,7 +34149,6 @@ class FFmpegBatchGUI:
                 if enc == "copy":
                     enc = "aac"
                     self._append_info_ui(_("[封装] 混合模式下编码器不能为 copy，已自动改为 aac"))
-                # 走 build_audio_encoder_args 统一处理 auto/无损/opus(-strict -2) 边界（与 base 一致）
                 cmd.extend(build_audio_encoder_args(
                     enc, first_mix.enc_settings,
                     skip_ar=bool(audio_soxr_resample_filter(first_mix.enc_settings))))
@@ -34531,7 +34620,10 @@ class FFmpegBatchGUI:
                 include_format=False, include_scale=False,
                 enhance_settings=settings.get("enhance", {}),
                 reverse=settings.get("reverse_enabled", False),
-                graph_id=f"c{i}", include_fade=True, clip_duration=seg_durations[i])
+                graph_id=f"c{i}", include_fade=True,
+                # clip_duration=源全时长（淡出起点由链内按 截取/变速 重算，2026-09-13）；
+                # 勿传 seg_durations[i]（已折算成输出时长，链内再算会二次扣减）
+                clip_duration=self._get_media_duration(track.file_path))
             forced = list(pre_norm)
             # setpts 只能段前：后置是整体平移，救不回段内偏移（实测总时长会多出偏移量）。
             # 历史路径 pre_norm 已含 setpts。精简路径下通常不必补——唯一会让段内 pts 起点非 0
@@ -42467,7 +42559,7 @@ class SegmentEditor:
             if tok == "-i":
                 i += 2
                 continue
-            if tok in skip_val:
+            if tok in skip_val or tok.startswith("-filter:a"):
                 i += 2
                 continue
             if tok == "-an":
@@ -42531,10 +42623,11 @@ class SegmentEditor:
             else:
                 return None
 
-            # 音频滤镜图 + 标签
-            if "-af" in c:
-                ai = c.index("-af")
-                af = c[ai + 1]
+            # 音频滤镜图 + 标签（-af，或转换页按轨的 -filter:a:N）
+            af_idx = next((j for j, tok in enumerate(c)
+                           if tok == "-af" or tok.startswith("-filter:a")), None)
+            if af_idx is not None and af_idx + 1 < len(c):
+                af = c[af_idx + 1]
                 alabel = f"[a{i}]"
                 agraph = f"[0:a]{af}[a{i}];"
             elif "-an" in c:
@@ -44326,6 +44419,2309 @@ class ChapterEditor:
     def on_cancel(self):
         self.result = None
         self.window.destroy()
+
+
+# ================== 多流同步参考（封装页专用，2026-09-13） ==================
+# 背景：封装页多机位素材（如 3 列竖屏拼横屏）需要知道彼此的时间偏移。
+# 设计定案（用户 2026-09-13 拍板）：
+#   - 入口：封装页轨道列表右键「多流同步参考」，只收选中的视频轨（2..6 条）
+#   - 布局：上下分道（非重叠）——各轨响度不同，重叠包络无法分辨
+#   - 坐标：共享一条时间轴（横轴 = 参考轨时间），非参考轨按偏移平移绘制，
+#           于是「对齐」= 各自的特征峰落在同一 x
+#   - 打点：锚点会话——按轨道逐个点击同一事件、各记一个时间戳；
+#           锚点完成立即按偏移平移到位；两个锚点还能算出速度漂移
+#   - 输出：方案 A —— 只显示与复制，【绝不】改动轨道数据
+_SYNC_WAVE_SR = 8000        # 波形解码采样率（与 _WAVE_SR 一致，单声道 s16）
+_SYNC_WAVE_BUCKETS = 4000   # 每轨包络桶数
+_SYNC_MAX_TRACKS = 6        # 单次最多比对的视频轨数
+_SYNC_MIN_TRACKS = 2
+
+# 每轨配色（浅填充, 深描边）
+_SYNC_TRACK_COLORS = (
+    ("#E6F1FB", "#185FA5"),
+    ("#E1F5EE", "#0F6E56"),
+    ("#FAECE7", "#993C1D"),
+    ("#EEEDFE", "#534AB7"),
+    ("#FAEEDA", "#854F0B"),
+    ("#FBEAF0", "#993556"),
+)
+_SYNC_ANCHOR_COLOR = "#7F77DD"   # 锚点标记（紫）
+_SYNC_CURSOR_COLOR = "#e8590c"   # 播放头（橙）
+_SYNC_GAIN_MAX = 200.0           # 波形显示增益上限：只有「真·抖动噪声」（< -66 dBFS）
+                                 # 才够不着它而仍是矮线；真实轻音一律能抬到看得见
+_SYNC_GAIN_TARGET = 0.92         # 归一化基准振幅占半高比例
+_SYNC_GAIN_PCT = 0.96            # 基准取「96% 分位」而非绝对峰值（见 _sync_peak_gain）
+
+
+def _sync_parse_fps(stream):
+    """从 ffprobe stream dict 解析帧率（'25/1' → 25.0），无法解析返回 None。"""
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        raw = (stream or {}).get(key) or ""
+        num, _, den = str(raw).partition("/")
+        try:
+            num = float(num)
+            den = float(den) if den else 1.0
+        except (TypeError, ValueError):
+            continue
+        if num > 0 and den > 0:
+            return num / den
+    return None
+
+
+def _sync_format_time(sec):
+    """秒 → '12.500'（固定 3 位小数，便于复制粘贴）。"""
+    try:
+        return f"{float(sec):.3f}"
+    except (TypeError, ValueError):
+        return "0.000"
+
+
+def _sync_normalize_offset(off, fps):
+    """把偏移吸附到 1/fps 的帧网格（与封装页「帧网格即真源」的定位纪律一致）。"""
+    try:
+        off = float(off)
+    except (TypeError, ValueError):
+        return 0.0
+    if not fps or fps <= 0:
+        return off
+    step = 1.0 / float(fps)
+    return round(off / step) * step
+
+
+def _sync_peak_gain(peaks, cap=_SYNC_GAIN_MAX, target=_SYNC_GAIN_TARGET,
+                    pct=_SYNC_GAIN_PCT):
+    """每轨波形显示增益：把该轨「高分位振幅」归一化到画布半高的 target 比例。
+
+    为什么需要（2026-09-13 实机反馈「波形起伏太低, 几乎都是一条线」）：
+    包络原先按绝对振幅 /32768 绘制（照抄大波形 _draw_wave），而实拍素材峰值
+    常在 -12 dBFS 以下 → 62px 的道高里只剩几个像素。显示增益只影响观感，
+    绝不改动任何数据（方案 A）。
+
+    为什么用高分位而不是绝对峰值（2026-09-13 二次实机反馈「中间的还是一条线」）：
+    按绝对峰值归一化时，只要素材里有孤立瞬态（开头咔嗒声、开关爆音、单点削波），
+    基准就被它顶到满幅，整条波形被压平——实测现象正是「增益只有 ×1.2 却画成一条
+    线」。改取 96% 分位当基准后，瞬态只表现为几根触顶尖峰，主体起伏照常铺满道高。
+    上限 cap 兜底：只有「真·抖动噪声」（基准振幅低于 32767×0.92/cap ≈ -66 dBFS）
+    够不着它、仍旧是矮线，真实轻音一律能抬到看得见；瞬态超标部分只是画到边缘截顶。
+    """
+    mags = []
+    for pk in (peaks or ()):
+        if not pk:
+            continue
+        mags.append(max(abs(pk[0]), abs(pk[1])))
+    if not mags:
+        return 1.0
+    mags.sort()
+    base = mags[min(len(mags) - 1, int(len(mags) * pct))]
+    if base <= 0:
+        base = mags[-1]              # 分位落在静音上 → 退回绝对峰值
+    if base <= 0:
+        return 1.0
+    return min(float(cap), target * 32767.0 / float(base))
+
+
+# ============ 多流同步参考：局部音频匹配（2026-09-13 追加） ============
+# 用户原话：「有没有能按当前光标给当前和其他轨道打点的按钮, 现在我要每一条手动点,
+#            会有1-2帧偏差的, 手抖的话」
+# 做法：归一化互相关（NCC）金字塔搜索。纯 Python、零第三方依赖（项目铁律禁 numpy）。
+#   级1：250Hz 全窗粗搜（约 4ms 分辨率，毫秒级出结果）→ 定大致位置
+#   级2：1kHz 在 ±6 格内细化（约 1ms）
+#   级3：8kHz 在 ±8 样本内精搜（0.125ms）——远超人工点选的 1~2 帧误差
+# 只在「当前偏移 ± _SYNC_MATCH_WIN 秒」内搜索，不做全局搜索：
+# 全局搜索会被音乐/周期音的旁瓣骗走，局部搜索把候选限制在肉眼已确认过的位置附近。
+_SYNC_MATCH_SR = 8000          # 匹配用采样率（与波形解码一致）
+_SYNC_MATCH_TPL = 0.30         # 模板时长（秒）
+_SYNC_MATCH_WIN = 5.0          # 搜索窗口（±秒，以当前偏移为猜测中心）
+_SYNC_MATCH_MIN_GAP = 0.12     # 「最佳−次佳」相关系数差下限，低于此值提示匹配不唯一
+
+
+def _sync_decode_pcm(ff_exe, file_path, t0, t1, sr=_SYNC_MATCH_SR):
+    """把 [t0, t1) 解码成单声道 s16 样本列表（ffmpeg 内存管道，无临时文件）。
+
+    `-ss/-t` 放在 `-i` 之前（input seek），只解需要的那几秒，快。
+    """
+    if not ff_exe or not file_path or (t1 - t0) <= 0.02:
+        return []
+    args = [ff_exe, "-v", "error",
+            "-ss", f"{max(0.0, t0):.3f}", "-t", f"{t1 - t0:.3f}",
+            "-i", file_path, "-vn", "-map", "0:a:0?",
+            "-ac", "1", "-ar", str(sr), "-f", "s16le", "pipe:1"]
+    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    try:
+        p = subprocess.run(args, stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, creationflags=flags,
+                           timeout=60)
+    except Exception:
+        return []
+    raw = p.stdout or b""
+    if len(raw) < 2:
+        return []
+    return list(array.array("h", raw[:len(raw) // 2 * 2]))
+
+
+def _sync_downsample(pcm, factor):
+    """盒式平均降采样（factor 个样本取均值）；factor <= 1 时原样返回。"""
+    if factor <= 1:
+        return list(pcm)
+    n = len(pcm)
+    return [sum(pcm[k:k + factor]) / float(factor)
+            for k in range(0, n - factor + 1, factor)]
+
+
+def _sync_ncc_search(tpl, hay, lo, hi):
+    """滑窗归一化互相关，返回 (best_lag, best, second)。
+
+    r(lag) = Σ tpl·hay[lag:] / sqrt(Σtpl² · Σhay[lag:]²)
+    分母的窗口能量用前缀平方和 O(1) 取得；tpl 为纯静音时返回 (None, -2.0, -2.0)。
+    """
+    L = len(tpl)
+    hi = min(hi, len(hay) - L)
+    if L < 8 or hi < lo:
+        return None, -2.0, -2.0
+    e1 = 0.0
+    for a in tpl:
+        e1 += a * a
+    if e1 <= 0:
+        return None, -2.0, -2.0
+    pre = [0.0] * (len(hay) + 1)
+    acc = 0.0
+    for i, v in enumerate(hay):
+        acc += v * v
+        pre[i + 1] = acc
+    best_lag, best, second = None, -2.0, -2.0
+    for lag in range(lo, hi + 1):
+        e2 = pre[lag + L] - pre[lag]
+        if e2 <= 0:
+            continue
+        num = 0.0
+        for a, b in zip(tpl, hay[lag:lag + L]):
+            num += a * b
+        r = num / ((e1 * e2) ** 0.5)
+        if r > best:
+            second, best, best_lag = best, r, lag
+        elif r > second:
+            second = r
+    return best_lag, best, second
+
+
+def _sync_match_point(tpl, hay, sr=_SYNC_MATCH_SR):
+    """在 hay 里找 tpl 的最佳起点（金字塔 NCC）。
+
+    返回 (lag_samples, score, gap)：
+      lag_samples —— 以 sr 为单位的样本偏移（hay 起点 = 0）；失败 → None
+      score       —— 精搜峰值的相关系数（越接近 1 越可信）
+      gap         —— 粗搜层的「最佳 − 次佳」，越小越可能是周期音造成的假峰
+    """
+    L = len(tpl)
+    if L < 64 or len(hay) <= L:
+        return None, -2.0, 0.0
+    f0, f1 = 32, 8                       # 8000 → 250Hz / 1000Hz
+    t0, h0 = _sync_downsample(tpl, f0), _sync_downsample(hay, f0)
+    lag0, sc0, sec0 = _sync_ncc_search(t0, h0, 0, len(h0) - len(t0))
+    if lag0 is None:
+        return None, -2.0, 0.0
+    gap = (sc0 - sec0) if sec0 > -1.5 else 1.0
+    t1, h1 = _sync_downsample(tpl, f1), _sync_downsample(hay, f1)
+    c1 = lag0 * (f0 // f1)
+    lag1, _, _ = _sync_ncc_search(t1, h1, max(0, c1 - 6),
+                                  min(len(h1) - len(t1), c1 + 6))
+    if lag1 is None:
+        lag1 = c1
+    c2 = lag1 * f1
+    lag2, sc2, _ = _sync_ncc_search(tpl, hay, max(0, c2 - 8),
+                                    min(len(hay) - L, c2 + 8))
+    if lag2 is None:
+        return None, -2.0, gap
+    return lag2, sc2, gap
+
+
+def _sync_overlap_span(offsets, durs):
+    """各轨在参考轴上的公共重叠区间 (t0, t1)；无交集时退回并集，仍无则 None。"""
+    los, his = [], []
+    for i, d in enumerate(durs):
+        if not d or d <= 0:
+            continue
+        los.append(offsets[i])
+        his.append(offsets[i] + d)
+    if not los:
+        return None
+    t0, t1 = max(los), min(his)
+    if t1 - t0 <= 1e-6:
+        t0, t1 = min(los), max(his)
+    if t1 - t0 <= 1e-6:
+        return None
+    return (t0, t1)
+
+
+def _sync_decode_peaks(file_path, ff_exe, duration, buckets=_SYNC_WAVE_BUCKETS,
+                       sr=_SYNC_WAVE_SR, should_stop=None):
+    """把音频解码成 min/max 包络桶（纯函数，无 Tk 依赖、无临时文件）。
+
+    核心照抄 SimplePreviewer._gen_wave（ffmpeg → s16le 内存管道）；
+    区别：一次性返回整段包络（不做流式渐进重绘），供多流比对窗口离线使用。
+    返回 (peaks, ok)：peaks 为长度 buckets 的列表，元素 (min, max) 或 None；
+    ok=False 表示解码不可用（无音频流 / ffmpeg 启动失败）。
+    """
+    peaks = [None] * buckets
+    if not file_path or not duration or duration <= 0 or not ff_exe:
+        return peaks, False
+    args = [ff_exe, "-v", "error", "-i", file_path, "-map", "0:a:0?",
+            "-ac", "1", "-ar", str(sr), "-f", "s16le", "pipe:1"]
+    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    try:
+        p = subprocess.Popen(args, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, creationflags=flags)
+    except Exception:
+        return peaks, False
+    spb = (duration * sr) / buckets          # 每桶采样数
+    if spb <= 0:
+        spb = 1.0
+    total, got = 0, False
+    try:
+        while True:
+            if should_stop is not None and should_stop():
+                break
+            chunk = p.stdout.read(65536)
+            if not chunk:
+                break
+            got = True
+            n = len(chunk) // 2
+            if n:
+                for s in struct.unpack(f"<{n}h", chunk[:n * 2]):
+                    idx = int(total / spb)
+                    if idx >= buckets:
+                        idx = buckets - 1
+                    pk = peaks[idx]
+                    if pk is None:
+                        peaks[idx] = (s, s)
+                    elif s < pk[0]:
+                        peaks[idx] = (s, pk[1])
+                    elif s > pk[1]:
+                        peaks[idx] = (pk[0], s)
+                    total += 1
+    except Exception:
+        pass
+    finally:
+        try:
+            p.kill()
+        except Exception:
+            pass
+    return peaks, got
+
+
+# ============ 多流同步参考：当前帧对比（2026-09-14 追加） ============
+# 用户原话：「在按光标对齐后面加个功能"取当前帧对比" 点击后取所有轨道当前帧
+#            平铺拼接对比, 注意缩放控制在屏幕内」
+# 做法：每条轨各取一帧（取该轨**自身时间轴**的光标处——与「按光标对齐」同口径，
+# 对齐后各轨光标指的就是同一个事件），ffmpeg 统一缩放到等大格子（保持原始比例、
+# 居中补黑边，绝不拉伸），Tk 里按网格平铺。图像走 PPM 内存管道，不落临时文件。
+_SYNC_FRAME_MAX_COLS = 3         # 最多 3 列：列再多每格就小到看不清了
+_SYNC_FRAME_ASPECT = 16.0 / 9.0  # 格子比例（竖屏素材居中补黑边）
+_SYNC_FRAME_SCREEN_W = 0.92      # 窗口最多占屏宽 / 屏高这么多
+_SYNC_FRAME_SCREEN_H = 0.90
+_SYNC_FRAME_CHROME_W = 48        # 窗口装饰：边框 + 内边距
+_SYNC_FRAME_CHROME_H = 130       # 标题栏 + 顶部提示 + 底部按钮 + 边框
+_SYNC_FRAME_CAP_H = 30           # 每格下方的文字说明
+_SYNC_FRAME_MIN_W = 96           # 格子下限（极小屏宁可超屏也不做成邮票）
+_SYNC_FRAME_MIN_H = 54
+
+
+def _sync_frame_grid(n, screen_w, screen_h):
+    """算平铺网格 → (cols, rows, tile_w, tile_h)；保证整窗装得进屏幕。
+
+    纯函数（无 Tk / 无 IO，可单测）：先按「列数 ≈ √n、最多 3 列」定网格，
+    再按可用宽定格子宽、按 16:9 定高；若总高超出可用高，就按高反算宽。
+    """
+    n = max(1, int(n))
+    cols = 1
+    while cols * cols < n and cols < _SYNC_FRAME_MAX_COLS:
+        cols += 1
+    if cols > n:
+        cols = n
+    rows = (n + cols - 1) // cols
+    avail_w = int(screen_w * _SYNC_FRAME_SCREEN_W) - _SYNC_FRAME_CHROME_W
+    avail_h = (int(screen_h * _SYNC_FRAME_SCREEN_H) - _SYNC_FRAME_CHROME_H
+               - rows * _SYNC_FRAME_CAP_H)
+    avail_w = max(_SYNC_FRAME_MIN_W, avail_w)
+    avail_h = max(_SYNC_FRAME_MIN_H, avail_h)
+    tw = avail_w // cols
+    th = int(tw / _SYNC_FRAME_ASPECT)
+    if th * rows > avail_h:
+        th = avail_h // rows
+        tw = int(th * _SYNC_FRAME_ASPECT)
+    tw = max(_SYNC_FRAME_MIN_W, tw - tw % 2)
+    th = max(_SYNC_FRAME_MIN_H, th - th % 2)
+    return cols, rows, tw, th
+
+
+def _sync_grab_frame(ff_exe, file_path, t, tw, th, timeout=60):
+    """取 file_path 在 t 秒处的一帧 → PPM bytes（缩到 tw×th，保持比例居中补黑边）。
+
+    `-ss` 前置（input seek：只解目标附近，快；ffmpeg 会解码到目标时间戳，
+    不是只落关键帧）。失败（超时 / 光标超尾 / 无视频流）一律返回 None。
+    """
+    if not ff_exe or not file_path or tw <= 0 or th <= 0:
+        return None
+    vf = ("scale=%d:%d:force_original_aspect_ratio=decrease,"
+          "pad=%d:%d:(ow-iw)/2:(oh-ih)/2,setsar=1" % (tw, th, tw, th))
+    args = [ff_exe, "-v", "error", "-hide_banner",
+            "-ss", "%.3f" % max(0.0, float(t)), "-i", file_path,
+            "-an", "-sn", "-frames:v", "1",
+            "-vf", vf, "-f", "image2pipe", "-vcodec", "ppm", "pipe:1"]
+    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    try:
+        p = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           creationflags=flags, timeout=timeout)
+    except Exception:
+        return None
+    data = p.stdout or b""
+    if p.returncode != 0 or len(data) < 64:
+        return None
+    return data
+
+
+
+
+class MultiSyncReferenceDialog(tk.Toplevel):
+    """多流同步参考：把选中的多个视频轨的音频波形上下分道比对，
+    用「锚点会话」求得各轨相对参考轨的时间偏移（封装页专用）。
+
+    方案 A：只显示与复制，绝不改动轨道数据。
+    """
+
+    def __init__(self, parent, app, tracks):
+        super().__init__(parent)
+        self.withdraw()
+        self.app = app
+        self.ff = getattr(app, "ffmpeg_cmd", None) or ""
+        self.ffplay = getattr(app, "ffplay_cmd", None) or find_executable("ffplay") or ""
+        self.tracks = list(tracks)
+        self.n = len(self.tracks)
+        self.title(_("多流同步参考"))
+        # ⚠️ 刻意**不用 transient**（2026-09-14 用户要求「这个窗口不要置顶，让他能切换」）：
+        # transient 会让本窗在 Z 序上永远压着主窗，复制结果到别处时切不回去。
+        # 需要常驻最前时用顶部「总在最前」勾选（默认关）。
+        self.resizable(True, False)
+
+        self.row_h = 62 if self.n <= 3 else (52 if self.n <= 4 else 44)
+
+        # 每轨状态：时长 / 包络 / 播放头（该轨自身时间）/ 相对参考轨偏移
+        self.durs = [0.0] * self.n
+        self.peaks = [None] * self.n
+        self.gains = [1.0] * self.n     # 显示增益（仅观感，见 _sync_peak_gain）
+        self._auto_gains = [1.0] * self.n   # 自动检测值（手动覆盖时的回落基准）
+        self._manual_gains = [None] * self.n  # 手动增益（None=自动）；长视频动态范围大、
+        # 自动归一化顾不了「前段平线后段正常」的两头（用户 2026-09-13），手动填更直接
+        self._probe_gen = 0             # 探测代际号：重新生成时旧线程自行退出
+        self.gain_entries = []
+        self.cursors = [0.0] * self.n
+        self.offsets = [0.0] * self.n
+        self.fps_list = [None] * self.n
+        self.ref_i = 0
+        self.fps = 0.0
+        self.active_i = 1 if self.n > 1 else 0
+        self.anchors = []            # [{"label": "起始", "vals": [t_i, ...]}]
+        self.drift = [None] * self.n  # 漂移（speed_factor − 1），需两个锚点
+        self._view = None            # 参考轴视图窗口 (t0, t1)
+        self._dot = None             # 打点会话 {vals: [t|None, ...]}
+        self._stop = False
+        self._procs = [None] * self.n
+        self._play_pos = [None] * self.n   # 播放中该轨位置（秒，轨自身时间轴；None=未播）
+        self._play_gen = [0] * self.n      # 播放代际号：停/重启递增，作废旧 reader
+        self._dirty = set(range(self.n))
+        self._drag = None
+        self._pan = None
+        self._poll_job = None
+        self._topmost = tk.BooleanVar(value=False)   # 「总在最前」默认关（见 __init__ 去 transient 的注释）
+        self._restored_note = ""     # 自动恢复上次结果的提示（构建完 UI 后刷到 hint_var）
+
+        self._build_ui()
+        self._reset_view()
+        self._start_probe()
+        self._restore_last()      # 上次结果自动恢复（同批轨道时；提示写进 hint_var）
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.update_idletasks()
+        w = max(1000, self.winfo_reqwidth())
+        h = self.winfo_reqheight()
+        x = max(0, (self.winfo_screenwidth() - w) // 2)
+        y = max(0, (self.winfo_screenheight() - h) // 2 - 30)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.deiconify()
+
+    # ---------- 界面构建 ----------
+    def _track_labels(self):
+        out = []
+        for i, tr in enumerate(self.tracks):
+            idx = getattr(tr, "index", i + 1)
+            base = os.path.basename(getattr(tr, "file_path", "") or "")
+            out.append(_('{0}. 轨道 {1} · {2}').format(i + 1, idx, base))
+        return out
+
+    def _build_ui(self):
+        main = ttk.Frame(self, padding="10")
+        main.pack(fill=tk.BOTH, expand=True)
+
+        top = ttk.Frame(main)
+        top.pack(fill=tk.X)
+        ttk.Label(top, text=_("参考轨")).pack(side=tk.LEFT)
+        self.ref_var = tk.StringVar()
+        self.ref_combo = ttk.Combobox(top, textvariable=self.ref_var,
+                                      state="readonly", width=28,
+                                      values=self._track_labels())
+        self.ref_combo.pack(side=tk.LEFT, padx=(4, 10))
+        self.ref_combo.current(0)
+        self.ref_combo.bind("<<ComboboxSelected>>", self._on_ref_changed)
+        self.fps_lbl = ttk.Label(top, text=_("帧率 —"))
+        self.fps_lbl.pack(side=tk.LEFT)
+
+        # 对齐结果的存档（2026-09-14，用户原话「窗口里的对齐状态能不能保存一下，
+        # 另存为 json... 或者程序关闭之前保存上一次结果」）：
+        # 「保存对齐… / 载入对齐…」手动进出任意位置；关窗时自动写一份到配置目录，
+        # 下次打开**同一批轨道**自动恢复（不用再把表格复制出去临时存放）。
+        sv = ttk.Button(top, text=_("保存对齐…"), width=11, command=self._save_state_as)
+        sv.pack(side=tk.LEFT, padx=(14, 0))
+        ToolTip(sv, _("把当前对齐结果（各轨偏移 / 光标 / 起始-结尾 / 参考轨）存成 JSON，\n"
+                    "下次「载入对齐…」或直接重开本窗（同批轨道会自动恢复）。"))
+        ld = ttk.Button(top, text=_("载入对齐…"), width=11, command=self._load_state_from)
+        ld.pack(side=tk.LEFT, padx=(4, 0))
+        ToolTip(ld, _("读回一个对齐结果 JSON。按**文件路径**匹配轨道：\n"
+                    "全中 = 完整恢复；部分中 = 只恢复对得上的那几条并提示；\n"
+                    "一个都不中 = 不动当前状态。"))
+        tm = ttk.Checkbutton(top, text=_("总在最前"), variable=self._topmost,
+                             command=self._apply_topmost)
+        tm.pack(side=tk.LEFT, padx=(14, 0))
+        ToolTip(tm, _("默认**关闭**：本窗可以和主窗自由切换（复制结果到别处时不会被挡住）。\n"
+                    "勾上后常驻最前，适合一边看波形一边在主窗操作。"))
+
+        # 打点目标必须显式（2026-09-13 实机反馈「这表格看不懂啊」）：
+        # 旧版只有一个「打点」，锚点名字由 len(anchors) 顺序决定 → 用户混用
+        # 「时间预览回填」与「打点会话」后就打出 #3/#4，而「起始/结尾」两格是空的。
+        # 现在固定成两个槽位，各自一个按钮，写哪一格由用户点哪个按钮决定。
+        self.dot_btn2 = ttk.Button(top, text=_("打结尾"),
+                                   command=lambda: self._toggle_dot(_("结尾")))
+        self.dot_btn2.pack(side=tk.RIGHT)
+        ToolTip(self.dot_btn2, _("进入打点会话：按提示在每条轨道波形上点同一个事件（拍手声等），\n"
+                               "这一轮写进「结尾」格。再次点击 = 取消本次会话。"))
+        self.dot_btn = ttk.Button(top, text=_("打起始"),
+                                  command=lambda: self._toggle_dot(_("起始")))
+        self.dot_btn.pack(side=tk.RIGHT, padx=(0, 6))
+        ToolTip(self.dot_btn, _("进入打点会话：按提示在每条轨道波形上点同一个事件（拍手声等），\n"
+                              "这一轮写进「起始」格。再次点击 = 取消本次会话。\n"
+                              "提示：波形上点一下也能设定该轨光标，逐帧微调后用「设为起始」更准。"))
+        btns_lbl = ttk.Button(top, text=_("自动对齐（待开发）"))
+        btns_lbl.state(["disabled"])
+        btns_lbl.pack(side=tk.RIGHT, padx=(0, 6))
+        rgb = ttk.Button(top, text=_("重新生成波形"), command=self._regen_waves)
+        rgb.pack(side=tk.RIGHT, padx=(0, 6))
+        ToolTip(rgb, _("重新解码全部轨道的包络并重算自动增益。\n"
+                     "各轨「增益×」框里已填的手动值不受影响。"))
+
+        self.hint_var = tk.StringVar(
+            value=_("上下分道共享一条时间轴。① 波形上点一下 = 设该轨光标（粗点即可），"
+                  "轨头「打起始(all) / 打结尾(all)」按已对齐的偏移一键写入全部轨；"
+                  "② 也可「−1帧 / +1帧」微调后按「设为起始 / 设为结尾」写入；"
+                  "③ 「时间预览」可边走带看精确定位（回填同一格）。汇总表每轨一行，可双击复制。"))
+        ttk.Label(main, textvariable=self.hint_var,
+                  foreground="#666666").pack(fill=tk.X, pady=(6, 6))
+
+        wave_wrap = ttk.Frame(main)
+        wave_wrap.pack(fill=tk.X)
+        self.canvases = []
+        self.badges = []
+        self.gain_vars = []
+        self.readout_vars = []
+        self.play_btns = []
+        self.preview_btns = []
+        for i, tr in enumerate(self.tracks):
+            row = ttk.Frame(wave_wrap)
+            row.pack(fill=tk.X, pady=(0, 4))
+            head = ttk.Frame(row)
+            head.pack(fill=tk.X)
+            idx = getattr(tr, "index", i + 1)
+            base = os.path.basename(getattr(tr, "file_path", "") or "")
+            ttk.Label(head, text=f"轨道 {idx} · {base}").pack(side=tk.LEFT)
+            badge = ttk.Label(head, text=_("参考") if i == self.ref_i else _("待对齐"),
+                              foreground="#185FA5" if i == self.ref_i else "#854F0B")
+            badge.pack(side=tk.LEFT, padx=(8, 0))
+            self.badges.append(badge)
+            gv = tk.StringVar(value="")
+            self.gain_vars.append(gv)
+            ttk.Label(head, textvariable=gv, foreground="#888888").pack(side=tk.LEFT,
+                                                                      padx=(8, 0))
+            ttk.Label(head, text=_("增益×"), foreground="#888888").pack(side=tk.LEFT,
+                                                                     padx=(10, 2))
+            ge = ttk.Entry(head, width=5)
+            ge.pack(side=tk.LEFT)
+            ge.bind("<Return>", lambda _e, i=i: self._apply_gain_entry(i))
+            ToolTip(ge, _("手动显示增益（只改观感，不影响对齐计算）：填正数如 8 或 8.5，\n"
+                        "回车生效；留空回车 = 恢复自动。长视频前段被压成平线时，\n"
+                        "把该轨增益调大即可；过大削顶属正常（超出 ±32768 截断）。"))
+            self.gain_entries.append(ge)
+            pb = ttk.Button(head, text=_("播放"), width=6,
+                            command=lambda i=i: self._toggle_play(i))
+            pb.pack(side=tk.LEFT, padx=(10, 0))
+            self.play_btns.append(pb)
+            tpb = ttk.Button(head, text=_("时间预览"), width=9,
+                             command=lambda i=i: self._open_track_preview(i))
+            tpb.pack(side=tk.LEFT, padx=(4, 0))
+            self.preview_btns.append(tpb)
+            # 一键打全部轨（2026-09-13，用户原话「每条波形的时间预览右面能加
+            # 2个按钮吗 按当前光标给所有轨道打起始 和 当前光标给所有轨道打结尾」）：
+            # 以**按钮所在这条轨**的光标为基点、按已对齐的偏移反算写入全部轨
+            # 的「起始/结尾」槽位——先对齐（自动找点/按光标对齐），再波形上
+            # 粗点一下设光标，一键写全。不做自动匹配，光标在哪就写哪。
+            # 只同步光标（2026-09-14，用户原话「打起始(all) 他们的一半动作，
+            # 只同步光标，不打点」）：按偏移把其余轨光标挪到这条轨的同一时刻，
+            # 不写锚点、不动偏移——用来先看看各轨波形是否落在同一个事件上，
+            # 确认无误再按「打起始(all)」落笔。
+            scb = ttk.Button(head, text=_("同步光标"), width=9,
+                             command=lambda i=i: self._sync_cursors_to(i))
+            scb.pack(side=tk.LEFT, padx=(4, 0))
+            ToolTip(scb, _("把其余轨的光标挪到**这条轨**当前光标处的同一时刻\n"
+                         "（按已对齐的偏移反算，与「打起始(all)」同一套算法）。\n"
+                         "只挪光标：不打起始/结尾、不改偏移、不重算漂移。\n"
+                         "用法：这条轨点到事件上 → 点这里 → 各轨波形都跳过去核对；\n"
+                         "确认对了再按右边的「打起始(all)」真正打点。"))
+            asb = ttk.Button(head, text=_("打起始(all)"), width=11,
+                             command=lambda i=i: self._write_anchor_all(0, i))
+            asb.pack(side=tk.LEFT, padx=(4, 0))
+            ToolTip(asb, _("一键打起始（全部轨）：以这条轨当前光标处为这个事件，\n"
+                         "其余轨按已对齐的偏移反算同一时刻，整行写入「起始」格。\n"
+                         "光标可用波形点击粗定位 + −1帧/+1帧微调；先对齐再用。"))
+            aeb = ttk.Button(head, text=_("打结尾(all)"), width=11,
+                             command=lambda i=i: self._write_anchor_all(1, i))
+            aeb.pack(side=tk.LEFT, padx=(4, 0))
+            ToolTip(aeb, _("一键打结尾（全部轨）：以这条轨当前光标处为这个事件，\n"
+                         "其余轨按已对齐的偏移反算同一时刻，整行写入「结尾」格。"))
+            rd = tk.StringVar(value="0.000 s")
+            self.readout_vars.append(rd)
+            ttk.Label(head, textvariable=rd).pack(side=tk.RIGHT)
+
+            cv = tk.Canvas(row, height=self.row_h, width=960,
+                           highlightthickness=1, highlightbackground="#d5d5d5",
+                           background="#ffffff")
+            cv.pack(fill=tk.X)
+            cv.bind("<Button-1>", lambda e, i=i: self._on_click(i, e))
+            cv.bind("<B1-Motion>", lambda e, i=i: self._on_drag(i, e))
+            cv.bind("<ButtonRelease-1>", lambda e, i=i: self._on_release(i, e))
+            cv.bind("<Button-3>", lambda e: self._reset_view())
+            cv.bind("<MouseWheel>", lambda e, i=i: self._on_wheel(i, e))
+            cv.bind("<Button-2>", lambda e, i=i: self._pan_start(i, e))
+            cv.bind("<B2-Motion>", lambda e, i=i: self._pan_move(i, e))
+            cv.bind("<Configure>", lambda e, i=i: self._on_canvas_resize(i))
+            self.canvases.append(cv)
+
+        ctl = ttk.Frame(main)
+        ctl.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(ctl, text=_("当前轨")).pack(side=tk.LEFT)
+        self.active_var = tk.StringVar()
+        self.active_combo = ttk.Combobox(ctl, textvariable=self.active_var,
+                                         state="readonly", width=22,
+                                         values=self._track_labels())
+        self.active_combo.pack(side=tk.LEFT, padx=(4, 10))
+        self.active_combo.current(self.active_i)
+        self.active_combo.bind("<<ComboboxSelected>>", self._on_active_changed)
+
+        ttk.Button(ctl, text=_("−10 帧"), command=lambda: self._nudge(-10)).pack(side=tk.LEFT)
+        ttk.Button(ctl, text=_("−1 帧"), command=lambda: self._nudge(-1)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(ctl, text=_("归零"), command=self._zero_offset).pack(side=tk.LEFT, padx=2)
+        ttk.Button(ctl, text=_("+1 帧"), command=lambda: self._nudge(1)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(ctl, text=_("+10 帧"), command=lambda: self._nudge(10)).pack(side=tk.LEFT)
+
+        ttk.Label(ctl, text=_("偏移")).pack(side=tk.LEFT, padx=(12, 2))
+        self.offset_var = tk.StringVar(value="0.000")
+        ent = ttk.Entry(ctl, textvariable=self.offset_var, width=10, justify=tk.RIGHT)
+        ent.pack(side=tk.LEFT)
+        ent.bind("<Return>", lambda e: self._commit_offset_entry())
+        ttk.Label(ctl, text="s").pack(side=tk.LEFT, padx=(2, 8))
+
+        # 光标精调（2026-09-13 实机反馈「打点有没有能准确选中他们的按钮」）：
+        # 波形上点一下只能粗定位；这里给逐帧微调 + 一键写成锚点，
+        # 替代「凭手感恰好点在拍手声上」——正是用户说的「重新选到那个打点的地方有点难」。
+        ctl1b = ttk.Frame(main)
+        ctl1b.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(ctl1b, text=_("光标")).pack(side=tk.LEFT)
+        ttk.Button(ctl1b, text=_("−1 帧"),
+                   command=lambda: self._nudge_cursor(-1)).pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Button(ctl1b, text=_("+1 帧"),
+                   command=lambda: self._nudge_cursor(1)).pack(side=tk.LEFT, padx=(0, 10))
+        self.auto_btn = ttk.Button(ctl1b, text=_("自动找点"), command=self._auto_find_all)
+        self.auto_btn.pack(side=tk.LEFT)
+        ToolTip(self.auto_btn,
+                _("以「当前轨」光标处的音频为模板，在其余轨道上自动找出同一个事件\n"
+                "（局部归一化互相关，精度约 0.1ms，替代逐条手点、免除手抖误差）。\n"
+                "只在当前偏移 ±5 秒内搜索；匹配不唯一的轨道会标出来让你核对。"))
+        self.set_start_btn = ttk.Button(
+            ctl1b, text=_("设为起始"),
+            command=lambda: self._write_anchor_all(0))
+        self.set_start_btn.pack(side=tk.LEFT, padx=(10, 0))
+        ToolTip(self.set_start_btn,
+                _("把当前光标处的这个事件写成**全部轨道**的「起始」：\n"
+                "当前轨用光标值，其余轨按当前偏移反算同一时刻（不吸附帧网格）。\n"
+                "只想一键写某条轨的光标时，用轨头「打起始(all)」更直接。"))
+        self.set_end_btn = ttk.Button(
+            ctl1b, text=_("设为结尾"),
+            command=lambda: self._write_anchor_all(1))
+        self.set_end_btn.pack(side=tk.LEFT, padx=2)
+        ToolTip(self.set_end_btn,
+                _("把当前光标处的这个事件写成**全部轨道**的「结尾」（同上，按当前偏移反算）。"))
+        ttk.Label(ctl1b, text=_("波形点一下设光标 → 逐帧微调 → 自动找点 → 一键写入全部轨"),
+                  foreground="gray").pack(side=tk.LEFT, padx=(10, 0))
+
+        ctl2 = ttk.Frame(main)
+        ctl2.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(ctl2, text=_("缩小"), command=lambda: self._zoom(1.4)).pack(side=tk.LEFT)
+        ttk.Button(ctl2, text=_("放大"), command=lambda: self._zoom(1 / 1.4)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(ctl2, text=_("适应重叠区"), command=self._fit_overlap).pack(side=tk.LEFT, padx=2)
+        ttk.Button(ctl2, text=_("全长"), command=self._reset_view).pack(side=tk.LEFT, padx=2)
+        ttk.Button(ctl2, text=_("清除标记"), command=self._clear_anchors).pack(side=tk.LEFT, padx=2)
+        self.undo_btn = ttk.Button(ctl2, text=_("撤销打点"), command=self._undo_dot)
+        self.undo_btn.pack(side=tk.LEFT, padx=2)
+        self.align_btn = ttk.Button(ctl2, text=_("按光标对齐"), command=self._align_by_cursors)
+        self.align_btn.pack(side=tk.LEFT, padx=(10, 0))
+        # 取当前帧对比（2026-09-14，用户原话「在按光标对齐后面加个功能"取当前帧对比"」）：
+        # 波形是听的，这里给眼睛看的——同一事件在各轨上到底是不是同一画面，一屏见分晓。
+        self.frame_btn = ttk.Button(ctl2, text=_("取当前帧对比"),
+                                    command=self._open_frame_compare)
+        self.frame_btn.pack(side=tk.LEFT, padx=(6, 0))
+        ToolTip(self.frame_btn,
+                _("把**每条轨道**当前光标处的那一帧取出来，平铺成网格同屏对比：\n"
+                "对齐对上了 → 各格画面应当一致；没对上 → 一眼看出差在哪。\n"
+                "取的是各轨**自己时间轴**上的光标处（与「按光标对齐」同口径），\n"
+                "所以先让各轨光标落到同一事件（自动找点 / 逐轨在波形上点）再取。\n"
+                "画面按原始比例缩放、整窗绝不超出屏幕；窗口不关，回去挪光标后\n"
+                "点对比窗里的「重新取帧」即可刷新。"))
+        # 反向生成打点（2026-09-14，用户原话「更或者能从选择的轨道的截取数值
+        # 反向生成打点」）：轨道上已经填好的 trim 起点/终点直接读回成锚点。
+        self.readback_btn = ttk.Button(ctl2, text=_("从截取读回"),
+                                       command=self._read_back_from_tracks)
+        self.readback_btn.pack(side=tk.LEFT, padx=(6, 0))
+        ToolTip(self.readback_btn,
+                _("从各轨**已设的截取数值**（trim 起点 / 终点）反向生成打点：\n"
+                "读进「起始 / 结尾」两格，并按「基准轨起始 − 本轨起始」重算偏移。\n"
+                "——上次把表格复制出去填进各轨 trim 后，重开本窗点这里就能接着调。\n"
+                "没开截取的轨会被跳过并在提示里列出来（不改动轨道数据）。"))
+        ttk.Button(ctl2, text=_("复制表格"), command=self._copy_table).pack(side=tk.RIGHT)
+        # 「复制时间」在「复制表格」左边（后 pack 的更靠左）：只复制选中行那两个值
+        self.copy_time_btn = ttk.Button(ctl2, text=_("复制时间"),
+                                        command=self._copy_selected_time)
+        self.copy_time_btn.pack(side=tk.RIGHT, padx=(0, 6))
+        ToolTip(self.copy_time_btn,
+                _("复制**汇总表当前选中行**的 `-ss X -to Y`（不含轨道名），\n"
+                "可直接粘进 trim 窗口 / 命令行。没选中行时按「当前轨」那一行走。"))
+
+        tbl_wrap = ttk.Frame(main)
+        tbl_wrap.pack(fill=tk.X, pady=(8, 0))
+        cols = ("who", "s", "e", "dur", "da", "db", "drift")
+        self.tree = ttk.Treeview(tbl_wrap, columns=cols, show="headings",
+                                 height=max(3, self.n))
+        for cid, head, w, anc, st in (
+                ("who", _("轨道"), 168, tk.W, False),
+                ("s", _("起始"), 96, tk.E, False),
+                ("e", _("结尾"), 96, tk.E, False),
+                ("dur", _("区间长度"), 104, tk.E, False),
+                ("da", _("起始差"), 96, tk.E, False),
+                ("db", _("结尾差"), 96, tk.E, False),
+                ("drift", _("漂移(%)"), 92, tk.E, True)):
+            self.tree.heading(cid, text=head)
+            self.tree.column(cid, width=w, anchor=anc, stretch=st)
+        self.tree.pack(fill=tk.X)
+        self.tree.bind("<Double-1>", self._on_table_double)
+        ToolTip(self.tree,
+                _("每轨一行：「基准」= 参考轨，「比对 N」= 其余轨道（顺序同上）。\n"
+                "起始 / 结尾 = 该轨自己的时间（秒），手填截取直接用这两列。\n"
+                "起始差 / 结尾差 = 本轨 − 基准（正数 = 该事件在本轨上出现得更晚）。\n"
+                "区间长度 = 结尾 − 起始；漂移(%) = 两端长度的相对差（不为 0 说明设备时钟有快慢，需变速补偿）。\n"
+                "双击某行 = 复制该轨全部数值（不含轨道名）。"))
+
+        self._refresh_table()
+
+    # ---------- 视图与坐标（横轴恒为「参考轨时间」） ----------
+    def _span(self):
+        if not self._view:
+            return 1.0
+        t0, t1 = self._view
+        return max(1e-6, t1 - t0)
+
+    def _x_of(self, w, t_ref):
+        t0, _ = self._view
+        return (t_ref - t0) / self._span() * w
+
+    def _t_of(self, w, x):
+        t0, _ = self._view
+        return t0 + x / max(1.0, float(w)) * self._span()
+
+    def _full_span(self):
+        los, his = [0.0], [10.0]
+        for i in range(self.n):
+            d = self.durs[i] or 0.0
+            if d <= 0:
+                continue
+            los.append(self.offsets[i])
+            his.append(self.offsets[i] + d)
+        return (min(los), max(his))
+
+    def _reset_view(self):
+        self._view = self._full_span()
+        self._redraw_all()
+
+    def _fit_overlap(self):
+        sp = _sync_overlap_span(self.offsets, self.durs)
+        if sp:
+            self._view = sp
+        self._redraw_all()
+
+    def _zoom(self, factor, anchor=None):
+        t0, t1 = self._view
+        f0, f1 = self._full_span()
+        span = self._span() * factor
+        span = max(0.02, min(span, max(1.0, (f1 - f0)) * 1.2))
+        if anchor is None:
+            anchor = (t0 + t1) / 2.0
+        r = (anchor - t0) / max(1e-9, t1 - t0)
+        self._view = (anchor - span * r, anchor + span * (1 - r))
+        self._redraw_all()
+
+    # ---------- 绘制 ----------
+    def _canvas_w(self, i):
+        cv = self.canvases[i]
+        w = cv.winfo_width()
+        if w <= 10:
+            w = cv.winfo_reqwidth()
+        return max(50, int(w))
+
+    def _redraw_all(self):
+        for i in range(self.n):
+            self._redraw_wave(i)
+        self._refresh_readouts()
+
+    def _redraw_wave(self, i):
+        """画第 i 道波形（min/max 包络多边形，照抄 SimplePreviewer._draw_wave）。"""
+        cv = self.canvases[i]
+        try:
+            cv.delete("all")
+            w = self._canvas_w(i)
+            h = int(cv.winfo_height())
+            if h <= 4:
+                h = self.row_h
+            mid = h // 2
+            amp = h / 2 - 6
+            cv.create_line(0, mid, w, mid, fill="#ececec")
+
+            fill_c, line_c = _SYNC_TRACK_COLORS[i % len(_SYNC_TRACK_COLORS)]
+            peaks = self.peaks[i]
+            dur = self.durs[i] or 0.0
+            off = self.offsets[i]
+            gain = self.gains[i] or 1.0     # 显示增益（归一化，只影响观感）
+            drawn = 0
+            if peaks and dur > 0:
+                N = len(peaks)
+                t0, t1 = self._view
+                o0, o1 = t0 - off, t1 - off          # 该轨自身时间窗口
+                k0 = max(0, int(o0 / dur * N) - 1)
+                k1 = min(N, int(o1 / dur * N) + 2)
+                top, bot = [], []
+                for k in range(k0, k1):
+                    pk = peaks[k]
+                    if pk is None:
+                        continue
+                    mn, mx = pk
+                    tau = (k + 0.5) / N * dur
+                    x = self._x_of(w, tau + off)
+                    v1 = max(-32768.0, min(32767.0, mx * gain))
+                    v2 = max(-32768.0, min(32767.0, mn * gain))
+                    y1 = mid - v1 / 32768.0 * amp
+                    y2 = mid - v2 / 32768.0 * amp
+                    if y2 - y1 < 1:
+                        y2 = y1 + 1
+                    top.append((x, y1))
+                    bot.append((x, y2))
+                    drawn += 1
+                if len(top) >= 2:
+                    pts = []
+                    for (x, y) in top:
+                        pts.append(x); pts.append(y)
+                    for (x, y) in reversed(bot):
+                        pts.append(x); pts.append(y)
+                    cv.create_polygon(pts, fill=fill_c, outline=line_c,
+                                      width=1, tags="wave")
+                elif top:
+                    x, y1 = top[0]
+                    cv.create_line(x, y1, x, bot[0][1], fill=line_c,
+                                   width=1, tags="wave")
+            if drawn == 0:
+                tip = _("波形生成中…") if peaks is None else _("无音频轨（或波形不可用）")
+                cv.create_text(w / 2, mid, text=tip, fill="#999999")
+
+            # 已记录的锚点（紫虚线）；打点会话中本轮已点的用实线
+            for a in self.anchors:
+                tau = a["vals"][i]
+                if tau is None:
+                    continue
+                cv.create_line(self._x_of(w, tau + off), 0,
+                               self._x_of(w, tau + off), h,
+                               fill=_SYNC_ANCHOR_COLOR, dash=(3, 3), tags="anchor")
+            if self._dot and self._dot["vals"][i] is not None:
+                xx = self._x_of(w, self._dot["vals"][i] + off)
+                cv.create_line(xx, 0, xx, h, fill=_SYNC_ANCHOR_COLOR,
+                               width=2, tags="anchor")
+
+            x = self._x_of(w, self.cursors[i] + off)
+            if -2 <= x <= w + 2:
+                cv.create_line(x, 0, x, h, fill=_SYNC_CURSOR_COLOR,
+                               width=2, tags="cursor")
+
+            if i == self.ref_i:
+                cv.create_rectangle(0, 0, w - 1, h - 1, outline="#1f6feb",
+                                    width=1, tags="frame")
+            elif i == self.active_i:
+                cv.create_rectangle(0, 0, w - 1, h - 1, outline="#b9b9b9",
+                                    width=1, tags="frame")
+        except Exception:
+            pass
+
+    def _refresh_readouts(self):
+        for i in range(self.n):
+            self.readout_vars[i].set(_sync_format_time(self.cursors[i]) + " s")
+
+    # ---------- 探测与解码（后台线程，绝不碰 Tk） ----------
+    def _start_probe(self):
+        self._probe_gen += 1
+        threading.Thread(target=self._probe_worker, args=(self._probe_gen,),
+                         daemon=True).start()
+        self._poll()
+
+    def _probe_worker(self, gen=0):
+        for i, tr in enumerate(self.tracks):
+            if self._stop or gen != self._probe_gen:
+                return
+            path = getattr(tr, "file_path", "") or ""
+            dur, fps, info = 0.0, None, None
+            try:
+                info = self.app._get_cached_stream_info(path)
+            except Exception:
+                info = None
+            if info:
+                streams = info.get("streams", [])
+                for s in streams:
+                    if s.get("codec_type") == "video":
+                        fps = _sync_parse_fps(s)
+                        break
+                try:
+                    dur = float((info.get("format") or {}).get("duration") or 0.0)
+                except (TypeError, ValueError):
+                    dur = 0.0
+                if dur <= 0:
+                    for s in streams:
+                        if s.get("codec_type") == "audio":
+                            try:
+                                dur = float(s.get("duration") or 0.0)
+                            except (TypeError, ValueError):
+                                dur = 0.0
+                            break
+            self.durs[i] = dur
+            self.fps_list[i] = fps
+            self._dirty.add(i)
+            if self._stop or gen != self._probe_gen:
+                return
+            peaks, _ok = _sync_decode_peaks(path, self.ff, dur,
+                                            should_stop=lambda: self._stop)
+            self.peaks[i] = peaks
+            self._auto_gains[i] = _sync_peak_gain(peaks)   # 线程外纯函数；标签由 _poll 刷
+            if self._manual_gains[i] is None:              # 手动增益优先，不被自动值覆盖
+                self.gains[i] = self._auto_gains[i]
+            self._dirty.add(i)
+
+    def _poll(self):
+        if self._stop:
+            return
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+        if self._dirty:
+            dirty = sorted(self._dirty)
+            self._dirty.clear()
+            for i in dirty:
+                if 0 <= i < self.n:
+                    self._redraw_wave(i)
+            self._sync_fps_label()
+        self._sync_gain_labels()
+        self._follow_play()
+        try:
+            self._poll_job = self.after(150, self._poll)
+        except Exception:
+            self._poll_job = None
+
+    def _sync_gain_labels(self):
+        """轨头显示实际应用了多大的显示增益（避免被误读成「两轨响度一样」）。"""
+        for i in range(self.n):
+            g = self.gains[i] or 1.0
+            tag = _("（手动）") if self._manual_gains[i] is not None else ""
+            txt = "" if abs(g - 1.0) <= 0.05 else _('显示增益 ×{0:.1f}{1}').format(g, tag)
+            try:
+                self.gain_vars[i].set(txt)
+            except Exception:
+                pass
+
+    def _apply_gain_entry(self, i):
+        """轨头「增益×」输入框回车：填正数=手动覆盖，留空=恢复自动（不弹窗）。"""
+        txt = self.gain_entries[i].get().strip()
+        if txt == "":
+            self._manual_gains[i] = None
+            self.gains[i] = self._auto_gains[i]
+            g = self.gains[i] or 1.0
+            self.hint_var.set(_('已恢复自动显示增益 ×{0:.1f}（自动值只按 96% 分位归一化，长视频安静段被压平是单一全局增益的固有特性）。').format(g))
+        else:
+            try:
+                g = float(txt)
+                if not (g > 0):
+                    raise ValueError
+            except ValueError:
+                self.hint_var.set(_("增益无效：请填正数（如 8 或 8.5），留空回车 = 自动。"))
+                return
+            self._manual_gains[i] = g
+            self.gains[i] = g
+            self.hint_var.set(_('已手动设置显示增益 ×{0:g}（只改观感；过大削顶属正常）。').format(g))
+        self._dirty.add(i)
+        self._sync_gain_labels()
+
+    def _regen_waves(self):
+        """重新生成全部轨波形：重新解码包络并重算自动增益（手动增益保留）。"""
+        self._start_probe()
+        self.hint_var.set(_("正在重新生成波形（重新解码包络；手动增益保留）…"))
+
+    def _follow_play(self):
+        """播放推进：把各轨光标移到该轨当前播放位置；仅单轨播放时启用视图右缘跟随。"""
+        playing = []
+        for i in range(self.n):
+            p = self._procs[i]
+            if p is None:
+                continue
+            if p.poll() is not None:
+                self._stop_play(i)
+                continue
+            playing.append(i)
+            pos = self._play_pos[i]
+            if pos is None:
+                continue
+            d = self.durs[i] or 0.0
+            if d > 0:
+                pos = max(0.0, min(pos, d))
+            self.cursors[i] = pos
+            self.readout_vars[i].set(_sync_format_time(pos) + " s")
+            self._redraw_wave(i)
+        if len(playing) == 1:
+            self._pan_to_cursor(playing[0])
+
+    def _pan_to_cursor(self, i):
+        """光标越过视图右缘 → 平移共享视图（各轨一起动；多轨同播时不抢视图）。"""
+        if not self._view:
+            return
+        t = self.cursors[i] + self.offsets[i]
+        _, t1 = self._view
+        span = self._span()
+        if t < t1 - span * 0.02:
+            return
+        self._view = (t - span * 0.15, t + span * 0.85)
+        self._redraw_all()
+
+    def _sync_fps_label(self):
+        """参考轨帧率就绪后更新标签；探测不到时按 25fps 估算（_eff_fps 的回退口径）。"""
+        f = self.fps_list[self.ref_i]
+        if f:
+            if abs(f - self.fps) > 1e-6:
+                self.fps = f
+            self.fps_lbl.config(text=_('帧率 {0:g}').format(f))
+        else:
+            self.fps = 0.0
+            self.fps_lbl.config(text=_("帧率 —（按 25fps 估算）"))
+
+    def _on_canvas_resize(self, i):
+        self._redraw_wave(i)
+
+    # ---------- 当前轨 / 参考轨 ----------
+    def _set_active(self, i):
+        if i == self.active_i:
+            return
+        old = self.active_i
+        self.active_i = i
+        try:
+            self.active_combo.current(i)
+        except Exception:
+            pass
+        self.offset_var.set(_sync_format_time(self.offsets[i]))
+        self._redraw_wave(old)
+        self._redraw_wave(i)
+
+    def _on_active_changed(self, _ev=None):
+        try:
+            i = self.active_combo.current()
+        except Exception:
+            i = self.active_i
+        if 0 <= i < self.n:
+            self._set_active(i)
+
+    def _on_ref_changed(self, _ev=None):
+        """换参考轨：整体平移偏移表示，保证各轨在屏幕上的位置不变。"""
+        j = self.ref_combo.current()
+        if not (0 <= j < self.n) or j == self.ref_i:
+            return
+        shift = self.offsets[j]
+        for i in range(self.n):
+            self.offsets[i] -= shift
+        self.ref_i = j
+        for i, b in enumerate(self.badges):
+            b.config(text=_("参考") if i == j else _("待对齐"),
+                     foreground="#185FA5" if i == j else "#854F0B")
+        self._sync_fps_label()
+        self.offset_var.set(_sync_format_time(self.offsets[self.active_i]))
+        self._redraw_all()
+        self._refresh_table()
+
+    # ---------- 画布交互 ----------
+    def _on_click(self, i, ev):
+        self._set_active(i)
+        t_ref = self._t_of(self._canvas_w(i), ev.x)
+        if self._dot is not None:
+            if self._dot["vals"][i] is None:
+                self._dot["vals"][i] = t_ref - self.offsets[i]
+                self._dot["order"].append(i)
+                self._dot_step()
+            return
+        if self._procs[i] is not None:
+            self._stop_play(i)      # 播放中点波形 = 定位并停下，否则光标立刻被拉走
+        self.cursors[i] = max(0.0, t_ref - self.offsets[i])
+        self._redraw_wave(i)
+        self.readout_vars[i].set(_sync_format_time(self.cursors[i]) + " s")
+
+    def _on_drag(self, i, ev):
+        if self._dot is not None or i == self.ref_i:
+            return
+        if self._drag is None:
+            if self._procs[i] is not None:
+                self._stop_play(i)
+            self._drag = {"i": i, "x": ev.x, "off": self.offsets[i]}
+            return
+        if self._drag["i"] != i:
+            return
+        dx = ev.x - self._drag["x"]
+        if abs(dx) < 2:
+            return
+        self.offsets[i] = (self._drag["off"]
+                           + dx / max(1.0, float(self._canvas_w(i))) * self._span())
+        self.offset_var.set(_sync_format_time(self.offsets[i]))
+        self._redraw_wave(i)
+
+    def _on_release(self, i, _ev):
+        if self._drag is None:
+            return
+        self._drag = None
+        self.offsets[i] = _sync_normalize_offset(self.offsets[i], self._eff_fps())
+        self.offset_var.set(_sync_format_time(self.offsets[i]))
+        self._redraw_wave(i)
+        self._refresh_table()
+
+    def _on_wheel(self, i, ev):
+        w = self._canvas_w(i)
+        anchor = self._t_of(w, ev.x)
+        self._zoom(1 / 1.25 if getattr(ev, "delta", 0) > 0 else 1.25, anchor)
+
+    def _pan_start(self, i, ev):
+        self._pan = {"x": ev.x, "view": self._view}
+
+    def _pan_move(self, i, ev):
+        if not self._pan:
+            return
+        w = self._canvas_w(i)
+        dt = -(ev.x - self._pan["x"]) / max(1.0, float(w)) * self._span()
+        t0, t1 = self._pan["view"]
+        self._view = (t0 + dt, t1 + dt)
+        self._redraw_all()
+
+    # ---------- 播放（每条独立 ffplay；只播音频，不动任何文件） ----------
+    # 光标跟随：复用 SimplePreviewer._a_start 的两段式 seek——ffplay 的 -ss 是
+    # demuxer 级寻址（视频容器只能落关键帧），故「粗跳到目标前 15s + atrim/asetpts
+    # 丢弃多余并归零」→ 状态行时钟 = 距目标相对时间 → 位置 = 起点 + 时钟。
+    # ⚠️ 绝不能加 -v error：那会连状态行一起静音，位置就无从解析（跟随失效）。
+    def _toggle_play(self, i):
+        if self._procs[i] is not None:
+            self._stop_play(i)
+            return
+        path = getattr(self.tracks[i], "file_path", "") or ""
+        if not path or not self.ffplay:
+            messagebox.showwarning(_("提示"), _("未找到 ffplay 或源文件不可用"), parent=self)
+            return
+        at = max(0.0, self.cursors[i])
+        coarse = max(0.0, at - _AV_COARSE_BACK)
+        args = [self.ffplay, "-nodisp", "-autoexit", "-vn", "-sn",
+                "-ss", f"{coarse:.3f}",
+                "-af", f"atrim=start={at:.3f},asetpts=PTS-STARTPTS",
+                "-i", path]
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        try:
+            p = subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.PIPE, creationflags=flags)
+        except Exception:
+            messagebox.showwarning(_("提示"), _("无法启动播放器"), parent=self)
+            return
+        self._procs[i] = p
+        self._play_pos[i] = at
+        self._play_gen[i] += 1
+        gen = self._play_gen[i]
+        self.play_btns[i].config(text=_("停止"))
+        threading.Thread(target=self._play_reader, args=(i, p, gen, at),
+                         daemon=True).start()
+
+    def _play_reader(self, i, proc, gen, at):
+        """读 ffplay stderr 状态行 → 写该轨当前位置（线程纪律：不碰 Tk，只写共享变量）。"""
+        buf = b""
+        try:
+            fd = proc.stderr.fileno()
+            if hasattr(os, "set_blocking"):
+                os.set_blocking(fd, False)
+            while not self._stop:
+                if gen != self._play_gen[i]:
+                    return
+                try:
+                    chunk = os.read(fd, 4096)
+                except BlockingIOError:
+                    time.sleep(0.01)
+                    continue
+                except OSError:
+                    return
+                if not chunk:
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.01)
+                    continue
+                buf += chunk
+                buf = buf.replace(b"\n", b"\r")   # 横幅是 \n 行，统一按 \r 切
+                parts = buf.split(b"\r")
+                buf = parts[-1]
+                for raw in parts[:-1]:
+                    m = _AUDIO_STATUS_RE.match(raw.decode("utf-8", "replace"))
+                    if m and gen == self._play_gen[i]:
+                        self._play_pos[i] = at + float(m.group(1))
+        except Exception:
+            pass
+
+    def _stop_play(self, i):
+        p = self._procs[i]
+        self._procs[i] = None
+        self._play_pos[i] = None
+        self._play_gen[i] += 1        # 作废 reader：被杀进程不再写位置
+        if p is not None:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        try:
+            self.play_btns[i].config(text=_("播放"))
+        except Exception:
+            pass
+
+    # ---------- 每轨时间预览（精确读起始/结尾，用户 2026-09-13 要求） ----------
+    def _open_track_preview(self, i):
+        """为该轨源文件打开「简易时间预览」，把读到的时刻回填进「起始/结尾」锚点格。
+
+        用户场景：结尾的那个点靠点波形对不准，希望在时间预览里一边看画面/听声一边
+        精确定位；并且**先**用它定好基准轨（参考轨）的起始与结束长度，再逐轨比对其余轨道。
+        预览里的「设为起点 / 设为终点」分别写进该轨的锚点 #1（起始）/ #2（结尾）→
+        立刻按锚点重算偏移与漂移，汇总表里可直接复制。
+
+        ⚠️ 传参铁律（见 time_preview.md）：file_path 必须是**该轨自己的源文件**——
+        本窗口所有偏移都量在「各轨自身时间轴」上；且 use_output_context=False
+        （不引入封装页成片时间，避免与轨道自身时间混为一谈）。
+        """
+        path = getattr(self.tracks[i], "file_path", "") or ""
+        if not path or not os.path.exists(path):
+            messagebox.showwarning(_("提示"), _("该轨道没有可用的源文件"), parent=self)
+            return
+        if not self.ff:
+            messagebox.showwarning(_("提示"), _("未找到 ffmpeg，无法预览"), parent=self)
+            return
+        # ⚠️ 释放调用方弹窗的模态 grab——否则预览窗口被锁住焦点（与可视化选区同一问题）
+        try:
+            g = self.grab_current()
+            if g is not None:
+                g.grab_release()
+        except Exception:
+            pass
+        a, b = self._anchor_pair(i)
+        marks = [(a, b)] if (a is not None and b is not None and b > a) else None
+        try:
+            self.app.show_time_picker(
+                self.app.root, path,
+                on_set_start=lambda s, i=i: self._set_anchor_from_preview(0, i, s),
+                on_set_end=lambda s, i=i: self._set_anchor_from_preview(1, i, s),
+                initial_marks=marks,
+                use_output_context=False)
+        except Exception as e:
+            self.hint_var.set(_('[时间预览] 打开失败: {0}').format(e))
+
+    def _set_anchor_from_preview(self, k, i, sec):
+        """时间预览「设为起点/终点」的回填入口（k=0 起始 / k=1 结尾）。"""
+        self._write_anchor(k, i, sec, src=_("时间预览"))
+
+    def _set_anchor_from_cursor(self, i, k):
+        """把第 i 轨光标所在时刻写入「起始 / 结尾」格（用户 2026-09-13 要求：
+        「打点有没有能准确选中他们的按钮」）。
+
+        这是「打点打不准」的解药：光标可用波形点击粗定位、用 −1帧/+1帧 逐帧微调，
+        确认无误后再一键写入，不必指望鼠标恰好点在拍手声上。"""
+        self._write_anchor(k, i, self.cursors[i], src=_("光标"))
+
+    def _write_anchor(self, k, i, sec, src=_("时间预览")):
+        """把秒数写进第 i 轨的「起始(k=0)/结尾(k=1)」槽位并全量重算。
+
+        不吸附帧网格：写入什么就是什么，保「时间预览 / 逐帧微调」的精度
+        （与「按光标对齐」口径一致）。"""
+        try:
+            v = float(sec)
+        except (TypeError, ValueError):
+            return
+        if self._dot is not None:        # 与打点会话互斥，避免两套输入交叉写同一格
+            self._dot = None
+            self._sync_dot_buttons()
+        label = _("起始") if k == 0 else _("结尾")
+        self._slot(label)["vals"][i] = v
+        self.cursors[i] = max(0.0, v)    # 顺带把该轨光标挪到这一刻，视觉上看得见
+        self._apply_anchors()
+        self._redraw_all()
+        self._refresh_table()
+        idx = self._track_disp(i)
+        self.hint_var.set(
+            _('{0}已为「{1}」设定{2} = {3} s；偏移与漂移按锚点重算（结果见汇总表）。').format(src, idx, label, _sync_format_time(v)))
+
+    # ---------- 微调 / 归零 / 手输 ----------
+    def _eff_fps(self):
+        """有效帧率：探测不到时回退 25（项目历史默认的 25fps 帧网格）。"""
+        return self.fps if self.fps and self.fps > 0 else 25.0
+
+    def _frame_step(self):
+        return 1.0 / self._eff_fps()
+
+    def _guard_ref(self):
+        if self.active_i == self.ref_i:
+            messagebox.showinfo(_("提示"), _("参考轨是基准，偏移恒为 0；请先在「当前轨」里切换轨道。"),
+                                parent=self)
+            return True
+        return False
+
+    def _nudge(self, frames):
+        if self._guard_ref():
+            return
+        self.offsets[self.active_i] = _sync_normalize_offset(
+            self.offsets[self.active_i] + frames * self._frame_step(), self._eff_fps())
+        self.offset_var.set(_sync_format_time(self.offsets[self.active_i]))
+        self._redraw_wave(self.active_i)
+        self._refresh_table()
+
+    def _nudge_cursor(self, frames):
+        """微调【当前轨光标】（区别于上面的偏移微调）。
+
+        用户 2026-09-13：「现在我要每一条手动点, 会有1-2帧偏差的, 手抖的话」——
+        波形上点一下只能粗定位，这里给逐帧微调，配合「设为起始 / 设为结尾」
+        就能把锚点写在精确的帧上，不必指望鼠标恰好点在拍手声上。
+        参考轨也允许微调（它只是光标，不影响偏移恒 0 的基准地位）。
+        """
+        i = self.active_i
+        self.cursors[i] = max(0.0, self.cursors[i] + frames * self._frame_step())
+        self.readout_vars[i].set(_sync_format_time(self.cursors[i]) + " s")
+        self._redraw_wave(i)
+
+    def _zero_offset(self):
+        if self._guard_ref():
+            return
+        self.offsets[self.active_i] = 0.0
+        self.offset_var.set("0.000")
+        self._redraw_wave(self.active_i)
+        self._refresh_table()
+
+    def _commit_offset_entry(self):
+        if self._guard_ref():
+            self.offset_var.set("0.000")
+            return
+        try:
+            v = float(self.offset_var.get())
+        except (TypeError, ValueError):
+            self.offset_var.set(_sync_format_time(self.offsets[self.active_i]))
+            return
+        self.offsets[self.active_i] = v      # 手输尊重原值，不吸附帧网格
+        self.offset_var.set(_sync_format_time(v))
+        self._redraw_wave(self.active_i)
+        self._refresh_table()
+
+    # ---------- 锚点槽位（「起始 / 结尾」两个固定格） ----------
+    def _ensure_slots(self):
+        """保证 anchors[0]/[1] 恒为「起始」「结尾」（值可为 None）。
+
+        为什么要有槽位（2026-09-13 实机反馈「这表格看不懂啊」）：旧版按
+        `len(self.anchors)` 给锚点起名，用户把「时间预览回填」与「打点会话」
+        混着用，就打出 [起始(空), 结尾(半格), #3, #4] 这种状态——真正想要的
+        两组数据藏在 #3/#4 里，而「起始/结尾」两格是空的。
+        """
+        while len(self.anchors) < 2:
+            m = len(self.anchors)
+            self.anchors.append({"label": _("起始") if m == 0 else _("结尾"),
+                                 "vals": [None] * self.n})
+
+    def _slot(self, label):
+        """取「起始 / 结尾」固定槽位；额外参考点按 label 复用或追加。"""
+        self._ensure_slots()
+        if label == _("起始"):
+            return self.anchors[0]
+        if label == _("结尾"):
+            return self.anchors[1]
+        for a in self.anchors[2:]:
+            if a["label"] == label:
+                return a
+        self.anchors.append({"label": label, "vals": [None] * self.n})
+        return self.anchors[-1]
+
+    def _pair_filled(self):
+        """「起始」与「结尾」两格是否都已有值（都满 = 漂移可算）。"""
+        self._ensure_slots()
+        return all(any(v is not None for v in a["vals"]) for a in self.anchors[:2])
+
+    # ---------- 打点会话（逐轨标记同一事件） ----------
+    def _sync_dot_buttons(self):
+        """按钮文字跟随会话状态（ttk 禁 .state(["disabled"])，用文字表达当前态）。"""
+        cur = self._dot["target"] if self._dot is not None else None
+        for tgt, btn in ((_("起始"), self.dot_btn), (_("结尾"), self.dot_btn2)):
+            btn.config(text=(_('取消打{0}').format(tgt) if cur == tgt else _('打{0}').format(tgt)))
+
+    def _toggle_dot(self, target=_("起始")):
+        if self._dot is not None:
+            same = (self._dot["target"] == target)
+            self._dot = None
+            self._sync_dot_buttons()
+            self._redraw_all()
+            self.hint_var.set(
+                (_('已取消「打{0}」').format(target) if same
+                 else _('已切换为「打{0}」（上一轮未点满，未记录）').format(target))
+                + _("；此前记录的锚点保留。"))
+            if same:
+                return
+        self._dot = {"vals": [None] * self.n, "order": [], "target": target}
+        self._sync_dot_buttons()
+        self._dot_hint()
+        self._redraw_all()
+
+    def _dot_hint(self, prefix=None):
+        if self._dot is None:
+            return
+        tgt = self._dot["target"]
+        pend = [i for i in range(self.n) if self._dot["vals"][i] is None]
+        if not pend:
+            return
+        nxt = pend[0]
+        idx = self._track_disp(nxt)
+        msg = (_('正在打「{0}」：请在「{1}」的波形上点击该事件的位置（还剩 {2} 条未点；可任意顺序）').format(tgt, idx, len(pend)))
+        self.hint_var.set((prefix + " " if prefix else "") + msg)
+
+    def _dot_step(self):
+        if self._dot is None:
+            return
+        vals = self._dot["vals"]
+        self._redraw_all()
+        if any(v is None for v in vals):
+            self._dot_hint()
+            return
+        target = self._dot["target"]
+        self._dot = None
+        self._sync_dot_buttons()
+        self._finish_anchor(target, list(vals))
+
+    def _finish_anchor(self, label, vals):
+        """把整轮的值写进「起始 / 结尾」槽位（覆盖整行，允许重打覆盖）。"""
+        self._slot(label)["vals"] = list(vals)
+        self._apply_anchors()
+        self._redraw_all()
+        self._refresh_table()
+        if self._pair_filled():
+            self.hint_var.set(
+                _('已记录「{0}」，各轨按偏移平移对齐；汇总表的「漂移」列给出速度差（不为 0 说明设备时钟有快慢，需变速补偿）。').format(label))
+        else:
+            self.hint_var.set(
+                _('已记录「{0}」，各轨按偏移平移对齐。建议到片尾再打一轮「打结尾」，可算出速度漂移。').format(label))
+
+    def _apply_anchors(self):
+        """用锚点求各轨相对参考轨的偏移与漂移；偏移全量重算（不吸附帧网格，保采样精度）。"""
+        if not self.anchors:
+            return
+        v0 = self.anchors[0]["vals"]
+        ref = v0[self.ref_i]
+        if ref is None:
+            return
+        for i in range(self.n):
+            if v0[i] is not None:
+                self.offsets[i] = ref - v0[i]
+        self.offsets[self.ref_i] = 0.0
+        self.drift = [None] * self.n
+        if len(self.anchors) >= 2:
+            v1 = self.anchors[1]["vals"]
+            if v0[self.ref_i] is not None and v1[self.ref_i] is not None:
+                dref = v1[self.ref_i] - v0[self.ref_i]
+                if abs(dref) > 1e-9:
+                    for i in range(self.n):
+                        if v0[i] is None or v1[i] is None:
+                            continue
+                        di = v1[i] - v0[i]
+                        if abs(di) > 1e-9:
+                            d = di / dref - 1.0
+                            # 极小值归零，避免浮点噪声显示成「-0.000%」
+                            self.drift[i] = 0.0 if abs(d) < 1e-9 else d
+        self.offset_var.set(_sync_format_time(self.offsets[self.active_i]))
+
+    def _clear_anchors(self):
+        self.anchors = []
+        self.drift = [None] * self.n
+        self._dot = None
+        self._sync_dot_buttons()
+        self.hint_var.set(_("已清除「起始 / 结尾」全部标记（偏移值保留）"))
+        self._redraw_all()
+        self._refresh_table()
+
+    def _undo_dot(self):
+        """撤销打点（用户 2026-09-13 要求），两种语义合一：
+        ① 正在打点 → 撤掉本轮最后点的那一条（按点击顺序回退，不丢其它轨）；
+        ② 否则 → 清空最后一个「有值」的槽位（起始 → 结尾 倒序）；
+           槽位全空 → 偏移归零，回到「未对齐」初始态。"""
+        if self._dot is not None:
+            order = self._dot["order"]
+            while order:
+                i = order.pop()
+                if self._dot["vals"][i] is not None:
+                    self._dot["vals"][i] = None
+                    idx = self._track_disp(i)
+                    self._redraw_all()
+                    self._dot_hint(_('已撤销「{0}」上的打点；').format(idx))
+                    return
+            self._toggle_dot(self._dot["target"])   # 本轮一条都没点 → 直接退出会话
+            return
+        target = None
+        for a in reversed(self.anchors[:2]):
+            if any(v is not None for v in a["vals"]):
+                target = a
+                break
+        if target is None:
+            self.hint_var.set(_("没有可撤销的打点：锚点全为空，且当前不在打点会话中"))
+            return
+        gone = target["label"]
+        target["vals"] = [None] * self.n
+        if any(any(v is not None for v in a["vals"]) for a in self.anchors[:2]):
+            self._apply_anchors()       # 按剩余锚点重算（漂移随之重算/消失）
+            tail = _("偏移按剩余锚点重算。")
+        else:
+            self.offsets = [0.0] * self.n
+            self.drift = [None] * self.n
+            self.offset_var.set("0.000")
+            tail = _("锚点已全部撤销，偏移归零（回到未对齐状态）。")
+        self._redraw_all()
+        self._refresh_table()
+        self.hint_var.set(_('已清空「{0}」这一格；{1}').format(gone, tail))
+
+    def _align_by_cursors(self):
+        """按各轨光标一键对齐（用户 2026-09-13 要求）：
+        偏移 = 参考轨光标 − 本轨光标 → 各轨的点击点落在同一 x。
+        与锚点路径口径一致：不吸附帧网格（保留点击精度）。"""
+        ref = self.cursors[self.ref_i]
+        for i in range(self.n):
+            self.offsets[i] = ref - self.cursors[i]
+        self.offsets[self.ref_i] = 0.0
+        self.offset_var.set(_sync_format_time(self.offsets[self.active_i]))
+        self._redraw_all()
+        self._refresh_table()
+        self.hint_var.set(
+            _("已按各轨光标对齐（偏移 = 参考轨光标 − 本轨光标）；"
+            "结果见汇总表的「起始差 / 结尾差」列，双击某行可复制该轨全部数值。"))
+
+    def _sync_cursors_to(self, i0=None):
+        """只把其余轨的光标同步到基点轨的同一时刻——不写锚点、不动偏移。
+
+        「打起始(all)」的一半动作（2026-09-14 用户要求）：T = 基点轨光标 + 其偏移
+        为该事件在参考轴上的位置，各轨光标 = T − 本轨偏移。与 `_write_anchor_all`
+        同一套算法、同样不吸附帧网格，但只挪光标：锚点/偏移/漂移一律不动，
+        所以可以先「看看各轨是不是真落在同一个事件上」，再决定打不打点。
+        """
+        i0 = self.active_i if i0 is None else i0
+        T = self.cursors[i0] + self.offsets[i0]     # 该事件在参考轴上的位置
+        for i in range(self.n):
+            self.cursors[i] = max(0.0, T - self.offsets[i])
+        self._redraw_all()
+        self._refresh_table()
+        idx = self._track_disp(i0)
+        self.hint_var.set(
+            f"已把其余 {self.n - 1} 条轨的光标同步到「{idx}」的当前位置"
+            f"（按偏移反算同一时刻）；未打点、未改偏移——确认无误再按「打起始(all)」。")
+
+    def _write_anchor_all(self, k, i0=None):
+        """把基点轨光标处的这个事件写成**全部轨道**的「起始(k=0)/结尾(k=1)」。
+
+        用户 2026-09-13：「有没有能按当前光标给当前和其他轨道打点的按钮,
+        现在我要每一条手动点, 会有1-2帧偏差的, 手抖的话」。
+        基点轨（默认=当前轨；每轨轨头的「打起始(all)/打结尾(all)」按钮则
+        以按钮所在那条轨为基点，不用先切「当前轨」）直接用光标值，其余轨按
+        当前偏移反算同一时刻——前提是偏移已对齐（先用「自动找点」或
+        「按光标对齐」）。不做任何自动匹配：偏移可信时光标在哪就是哪。
+        """
+        i0 = self.active_i if i0 is None else i0
+        T = self.cursors[i0] + self.offsets[i0]     # 该事件在参考轴上的位置
+        label = _("起始") if k == 0 else _("结尾")
+        slot = self._slot(label)
+        for i in range(self.n):
+            slot["vals"][i] = max(0.0, T - self.offsets[i])
+            self.cursors[i] = slot["vals"][i]
+        self._apply_anchors()
+        self._redraw_all()
+        self._refresh_table()
+        idx = self._track_disp(i0)
+        self.hint_var.set(
+            _('已把「{0}」光标处的事件写成全部 {1} 条轨的{2}（其余轨按当前偏移反算，不吸附帧网格）；偏移与漂移已按锚点重算，见汇总表。').format(idx, self.n, label))
+
+    def _auto_match(self):
+        """以当前轨光标处音频为模板，互相关在其余轨道上找同一事件。
+
+        返回 (t_hits, unsure, no_hit, err)：t_hits={轨索引: 命中时刻}（含当前轨
+        自身），unsure=[(轨索引, 提示)]（低置信，时刻已写入 t_hits），
+        no_hit=完全没拿到时刻的轨道提示列表，err=整体失败原因（None=成功）。
+        「自动找点」与「打起始/打结尾」一键化共用（用户 2026-09-13：
+        「右上的那2个打起始打结尾不好用，每次都要把波形放到最大才能点准」）。
+        """
+        i0 = self.active_i
+        p0 = getattr(self.tracks[i0], "file_path", "") or ""
+        if not p0 or not self.ff:
+            return None, [], [], _("当前轨没有可用源文件，或未找到 ffmpeg")
+        t0 = self.cursors[i0]
+        tpl = _sync_decode_pcm(self.ff, p0, t0, t0 + _SYNC_MATCH_TPL)
+        shift = 0.0
+        if len(tpl) < 256:
+            # 打结尾时光标常贴文件尾，向后取不满 0.3s → 改向前取
+            # [t0-TPL, t0]（模板终点=光标=事件点）；命中时刻按 shift 换算回事件。
+            # 用户 2026-09-13 实机反馈「打起始是一键了，打结尾还是自己点」即此根因。
+            t_start = max(0.0, t0 - _SYNC_MATCH_TPL)
+            tpl = _sync_decode_pcm(self.ff, p0, t_start, t0)
+            shift = t0 - t_start
+        if len(tpl) < 256:
+            return None, [], [], _("当前轨光标附近没有可用音频（该处是否无声？）")
+        T = t0 + self.offsets[i0]           # 该事件在参考轴上的位置
+        t_hits, unsure, no_hit = {i0: t0}, [], []
+        for i in range(self.n):
+            if i == i0:
+                continue
+            pi = getattr(self.tracks[i], "file_path", "") or ""
+            idx = self._track_disp(i)
+            if not pi:
+                no_hit.append(_('{0}（无源文件）').format(idx))
+                continue
+            guess = T - self.offsets[i]     # 当前偏移下的猜测位置
+            # 逐级扩窗（2026-09-13 实机反馈「一键打起始打的时间不对」）：
+            # 首次打点时 offsets 往往全 0/不可信，比对轨的真实事件可能在 guess
+            # 之外十几秒——±5s 窗口里没有目标，NCC 就会匹配到窗口内别的音频、
+            # 写入错值。改为 5→15→45s 逐级扩大；offsets 准时第一级高置信命中
+            # 即停（不多花成本）；低置信命中继续扩窗，最后取相关系数最高的一级
+            # （错误窗口里的凑合匹配分低，会被正确窗口的高分覆盖）。
+            t_hit, t_sc, t_gap = None, -2.0, 0.0
+            for w in (_SYNC_MATCH_WIN, 15.0, 45.0):
+                lo = max(0.0, guess - w)
+                hay = _sync_decode_pcm(self.ff, pi, lo, guess + w)
+                if len(hay) <= len(tpl):
+                    continue
+                lag, sc, gap = _sync_match_point(tpl, hay)
+                if lag is None:
+                    continue
+                cand = lo + lag / float(_SYNC_MATCH_SR) + shift   # 模板起点 → 事件点
+                if sc > t_sc:
+                    t_hit, t_sc, t_gap = cand, sc, gap
+                if gap >= _SYNC_MATCH_MIN_GAP and sc >= 0.5:
+                    break
+            if t_hit is None:
+                no_hit.append(_('{0}（未命中）').format(idx))
+                continue
+            t_hits[i] = t_hit
+            if t_gap < _SYNC_MATCH_MIN_GAP or t_sc < 0.3:
+                unsure.append((i, _('{0}（匹配不唯一，请核对）→ {1}').format(idx, _sync_format_time(t_hit))))
+        return t_hits, unsure, no_hit, None
+
+    def _auto_find_all(self):
+        """以当前轨光标为锚，用局部归一化互相关在其余轨道上自动找出同一事件。
+
+        用户 2026-09-13 追加需求。命中后写进各轨光标并重算偏移（波形随之平移对齐），
+        **不直接写锚点**：先让你看波形/试听确认，再按「设为起始 / 设为结尾」一次写入。
+        """
+        t_hits, unsure, no_hit, err = self._auto_match()
+        if err is not None:
+            # 状态栏上报不弹窗（无头测试红线 + 用户偏好 log/status bar 上报）
+            self.hint_var.set(_("自动找点失败：") + err)
+            return
+        unsure_i = {i for i, _ in unsure}
+        hits, got_ref = [], (self.ref_i in t_hits)
+        for i, t in t_hits.items():
+            self.cursors[i] = t
+            if i != self.active_i and i not in unsure_i:
+                hits.append(f"{self._track_disp(i)} → {_sync_format_time(t)}")
+        low = [m for _, m in unsure] + no_hit
+        if not got_ref:
+            low.append(_("参考轨未命中，偏移仍按上一次的锚点体系"))
+        else:
+            # 统一口径：offset = 该事件在参考轨的时刻 − 该事件在本轨的时刻
+            ref_t = self.cursors[self.ref_i]
+            for i in range(self.n):
+                self.offsets[i] = ref_t - self.cursors[i]
+            self.offsets[self.ref_i] = 0.0
+        self.offset_var.set(_sync_format_time(self.offsets[self.active_i]))
+        self._redraw_all()
+        self._refresh_table()
+        msg = _("自动找点：") + (_("；").join(hits) if hits else _("无命中"))
+        if low:
+            msg += _("　⚠ ") + _("、").join(low)
+        self.hint_var.set(msg)
+
+    # ---------- 汇总表与复制 ----------
+    def _track_disp(self, i):
+        """轨道显示名：文件名优先——Track.index 是 ffprobe 的**流索引**（每个
+        视频文件首条视频流恒为 0，多轨并列时全是「轨道0」分不清，用户 2026-09-13
+        实机反馈），无文件名时才回退「轨道N」。"""
+        tr = self.tracks[i]
+        base = os.path.basename(getattr(tr, "file_path", "") or "")
+        return base if base else _('轨道{0}').format(getattr(tr, 'index', i + 1))
+
+    def _table_heads(self):
+        return [_("轨道"), _("起始"), _("结尾"), _("区间长度"), _("起始差"), _("结尾差"), _("漂移(%)")]
+
+    def _anchor_pair(self, i):
+        """第 i 轨的 (起始, 结尾)（锚点 #1 / #2 的该轨格；未设 → None）。"""
+        a = self.anchors[0]["vals"][i] if len(self.anchors) > 0 else None
+        b = self.anchors[1]["vals"][i] if len(self.anchors) > 1 else None
+        return a, b
+
+    @staticmethod
+    def _fmt_t(v):
+        return "—" if v is None else _sync_format_time(v)
+
+    @staticmethod
+    def _fmt_d(v):
+        """差值列：带符号，让「正 = 该事件在本轨上更晚」一眼可读。"""
+        return "—" if v is None else f"{v:+.3f}"
+
+    def _table_rows(self):
+        """每轨一行（基准轨排第一行）。
+
+        用户 2026-09-13：「这表格看不懂啊…… 比如 基准 起始0 结尾77.788 /
+        比对1 18.846 96.655 这样来?」——旧表是「行=锚点，列=轨道」，
+        用户要的是「行=轨道，列=参数」，且差值要按「本轨 − 基准」的直觉口径。
+        """
+        ra, rb = self._anchor_pair(self.ref_i)
+        order = [self.ref_i] + [i for i in range(self.n) if i != self.ref_i]
+        rows, k = [], 0
+        for i in order:
+            a, b = self._anchor_pair(i)
+            disp = self._track_disp(i)
+            if i == self.ref_i:
+                name = _('基准 · {0}').format(disp)
+            else:
+                k += 1
+                name = _('比对{0} · {1}').format(k, disp)
+            base = (i == self.ref_i)
+            da = None if (base or a is None or ra is None) else a - ra
+            db = None if (base or b is None or rb is None) else b - rb
+            dv = ("—" if (base or self.drift[i] is None)
+                  else f"{self.drift[i] * 100:+.3f}")
+            rows.append([
+                name, self._fmt_t(a), self._fmt_t(b),
+                "—" if (a is None or b is None) else _sync_format_time(b - a),
+                self._fmt_d(da), self._fmt_d(db), dv])
+        return rows
+
+    def _refresh_table(self):
+        try:
+            for iid in self.tree.get_children():
+                self.tree.delete(iid)
+            for row in self._table_rows():
+                self.tree.insert("", tk.END, values=row)
+        except Exception:
+            pass
+
+    def _copy_text(self, text):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update_idletasks()
+        except Exception:
+            pass
+
+    def _selected_table_row(self):
+        """当前选中行对应的轨道索引；没选中 → 「当前轨」（并给出说明）。
+
+        汇总表行序固定为 [ref_i, 其余轨...]（见 _table_rows），行号 → 轨道号要反查。
+        """
+        order = [self.ref_i] + [i for i in range(self.n) if i != self.ref_i]
+        try:
+            sel = self.tree.selection()
+        except Exception:
+            sel = ()
+        if sel:
+            try:
+                pos = self.tree.index(sel[0])
+            except Exception:
+                pos = -1
+            if 0 <= pos < len(order):
+                return order[pos], ""
+        pos = order.index(self.active_i) if self.active_i in order else 0
+        return order[pos], _("（未选中行，按「当前轨」走）")
+
+    def _copy_selected_time(self):
+        """「复制时间」：只复制选中行的 -ss/-to 两个值（2026-09-14）。
+
+        与双击行不同：双击复制整行（含区间长度 / 差值 / 漂移），这里只要时间，
+        粘进 trim 窗口的两个框 / 命令行最省事。"""
+        i, note = self._selected_table_row()
+        a, b = self._anchor_pair(i)
+        if a is None or b is None:
+            self.hint_var.set(
+                f"「{self._track_disp(i)}」还没有完整的起始/结尾（先打点或"
+                f"「从截取读回」），没有可复制的时间。")
+            return
+        txt = f"-ss {_sync_format_time(a)} -to {_sync_format_time(b)}"
+        self._copy_text(txt)
+        self.hint_var.set(f"已复制「{self._track_disp(i)}」的时间：{txt}{note}")
+
+    def _read_back_from_tracks(self):
+        """从各轨已设的截取数值（trim_start / trim_end）反向生成打点。
+
+        读进「起始 / 结尾」槽位后走 _apply_anchors 重算偏移（基准轨起始 − 本轨起始），
+        等价于「按光标对齐」的自动版——上次的结果只要还在轨道上，就能一键接着调。
+        只读轨道，不写回任何东西。
+        """
+        def _num(v):
+            try:
+                s = str(v).strip()
+                return float(s) if s else None
+            except (TypeError, ValueError):
+                return None
+
+        s_slot = self._slot(_("起始"))
+        e_slot = self._slot(_("结尾"))
+        got_s = got_e = 0
+        missing = []
+        for i, tr in enumerate(self.tracks):
+            es = getattr(tr, "enc_settings", None) or {}
+            if not es.get("trim_enabled", False):
+                missing.append(self._track_disp(i))
+                continue
+            ts = _num(es.get("trim_start"))
+            te = _num(es.get("trim_end"))
+            if ts is not None and ts >= 0:
+                s_slot["vals"][i] = ts
+                self.cursors[i] = max(0.0, ts)
+                got_s += 1
+            if te is not None and te > 0:
+                e_slot["vals"][i] = te
+                got_e += 1
+            if ts is None and te is None:
+                missing.append(self._track_disp(i))
+        if got_s == 0 and got_e == 0:
+            self.hint_var.set(
+                _("没有任何轨道读到截取数值：先在封装页给这些轨道设好截取起点/终点"
+                "（trim），再点这里读回。"))
+            return
+        self._apply_anchors()
+        self._redraw_all()
+        self._refresh_table()
+        msg = f"已从轨道截取读回：起始 {got_s} 条 / 结尾 {got_e} 条，偏移与漂移已重算。"
+        if missing:
+            msg += _("　未设截取：") + "、".join(missing)
+        self.hint_var.set(msg)
+
+    def _state_dict(self):
+        """当前对齐结果 → 可 JSON 化的 dict。
+
+        按**文件路径**记录（不是序号）：换一次选中的轨道顺序、或重新选了同几个文件，
+        都能对上。"""
+        out = {
+            "kind": "KliFFmpegGUI.sync_reference",
+            "version": 1,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "ref_i": self.ref_i,
+            "ref_path": normalize_path(
+                getattr(self.tracks[self.ref_i], "file_path", "") or ""),
+            "tracks": [],
+        }
+        for i, tr in enumerate(self.tracks):
+            a, b = self._anchor_pair(i)
+            out["tracks"].append({
+                "path": normalize_path(getattr(tr, "file_path", "") or ""),
+                "dur": round(float(self.durs[i] or 0.0), 6),
+                "offset": round(float(self.offsets[i] or 0.0), 6),
+                "cursor": round(float(self.cursors[i] or 0.0), 6),
+                "start": None if a is None else round(float(a), 6),
+                "end": None if b is None else round(float(b), 6),
+                "drift": (None if self.drift[i] is None
+                          else round(float(self.drift[i]), 9)),
+            })
+        return out
+
+    def _apply_state(self, data):
+        """把存档写回本窗 → (命中轨数, 总轨数, 说明)。只读文件、按路径匹配。"""
+        if not isinstance(data, dict):
+            return 0, self.n, _("读出来的不是对象（不是本工具导出的 JSON）")
+        if "sync_reference" not in str(data.get("kind", "")):
+            return 0, self.n, _("不是「多流同步参考」的存档")
+        by_path = {}
+        for it in (data.get("tracks") or []):
+            if not isinstance(it, dict):
+                continue
+            p = normalize_path(str(it.get("path", "") or ""))
+            if p:
+                by_path[p] = it
+
+        def _f(v, default=None):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return default
+
+        hit = 0
+        for i, tr in enumerate(self.tracks):
+            it = by_path.get(normalize_path(getattr(tr, "file_path", "") or ""))
+            if it is None:
+                continue
+            hit += 1
+            for key, arr in (("offset", self.offsets), ("cursor", self.cursors),
+                             ("dur", self.durs)):
+                v = _f(it.get(key))
+                if v is not None:
+                    arr[i] = v
+            st = _f(it.get("start"))
+            if st is not None:
+                self._slot(_("起始"))["vals"][i] = st
+            en = _f(it.get("end"))
+            if en is not None:
+                self._slot(_("结尾"))["vals"][i] = en
+            self.drift[i] = _f(it.get("drift"))
+        if hit == 0:
+            return 0, self.n, _("存档里的轨道与当前选中的一条都对不上（按文件路径匹配）")
+        # 参考轨：优先按存档的 ref_path 找（轨道顺序可能变了），否则用存档的 ref_i
+        rp = normalize_path(str(data.get("ref_path", "") or ""))
+        new_ref = None
+        if rp:
+            for i, tr in enumerate(self.tracks):
+                if normalize_path(getattr(tr, "file_path", "") or "") == rp:
+                    new_ref = i
+                    break
+        if new_ref is None:
+            try:
+                ri = int(data.get("ref_i", 0))
+            except (TypeError, ValueError):
+                ri = self.ref_i
+            new_ref = ri if 0 <= ri < self.n else self.ref_i
+        if new_ref != self.ref_i:
+            self.ref_i = new_ref
+            try:
+                self.ref_combo.current(new_ref)
+            except Exception:
+                pass
+            for i, bdg in enumerate(self.badges):
+                bdg.config(text=_("参考") if i == new_ref else _("待对齐"),
+                           foreground="#185FA5" if i == new_ref else "#854F0B")
+        self.offsets[self.ref_i] = 0.0
+        try:
+            self.offset_var.set(_sync_format_time(self.offsets[self.active_i]))
+        except Exception:
+            pass
+        self._reset_view()
+        self._refresh_table()
+        return hit, self.n, ""
+
+    def _autosave_path(self):
+        """上次结果自动存档的位置：配置目录（与预设/settings 同目录）。"""
+        try:
+            d = _resolve_config_dir()
+        except Exception:
+            d = ""
+        return os.path.join(d, "sync_ref_last.json") if d else ""
+
+    def _save_state_to(self, path):
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self._state_dict(), f, ensure_ascii=False, indent=2)
+            return True
+        except Exception as e:
+            self.hint_var.set(f"保存失败：{e}")
+            return False
+
+    def _save_state_as(self):
+        path = filedialog.asksaveasfilename(
+            parent=self, title=_("保存对齐结果"),
+            defaultextension=".json",
+            initialfile=_("同步参考_对齐结果.json"),
+            filetypes=[(_("JSON 文件"), "*.json"), (_("所有文件"), "*.*")])
+        if not path:
+            return
+        if self._save_state_to(path):
+            self.hint_var.set(f"已保存对齐结果：{path}")
+
+    def _load_state_from(self):
+        path = filedialog.askopenfilename(
+            parent=self, title=_("载入对齐结果"),
+            filetypes=[(_("JSON 文件"), "*.json"), (_("所有文件"), "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            self.hint_var.set(f"读取失败：{e}")
+            return
+        hit, total, msg = self._apply_state(data)
+        if hit == 0:
+            self.hint_var.set(_("未载入：") + msg)
+            return
+        when = str(data.get("saved_at", "") or "")
+        tail = f"（存档时间 {when}）" if when else ""
+        if hit < total:
+            self.hint_var.set(
+                f"已载入 {hit}/{total} 条轨道{tail}；其余对不上，需重新对齐。")
+        else:
+            self.hint_var.set(f"已载入对齐结果（{hit} 条轨道）{tail}")
+
+    def _autosave_state(self):
+        p = self._autosave_path()
+        if not p:
+            return
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(self._state_dict(), f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass        # 自动存档失败绝不影响关窗
+
+    def _restore_last(self):
+        """打开窗口时自动恢复上次结果（同一批轨道才恢复；对不上不打扰）。"""
+        p = self._autosave_path()
+        if not p or not os.path.exists(p):
+            return
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+        hit, total, _msg = self._apply_state(data)
+        if hit == 0:
+            return
+        when = str(data.get("saved_at", "") or "")
+        tail = f"（{when}）" if when else ""
+        if hit < total:
+            self.hint_var.set(
+                f"已恢复上次的对齐结果：{hit}/{total} 条轨道对得上{tail}，"
+                f"其余需重新对齐。")
+        else:
+            self.hint_var.set(f"已恢复上次的对齐结果{tail}（不想要就点「清除标记」）。")
+
+    def _apply_topmost(self):
+        """顶部「总在最前」勾选（默认关，见 __init__ 里去掉 transient 的注释）。"""
+        try:
+            self.attributes("-topmost", bool(self._topmost.get()))
+        except Exception:
+            pass
+
+    def _copy_table(self):
+        # 用户 2026-09-13：「复制出来的表格不方便，能不能变成
+        # 基准 · 轨道0 -ss 0.000 -to 77.629 …」——起始/结尾两列合成
+        # `-ss X -to Y` 片段，粘进 trim 窗口或命令行都能直接用。
+        rows = []
+        for r in self._table_rows():
+            rows.append([r[0], f"-ss {r[1]} -to {r[2]}"] + r[3:])
+        txt = "\n".join("\t".join(c) for c in rows)
+        self._copy_text(txt)
+        self.hint_var.set(_("已复制汇总表（每轨含 -ss/-to 片段，可直接粘进 trim 或命令行）"))
+
+    def _on_table_double(self, ev):
+        try:
+            iid = self.tree.identify_row(ev.y)
+            if not iid:
+                return
+            vals = self.tree.item(iid, "values")
+            txt = "\t".join(str(v) for v in vals[1:])
+            self._copy_text(txt)
+            self.hint_var.set(_('已复制：{0}').format(txt))
+        except Exception:
+            pass
+
+    def _frame_cmp_entries(self):
+        """对比窗要的条目：每轨一条 {path, t, caption}（基准轨排第一，与汇总表同序）。
+
+        时刻取**该轨自身时间轴的光标**（与「按光标对齐」同口径：对齐后各轨光标
+        就是同一个事件），并钳进该轨时长内——超尾 ffmpeg 取不到帧，会白跑一趟。
+        """
+        out = []
+        k = 0
+        order = [self.ref_i] + [i for i in range(self.n) if i != self.ref_i]
+        for i in order:
+            t = max(0.0, float(self.cursors[i] or 0.0))
+            d = self.durs[i] or 0.0
+            if d > 0:
+                t = min(t, max(0.0, d - 0.001))
+            disp = self._track_disp(i)
+            if i == self.ref_i:
+                name = _("基准 · %s") % disp
+            else:
+                k += 1
+                name = _("比对%d · %s") % (k, disp)
+            out.append({"path": getattr(self.tracks[i], "file_path", "") or "",
+                        "t": t,
+                        "caption": "%s　%s s" % (name, _sync_format_time(t))})
+        return out
+
+    def _open_frame_compare(self):
+        """打开 / 复用「当前帧对比」窗口（非模态：留着边调光标边刷新）。"""
+        if not self.ff:
+            self.hint_var.set(_("未找到 ffmpeg，无法取帧。"))
+            return
+        win = getattr(self, "_frame_win", None)
+        try:
+            alive = win is not None and win.winfo_exists()
+        except Exception:
+            alive = False
+        if alive:
+            win.refresh()
+            win.lift()
+            return
+        self._frame_win = SyncFrameCompareDialog(
+            self, self.ff, self._frame_cmp_entries,
+            on_close=self._on_frame_win_closed)
+        self.hint_var.set(_("已按各轨当前光标取帧对比（回去挪光标后，"
+                          "点对比窗里的「重新取帧」即可刷新）。"))
+
+    def _on_frame_win_closed(self):
+        self._frame_win = None
+
+    # ---------- 关闭 ----------
+    def _on_close(self):
+        self._stop = True
+        for i in range(self.n):
+            self._stop_play(i)
+        self._autosave_state()       # 关窗前自动存一份（下次打开同批轨道自动恢复）
+        fw = getattr(self, "_frame_win", None)     # 对比窗非模态，关主窗时一并带走
+        if fw is not None:
+            try:
+                fw.destroy()
+            except Exception:
+                pass
+            self._frame_win = None
+        if self._poll_job is not None:
+            try:
+                self.after_cancel(self._poll_job)
+            except Exception:
+                pass
+            self._poll_job = None
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+
+class SyncFrameCompareDialog(tk.Toplevel):
+    """当前帧对比：把各轨当前光标处的画面平铺成网格，肉眼核对「到底对没对上」。
+
+    只读（不写任何轨道数据）。**非模态**：不 grab、不置顶，留着一边在主窗挪光标
+    一边点「重新取帧」。取帧走后台线程 + 主线程轮询回填（线程纪律：worker 绝不碰 Tk）。
+    """
+
+    def __init__(self, parent, ff, get_entries, on_close=None):
+        super().__init__(parent)
+        self.withdraw()
+        self.ff = ff
+        self.get_entries = get_entries      # 回调：每次刷新都重新取各轨最新光标
+        self.on_close = on_close
+        self.title(_("当前帧对比"))
+        # 同样**不用 transient**（2026-09-14）：本窗要能和主窗、同步参考窗自由切换。
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.cells = []          # [(img_label, cap_label)]
+        self.imgs = []           # 持有 PhotoImage 引用，防 GC 后图像变空白
+        self.tile = (96, 54)
+        self._gen = 0
+        self._busy = False
+        self._pending = None     # 线程产物：(shots, entries, gen)
+        self._poll_job = None
+        self.hint_var = tk.StringVar(
+            value=_("各轨当前光标处的画面。对齐对上了，各格就应当是同一个瞬间。"))
+        self._build()
+        self.refresh()
+        self._start_poll()
+
+    # ---------- 构建 ----------
+    def _build(self):
+        main = ttk.Frame(self, padding="8")
+        main.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(main, textvariable=self.hint_var,
+                  foreground="#666666").pack(fill=tk.X)
+        self.grid_frame = ttk.Frame(main)
+        self.grid_frame.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+        btns = ttk.Frame(main)
+        btns.pack(fill=tk.X, pady=(8, 0))
+        self.re_btn = ttk.Button(btns, text=_("重新取帧"), command=self.refresh)
+        self.re_btn.pack(side=tk.LEFT)
+        ToolTip(self.re_btn,
+                _("按各轨**现在**的光标再取一次（窗口不用关）。\n"
+                "流程：回主窗挪光标 / 逐帧微调 → 点这里 → 看画面是否一致。"))
+        self._topmost = tk.BooleanVar(value=False)
+        tm = ttk.Checkbutton(btns, text=_("总在最前"), variable=self._topmost,
+                             command=self._apply_topmost)
+        tm.pack(side=tk.LEFT, padx=(14, 0))
+        ToolTip(tm, _("默认关闭：本窗可以和同步参考窗自由切换（挪光标时不会被挡住）。"))
+        ttk.Button(btns, text=_("关闭"), command=self._close).pack(side=tk.RIGHT)
+
+    def _ensure_grid(self, n):
+        """按轨道数铺格子（轨道数不变则复用旧格，只换图，避免闪烁）。"""
+        if len(self.cells) == n:
+            return
+        for c in list(self.grid_frame.winfo_children()):
+            c.destroy()
+        self.cells = []
+        self.imgs = []
+        cols, _rows, tw, th = _sync_frame_grid(n, self.winfo_screenwidth(),
+                                               self.winfo_screenheight())
+        self.tile = (tw, th)
+        for k in range(n):
+            r, c = divmod(k, cols)
+            cell = ttk.Frame(self.grid_frame)
+            cell.grid(row=r, column=c, padx=3, pady=(0, 2))
+            # 固定尺寸的黑色盒：取帧中占位、取到后居中贴图，窗口尺寸不跳
+            box = tk.Frame(cell, width=tw, height=th, background="#000000")
+            box.pack()
+            box.pack_propagate(False)
+            lab = ttk.Label(box, text=_("取帧中…"), background="#000000",
+                            foreground="#888888")
+            lab.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+            cap = ttk.Label(cell, text="", foreground="#444444", wraplength=max(60, tw))
+            cap.pack(pady=(2, 0))
+            self.cells.append((lab, cap))
+            self.imgs.append(None)
+
+    # ---------- 取帧 ----------
+    def refresh(self):
+        if self._busy:
+            return
+        try:
+            entries = list(self.get_entries() or [])
+        except Exception:
+            entries = []
+        if not entries:
+            self.hint_var.set(_("没有可对比的轨道。"))
+            self.deiconify()
+            return
+        self._busy = True
+        self.re_btn.config(state=tk.DISABLED)
+        self.hint_var.set(_("正在取帧…（共 %d 条轨道）") % len(entries))
+        self._ensure_grid(len(entries))
+        self._gen += 1
+        gen = self._gen
+        ff, tw, th = self.ff, self.tile[0], self.tile[1]
+        self._place()               # 先用占位格把窗口摆好（尺寸已定，取到图不再跳动）
+
+        def worker():
+            shots = []
+            for e in entries:
+                shots.append(_sync_grab_frame(ff, e.get("path", ""),
+                                              e.get("t", 0.0), tw, th))
+                if gen != self._gen:
+                    return        # 已被更新的取帧取代 / 窗口已关
+            self._pending = (shots, entries, gen)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _start_poll(self):
+        """主线程轮询（与 MultiSyncReferenceDialog._poll 同纪律）：线程只写
+        `self._pending`，贴图一律在主线程做。"""
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+        pend = self._pending
+        if pend is not None:
+            self._pending = None
+            self._apply(*pend)
+        try:
+            self._poll_job = self.after(120, self._start_poll)
+        except Exception:
+            self._poll_job = None
+
+    def _apply(self, shots, entries, gen):
+        if gen != self._gen:
+            return
+        self._busy = False
+        try:
+            self.re_btn.config(state=tk.NORMAL)
+        except Exception:
+            pass
+        ok = 0
+        for k, (lab, cap) in enumerate(self.cells):
+            e = entries[k] if k < len(entries) else {}
+            cap.config(text=e.get("caption", ""))
+            data = shots[k] if k < len(shots) else None
+            if data:
+                try:
+                    img = tk.PhotoImage(data=data)
+                    self.imgs[k] = img
+                    lab.config(image=img, text="")
+                    ok += 1
+                    continue
+                except Exception:
+                    pass
+            self.imgs[k] = None
+            lab.config(image="", text=_("取帧失败\n（光标可能超出时长）"),
+                       foreground="#a04040")
+        bad = len(self.cells) - ok
+        self.hint_var.set(
+            _("各轨当前光标处的画面（格下方 = 轨道名 + 该轨自身时刻）：已取 %d 格。") % ok
+            + (_("　⚠ %d 格失败（多为光标超尾 / 无视频流）。") % bad if bad else ""))
+        self._place()
+
+    def _place(self):
+        """按内容重算窗口尺寸并居中（缩放已在 _sync_frame_grid 里卡在屏幕内）。"""
+        self.update_idletasks()
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w = min(max(200, self.winfo_reqwidth()), int(sw * _SYNC_FRAME_SCREEN_W))
+        h = min(max(160, self.winfo_reqheight()), int(sh * _SYNC_FRAME_SCREEN_H))
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 2 - 20)
+        self.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        self.deiconify()
+        self.lift()
+
+    def _apply_topmost(self):
+        try:
+            self.attributes("-topmost", bool(self._topmost.get()))
+        except Exception:
+            pass
+
+    def _close(self):
+        if self._poll_job is not None:
+            try:
+                self.after_cancel(self._poll_job)
+            except Exception:
+                pass
+            self._poll_job = None
+        self._gen += 1              # 作废在跑的取帧线程
+        try:
+            cb = self.on_close
+        except Exception:
+            cb = None
+        if cb is not None:
+            try:
+                cb()
+            except Exception:
+                pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
 
 # ================== 主入口 ==================

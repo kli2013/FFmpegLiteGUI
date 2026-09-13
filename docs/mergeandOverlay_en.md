@@ -247,6 +247,7 @@ Double-click any audio or subtitle track in the list to open its detailed settin
 - **"Preview track (snapshot – PiP composite)"** — render a still of the PiP-composited frame.
 - **"Live preview (PiP, may stutter)"** — mpv real-time composite preview (PiP mode only).
 - **"Create thumbnail"** — generate a contact sheet for the first selected video track (for the main video, simulates the composited / concatenated frame per the current mode).
+- **"Multi-stream sync reference"** — open the multi-track waveform alignment window and export each track's `-ss/-to` trim times (see Chapter 16).
 
 **④ Track order & structure**
 - **"Move up" / "Move down"** — reorder the selected tracks in the list.
@@ -656,3 +657,61 @@ Four working modes: ① Transcode ② Mux ③ PiP ④ Concat. Below, video filte
 - Video & audio creative filters: all four modes are per-track independent.
 - Audio reverse / speed: all four modes are now fully independent — no "audio follows video" fallback remains (Mux dropped "audio reverse falls back to main"; Concat dropped "embedded audio falls back to segment video reverse/speed"). Each audio track's reverse/speed is decided solely by its own audio-track settings.
 - The only remaining "following" is the intentional global: subtitle burn-in, text watermark, and Concat's forced spec normalize. These are meant to be global, not linkage. All three mux-page modes (normal-mux / PiP / serial-concat) support subtitle burn-in with charenc (restored & completed 2026-08-28).
+
+## 16. Multi-stream sync reference (multi-track waveform alignment → trim-time export, 2026-09-13)
+
+Say you have several versions of the same content (different cameras, different recording start points, re-uploads at different quality) and want to cut **exactly the same segment** out of each — trying time codes by hand for every file is painful. **Multi-stream sync reference** solves this: it overlays each track's audio waveform on one shared timeline, aligns them, and computes every track's `-ss/-to` trim times in one pass.
+
+### 1. The window at a glance
+
+- **Entry**: track-list right-click **"Multi-stream sync reference"** (right after "Create thumbnail"). Accepts 2–6 video tracks; each track gets its own waveform lane, stacked vertically, all sharing one timeline (x-axis = reference track time).
+- **Read-only tool**: it only displays and copies times — it **never modifies any track data**. The computed times are for you to use on the Transcode page.
+- **Waveform gain**: each track is auto-normalized to be visible (96th-percentile baseline, shown as "Display gain ×N" on the lane header). On long videos with a large loudness range some sections may still look like a flat line — type a multiplier into the lane header's "Gain ×" box (**press Enter to apply**, leave empty to return to auto), or click "Regenerate waveforms" at the top to re-decode. Gain affects display only, never data.
+- **Per-lane header buttons**: `Play` / `Time preview` / `Sync cursors` / `Set start (all)` / `Set end (all)`. "Align by cursors", "Grab current frame" and "Read back from trim" sit at the bottom of the window; "Copy time" and "Copy table" at the bottom right.
+- **Sync cursors** (2026-09-14, left of "Set start (all)" on every lane): moves **every other track's cursor** to the same moment as this track's current cursor (same offset back-calculation as "Set start (all)") — **cursors only: no anchor written, offsets untouched, drift not recomputed**. Workflow: click the event on this track → "Sync cursors" → check all waveforms land on the same instant → only then click "Set start (all)" to actually mark. Negative times clamp to 0.
+- **Grab current frame** (right of "Align by cursors", 2026-09-14): grabs the frame at **each track's own cursor** and tiles them into a grid for side-by-side comparison — if the alignment is right, every tile should show the same instant. Scaling keeps the original aspect ratio (portrait clips are pillarboxed, never stretched) and the whole window always fits on screen. The window stays open: move cursors and hit "Re-grab" inside it.
+- **Copy time** (left of "Copy table"): copies just the `-ss X -to Y` of the **selected table row** (no track name), ready to paste into a trim window or command line. With nothing selected it falls back to the "current track" row.
+- **Read back from trim**: reads each track's existing trim values (`trim_start`/`trim_end`) into the "Start"/"End" slots and recomputes offsets as "reference start − own start". Last session's result can therefore be recovered straight from the tracks — perfect for continuing where you left off.
+- **Saving alignment state** (2026-09-14): "Save alignment…" / "Load alignment…" on the top row export/import a JSON of offsets, cursors, start-end anchors and the reference track. Closing the window also autosaves to `sync_ref_last.json` in the config folder, and reopening the window with **the same tracks** restores it automatically (matched by file path; partial matches restore what they can and say so). So there is no need to stash the copied table in a scratch file any more.
+- **Not always on top**: the window deliberately does not pin itself over the main window, so you can freely switch to the main window (e.g. to paste times). Tick **"Always on top"** on the top row when you do want it pinned.
+
+### 2. Recommended workflow
+
+#### Step 1: find a landmark, align by cursors
+
+1. On **one waveform**, click "Play" and pick a sonically distinctive moment that also exists in the other tracks (a drum hit, a line of dialogue, a door slam), and park the red cursor on it.
+2. Move to each other waveform, find **the same landmark** — play back and forth as often as needed to confirm — and park its cursor on the same spot.
+3. Once every track's cursor is placed, click **"Align by cursors"** at the bottom: each track shifts by "reference cursor − own cursor", and the waveforms line up in columns.
+
+> Too lazy to click track by track? Use a lane's "Auto-find point": it takes the 0.3 s of audio at the current track's cursor and cross-correlates it against the other tracks (uncertain hits are flagged for review). It still needs a rough alignment first — auto-find only searches within ±5 seconds.
+
+#### Step 2: set the start point (all)
+
+1. Find the track that sits **furthest to the left** (the one with the smallest start time — track 1 in the example below). After alignment all tracks point at the same content; the one with the smallest source time is the start baseline.
+2. Use its very beginning (0 s) as the start; or if the opening should be skipped (say a 6-second intro), open that track's **"Time preview"**, jump past the intro and click **"Set as start"** — the cursor moves to 6 s.
+3. On that track's lane header click **"Set start (all)"**: using that track's cursor as the baseline, a start point is written for **every track** via the already-aligned offsets.
+
+#### Step 3: set the end point (all)
+
+1. Pick the track to serve as the **end reference** (track 2, say), open its "Time preview", find the end time and click **"Set as end"** to move the cursor there.
+2. On that track 2's lane header click **"Set end (all)"**: the end point is likewise written for all tracks.
+
+#### Step 4: copy the table
+
+Click **"Copy table"** to get header-less tab-separated text (one row per track); paste it into a scratch file for the next step:
+
+```
+Base · 123.mp4	-ss 93.815 -to 171.207	77.392	—	—	—
+Cmp1 · 321.mp4	-ss 6.567 -to 83.959	77.392	-87.248	-87.248	+0.000
+Cmp2 · 1234.mp4	-ss 181.141 -to 258.533	77.392	+87.326	+87.326	+0.000
+```
+
+Columns: track name / trim times / segment length / start diff / end diff / drift. Diffs = this track − base (positive = the event happens later on this track); the base row is always "—". Matching segment lengths and 0.000 drift mean the start/end points are clean. (Labels follow the UI language — "基准" in Chinese, "Base" in English.)
+
+#### Step 5: trim each track on the Transcode page
+
+1. Locate the row for each file by name and copy its `-ss 93.815 -to 171.207` field.
+2. Switch to the Transcode page, open that file's **Trim segment** window and click **"Import times"** — it reads `-ss start -to end` from the clipboard and fills the start/end boxes.
+3. Check **"Frame-accurate"** (frame-precise trimming; automatically switches to re-encoding) and start the conversion. Repeat per track.
+
+> Step 5 is currently a manual copy-paste; a future version plans to **write the trim settings automatically**.
