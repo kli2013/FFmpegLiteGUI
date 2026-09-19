@@ -322,6 +322,8 @@ These use a geometric shape or a zoom to switch content.
 
 The mask is a standalone feature (not a toggle on some filter). It applies to the **sub-video** and **text watermark** on the Mux page, making part of the sub-video transparent so the main video (or canvas) shows through. Entry point: on the video-track editor's **"Loop / Chroma"** tab, the **"Mask"** button to the right of the **Transparency** checkbox (spaced `padx=25` from it).
 
+The same **Loop / Chroma** tab also has a per-sub-video **"Audio:"** mode dropdown (Default / Ignore / Mix / Replace) controlling how that sub-video's audio is handled — see §17.
+
 ### 9.1 Open the mask dialog
 - Click **Mask** to open the settings box. **Since 2026-09-11 this is a single delogo-style dialog (list on top, params below)** that can hold several shapes (see §15): top **Enable mask** master switch → shape list (enabled / type / direction / coord summary; click the "enabled" cell to toggle one row) → edit-selected-shape panel (direction radio / X·Y·W·H + 🎯 visual region picker / edge feather / external shape image / time window / trajectory) → Save / Cancel.
 - Coordinate space = the sub-video's **final rendered frame** (after crop→rotate→scale), identical to the dialog's canvas — zero conversion. The old **"📋 Copy coords from crop"** button is gone (replaced by an independent region picker inside the list).
@@ -722,3 +724,50 @@ Cmp2 · 1234.mp4	-ss 181.141 -to 258.533	77.392	+87.326	+87.326	+0.000
 1. Switch to the Transcode page and double-click a track to open its **Trim segment** window — the start/end times are already the values written back in Step 4, and **"Frame-accurate"** has been ticked too (frame-precise trimming; switches to re-encoding).
 2. If you prefer to do it by hand, you can still click **"Import times"** there to read `-ss start -to end` from the clipboard and fill the start/end boxes.
 3. Just start the conversion. Repeat per track.
+---
+
+## 17. Loop/Chroma page sub-video audio mode (Default / Ignore / Mix / Replace, 2026-09-18)
+
+On the Loop / Chroma control tab (the sub-video settings window), an **"Audio:" dropdown** sits to the right of the Transparency / Mask row. It controls **how that one sub-video's own sound is handled** — each sub-video is set independently, with no effect on the others.
+
+### 1. Choosing one of the four modes
+
+| Mode | Effect | When to use |
+|------|--------|-------------|
+| **Default** | The sub-video's sound is kept as an **independent audio track** (exactly the old behaviour). | You just want to overlay the sub-video and keep its sound as its own separate track. |
+| **Ignore** | Drops the sub-video's sound, keeps only the picture. | Silent watermark / silent corner logo — you do not want the sub-video to make any sound. |
+| **Mix** | The sub-video's sound is **mixed into the main audio** instead of becoming a separate track. | You want the sub-video's narration / sound effect to blend naturally into the main audio. |
+| **Replace** | On top of the main audio: **while the sub-video is displayed, the main audio is muted and the sub audio takes over**; once that stretch ends, the main audio returns. | You want to "cover" the main audio while the sub-video is on screen and hear only the sub-video (e.g. inserting a voice-over). |
+
+**The key point — only two of the four are "sound and picture come and go together":**
+
+- **Mix / Replace**: the sound follows this sub-video's **display range** exactly — audible inside the range, muted outside it. The range is the start ~ end of the "display period" on the same page (the loop count decides how long the range is). The picture appears, the sound starts; the picture disappears, the sound stops.
+- **Default**: this one is **keep an independent track** (exactly as before) — the sound **does not follow the display range and is not synchronized with the picture**: it starts at 0 s and, following the sub-video's own looping, runs to the end of the movie. So if the display period does not start at 0, you get "the sound is already playing before the picture appears"; and after the picture is long gone, the sound is still playing. **If you want sound and picture to come and go together, choose Mix or Replace.**
+- **Ignore**: there is no sound at all, so there is no range to speak of.
+
+### 2. How it works with background music (BGM)
+
+If you also enabled "Background music (BGM)" on the main video:
+
+- **Replace**: the main audio is muted inside the display range, but **BGM keeps playing underneath** — during that stretch you hear "the sub-video's sound + BGM", not dead silence. (With BGM off, only the sub-video's sound is heard inside the range.)
+- **Mix**: BGM is layered together with the mixed main + sub audio, still one audio track in the end.
+- **Default / Ignore**: BGM stays under the main audio as usual; in Default mode that sub-video's independent track is an **extra** one and is not folded into the BGM track.
+
+### 3. Things handled automatically
+
+- **The sub-video has no audio track**: Mix / Replace automatically degrade to "Ignore" — no error, and the main audio is not muted.
+- **Several sub-videos using Mix / Replace at once**: each is active during its own display range; overlapping parts simply add up and never "eat" each other. Mix on one and Replace on another behaves the same way: the main audio is muted over the Replace range, and the Mix sub still stacks on top.
+- **The main video itself has no sound**: Mix / Replace use a silent bed, so the output contains only the sub audio (plus BGM if enabled) — no error.
+- **Mismatched sample rate / channels**: everything that joins the mix is normalized to one spec automatically, avoiding clipping or channel misalignment.
+
+### 4. How many audio tracks you get
+
+| Mode chosen for this sub-video | Change in output audio tracks |
+|---|---|
+| **Mix / Replace** | Folded into the main audio track (BGM is in that same track too) — **no extra track** |
+| **Default** | **+1** independent track (one per such sub-video) |
+| **Ignore** | **no extra track** |
+
+### 5. One-sentence summary
+
+**The "Audio" dropdown picks, for this sub-video: while it is on screen, is its sound gone for good (Ignore), its own separate track (Default), blended into the main audio (Mix), or taking over the main audio (Replace)?** For Mix / Replace the range follows the picture — nothing extra to set up.
