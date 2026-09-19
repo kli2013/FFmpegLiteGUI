@@ -567,4 +567,9 @@ split=2[rb…bg][rb…fg];[rb…fg]crop=<外扩>,<滤镜>,<裁回>[rb…bl];[rb�
 ### 快速平铺
 <video src="https://github.com/user-attachments/assets/d4321056-ec49-4e90-a4b4-b26ef27997d2" controls width="100%"></video>
 
+### 倒计时类水印
+
+<video src="https://github.com/user-attachments/assets/579bcace-3954-4838-a3ff-d27a0e612d52" controls width="100%"></video>
+
+
 
