@@ -11,6 +11,7 @@ import re
 import collections
 import copy
 import queue
+import random
 import json
 import sys
 import shutil
@@ -122,6 +123,31 @@ def _kill_proc_tree(pid):
             os.kill(pid, 9)
     except Exception:
         pass
+
+# 预览播放器进程登记表（mpv/ffplay，含音频引擎、轨列表播放、分段预览）：
+# 关闭程序时统一杀掉，避免孤儿 ffplay 残留（用户报「关闭程序 ffplay 预览进程残留一堆」）。
+# 只登记本程序自己 spawn 的播放器，绝不按进程名全量杀（用户可能另开着独立播放器）。
+_PREVIEW_PROCS = []
+
+
+def _register_preview_proc(p):
+    """登记一个预览播放器进程；顺带清掉已自然退出的旧条目。"""
+    try:
+        _PREVIEW_PROCS[:] = [q for q in _PREVIEW_PROCS if q.poll() is None]
+    except Exception:
+        pass
+    _PREVIEW_PROCS.append(p)
+
+
+def _kill_all_preview_procs():
+    """关闭程序时杀掉全部登记的预览播放器（已退出的跳过，静默忽略一切异常）。"""
+    for q in list(_PREVIEW_PROCS):
+        try:
+            if q.poll() is None:
+                q.terminate()
+        except Exception:
+            pass
+    _PREVIEW_PROCS[:] = []
 
 # 日志文本框行数上限（超出删前 1/4，控制内存与控件体积，根治长任务滚爆）
 # detail=转换进程信息（ffmpeg stderr 逐行；实测统计行约 2 行/秒 → 10000 行≈80 分钟编码）
@@ -292,6 +318,9 @@ def center_window(win: tk.Toplevel, width: int, height: int, offset_y: int = 0):
     """
     在屏幕中央显示窗口（忽略父窗口），避免闪烁。
     前提：窗口创建后已调用 withdraw()，此处只负责定位和显示。
+
+    ⚠️ width/height 是**客户区**尺寸（Tk geometry 语义）—— 屏幕占位还要加 WM 外壳
+    （标题栏 + 边框），见 WIN_SHELL_W / WIN_SHELL_H。
     """
     # 只更新布局（idle tasks），不重入事件循环；几何信息由传入的 width/height 决定，
     # 无需 win.update()（重入会打断自身回调 / 窗口销毁后触发 TclError）。
@@ -309,6 +338,17 @@ def center_window(win: tk.Toplevel, width: int, height: int, offset_y: int = 0):
     win.lift()
     win.focus_force()
     win.update_idletasks()
+
+
+# 快照/拼图窗口的「WM 外壳」估计值（像素）= Windows 标题栏 + 左右/下边框。
+# 为什么需要：center_window 设的是**客户区**尺寸，屏幕上的实际占位 = 客户区 + 外壳。
+# 所有「窗口放不放得下屏幕」的判断（_snapshot_display_box 的 reserve、_place_image_window
+# 的底边钳制）都必须用它换算，否则会少算约 36px 高 —— 底部的状态文字正好掉进任务栏
+# （2026-09-26 用户实测：快照窗下面那行字被任务栏吃掉）。
+WIN_SHELL_W = 16
+WIN_SHELL_H = 36
+# 快照/拼图窗口客户区里除图片以外的固定开销：图片 Label 上下边距 12 + 状态栏约 24 + 下边距 6。
+WIN_CLIENT_OVERHEAD_H = 42
 
 
 # 八向「飞入/飞出」预设方向（2026-09-12 抽为模块级常量；同日改为 canonical 英文）。
@@ -352,6 +392,17 @@ def corner_dir_display_map():
     }
 
 
+def _canon_disp_list(canon_ids, disp_map):
+    """canonical id 序列 → 下拉显示名列表；缺映射回落 id 本身（英文）。
+
+    disp_map 传 dict 或「返回 dict 的函数」：i18n 场景必须传函数——multi 的 _()
+    依赖启动后装载的 TRANS，模块级常量会冻在导入时的中文上
+    （corner_dir_display_map / _traj_mode_display_map 同一铁律）。
+    """
+    m = disp_map() if callable(disp_map) else disp_map
+    return [m.get(k, k) for k in canon_ids]
+
+
 def corner_dir_choices(dirs=None, minimum=6):
     """八向预设 → (下拉显示名列表, 建议 combobox 宽度)。
 
@@ -359,8 +410,7 @@ def corner_dir_choices(dirs=None, minimum=6):
     宽度按显示名实宽估算（CJK 记 2），保证中/英两种语言下都不被截断。
     """
     src = CORNER_DIR_PRESETS if dirs is None else dirs
-    _disp = corner_dir_display_map()
-    names = [_disp.get(d[0], d[0]) for d in src]
+    names = _canon_disp_list([d[0] for d in src], corner_dir_display_map)
     _w = max((sum(2 if ord(ch) > 127 else 1 for ch in s) for s in names), default=0)
     return names, max(minimum, _w)
 
@@ -474,6 +524,10 @@ RK_PAD_WIDE = 20
 #    2026-09-12 实踩：把「默认摆放」绑到 PAD 上 → 遮罩窗口（带起始/结尾、PAD=20）
 #    重置跑到 (-20,-20)；PAD 还会随「窗口是否带起始/结尾」浮动，摆放位置跟着乱变。
 RK_PLACE_INSET = 10
+# 2026-09-24：水印/子视频默认位置表达式（右下角内缩 10 个内容像素）。
+# 原先在 50+ 处硬编码，抽成常量做单一真相源，改默认只需改这里。
+DEFAULT_OVERLAY_X = "W-w-10"
+DEFAULT_OVERLAY_Y = "H-h-10"
 # 2026-09-12：「起始 / 结尾」双端窗口里【非活动端幽灵框】的描边/填充/标签颜色。
 # 为什么不用活动端同一个 rect_color：原先两端都是红色，只靠线宽 1/2 + 点密度
 # stipple gray25/gray50 区分——1px 线宽下肉眼几乎分不出哪端正在被编辑，两端靠拢
@@ -692,6 +746,19 @@ def _fmt_sec6(sec):
     return "%.6f" % v
 
 
+def _hms_split(sec):
+    """秒 → (时, 分, 秒浮点)；非法/负值一律钳为 0（各时间显示函数共用的分解步）。
+
+    只服务「看」的格式化；要写回/进命令的真值请直接用 float/_ffsec，不要经这里。
+    """
+    try:
+        s = float(sec)
+    except (TypeError, ValueError):
+        s = 0.0
+    s = max(0.0, s)
+    return int(s // 3600), int((s % 3600) // 60), s % 60
+
+
 def seconds_to_time(sec, short=True):
     """
     秒数转时间字符串。
@@ -700,10 +767,7 @@ def seconds_to_time(sec, short=True):
     """
     if sec is None:
         return ""
-    sec = float(sec)
-    h = int(sec // 3600)
-    m = int((sec % 3600) // 60)
-    s = sec % 60
+    h, m, s = _hms_split(sec)
     if short:
         if h > 0:
             return f"{h:01d}:{m:02d}:{s:09.6f}"
@@ -722,10 +786,7 @@ def _fmt_window_time(sec):
     与子视频 enable 表达式同源。该信息仅非主视频的视频轨有意义（主视频始终铺满）。"""
     if sec is None:
         return None
-    sec = float(sec)
-    h = int(sec // 3600)
-    m = int((sec % 3600) // 60)
-    s = sec % 60
+    h, m, s = _hms_split(sec)
     if h > 0:
         return f"{h}:{m:02d}:{s:05.2f}"
     return f"{m:02d}:{s:05.2f}"
@@ -744,6 +805,51 @@ def _is_static_image_file(path):
     if not path:
         return False
     return os.path.splitext(str(path))[1].lower() in _STATIC_IMAGE_EXTS
+
+
+# ----- 媒体类浏览窗口文件类型统一口径（2026-09-22）-----
+# 媒体 = 视频 + 图片，之下细分 视频 / 图片（用户诉求：全包括的媒体下再分视频、图片，
+# 选起来更快）。此前各浏览窗口各自手写，出现过两类问题：①串联「添加外部视频」只列
+# 视频、图片选不到；②「替换素材」把图片塞进「视频文件」项（分类错）。
+# 视频集合 = 程序实际支持的容器（与拖拽分类 video_exts 一致）；
+# 图片集合 = 程序实际按图片轨处理的集合（与拖拽分类 img_exts 一致，不含 tif/tiff）。
+_MEDIA_VIDEO_PATTERN = "*.mp4 *.mkv *.avi *.mov *.flv *.webm *.ts"
+# 「素材分类用」图片集合：添加轨道 / 浏览窗口 filter 的判定，含 gif。
+# ⚠️ 与上面的 _STATIC_IMAGE_EXTS 不是一回事，两者不能混用：
+#   _STATIC_IMAGE_EXTS = 可视化抽帧判定（刻意排除动画 gif：gif 多帧可 seek，抽帧不该跳过 seek）
+#   _MEDIA_IMAGE_EXTS  = 素材归类判定（拖拽 / 添加轨道 / filetypes，"gif 是图片"符合用户直觉）
+# 2026-09-22 审计：两者曾被混用 → 同一个 .gif，拖拽 / 画中画建成 image2 图片轨，
+#   而用「添加外部视频(串联)」按钮选进去却建成 gif 视频轨（回执也写成"视频"）
+#   → 同一文件两种添加方式的轨道标记与回执不一致。现统一走本常量。
+#   ⚠️ 命令构建层（40+ 处）仍统一走 _is_static_image：gif 有自身时长、按视频处理，此处不改。
+_MEDIA_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
+_MEDIA_IMAGE_PATTERN = " ".join("*" + e for e in _MEDIA_IMAGE_EXTS)
+_MEDIA_AUDIO_PATTERN = "*.mp3 *.aac *.m4a *.wav *.flac *.ogg *.opus *.ac3 *.dts *.mka"
+_MEDIA_SUBTITLE_PATTERN = "*.srt *.ass *.ssa *.vtt *.idx *.sup"
+
+
+def media_filetypes(include_audio=False, include_subtitle=False, all_files=True):
+    """媒体类浏览窗口的统一 filetypes：媒体文件(全) → 视频 → 图片 [→ 音频 → 字幕] → 所有文件。
+
+    :param include_audio:    该窗口也接受音频（替换素材 / 流提取页等）
+    :param include_subtitle: 该窗口也接受字幕
+    :param all_files:        末尾是否附「所有文件 *.*」（默认附，避免特殊格式被过滤挡住）
+    """
+    _all = _MEDIA_VIDEO_PATTERN + " " + _MEDIA_IMAGE_PATTERN
+    if include_audio:
+        _all += " " + _MEDIA_AUDIO_PATTERN
+    if include_subtitle:
+        _all += " " + _MEDIA_SUBTITLE_PATTERN
+    types = [(_("媒体文件"), _all),
+             (_("视频文件"), _MEDIA_VIDEO_PATTERN),
+             (_("图片文件"), _MEDIA_IMAGE_PATTERN)]
+    if include_audio:
+        types.append((_("音频文件"), _MEDIA_AUDIO_PATTERN))
+    if include_subtitle:
+        types.append((_("字幕文件"), _MEDIA_SUBTITLE_PATTERN))
+    if all_files:
+        types.append((_("所有文件"), "*.*"))
+    return types
 
 
 def _blend_colors(hexes):
@@ -1272,7 +1378,51 @@ def _main_bg_pre_filter(settings):
     return ",".join(parts) if parts else None
 
 
-def _resolve_editor_bg(app, ctx_file=None, ctx_settings=None):
+def _page_main_video(app, page):
+    """按页面取该页自己的主视频：返回 (文件, 设置) 或 (None, None)。
+
+    2026-09-23：转换页与封装页【禁止互相兜底】——本页没有主视频就是纯黑背景帧，
+    绝不能用另一页的主视频抽帧（用户实测：转换页文字水印位置编辑器空输入时却显示
+    封装页主视频的画面帧）。page 语义：
+      'convert' → 转换页输入文件 app.input_file（设置=get_current_settings()）；
+      'merge'   → 封装页「主视频」框 merge_video → 首个启用视频轨
+                  （设置=该轨 enc_settings，保证与文件同源）；
+      None      → (None, None)。"""
+    if app is None or not page:
+        return None, None
+    f = s = None
+    try:
+        if page == "convert":
+            if getattr(app, "input_file", None):
+                p = app.input_file.get().strip()
+                if p and os.path.exists(p):
+                    f = p
+                    if hasattr(app, "get_current_settings"):
+                        s = app.get_current_settings()
+        elif page == "merge":
+            _tracks = [t for t in (getattr(app, "merge_tracks", None) or [])
+                       if getattr(t, "enabled", False) and getattr(t, "type", "") == "video"]
+            if getattr(app, "merge_video", None):
+                p = app.merge_video.get().strip()
+                if p and os.path.exists(p):
+                    f = p
+                    # 设置必须与文件同源：主视频框通常就是首轨文件，同名优先，否则退回首轨
+                    for _t in _tracks:
+                        if _t.file_path and os.path.abspath(_t.file_path) == os.path.abspath(p):
+                            s = _t.enc_settings
+                            break
+                    if s is None and _tracks:
+                        s = _tracks[0].enc_settings
+            if f is None and _tracks:
+                if _tracks[0].file_path and os.path.exists(_tracks[0].file_path):
+                    f = _tracks[0].file_path
+                    s = _tracks[0].enc_settings
+    except Exception:
+        pass
+    return f, s
+
+
+def _resolve_editor_bg(app, ctx_file=None, ctx_settings=None, scope=None):
     """位置编辑器背景帧统一解析：返回 (主视频文件, 主视频设置) 或 (None, None)（纯黑）。
 
     背景帧必须来自「被编辑对象所属语境」的主视频，且文件与设置必须同源（crop/rotate/
@@ -1280,9 +1430,11 @@ def _resolve_editor_bg(app, ctx_file=None, ctx_settings=None):
     封装页/队列语境下那是转换页全局设置 = 错源（2026-09-03 问题②③④统一修复，
     替代此前 3-4 份互相矛盾的手写兜底链）。优先级：
     1. ctx_file/ctx_settings：调用方显式语境（队列=task.input+task.settings、
-       封装 merge 主轨=file_path+enc_settings、转换页注入封装=merge 主轨）；
-    2. 转换页主界面 app.input_file + get_current_settings()；
-    3. 封装页全局 merge_video → 主轨 file_path+enc_settings（仅防御调用方漏传）。"""
+       封装页=主轨 file_path+enc_settings）；
+    2. 按 scope 只在本页内兜底（2026-09-23）：scope='convert' → 转换页 input_file；
+       scope='merge' → 封装页主视频。⚠️ 两页绝不互相兜底——本页没主视频就是纯黑，
+       不再出现「转换页空输入却显示封装页画面帧」。scope=None（旧调用点未标注语境）
+       → 依次 convert → merge。"""
     f, s = None, None
     if ctx_file:
         try:
@@ -1294,32 +1446,19 @@ def _resolve_editor_bg(app, ctx_file=None, ctx_settings=None):
             pass
     if f is None and app is not None:
         try:
-            if getattr(app, "input_file", None):
-                p = app.input_file.get().strip()
-                if p and os.path.exists(p):
-                    f = p
-                    if s is None and hasattr(app, "get_current_settings"):
-                        s = app.get_current_settings()
+            for _pg in ((scope,) if scope else ("convert", "merge")):
+                _pf, _ps = _page_main_video(app, _pg)
+                if _pf:
+                    f = _pf
+                    if s is None:
+                        s = _ps
+                    break
         except Exception:
             pass
-    if f is None and app is not None:
-        try:
-            if getattr(app, "merge_video", None):
-                p = app.merge_video.get().strip()
-                if p and os.path.exists(p):
-                    f = p
-        except Exception:
-            pass
-    if f is None and app is not None and getattr(app, "merge_tracks", None):
-        try:
-            mt = next((t for t in app.merge_tracks if t.enabled and t.type == "video"), None)
-            if mt is not None and mt.file_path and os.path.exists(mt.file_path):
-                f = mt.file_path
-                if s is None:
-                    s = mt.enc_settings
-        except Exception:
-            pass
-    if s is None and app is not None:
+    # 设置仍缺 → 退回转换页全局设置。2026-09-23：封装页语境（scope='merge'）绝不用转换页
+    # 设置兜底（背景帧预处理 crop/rotate 会与画布不同源）；本页无主视频（f=None）直接
+    # 返回 (None, None) = 纯黑，设置也无需再凑。
+    if s is None and f is not None and scope != "merge" and app is not None:
         try:
             if hasattr(app, "get_current_settings"):
                 _gs = app.get_current_settings()
@@ -1757,10 +1896,63 @@ def build_move_xy_expr(mode, x0, y0, move_settings=None, sw="w", sh="h"):
 # 首个 end_action != keep 的段 = 独立终止点（该段之后的段全部失效）。
 
 def _wp_num(w, key, default=0.0):
+    # ⚠️ 不能用 `w.get(key, default) or default`：0.0 是合法值（如透明度 oa/ob=0
+    # 表示完全隐形、scale=0 经 _za/_zb 钳制为 0.01），0.0 的 falsy 会让
+    # `0.0 or default` 错误地回退到 default。必须区分「缺键」与「值为 0」。
+    v = w.get(key, None)
+    if v is None:
+        return default
     try:
-        return float(w.get(key, default) or default)
+        return float(v)
     except (ValueError, TypeError):
         return default
+
+
+def _opt_float(v, default=None):
+    """宽容地把 UI 字符串/数值转 float：None/空串/非法 → default，绝不抛异常。
+
+    唯一口径（2026-09-22 抽取）：取代散落各处的局部 _f/_to_f/_num/_aseg_float/
+    _parse_ffmeta_num 同构体。dict 取数值字段请用 _seg_num / _wp_num（注意 0 是合法值，
+    不能用 `x or d` 语义的口径混淆「缺键」与「值为 0」）。
+    """
+    if v is None:
+        return default
+    if isinstance(v, str):
+        v = v.strip()
+        if v == "":
+            return default
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def loudnorm_i_norm(raw, default=-23):
+    """响度标准化目标值（loudnorm I）防呆解析 → (ok, int)。
+
+    防呆口径（2026-09-26 用户要求，开放「标准」编辑框后配套）：
+    · 空 / 非数字 → (False, default)（调用方负责日志提示）
+    · 正数按负值处理：输入 16 = 目标 -16（响度目标恒为负，用户常省负号）
+    · clamp 到 loudnorm 合法域 [-70, -5]（ffmpeg 对 I 的参数范围）
+    """
+    v = _opt_float(raw, None)
+    if v is None:
+        return False, default
+    if v > 0:
+        v = -v
+    if v < -70:
+        v = -70
+    elif v > -5:
+        v = -5
+    return True, int(v)
+
+
+def _seg_num(s, k, d=0.0):
+    """段 dict 安全取数值字段：缺键/非法 → d（照抄原局部实现，含 0 or d 行为）。"""
+    try:
+        return float(s.get(k, d) or d)
+    except (ValueError, TypeError):
+        return d
 
 
 # 2026-09-10：遮罩轨迹画布尺寸的【兜底值】。
@@ -1774,7 +1966,7 @@ MASK_TRAJ_CANVAS_H = 720
 
 def build_waypoint_expr(waypoints, sw="w", sh="h", spin_speed=60.0,
                         trim_start=0.0, speed_factor=1.0):
-    """列表轨迹 → (x_expr, y_expr, spin_angle_expr, zoom_expr) 或 (None, None, None, None)。
+    """列表轨迹 → (x_expr, y_expr, spin_angle_expr, zoom_expr, alpha_expr) 或 (None, None, None, None, None)。
 
     - x/y：扁平累加（每段 gte/lt 选择互斥无空档），隐藏段/显示前/消失后 x=-100000 移出画面；
       插值天然在段内两端点之间，无需全局 clamp。
@@ -1791,9 +1983,9 @@ def build_waypoint_expr(waypoints, sw="w", sh="h", spin_speed=60.0,
     """
     wps = [w for w in (waypoints or []) if isinstance(w, dict)]
     if not wps:
-        # ⚠️ 必须是 4 元组：调用方普遍取 [3]（缩放倍率），返回 3 元组会在
+        # ⚠️ 必须是 5 元组：调用方普遍取 [3]（缩放倍率）/[4]（透明度），返回 3 元组会在
         # move_mode=="waypoints" 但列表为空时抛 IndexError（2026-09-17 修）。
-        return None, None, None, None
+        return None, None, None, None, None
     # ---- 段时间换算（原始 → 输出时间线，统一入口 _timeline_convert）----
     _ts = float(trim_start or 0.0)
     try:
@@ -1831,7 +2023,7 @@ def build_waypoint_expr(waypoints, sw="w", sh="h", spin_speed=60.0,
         if _ez <= 0:
             _ez = 0.01
         _ez_ret = f"{_ez:g}" if abs(_ez - 1.0) > 1e-9 else None
-        return f"{_ex:g}", f"{_ey:g}", None, _ez_ret
+        return f"{_ex:g}", f"{_ey:g}", None, _ez_ret, None
     # ---- 独立终止点（首个 end_action != keep 的段） ----
     cut = None                # (t_cut, "hide"|"freeze", xb, yb, rb, sb)
     for s in segs:
@@ -1842,7 +2034,7 @@ def build_waypoint_expr(waypoints, sw="w", sh="h", spin_speed=60.0,
             if _d0 <= 0:
                 _d0 = 1.0
             cut = (_t0 + _d0, ea, _wp_num(s, "xb"), _wp_num(s, "yb"),
-                   _wp_num(s, "rb", 0.0), _wp_num(s, "sb", 1.0))
+                   _wp_num(s, "rb", 0.0), _wp_num(s, "sb", 1.0), _wp_num(s, "ob", 1.0))
             break
     # ---- 截断后的有效段 ----
     valid = []
@@ -1851,7 +2043,7 @@ def build_waypoint_expr(waypoints, sw="w", sh="h", spin_speed=60.0,
             break
         valid.append(s)
     if not valid:
-        return None, None, None, None
+        return None, None, None, None, None
     # t_end = 最后有效段结束
     _l0 = _wp_num(valid[-1], "start")
     _ld = _wp_num(valid[-1], "dur", 1.0)
@@ -1882,7 +2074,7 @@ def build_waypoint_expr(waypoints, sw="w", sh="h", spin_speed=60.0,
             pys.append(f"{sel}*({ya:g}+({yb - ya:g})*(t-{t0:g})/{d0:g})")
     # ---- 尾部处置（cut 优先；无 cut 时：终点行 / 末段消失 / 停在末段 B） ----
     if cut is not None:
-        t_cut, _ea, _fx, _fy, _frb, _fz = cut
+        t_cut, _ea, _fx, _fy, _frb, _fz, _fob = cut
         if _ea == "freeze":
             pxs.append(f"gte(t,{t_cut:g})*{_fx:g}")
             pys.append(f"gte(t,{t_cut:g})*{_fy:g}")
@@ -1991,6 +2183,42 @@ def build_waypoint_expr(waypoints, sw="w", sh="h", spin_speed=60.0,
         # 兜底钳制：任何空档/异常都不允许倍率=0（scale w=0 会直接报错）
         zoom_expr = "max(0.01," + "+".join(zparts) + ")"
 
+    # 透明度分段 alpha（2026-09-22 照抄 zoom 范式）：每段 oa→ob 线性插值（默认 1.0）。
+    # 全部航点都是 1.0 时返回 None（调用方不挂 alpha 滤镜，老工程行为完全不变）。
+    # 钳制 max(0,…) 而非 max(0.01,…) —— 0 透明度是合法语义（完全隐形）。
+    def _oa(w):
+        return _wp_num(w, "oa", 1.0)
+    def _ob(w):
+        return _wp_num(w, "ob", 1.0)
+    alpha_expr = None
+    _alpha_any = any((abs(_oa(s) - 1.0) > 1e-9 or abs(_ob(s) - 1.0) > 1e-9) for s in valid)
+    if end is not None and abs(_oa(end) - 1.0) > 1e-9:
+        _alpha_any = True
+    if _alpha_any:
+        alparts = []
+        alparts.append(f"lt(t,{_t_first:g})*{_oa(valid[0]):g}")
+        for s in valid:
+            _t0 = _wp_num(s, "start")
+            _d0 = _wp_num(s, "dur", 1.0)
+            if _d0 <= 0:
+                _d0 = 1.0
+            _t1 = _t0 + _d0
+            _a, _b = _oa(s), _ob(s)
+            _sel = f"gte(t,{_t0:g})*lt(t,{_t1:g})"
+            if abs(_b - _a) > 1e-9:
+                alparts.append(f"{_sel}*({_a:g}+({_b - _a:g})*(t-{_t0:g})/{_d0:g})")
+            else:
+                alparts.append(f"{_sel}*({_a:g})")
+        # 尾部：cut 优先（freeze 停在 ob；hide 已移出画面，透明度表达式照挂同样无副作用）；
+        # 否则 终点行 oa → 末段 ob
+        if cut is not None:
+            alparts.append(f"gte(t,{cut[0]:g})*{_fob:g}")
+        elif end is not None:
+            alparts.append(f"gte(t,{t_end:g})*{_oa(end):g}")
+        else:
+            alparts.append(f"gte(t,{t_end:g})*{_ob(valid[-1]):g}")
+        alpha_expr = "max(0," + "+".join(alparts) + ")"
+
     # 自旋转分段 angle（多段角度连续累计；freeze/保持后末段为自旋转则继续转）
     try:
         spd = float(spin_speed)
@@ -2026,7 +2254,7 @@ def build_waypoint_expr(waypoints, sw="w", sh="h", spin_speed=60.0,
         angle_expr = spin_angle
     else:
         angle_expr = None
-    return x_expr, y_expr, angle_expr, zoom_expr
+    return x_expr, y_expr, angle_expr, zoom_expr, alpha_expr
 
 
 # 轨迹「移动方式 / 缓动」统一下拉（2026-09-13 重构：缓动折进方式，所有轨迹窗口共用）。
@@ -2068,8 +2296,7 @@ def _traj_mode_display_map():
 
 def _traj_mode_choices():
     """→ 与 _TRAJ_MODE_ORDER 同序的下拉显示名列表（combobox values）。"""
-    _disp = _traj_mode_display_map()
-    return [_disp.get(k, k) for k in _TRAJ_MODE_ORDER]
+    return _canon_disp_list(_TRAJ_MODE_ORDER, _traj_mode_display_map)
 
 
 def _seg_move_mode(w):
@@ -2170,7 +2397,7 @@ def _bezier_y_at_x(x, p1x, p1y, p2x, p2y, eps=1e-6, max_iter=8):
     if x >= 1.0:
         return 1.0
     t = x
-    for _ in range(max_iter):
+    for _unused in range(max_iter):
         bx = 3 * (1 - t) ** 2 * t * p1x + 3 * (1 - t) * t ** 2 * p2x + t ** 3 - x
         if abs(bx) < eps:
             break
@@ -2183,7 +2410,7 @@ def _bezier_y_at_x(x, p1x, p1y, p2x, p2y, eps=1e-6, max_iter=8):
         elif t > 1.0:
             t = 1.0
     lo, hi = 0.0, 1.0
-    for _ in range(20):
+    for _unused in range(20):
         mt = (lo + hi) / 2.0
         bx = 3 * (1 - mt) ** 2 * mt * p1x + 3 * (1 - mt) * mt ** 2 * p2x + mt ** 3
         if abs(bx - x) < eps:
@@ -2348,11 +2575,7 @@ def build_canvas_filtergraph(settings, W, H, trim_start=0.0, speed_factor=1.0,
     segs = [dict(s) for s in segs]
     segs.sort(key=lambda s: float(s.get("start", 0) or 0))
 
-    def _num(s, k, d=0.0):
-        try:
-            return float(s.get(k, d) or d)
-        except (ValueError, TypeError):
-            return d
+    _num = _seg_num  # 段 dict 安全取数值（2026-09-22 抽公共，原局部实现逐字上移）
 
     def _st_dur(seg):
         return _timeline_convert(seg.get("start", 0), seg.get("dur", 0), ts, sp)
@@ -2547,7 +2770,7 @@ def _log_time_order_warn(app, where=""):
         _w = str(where or "").strip()
         if app is not None and hasattr(app, "_append_info_ui"):
             app._append_info_ui(
-                f"[时间] {_w}结束时间须晚于开始时间（已保留输入，未写入）")
+                _('[时间] {0}结束时间须晚于开始时间（已保留输入，未写入）').format(_w))
     except Exception:
         pass
     return False
@@ -2659,7 +2882,7 @@ def _attach_state_clipboard_menu(tree, *, edit_row, get_state, apply_state, can_
 
 def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
                      grab_win=None, video_file=None, ffmpeg_cmd=None, ffprobe_cmd=None,
-                     app=None, allow_angle=True, allow_empty=False):
+                     app=None, allow_angle=True, allow_empty=False, consume_alpha=True):
     """列表轨迹面板（2026-08-27 内嵌版，替代原独立弹窗 _waypoints_dialog）。
 
     host: 承载面板的父 frame；waypoints: list[dict]，面板内直接修改（引用传递）。
@@ -2701,28 +2924,34 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
     frm.grid_rowconfigure(0, weight=1)
 
     # ---- 列表 ----
-    cols = ("idx", "start", "mode", "end", "btime", "dur", "ea", "ra", "rb", "za", "zb")
-    headers = (_("行"), _("起始坐标"), _("移动方式"), _("结尾坐标"), _("开始时间"), _("结束时间"), _("到期行为"), _("起始角度"), _("结尾角度"), _("起始缩放"), _("结尾缩放"))
-    widths = (34, 130, 70, 130, 62, 62, 62, 54, 54, 54, 54)
-    # allow_angle=False（遮罩）：displaycolumns 裁掉角度/缩放四列——列定义保留（values
-    # 仍按 cols 存 11 项），只是不显示；行数据写入逻辑零改动。
+    cols = ("idx", "start", "mode", "end", "btime", "dur", "ea", "ra", "rb", "za", "zb", "oa", "ob")
+    headers = (_("行"), _("起始坐标"), _("移动方式"), _("结尾坐标"), _("开始时间"), _("结束时间"), _("到期行为"), _("起始角度"), _("结尾角度"), _("起始缩放"), _("结尾缩放"), _("起始透明度"), _("结尾透明度"))
+    widths = (34, 130, 70, 130, 62, 62, 62, 54, 54, 54, 54, 58, 58)
+    # allow_angle=False（遮罩）：displaycolumns 裁掉角度/缩放四列；consume_alpha=False（遮罩）
+    # 再裁掉透明度两列——列定义保留（values 仍按 cols 存 13 项），只是不显示；行数据写入逻辑零改动。
     if allow_angle:
         _disp_cols = cols
     else:
         _disp_cols = tuple(c for c in cols if c not in ("ra", "rb", "za", "zb"))
+    if not consume_alpha:
+        _disp_cols = tuple(c for c in _disp_cols if c not in ("oa", "ob"))
     tree = ttk.Treeview(frm, columns=cols, show="headings", height=6,
                         displaycolumns=_disp_cols)
     for c, h, wdt in zip(cols, headers, widths):
         tree.heading(c, text=h)
-        # 弹性列：角度/缩放列在位时给 rb/zb；被 displaycolumns 裁掉时切给末列 ea，
-        # 避免窗口拉宽右侧留白。
-        _stretch = (c in ("rb", "zb")) if allow_angle else (c == "ea")
+        # 弹性列：透明度末列(ob, 显示时) / 角度缩放列(rb,zb) / 遮罩末列(ea) 之一 stretch，
+        # 避免窗口拉宽右侧留白；其余列固定宽（含新加的 oa/ob）。
+        _stretch = ((c == "ob" and consume_alpha)
+                    or (c in ("rb", "zb") and allow_angle)
+                    or (c == "ea" and not allow_angle))
         tree.column(c, width=wdt, anchor=tk.CENTER if c != "start" and c != "end" else tk.W,
                     stretch=_stretch)
     vsb = ttk.Scrollbar(frm, orient=tk.VERTICAL, command=tree.yview)
-    tree.configure(yscrollcommand=vsb.set)
+    hsb = ttk.Scrollbar(frm, orient=tk.HORIZONTAL, command=tree.xview)
+    tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
     tree.grid(row=0, column=0, columnspan=5, sticky="nsew")
     vsb.grid(row=0, column=5, sticky="ns")
+    hsb.grid(row=1, column=0, columnspan=5, sticky="ew")
 
     def _blank_click(ev):
         # 点列表空白取消选中（ttk Treeview 默认点空白保持原选中），
@@ -2751,7 +2980,11 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
         _rb = f"{_wp_num(w, 'rb', 0):g}"
         _za = f"{_wp_num(w, 'sa', 1.0):g}"
         _zb = "" if is_end else f"{_wp_num(w, 'sb', 1.0):g}"
-        return (i + 1, sta, mode, endc, btm, dur, ea, _ra, _rb, _za, _zb)
+        # 透明度：终点行只持有「起始透明度」(oa) 作为尾部保持值，结尾透明度(ob)无意义 → 留空
+        # （与缩放 rb/zb 处理一致）；非终点行显示 oa→ob 两列（段内线性插值）。
+        _oa = f"{_wp_num(w, 'oa', 1.0):g}"
+        _ob = "" if is_end else f"{_wp_num(w, 'ob', 1.0):g}"
+        return (i + 1, sta, mode, endc, btm, dur, ea, _ra, _rb, _za, _zb, _oa, _ob)
 
     def _refresh(select_idx="__keep__"):
         """刷新列表；select_idx 指定选中行；默认保持当前选中（操作后不丢行）。"""
@@ -2827,7 +3060,7 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
             edit_cb(row_idx, which, cx, cy, _cur_angle, _apply_xy, _apply_angle,
                     _t0, active_flag=_active, w=w)
         except Exception as e:
-            messagebox.showerror(_("错误"), _("无法打开可视化编辑器：{0}").format(e))
+            messagebox.showerror(_("错误"), _('无法打开可视化编辑器：{0}').format(e))
 
     # ---- 行操作按钮 ----
     btns = ttk.Frame(frm)
@@ -2835,15 +3068,27 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
     def _add_row():
         n = len(waypoints)
         if n >= MAX_ROWS:
-            messagebox.showinfo(_("提示"), _("最多 {0} 行").format(MAX_ROWS))
+            messagebox.showinfo(_("提示"), _('最多 {0} 行').format(MAX_ROWS))
             return
         # 2026-08-27：新行=独立空白（不继承上一行的时间/坐标，每条时间可互相交叉），
         # 追加到末尾（终点行前），不改变已有行的顺序与时间；
         # 上移/下移只交换行序、永不动时间（删除旧「插倒数第二 + 自动继承 start+dur」逻辑）
-        new_row = {"xa": 20.0, "ya": 20.0, "mode": "move",
-                   "xb": 200.0, "yb": 20.0,
+        # 2026-09-22：默认坐标改小 + 钳进画布——子视频画中画默认 320 缩放，遮罩画布=
+        # 子视频缩放后尺寸（往往只有几百像素宽），旧固定默认 xb=200/400 直接落到画布外
+        # → 编辑器红框不可见也不可抓（历史工程已踩）。改为结尾偏移 100（120/130），
+        # 仅需起始/结尾有偏差；小画布再钳进（canvas-40），大画布（水印=主视频）不受影响。
+        try:
+            _lim_x = max(0.0, float(canvas_w) - 40.0)
+        except (TypeError, ValueError):
+            _lim_x = 1e9
+        try:
+            _lim_y = max(0.0, float(canvas_h) - 40.0)
+        except (TypeError, ValueError):
+            _lim_y = 1e9
+        new_row = {"xa": min(20.0, _lim_x), "ya": min(20.0, _lim_y), "mode": "move",
+                   "xb": min(120.0, _lim_x), "yb": min(20.0, _lim_y),
                    "start": 0.0, "dur": 2.0, "end_action": "keep",
-                   "ra": 0.0, "rb": 0.0}
+                   "ra": 0.0, "rb": 0.0, "oa": 1.0, "ob": 1.0}
         if n and waypoints[-1].get("mode") == "end":
             waypoints.insert(n - 1, new_row)
             _refresh(n - 1)
@@ -2965,6 +3210,24 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
                       foreground="#5F5E5A").grid(row=r, column=0, columnspan=2, sticky="w", pady=(2, 0))
             r += 1
 
+        # consume_alpha=False（遮罩）：透明度链路不消费，输入行整块不建——
+        # 下方 _ok() 解析+写回段同步判 consume_alpha，w 里的 oa/ob 键原值保留。
+        _oa_v = _ob_v = None
+        if consume_alpha:
+            ttk.Label(ef, text=_("起始透明度(倍):")).grid(row=r, column=0, sticky="e", pady=2)
+            _oa_v = tk.StringVar(value=f"{_wp_num(w, 'oa', 1.0):g}")
+            ttk.Entry(ef, textvariable=_oa_v, width=10).grid(row=r, column=1, sticky="w", padx=6)
+            r += 1
+
+            ttk.Label(ef, text=_("结尾透明度(倍):")).grid(row=r, column=0, sticky="e", pady=2)
+            _ob_v = tk.StringVar(value=f"{_wp_num(w, 'ob', 1.0):g}")
+            ttk.Entry(ef, textvariable=_ob_v, width=10).grid(row=r, column=1, sticky="w", padx=6)
+            r += 1
+
+            ttk.Label(ef, text=_("0=完全隐形；1=不透明；段内 oa→ob 线性插值"),
+                      foreground="#5F5E5A").grid(row=r, column=0, columnspan=2, sticky="w", pady=(2, 0))
+            r += 1
+
         def _parse_pt(s):
             try:
                 _a, _b = str(s).split(",")
@@ -3008,6 +3271,18 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
                 w["rb"] = _rb_v
                 w["sa"] = _za_v
                 w["sb"] = _zb_v
+            # consume_alpha=False（遮罩）：无输入控件 → 不解析不写回，w 里的 oa/ob 原键原值保留。
+            if consume_alpha:
+                try:
+                    _oa_val = float(_oa_v.get().strip())
+                except (ValueError, TypeError):
+                    _oa_val = 1.0
+                try:
+                    _ob_val = float(_ob_v.get().strip())
+                except (ValueError, TypeError):
+                    _ob_val = 1.0
+                w["oa"] = _oa_val
+                w["ob"] = _ob_val
             if _m != "end":
                 pb = _parse_pt(_sb.get())
                 if pb is None:
@@ -3047,8 +3322,8 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
 
         ttk.Button(ef, text=_("确定"), command=_ok, width=8).grid(row=r, column=0, sticky="e", padx=(0, 3), pady=(10, 0))
         ttk.Button(ef, text=_("取消"), command=_close, width=8).grid(row=r, column=1, sticky="w", padx=(3, 0), pady=(10, 0))
-        # 窗口高随角度/缩放输入行有无自适应（隐藏 5 行 ≈ 150px，含提示行）
-        center_window(ed, 300, 340 if allow_angle else 190)
+        # 窗口高随角度/缩放/透明度输入行有无自适应（隐藏角度/缩放/透明度 ≈ 各 50px，含提示行）
+        center_window(ed, 300, (340 if allow_angle else 190) + (55 if consume_alpha else 0))
         _grab_release()   # 打开子窗先释放父锁，避免嵌套锁链
         ed.grab_set()
 
@@ -3113,10 +3388,21 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
                 if len(waypoints) >= MAX_ROWS:
                     skipped += 1
                     continue
-                new_row = {"xa": 20.0, "ya": 20.0, "mode": "hide",
-                           "xb": 200.0, "yb": 20.0,
+                # 2026-09-22：隐藏行坐标虽不参与表达式，但编辑器红框仍按它画——同样钳进画布
+                # （遮罩画布=子视频缩放后尺寸，固定 200 会落到画布外，红框不可见）。
+                try:
+                    _lim_x = max(0.0, float(canvas_w) - 40.0)
+                except (TypeError, ValueError):
+                    _lim_x = 1e9
+                try:
+                    _lim_y = max(0.0, float(canvas_h) - 40.0)
+                except (TypeError, ValueError):
+                    _lim_y = 1e9
+                new_row = {"xa": min(20.0, _lim_x), "ya": min(20.0, _lim_y), "mode": "hide",
+                           "xb": min(120.0, _lim_x), "yb": min(20.0, _lim_y),
                            "start": float(s), "dur": float(e - s),
-                           "end_action": "keep", "ra": 0.0, "rb": 0.0}
+                           "end_action": "keep", "ra": 0.0, "rb": 0.0,
+                           "oa": 1.0, "ob": 1.0}
                 if waypoints and waypoints[-1].get("mode") == "end":
                     waypoints.insert(len(waypoints) - 1, new_row)
                     _refresh(len(waypoints) - 2)
@@ -3126,9 +3412,9 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
                 added += 1
             # 结果只写主窗口日志，不弹窗（弹窗会让预览窗口沉底、易堆积多个预览）
             if added or skipped:
-                msg = f"已追加 {added} 个隐藏段到轨迹列表"
+                msg = _('已追加 {0} 个隐藏段到轨迹列表').format(added)
                 if skipped:
-                    msg += _("（跳过 {0} 个：超出 {1} 行上限或无效）").format(skipped, MAX_ROWS)
+                    msg += _('（跳过 {0} 个：超出 {1} 行上限或无效）').format(skipped, MAX_ROWS)
                 try:
                     app._append_info_ui(_("[轨迹] ") + msg)
                 except Exception:
@@ -3228,13 +3514,12 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
     prev_lab = ttk.Label(frm, text="", foreground="gray")
     prev_lab.grid(row=3, column=0, columnspan=5, sticky="w")
 
-    HINT = _("≤{0} 行，每行独立段（可不设终点行）；双击编辑整行；结束时间=开始+持续").format(MAX_ROWS)
+    HINT = _('≤{0} 行，每行独立段（可不设终点行）；双击编辑整行；结束时间=开始+持续').format(MAX_ROWS)
     # 2026-08-29：主视频启用截取/变速 → 轨迹时间按输出时间线（滤镜 t=截取后从 0 起）填
     try:
         _ts0, _sp0 = _main_trim_speed(app)
         if _ts0 > 0 or _sp0 != 1.0:
-            HINT += (_(" ｜ ⚠ 主视频已截取(起点 {0:.3f}s)/变速(×{1:g})："
-                     "时间按主视频原始时间填，转换时自动换算（无需手动减）").format(_ts0, _sp0))
+            HINT += (_(' ｜ ⚠ 主视频已截取(起点 {0:.3f}s)/变速(×{1:g})：时间按主视频原始时间填，转换时自动换算（无需手动减）').format(_ts0, _sp0))
     except Exception:
         pass
 
@@ -3302,13 +3587,13 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
                                    outline="#333333", width=1)
         prev_cv.create_line(x1, 6, x1, 26, fill="#A32D2D", width=2)
         prev_lab.config(
-            text=f"{HINT} ｜ 总时长 {t_max:.3f}s（红色竖线=终点；重叠段自动混色，段起点有三角）")
+            text=_('{0} ｜ 总时长 {1}:.3fs（红色竖线=终点；重叠段自动混色，段起点有三角）').format(HINT, t_max))
 
     def _update_hint():
         try:
-            _x, _y, _ang, _zoom = build_waypoint_expr(waypoints)
+            _x, _y, _ang, _zoom, _alpha = build_waypoint_expr(waypoints)
             _n = (len(_x) + len(_y) + len(_zoom or "")) // 2 if _x else 0
-            prev_lab.config(text=_("{0} ｜ 表达式约 {1} 字符（实测 2400+ 字符仍正常，安全）").format(HINT, _n))
+            prev_lab.config(text=_('{0} ｜ 表达式约 {1} 字符（实测 2400+ 字符仍正常，安全）').format(HINT, _n))
             _draw_preview()
         except Exception:
             pass
@@ -3346,6 +3631,9 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
         if idx < 0 or idx >= len(waypoints):
             return None
         w = waypoints[idx]
+        # 复制/粘贴状态只搬 位置/缩放/角度（与 _attach_state_clipboard_menu 契约一致：
+        # get_state→(x,y,scale,angle) 4 元组）；oa/ob 透明度在整行编辑弹窗改、不随
+        # 坐标连通粘贴，apply_state 也只写回 x/y/scale/angle，故此处不返回。
         if which == "end":
             return (_wp_num(w, "xb"), _wp_num(w, "yb"),
                     _wp_num(w, "sb", 1.0), _wp_num(w, "rb", 0.0))
@@ -3401,7 +3689,8 @@ def _waypoints_panel(host, waypoints, edit_cb, canvas_w, canvas_h,
 
 def _trajectory_dialog(parent, initial, commit, edit_cb=None, canvas_w=1280, canvas_h=720,
                        video_file=None, ffmpeg_cmd=None, ffprobe_cmd=None, app=None,
-                       show_presets=True, allow_angle=True, allow_empty=False):
+                       show_presets=True, allow_angle=True, allow_empty=False,
+                       consume_alpha=True):
     """轨迹控制弹窗公共实现（图片/视频水印与文字水印共用）。
     initial: dict，含 move_mode / move_cycle / move_dwell / move_margin / move_waypoints 初值；
     commit: callable(dict)，点「确定」时把规范化后的新值写回（写 tk 变量或 settings dict 均可）。
@@ -3471,11 +3760,11 @@ def _trajectory_dialog(parent, initial, commit, edit_cb=None, canvas_w=1280, can
         cyc_sb = ttk.Spinbox(cyc_frm, from_=0.5, to=600, increment=0.5, width=7, textvariable=cyc_var)
         cyc_sb.pack(side=tk.LEFT, padx=(2, 0))
         ToolTip(_lbltt1,
-                """这里的周期管的是速度：周期越短，水印移动越快。
+                _("""这里的周期管的是速度：周期越短，水印移动越快。
 往返 = 单程来回一次的时间；菱形 = 走完一圈的时间；
 四角跳跃不受此周期影响（用下方「每点停留」控制）。
 往返无需幅度参数：左右往返自动横跨整个画面宽度（0→W），
-上下往返自动纵跨整个画面高度（0→H）。""",
+上下往返自动纵跨整个画面高度（0→H）。"""),
                 wraplength=340)
         cyc_frm.pack(side=tk.LEFT, padx=(10, 0))
 
@@ -3490,8 +3779,8 @@ def _trajectory_dialog(parent, initial, commit, edit_cb=None, canvas_w=1280, can
         margin_entry = ttk.Entry(dwell_frm, textvariable=margin_var, width=10)
         margin_entry.pack(side=tk.LEFT, padx=2)
         ToolTip(_lbltt2,
-                """四角跳跃时水印离屏幕边缘的距离。
-可填像素数（如 20）或相对式（如 W*0.03 = 主画面宽度 3%）。""",
+                _("""四角跳跃时水印离屏幕边缘的距离。
+可填像素数（如 20）或相对式（如 W*0.03 = 主画面宽度 3%）。"""),
                 wraplength=320)
 
         tip_label = ttk.Label(frm, text="", foreground="gray")
@@ -3514,8 +3803,8 @@ def _trajectory_dialog(parent, initial, commit, edit_cb=None, canvas_w=1280, can
     wp_chk = ttk.Checkbutton(chk_frm, text=_("启用列表轨迹"), variable=wp_var)
     wp_chk.pack(side=tk.LEFT)
     ToolTip(wp_chk,
-            """勾选后上方的运动轨迹下拉自动忽略（列表轨迹优先）。
-列表轨迹：每行=时间段，含平移/隐藏/自旋转与分段到期行为；启用后覆盖全局自旋转。""",
+            _("""勾选后上方的运动轨迹下拉自动忽略（列表轨迹优先）。
+列表轨迹：每行=时间段，含平移/隐藏/自旋转与分段到期行为；启用后覆盖全局自旋转。"""),
             wraplength=360)
 
 
@@ -3532,14 +3821,29 @@ def _trajectory_dialog(parent, initial, commit, edit_cb=None, canvas_w=1280, can
     set_panel_enabled, refresh_panel = _waypoints_panel(
         panel_host, _wps, edit_cb, canvas_w, canvas_h,
         grab_win=win, video_file=video_file, ffmpeg_cmd=ffmpeg_cmd, ffprobe_cmd=ffprobe_cmd,
-        app=app, allow_angle=allow_angle, allow_empty=allow_empty)
+        app=app, allow_angle=allow_angle, allow_empty=allow_empty,
+        # ⚠️ 必须透传：遮罩调用点传 consume_alpha=False（链路不消费 oa/ob），
+        # 漏透传则面板拿默认 True → 遮罩轨迹列表仍显示透明度两列（误导用户）。
+        consume_alpha=consume_alpha)
 
     def _ensure_wps():
         """勾选时若列表为空则种子默认行，并写回 initial（WYSIWYG）。"""
         if _wps:
             return
+        # 2026-09-22：种子行默认坐标改小（结尾偏移 100）+ 钳进画布——遮罩画布=
+        # 子视频缩放后尺寸（画中画默认 320 缩放），旧 xb=400 会落到画布外 →
+        # 编辑器红框不可见不可抓。大画布（水印=主视频）min 不触发，行为不变。
+        try:
+            _lim_x = max(0.0, float(canvas_w) - 40.0)
+        except (TypeError, ValueError):
+            _lim_x = 1e9
+        try:
+            _lim_y = max(0.0, float(canvas_h) - 40.0)
+        except (TypeError, ValueError):
+            _lim_y = 1e9
         _wps.extend([
-            {"xa": 30, "ya": 30, "mode": "move", "xb": 400, "yb": 30,
+            {"xa": min(30, _lim_x), "ya": min(30, _lim_y), "mode": "move",
+             "xb": min(130, _lim_x), "yb": min(30, _lim_y),
              "start": 0, "dur": 3, "end_action": "keep", "ra": 0.0, "rb": 0.0},
         ])
         initial["move_waypoints"] = _wps
@@ -3599,7 +3903,7 @@ def _trajectory_dialog(parent, initial, commit, edit_cb=None, canvas_w=1280, can
     ttk.Button(btn_row, text=_("确定"), command=_apply, width=8).grid(row=0, column=0, sticky="e", padx=(0, 3))
     ttk.Button(btn_row, text=_("取消"), command=win.destroy, width=8).grid(row=0, column=1, sticky="w", padx=(3, 0))
 
-    center_window(win, 820, 560)
+    center_window(win, 920, 560)
     try:
         win.grab_set()   # 延后到 deiconify 之后：withdraw+带锁窗口会吞输入（2026-08-27）
     except Exception:
@@ -3989,7 +4293,7 @@ def _mask_shape_pos_expr(sh, cvw, cvh, ts0, sp0):
     if sh.get("traj_enabled") and isinstance(sh.get("waypoints"), list):
         _wps = [w for w in sh["waypoints"] if isinstance(w, dict)]
         if _wps:
-            _xe, _ye, _, _ = build_waypoint_expr(
+            _xe, _ye, _unused, _unused, _unused = build_waypoint_expr(
                 _wps, sw=str(cvw), sh=str(cvh), trim_start=ts0, speed_factor=sp0)
             if _xe and _ye:
                 return f"'({_xe})*main_w/{cvw}'", f"'({_ye})*main_h/{cvh}'"
@@ -4014,7 +4318,7 @@ def _mask_shape_pos_expr(sh, cvw, cvh, ts0, sp0):
         "start": _ts_out, "dur": max(0.04, _dur_out), "mode": "move",
         "xa": _x, "ya": _y, "xb": _x, "yb": _y, "end_action": "hide",
     }]
-    _xe, _ye, _, _ = build_waypoint_expr(_wps)
+    _xe, _ye, _unused, _unused, _unused = build_waypoint_expr(_wps)
     return _xe or "0", _ye or "0"
 
 
@@ -4134,7 +4438,7 @@ def _build_mask_filter_block(settings, graph_id="", in_label=None, out_label=Non
                         _psp = float(motion_speed_factor) if motion_speed_factor is not None else 1.0
                     else:
                         _pts, _psp = _trim_speed_from_settings(settings)
-                    _pxe, _pye, _pws, _pwz = build_waypoint_expr(
+                    _pxe, _pye, _pws, _pwz, _pwza = build_waypoint_expr(
                         _wps, sw=str(_cvw), sh=str(_cvh), trim_start=_pts, speed_factor=_psp)
                     if _pxe and _pye:
                         _png_ox = f"'({_pxe})*main_w/{_cvw}'"
@@ -4164,11 +4468,11 @@ def _build_mask_filter_block(settings, graph_id="", in_label=None, out_label=Non
                 _out_seg = _png_seg
                 _png_built = True
                 if _png_traj_on:
-                    print(f"[遮罩] 形状图沿轨迹移动：{_png_raw}（路线={_ptype}，大小={_sw}x{_sh}，模式={_mode}，{len(_wps)} 航点）")
+                    print(_('[遮罩] 形状图沿轨迹移动：{0}（路线={1}，大小={2}x{3}，模式={4}，{5} 航点）').format(_png_raw, _ptype, _sw, _sh, _mode, len(_wps)))
                 else:
-                    print(f"[遮罩] 形状图生效（静止）：{_png_raw}（路线={_ptype}，矩形={mx},{my},{_sw}x{_sh}，模式={_mode}）")
+                    print(_('[遮罩] 形状图生效（静止）：{0}（路线={1}，矩形={2},{3},{4}x{5}，模式={6}）').format(_png_raw, _ptype, mx, my, _sw, _sh, _mode))
             else:
-                print(f"[遮罩] 形状图路径不可用（不存在/含特殊字符且硬链接失败），回退矩形：{_png_raw}")
+                print(_('[遮罩] 形状图路径不可用（不存在/含特殊字符且硬链接失败），回退矩形：{0}').format(_png_raw))
         _dyn_built = False
         if not _png_built and _traj_on and _wps:
             # 段时间换算与裁剪简易位置同款（2026-08-29：段时间=主视频原始时间 → 换算输出时间线）
@@ -4177,7 +4481,7 @@ def _build_mask_filter_block(settings, graph_id="", in_label=None, out_label=Non
                 _sp0 = float(motion_speed_factor) if motion_speed_factor is not None else 1.0
             else:
                 _ts0, _sp0 = _trim_speed_from_settings(settings)
-            _xe, _ye, _ws, _wz = build_waypoint_expr(
+            _xe, _ye, _ws, _wz, _wza = build_waypoint_expr(
                 _wps, sw=str(_cvw), sh=str(_cvh), trim_start=_ts0, speed_factor=_sp0)
             if _xe and _ye:
                 # 航点画布（cvw×cvh = 打开遮罩窗口时的最终渲染帧尺寸）→ 实际帧等比还原：
@@ -4253,6 +4557,776 @@ def _build_mask_filter_block(settings, graph_id="", in_label=None, out_label=Non
     if _out_seg is None:
         return None
     return _pre + _out_seg + _post
+
+
+# ==================== 图节点（中间标签）工具 —— 2026-09-25 ====================
+# 用途：把 -filter_complex 里某个中间标签（例如「主视频叠加完 PNG 之后」）当成一个
+# 新的视频素材来处理 —— ①截断到该节点渲染出行焊缝 ②把一段滤镜插到它后面。
+#
+# 两条硬约束（tests/_verify_graph_node_tap.py 实跑 ffmpeg 得出，改动前务必重读该档案）：
+#   ① 标签独占消费：一个标签被下游滤镜消费后，不能再用 -map 把它当输出 —— 会报
+#      "Output with label 'x' ... was already used elsewhere" ⇒ 只能「截断」或「split 分流」；
+#   ② 命名输出必须有去处：截断 / 删段后悬空的输出标签必须补 nullsink —— 否则报
+#      "Filter 'xxx' has output N (...) unconnected"（真实图里 split 分叉极多，一截就悬空）。
+#
+# 因此本组全部是**纯字符串搬运**：输入一串 filtergraph，输出一串新的 filtergraph，
+# 不 import 任何东西、不碰任何 builder、不依赖 app 状态 ⇒ 可直接单元测试。
+
+
+def graph_split(graph):
+    """按 ';' 切成多段，感知单引号保护（drawtext=text='a;b' 里的分号不是分隔符）。"""
+    parts, buf, q, esc = [], [], False, False
+    for ch in (graph or ""):
+        if esc:
+            buf.append(ch); esc = False; continue
+        if ch == "\\":
+            buf.append(ch); esc = True; continue
+        if ch == "'":
+            q = not q; buf.append(ch); continue
+        if ch == ";" and not q:
+            parts.append("".join(buf)); buf = []; continue
+        buf.append(ch)
+    tail = "".join(buf)
+    if tail.strip():
+        parts.append(tail)
+    return [p for p in parts if p.strip()]
+
+
+def _scan_labels(seg):
+    """扫描段内所有**不在单引号内**的 [标签]，返回 [(start, end, name)]（按位置升序）。"""
+    res, q, esc, i, n = [], False, False, 0, len(seg)
+    while i < n:
+        c = seg[i]
+        if esc:
+            esc = False; i += 1; continue
+        if c == "\\":
+            esc = True; i += 1; continue
+        if c == "'":
+            q = not q; i += 1; continue
+        if c == "[" and not q:
+            j = seg.find("]", i)
+            if j == -1:
+                break
+            res.append((i, j + 1, seg[i + 1:j]))
+            i = j + 1
+            continue
+        i += 1
+    return res
+
+
+def graph_parse_chain(seg):
+    """拆一段 → (ins, body, outs)。ins/outs 是标签名（不含方括号），body 是滤镜主体。"""
+    labs = _scan_labels(seg)
+    ins, pos, k = [], 0, 0
+    while k < len(labs) and labs[k][0] == pos:      # 段首连续标签 = 输入
+        ins.append(labs[k][2]); pos = labs[k][1]; k += 1
+    outs, end, j = [], len(seg), len(labs) - 1      # 段尾连续标签 = 输出
+    while j >= k and labs[j][1] == end:
+        outs.insert(0, labs[j][2]); end = labs[j][0]; j -= 1
+    return ins, seg[pos:end], outs
+
+
+def _last_top_comma(body):
+    """主体内最后一个不在引号内的逗号位置（-1=没有）。"""
+    q, esc, res = False, False, -1
+    for i, c in enumerate(body):
+        if esc:
+            esc = False; continue
+        if c == "\\":
+            esc = True; continue
+        if c == "'":
+            q = not q; continue
+        if c == "," and not q:
+            res = i
+    return res
+
+
+def chain_last_filter(body):
+    """取主体里最后一个滤镜名（用于给节点生成可读名/指纹）。"""
+    if not body:
+        return ""
+    i = _last_top_comma(body)
+    tail = body[i + 1:] if i >= 0 else body
+    return tail.split("=", 1)[0].strip().lstrip("-")
+
+
+def graph_nodes(graph):
+    """列出可作为节点（在其后插入滤镜）的候选 → [(段序号, 输出标签名, 末滤镜名)]。
+
+    只收「恰好一个输出标签」的段：多输出即分叉（split），语义不明，本轮不支持。
+    """
+    nodes = []
+    for i, seg in enumerate(graph_split(graph)):
+        _ins, body, outs = graph_parse_chain(seg)
+        if len(outs) == 1:
+            nodes.append((i, outs[0], chain_last_filter(body)))
+    return nodes
+
+
+def graph_nodes_full(graph):
+    """graph_nodes 的扩展：额外返回段主体（用于判别视频/音频段）。
+
+    返回 [(段序号, 输出标签名, 末滤镜名, 主体)]，只收「恰好一个输出标签」的段。
+    """
+    out = []
+    for i, seg in enumerate(graph_split(graph)):
+        _ins, body, outs = graph_parse_chain(seg)
+        if len(outs) == 1:
+            out.append((i, outs[0], chain_last_filter(body), body))
+    return out
+
+
+# 音频段判定用的滤镜 token（含 = 的是带参滤镜名，避免误命中其它词）
+_AUDIO_FILTER_TOKENS = (
+    "anull", "amix", "acrossfade", "atrim", "adelay", "asetpts", "aformat",
+    "aresample", "apad", "pan=", "bass=", "treble=", "equalizer=", "afftdn",
+    "arnndn", "highpass=", "lowpass=", "loudnorm", "volume=", "acompressor",
+    "aecho", "anlmdn", "acontrast", "dynaudnorm", "silenceremove", "asetrate",
+    "achannelmap", "ajoin", "amerge", "asplit", "anullsrc", "anullsink",
+    "areverse", "aphaser", "agate", "aemph", "adeclick", "adeclip",
+)
+
+
+def is_audio_segment(body):
+    """判断一段 filter 主体是否为「音频段」（视频/音频节点对话框据此互相排除）。
+
+    判别依据：①显式音频拼接标记 v=0:a=1 / a=1:v=0；②音频专用滤镜 token；
+    ③aformat/aresample（音频归一）。视频段（overlay/scale/crop/format…）不含这些 → 判为视频。
+    """
+    b = (body or "").lower()
+    if "v=0:a=1" in b or "a=1:v=0" in b:
+        return True
+    if "aformat=" in b or "aresample" in b:
+        return True
+    for _t in _AUDIO_FILTER_TOKENS:
+        if _t in b:
+            return True
+    return False
+
+
+def node_fingerprint(seg_index, last_filter, dup=0):
+    """节点指纹 —— 「段序号 + 末滤镜名」。
+
+    ⚠️ 为什么不用标签名当持久化 key：标签是随开关增减的 f-string（v_out_{i} / v_temp_{i}…），
+    同一「第 N 步」在不同配置下名字会变 ⇒ 存了也对不上。改用位置+滤镜名作指纹，
+    配置变了就自然失配 → 由调用方日志提示并跳过，绝不静默插到错误位置。
+    """
+    base = "#%d:%s" % (seg_index, last_filter or "null")
+    return base if not dup else "%s#%d" % (base, dup)
+
+
+def node_key_alias(base_nodes, target_nodes):
+    """把「base 图」算出的节点指纹重锚到「target 图」的标签 → {指纹: 标签}。
+
+    为什么需要：同一个「第 N 步」在两张图里**段序号常常不同**。正式命令图与预览图
+    （mpv/ffplay 以及管道）是两套构图（预览多了 movie= 源段、trim 收尾段、末尾 null
+    段等），于是直接拿各自算出的「#段序号:末滤镜名」互相对齐一定会大量落空
+    （实测：3 个节点里只有主链那个对得上）。
+
+    折中口径 —— **只按「同名末滤镜的第 n 次出现」对齐，且要求该滤镜名在两张图里出现
+    次数完全相同**：次数不同说明这一层的结构真的变了（例如预览把某环节展开成多段），
+    此时不给结果，由调用方按「处理链已变化」提示跳过。宁可不生效，也绝不插到别的节点上。
+
+    精确相同的 key 由调用方**优先**使用，本函数只负责补齐没命中的那些。
+
+    返回 {指纹: (标签, 段序号)}（2026-09-26 起带段序号）：PiP 级联 amix 的同名标签
+    [amain] 顺序复用时，只拿标签名没法区分「第 n 个 amain」→ 调用方须按段序号插入
+    （insert_after_at），否则永远命中第一个。
+    """
+    out = {}
+    if not base_nodes or not target_nodes:
+        return out
+    tgt_by_f, base_cnt = {}, {}
+    for _i, _n, _f in target_nodes:
+        tgt_by_f.setdefault(_f, []).append((_n, _i))
+    for _i, _n, _f in base_nodes:
+        base_cnt[_f] = base_cnt.get(_f, 0) + 1
+    seen = {}
+    for _i, _n, _f in base_nodes:
+        _nth = seen.get(_f, 0)
+        seen[_f] = _nth + 1
+        _lst = tgt_by_f.get(_f) or []
+        if len(_lst) != base_cnt[_f]:      # 该滤镜层在两张图里数量不对等 → 不猜
+            continue
+        if _nth < len(_lst):
+            out[node_fingerprint(_i, _f)] = _lst[_nth]   # (标签, 段序号)
+    return out
+
+
+def truncate_at(graph, label):
+    """方案A 截断：丢掉该标签之后的所有段，让它变成末节点（这样就能 -map 了）。"""
+    segs = graph_split(graph)
+    for i, seg in enumerate(segs):
+        _ins, _body, outs = graph_parse_chain(seg)
+        if label in outs:
+            return ";".join(segs[:i + 1])
+    return None
+
+
+def dangling_labels(graph):
+    """图中「产出但无人消费」的输出标签（末段的输出=图的出口，不算悬空）。"""
+    segs = graph_split(graph)
+    produced, consumed = [], set()
+    for i, seg in enumerate(segs):
+        ins, _body, outs = graph_parse_chain(seg)
+        consumed.update(ins)
+        for o in outs:
+            produced.append((i, o))
+    last_i = len(segs) - 1
+    return [o for i, o in produced if o not in consumed and i != last_i]
+
+
+def add_nullsinks(graph, keep=None):
+    """给悬空标签补 nullsink（约束②）。keep = 你自己要 -map 的那个，不给它补。"""
+    dang = [d for d in dangling_labels(graph) if d != keep]
+    if not dang:
+        return graph
+    extra = ";".join("[%s]nullsink" % d for d in dang)
+    return "%s;%s" % (graph, extra) if graph else extra
+
+
+def insert_after(graph, label, effect, tmp_suffix="_nf"):
+    """在定义 label 的段后面插入一段滤镜。
+
+    手法就是用户说的那句：把原输出改名成临时标签 → effect 接上 → 产出还原成原名。
+    effect 可以是多段串（局部模糊之类的带标签子图就是这样）；只改「入口/出口」两端，
+    内部自带标签原样并入。找不到或不满足前置条件返回 None（调用方负责提示）。
+    """
+    segs = graph_split(graph)
+    for i, seg in enumerate(segs):
+        ins, body, outs = graph_parse_chain(seg)
+        if len(outs) != 1 or outs[0] != label:
+            continue
+        eff_segs = graph_split(effect)
+        if not eff_segs:
+            return None
+        tmp = label + tmp_suffix
+        new_seg = "%s%s[%s]" % ("".join("[%s]" % x for x in ins), body, tmp)
+        eff_segs[0] = "[%s]%s" % (tmp, eff_segs[0])
+        eff_segs[-1] = "%s[%s]" % (eff_segs[-1], label)
+        return ";".join(segs[:i] + [new_seg] + eff_segs + segs[i + 1:])
+    return None
+
+
+def insert_after_at(graph, seg_index, effect, tmp_suffix="_nf"):
+    """在指定段序号的段后面插入滤镜（insert_after 的按位版本）。
+
+    为什么需要（2026-09-26）：PiP 级联 amix 的每个段输出都叫 [amain]（同名标签
+    顺序复用），insert_after 按标签名找只会命中第一个 —— 用户在「音频节点」里选
+    最后一个 amain，效果却插到第一个后面。按段序号（graph_split 下标）定位天然
+    精确：指纹「段序号+末滤镜名」里的段序号在这里真正派上用场。
+    手法与 insert_after 完全一致：原输出改名临时标签 → effect 接上 → 还原原名。
+    段序号越界 / 该段输出不是单标签（分叉）/ effect 为空 → 返回 None（调用方提示）。
+    """
+    segs = graph_split(graph)
+    if not (0 <= seg_index < len(segs)):
+        return None
+    ins, body, outs = graph_parse_chain(segs[seg_index])
+    if len(outs) != 1:
+        return None
+    eff_segs = graph_split(effect)
+    if not eff_segs:
+        return None
+    tmp = outs[0] + tmp_suffix
+    new_seg = "%s%s[%s]" % ("".join("[%s]" % x for x in ins), body, tmp)
+    eff_segs[0] = "[%s]%s" % (tmp, eff_segs[0])
+    eff_segs[-1] = "%s[%s]" % (eff_segs[-1], outs[0])
+    return ";".join(segs[:seg_index] + [new_seg] + eff_segs + segs[seg_index + 1:])
+
+
+NODE_FX_CUSTOM_KEY = "_custom_chain"
+
+
+def node_label_friendly(name):
+    """原始图标签 → 中文阶段名（**纯显示层**；定位仍靠指纹 = 段序号+末滤镜名）。
+
+    为什么不做成「标签名 → 效果」的登记表（2026-09-27「节点窗显示友好名」）：标签是随开关
+    增减的位置相关 f-string（`v_out_{i}` / `v_temp_{i}`…），登记表得改遍所有 builder。
+    这里只做**从名字反推**的正则映射，漏匹配就原样返回原名 —— 显示降级，绝不误判。
+    """
+    import re as _re
+    n = (name or "").strip()
+    if not n:
+        return "?"
+    if n == "v_main_proc":
+        return "主视频（预处理后）"
+    if n == "v_main_base":
+        return "主视频原始帧（blend 基底）"
+    if n == "v_base":
+        return "画布基底"
+    if n == "v1":
+        return "画布缩放后"
+    if n == "amain":
+        return "主音频"
+    if n == "aout":
+        return "音频输出"
+    _m = _re.fullmatch(r"v_temp_(\d+)", n)
+    if _m:
+        return "子视频 %d（预处理后）" % (int(_m.group(1)) + 1)
+    _m = _re.fullmatch(r"v_out_(\d+)", n)
+    if _m:
+        return "叠加子视频 %d 后" % (int(_m.group(1)) + 1)
+    _m = _re.fullmatch(r"v_crop_(\d+)", n)
+    if _m:
+        return "区域裁剪 %d" % (int(_m.group(1)) + 1)
+    _m = _re.fullmatch(r"v_base(\d+)", n)
+    if _m:
+        return "画布段 %d 基底" % (int(_m.group(1)) + 1)
+    _m = _re.fullmatch(r"vt(\d+)", n)
+    if _m:
+        return "画布段 %d 中间" % (int(_m.group(1)) + 1)
+    return n
+
+
+_NODE_FX_DISPLAY = {
+    "crop": "裁剪", "delogo": "去水印", "rotate": "旋转", "hflip": "水平翻转",
+    "vflip": "垂直翻转", "transpose": "转置", "unsharp": "锐化", "eq": "色彩",
+    "hue": "色相", "chromakey": "抠像", "colorkey": "抠像", "boxblur": "模糊",
+    "smartblur": "模糊", "gblur": "模糊", "hqdn3d": "降噪", "nlmeans": "降噪",
+    "deblock": "去块", "detelecine": "反胶卷", "yadif": "反交错", "bwdif": "反交错",
+    "fieldmatch": "IVTC", "decimate": "IVTC", "scale": "缩放", "pad": "画布",
+    "drawtext": "文字", "curves": "曲线", "colorlevels": "色阶", "lut": "LUT",
+    "negate": "反相", "colorchannelmixer": "通道混合", "volume": "音量",
+    "loudnorm": "响度统一", "dynaudnorm": "响度统一", "anequalizer": "EQ",
+    "highpass": "高频截止", "lowpass": "低频截止", "afftdn": "降噪",
+    "pan": "声道", "aresample": "重采样", "atempo": "变速",
+}
+
+
+_CHAIN_NOOP = ("null", "anull", "copy", "acopy")
+
+
+def _chain_filter_names(chain):
+    """滤镜串 → 去重保序的滤镜名列表（只取每段 `=` 前的名字）。
+
+    ⚠️ 必须滤掉 no-op：`build_video_filter_chain` 在**没有任何效果**时返回 `null`
+    （ffmpeg 的空操作滤镜），不过滤的话列表里会显示「插入效果：null」。
+    """
+    out = []
+    for _p in (chain or "").split(","):
+        _nm = _p.split("=", 1)[0].strip()
+        if _nm and _nm not in _CHAIN_NOOP and _nm not in out:
+            out.append(_nm)
+    return out
+
+
+def node_effect_summary(settings, chain=None):
+    """节点已挂效果的**短摘要**（纯显示，给列表「插入效果」列用）。
+
+    chain=None 时按视频节点口径自己算；音频节点请把 chain 传进来（它走
+    `node_audio_effect_chain`，是方法不是模块级函数）。有自定义命令时优先显示。
+    """
+    s = settings if isinstance(settings, dict) else {}
+    if (s.get(NODE_FX_CUSTOM_KEY) or "").strip():
+        return "自定义命令"
+    if chain is None:
+        try:
+            chain = node_effect_chain(s)
+        except Exception:
+            chain = ""
+    _names = _chain_filter_names(chain)
+    if not _names:
+        return ""
+    _disp = [_NODE_FX_DISPLAY.get(n, n) for n in _names]
+    if len(_disp) > 3:
+        return " · ".join(_disp[:3]) + " …"
+    return " · ".join(_disp)
+
+
+def orphan_node_fx_keys(available_keys, fx):
+    """已存的效果里**在当前图找不到落点**的那些 key（孤儿）→ list[key]（保序）。
+
+    为什么要专门有这个概念（2026-09-28）：`_apply_node_fx` 碰到找不到的 key 只日志
+    提示并跳过 —— 条目本身**一直留在项目里**，于是每次保存/载入都刷同一条提示，
+    而用户根本不知道去哪儿删。给它们一个可列举、可清理的出口才是根治。
+
+    ⚠️ 判据必须基于**「应用效果前」的干净图**算出的指纹集合：插入效果会让图多出
+    一段、其后段序号整体漂移 ⇒ 拿成品图算会把正常效果误判成孤儿（2026-09-28 实测）。
+
+    available_keys：当前图里真实存在的指纹集合（调用方从干净图算出）。
+    fx：self.node_fx / self.node_audio_fx。空 dict 返回 []。
+    """
+    if not fx:
+        return []
+    _have = set(available_keys or ())
+    return [k for k in fx if k not in _have]
+
+
+def validate_node_custom_chain(text):
+    """校验用户在节点窗写的自由命令串。返回 (ok, 值或错误原因)。
+
+    ⚠️ 为什么禁 `[` `]` 和 `;`：插入手法是 `insert_after_at`（原输出改名 → 接 effect →
+    还原原名），effect 里再出现标签会撞名/悬空，`;` 会让它变成多段、段序号随之漂移。
+    纯逗号滤镜链覆盖 99% 需求（drawbox / unsharp / eq / colorkey…），且不可能破坏图结构。
+    """
+    v = (text or "").strip()
+    if not v:
+        return False, "命令为空"
+    if "[" in v or "]" in v:
+        return False, "暂不支持方括号 [ ]（会引入标签，破坏处理链）"
+    if ";" in v:
+        return False, "暂不支持分号 ;（会分段，导致节点位置漂移）"
+    return True, v
+
+
+def node_effect_chain(settings):
+    """设置 dict → 可插入到节点后面的**纯效果**滤镜串。
+
+    刻意关掉 trim / subtild / speed / scale / format / fade / mask —— 那些是「素材出口」
+    层面的事，挂到中间节点上语义不对（且会改变节点流向的时间轴）。保留：裁剪 / 旋转 /
+    翻转 / 去水印 delogo / 增强 / IVTC / 去块 / 降噪 / 锐化 / 色彩 / 抠像。
+    """
+    s = dict(settings or {})
+    # 自定义命令优先（2026-09-27「节点自由插入命令」）：用户在节点窗直接写的滤镜串，
+    # 原样插回。校验在入口做（validate_node_custom_chain），这里只认钥匙。
+    _custom = (s.get(NODE_FX_CUSTOM_KEY) or "").strip()
+    if _custom:
+        return _custom
+    return build_video_filter_chain(
+        s,
+        include_subtitle=False, include_speed=False, include_trim=False,
+        include_format=False, include_scale=False, include_fade=False,
+        include_mask=False,
+        enhance_settings=s.get("enhance"),
+        graph_id="nodefx",
+    )
+
+
+def png_size(path):
+    """读 PNG 头部拿 (宽, 高) —— 纯 stdlib（本项目禁 PIL）。
+
+    为什么不用 PIL/ImageTk：铁律「绝不引入 PIL 及除 dnd2 外任何第三方库」。
+    PNG IHDR 布局固定：8 字节签名 + 4 长度 + 4 "IHDR" + 4 宽 + 4 高（大端）。
+    """
+    try:
+        with open(path, "rb") as f:
+            _h = f.read(26)
+        if len(_h) < 24 or _h[:8] != b"\x89PNG\r\n\x1a\n":
+            return None
+        _w, _hh = struct.unpack(">II", _h[16:24])
+        return (_w, _hh) if (_w and _hh) else None
+    except Exception:
+        return None
+
+
+def _ppm_parse_header(data):
+    """解析内存 PPM(P6) 头 → (宽, 高, 像素起点偏移)；解析失败返回 None。
+
+    与 png_size 同口径，但针对**管道内存帧**（image2pipe -vcodec ppm 输出的字节），
+    不碰磁盘。ffmpeg ppm 复用器头固定为 `P6\\n<W> <H>\\n<maxval>\\n`（maxval 恒 255）。
+    """
+    try:
+        if not data or data[:2] != b"P6":
+            return None
+        _k = 2
+        _L = len(data)
+        while _k < _L and data[_k] in b" \t\r\n":
+            _k += 1
+        _vals = []
+        _cur = bytearray()
+        while _k < _L and len(_vals) < 3:
+            _c = data[_k]
+            if _c in b" \t\r\n":
+                if _cur:
+                    _vals.append(int(_cur))
+                    _cur = bytearray()
+            else:
+                _cur.append(_c)
+            _k += 1
+        if len(_vals) < 3:
+            return None
+        _w, _h, _maxv = _vals
+        while _k < _L and data[_k] in b" \t\r\n":
+            _k += 1
+        return (_w, _h, _k)
+    except Exception:
+        return None
+
+
+def ppm_size(data):
+    """读内存 PPM(P6) 字节头拿 (宽, 高) —— 零磁盘，与 png_size 对应（管道内存帧版）。"""
+    _h = _ppm_parse_header(data)
+    if not _h:
+        return None
+    _w, _h2, _ = _h
+    return (_w, _h2) if (_w and _h2) else None
+
+
+def split_ppm_frames(data, n):
+    """把**拼接**的 PPM(P6) 字节流按序拆成 n 个独立帧（image2pipe 多 -map 单管道输出）。
+
+    返回 list[bytes]，长度 ≤ n（不足按实际；某帧越界/坏头即停）。顺序与 -map 顺序一致
+    （已实测：单输出 + 多 -map + 一个 pipe:1，ffmpeg 按 -map 顺序写出）。
+    用于「节点窗预览」的批量取帧：一趟解码、N 帧全在内存、零落盘。
+    """
+    _out = []
+    _i = 0
+    _L = len(data)
+    while len(_out) < n and _i < _L:
+        if data[_i:_i + 2] != b"P6":
+            _j = data.find(b"P6", _i + 1)
+            if _j == -1:
+                break
+            _i = _j
+            continue
+        _hdr = _ppm_parse_header(data[_i:])
+        if not _hdr:
+            break
+        _w, _h, _start = _hdr
+        _size = _w * _h * 3
+        if _start + _size > _L - _i:
+            break
+        _out.append(data[_i:_i + _start + _size])
+        _i = _i + _start + _size
+    return _out
+
+
+# ==================== -print_graphs 图分析（2026-09-28）====================
+# ffmpeg 自带 `-print_graphs`（7.x+）能把**已初始化**的滤镜图导成 JSON：每个滤镜实例、
+# 每条边的真实 pix_fmt / 宽高 / 声道 / 采样率 / 上下游。本项目据此拿到纯字符串解析
+# **猜不到**的信息 —— 「这一节点此刻到底是什么格式、多大、能不能挂 alpha 滤镜」。
+#
+# ★ 标签 → JSON 边 的映射关系（tests/_verify_print_graphs_map.py 37/37 实证，
+#   改这里前必须先跑那个探针）：
+#   ① 图内滤镜实例按**全局顺序**编号，id 形如 `G0_Parsed_<name>_<k>`，
+#      k = filter_complex 按 ';' 切段、段内再按顶层 ',' 切滤镜后的**全局实例序号**。
+#      ⚠️ 不是段序号：逗号链一段含多个实例，序号跨逗号累加（已实测证伪）。
+#   ② 标签 L 由「所在段的最后一个实例」的第 j 个输出 pad 产出
+#      ⇒ L 的真实属性 = 该实例 filter_outputs[j]。
+#   ③ ffmpeg **自动插入**的转换滤镜叫 `auto_*` / `G0_format`，**不占** Parsed_ 序号
+#      ⇒ 不会挤乱对齐（异格式 overlay 实测）。
+#   ④ 对齐不上（数量/名字不符、图串与 JSON 不匹配）一律返回失败，绝不猜、绝不静默错映射。
+# ⚠️ 老 ffmpeg（4.x/5.x）没有 -print_graphs ⇒ 必须能力探测 + 静默回落，绝不阻塞用户。
+
+
+def top_comma_split(body):
+    """按顶层逗号切分，感知单引号（drawtext=text='a,b' 里的逗号不是分隔符）。
+
+    与 graph_split 同款引号/转义规则 —— 两者合起来才能把 filter_complex 还原成
+    ffmpeg 眼里的「滤镜实例序列」。
+    """
+    parts, buf, q, esc = [], [], False, False
+    for ch in (body or ""):
+        if esc:
+            buf.append(ch); esc = False; continue
+        if ch == "\\":
+            buf.append(ch); esc = True; continue
+        if ch == "'":
+            q = not q; buf.append(ch); continue
+        if ch == "," and not q:
+            parts.append("".join(buf)); buf = []; continue
+        buf.append(ch)
+    parts.append("".join(buf))
+    return [p for p in parts if p.strip()]
+
+
+def graph_filter_instances(graph):
+    """把 filter_complex 展开成 ffmpeg 的滤镜实例序列 → [(段序号, 滤镜名), ...]。
+
+    顺序必须与 ffmpeg 建图顺序一致：`;` 分段 → 段内顶层 `,` 分滤镜。
+    movie=/color= 这类**源滤镜也占一个实例序号**（实测）。
+    """
+    out = []
+    for i, seg in enumerate(graph_split(graph)):
+        _ins, body, _outs = graph_parse_chain(seg)
+        for p in top_comma_split(body):
+            nm = p.strip().split("=", 1)[0].strip().lstrip("-")
+            if nm:
+                out.append((i, nm))
+    return out
+
+
+def pg_filter_id(f):
+    """取 filter 自身的 id —— JSON 里它**不在**顶层，只出现在 filter_inputs/outputs 中。"""
+    for io in (f.get("filter_inputs") or []):
+        if io.get("filter_id"):
+            return io["filter_id"]
+    for io in (f.get("filter_outputs") or []):
+        if io.get("filter_id"):
+            return io["filter_id"]
+    return ""
+
+
+def pg_inst_index(fid):
+    """`G0_Parsed_scale_0` → 0；非用户滤镜（auto_* / G0_format / buffer / sink）→ None。"""
+    if "_Parsed_" not in fid:
+        return None
+    try:
+        return int(fid.rsplit("_", 1)[1])
+    except Exception:
+        return None
+
+
+def pg_pick_graph(data, graph_str):
+    """挑出对应的那张图：优先 description 精确匹配，否则唯一含 Parsed_ 实例的图。
+
+    一张命令可能有多张图（-vf 与 -filter_complex 各一张），取错图等于全错。
+    """
+    graphs = (data or {}).get("graphs") or []
+    gs = (graph_str or "").strip()
+    for g in graphs:
+        if ((g.get("description") or "").strip()) == gs:
+            return g
+    cand = [g for g in graphs
+            if any(pg_inst_index(pg_filter_id(f)) is not None
+                   for f in (g.get("filters") or []))]
+    return cand[0] if len(cand) == 1 else None
+
+
+def pg_map_labels(data, graph_str):
+    """JSON + 原始图串 → (ok, {标签: 边属性})。
+
+    边属性 = {"media","fmt","w","h","sar","ch","sr","inst","fid","dest"}；
+    视频边给 fmt/w/h/sar，音频边给 ch/sr（音频边**没有** sample_fmt 字段，实测）。
+    ⚠️ 任何一步对不上都返回 (False, {})：宁可让界面显示「—」，也绝不给出错位的格式。
+    """
+    g = pg_pick_graph(data, graph_str)
+    if g is None:
+        return False, {}
+    insts = {}
+    for f in (g.get("filters") or []):
+        fid = pg_filter_id(f)
+        idx = pg_inst_index(fid)
+        if idx is not None:
+            insts[idx] = (f.get("filter_name"), fid, f)
+    mine = graph_filter_instances(graph_str)
+    if not insts or len(mine) != len(insts):
+        return False, {}
+    for k, (_seg, name) in enumerate(mine):
+        if k not in insts or insts[k][0] != name:
+            return False, {}
+    seg_last = {}
+    for k, (seg, _nm) in enumerate(mine):
+        seg_last[seg] = k          # 段 → 其最后一个实例的全局序号
+    res = {}
+    for i, seg in enumerate(graph_split(graph_str)):
+        _ins, _body, outs = graph_parse_chain(seg)
+        if not outs or i not in seg_last:
+            continue
+        _nm, fid, f = insts[seg_last[i]]
+        edges = sorted(f.get("filter_outputs") or [],
+                       key=lambda e: e.get("output_index", 0))
+        for j, lab in enumerate(outs):
+            if j >= len(edges):
+                continue
+            e = edges[j]
+            res[lab] = {"media": e.get("media_type"), "fmt": e.get("format"),
+                        "w": e.get("width"), "h": e.get("height"), "sar": e.get("sar"),
+                        "ch": e.get("channels"), "sr": e.get("sample_rate"),
+                        "inst": seg_last[i], "fid": fid, "dest": e.get("dest_filter_id")}
+    return True, res
+
+
+def pg_node_brief(info):
+    """边属性 → 节点列表里那一格显示的短串；测不到返回 ""（调用方显示「—」）。"""
+    if not info:
+        return ""
+    if info.get("media") == "audio":
+        _ch = info.get("ch")
+        _hz = ""
+        if info.get("sr"):
+            try:
+                # 音频边的 sample_rate 是 AVRational 字符串 "1/44100"
+                _hz = "%dHz" % round(1.0 / float(info["sr"]))
+            except Exception:
+                _hz = str(info["sr"])
+        return " ".join(x for x in (((_("%s声道") % _ch) if _ch else ""), _hz) if x)
+    _w, _h = info.get("w"), info.get("h")
+    _sz = ("%d×%d" % (_w, _h)) if (_w and _h) else ""
+    return " ".join(x for x in ((info.get("fmt") or ""), _sz) if x)
+
+
+def probe_tap_graph(graph, labels):
+    """给每个探测标签接一个 **split 旁路出口**，一次命令就能拿到全部节点的帧。
+
+    返回 (新图, {原标签: 可 -map 的标签})；一个都挂不上时返回 (原图, {})。
+
+    ⚠️ 为什么不能直接 `-map` 中间标签（2026-09-27 实测）：
+        ffmpeg 对「已被下游消费」的标签直接报错
+        `Output with label 'a' does not exist in any defined filter graph,
+         or was already used elsewhere`
+        （节点取帧旧做法因此必须先 truncate_at 截断、一次只能取一个节点）。
+    做法：把定义段的输出改到临时名 → `split=2` 分出「原名（原链继续用，一字不改）」
+    和「probe 出口（没人消费 → 可 -map）」。整图只多几段 split，解码仍然只有一次，
+    于是 N 个节点的尺寸 / 画面可以一趟跑完（旧做法要 N 趟）。
+    末段输出（无人消费）不需要 split，直接 map 原名。
+    """
+    segs = graph_split(graph)
+    if not segs or not labels:
+        return graph, {}
+    _used, _ins_all, _outs_all = set(), set(), set()
+    for _s in segs:
+        _i, _b, _o = graph_parse_chain(_s)
+        _ins_all.update(_i)
+        _outs_all.update(_o)
+        _used.update(_i)
+        _used.update(_o)
+
+    def _uniq(base):
+        _n = 0
+        while True:
+            _cand = "%s%s" % (base, ("%d" % _n) if _n else "")
+            if _cand not in _used:
+                _used.add(_cand)
+                return _cand
+            _n += 1
+
+    _rename, _extra, _map = {}, [], {}
+    for _L in labels:
+        if _L in _map or not _L:
+            continue
+        if _L not in _outs_all:
+            # 图里根本没有这个输出 → 必须跳过。不能落到下面「无人消费」分支：
+            # 那会凭空 map 一个不存在的标签，ffmpeg 直接报
+            # "Output with label 'x' does not exist in any defined filter graph"。
+            continue
+        if _L not in _ins_all:          # 无人消费（通常是图的出口）→ 直接 map 原名
+            _map[_L] = _L
+            continue
+        if _L in _rename:
+            continue
+        for _i, _s in enumerate(segs):
+            _ins, _body, _outs = graph_parse_chain(_s)
+            if len(_outs) == 1 and _outs[0] == _L:
+                _t = _uniq(_L + "__psrc")
+                segs[_i] = "%s%s[%s]" % ("".join("[%s]" % x for x in _ins), _body, _t)
+                _p = _uniq(_L + "__probe")
+                _extra.append("[%s]split=2[%s][%s]" % (_t, _L, _p))
+                _map[_L] = _p
+                break
+    if not _map:
+        return graph, {}
+    return ";".join(segs + _extra), _map
+
+
+# 「收尾」类末滤镜：出现在图上就当它是收尾环节（尺寸/帧率归一、字幕烧录、画布…）
+_NODE_TAIL_FILTERS = ("format", "fps", "pad", "setsar", "setdar", "colorspace",
+                      "subtitles", "ass", "drawtext", "scale2ref")
+
+
+def node_group_of(name, last_filter, is_last=False):
+    """节点 → 分组名（两级树的第一级；纯显示层）。
+
+    顺序：转场(xfade) → 子链(子视频预处理) → 主链(主视频/画布基底) → 叠加(overlay)
+    → 收尾(图末段或收尾类滤镜) → 其它。漏匹配落「其它」，绝不硬塞进错组。
+    """
+    _n = (name or "").strip().lower()
+    _f = (last_filter or "").strip().lower()
+    if "xfade" in _f:
+        return _("转场")
+    if _n.startswith("v_temp_") or _n.startswith("v_crop_"):
+        return _("子链")
+    if _n in ("v_main_proc", "v_main_base", "v_base", "v1") or \
+            _n.startswith("v_base") or _n.startswith("vt"):
+        return _("主链")
+    if _n.startswith("v_out_") or "overlay" in _f:
+        return _("叠加")
+    if is_last or _f in _NODE_TAIL_FILTERS:
+        return _("收尾")
+    return _("其它")
+
+
+_NODE_GROUP_ORDER = (_("主链"), _("子链"), _("叠加"), _("转场"), _("收尾"), _("其它"))
 
 
 def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = True, include_speed: bool = True,
@@ -4333,8 +5407,14 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
     # 不生效，有限显示窗口形同虚设。
     if window_start is not None and window_end is not None and window_end > window_start:
         if loop_size is not None and loop_size > 0:
-            _wc = int(window_loop_count) if window_loop_count and int(window_loop_count) > 0 else 1
-            filters.append(f"loop=loop={_wc}:size={int(loop_size)}:start=0")
+            # window_loop_count = **重复次数**（总供给 = N+1 遍）。显式 0 = 窗口一遍即满，
+            # 不加 loop（防回放帧 pts 回退泄漏进显示边界 → 闪首帧）；None 才兜底 1（旧行为）。
+            if window_loop_count is None:
+                _wc = 1
+            else:
+                _wc = int(window_loop_count)
+            if _wc > 0:
+                filters.append(f"loop=loop={_wc}:size={int(loop_size)}:start=0")
         # 锚定子链首帧到输出时间线 show_start（TB=输入时基，show_start/TB 即 show_start 秒）。
         # 此时 PTS 已归零（截取/loop 保证），setpts 同时完成重置+偏移；窗口外不产生帧。
         filters.append(f"setpts=PTS-STARTPTS+{float(window_start):.6g}/TB")
@@ -4361,7 +5441,7 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
     if motion_trim_start is not None:
         _blur_tbase = float(motion_trim_start)
     else:
-        _blur_tbase, _ = _trim_speed_from_settings(settings)
+        _blur_tbase, _unused = _trim_speed_from_settings(settings)
     if settings.get("blur_enabled", False):
         # 多区域列表（2026-08-26）：遍历 blur_items 生成多条；无列表时回退旧单键（统一出口）
         blur_items = _effective_blur_items(settings)
@@ -5085,7 +6165,7 @@ def _font_names_from_file(path: str) -> Optional[dict]:
                 return None
             recs = []
             q = 6
-            for _ in range(count):
+            for _unused in range(count):
                 if q + 12 > len(nb):
                     break
                 recs.append(struct.unpack(">HHHHHH", nb[q:q + 12]))
@@ -5331,14 +6411,7 @@ def _build_drawtext_enable(s: dict, trim_start=0.0, speed_factor=1.0):
     绝对时间点(start/end)减 trim 再除 speed；周期/时长(cycle/show)只除 speed。
     预览 settings 已禁用 trim → 不换算。
     """
-    def _f(v):
-        v = (v or "").strip()
-        if v == "":
-            return None
-        try:
-            return float(v)
-        except (ValueError, TypeError):
-            return None
+    _f = _opt_float  # 空串/None/非法 → None（2026-09-22 抽公共，原局部 _f 上移）
     _ts = float(trim_start or 0.0)
     try:
         _sp = float(speed_factor or 1.0)
@@ -5370,6 +6443,33 @@ def _build_drawtext_enable(s: dict, trim_start=0.0, speed_factor=1.0):
         return f"lte(t,{_ffsec(end)})"
     return ""
 
+def _tw_multiline_on(tw_settings) -> bool:
+    """文字水印「多行（竖排）」开关：tw['multiline'] 真值判定（容忍 JSON 里的字符串形式）。"""
+    v = (tw_settings or {}).get("multiline", False)
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
+
+
+def _tw_effective_text(tw_settings) -> str:
+    """文字水印「有效渲染文本」——编辑器矩形估算与 drawtext 共用的唯一真相源。
+
+    - `multiline` 开：保留换行（富文本 / @字体式竖排，drawtext 逐行渲染）。
+      真实 0x0A 在 ffmpeg n9 / n71 / 4.3 三版本 drawtext 均渲染多行
+      （研究档案 research/vertical-countdown 结论 1）；且**不加引号**的写法同样成立
+      （tests/_verify_tw_multiline.py 实测 bands=3）→ 转义链与 mpv 路径无需改动。
+    - `multiline` 关：沿用旧行为，多行拼成一行（空格分隔）。
+
+    2026-09-25：编辑器 wm_w/wm_h 与渲染端 crop 盒都取自本函数，二者必须同源，
+    否则「编辑器按多行画高框、渲染却压成单行」→ 用户报「设置与显示不符 / 文字没当富文本」。
+    """
+    raw = str((tw_settings or {}).get("text", "") or "")
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    if _tw_multiline_on(tw_settings):
+        return raw.strip("\n")
+    return " ".join(countdown_lines(raw))
+
+
 def build_drawtext_filter(tw_settings: dict, trim_start=0.0, speed_factor=1.0):
     """
     根据文字水印设置构建 drawtext 滤镜字符串。
@@ -5379,9 +6479,10 @@ def build_drawtext_filter(tw_settings: dict, trim_start=0.0, speed_factor=1.0):
     """
     if not tw_settings or not tw_settings.get("enabled", False):
         return ""
-    # 富文本（含换行）在这里必须拼成一行：单个 drawtext 的 text 里塞真实换行字节只有在
-    # 部分版本 ffmpeg 上才渲染，且会把命令预览弄成一坨断行 —— 多行排版只属于倒计时模式。
-    text = " ".join(countdown_lines(tw_settings.get("text", "")))
+    # 有效文本（2026-09-25 统一）：multiline 开 → 保留换行（竖排）；关 → 拼成一行。
+    # 旧注释「必须拼成一行」已作废：真实换行在 n9/n71/4.3 三版本均能渲染，且不加引号
+    # 也成立（tests/_verify_tw_multiline.py），故不再强制压平。
+    text = _tw_effective_text(tw_settings)
     if not text:
         return ""
     font_name = tw_settings.get("font_name", _("微软雅黑"))
@@ -5402,6 +6503,7 @@ def build_drawtext_filter(tw_settings: dict, trim_start=0.0, speed_factor=1.0):
     y_expr = tw_settings.get("overlay_y", "10").strip() or "10"
     # 动态轨迹（与图片/视频水印同套逻辑；文字尺寸用 tw/th，主画布用 main_w/main_h）
     _mv = (tw_settings.get("move_mode", "") or "").strip()
+    _wpr = None
     if _mv == "waypoints":
         # 列表轨迹：画布绝对像素（数字），drawtext x/y 表达式含 t 每帧求值
         _wpr = build_waypoint_expr(tw_settings.get("move_waypoints"),
@@ -5440,6 +6542,9 @@ def build_drawtext_filter(tw_settings: dict, trim_start=0.0, speed_factor=1.0):
                                          speed_factor=speed_factor)
     if enable_expr:
         parts.append(f"enable='{enable_expr}'")
+    # 列表轨迹透明度（oa→ob 段内线性插值）：与 fontcolor@opacity 相乘（drawtext alpha × 颜色透明度）
+    if _wpr is not None and _wpr[4] is not None:
+        parts.append(f"alpha='{_wpr[4].replace(chr(39), chr(92) + chr(39))}'")
     return "drawtext=" + ":".join(parts)
 
 
@@ -5639,9 +6744,9 @@ def build_text_watermark_filtergraph(tw_settings: dict, main_label: str = "", ou
     """
     if not tw_settings or not tw_settings.get("enabled", False):
         return ""
-    # 兜底的多行 handling：倒计时子图算不出来（如字体缺失）退回单 drawtext 时，
-    # 富文本里的换行拼成一行——真实换行字节塞进 filter 串会在部分版本上不渲染/报错。
-    text = " ".join(countdown_lines(tw_settings.get("text", "")))
+    # 有效文本（2026-09-25 统一）：multiline 开 → 保留换行（富文本 / @字体式竖排，
+    # drawtext 逐行渲染）；关 → 拼成一行（历史行为，旧工程兼容）。
+    text = _tw_effective_text(tw_settings)
     if not text:
         return ""
     # 倒计时（滚动小窗）：独占表现形式，优先于旋转/spin/轨迹返回自己的子图。
@@ -5668,7 +6773,7 @@ def build_text_watermark_filtergraph(tw_settings: dict, main_label: str = "", ou
     x_expr = (tw_settings.get("overlay_x", "10") or "10").strip() or "10"
     y_expr = (tw_settings.get("overlay_y", "10") or "10").strip() or "10"
 
-    def _dt_parts(xv, yv):
+    def _dt_parts(xv, yv, alpha_expr=None):
         parts = [
             f"fontfile={escape_drawtext_path(font_path)}",
             f"text={escape_drawtext_text(text)}",
@@ -5689,6 +6794,9 @@ def build_text_watermark_filtergraph(tw_settings: dict, main_label: str = "", ou
                                              speed_factor=speed_factor)
         if enable_expr:
             parts.append(f"enable='{enable_expr}'")
+        # 列表轨迹透明度（oa→ob 段内线性插值）：与 fontcolor@opacity 相乘（drawtext alpha × 颜色透明度）
+        if alpha_expr is not None:
+            parts.append(f"alpha='{alpha_expr.replace(chr(39), chr(92) + chr(39))}'")
         return ":".join(parts)
 
     rotate = tw_settings.get("rotate", 0)
@@ -5710,11 +6818,17 @@ def build_text_watermark_filtergraph(tw_settings: dict, main_label: str = "", ou
     _mv = (tw_settings.get("move_mode", "") or "").strip()
     _wp_res_tw = None
     _wp_rot_tw = False
+    # 列表轨迹透明度（oa→ob）：默认 None（仅 waypoints 模式赋值）；非 waypoints 时
+    # 必须在外层先初始化，否则下方非旋转分支 _dt_parts(..., _tw_alpha_expr_tw) 会触发
+    # UnboundLocalError（画中画模式简单单条水印即命中，导致整条命令崩掉、不出命令）。
+    _tw_alpha_expr_tw = None
     if _mv == "waypoints":
         _wp_res_tw = build_waypoint_expr(tw_settings.get("move_waypoints"),
                                          spin_speed=sp,
                                          trim_start=trim_start, speed_factor=speed_factor)
         _wp_rot_tw = (_wp_res_tw is not None and _wp_res_tw[2] is not None)
+        # 列表轨迹透明度（oa→ob）：与静态 opacity 相乘（drawtext alpha × fontcolor@opacity）
+        _tw_alpha_expr_tw = (_wp_res_tw[4] if (_wp_res_tw is not None and _wp_res_tw[4] is not None) else None)
     needs_rot = rotate != 0 or (spin_on and sp != 0) or _wp_rot_tw
 
     # 动态轨迹（move）：旋转时子层尺寸用裁剪后的文字包围盒（含 padding）做钳制；
@@ -5728,7 +6842,7 @@ def build_text_watermark_filtergraph(tw_settings: dict, main_label: str = "", ou
             if _mx is not None:
                 x_expr = _mx.replace("W", "main_w").replace("H", "main_h")
                 y_expr = _my.replace("W", "main_w").replace("H", "main_h")
-        dt = "drawtext=" + _dt_parts(x_expr, y_expr)
+        dt = "drawtext=" + _dt_parts(x_expr, y_expr, _tw_alpha_expr_tw)
         return f"{main_label}{dt}{out_label}" if main_label else f"{dt}{out_label}"
 
     # ---- 旋转：透明层 + drawtext(居中) + rotate(静态/spin) + overlay ----
@@ -5985,12 +7099,7 @@ def build_tw_countdown_subgraph(tw_settings, main_label: str = "", out_label: st
         dt_nodes.append("drawtext=" + ":".join(p))
 
     # ---- ② 滚动时段换算（同 _build_drawtext_enable 口径：秒随 trim 平移、除 speed）----
-    def _f(v):
-        v = (v or "").strip()
-        try:
-            return float(v) if v else None
-        except (ValueError, TypeError):
-            return None
+    _f = _opt_float  # 空串/None/非法 → None（2026-09-22 抽公共，原局部 _f 上移）
     _ts = float(trim_start or 0.0)
     try:
         _sp = float(speed_factor or 1.0)
@@ -6051,6 +7160,100 @@ def build_tw_countdown_subgraph(tw_settings, main_label: str = "", out_label: st
     ])
 
 
+def wrap_image_static_timed_complex(lavfi_complex_str, base_vf, w, h, dur,
+                                    vin="[VIN]", prefix="", fps=30, out="v0"):
+    """图片主视频 + 带时间滤镜（倒计时/轨迹/旋转）的 mpv 动画修复（纯函数，2026-09-19）。
+
+    2026-09-22 参数化（A5 收敛）：原先只有 `[VIN]` + `[v0]` 一种形态，导致封装页画中画
+    （`[vid1]` 且带 loop/trim 前缀）只能内联手抄一遍。现补 4 个可选参数，默认值与旧调用
+    逐字等价，故既有调用方零行为变化：
+      · vin    主输入标签（画中画传 "[vid1]"）；
+      · prefix 主输入标签后的前置滤镜串（画中画传 loop/trim 前缀，需带尾逗号）；
+      · fps    基源帧率（默认 30，与旧硬编码一致）；
+      · out    输出标签名（不含方括号，默认 "v0"）。
+
+    静态图片在 mpv 里只被解码成「单帧」：若 lavfi-complex 最终输出的主输入是图片
+    ([VIN])，整张滤镜图只在该单帧上求值一次，时间变量 t 卡死 → 倒计时/轨迹不动。
+    修复 = 前置一个连续 color 基源、把图片作为「被保持的次输入」叠上去（overlay 默认
+    eof_action=repeat 保持图片），使 [v0] 变连续流。这精确镜像用户已验证可用的 fade 写法
+    （连续 color 作主时间轴驱动，图片作被保持的次输入）。
+
+    仅对 mpv 的 lavfi-complex 路径生效；ffplay 走 -loop 1 天然连续，不走此函数。
+    :param base_vf: 主视频前置滤镜链（如 'format=yuv420p' 或 ''/'null'）；
+                    与 lavfi_complex_str 首节点 '[VIN]{base_vf}[v0]' 保持一致。
+    :param w,h,dur: 图片尺寸与显示时长（秒）；基源 s=WxH、r=30、d=dur。
+    :return: 改写后的 lavfi-complex 字符串（首节点变为
+             '[VIN]{base_vf}[cd_v0];[cd_base][cd_v0]overlay=format=auto[v0]'，
+             前置 'color=c=black@0:s=WxH:r=30:d=dur[cd_base];'）；
+             注意 [cd_base] 只能作为 overlay 的主输入，绝不能前置到 format 这类单输入滤镜前
+             （否则 filtergraph 报「输入数不符」→ mpv 无画面）；[VIN] 经 format 后只产生 [cd_v0]，
+             再由 overlay 叠到连续基源上。若首节点形态不匹配则原样返回（如画布图，其首节点
+             不是 [VIN]{base_vf}[v0]）。
+    """
+    if not lavfi_complex_str:
+        return lavfi_complex_str
+    try:
+        _w = int(w); _h = int(h); _d = float(dur)
+    except (ValueError, TypeError):
+        return lavfi_complex_str
+    if _w <= 0 or _h <= 0 or _d <= 0:
+        return lavfi_complex_str
+    _bf = base_vf if (base_vf and base_vf != "null") else "format=yuv420p"
+    _old = f"{vin}{prefix}{_bf}[{out}]"
+    if _old not in lavfi_complex_str:
+        return lavfi_complex_str
+    _new = (f"{vin}{prefix}{_bf}[cd_v0];"
+            f"[cd_base][cd_v0]overlay=format=auto[{out}]")
+    _pre = f"color=c=black@0:s={_w}x{_h}:r={fps:g}:d={_ffsec(_d)}[cd_base];"
+    return _pre + lavfi_complex_str.replace(_old, _new, 1)
+
+
+def ffplay_image_main_vf(vf, dur):
+    """图片主视频的 ffplay `-vf` 图改写：让单帧图片变成「可循环 + 到点收尾」的连续流（2026-09-21）。
+
+    为什么必须改写（真机实测 ffplay n9.0.1，SDL dummy 无头）：
+      - `-loop 1 -i img.jpg` 在 ffplay 下**不循环** ⇒ 1 帧读完即退窗（实测 0.64s）；
+      - `-autoexit` 盯的是**主输入 EOF**，图片输入只有 1 帧 ⇒ 立刻 EOF 退窗；
+      - 只前置 color 连续基源（mpv 的 wrap）也救不了退窗（实测仍 0.64s）——它解决的是
+        「时间变量 t 卡死」（倒计时/轨迹/旋转不动），不是输入 EOF。
+
+    ✅ 破法（与封装页画中画 ffplay 路线同款、已实测）：图首给主输入注入
+    `loop=loop=-1:size=1:start=0,setpts=PTS-STARTPTS,` 把主分支变**无限流**，图尾
+    `trim=0:N,setpts=PTS-STARTPTS` 收尾 ⇒ `-autoexit` 转而等【输出】结束，窗口在 N 秒正常关。
+    实测 6s 图：0.64s → 6.63s（存活 = 图长）。
+
+    :param vf:  ffplay 的 -vf 字符串。两种形态都支持：
+                · 分号多段图（含 `[in]`/`[out]` 显式标签，如复杂图改写结果）；
+                · 纯逗号链（无标签，如普通滤镜链）。
+    :param dur: 图片显示时长（秒）；无效/<=0 时原样返回（调用方保持旧行为）。
+    :return: 改写后的 -vf 字符串。
+    """
+    try:
+        _d = float(dur)
+    except (ValueError, TypeError):
+        return vf
+    if not vf or _d <= 0:
+        return vf
+    _pfx = "loop=loop=-1:size=1:start=0,setpts=PTS-STARTPTS,"
+    _tail = f"trim=0:{_ffsec(_d)},setpts=PTS-STARTPTS"
+    if "[in]" in vf:
+        g = vf.replace("[in]", "[in]" + _pfx, 1)
+        if "[out]" in g:
+            g = g.replace("[out]", "[v_img_loop]", 1)
+        else:
+            # 图的末标签不是 [out]（异常形态）→ 取最后一个输出标签接尾
+            _tags = re.findall(r"\[([^\]]+)\](?=\s*(?:;|$))", g)
+            if not _tags:
+                return vf
+            g = g.replace(f"[{_tags[-1]}]", "[v_img_loop]", 1)
+        return f"{g};[v_img_loop]{_tail}[out]"
+    # 分号多段图却拿不到 [in]（异常形态：调用方未用 [VIN]/[vid1] 占位）→ 前缀无处可插，
+    # 原样返回（调用方另打日志）。绝不能退化成拼逗号链：`loop=..,<段1>;<段2>,trim=..`
+    # 是坏图，ffplay 只会给黑窗 + stderr 噪声。
+    if ";" in vf:
+        return vf
+    # 纯逗号链：直接首尾相接（loop 前缀 + 末端 trim）
+    return f"{_pfx}{vf},{_tail}"
 
 
 def build_text_watermark_chain(tw_input, main_label: str = "", out_label: str = "[v_tw]") -> str:
@@ -6130,8 +7333,26 @@ def text_watermark_active(tw_settings) -> tuple:
     return enabled, (enabled and text_watermark_needs_subgraph(tw_settings))
 
 
+def _cmd_has_output_option(cmd_list, *opts):
+    u"""命令的【输出侧】是否已含指定选项（如 -t / -to / -shortest）。
+
+    ffmpeg 的 -t/-to/-shortest 是位置相关选项：出现在最后一个 -i 之前的是【输入级】，
+    只作用于该输入（例如图片素材烘焙出的 "-loop 1 -framerate 30 -t 16 -i img" 只让这张图
+    读 16 秒），并不能限制整体输出。所以判断「输出已有时长限制」必须只看最后一个 -i
+    之后的部分——否则输入级 -t 会让输出级限制被误判成已存在而漏加，无限源（文字水印旋转
+    画布 color=c=black@0）就再也没人截断。
+    同口径先例见 _adjust_end_concat_duration 的 last_i 写法。"""
+    last_i = -1
+    for idx, a in enumerate(cmd_list):
+        if a == "-i":
+            last_i = idx
+    tail = cmd_list[last_i + 1:]
+    return any(o in tail for o in opts)
+
+
 def _ensure_tw_duration_limit(app, cmd_list, *, input_path=None, main_duration=None,
-                              audio_enabled=True, tag=_("[文字水印]")):
+                              audio_enabled=True, tag=_("[文字水印]"),
+                              image_display_duration=None):
     """文字水印旋转/持续旋转(spin)时，build_text_watermark_filtergraph 使用
     color=c=black@0:s=WxH:d=999999 的无限时长透明源；若命令尚未加任何时长限制，
     必须补上时长限制，否则输出会被无限拉长到 999999s（甚至卡死）。
@@ -6148,8 +7369,9 @@ def _ensure_tw_duration_limit(app, cmd_list, *, input_path=None, main_duration=N
     # 仅当命令确实包含文字水印的无限透明源时才需要限制
     if not any("color=c=black@0" in str(a) for a in cmd_list):
         return
-    # 已有限制（trim 自带 -t、或别处已加 -shortest）则跳过，避免重复
-    if "-shortest" in cmd_list or "-t" in cmd_list:
+    # 输出侧已有限制（别处已加输出级 -t / -shortest）则跳过，避免重复。
+    # 注意只看输出侧：输入级 -t（图片素材烘焙时长 -loop 1 -t N -i img）不能截断无限源画布。
+    if _cmd_has_output_option(cmd_list, "-shortest", "-t"):
         return
     has_audio_stream = False
     if input_path and os.path.exists(input_path):
@@ -6168,7 +7390,8 @@ def _ensure_tw_duration_limit(app, cmd_list, *, input_path=None, main_duration=N
     # 避免文字水印旋转/spin 触发的时长限制把 -t 干扰成 -t 0.040。
     if input_path and os.path.exists(input_path) and \
             os.path.splitext(input_path)[1].lower() in ('.png', '.jpg', '.jpeg', '.bmp', '.webp'):
-        eff = 10.0
+        # 图片主视频：优先用用户设定的「显示时长」(img_duration)，否则回退 10s
+        eff = image_display_duration if (image_display_duration and image_display_duration > 0) else 10.0
     elif not (eff and eff > 0) and input_path and os.path.exists(input_path):
         try:
             eff = app._get_media_duration(input_path)
@@ -6181,9 +7404,55 @@ def _ensure_tw_duration_limit(app, cmd_list, *, input_path=None, main_duration=N
         cmd_list.append("-shortest")
         try:
             app._append_info_ui(
-                _("{0} 警告：无法计算主视频时长，使用 -shortest 控制输出。").format(tag))
+                _('{0} 警告：无法计算主视频时长，使用 -shortest 控制输出。').format(tag))
         except Exception:
             pass
+
+
+def _eff_image_display_duration(settings, default=10.0):
+    u"""图片素材的「显示时长(秒)」：优先取用户设置的 img_duration，否则回退 default。
+
+    图片文件本身无时长概念（ffprobe 对图片常返回 N/A 或 0.04s 小值），
+    显示时长完全由用户在「截取」面板设定，不依赖文件探测值。"""
+    if not settings:
+        return default
+    d = settings.get("img_duration", "")
+    if d:
+        try:
+            s = time_to_seconds(str(d))
+            if s and s > 0:
+                return s
+        except Exception:
+            pass
+    return default
+
+
+def _merge_output_total_duration(app, enabled_tracks):
+    u"""串行合并多素材时，整条时间轴的总时长 = 各启用视频轨道有效时长之和。
+
+    图片素材取其「显示时长」(img_duration)；真实视频取探测时长（尊重截取）。
+    不含转场重叠扣减——转场由用户后续作为独立文件处理（与 NLE「每张图=自带时长的 clip」一致）。"""
+    total = 0.0
+    for t in enabled_tracks:
+        if getattr(t, "type", "video") != "video":
+            continue
+        st = getattr(t, "enc_settings", None) or {}
+        p = normalize_path(getattr(t, "file_path", "") or "")
+        if app._is_static_image(p):
+            total += _eff_image_display_duration(st)
+        else:
+            d = app._get_media_duration(p) if p else None
+            if d:
+                if st.get("trim_enabled"):
+                    try:
+                        ss = time_to_seconds(str(st.get("trim_start", "")).strip() or "0") or 0.0
+                        es = time_to_seconds(str(st.get("trim_end", "")).strip() or "")
+                        if es is not None:
+                            d = max(0.0, es - ss)
+                    except Exception:
+                        pass
+                total += d
+    return total
 
 
 # ================== 视频尺寸计算 ==================
@@ -6276,32 +7545,71 @@ def get_video_display_geometry(ffprobe_cmd: str, file_path: str):
             fw = max(1, int(round(w * sn / sd)))
     return w, h, fw, fh, sn, sd
 
+# get_video_rotated_dimensions 原本每次调用要起 2 个 ffprobe 子进程（尺寸 + 元数据旋转），
+# 而预览路径（_preview_with_settings）单次会对同一个水印文件重复调用 4 次 ⇒ 这里按
+# (路径, mtime) 缓存，源文件一改自动失效。与 FFmpegBatchGUI._get_video_dimensions_cached
+# 同口径（都是 path+mtime）。
+# ⚠ 失败不进缓存（超时 / rc≠0 / 解析失败下次仍重试），避免把「这次没探到」固化成「没有旋转」。
+_PROBE_CACHE_MAX = 256
+_PROBE_DIM_CACHE = {}      # (path, mtime) -> (w, h)
+_PROBE_ROT_CACHE = {}      # (path, mtime) -> Optional[int] 元数据旋转角
+
+def _probe_cache_key(file_path):
+    """取不到 mtime 时返回 None（= 本次不缓存）"""
+    try:
+        return (file_path, os.path.getmtime(file_path))
+    except OSError:
+        return None
+
+def _probe_cache_put(cache, key, value):
+    if key is None:
+        return
+    if len(cache) >= _PROBE_CACHE_MAX:
+        cache.clear()
+    cache[key] = value
+
 def get_video_rotated_dimensions(ffprobe_cmd: str, file_path: str, settings: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
-    """获取考虑元数据旋转和用户旋转后的尺寸"""
-    w, h = get_video_dimensions(ffprobe_cmd, file_path)
+    """获取考虑元数据旋转和用户旋转后的尺寸
+
+    尺寸与元数据旋转各带一层缓存（见上方 _PROBE_*）：重复调用不再重复起 ffprobe。
+    用户旋转（settings["rotate"]）**不进**缓存 key —— 它是在返回值上临时叠加的。
+    """
+    _ckey = _probe_cache_key(file_path)
+    if _ckey is not None and _ckey in _PROBE_DIM_CACHE:
+        w, h = _PROBE_DIM_CACHE[_ckey]
+    else:
+        w, h = get_video_dimensions(ffprobe_cmd, file_path)
+        if w is not None and h is not None:
+            _probe_cache_put(_PROBE_DIM_CACHE, _ckey, (w, h))
     if w is None:
         return None, None
     # 检测元数据旋转
     if ffprobe_cmd:
-        cmd = [ffprobe_cmd, "-v", "error", "-select_streams", "v:0",
-               "-show_entries", "stream=side_data_list", "-of", "json", file_path]
-        try:
-            flags = _ffmpeg_spawn_flags()
-            result = subprocess.run(cmd, capture_output=True, text=True,
-                                    timeout=_GLOBAL_SETTINGS["ffprobe_timeout"], creationflags=flags)
-            if result.returncode == 0:
-                data = json.loads(result.stdout)
-                streams = data.get("streams", [])
-                if streams:
-                    side_data = streams[0].get("side_data_list", [])
-                    for sd in side_data:
-                        if sd.get("rotation") is not None:
-                            rot = int(sd.get("rotation"))
-                            if rot % 180 == 90:
-                                w, h = h, w
-                            break
-        except:
-            pass
+        rot = None
+        if _ckey is not None and _ckey in _PROBE_ROT_CACHE:
+            rot = _PROBE_ROT_CACHE[_ckey]
+        else:
+            cmd = [ffprobe_cmd, "-v", "error", "-select_streams", "v:0",
+                   "-show_entries", "stream=side_data_list", "-of", "json", file_path]
+            try:
+                flags = _ffmpeg_spawn_flags()
+                result = subprocess.run(cmd, capture_output=True, text=True,
+                                        timeout=_GLOBAL_SETTINGS["ffprobe_timeout"], creationflags=flags)
+                if result.returncode == 0:
+                    data = json.loads(result.stdout)
+                    streams = data.get("streams", [])
+                    if streams:
+                        side_data = streams[0].get("side_data_list", [])
+                        for sd in side_data:
+                            if sd.get("rotation") is not None:
+                                rot = int(sd.get("rotation"))
+                                break
+                    # 只有 rc==0 才写入缓存（失败留给下次重试）
+                    _probe_cache_put(_PROBE_ROT_CACHE, _ckey, rot)
+            except:
+                pass
+        if rot is not None and rot % 180 == 90:
+            w, h = h, w
     # 用户旋转
     rotate = settings.get("rotate", "none")
     if rotate in ("90", "270"):
@@ -6427,7 +7735,7 @@ def rotate_box_size(w, h, stages=1):
     （图片/视频水印把三种角度合并进**单道** rotate，不受影响）。
     """
     bw, bh = float(w), float(h)
-    for _ in range(max(0, int(stages))):
+    for _unused in range(max(0, int(stages))):
         bw = bh = (bw * bw + bh * bh) ** 0.5
     return bw, bh
 
@@ -6480,6 +7788,68 @@ def overlay_rotation_active(settings, wp_rot=None):
         except Exception:
             return False
     return False
+
+
+def _pipe_scale_abs_coord(expr, factor):
+    """管道预览「工作分辨率上限」下，把**原始画面空间**的绝对像素坐标换算到缩小后的空间。
+
+    背景（2026-09-21 用户实测）：上限把帧整体乘 f=上限/帧宽 缩小后，设置里写死的绝对像素
+    （简易位置/水印的数字、列表轨迹航点、四角边距）不会跟着变 → 子视频在缩小后的画布里相对
+    更靠右下，表现为「主视频与子视频之间很大空隙」。mpv/ffplay 不做降采样，故只在管道预览出现；
+    f = 上限/原始宽 → 原始越大偏得越多（用户实测「原始尺寸越大，空隙越大」）。
+    含画布/子视频尺寸变量（W/H/w/h 等）或函数名的表达式由 ffmpeg 在图内按**当前（已缩小的）**
+    空间求值，不需要也不应再缩放 → 原样返回。factor>=1 时原样返回（零行为变化）。
+    """
+    try:
+        f = float(factor)
+    except (TypeError, ValueError):
+        return expr
+    if f == 1.0 or expr is None:
+        return expr
+    s = str(expr).strip()
+    if not s or re.search(r"[A-Za-z_]", s):
+        return expr
+    try:
+        return "%g" % (float(s) * f)
+    except (ValueError, TypeError):
+        return expr
+
+
+def _pipe_scale_pos_settings(settings, factor):
+    """把定位类设置的**绝对像素坐标**从「原始画面空间」换算到「工作分辨率上限缩小后的空间」。
+
+    覆盖键：overlay_x / overlay_y（简易位置基准；纯数值才换算）、move_margin（四角边距）、
+    move_waypoints[].x / y（列表轨迹航点，画布绝对像素）。含画布/子尺寸变量（W/H/w/h）的表达式
+    由 ffmpeg 在图内按**当前（已缩小的）空间**求值 → 原样保留。factor>=1（含非数值）时
+    **原样返回同一对象**：零拷贝、零行为变化。
+
+    三处共用（画中画预览子视频 / 转换页图片水印 / 转换页文字水印）——同一换算只留一份实现，
+    避免多处漂移。原 dict 不会被修改（f<1 时先浅拷贝）。
+    """
+    try:
+        f = float(factor)
+    except (TypeError, ValueError):
+        return settings
+    if f == 1.0 or not settings:
+        return settings
+    out = dict(settings)
+    for _k in ("overlay_x", "overlay_y", "move_margin"):
+        if _k in out:
+            out[_k] = _pipe_scale_abs_coord(out.get(_k), f)
+    _wps = out.get("move_waypoints")
+    if isinstance(_wps, list) and _wps:
+        _sw = []
+        for _w in _wps:
+            if not isinstance(_w, dict):
+                _sw.append(_w)
+                continue
+            _w2 = dict(_w)
+            for _ax in ("x", "y"):
+                if _ax in _w2:
+                    _w2[_ax] = _pipe_scale_abs_coord(_w2.get(_ax), f)
+            _sw.append(_w2)
+        out["move_waypoints"] = _sw
+    return out
 
 
 def _pad_canvas_geometry(main_settings) -> Optional[Tuple[int, int, str, str]]:
@@ -6817,7 +8187,7 @@ def detect_crop(ffmpeg_cmd: str, input_file: str, timeout: float = 15) -> Option
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, encoding='utf-8', errors='replace',
                                 creationflags=_ffmpeg_spawn_flags())
-        _, stderr = proc.communicate(timeout=timeout)
+        _unused, stderr = proc.communicate(timeout=timeout)
         pattern = re.compile(r'crop=(\d+):(\d+):(\d+):(\d+)')
         matches = pattern.findall(stderr)
         if not matches:
@@ -6866,7 +8236,8 @@ def launch_player(file_path: str, filters: str = "", audio_only: bool = False, v
 
     flags = _ffmpeg_spawn_flags()
     try:
-        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
+        _p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
+        _register_preview_proc(_p)
     except Exception as e:
         print(_("预览失败: {0}").format(e))
 
@@ -7211,7 +8582,7 @@ class ParamValidator:
             else:
                 ok, msg = ParamValidator.validate_bitrate(audio_bitrate)
                 if not ok:
-                    errors.append(f"音频比特率: {msg}")
+                    errors.append(_('音频比特率: {0}').format(msg))
         return errors
 
 # ================== 编码器策略 ==================
@@ -7378,7 +8749,7 @@ def append_video_output_extras(cmd_list: List[str], settings: Dict[str, Any]) ->
                 cmd_list.extend([_opt, _v])
             else:
                 # 非法值防御：下拉 readonly 正常到不了这里，防旧预设/手改配置脏值拖垮整个命令
-                print(f"[输出颜色标记] 忽略非法值 {_key}={_v!r}")
+                print(_('[输出颜色标记] 忽略非法值 {0}={1}!r').format(_key, _v))
     # 原色/传输：本机实测（n9.0.1）-color_primaries/-color_trc 会被 libx264/x265/svtav1
     # 封装器静默丢弃（y4m 无侧数据输入同样丢，排除帧侧数据覆盖），而编码器私有参数
     # （原生 VUI）可靠落盘 → 这三个编码器走私有参数，其余编码器退回通用选项（尽力而为）
@@ -8172,7 +9543,7 @@ class FrameSettingsDialog(tk.Toplevel):
     """
 
     def __init__(self, parent, gop_var, keyint_min_var, frame_sync_var,
-                 title="帧设置", show_gop=True, refresh_cb=None, note="",
+                 title=_('帧设置'), show_gop=True, refresh_cb=None, note="",
                  read_only=False):
         super().__init__(parent)
         self.title(_(title))
@@ -8318,7 +9689,7 @@ class VideoFilterFrame(ttk.LabelFrame):
     # 封装页只有一条输出视频流，GOP(-g/-keyint_min) 与帧同步(-vsync/-fps_mode) 都只从
     # 【主视频轨道】enc_settings 读（append_video_output_extras 的调用点全是 main_video）
     # → 非主视频轨道上这两项都不生效，故弹窗置为只读，避免改了没反应。
-    frame_settings_title = "帧设置"
+    frame_settings_title = _('帧设置')
     frame_settings_note = ""
     frame_settings_read_only = False
 
@@ -8797,7 +10168,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                 except Exception:
                     pass
                 self.app._append_info_ui(
-                    f"[裁剪辅助] 取帧超时(30s): {os.path.basename(input_file)} @ {frame_sec:.2f}s")
+                    _('[裁剪辅助] 取帧超时(30s): {0} @ {1}:.2fs').format(os.path.basename(input_file), frame_sec))
                 return None, None, None
             if proc.returncode != 0 or not data:
                 if proc.returncode != 0:
@@ -8807,14 +10178,14 @@ class VideoFilterFrame(ttk.LabelFrame):
                         if _lines:
                             _tail = _lines[-1][:200]
                     self.app._append_info_ui(
-                        f"[裁剪辅助] 取帧失败: {os.path.basename(input_file)} @ {frame_sec:.2f}s, "
-                        f"ffmpeg 返回码 {proc.returncode}" + (f" | {_tail}" if _tail else ""))
+                        _('[裁剪辅助] 取帧失败: {0} @ {1}:.2fs, ffmpeg 返回码 {2}').format(os.path.basename(input_file), frame_sec, proc.returncode)
+ + (f" | {_tail}" if _tail else ""))
                 else:
                     # rc=0 但 0 字节：-ss 越过 EOF（取帧时间 ≥ 视频时长），典型成因是
                     # 换了新主视频后旧「截取」起始时间残留。只提示不改行为。
                     self.app._append_info_ui(
-                        f"[裁剪辅助] 取帧无输出帧: {os.path.basename(input_file)} @ {frame_sec:.2f}s —— "
-                        "取帧时间可能超出视频时长，请检查「截取」是否残留开启（起始时间超出本视频）")
+                        _('[裁剪辅助] 取帧无输出帧: {0} @ {1}:.2fs —— 取帧时间可能超出视频时长，请检查「截取」是否残留开启（起始时间超出本视频）').format(os.path.basename(input_file), frame_sec)
+)
                 return None, None, None
             w, h = _ppm_dimensions_from_bytes(data)
             _frame_cache_put(_ck, (w, h, data))
@@ -8942,7 +10313,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                      values=(4, 8)).pack(side=tk.LEFT, padx=(2, 6))
         ToolTip(deblock_frame,
                 _("去块滤波（ffmpeg deblock）：\n"
-                "• 强度：weak/medium/strong（HandBrake 式 strength）\n"
+                "• 强度：weak/medium/strong\n"
                 "• 块尺寸：4 / 8（blocksize，4 更精细、8 更彻底）\n"
                 "对应 ffmpeg: deblock=filter=strong:block=8 等"))
     
@@ -8988,8 +10359,8 @@ class VideoFilterFrame(ttk.LabelFrame):
         marks_frame = ttk.LabelFrame(right_frame, text=_("输出颜色标记"), padding="5")
         marks_frame.pack(fill=tk.X, pady=5)
         row6 = ttk.Frame(marks_frame); row6.pack(fill=tk.X, pady=2)
-        # 显示/判断双变量（2026-09-10）：canonical 恒为英文（auto/bt709/...），显示值经 _() 翻译
-        # （中文「随源」/英文 "Follow source"）；判断（命令组装/tonemap 自动补标）只认 canonical
+        # 显示/判断双变量（2026-09-10）：canonical 恒为英文（auto/bt709/...），「随源」仅为显示值；
+        # 判断（命令组装/tonemap 自动补标）只认 canonical，显示值日后 i18n 化不影响逻辑
         self._mark_disp = {"auto": _("随源")}
         self._mark_d2v = {v: k for k, v in self._mark_disp.items()}
 
@@ -9000,7 +10371,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                 value=self._mark_disp.get(_canon.get(), _canon.get()))
             ttk.Label(row, text=label).pack(side=tk.LEFT)
             ttk.Combobox(row, textvariable=_disp,
-                         values=[self._mark_disp.get(v, v) for v in _MARK_VALUE_SETS[key]],
+                         values=_canon_disp_list(_MARK_VALUE_SETS[key], self._mark_disp),
                          state="readonly", width=12).pack(side=tk.LEFT, padx=padx)
             def _d2c(*_a):
                 _v = self._mark_d2v.get(_disp.get())
@@ -9149,11 +10520,34 @@ class VideoFilterFrame(ttk.LabelFrame):
 
 
 
-    def open_crop_editor(self):
+    def open_crop_editor(self, file_path=None, x_var=None, y_var=None, w_var=None, h_var=None,
+                         frame_extractor=None, helper_rect=None, helper_label=_("裁剪框"),
+                         safe_border=False, title=None, on_apply=None,
+                         initial_time_override=None, show_simple_pos=True, simple_pos_cb=None,
+                         show_black_border=True, black_border_cb=None,
+                         allow_alt_move=True, preload_points=None,
+                         apply_label=_("保存并应用裁剪"), clear_label=_("清除矩形"), info_extra=None, modal=False):
+        """统一矩形选区编辑器（富 UI 版）：可视化裁剪窗口与 delogo/局部滤镜可视化选区共用。
+
+        完整功能：大窗口（按屏幕 0.9 计算、最低高度 720）、SAR 坐标换算、时间跳转重新取帧、
+        拖拽绘制/Alt 整体搬移、宽高左上数值双向联动、边缘/平移微调、自动检测黑边、
+        简易位置入口、清除/应用/取消三行按钮（文字可经 clear_label/apply_label 覆写，delogo 传自己的）。
+
+        裁剪语境：show_simple_pos/show_black_border 开、on_apply=None（默认写回 crop_*）。
+        delogo/局部滤镜语境：只取坐标 —— show_simple_pos/show_black_border 关、
+        safe_border 留边（防滤镜失败）、helper_rect 显示裁剪框辅助、on_apply 写回 x/y/w/h。
+        """
         """可视化裁剪窗口 - 拖拽绘制矩形，支持时间跳转重新取帧，初始时间自动从主界面或者当前编辑窗口的截取起始时间获取"""
-        input_file = getattr(self, 'current_file', None)
+        input_file = file_path
         if not input_file or not os.path.exists(input_file):
-            input_file = self.app.input_file.get().strip()
+            # 恢复原语义（RectSelectEditor 重构时误删，2026-09-23）：无显式 file_path 时
+            # 先读本滤镜帧的 current_file——封装页轨道/水印/队列窗口里它是轨道/任务文件
+            # （这些语境的可视化裁剪源），转换页=输入文件。current_file 也无效时才按
+            # _context 门控兜底 app.input_file（仅转换页；封装页不跨页拿转换页视频）。
+            input_file = getattr(self, 'current_file', None)
+        if not input_file or not os.path.exists(input_file):
+            if getattr(self, "_context", "convert") == "convert":
+                input_file = self.app.input_file.get().strip()
         if not input_file or not os.path.exists(input_file):
             messagebox.showerror(_("错误"), _("请先选择一个有效的输入文件"))
             return
@@ -9162,6 +10556,8 @@ class VideoFilterFrame(ttk.LabelFrame):
         if not ffmpeg:
             messagebox.showerror(_("错误"), _("未找到 ffmpeg，无法提取视频帧"))
             return
+        frame_extractor = frame_extractor or getattr(self, "node_frame_extractor", None) \
+            or self.extract_video_frame_scaled
     
         # ----- 从当前轨道或主界面获取截取起始时间 未启用则为0秒 -----
         initial_time = 0.0
@@ -9173,7 +10569,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                     sec = time_to_seconds(start_str)
                     if sec is not None and sec >= 0:
                         initial_time = sec
-                        self.app._append_info_ui(_("[裁剪] 使用当前编辑窗口的截取起始时间: {0:.2f}s").format(sec))
+                        self.app._append_info_ui(_('[裁剪] 使用当前编辑窗口的截取起始时间: {0:.2f}s').format(sec))
         elif self.override_settings is not None:
             if self.override_settings.get("trim_enabled", False):
                 start_str = self.override_settings.get("trim_start", "").strip()
@@ -9181,7 +10577,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                     sec = time_to_seconds(start_str)
                     if sec is not None and sec >= 0:
                         initial_time = sec
-                        self.app._append_info_ui(_("[裁剪] 使用外部设置的截取起始时间: {0:.2f}s").format(sec))
+                        self.app._append_info_ui(_('[裁剪] 使用外部设置的截取起始时间: {0:.2f}s').format(sec))
         elif self.current_track is not None:
             enc = self.current_track.enc_settings
             if enc.get("trim_enabled", False):
@@ -9190,15 +10586,21 @@ class VideoFilterFrame(ttk.LabelFrame):
                     sec = time_to_seconds(start_str)
                     if sec is not None and sec >= 0:
                         initial_time = sec
-                        self.app._append_info_ui(_("[裁剪] 使用轨道截取起始时间: {0:.2f}s").format(sec))
-        else:
+                        self.app._append_info_ui(_('[裁剪] 使用轨道截取起始时间: {0:.2f}s').format(sec))
+        elif getattr(self, "_context", "convert") == "convert":
+            # 2026-09-23 收紧：主界面截取只属于转换页（_context=="convert"）。
+            # 封装页/水印/队列窗口此前会跨页兜底到转换页截取设置（互相兜底无意义，
+            # 且另一页的截取对本页画面语义错误），现在非转换页一律从 0 秒取帧。
             if self.app.trim_frame.trim_enabled.get():
                 start_str = self.app.trim_frame.trim_start.get().strip()
                 if start_str:
                     sec = time_to_seconds(start_str)
                     if sec is not None and sec >= 0:
                         initial_time = sec
-                        self.app._append_info_ui(_("[裁剪] 使用主界面截取起始时间: {0:.2f}s").format(sec))
+                        self.app._append_info_ui(_('[裁剪] 使用主界面截取起始时间: {0:.2f}s').format(sec))
+        # 外部覆盖（delogo 传 0 或指定；None=沿用上面 trim 计算）
+        if initial_time_override is not None:
+            initial_time = initial_time_override
     
         # ----- 初始取帧时间钳制（2026-09-08）-----
         # 换新主视频后旧「截取」起始时间会残留（各来源都不随加载重置），initial_time
@@ -9208,8 +10610,8 @@ class VideoFilterFrame(ttk.LabelFrame):
         _dur = self.app._get_media_duration(input_file)
         if _dur is not None and initial_time > max(0.0, _dur - 0.1):
             self.app._append_info_ui(
-                f"[裁剪] 初始取帧时间 {initial_time:.2f}s 超出视频时长 {_dur:.2f}s"
-                "（旧「截取」设置残留），已钳制到末帧附近")
+                _('[裁剪] 初始取帧时间 {0}:.2fs 超出视频时长 {1}:.2fs（旧「截取」设置残留），已钳制到末帧附近').format(initial_time, _dur)
+)
             initial_time = max(0.0, _dur - 0.1)
 
         current_time = initial_time
@@ -9220,7 +10622,13 @@ class VideoFilterFrame(ttk.LabelFrame):
             # 降级：使用固定默认值
             orig_w, orig_h = 1920, 1080
             self.app._append_info_ui(_("[裁剪] 无法获取原始尺寸，使用默认值"))
-    
+        # 2026-09-26「节点效果编辑器按时间取帧」：节点语境下编辑器坐标空间必须对齐到
+        # 节点输出真实尺寸（取帧器产出的帧就是它），否则裁剪矩形坐标与正式输出对不上。
+        if getattr(self, "node_frame_orig_size", None):
+            orig_w, orig_h = self.node_frame_orig_size
+            self.app._append_info_ui(
+                _('[裁剪] 节点语境：坐标空间对齐到节点输出 %dx%d') % (orig_w, orig_h))
+
         # ----- 非方形像素（SAR）检测（2026-09-07）：HandBrake crop 等场景会写 SAR
         # 保住源显示比例，出现「编码 1080x1080、播放器按 9:16 拉伸成 1080x1920」的文件。
         # 处理：预览帧按播放显示比例拉伸（ffmpeg scale 直接非等比输出到 disp 尺寸），
@@ -9237,7 +10645,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             else:
                 # 横向拉伸：播放器保持高度、拉宽
                 full_w = max(1, int(round(orig_w * _sn / _sd)))
-            sar_note = f", 播放显示 SAR {_sn}:{_sd}"
+            sar_note = _(', 播放显示 SAR {0}:{1}').format(_sn, _sd)
             self.app._append_info_ui(
                 _("[裁剪] 检测到非方形像素 (SAR {0}:{1})：编码 {2}x{3}，播放器显示约 {4}x{5}；"
                 "预览已按显示比例拉伸，裁剪坐标仍按编码像素换算").format(_sn, _sd, orig_w, orig_h, full_w, full_h))
@@ -9261,7 +10669,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             disp_w = 1
         if disp_h < 1:
             disp_h = 1
-        self.app._append_info_ui(_("[裁剪] 原始尺寸: {0}x{1}, 显示尺寸: {2}x{3}").format(orig_w, orig_h, disp_w, disp_h) + (f" (SAR {_sn}:{_sd} 拉伸预览)" if sar_note else ""))
+        self.app._append_info_ui(_('[裁剪] 原始尺寸: {0}x{1}, 显示尺寸: {2}x{3}').format(orig_w, orig_h, disp_w, disp_h) + (_(' (SAR {0}:{1} 拉伸预览)').format(_sn, _sd) if sar_note else ""))
     
         # ----- 坐标缩放因子（用于坐标系转换） -----
         scale_x = orig_w / disp_w
@@ -9304,8 +10712,10 @@ class VideoFilterFrame(ttk.LabelFrame):
             total_h = min(720, max_h)
     
         with self.app.SafeToplevel(self.app.root) as win:
-            win.title(f"可视化裁剪 - 拖拽绘制矩形 (显示 {disp_w}x{disp_h}, 原始 {orig_w}x{orig_h}{sar_note})")
+            win.title(_('{0} (显示 {1}x{2}, 原始 {3}x{4}{5})').format(title or _('可视化裁剪 - 拖拽绘制矩形'), disp_w, disp_h, orig_w, orig_h, sar_note))
             win.transient(self.app.root)
+            if modal:
+                win.grab_set()
             center_window(win, total_w, total_h, offset_y=15)
     
             # 窗口关闭时清理临时文件
@@ -9347,10 +10757,40 @@ class VideoFilterFrame(ttk.LabelFrame):
                 return ox / scale_x, oy / scale_y
     
             # ----- 信息显示 -----
-            info_var = tk.StringVar(value=_("👉 在图像上按住左键拖拽（可从边缘外开始）以绘制裁剪矩形"))
+            # 旋转/翻转提示（2026-09-20 健壮性审计，用户反馈「开左右翻转后背景没翻转=不一致」）：
+            # 正式输出顺序 = 裁剪 → 旋转 → 翻转（与 _main_bg_pre_filter 同序），裁剪坐标定义在
+            # 【处理前】的画面上 → 背景帧刻意显示原始画面，对裁剪才是所见即所得（位置编辑器
+            # 则相反——它们编辑的是处理后的叠加位置，背景帧走 bg_pre_filter 显示处理后画面）。
+            # 开旋转/翻转时在此说明；不做「背景翻转+坐标镜像换算」（风险大于收益）。
+            _crop_note = ""
+            try:
+                _cs = None
+                if getattr(self, "current_track", None) is not None:
+                    _cs = self.current_track.enc_settings
+                elif getattr(self, "override_settings", None) is not None:
+                    _cs = self.override_settings
+                elif hasattr(self.app, "get_current_settings"):
+                    _cs = self.app.get_current_settings()
+                if _cs and (_cs.get("vflip") or _cs.get("hflip")
+                            or _cs.get("rotate", "none") != "none"):
+                    _crop_note = (_("\nℹ️ 主视频开了旋转/翻转：正式输出顺序=裁剪→旋转→翻转，"
+                                  "背景显示的是处理前画面（裁剪坐标不受影响）"))
+            except Exception:
+                _crop_note = ""
+            info_var = tk.StringVar(value=_("👉 在图像上按住左键拖拽（可从边缘外开始）以绘制裁剪矩形")
+                                         + _crop_note + (info_extra or ""))
             info_label = tk.Label(right_frame, textvariable=info_var, wraplength=RIGHT_PANEL_WIDTH - 20,
                                   justify=tk.LEFT, bg="#FFFFCC", relief=tk.SUNKEN, padx=5, pady=5)
             info_label.pack(pady=5, fill=tk.X)
+            if helper_rect:
+                try:
+                    _hx, _hy, _hw, _hh = helper_rect
+                    tk.Label(right_frame,
+                             text=_('辅助:{0} ({1},{2},{3},{4})').format(helper_label, _hx, _hy, _hw, _hh),
+                             foreground="blue", wraplength=RIGHT_PANEL_WIDTH - 20,
+                             justify=tk.LEFT).pack(pady=2, fill=tk.X)
+                except Exception:
+                    pass
     
             # 延迟注册的「信息变更」回调（宽/高/左/上 数值框的回填挂在这里，
             # 它是矩形变化的唯一收口点：拖拽/微调/检测/清除都必经此处）。
@@ -9364,14 +10804,29 @@ class VideoFilterFrame(ttk.LabelFrame):
                     y = min(y1, y2)
                     w = abs(x2 - x1)
                     h = abs(y2 - y1)
-                    info_var.set(f"✅ 矩形已确定\n左上: ({x}, {y})  宽: {w}  高: {h}\n"
-                                 f"裁剪参数: crop={w}:{h}:{x}:{y}\n"
-                                 "👉 可继续拖拽新矩形覆盖")
+                    info_var.set(_('✅ 矩形已确定\\n左上: ({0}, {1})  宽: {2}  高: {3}\\n裁剪参数: crop={4}:{5}:{6}:{7}\\n👉 可继续拖拽新矩形覆盖').format(x, y, w, h, w, h, x, y)
+
+)
                 else:
                     info_var.set(_("👉 在图像上按住左键拖拽（可从边缘外开始）以绘制裁剪矩形"))
                 for _fn in _info_hooks:
                     try:
                         _fn()
+                    except Exception:
+                        pass
+
+            def _draw_helper():
+                """绘制辅助框（蓝色虚线，只读）——delogo/局部滤镜语境显示裁剪框作参考。"""
+                canvas.delete("helper")
+                if helper_rect:
+                    try:
+                        _hx, _hy, _hw, _hh = helper_rect
+                        _a1, _a2 = original_to_display(_hx, _hy)
+                        _b1, _b2 = original_to_display(_hx + _hw, _hy + _hh)
+                        canvas.create_rectangle(
+                            _a1 + PADDING, _a2 + PADDING,
+                            _b1 + PADDING, _b2 + PADDING,
+                            outline="blue", width=1, dash=(4, 2), tags="helper")
                     except Exception:
                         pass
 
@@ -9457,7 +10912,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                     drag_rect_id = None
                 # Alt + 已有矩形 → 整体搬移（保留原矩形，只改坐标）；
                 # 无矩形时 Alt 无意义，退化为普通重画。
-                if _alt_held(event) and len(points) == 2 and rect_id:
+                if allow_alt_move and _alt_held(event) and len(points) == 2 and rect_id:
                     move_start_display = (dx, dy)
                     move_orig_points = [tuple(points[0]), tuple(points[1])]
                     return
@@ -9586,12 +11041,29 @@ class VideoFilterFrame(ttk.LabelFrame):
                 if w <= 0 or h <= 0:
                     messagebox.showerror(_("错误"), _("修正后矩形无效"))
                     return
-                self.crop_enabled.set(True)
-                self.crop_width.set(str(int(w)))
-                self.crop_height.set(str(int(h)))
-                self.crop_left.set(str(int(x)))
-                self.crop_top.set(str(int(y)))
-                self.app._append_info_ui(_("[裁剪] 应用 crop={0}:{1}:{2}:{3}").format(int(w), int(h), int(x), int(y)))
+                if safe_border:
+                    if x < 1:
+                        w -= (1 - x); x = 1
+                    if y < 1:
+                        h -= (1 - y); y = 1
+                    if w > orig_w - x - 1:
+                        w = orig_w - x - 1
+                    if h > orig_h - y - 1:
+                        h = orig_h - y - 1
+                    if w <= 0 or h <= 0:
+                        messagebox.showerror(_("错误"), _("选区贴近画面边缘，无法安全应用（需四周留边）"))
+                        return
+                if on_apply is not None:
+                    _ok = on_apply((int(x), int(y), int(w), int(h)))
+                    if _ok is False:
+                        return
+                else:
+                    self.crop_enabled.set(True)
+                    self.crop_width.set(str(int(w)))
+                    self.crop_height.set(str(int(h)))
+                    self.crop_left.set(str(int(x)))
+                    self.crop_top.set(str(int(y)))
+                    self.app._append_info_ui(_('[裁剪] 应用 crop={0}:{1}:{2}:{3}').format(int(w), int(h), int(x), int(y)))
                 win.destroy()
     
             # ----- 自动检测黑边 -----
@@ -9660,11 +11132,11 @@ class VideoFilterFrame(ttk.LabelFrame):
                     return
                 sec = parse_time_str(time_str)
                 if sec is None:
-                    messagebox.showerror(_("错误"), _("无效的时间格式: {0}\n支持格式: 秒数 (如 10.5) 或 HH:MM:SS[.mmm]").format(time_str))
+                    messagebox.showerror(_("错误"), _('无效的时间格式: {0}\n支持格式: 秒数 (如 10.5) 或 HH:MM:SS[.mmm]').format(time_str))
                     return
                 total_duration = self.app._get_media_duration(input_file)
                 if total_duration is not None and sec > total_duration:
-                    messagebox.showwarning(_("警告"), _("输入时间 {0:.2f}s 超过视频总时长 {1:.2f}s，将跳转到末尾").format(sec, total_duration))
+                    messagebox.showwarning(_("警告"), _('输入时间 {0:.2f}s 超过视频总时长 {1:.2f}s，将跳转到末尾').format(sec, total_duration))
                     # 2026-09-08：-ss 精确等于时长也会越过 EOF 取到 0 帧（实测 30s 视频：
                     # t=30 空输出 / t=29.9 正常），留 0.1s 余量。
                     sec = max(0.0, total_duration - 0.1)
@@ -9686,7 +11158,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                     if self._crop_cancel_event.is_set():
                         return
                     try:
-                        w, h, data = self.extract_video_frame_scaled(
+                        w, h, data = frame_extractor(
                             input_file,
                             frame_sec=sec,
                             target_width=disp_w,
@@ -9700,7 +11172,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                             return
                         self.app.root.after(0, lambda: on_extract_success(data, w, h))
                     except Exception as e:
-                        self.app.root.after(0, lambda e=e: on_extract_failed(_("提取异常: {0}").format(e)))
+                        self.app.root.after(0, lambda e=e: on_extract_failed(_('提取异常: {0}').format(e)))
             
                 # 启动新线程
                 self._crop_extract_thread = threading.Thread(target=extract_thread, daemon=True)
@@ -9722,6 +11194,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                     canvas.delete("bg_img")
                     canvas.create_image(PADDING, PADDING, anchor=tk.NW, image=new_img, tags="bg_img")
                     canvas.image = new_img
+                    _draw_helper()
                     img = new_img
     
                     # 重置选择状态
@@ -9734,7 +11207,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                     points = []
                     drag_start_display = None
                     update_info()
-                    info_var.set(f"✅ 已更新画面 (时间: {current_time:.2f}s) 请重新拖拽裁剪")
+                    info_var.set(_('✅ 已更新画面 (时间: {0}:.2fs) 请重新拖拽裁剪').format(current_time))
                     self.app._append_info_ui(_("[裁剪] 跳转到 {0:.2f}s，原始尺寸 {1}x{2}，显示尺寸 {3}x{4}").format(current_time, orig_w, orig_h, disp_w, disp_h))
                     refresh_btn.config(state=tk.NORMAL, text=_("重新获取画面"))
     
@@ -9742,7 +11215,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                     # 清理可能残留的临时文件
                     cleanup_temp_file()
                     info_var.set(f"❌ {err_msg}")
-                    self.app._append_info_ui(_("[裁剪] 提取失败: {0}").format(err_msg))
+                    self.app._append_info_ui(_('[裁剪] 提取失败: {0}').format(err_msg))
                     refresh_btn.config(state=tk.NORMAL, text=_("重新获取画面"))
     
                 threading.Thread(target=extract_thread, daemon=True).start()
@@ -9831,26 +11304,28 @@ class VideoFilterFrame(ttk.LabelFrame):
             btn_frame = ttk.Frame(right_frame)
             btn_frame.pack(fill=tk.X, pady=5)
     
-            ttk.Button(btn_frame, text=_("自动检测黑边"), command=auto_detect).pack(fill=tk.X, pady=2)
+            if show_black_border:
+                ttk.Button(btn_frame, text=_("自动检测黑边"), command=auto_detect).pack(fill=tk.X, pady=2)
 
-            param_frame = ttk.Frame(btn_frame)
-            param_frame.pack(fill=tk.X, pady=5)
-            row = ttk.Frame(param_frame)
-            row.pack(fill=tk.X)
-    
-            frames_container = ttk.Frame(row)
-            frames_container.pack(side=tk.LEFT, padx=(0, 10))
-            ttk.Label(frames_container, text=_("分析帧数:")).pack(side=tk.LEFT)
-            frames_var = tk.StringVar(value=self.crop_detect_frames.get())
-            ttk.Spinbox(frames_container, from_=1, to=100, width=5, textvariable=frames_var, state="normal").pack(side=tk.LEFT, padx=5)
-            frames_var.trace_add("write", lambda *a: self.crop_detect_frames.set(frames_var.get()))
-    
-            round_container = ttk.Frame(row)
-            round_container.pack(side=tk.LEFT)
-            ttk.Label(round_container, text="round:").pack(side=tk.LEFT)
-            round_var = tk.StringVar(value=self.crop_detect_round.get())
-            ttk.Spinbox(round_container, from_=1, to=16, width=5, textvariable=round_var, state="normal").pack(side=tk.LEFT, padx=5)
-            round_var.trace_add("write", lambda *a: self.crop_detect_round.set(round_var.get()))
+            if show_black_border:
+                param_frame = ttk.Frame(btn_frame)
+                param_frame.pack(fill=tk.X, pady=5)
+                row = ttk.Frame(param_frame)
+                row.pack(fill=tk.X)
+        
+                frames_container = ttk.Frame(row)
+                frames_container.pack(side=tk.LEFT, padx=(0, 10))
+                ttk.Label(frames_container, text=_("分析帧数:")).pack(side=tk.LEFT)
+                frames_var = tk.StringVar(value=self.crop_detect_frames.get())
+                ttk.Spinbox(frames_container, from_=1, to=100, width=5, textvariable=frames_var, state="normal").pack(side=tk.LEFT, padx=5)
+                frames_var.trace_add("write", lambda *a: self.crop_detect_frames.set(frames_var.get()))
+        
+                round_container = ttk.Frame(row)
+                round_container.pack(side=tk.LEFT)
+                ttk.Label(round_container, text="round:").pack(side=tk.LEFT)
+                round_var = tk.StringVar(value=self.crop_detect_round.get())
+                ttk.Spinbox(round_container, from_=1, to=16, width=5, textvariable=round_var, state="normal").pack(side=tk.LEFT, padx=5)
+                round_var.trace_add("write", lambda *a: self.crop_detect_round.set(round_var.get()))
 
             # ----- 边缘/平移微调按钮 -----
             # 边界收缩行（上减/下减/左减/右减 + 独立步进）
@@ -9889,8 +11364,8 @@ class VideoFilterFrame(ttk.LabelFrame):
                 except ValueError:
                     return 1
 
-            ttk.Button(btn_frame, text=_("清除矩形"), command=clear_rect).pack(fill=tk.X, pady=2)
-            ttk.Button(btn_frame, text=_("保存并应用裁剪"), command=apply_crop).pack(fill=tk.X, pady=2)
+            ttk.Button(btn_frame, text=clear_label, command=clear_rect).pack(fill=tk.X, pady=2)
+            ttk.Button(btn_frame, text=apply_label, command=apply_crop).pack(fill=tk.X, pady=2)
             ttk.Button(btn_frame, text=_("取消"), command=on_window_close).pack(fill=tk.X, pady=2)
     
             tip = (_("按住左键拖拽绘制矩形（可从边缘外开始），松开确定。黄色虚线为辅助，红色为最终选区。\n"
@@ -9923,37 +11398,46 @@ class VideoFilterFrame(ttk.LabelFrame):
                 if cw <= 0 or ch <= 0:
                     messagebox.showwarning(_("提示"), _("裁剪矩形尺寸无效"))
                     return
-                self._crop_pos_dialog(input_file, orig_w, orig_h, cw, ch, bx, by)
+                _cb = simple_pos_cb if simple_pos_cb is not None else self._crop_pos_dialog
+                _cb(input_file, orig_w, orig_h, cw, ch, bx, by)
 
-            ttk.Button(right_frame, text=_("简易位置…"), command=open_simple_pos).pack(fill=tk.X, pady=(6, 2))
-            ttk.Label(right_frame,
-                      text=_("简易位置：某段时间内裁剪框在画面内移动（列表轨迹式）；"
-                           "与「位置、尺寸、旋转」并存，二者同时开启时以后者的画布模式为准。"),
-                      foreground="gray", wraplength=RIGHT_PANEL_WIDTH - 20).pack(pady=(0, 6))
+            if show_simple_pos:
+                ttk.Button(right_frame, text=_("简易位置…"), command=open_simple_pos).pack(fill=tk.X, pady=(6, 2))
+                ttk.Label(right_frame,
+                          text=_("简易位置：某段时间内裁剪框在画面内移动（列表轨迹式）；"
+                               "与「位置、尺寸、旋转」并存，二者同时开启时以后者的画布模式为准。"),
+                          foreground="gray", wraplength=RIGHT_PANEL_WIDTH - 20).pack(pady=(0, 6))
 
-            # ----- 若已有裁剪参数，自动加载矩形 -----
-            if self.crop_enabled.get():
+            # ----- 初始矩形：外部 preload_points 优先；否则裁剪语境读 crop_* -----
+            _preload = preload_points
+            if _preload is None and on_apply is None and self.crop_enabled.get():
                 try:
                     w = int(self.crop_width.get())
                     h = int(self.crop_height.get())
                     x = int(self.crop_left.get())
                     y = int(self.crop_top.get())
-                    _set_points([(x, y), (x + w, y + h)])
-                    dx1, dy1 = original_to_display(x, y)
-                    dx2, dy2 = original_to_display(x + w, y + h)
+                    _preload = [(x, y), (x + w, y + h)]
+                except (ValueError, TypeError):
+                    _preload = None
+            if _preload is not None:
+                try:
+                    (x1, y1), (x2, y2) = _preload
+                    _set_points([(int(x1), int(y1)), (int(x2), int(y2))])
+                    dx1, dy1 = original_to_display(int(x1), int(y1))
+                    dx2, dy2 = original_to_display(int(x2), int(y2))
                     rect_id = canvas.create_rectangle(
                         dx1 + PADDING, dy1 + PADDING,
                         dx2 + PADDING, dy2 + PADDING,
                         outline='red', width=2
                     )
                     update_info()
-                except:
+                except Exception:
                     pass
     
             # ----- 初始加载图像 -----
             def initial_load():
                 try:
-                    w, h, data = self.extract_video_frame_scaled(
+                    w, h, data = frame_extractor(
                         input_file,
                         frame_sec=initial_time,
                         target_width=disp_w,
@@ -9968,6 +11452,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                     canvas.delete(loading_text)  # 清除占位提示
                     canvas.create_image(PADDING, PADDING, anchor=tk.NW, image=img_obj, tags="bg_img")
                     canvas.image = img_obj
+                    _draw_helper()
                     nonlocal img, scaled_temp_path
                     img = img_obj
                     temp_file_info["data"] = data
@@ -9980,7 +11465,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                         canvas.delete(loading_text)
                     except Exception:
                         pass
-                    messagebox.showerror(_("错误"), _("加载初始帧失败: {0}").format(e))
+                    messagebox.showerror(_("错误"), _('加载初始帧失败: {0}').format(e))
                     win.destroy()
 
             # 调用初始加载
@@ -9996,9 +11481,10 @@ class VideoFilterFrame(ttk.LabelFrame):
         编辑「自身」的位置/尺寸/旋转 → 基准必须是被编辑的文件自身：
         - 主视频（转换页/封装主视频）：自身 = 主视频文件；
         - 子视频：自身 = 子视频文件（调用方传 target_file=current_file，或本方法探测 self.current_file）。
-        优先级：显式 target_file > self.current_file(子视频自身) > 上下文主视频 > 转换页 input_file。
+        优先级：显式 target_file > self.current_file(子视频自身) > 本页主视频。
         ⚠️ 2026-08-30 修正：不再裸用 _context_main_video 当子视频/自身窗口的基准
-        （会导致黑画布、时间预览「未找到主视频」、尺寸对不上）。"""
+        （会导致黑画布、时间预览「未找到主视频」、尺寸对不上）。
+        ⚠️ 2026-09-23：兜底改为按宿主页取（self._context），转换页与封装页禁止互相兜底。"""
         app = getattr(self, "app", self)
         input_file = ""
         tf = (target_file or "").strip()
@@ -10010,18 +11496,12 @@ class VideoFilterFrame(ttk.LabelFrame):
             if _cf and os.path.exists(str(_cf).strip()):
                 input_file = str(_cf).strip()
         if not input_file:
+            # 2026-09-23：按宿主页取主视频（转换页↔封装页禁止互相兜底：本页没主视频
+            # 就是纯黑/报错，绝不能用另一页的视频当基准）。
+            _pg = "merge" if getattr(self, "_context", "convert") == "merge" else "convert"
             try:
-                input_file = self._context_main_video()
-            except Exception:
-                input_file = ""
-        if not input_file:
-            try:
-                input_file = app.input_file.get().strip()
-            except Exception:
-                input_file = ""
-        if not input_file:
-            try:
-                input_file = app.merge_video.get().strip()
+                _pf, _unused = _page_main_video(app, _pg)
+                input_file = _pf or ""
             except Exception:
                 input_file = ""
         if not input_file or not os.path.exists(input_file):
@@ -10076,12 +11556,6 @@ class VideoFilterFrame(ttk.LabelFrame):
         except Exception:
             MAX_ROWS = 15
 
-        def _seg_num(s, k, d=0.0):
-            try:
-                return float(s.get(k, d) or d)
-            except (ValueError, TypeError):
-                return d
-
         def _video_duration(fpath):
             if not ffprobe_cmd or not fpath or not os.path.exists(fpath):
                 return None
@@ -10122,8 +11596,8 @@ class VideoFilterFrame(ttk.LabelFrame):
             _state_clipboard[0] = {"x": x, "y": y, "scale": sc, "angle": ang}
             where = _("结尾") if (edit_end.get() and _seg_move_mode(dlg_segs[_idx]) != "still") else _("起始")
             try:
-                app._append_info_ui(f"[画布模式] 已复制当前「{where}」状态"
-                                    f"（x={int(round(x))}, y={int(round(y))}, 缩放={sc*100:g}%, 角度={ang:g}°）")
+                app._append_info_ui(_('[画布模式] 已复制当前「{0}」状态（x={1}, y={2}, 缩放={3}:g%, 角度={4}:g°）').format(where, int(round(x)), int(round(y)), sc*100, ang)
+)
             except Exception:
                 pass
 
@@ -10138,7 +11612,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             _refresh(kv[0])   # 默认 sync_entries=True：列表单行更新 + X/Y 框随当前端回填
             where = _("结尾") if (edit_end.get() and _seg_move_mode(dlg_segs[kv[0]]) != "still") else _("起始")
             try:
-                app._append_info_ui(f"[画布模式] 已把剪贴板状态粘贴到当前「{where}」")
+                app._append_info_ui(_('[画布模式] 已把剪贴板状态粘贴到当前「{0}」').format(where))
             except Exception:
                 pass
 
@@ -10166,8 +11640,9 @@ class VideoFilterFrame(ttk.LabelFrame):
         # = max(两者) 而非之和，窗口宽度由列表决定（590），正好贴合。
         _top_row1 = ttk.Frame(top)
         _top_row1.pack(fill=tk.X)
-        ttk.Checkbutton(_top_row1, text=_("启用画布模式（位置、尺寸、旋转）"),
-                        variable=self.canvas_mode).pack(side=tk.LEFT)
+        chk_canvas = ttk.Checkbutton(_top_row1, text=_("启用画布模式（位置、尺寸、旋转）"),
+                                     variable=self.canvas_mode)
+        chk_canvas.pack(side=tk.LEFT)
         _size_lbl = (f"  窗口（画布 固定尺寸）: {canvas_w} x {canvas_h}"
                      + (_("  （来自裁剪框）") if crop_used else _("  （原始尺寸）"))
                      + f"  ｜ 内容(完整画面): {pic_w} x {pic_h}")
@@ -10890,7 +12365,7 @@ class VideoFilterFrame(ttk.LabelFrame):
         def _add_row():
             n = len(dlg_segs)
             if n >= MAX_ROWS:
-                messagebox.showinfo(_("提示"), f"最多 {MAX_ROWS} 行")
+                messagebox.showinfo(_("提示"), _("最多 {0} 行").format(MAX_ROWS))
                 return
             if n:
                 pw = dlg_segs[-1]
@@ -10989,7 +12464,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                 if added or skipped:
                     try:
                         app._append_info_ui(
-                            f"[画布模式] 已追加 {added} 个时间段（跳过 {skipped}）")
+                            _('[画布模式] 已追加 {0} 个时间段（跳过 {1}）').format(added, skipped))
                     except Exception:
                         pass
                 _refresh()
@@ -11045,6 +12520,19 @@ class VideoFilterFrame(ttk.LabelFrame):
             _refresh(0)
         else:
             _refresh(None)
+
+        def _on_canvas_mode_toggle():
+            # 启用画布模式：若关键帧列表为空则种子一条默认行，行为对齐其他列表轨迹
+            # （航点「启用列表轨迹」_ensure_wps / 裁剪「启用简易位置」_on_enable_toggle：
+            #   点击启用即落一条，无需手动「添加」）。
+            if self.canvas_mode.get() and not dlg_segs:
+                _add_row()
+
+        chk_canvas.config(command=_on_canvas_mode_toggle)
+        # 打开时若总开关已启用而列表尚空，同样种子默认段——否则只有点「确定」时才在
+        # _ok() 里兜底补一行，用户全程看不到可编辑行（列表一直空着）。
+        _on_canvas_mode_toggle()
+
         win.protocol("WM_DELETE_WINDOW", _close)
         # 窗口可缩放：拉宽时由末列 ex 吸收多余宽度（2026-08-30 布局修正）
         win.resizable(True, True)
@@ -11091,12 +12579,6 @@ class VideoFilterFrame(ttk.LabelFrame):
         dlg_segs = copy.deepcopy(self.crop_pos_segments)
         ffmpeg_cmd = getattr(self.app, "ffmpeg_cmd", None)
         ffprobe_cmd = getattr(self.app, "ffprobe_cmd", None)
-
-        def _seg_num(s, k, d=0.0):
-            try:
-                return float(s.get(k, d) or d)
-            except (ValueError, TypeError):
-                return d
 
         win = tk.Toplevel(self.app.root)
         win.title(_("简易位置 - 裁剪框动态位移"))
@@ -11259,7 +12741,7 @@ class VideoFilterFrame(ttk.LabelFrame):
         def _add_row():
             n = len(dlg_segs)
             if n >= MAX_ROWS:
-                messagebox.showinfo(_("提示"), f"最多 {MAX_ROWS} 行")
+                messagebox.showinfo(_("提示"), _("最多 {0} 行").format(MAX_ROWS))
                 return
             # 新行接在尾巴上：开始时间=上一行结束，起始坐标=上一行结尾，移动方式=移动
             # （默认移动：零位移起步 sx==ex，列表显示「移动」，与用户要求一致；之前默认「不动」）
@@ -11276,6 +12758,17 @@ class VideoFilterFrame(ttk.LabelFrame):
                    "ex": sx, "ey": sy, "start": st, "dur": 2.0}
             dlg_segs.append(new)
             _refresh(n)
+
+        def _on_enable_toggle():
+            # 启用简易位置：若列表为空则种子一条默认段，行为对齐其他列表轨迹
+            # （航点「启用列表轨迹」_ensure_wps：点击启用即落一条，无需手动「添加」）。
+            if chk_on.get() and not dlg_segs:
+                _add_row()
+
+        chk_box.config(command=_on_enable_toggle)
+        # 打开时若总开关已启用且列表尚空，同样种子默认段（对齐 waypoint 对话框
+        # _sync_params 打开即 seed 的口径），保证「启用 + 空列表」一进窗就有可编辑行。
+        _on_enable_toggle()
 
         def _del_row():
             idx = _selected()
@@ -11474,9 +12967,9 @@ class VideoFilterFrame(ttk.LabelFrame):
                         if max(os0, float(s)) < min(oe0, float(e)):
                             overlap_hits.append((oi + 1, float(s), float(e)))
                 if added or skipped:
-                    msg = f"已追加 {added} 个时间段到简易位置列表"
+                    msg = _('已追加 {0} 个时间段到简易位置列表').format(added)
                     if skipped:
-                        msg += f"（跳过 {skipped} 个：超出 {MAX_ROWS} 行上限或无效）"
+                        msg += _("（跳过 {0} 个：超出 {1} 行上限或无效）").format(skipped, MAX_ROWS)
                     try:
                         self.app._append_info_ui(_("[简易位置] ") + msg)
                     except Exception:
@@ -11579,8 +13072,8 @@ class VideoFilterFrame(ttk.LabelFrame):
         try:
             _ts0, _sp0 = _main_trim_speed(self.app)
             if _ts0 > 0 or _sp0 != 1.0:
-                HINT2 += (f" ｜ ⚠ 主视频已截取(起点 {_ts0:.3f}s)/变速(×{_sp0:g})："
-                          f"时间按主视频原始时间填，转换时自动换算（无需手动减）")
+                HINT2 += (_(" ｜ ⚠ 主视频已截取(起点 {0:.3f}s)/变速(×{1:g})："
+                            "时间按主视频原始时间填，转换时自动换算（无需手动减）").format(_ts0, _sp0))
         except Exception:
             pass
 
@@ -11591,9 +13084,9 @@ class VideoFilterFrame(ttk.LabelFrame):
                 pe = _seg_num(ss[i - 1], "start") + max(_seg_num(ss[i - 1], "dur"), 0)
                 cs = _seg_num(ss[i], "start")
                 if cs + 1e-6 < pe:
-                    ws.append(f"第{i+1}行开始 {cs:.3f}s 与上一行结束 {pe:.3f}s 重叠")
+                    ws.append(_('第{0}行开始 {1}:.3fs 与上一行结束 {2}:.3fs 重叠').format(i+1, cs, pe))
                 elif cs > pe + 1e-6:
-                    ws.append(f"第{i+1}行开始 {cs:.3f}s 与上一行结束 {pe:.3f}s 空档 {cs-pe:.3f}s")
+                    ws.append(_('第{0}行开始 {1}:.3fs 与上一行结束 {2}:.3fs 空档 {3}:.3fs').format(i+1, cs, pe, cs-pe))
             return ws
 
         def _draw_preview():
@@ -11713,10 +13206,10 @@ class VideoFilterFrame(ttk.LabelFrame):
             _st = _("已启用") if chk_on.get() else _("已禁用（列表保留但不生效）")
             ws = _collect_warnings()
             if ws:
-                self.app._append_info_ui(f"[简易位置] {_st}；已应用，但时间未首尾相接：" +
+                self.app._append_info_ui(_('[简易位置] {0}；已应用，但时间未首尾相接：').format(_st) +
                                          "；".join(ws[:6]) + (" …" if len(ws) > 6 else ""))
             else:
-                self.app._append_info_ui(f"[简易位置] {_st}；已应用 {len(dlg_segs)} 段（时间首尾相接）")
+                self.app._append_info_ui(_('[简易位置] {0}；已应用 {1} 段（时间首尾相接）').format(_st, len(dlg_segs)))
             _close()
 
         _btns = ttk.Frame(okf)
@@ -11733,7 +13226,9 @@ class VideoFilterFrame(ttk.LabelFrame):
     def auto_detect_crop(self):
         input_file = getattr(self, 'current_file', None)
         if not input_file or not os.path.exists(input_file):
-            input_file = self.app.input_file.get().strip()
+            # 2026-09-23：同 open_crop_editor，只有转换页语境才兜底到转换页输入文件
+            if getattr(self, "_context", "convert") == "convert":
+                input_file = self.app.input_file.get().strip()
         if not input_file or not os.path.exists(input_file):
             messagebox.showerror(_("错误"), _("请先选择一个有效的输入文件"))
             return
@@ -11782,7 +13277,9 @@ class VideoFilterFrame(ttk.LabelFrame):
                         sec = time_to_seconds(start_str)
                         if sec is not None:
                             start_sec = sec
-            else:
+            elif getattr(self, "_context", "convert") == "convert":
+                # 2026-09-23 收紧：同 open_crop_editor——主界面截取仅转换页语境可用，
+                # 封装页/水印/队列不再跨页兜底转换页截取设置，非转换页从 0 秒检测。
                 if self.app.trim_frame.trim_enabled.get():
                     start_str = self.app.trim_frame.trim_start.get().strip()
                     if start_str:
@@ -11814,7 +13311,7 @@ class VideoFilterFrame(ttk.LabelFrame):
                     text=True, encoding='utf-8', errors='replace',
                     creationflags=_ffmpeg_spawn_flags()
                 )
-                _, stderr = proc.communicate(timeout=15)
+                _unused, stderr = proc.communicate(timeout=15)
     
                 pattern = re.compile(r'crop=(\d+):(\d+):(\d+):(\d+)')
                 matches = pattern.findall(stderr)
@@ -12055,7 +13552,8 @@ class VideoFilterFrame(ttk.LabelFrame):
 
 
 def _open_tw_position_editor_impl(app, tw, canvas_w, canvas_h, refresh_cb, parent_widget,
-                                  ctx_file=None, ctx_settings=None):
+                                  ctx_file=None, ctx_settings=None, scope=None,
+                                  main_offset=None, main_render_size=None):
     """文字水印位置编辑器公共实现（AdvancedFrame 转换页/队列 与 封装页共用）。
 
     - tw：要编辑的文字水印设置 dict（写回 overlay_x/overlay_y/font_size/rotate）
@@ -12063,8 +13561,14 @@ def _open_tw_position_editor_impl(app, tw, canvas_w, canvas_h, refresh_cb, paren
     - refresh_cb：应用后的刷新回调（命令预览）
     - parent_widget：通用编辑器的宿主控件（AdvancedFrame 自身 / 文字水印对话框）
     - ctx_file/ctx_settings：背景帧语境主视频（2026-09-03 问题②③：队列=task.input+
-      task.settings、封装 merge 主轨=file_path+enc_settings、转换页注入封装=merge 主轨）；
-      None → _resolve_editor_bg 兜底（转换页/封装全局）。绝不再无条件封装页优先。
+      task.settings、封装页=主轨 file_path+enc_settings）；
+      None → _resolve_editor_bg 按 scope 在本页内兜底（2026-09-23：转换页/封装页
+      禁止互相兜底，本页没主视频=纯黑；封装页已有独立文字水印，「注入到封装页」已下线，
+      两页不再互相掺）。绝不再无条件封装页优先。
+    - main_offset/main_render_size：封装页 pad 时主视频内容在画布中的偏移与渲染尺寸。
+      2026-09-23：此前封装页不传 → 画布已是 pad 尺寸、背景帧却被拉伸铺满 → 画面变形；
+      与子视频位置编辑器（open_visual_overlay_editor）同款传参后主视频按自身尺寸摆放、
+      pad 留黑区保持黑色。None=铺满画布（旧行为，转换页无 pad 功能）。
     """
     text = tw.get("text", "")
     try:
@@ -12074,7 +13578,10 @@ def _open_tw_position_editor_impl(app, tw, canvas_w, canvas_h, refresh_cb, paren
     # 内容盒估算（2026-09-03 统一为 estimate_text_size，与渲染端 build_text_watermark_filtergraph
     # 同源）：渲染端内容盒 = estimate + 2×pad(8) → 编辑器矩形必须含 pad，否则
     # 「编辑时旋转中心看着居中、渲染后文字中心偏移」；旧 0.7/字符×1.3fs 估算偏宽偏矮。
-    _est_w, _est_h = estimate_text_size(str(text), "", fs)
+    # 2026-09-25：与渲染端统一用 _tw_effective_text —— multiline 开保留换行（高盒）、
+    # 关拼成一行（矮盒），编辑器矩形与最终渲染严格一致。
+    _eff_text = _tw_effective_text(tw)
+    _est_w, _est_h = estimate_text_size(_eff_text, "", fs)
     wm_w = _est_w + 16
     wm_h = _est_h + 16
     x_var = tk.StringVar(value=tw.get("overlay_x", "10"))
@@ -12087,15 +13594,15 @@ def _open_tw_position_editor_impl(app, tw, canvas_w, canvas_h, refresh_cb, paren
         # 矩形高度反推字体大小（wm_h = est_th+16 = fs*1.2×行数 + 16 → fs=(nh−16)/(1.2×行数)；
         # 单行即 (nh−16)/1.2，2026-09-03 与 estimate_text_size 行高 1.2fs 对齐）
         if nh > 0:
-            _nlines = max(1, str(text).count("\n") + 1)
+            _nlines = max(1, _eff_text.count("\n") + 1)
             new_fs = max(8, int(round((nh - 16) / (1.2 * _nlines))))
             old_fs = int(tw.get("font_size", 48))
             if new_fs != old_fs:
                 tw["font_size"] = new_fs
-                app._append_info_ui(_("[文字水印] 字体大小已更新: {0} → {1}").format(old_fs, new_fs))
+                app._append_info_ui(_('[文字水印] 字体大小已更新: {0} → {1}').format(old_fs, new_fs))
         if refresh_cb:
             refresh_cb()
-        app._append_info_ui(_("[文字水印] 位置已设置: ({0}, {1})").format(nx, ny))
+        app._append_info_ui(_('[文字水印] 位置已设置: ({0}, {1})').format(nx, ny))
     title = _("可视化编辑文字水印位置")
     # 文字水印静态旋转角度（-180..180），旋转后为 hypot 正方形包围盒
     try:
@@ -12123,12 +13630,13 @@ def _open_tw_position_editor_impl(app, tw, canvas_w, canvas_h, refresh_cb, paren
                 pass
         if refresh_cb:
             refresh_cb()
-        app._append_info_ui(_("[文字水印] 旋转角度已更新: {0}°").format(new_angle))
+        app._append_info_ui(_('[文字水印] 旋转角度已更新: {0}°').format(new_angle))
 
-    # ---- 背景帧源（2026-09-03 统一）：显式 ctx（队列 task/封装 merge 主轨/注入主轨）
-    # ---- → 转换页 input_file → 封装全局。旧代码无条件「封装页 merge_video 优先」是
-    # ---- 问题②③根因（转换页/队列文字水印第一顺位错取封装页主视频）----
-    _bg_file, _main_settings = _resolve_editor_bg(app, ctx_file, ctx_settings)
+    # ---- 背景帧源（2026-09-03 统一）：显式 ctx（队列 task / 封装页主轨）→ 按 scope
+    # ---- 在本页内兜底（2026-09-23：转换页/封装页禁止互相兜底，本页没主视频=纯黑）。
+    # ---- 旧代码无条件「封装页 merge_video 优先」是问题②③根因（转换页/队列文字水印
+    # ---- 第一顺位错取封装页主视频）。
+    _bg_file, _main_settings = _resolve_editor_bg(app, ctx_file, ctx_settings, scope=scope)
     _bg_filter = _main_bg_pre_filter(_main_settings) if _main_settings else None
 
     app._generic_overlay_editor(
@@ -12141,6 +13649,8 @@ def _open_tw_position_editor_impl(app, tw, canvas_w, canvas_h, refresh_cb, paren
         rotate_angle=_tw_ra, angle_cb=apply_tw_angle,
         show_nudge=False,   # 文字水印位置编辑器：看不到画布，无微调按钮
         main_video_file=_bg_file or None,   # 背景帧=实际主视频当前帧
+        main_offset=main_offset,            # pad 时主视频内容偏移（超出画布部分留黑）
+        main_render_size=main_render_size,  # pad 时主视频自身渲染尺寸（None=铺满画布）
         bg_pre_filter=_bg_filter)           # 主视频 crop/rotate（防背景帧变形）
 
 
@@ -12155,7 +13665,7 @@ class TextWatermarkDialog(tk.Toplevel):
     """
     def __init__(self, parent, app, settings_target=None, refresh_cb=None,
                  settings_container=None, position_editor_cb=None, canvas_file=None,
-                 canvas_settings=None):
+                 canvas_settings=None, canvas_scope=None):
         super().__init__(parent)
         self.withdraw()
         self.app = app
@@ -12166,6 +13676,10 @@ class TextWatermarkDialog(tk.Toplevel):
         # 上下文主视频设置（画布渲染/背景帧 crop+rotate 预处理同源，问题④）：队列=task.settings、
         # 封装=主轨 enc_settings；None → 轨迹编辑器回退转换页 get_current_settings。
         self.canvas_settings = canvas_settings
+        # 宿主页作用域（2026-09-23）：'convert'/'merge' —— canvas_file 为空时只在本页
+        # 内找主视频，绝不用另一页的主视频兜底抽帧（本页没主视频=纯黑背景帧）。
+        # None → 按 'convert' 处理（旧调用点行为）。
+        self.canvas_scope = canvas_scope
         self.settings = settings_target if settings_target is not None else app.text_watermark_settings
         self.tw_refresh = refresh_cb
         # 位置编辑器回调（封装页独立文字水印入口传入）：None → 委托 parent._open_text_wm_position_editor
@@ -12249,19 +13763,6 @@ class TextWatermarkDialog(tk.Toplevel):
         self.enabled_var = tk.BooleanVar(value=s.get("enabled", False))
         ttk.Checkbutton(main, text=_("启用文字水印"), variable=self.enabled_var).grid(
             row=1, column=0, sticky="w", pady=5)
-        # 注入到封装页开关：开启后，本页文字水印设置会随主视频轨道带入封装页 3 个模式。
-        # 仅转换主界面打开的文字水印窗口显示；队列任务编辑隐藏（inject_var 仍创建，
-        # 保留已有键值，on_ok 照常写回，不显示控件而已）。
-        # ⚠️ 必须 trace 实时写回（不能只在 on_ok 写）：否则勾选注入后立即点「打开位置编辑器」，
-        # 画布判定（_tw_canvas_size 读 inject_to_packaging）还是旧值 False → 回退 1280x720。
-        self.inject_var = tk.BooleanVar(value=s.get("inject_to_packaging", False))
-        def _tw_sync_inject(*_a):
-            self.settings["inject_to_packaging"] = bool(self.inject_var.get())
-            self._refresh()
-        self.inject_var.trace_add("write", _tw_sync_inject)
-        # ⚠️ 2026-08-26：封装页已改为独立文字水印入口（「封装/合并」页底部「文字水印」按钮），
-        # 不再从转换页注入 → 不再显示「注入到封装页」复选框（旧版它 grid 在 row0 col1，
-        # 与上方列表 LabelFrame 重叠，挡住列表内容）。inject_var 保留仅做数据兼容，无控件。
 
         # ---- 基础参数区（文字内容 → 描边颜色）----
         # 2026-09-04 布局改造：这一整段原为 grid 单行排布，但 grid 的列宽由该列「最宽控件」
@@ -12290,7 +13791,28 @@ class TextWatermarkDialog(tk.Toplevel):
         # 富文本（2026-09-19）：多行编辑入口。普通模式把多行拼成一行显示；
         # 倒计时模式按行拆分逐行排版（见 countdown_lines / build_tw_countdown_subgraph）。
         ttk.Button(_r, text=_("富文本"), width=6,
-                   command=self._open_rich_text_editor).pack(side=tk.LEFT)
+                   command=self._open_rich_text_editor).pack(side=tk.LEFT, padx=(0, 4))
+        # 富文本换行（2026-09-25）：勾选后渲染保留换行（竖排 / @字体式），不再拼成一行；
+        # 与「启用倒计时」互斥（见 _tw_sync_multiline / _tw_sync_countdown）。
+        self.multiline_var = tk.BooleanVar(value=bool(s.get("multiline", False)))
+
+        def _tw_sync_multiline(*_a):
+            if getattr(self, "_tw_loading", False):
+                return
+            st = self.settings
+            _on = bool(self.multiline_var.get())
+            st["multiline"] = _on
+            if _on and getattr(self, "cd_enabled_var", None) is not None and self.cd_enabled_var.get():
+                # 与倒计时互斥：勾选富文本换行 → 关掉倒计时
+                self.cd_enabled_var.set(False)
+                st["countdown_enabled"] = False
+            self._sync_item_to_container()
+            self._refresh_tw_tree()
+            self._refresh()
+
+        ttk.Checkbutton(_r, text=_("富文本换行"), variable=self.multiline_var,
+                        command=_tw_sync_multiline).pack(side=tk.LEFT)
+        self.multiline_var.trace_add("write", _tw_sync_multiline)
 
         # ---- 字体（内置中文在前 → 常用英文 → 系统扫描字体，2026-09-04）----
         _r = _tw_row()
@@ -12433,6 +13955,10 @@ class TextWatermarkDialog(tk.Toplevel):
             # 与 _tw_sync_rotate 同款：实时写回当前选中项（加载期间由守卫跳过刷新）
             st = self.settings
             st["countdown_enabled"] = bool(self.cd_enabled_var.get())
+            if st["countdown_enabled"] and getattr(self, "multiline_var", None) is not None and self.multiline_var.get():
+                # 与富文本换行互斥：启用倒计时 → 关掉富文本换行
+                self.multiline_var.set(False)
+                st["multiline"] = False
             _name2id = {n: i for n, i in COUNTDOWN_DIRECTIONS}
             st["countdown_direction"] = _name2id.get(self.cd_dir_var.get(), "top_bottom")
             # 滚动时段/行距/窗口存原始字符串：空 = 自动（时段=0~行数−1 秒、窗口=单行满幅）
@@ -12611,9 +14137,9 @@ class TextWatermarkDialog(tk.Toplevel):
 
         presets = {
             _("左上"): ("10", "10"),
-            _("右上"): ("W-w-10", "10"),
-            _("左下"): ("10", "H-h-10"),
-            _("右下"): ("W-w-10", "H-h-10"),
+            _("右上"): (DEFAULT_OVERLAY_X, "10"),
+            _("左下"): ("10", DEFAULT_OVERLAY_Y),
+            _("右下"): (DEFAULT_OVERLAY_X, DEFAULT_OVERLAY_Y),
             _("居中"): ("(W-w)/2", "(H-h)/2"),
         }
         preset_frame = ttk.Frame(main)
@@ -12770,7 +14296,6 @@ class TextWatermarkDialog(tk.Toplevel):
         否则编辑过的内容（文字/字体/字号/颜色等）在切换时被静默丢弃。"""
         s = self.items[idx]
         s["enabled"] = self.enabled_var.get()
-        s["inject_to_packaging"] = self.inject_var.get()
         s["text"] = self.text_var.get().strip()
         s["font_name"] = self.font_var.get()
         # 外部字体优先：填了外部字体路径就以它为准，留空则回落到下拉所选的系统字体。
@@ -12787,6 +14312,9 @@ class TextWatermarkDialog(tk.Toplevel):
         s["opacity"] = self.opacity_var.get() / 100.0
         s["border_w"] = self.border_w_var.get()
         s["border_color"] = self.border_color_var.get().strip() or "#000000"
+        # 富文本换行（2026-09-25）：与「启用倒计时」互斥，由各自 trace 守卫。
+        if hasattr(self, "multiline_var"):
+            s["multiline"] = bool(self.multiline_var.get())
         s["enable_start"] = self.enable_start_var.get().strip()
         s["enable_end"] = self.enable_end_var.get().strip()
         s["enable_cycle"] = self.enable_cycle_var.get().strip()
@@ -12865,7 +14393,6 @@ class TextWatermarkDialog(tk.Toplevel):
             s = self.settings
             try:
                 self.enabled_var.set(s.get("enabled", False))
-                self.inject_var.set(s.get("inject_to_packaging", False))
                 self.text_var.set(s.get("text", ""))
                 self.font_var.set(s.get("font_name", _("微软雅黑")))
                 # 外部字体路径回填（与 _collect_tw_form 对称；留空表示用上方下拉的系统字体）
@@ -12900,6 +14427,9 @@ class TextWatermarkDialog(tk.Toplevel):
                     self.border_w_var.set(int(s.get("border_w", 0)))
                 except (ValueError, TypeError):
                     pass
+                # 富文本换行（2026-09-25）：与「启用倒计时」互斥，由各自 trace 守卫。
+                if hasattr(self, "multiline_var"):
+                    self.multiline_var.set(bool(s.get("multiline", False)))
                 # 倒计时（滚动小窗）：空字符串 = 自动（生成器里兜底）
                 if hasattr(self, "cd_enabled_var"):
                     self.cd_enabled_var.set(bool(s.get("countdown_enabled", False)))
@@ -13079,18 +14609,18 @@ class TextWatermarkDialog(tk.Toplevel):
         _f = ""   # 2026-08-27：try 外初始化，供下方 main_video_file 透传（异常时回退空→纯黑）
         try:
             _f = ""
-            # 上下文主视频优先（队列=task.input / 封装=merge_video或主轨），再回退转换页
+            # 上下文主视频优先（队列=task.input / 封装=merge_video或主轨）
             if getattr(self, "canvas_file", ""):
                 _f = str(self.canvas_file).strip()
+            # 2026-09-23：未给出语境时按宿主页作用域在本页内找，绝不再回退另一页
+            # （旧代码先 input_file 再 merge_video，封装页会错取转换页画面帧）。
             if not _f or not os.path.exists(_f):
-                if getattr(app, "input_file", None):
-                    _f = app.input_file.get().strip()
-            if not _f or not os.path.exists(_f):
-                if getattr(app, "merge_video", None):
-                    _f = app.merge_video.get().strip()
+                _pf, _unused = _page_main_video(
+                    app, getattr(self, "canvas_scope", None) or "convert")
+                _f = _pf or ""
             if not _f or not os.path.exists(_f):
                 messagebox.showinfo(_("提示"),
-                                    _("请先设置主视频（封装页「主视频」或转换页输入文件）后再使用可视化坐标编辑"))
+                                    _("请先设置主视频后再使用可视化坐标编辑"))
                 return
             _wd, _hd = app._get_video_dimensions_cached(_f)
             mw, mh = _wd or 1280, _hd or 720
@@ -13110,7 +14640,11 @@ class TextWatermarkDialog(tk.Toplevel):
             pass
         wm_w, wm_h = 160, 40
         try:
-            _txt = self.text_var.get().strip() or _("水印")
+            # 富文本换行（2026-09-25）：与渲染端统一。multiline 开保留换行（高盒）、
+            # 关拼成一行（矮盒），与最终渲染严格一致。
+            _ml = bool(getattr(self, "multiline_var", None) and self.multiline_var.get())
+            _txt = _tw_effective_text({"text": self.text_var.get(),
+                                       "multiline": _ml}) or _("水印")
             _fs = int(float(self.size_var.get() or 24))
             # 外部字体优先（与 _collect_tw_form / 滤镜侧同语义。注：当前 estimate_text_size
             # 并不消费 font_path，仅纯字符宽度估算；此处保持一致是为将来按字体度量估算预留）
@@ -13149,7 +14683,8 @@ class TextWatermarkDialog(tk.Toplevel):
                         if self.tw_refresh:
                             try: self.tw_refresh()
                             except Exception: pass
-                        try: self.app._append_info_ui(_("[文字水印-轨迹] 字体大小已更新: {0} → {1}").format(_old_fs, _new_fs))
+                        try:
+                            self.app._append_info_ui(_('[文字水印-轨迹] 字体大小已更新: {0} → {1}').format(_old_fs, _new_fs))
                         except Exception: pass
             except Exception:
                 pass
@@ -13391,21 +14926,18 @@ class TextWatermarkDialog(tk.Toplevel):
 
     def _context_main_video(self):
         """当前对话框上下文的主视频（叠加层时间线基准，时间预览/轨迹/位置编辑器共用）：
-        canvas_file（队列=task.input / 封装=merge_video或主轨）→ 转换页 input_file → 封装页 merge_video。"""
+        canvas_file（队列=task.input / 封装=merge_video或主轨）→ 本页主视频。
+        2026-09-23：两页禁止互相兜底——canvas_scope='merge' 只取封装页主视频，
+        其余只取转换页输入文件；本页没有就是空串（调用方各自提示/纯黑）。"""
         if getattr(self, "canvas_file", ""):
             return str(self.canvas_file).strip()
         app = getattr(self, "app", None)
         if app is None:
             return ""
         try:
-            if hasattr(app, "input_file"):
-                p = app.input_file.get().strip()
-                if p and os.path.exists(p):
-                    return p
-            if getattr(app, "merge_video", None):
-                p = app.merge_video.get().strip()
-                if p and os.path.exists(p):
-                    return p
+            _pf, _unused = _page_main_video(app, getattr(self, "canvas_scope", None) or "convert")
+            if _pf and os.path.exists(_pf):
+                return _pf
         except Exception:
             pass
         return ""
@@ -13656,22 +15188,22 @@ class BlurFilterDialog(tk.Toplevel):
         # 坐标输入行
         row1 = ttk.Frame(coord_frame)
         row1.pack(fill=tk.X, pady=2)
-        ttk.Label(row1, text="X:").pack(side=tk.LEFT)
+        ttk.Label(row1, text=_("左:")).pack(side=tk.LEFT)
         self.x_var = tk.StringVar(value=self.filter_frame._blur_x.get())
         x_entry = ttk.Entry(row1, textvariable=self.x_var, width=6)
         x_entry.pack(side=tk.LEFT, padx=2)
     
-        ttk.Label(row1, text="Y:").pack(side=tk.LEFT, padx=(10,0))
+        ttk.Label(row1, text=_("上:")).pack(side=tk.LEFT, padx=(10,0))
         self.y_var = tk.StringVar(value=self.filter_frame._blur_y.get())
         y_entry = ttk.Entry(row1, textvariable=self.y_var, width=6)
         y_entry.pack(side=tk.LEFT, padx=2)
  
-        ttk.Label(row1, text=_("宽度:")).pack(side=tk.LEFT, padx=(10,0))
+        ttk.Label(row1, text=_("宽:")).pack(side=tk.LEFT, padx=(10,0))
         self.w_var = tk.StringVar(value=self.filter_frame._blur_w.get())
         w_entry = ttk.Entry(row1, textvariable=self.w_var, width=6)
         w_entry.pack(side=tk.LEFT, padx=2)
 
-        ttk.Label(row1, text=_("高度:")).pack(side=tk.LEFT, padx=(10,0))
+        ttk.Label(row1, text=_("高:")).pack(side=tk.LEFT, padx=(10,0))
         self.h_var = tk.StringVar(value=self.filter_frame._blur_h.get())
         h_entry = ttk.Entry(row1, textvariable=self.h_var, width=6)
         h_entry.pack(side=tk.LEFT, padx=2)
@@ -13703,13 +15235,36 @@ class BlurFilterDialog(tk.Toplevel):
                 self.grab_release()
             except Exception:
                 pass
-            RegionVisualEditor(
-                app, file_path,
+            def _delogo_apply(rect):
+                _x, _y, _w, _h = rect
+                self.x_var.set(str(int(_x)))
+                self.y_var.set(str(int(_y)))
+                self.w_var.set(str(int(_w)))
+                self.h_var.set(str(int(_h)))
+            _pre = None
+            try:
+                _px = int(float(str(self.x_var.get()).strip() or 0))
+                _py = int(float(str(self.y_var.get()).strip() or 0))
+                _pw = int(float(str(self.w_var.get()).strip() or 0))
+                _ph = int(float(str(self.h_var.get()).strip() or 0))
+                if _pw > 0 and _ph > 0:
+                    _pre = [(_px, _py), (_px + _pw, _py + _ph)]
+            except (ValueError, TypeError):
+                _pre = None
+            RectSelectEditor(
+                self.filter_frame, file_path,
                 self.x_var, self.y_var, self.w_var, self.h_var,
-                frame_extractor=ff.extract_video_frame_scaled,
+                frame_extractor=getattr(self.filter_frame, "node_frame_extractor", None) or ff.extract_video_frame_scaled,
                 helper_rect=helper,
                 safe_border=(self.type_var.get() == "delogo"),
                 title=_("可视化选区 - delogo / 局部滤镜"),
+                on_apply=_delogo_apply,
+                preload_points=_pre,
+                initial_time_override=0.0,
+                show_simple_pos=False,
+                show_black_border=False,
+                apply_label=_("应用"),
+                clear_label=_("清除选区"),
             )
 
         btn_visual = ttk.Button(coord_frame, text=_("🎯 可视化选区…"),
@@ -14354,35 +15909,25 @@ def _aseg_num(x):
     return s.rstrip("0").rstrip(".") if "." in s else s
 
 
-def _aseg_float(v, default=0.0):
-    """宽容地把 UI 字符串转成 float，失败返回默认值（绝不抛异常中断命令构建）。"""
-    if v is None:
-        return default
-    try:
-        return float(str(v).strip())
-    except (TypeError, ValueError):
-        return default
-
-
 def _aseg_filter_body(t, p1, p2):
     """效果类型 + 参数 → 滤镜主体串（不含 enable）。"""
     if t == "mute":
         return "volume=0"
     if t == "volume":
-        return f"volume={_aseg_num(_aseg_float(p1, 1.0))}"
+        return f"volume={_aseg_num(_opt_float(p1, 1.0))}"
     if t == "denoise":
-        return (f"afftdn=nr={_aseg_num(_aseg_float(p1, 12.0))}"
-                f":nf={_aseg_num(_aseg_float(p2, -30.0))}")
+        return (f"afftdn=nr={_aseg_num(_opt_float(p1, 12.0))}"
+                f":nf={_aseg_num(_opt_float(p2, -30.0))}")
     if t == "highpass":
-        return f"highpass=f={_aseg_num(_aseg_float(p1, 200.0))}"
+        return f"highpass=f={_aseg_num(_opt_float(p1, 200.0))}"
     if t == "lowpass":
-        return f"lowpass=f={_aseg_num(_aseg_float(p1, 3000.0))}"
+        return f"lowpass=f={_aseg_num(_opt_float(p1, 3000.0))}"
     if t == "eq_low":
-        return f"bass=g={_aseg_num(_aseg_float(p1, 0.0))}"
+        return f"bass=g={_aseg_num(_opt_float(p1, 0.0))}"
     if t == "eq_mid":
-        return f"equalizer=f=1000:width_type=h:width=200:g={_aseg_num(_aseg_float(p1, 0.0))}"
+        return f"equalizer=f=1000:width_type=h:width=200:g={_aseg_num(_opt_float(p1, 0.0))}"
     if t == "eq_high":
-        return f"treble=g={_aseg_num(_aseg_float(p1, 0.0))}"
+        return f"treble=g={_aseg_num(_opt_float(p1, 0.0))}"
     return ""
 
 
@@ -14474,11 +16019,11 @@ def build_audio_segment_filters(segments, trim_start=0.0, speed_factor=1.0, offs
     for a, b, seg in items:
         t = seg.get("type", "mute")
         if t == "fade_in":
-            d = _aseg_float(seg.get("p1", ""), 0.5)
+            d = _opt_float(seg.get("p1", ""), 0.5)
             if d > 0:
                 out.append(f"afade=t=in:st={_aseg_num(a)}:d={_aseg_num(d)}")
         elif t == "fade_out":
-            d = _aseg_float(seg.get("p1", ""), 0.5)
+            d = _opt_float(seg.get("p1", ""), 0.5)
             if d > 0:
                 out.append(f"afade=t=out:st={_aseg_num(max(0.0, b - d))}:d={_aseg_num(d)}")
 
@@ -14491,7 +16036,7 @@ def build_audio_segment_filters(segments, trim_start=0.0, speed_factor=1.0, offs
             continue
         soft = 0
         if t in _ASEG_SOFT_TYPES:
-            soft = int(_aseg_float(seg.get("soft", 0), 0))
+            soft = int(_opt_float(seg.get("soft", 0), 0))
             if soft < 0:
                 soft = 0
         p1 = str(seg.get("p1", ""))
@@ -14508,7 +16053,7 @@ def build_audio_segment_filters(segments, trim_start=0.0, speed_factor=1.0, offs
         # 静音 / 局部音量：走 volume 表达式（eval=frame 每帧求值，绕开 enable 段首瞬态，
         # 且与柔化共用同一滤镜形式；硬切=if(enable,target,1)，柔化=clip/max/min 包络）。
         if t in _ASEG_SOFT_TYPES:
-            target = 0.0 if t == "mute" else _aseg_float(p1, 1.0)
+            target = 0.0 if t == "mute" else _opt_float(p1, 1.0)
             if soft > 0:
                 out.append(f"volume=eval=frame:volume='{_aseg_soft_expr(ranges, target, soft / 1000.0)}'")
             else:
@@ -14567,9 +16112,9 @@ class AudioSegmentDialog:
             labels = [lb for lb, _dv in spec.get("params", [])]
             vals = [str(seg.get("p1", "")), str(seg.get("p2", ""))]
             pv = "  ".join(f"{lb}={v}" for lb, v in zip(labels, vals) if v != "")
-            soft = int(_aseg_float(seg.get("soft", 0), 0))
+            soft = int(_opt_float(seg.get("soft", 0), 0))
             if soft > 0 and t in _ASEG_SOFT_TYPES:
-                pv = (pv + _("  柔化{0}ms").format(soft)).strip()
+                pv = (pv + _('  柔化{0}ms').format(soft)).strip()
             tv.insert("", "end", iid=str(i), values=(
                 "√" if seg.get("enabled", True) else "",
                 seconds_to_time(a, short=True),
@@ -14631,7 +16176,7 @@ class AudioSegmentDialog:
             self.type_var.set(aseg_type_label(seg.get("type", "mute")))
             self.p1_var.set(str(seg.get("p1", "")))
             self.p2_var.set(str(seg.get("p2", "")))
-            self.soft_var.set(str(int(_aseg_float(seg.get("soft", 0), 0))))
+            self.soft_var.set(str(int(_opt_float(seg.get("soft", 0), 0))))
             self._sync_param_fields()
         finally:
             self._loading = False
@@ -14680,7 +16225,7 @@ class AudioSegmentDialog:
         seg["type"] = aseg_key_from_label(self.type_var.get())
         seg["p1"] = self.p1_var.get().strip()
         seg["p2"] = self.p2_var.get().strip()
-        seg["soft"] = int(_aseg_float(self.soft_var.get(), 0))
+        seg["soft"] = int(_opt_float(self.soft_var.get(), 0))
         self._refresh_row(idx)
         self._update_count()
 
@@ -14703,9 +16248,9 @@ class AudioSegmentDialog:
         labels = [lb for lb, _dv in spec.get("params", [])]
         vals = [str(seg.get("p1", "")), str(seg.get("p2", ""))]
         pv = "  ".join(f"{lb}={v}" for lb, v in zip(labels, vals) if v != "")
-        soft = int(_aseg_float(seg.get("soft", 0), 0))
+        soft = int(_opt_float(seg.get("soft", 0), 0))
         if soft > 0 and t in _ASEG_SOFT_TYPES:
-            pv = (pv + _("  柔化{0}ms").format(soft)).strip()
+            pv = (pv + _('  柔化{0}ms').format(soft)).strip()
         try:
             tv.item(str(idx), values=(
                 "√" if seg.get("enabled", True) else "",
@@ -15162,7 +16707,7 @@ class AudioFrame(ttk.LabelFrame):
         self.audio_bitrate = tk.StringVar(value="auto")
         bitrate_combo = ttk.Combobox(controls_frame, textvariable=self.audio_bitrate, width=6, values=["auto","64k", "96k", "128k", "192k", "256k", "320k"], state='readonly')
         bitrate_combo.pack(side=tk.LEFT, padx=5)
-        ToolTip(_lbltt21, _("auto = 不向 ffmpeg 传 -b:a，由编码器自行决定。\n\n无损编码器（FLAC/ALAC/PCM）不接受比特率——ffmpeg 会静默忽略，\nHandBrake 同样不提供该选项，故此时本框自动置灰。"), wraplength=420)
+        ToolTip(_lbltt21, _("auto = 不向 ffmpeg 传 -b:a，由编码器自行决定。\n\n无损编码器（FLAC/ALAC/PCM）不接受比特率——ffmpeg 会静默忽略。"), wraplength=420)
 
         _lbltt22 = ttk.Label(controls_frame, text=_("采样率:"))
         _lbltt22.pack(side=tk.LEFT)
@@ -15245,16 +16790,54 @@ class AudioFrame(ttk.LabelFrame):
         ToolTip(chk_volume, _("勾选后启用音量倍数调整，可拖动滑块设置倍数（0.1~3.0）\n\n1.0=原始音量"), wraplength=400)
         ttk.Label(volume_frame, text=_("倍数:")).pack(side=tk.LEFT, padx=(5,0))
         self.volume_value = tk.DoubleVar(value=1.0)
+        self.volume_text = tk.StringVar(value="1.00")
+        self._vol_sync = [False]                      # 编辑框↔滑块同步锁，防 trace 自激
         self.volume_slider = ttk.Scale(volume_frame, from_=0.1, to=3.0, variable=self.volume_value,
                                        orient=tk.HORIZONTAL, length=110, state=tk.DISABLED)
         self.volume_slider.pack(side=tk.LEFT, padx=5)
-        self.volume_label = ttk.Label(volume_frame, text="1.0", width=5)
-        self.volume_label.pack(side=tk.LEFT)
-        self.volume_slider.configure(command=lambda v: self.volume_label.config(text=f"{float(v):.2f}"))
+        # 滑块右侧编辑框：可直接键入倍数（0.1~3.0），与滑块双向同步（2026-09-26）
+        # ⚠️ 原右侧是只读 Label，改成 Entry 后必须自己保证「键入即生效」，否则等于没加。
+        self.volume_entry = ttk.Entry(volume_frame, textvariable=self.volume_text, width=5,
+                                      justify=tk.CENTER)
+        self.volume_entry.pack(side=tk.LEFT)
+
+        def _vol_from_entry(*_a):
+            if self._vol_sync[0]:
+                return
+            try:
+                v = float(self.volume_text.get())
+            except (ValueError, TypeError):
+                self._vol_sync[0] = True
+                self.volume_text.set(f"{self.volume_value.get():.2f}")
+                self._vol_sync[0] = False
+                return
+            if v < 0.1:
+                v = 0.1
+            elif v > 3.0:
+                v = 3.0
+            self._vol_sync[0] = True
+            self.volume_value.set(v)
+            self.volume_text.set(f"{v:.2f}")
+            self._vol_sync[0] = False
+
+        def _vol_from_slider(v):
+            if self._vol_sync[0]:
+                return
+            # ⚠️ 置锁必须在写文本**之前**：写文本会触发 volume_text 的 trace →
+            #    _vol_from_entry，不置锁就会把滑块值反向写回 volume_value（多余往返）。
+            self._vol_sync[0] = True
+            self.volume_text.set(f"{float(v):.2f}")
+            self._vol_sync[0] = False
+
+        self.volume_text.trace_add("write", _vol_from_entry)
+        self.volume_entry.bind("<Return>", lambda e: self.volume_entry.selectrange(0, tk.END))
+        self.volume_slider.configure(command=_vol_from_slider)
 
         def on_volume_enabled(*args):
             state = tk.NORMAL if self.volume_enabled.get() else tk.DISABLED
             self.volume_slider.config(state=state)
+            # 编辑框跟随滑块一起禁用/启用，否则「未勾选启用」还能键入（口径不一致）
+            self.volume_entry.config(state=state)
         self.volume_enabled.trace_add("write", on_volume_enabled)
 
         # 变速 + 高级音频弹窗
@@ -15400,9 +16983,10 @@ class AudioFrame(ttk.LabelFrame):
         ToolTip(chk_loud, _("将音频响度标准化到广播级标准（EBU R128），适合统一多段音频的音量"))
         _lbltt23 = ttk.Label(main, text=_("标准:"))
         _lbltt23.grid(row=row, column=2, sticky="w", padx=(10, 2))
-        combo_ln = ttk.Combobox(main, textvariable=ln_i, values=["-23", "-16", "-14"], state="readonly", width=9)
+        combo_ln = ttk.Combobox(main, textvariable=ln_i, values=["-23", "-16", "-14"], width=9)
         combo_ln.grid(row=row, column=3, padx=2, sticky="w")
-        ToolTip(_lbltt23, _("-23=EBU R128（电视/广播） | -16=Spotify | -14=YouTube"))
+        ToolTip(_lbltt23, _("-23=EBU R128（电视/广播） | -16=Spotify | -14=YouTube\n"
+                            "可输入任意值：16 与 -16 等价（自动取负），合法范围 -70~-5，越界自动钳制"))
 
         # ---- 行2：降噪 ----
         row += 1
@@ -15488,7 +17072,11 @@ class AudioFrame(ttk.LabelFrame):
             self.fade_in.set(fi.get().strip())
             self.fade_out.set(fo.get().strip())
             self.loudnorm_enabled.set(le.get())
-            self.loudnorm_i.set(ln_i.get())
+            _ln_ok, _ln_v = loudnorm_i_norm(ln_i.get())
+            if not _ln_ok and ln_i.get().strip():
+                if self.app is not None:
+                    self.app._append_info_ui(_('[响度] 标准值「{0}」无法解析，已按默认 -23').format(ln_i.get().strip()))
+            self.loudnorm_i.set(str(_ln_v))   # 归一回显（正数取负 / 钳到 -70~-5）
             self.denoise_enabled.set(de.get())
             self.denoise_method.set(dn_method.get())
             self.hp_enabled.set(hp_en.get())
@@ -15532,7 +17120,7 @@ class AudioFrame(ttk.LabelFrame):
             "fade_in": self.fade_in.get().strip(),
             "fade_out": self.fade_out.get().strip(),
             "loudnorm_enabled": self.loudnorm_enabled.get(),
-            "loudnorm_i": int(float(self.loudnorm_i.get() or -23)),
+            "loudnorm_i": loudnorm_i_norm(self.loudnorm_i.get())[1],
             "denoise_enabled": self.denoise_enabled.get(),
             "denoise_method": self.denoise_method.get(),
             "hp_enabled": self.hp_enabled.get(),
@@ -15567,8 +17155,11 @@ class AudioFrame(ttk.LabelFrame):
         self.only_audio.set(settings.get("only_audio", False))
         self.audio_format.set(settings.get("audio_format", "m4a"))
         vol = settings.get("volume", 1.0)
-        self.volume_value.set(vol)
-        self.volume_label.config(text=f"{vol:.2f}")
+        try:
+            self.volume_value.set(float(vol))
+        except (ValueError, TypeError):
+            self.volume_value.set(1.0)
+        self.volume_text.set(f"{self.volume_value.get():.2f}")
         enabled = settings.get("volume_enabled", False)
         self.volume_enabled.set(enabled)
         self.audio_speed_enabled.set(settings.get("audio_speed_enabled", False))
@@ -15578,7 +17169,7 @@ class AudioFrame(ttk.LabelFrame):
         self.fade_in.set(settings.get("fade_in", ""))
         self.fade_out.set(settings.get("fade_out", ""))
         self.loudnorm_enabled.set(settings.get("loudnorm_enabled", False))
-        self.loudnorm_i.set(str(settings.get("loudnorm_i", -23)))
+        self.loudnorm_i.set(str(loudnorm_i_norm(settings.get("loudnorm_i", -23))[1]))   # 旧工程可能存了正数/越界值，加载时归一
         self.denoise_enabled.set(settings.get("denoise_enabled", False))
         self.denoise_method.set(settings.get("denoise_method", "afftdn"))
         self.hp_enabled.set(settings.get("hp_enabled", False))
@@ -15607,6 +17198,8 @@ class TrimFrame(ttk.LabelFrame):
         self.update_callback = update_callback
         self.combo_check = None
         self._setting = False
+        self._combo_frame = None  # 组合跳转控件容器（仅 show_combo_seek 时创建）
+        self._src_is_img_mode = None  # 素材类型模式缓存（None=未判定；refresh_source_mode 幂等用）
         # 简易时间预览：app=主程序引用（拿 ffmpeg/ffprobe 路径），file_source=返回当前文件路径的
         # 回调（None 则不显示「简易时间预览」按钮）。三处（转换页/队列编辑/封装页视频流编辑）
         # 复用同一个 TrimFrame，各自传入自己的文件来源。
@@ -15616,17 +17209,17 @@ class TrimFrame(ttk.LabelFrame):
 
     def create_widgets(self):
         self.trim_enabled = tk.BooleanVar(value=False)
-        top_line = ttk.Frame(self)
-        top_line.pack(fill=tk.X, pady=(0,5))
-        
-        self.trim_check = ttk.Checkbutton(top_line, text=_("启用截取片段"), variable=self.trim_enabled,
+        self._top_line = ttk.Frame(self)
+        self._top_line.pack(fill=tk.X, pady=(0,5))
+
+        self.trim_check = ttk.Checkbutton(self._top_line, text=_("启用截取片段"), variable=self.trim_enabled,
                                           command=self.on_trim_toggle)
         self.trim_check.pack(side=tk.LEFT, padx=5)
         
         # 简易时间预览入口（内置帧浏览器，纯 ffmpeg 依赖）：替代外部播放器获取精确截取时间
         self.preview_btn = None
         if self.app is not None and self.file_source is not None:
-            self.preview_btn = ttk.Button(top_line, text=_("简易时间预览"),
+            self.preview_btn = ttk.Button(self._top_line, text=_("简易时间预览"),
                                           command=self._open_simple_preview)
             self.preview_btn.pack(side=tk.LEFT, padx=5)
             ToolTip(self.preview_btn,
@@ -15640,7 +17233,7 @@ class TrimFrame(ttk.LabelFrame):
                     wraplength=420)
             # 导入时间：读剪贴板一行 `-ss S -to E` 直接填入起止时间（不弹窗输入）。
             # 用户场景：习惯性在预览里标记首尾却忘了发送，或从音频等无预览窗口复制一行过来。
-            self.import_trim_btn = ttk.Button(top_line, text=_("导入时间"),
+            self.import_trim_btn = ttk.Button(self._top_line, text=_("导入时间"),
                                               command=self._import_trim_clipboard, width=8)
             self.import_trim_btn.pack(side=tk.LEFT, padx=5)
             ToolTip(self.import_trim_btn,
@@ -15665,26 +17258,26 @@ class TrimFrame(ttk.LabelFrame):
                 "示例: 01:23:45 或 01:23:45.500 (留空表示到文件末尾)"),
                 wraplength=700)
 
-        time_frame = ttk.Frame(self)
-        time_frame.pack(fill=tk.X, pady=2)
-        ttk.Label(time_frame, text=_("开始时间 (HH:MM:SS[.mmm]):")).pack(side=tk.LEFT)
+        self._time_frame = ttk.Frame(self)
+        self._time_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(self._time_frame, text=_("开始时间 (HH:MM:SS[.mmm]):")).pack(side=tk.LEFT)
         self.trim_start = tk.StringVar(value="0")
-        self.trim_start_entry = ttk.Entry(time_frame, textvariable=self.trim_start, width=12)
+        self.trim_start_entry = ttk.Entry(self._time_frame, textvariable=self.trim_start, width=12)
         self.trim_start_entry.pack(side=tk.LEFT, padx=5)
     
-        time_frame2 = ttk.Frame(self)
-        time_frame2.pack(fill=tk.X, pady=2)
-        ttk.Label(time_frame2, text=_("结束时间 (HH:MM:SS[.mmm]):")).pack(side=tk.LEFT)
+        self._time_frame2 = ttk.Frame(self)
+        self._time_frame2.pack(fill=tk.X, pady=2)
+        ttk.Label(self._time_frame2, text=_("结束时间 (HH:MM:SS[.mmm]):")).pack(side=tk.LEFT)
         self.trim_end = tk.StringVar(value="")
-        self.trim_end_entry = ttk.Entry(time_frame2, textvariable=self.trim_end, width=12)
+        self.trim_end_entry = ttk.Entry(self._time_frame2, textvariable=self.trim_end, width=12)
         self.trim_end_entry.pack(side=tk.LEFT, padx=5)
     
         # 精准到帧
-        precise_frame = ttk.Frame(self)
-        precise_frame.pack(fill=tk.X, pady=5)
+        self._precise_frame = ttk.Frame(self)
+        self._precise_frame.pack(fill=tk.X, pady=5)
         self.precise_trim = tk.BooleanVar(value=False)
         self.precise_check = ttk.Checkbutton(
-            precise_frame, 
+            self._precise_frame, 
             text=_("精准到帧（需重新编码，速度慢）"), 
             variable=self.precise_trim,
             command=self.on_precise_toggle
@@ -15698,8 +17291,8 @@ class TrimFrame(ttk.LabelFrame):
 
         # ---------- 组合跳转控件（根据 show_combo_seek 决定是否显示） ----------
         if self.show_combo_seek:
-            combo_frame = ttk.Frame(self)
-            combo_frame.pack(fill=tk.X, pady=2)
+            self._combo_frame = ttk.Frame(self)
+            self._combo_frame.pack(fill=tk.X, pady=2)
             
             self.combo_seek = tk.BooleanVar(value=False)
             self.combo_threshold = tk.IntVar(value=30)
@@ -15708,15 +17301,15 @@ class TrimFrame(ttk.LabelFrame):
             self.combo_threshold.trace_add('write', self._on_combo_changed)
 
             self.combo_check = ttk.Checkbutton(
-                combo_frame, 
+                self._combo_frame, 
                 text=_("组合跳转（加速长视频精确截取）"), 
                 variable=self.combo_seek,
                 command=self._on_combo_toggle
             )
             self.combo_check.pack(side=tk.LEFT, padx=5)
             
-            ttk.Label(combo_frame, text=_("后置微调阈值(秒):")).pack(side=tk.LEFT, padx=(10,0))
-            spin = ttk.Spinbox(combo_frame, from_=1, to=120, width=5, 
+            ttk.Label(self._combo_frame, text=_("后置微调阈值(秒):")).pack(side=tk.LEFT, padx=(10,0))
+            spin = ttk.Spinbox(self._combo_frame, from_=1, to=120, width=5, 
                                textvariable=self.combo_threshold)
             spin.pack(side=tk.LEFT, padx=2)
             
@@ -15757,6 +17350,24 @@ class TrimFrame(ttk.LabelFrame):
 
         self.on_trim_toggle()
 
+        # ---- 图片素材专属：显示时长（秒） ----
+        # 图片本身无时间轴，用「显示时长」规定它显示多少秒，无需预先转成视频（零画质损失）。
+        self.img_duration = tk.StringVar(value="10")
+        self._img_frame = ttk.Frame(self)
+        self._img_frame.pack(fill=tk.X, pady=4)
+        ttk.Label(self._img_frame, text=_("显示时长 (秒):")).pack(side=tk.LEFT)
+        self.img_duration_entry = ttk.Entry(self._img_frame, textvariable=self.img_duration, width=10)
+        self.img_duration_entry.pack(side=tk.LEFT, padx=5)
+        ToolTip(self.img_duration_entry,
+                _("图片素材的显示时长（秒）。图片本身没有时间长度，\n"
+                "在这里直接规定它显示多少秒，无需预先转成视频，无画质损失。\n"
+                "例：16 表示显示 16 秒。配合转场 / 淡入淡出 / 倒数文字水印直接挂在本段即可。"),
+                wraplength=420)
+        ttk.Label(self._img_frame,
+                  text=_("（图片素材专属，视频素材相关控件隐藏。）")).pack(side=tk.LEFT, padx=5)
+        # 创建末尾：根据素材类型切换 UI（图片→仅显示时长；视频→常规截取控件）
+        self.refresh_source_mode()
+
 
     def _on_combo_changed(self, *args):
         """组合跳转相关控件变化时，触发外部刷新"""
@@ -15788,6 +17399,53 @@ class TrimFrame(ttk.LabelFrame):
         state = tk.NORMAL if self.trim_enabled.get() else tk.DISABLED
         self.trim_start_entry.config(state=state)
         self.trim_end_entry.config(state=state)
+
+    # ---------- 图片素材模式：显示「显示时长」，隐藏常规截取控件 ----------
+    def _current_source_is_image(self):
+        u"""根据 file_source 回调判断当前素材是否为静态图片。"""
+        try:
+            if self.file_source is None:
+                return False
+            p = self.file_source()
+            if not p:
+                return False
+            return _is_static_image_file(p)
+        except Exception:
+            return False
+
+    def trim_active(self):
+        u"""「截取」是否等效生效：图片素材没有时间轴，截取不适用（长度由「显示时长」决定）。
+        统一出口——图片模式下控件已被隐藏，这里把残留状态一并屏蔽，
+        避免隐藏控件的旧值被命令生成端消费（曾出现：图片被前置 -ss/-to 截取，覆盖显示时长）。"""
+        if self._current_source_is_image():
+            return False
+        return bool(self.trim_enabled.get())
+
+    def refresh_source_mode(self):
+        u"""根据素材类型切换 UI：
+        图片 → 仅显示「显示时长(秒)」，隐藏 启用截取/起止/精准/组合跳转；
+        视频 → 显示常规截取控件，隐藏「显示时长」。
+        幂等：模式未变直接返回（命令预览每次刷新都会调用一次）。"""
+        is_img = self._current_source_is_image()
+        if self._src_is_img_mode == is_img:
+            return
+        self._src_is_img_mode = is_img
+        if is_img:
+            for w in (self._top_line, self._time_frame, self._time_frame2,
+                      self._precise_frame, self._combo_frame):
+                if w is not None:
+                    w.pack_forget()
+            self._img_frame.pack(fill=tk.X, pady=4)
+        else:
+            self._img_frame.pack_forget()
+            self._top_line.pack(fill=tk.X, pady=(0, 5))
+            self._time_frame.pack(fill=tk.X, pady=2)
+            self._time_frame2.pack(fill=tk.X, pady=2)
+            self._precise_frame.pack(fill=tk.X, pady=5)
+            if self._combo_frame is not None:
+                self._combo_frame.pack(fill=tk.X, pady=2)
+        if not is_img:
+            self.on_trim_toggle()
 
     # ---------- 简易时间预览（内置帧浏览器，2026-08-25 方案 B） ----------
     def _open_simple_preview(self):
@@ -15842,10 +17500,11 @@ class TrimFrame(ttk.LabelFrame):
     # ---------- 修改：get_settings 增加组合跳转字段 ----------
     def get_settings(self):
         res = {
-            "trim_enabled": self.trim_enabled.get(),
+            "trim_enabled": self.trim_active(),
             "trim_start": self.trim_start.get(),
             "trim_end": self.trim_end.get(),
             "precise_trim": self.precise_trim.get(),
+            "img_duration": self.img_duration.get(),
         }
         if self.show_combo_seek:
             res["combo_seek"] = self.combo_seek.get()
@@ -15864,6 +17523,8 @@ class TrimFrame(ttk.LabelFrame):
             self.trim_start.set(settings.get("trim_start", "0"))
             self.trim_end.set(settings.get("trim_end", ""))
             self.precise_trim.set(settings.get("precise_trim", False))
+            self.img_duration.set(settings.get("img_duration", "10"))
+            self.refresh_source_mode()
             if self.show_combo_seek:
                 self.combo_seek.set(settings.get("combo_seek", False))
                 self.combo_threshold.set(settings.get("combo_threshold", 30))
@@ -15874,13 +17535,13 @@ class TrimFrame(ttk.LabelFrame):
         finally:
             self._setting = False
 
+
+
 # ================== 内置简易时间预览（方案 B，2026-08-25） ==================
 def _format_preview_time(sec: float) -> str:
     """秒 → HH:MM:SS.mmm（3 位小数），供截取时间回填。"""
-    s = max(0.0, float(sec))
-    h = int(s // 3600)
-    m = int((s % 3600) // 60)
-    return f"{h:02d}:{m:02d}:{s % 60:09.6f}"
+    h, m, s = _hms_split(sec)
+    return f"{h:02d}:{m:02d}:{s:09.6f}"
 
 
 # ---------- 简易时间预览窗口宽度下限（2026-09-09） ----------
@@ -15901,7 +17562,7 @@ _WAVE_SR = 8000        # 波形解码采样率（单声道 s16，纯内存管道
 
 # ================== 更多设置（2026-08-28；2026-09-18 扩容） ==================
 # 模块级配置字典：无 app/self 引用的模块级函数（get_video_dimensions / _frame_cache_put /
-# record_external_font）与 SimplePreviewer 从这里读取；App 初始化 /「更多设置」弹窗
+# _fonts_remember_recent）与 SimplePreviewer 从这里读取；App 初始化 /「更多设置」弹窗
 # 保存时同步（见 _sync_global_settings）。
 # 后 6 项 2026-09-18 由「写死的模块级常量」升级为可调：出厂默认值一律取自各同名常量
 # （单一来源，避免两处写死走偏）。
@@ -15915,7 +17576,21 @@ _GLOBAL_SETTINGS = {
     "wave_sr": _WAVE_SR,                            # 波形解码采样率（Hz）
     "frame_cache_max": _FRAME_CACHE_MAX,            # 可视化背景帧 LRU 上限
     "fonts_recent_max": FONTS_CACHE_MAX_RECENT,     # 字体最近使用条数上限
+    "preview_volume": 10,                           # 预览播放音量（ffplay -volume，0~100）
 }
+
+# 内置时间预览引擎（pipe_engine）的「工作分辨率上限」（px，按宽度计）：
+# 简易时间引擎用 CPU 跑 ffmpeg 滤镜图，4K+ 主视频上叠加子视频/滤镜时全分辨率计算极吃力
+# （外部播放器 mpv/ffplay 走 GPU 不显此问题）。帧尺寸（渲染尺寸 / pad 画布 / 画布模式产出）宽超过
+# 此值时，把帧尺寸整体乘 f = 上限/宽，并**改写链内分辨率**为降采样尺寸（不在图首另插 scale——
+# 链内自带用户「分辨率」scale，插在图首会被它整段顶回去），全部几何（_main_w/_main_h、子尺寸、
+# pad 画布）同步乘 f → 布局逐像素一致、仅像素变少，图计算量按 f² 下降。≤此值时 f=1，完全不改设置、
+# 几何零缩放（与旧行为逐字节一致）。仅作用于 pipe_engine 路线；外部播放器（GPU）不受此限。
+# 实测（tests/_bench_pipe_cap_speed3.py，4K/4s，真链顺序「缩放 → 降噪/锐化/颜色」）：
+#   缩放后 hqdn3d+unsharp 3.53s→0.68s（5.2x，1.1x 实时 → 5.9x 实时）；
+#   缩放后 nlmeans        36.8s→2.3s（15.9x）；
+#   纯 overlay / delogo 链本就 ≥3x 实时 ⇒ 无增益（~1.0x，上限只对「缩放之后的昂贵滤镜」有效）。
+_PIPE_WORK_MAX_W = 1280
 
 # ---------- A/V 双引擎内核常量（2026-09-06：内核移植自 tests/_audit_av_sync_player.py） ----------
 _AV_POLL_MS = 50            # 同步仲裁 / UI 刷新周期
@@ -15972,7 +17647,10 @@ class SimplePreviewer:
                  on_set_start=None, on_set_end=None, app=None, on_send_segments=None,
                  on_send_waypoints=None, on_send_tw_items=None, on_send_chapters=None,
                  initial_marks=None, trim_start=None, speed_factor=None,
-                 use_output_context=True, start_mode="video"):
+                 use_output_context=True, start_mode="video",
+                 lavfi_complex=None, pipe_aspect=None, pipe_duration=None,
+                 pipe_start=None, pipe_out_mode=False,
+                 pipe_audio_graph=None, pipe_audio_map=None):
         """initial_marks: 打开预览时回溯调用方已有时间 [(s, e), ...]（秒/字符串/None 混合），
         探测完成后重建为标记段显示在段落条上，可直接「复制时间」粘到别处（如音频窗口）。
         on_send_*（2026-08-29 回滚恢复）：单对单「发送到」按钮，mark_row 原位、点击即发，
@@ -15980,11 +17658,41 @@ class SimplePreviewer:
         trim_start/speed_factor（2026-08-29 方向A/阶段1）：主视频截取/变速参数。默认 None
         且 use_output_context=True 时**自动从 app.get_time_context() 读取**（子功能预览），
         调用方零参数；激活时在时间旁追加「成片」时间显示（=(素材−trim)/speed）。
-        主视频自身预览（截取/分段/章节）传 use_output_context=False：纯素材时间、不显示成片。"""
+        主视频自身预览（截取/分段/章节）传 use_output_context=False：纯素材时间、不显示成片。
+        lavfi_complex（2026-09-20「时间预览引擎」）：给定时本预览改为**管道合成模式**
+        ——`-filter_complex` 渲染完整合成图（水印/旋转/轨迹/画布/画中画）→ 末尾 scale+pad 到
+        预览尺寸 → rawvideo 管道。默认 None ⇒ 行为与旧调用方**完全一致**（普通 scale 管道）。
+        ⚠️ 图内 movie= 子输入不吃命令行 -ss，但 _launch_video_pipe 会把它改写成外部 `-ss -i`
+        输入（帧精确），改不到的才退回 `seek_point` 近似（向后关键帧 seek，误差可达一个 GOP）——
+        与正式导出「主从 pipe_start 起算、子从 0 起算」口径一致。
+        见 research/preview/README1.md 修正表 #2 与 Phase 2 记录。
+        pipe_aspect：合成图画面比（≠源文件时给，用于画面框计算）；pipe_duration：输出时长上限
+        （图内可能有 color 无限源，给 0/None 时退化为「主输入时长 → 1h 兜底」）。
+        pipe_start：打开后自动定位到的秒数（管道模式用；对应旧路径把截取起点交给播放器 --start
+        的行为）——默认 None ⇒ 从 0 开始（旧行为）。
+        pipe_out_mode（串行合并专用）：True = 图本身是「输出时间轴」（多段 + xfade），不能用
+        素材时间轴 seek → 拖动时改为在图的末端追加 `trim=start=sec`（输出侧裁剪，从头解码到
+        目标点）。默认 False = 素材时间轴模式（-ss 主输入 + 子输入改写成外部 -i）。
+        pipe_audio_graph/pipe_audio_map（串行合并专用，2026-09-20）：合成音频图（各段 amovie +
+        concat/acrossfade/BGM，末标签 = pipe_audio_map）。给定时 _a_start 不再直读主文件音轨
+        （串行合并的主文件=第一段 → 播完第一段就无声，用户实测），改起
+        `ffplay -f lavfi -i "<图>;[末标签]atrim=start=at,asetpts=PTS-STARTPTS"` 播**合成音频**，
+        声音跨段连续且与 xfade 画面对齐；has_audio/时长也按图口径覆盖。默认 None ⇒ ffplay 行为
+        与旧版逐字一致。"""
         self.root = root
         self.ff = ffmpeg_cmd
         self.ffprobe = ffprobe_cmd
         self.file = file_path
+        # ---- 管道合成模式（2026-09-20「时间预览引擎」Phase 1）：门控，None=完全旧行为 ----
+        # _pipe_graph：已翻译成 ffmpeg -filter_complex 的合成图（[0:v] 主输入 + [pv_src] 末标签）；
+        # None ⇒ _launch_video 走原 -vf scale 路径，零行为变化。
+        self._pipe_graph = lavfi_complex or None
+        self._pipe_aspect = pipe_aspect
+        self._pipe_dur = pipe_duration
+        self._pipe_start = pipe_start
+        self._pipe_out_mode = bool(pipe_out_mode)
+        self._pipe_audio_graph = pipe_audio_graph or None
+        self._pipe_audio_map = pipe_audio_map or "[ao]"
         self.on_set_start = on_set_start
         self.on_set_end = on_set_end
         self._stop = False
@@ -16183,7 +17891,9 @@ class SimplePreviewer:
 
     def _build_ui(self):
         self.win = tk.Toplevel(self.root)
-        self.win.title(_("简易时间预览 - ") + os.path.basename(self.file))
+        # 管道合成模式（时间预览引擎）标题区分，便于与普通入口对照
+        self.win.title((_("时间预览（合成） - ") if self._pipe_graph else _("简易时间预览 - "))
+                       + os.path.basename(self.file))
         # 不置顶（2026-08-28）：置顶会把标记/内部播放等按钮的 ToolTip（普通 Toplevel）盖住，
         # 导致提示显示不出来。父窗按项目约定均非置顶（弹窗禁 -topmost），且打开预览前已
         # grab_release，普通 Toplevel + 打开时 lift/focus_force 已足够盖住父窗可交互。
@@ -16440,7 +18150,7 @@ class SimplePreviewer:
         self.seg_cv.bind("<Double-Button-1>", self._on_seg_double)
         self.seg_cv.bind("<Motion>", self._on_seg_motion)   # 悬停显示该处时间
         self.seg_cv.bind("<Leave>", self._on_seg_leave)
-        # 画布宽度变化 → 重绘（2026-09-09 port from base）：段的绘制与点击命中都按 winfo_width() 换算，
+        # 画布宽度变化 → 重绘（2026-09-09）：段的绘制与点击命中都按 winfo_width() 换算，
         # 宽度变了不重绘 → 色块停留旧宽度、点击落点与实际时间错位。窗口加宽下限生效后
         # 画面↔音频切换会让宽度跨 300px，必须跟着重画（与大波形 _on_wave_resize 同款）。
         self.seg_cv.bind("<Configure>", self._on_seg_resize)
@@ -16639,10 +18349,27 @@ class SimplePreviewer:
                         self._dur = float(_d)
             except Exception:
                 pass
+        # 管道合成模式覆盖（2026-09-20）：串行合并的主文件=第一段 → 探测到的时长/音轨与
+        # 合成图口径不符。pipe_duration（=总时长）优先作时间轴长度；给了合成音频图 ⇒
+        # has_audio 恒真（首段无音轨但后续段有时也要起 ffplay 播合成音频）。
+        try:
+            if self._pipe_dur and float(self._pipe_dur) > 0:
+                self._dur = float(self._pipe_dur)
+        except (TypeError, ValueError):
+            pass
+        if self._pipe_audio_graph:
+            self.has_audio = True
         if self._fps <= 0 or self._fps > 240:
             self._fps = 25.0
         if self._aspect <= 0:
             self._aspect = 16.0 / 9.0
+        # 管道合成模式：合成图画面比可能与源文件不同（pad 画布 / split 网格）→ 调用方给的值优先，
+        # 用于画面框计算（合成图由 _launch_video_pipe 的 pad 兜住实际尺寸，恒定输出 WxH）。
+        try:
+            if self._pipe_aspect and float(self._pipe_aspect) > 0:
+                self._aspect = float(self._pipe_aspect)
+        except (TypeError, ValueError):
+            pass
         # 调度主线程更新控件（tk 非线程安全，所有控件操作必须回主线程）
         try:
             self.root.after(0, self._apply_probe_ui)
@@ -16693,7 +18420,7 @@ class SimplePreviewer:
         self._marks = marks
         try:
             self.mark_status.config(
-                text=f"已回溯 {len(marks)} 段（来源当前窗口已有时间），可直接复制；清除全部后重新标记")
+                text=_('已回溯 {0} 段（来源当前窗口已有时间），可直接复制；清除全部后重新标记').format(len(marks)))
         except Exception:
             pass
         self._update_mark_buttons()
@@ -16726,6 +18453,16 @@ class SimplePreviewer:
             self._v_pos = 0.0
             self._a_pos = 0.0
             self._current_us = 0
+            # 管道合成模式：从调用方指定起点开播（等价旧路径把截取起点交给播放器 --start）。
+            # 必须在首次自动开播（_poll_av 读 _current_us）之前落值。clamp 到 [0, dur]。
+            if self._pipe_start:
+                try:
+                    _ps = float(self._pipe_start)
+                    if self._dur:
+                        _ps = max(0.0, min(_ps, float(self._dur)))
+                    self._current_us = int(_ps * 1e6)
+                except (TypeError, ValueError):
+                    pass
             if self._poll_job is None:
                 self._poll_job = self.win.after(_AV_POLL_MS, self._poll)
             if self._pump_job is None:
@@ -16951,10 +18688,10 @@ class SimplePreviewer:
             # 审计 M4：communicate(timeout) 才真正受超时约束；read() 会一直阻塞到 EOF，
             # 后面的 wait(timeout) 形同虚设。超时则杀进程再收尾。
             try:
-                out, _ = proc.communicate(timeout=30)
+                out, _unused = proc.communicate(timeout=30)
             except subprocess.TimeoutExpired:
                 proc.kill()
-                out, _ = proc.communicate()
+                out, _unused = proc.communicate()
             if proc.returncode != 0:
                 return
             kfs = []
@@ -17057,22 +18794,22 @@ class SimplePreviewer:
         t = self._current_us / 1e6
         if self._open_start is None:
             self._open_start = t
-            self.mark_status.config(text=f"已标起点 {_format_preview_time(t)}，再按「标记」记终点")
+            self.mark_status.config(text=_('已标起点 {0}，再按「标记」记终点').format(_format_preview_time(t)))
             return
         e = t
         if e <= self._open_start:
             self.mark_status.config(
-                text=f"终点 {_format_preview_time(e)} 须晚于起点 "
-                     f"{_format_preview_time(self._open_start)}，请移到后面再按「标记」或「撤销标记」")
+                text=_('终点 {0} 须晚于起点 {1}，请移到后面再按「标记」或「撤销标记」').format(_format_preview_time(e), _format_preview_time(self._open_start))
+)
             return
         self._marks.append([self._open_start, e])
         self._open_start = None
         self._update_mark_buttons()
         self._draw_segments()
         self.mark_status.config(
-            text=f"✓ 已标第 {len(self._marks)} 段："
-                 f"{_format_preview_time(self._marks[-1][0])} → "
-                 f"{_format_preview_time(self._marks[-1][1])}")
+            text=_('✓ 已标第 {0} 段：{1} → {2}').format(len(self._marks), _format_preview_time(self._marks[-1][0]), _format_preview_time(self._marks[-1][1]))
+
+)
 
     def _undo_mark(self):
         if self._open_start is not None:
@@ -17167,7 +18904,7 @@ class SimplePreviewer:
                 self.mark_status.config(text=_("已在最后一个标记点"))
                 return
         p = pts[idx]
-        self.mark_status.config(text=f"已跳转到标记点 {_format_preview_time(p)}")
+        self.mark_status.config(text=_('已跳转到标记点 {0}').format(_format_preview_time(p)))
         self._seek_no_autoplay(p)  # 手动跳转：保持播放/暂停态，不强行自动播放（同关键帧跳转）
 
     def _seek_no_autoplay(self, sec):
@@ -17340,9 +19077,9 @@ class SimplePreviewer:
                 else:
                     self._selected_seg = idx
                     self.seg_lab.config(
-                        text=f"选中第 {idx+1} 段：{_format_preview_time(self._marks[idx][0])} → "
-                             f"{_format_preview_time(self._marks[idx][1])}，"
-                             f"长 {self._marks[idx][1]-self._marks[idx][0]:.3f}s")
+                        text=_('选中第 {0} 段：{1} → {2}，长 {3}:.3fs').format(idx+1, _format_preview_time(self._marks[idx][0]), _format_preview_time(self._marks[idx][1]), self._marks[idx][1]-self._marks[idx][0])
+
+)
                 self._update_mark_buttons()
                 self._draw_segments()
                 return
@@ -17351,9 +19088,9 @@ class SimplePreviewer:
         self._seek_pause(t)
         sel_info = ""
         if self._selected_seg is not None and 0 <= self._selected_seg < len(self._marks):
-            sel_info = f"（当前仍选中第 {self._selected_seg+1} 段，点起点三角可切换）"
+            sel_info = _('（当前仍选中第 {0} 段，点起点三角可切换）').format(self._selected_seg+1)
         self.seg_lab.config(
-            text=f"已定位并暂停 {_format_preview_time(t)}{sel_info}")
+            text=_('已定位并暂停 {0}{1}').format(_format_preview_time(t), sel_info))
 
     def _on_seg_double(self, event):
         """双击：点中色块=循环预览该段（重叠区取最上层，同单击选中语义）；点空白不动作。"""
@@ -17385,8 +19122,8 @@ class SimplePreviewer:
         self._request_seek(s)      # 初始 seek 走守卫，不立即被自身清掉循环
         self._loop_seek_pending = False
         self.mark_status.config(
-            text=f"循环预览第 {idx+1} 段：{_format_preview_time(s)} → "
-                 f"{_format_preview_time(e)}（任意跳转/双击退出）")
+            text=_('循环预览第 {0} 段：{1} → {2}（任意跳转/双击退出）').format(idx+1, _format_preview_time(s), _format_preview_time(e))
+)
         self._draw_segments()
 
     def _copy_segments_clipboard(self):
@@ -17399,7 +19136,7 @@ class SimplePreviewer:
         try:
             write_clipboard_safe(self.win, txt)
             self.mark_status.config(
-                text=f"已复制 {len(self._marks)} 段时间到剪贴板（粘到分段拼接右栏导入）")
+                text=_('已复制 {0} 段时间到剪贴板（粘到分段拼接右栏导入）').format(len(self._marks)))
         except Exception:
             self.mark_status.config(text=_("复制失败"))
 
@@ -17437,7 +19174,7 @@ class SimplePreviewer:
             self._update_mark_buttons()
             self._draw_segments()
             self.mark_status.config(
-                text=f"已导入 {len(marks)} 段（共 {len(self._marks)} 段），可复制时间/发送到各列表")
+                text=_('已导入 {0} 段（共 {1} 段），可复制时间/发送到各列表').format(len(marks), len(self._marks)))
             win.destroy()
 
         ttk.Button(bf, text=_("解析并添加"), command=_do).pack(side=tk.LEFT, padx=2)
@@ -17456,7 +19193,7 @@ class SimplePreviewer:
             self.mark_status.config(text=_("没有可发送的已闭合标记"))
             return
         self._on_send_segments(valid)
-        msg = f"已发送 {len(valid)} 段到分段列表"
+        msg = _('已发送 {0} 段到分段列表').format(len(valid))
         if n_open:
             msg += _("（忽略 1 个未闭合标记）")
         self.mark_status.config(text=msg)
@@ -17471,7 +19208,7 @@ class SimplePreviewer:
             self.mark_status.config(text=_("没有可发送的已闭合标记"))
             return
         cb(valid)
-        self.mark_status.config(text=f"已发送 {len(valid)} 段到{dest_label}")
+        self.mark_status.config(text=_('已发送 {0} 段到{1}').format(len(valid), dest_label))
 
     def _play_segment_inner(self):
         """内部循环预览选中段：复用 _loop_segment（到段尾回跳段首，任意跳转退出）。
@@ -17495,10 +19232,10 @@ class SimplePreviewer:
         try:
             self._app.preview_with_player(self.file, start_time=s, duration=e - s)
             self.mark_status.config(
-                text=f"已用外部播放器播放第 {self._selected_seg+1} 段："
-                     f"{_format_preview_time(s)} → {_format_preview_time(e)}")
+                text=_('已用外部播放器播放第 {0} 段：{1} → {2}').format(self._selected_seg+1, _format_preview_time(s), _format_preview_time(e))
+)
         except Exception as ex:
-            self.mark_status.config(text=f"外部播放失败：{ex}")
+            self.mark_status.config(text=_('外部播放失败：{0}').format(ex))
 
     # ================== 音频引擎 / 波形 / 波形条 / A/V设置（2026-09-06 内核移植） ==================
     # 音频=ffplay 直读（粗 -ss 回退 + atrim 精修，落点采样级精确；ffplay 无 IPC，
@@ -17625,22 +19362,44 @@ class SimplePreviewer:
     # ---------- ffplay 播放核心（内核：粗 -ss + atrim 精修 + 状态行解析） ----------
     def _a_start(self, at):
         """启动 ffplay 直读（-nodisp -autoexit）。_a_gen+1 作废旧代 reader 事件。
-        at=音频应出声的绝对源时间（A/V 模式调用方已 +latency 补偿启动延迟）。"""
+        at=音频应出声的绝对源时间（A/V 模式调用方已 +latency 补偿启动延迟）。
+
+        2026-09-20 串行合并管道预览：给了 _pipe_audio_graph 时不直读 self.file（那是第一段
+        的文件，播完第一段就无声——用户实测），改播**合成音频图**：
+          ffplay -f lavfi -i "<各段 amovie + concat/acrossfade/BGM 图>;[末标签]atrim=start=at,
+          asetpts=PTS-STARTPTS"
+        atrim 在拼接后的输出时间轴上裁（与视频 out_mode 同口径），落点精确；每帧图按需解码，
+        不需要粗 seek。"""
         self._a_kill()
+        # 音量以「更多设置 → 预览音量」为唯一来源（2026-09-21）：App 侧改过后也不会过期
+        self.volume = max(0, min(100, int(_GLOBAL_SETTINGS.get("preview_volume", self.volume))))
         if not (self.has_audio and self.audio_enabled):
             return
         if self._dur:
             at = max(0.0, min(at, max(0.0, self._dur - 0.05)))
-        # ffplay 的 -ss 是 demuxer 级 seek（默认流=视频），视频容器里寻址只能落在
-        # 视频关键帧（实测 36.00→33.80）。修法=粗+精两段：-ss coarse 瞬间跳到目标前
-        # 15s，atrim=start=at 把关键帧→目标之间解码后丢弃（音频无关键帧概念 →
-        # 落点采样级精确），asetpts 归零 → 状态行时钟=距目标相对时间。
-        coarse = max(0.0, at - _AV_COARSE_BACK)
-        cmd = [self._ffplay, "-nodisp", "-autoexit", "-vn", "-sn",
-               "-volume", str(max(0, min(100, self.volume))),
-               "-ss", _ffsec(coarse),
-               "-af", "atrim=start=" + _ffsec(at) + ",asetpts=PTS-STARTPTS",
-               self.file]
+        _lavfi_graph = getattr(self, "_pipe_audio_graph", None)
+        coarse = max(0.0, at - _AV_COARSE_BACK)   # ⚠️ 必须在分支前赋值： lavfi 分支不做粗
+        # seek（图内 atrim 自带精定位），但分支汇合后的 _atrace 日志行引用 coarse——
+        # 若只在此处定义，lavfi 分支走到 _atrace 必 NameError，且异常会沿调用链炸死
+        # _pump 的 after 循环（画面冻结在首帧、音频被 _poll 仲裁每 0.7s 重启一次——
+        # 2026-09-20 用户实测 concat 预览「画面不动+声音反复重播」的根因）。
+        if _lavfi_graph:
+            cmd = [self._ffplay, "-nodisp", "-autoexit", "-vn", "-sn",
+                   "-volume", str(max(0, min(100, self.volume))),
+                   "-f", "lavfi", "-i",
+                   "%s;%satrim=start=%s,asetpts=PTS-STARTPTS"
+                   % (_lavfi_graph, getattr(self, "_pipe_audio_map", "[ao]"),
+                      _ffsec(at))]
+        else:
+            # ffplay 的 -ss 是 demuxer 级 seek（默认流=视频），视频容器里寻址只能落在
+            # 视频关键帧（实测 36.00→33.80）。修法=粗+精两段：-ss coarse 瞬间跳到目标前
+            # 15s，atrim=start=at 把关键帧→目标之间解码后丢弃（音频无关键帧概念 →
+            # 落点采样级精确），asetpts 归零 → 状态行时钟=距目标相对时间。
+            cmd = [self._ffplay, "-nodisp", "-autoexit", "-vn", "-sn",
+                   "-volume", str(max(0, min(100, self.volume))),
+                   "-ss", _ffsec(coarse),
+                   "-af", "atrim=start=" + _ffsec(at) + ",asetpts=PTS-STARTPTS",
+                   self.file]
         flags = _ffmpeg_spawn_flags()
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
@@ -17649,11 +19408,12 @@ class SimplePreviewer:
             self._playing = False
             try:
                 self.btn_play.config(text=_("播放"))
-                self.mark_status.config(text=_("启动 ffplay 失败：{0}").format(e))
+                self.mark_status.config(text=_('启动 ffplay 失败：{0}').format(e))
             except Exception:
                 pass
             return
         self._a_proc = proc
+        _register_preview_proc(proc)
         self._a_gen += 1
         self._a_anchor = at
         self._a_anchor_wall = time.perf_counter()
@@ -17983,9 +19743,22 @@ class SimplePreviewer:
             self._wave_done = True
             self._wave_dirty = True
             return
-        args = [self.ff, "-v", "error", "-i", path, "-map", "0:a:0?",
-                # 2026-09-18：采样率改从「更多设置」读取（_GLOBAL_SETTINGS 由 _sync_global_settings 同步）
-                "-ac", "1", "-ar", str(_GLOBAL_SETTINGS["wave_sr"]), "-f", "s16le", "pipe:1"]
+        _a_graph = getattr(self, "_pipe_audio_graph", None)
+        if _a_graph:
+            # 串行合并管道预览（2026-09-20）：self.file 是第一段的文件，直读只会画出
+            # 第一段波形（用户实测「只绘制了第一段音频的波形」）。改从合成音频图解码
+            # （各段 amovie + concat/acrossfade/BGM），出声来源与 _a_start 逐字一致——
+            # 同样在图尾接一段**无标签**链（anull），产出单个输出 pad → 无需 -map。
+            # -t 防御：万一图内混入无限源，避免 worker 永远解不完（桶越界会被钳到末桶）。
+            args = [self.ff, "-v", "error", "-f", "lavfi", "-i",
+                    "%s;%sanull" % (_a_graph, getattr(self, "_pipe_audio_map", "[ao]")),
+                    "-t", "%.6f" % float(dur),
+                    "-ac", "1", "-ar", str(_GLOBAL_SETTINGS["wave_sr"]),
+                    "-f", "s16le", "pipe:1"]
+        else:
+            args = [self.ff, "-v", "error", "-i", path, "-map", "0:a:0?",
+                    # 2026-09-18：采样率改从「更多设置」读取（_GLOBAL_SETTINGS 由 _sync_global_settings 同步）
+                    "-ac", "1", "-ar", str(_GLOBAL_SETTINGS["wave_sr"]), "-f", "s16le", "pipe:1"]
         flags = _ffmpeg_spawn_flags()
         try:
             p = subprocess.Popen(args, stdout=subprocess.PIPE,
@@ -18103,7 +19876,7 @@ class SimplePreviewer:
                     cv.create_polygon(pts, fill="#9ec5ff",
                                       outline="#1f6feb", width=1, tags="wave")
                 elif top:
-                    x, y1 = top[0]; _, y2 = bot[0]
+                    x, y1 = top[0]; _unused, y2 = bot[0]
                     cv.create_line(x, y1, x, y2, fill="#1f6feb", width=1, tags="wave")
             if drawn == 0:
                 if self._wave_peaks is not None and not self._wave_done:
@@ -18202,7 +19975,7 @@ class SimplePreviewer:
                 cv.create_polygon(pts, fill="#cfe3ff",
                                   outline="#1f6feb", width=1, tags="static")
             elif top:
-                x, y1 = top[0]; _, y2 = bot[0]
+                x, y1 = top[0]; _unused, y2 = bot[0]
                 cv.create_line(x, y1, x, y2, fill="#1f6feb", width=1, tags="static")
         # 关键帧刻度（复用关键帧模块的预扫描表；只画视野内）
         if self._keyframes:
@@ -18361,6 +20134,27 @@ class SimplePreviewer:
         self._tv_t0, self._tv_t1 = n0, n0 + span
         return True
 
+    def _sync_volume_var(self):
+        """刷新 A/V 弹窗的音量变量 =「更多设置 → 预览音量」的当前值。
+
+        2026-09-21：音量统一为单一参数（App.preview_volume，默认 10）——A/V 弹窗音量、
+        内置时间预览的音频引擎（self.volume）、各预览播放器（ffplay -volume）共用同一个数。
+        App 侧改过之后本类持有的 vol_var 可能过期 → 建/开弹窗时从 App 变量重取一次。
+        """
+        _v = int(_GLOBAL_SETTINGS.get("preview_volume", 10))
+        _vapp = getattr(self, "_app", None)
+        if _vapp is not None and hasattr(_vapp, "preview_volume"):
+            try:
+                _v = int(_vapp.preview_volume.get())
+            except Exception:
+                pass
+        _v = max(0, min(100, _v))
+        try:
+            self.vol_var.set(_v)
+        except Exception:
+            pass
+        self.volume = _v
+
     def _build_params_vars(self):
         self.hard_var = tk.DoubleVar(value=_AV_HARD_TOL)
         self.soft_var = tk.DoubleVar(value=_AV_SOFT_TOL)
@@ -18369,6 +20163,7 @@ class SimplePreviewer:
         self.lat_var = tk.DoubleVar(value=_AV_LATENCY)
         self.vol_var = tk.IntVar(value=30)
         self.volume = 30
+        self._sync_volume_var()   # 音量由「更多设置 → 预览音量」提供（默认 10），建时对齐一次
         self.auto_lat_var = tk.BooleanVar(value=True)
         self.aud_var = tk.BooleanVar(value=True)
         self.step_aud_var = tk.BooleanVar(value=False)
@@ -18381,7 +20176,12 @@ class SimplePreviewer:
             self.restart_gap = float(self.gap_var.get())
             self.auto_latency = bool(self.auto_lat_var.get())
             self.step_with_audio = bool(self.step_aud_var.get())
-            self.volume = int(self.vol_var.get())
+            self.volume = max(0, min(100, int(self.vol_var.get())))
+            # 音量是单一参数：写回全局 + App 的「更多设置 → 预览音量」（App 侧 trace 负责存盘）
+            _GLOBAL_SETTINGS["preview_volume"] = self.volume
+            _vapp = getattr(self, "_app", None)
+            if _vapp is not None and hasattr(_vapp, "preview_volume"):
+                _vapp.preview_volume.set(self.volume)
             self.audio_enabled = bool(self.aud_var.get())
             if not self.auto_latency:
                 self.latency = max(_AV_LAT_MIN, min(_AV_LAT_MAX, float(self.lat_var.get())))
@@ -18403,6 +20203,7 @@ class SimplePreviewer:
             return
         win = tk.Toplevel(self.win)
         win.withdraw()   # center_window 前提（docstring）：先隐藏，定位好再显示，防左上角闪现
+        self._sync_volume_var()   # 音量可能在「更多设置」里改过 → 打开时重取最新值
         win.title(_("A/V 设置 - ") + os.path.basename(self.file))
         win.transient(self.win)
         win.resizable(False, False)
@@ -18697,6 +20498,9 @@ class SimplePreviewer:
         """双 -ss：输入粗 seek（关键帧对齐，快）+ 输出精 seek（解码丢弃，B 帧重排正确）
         → 首帧=目标网格帧。stderr 必须 DEVNULL（4KB 块缓冲写满会锁死 ffmpeg）。"""
         flags = _ffmpeg_spawn_flags()
+        if self._pipe_graph:
+            # 管道合成模式（时间预览引擎）：走 -filter_complex 完整合成图，见 _launch_video_pipe
+            return self._launch_video_pipe(sec, flags)
         if _is_static_image_file(self.file):
             # 静态图片：单帧、无时间轴。-loop 1 持续流式输出（图片无法 seek，
             # 不要任何 -ss）。等价「直接用图片」预览。
@@ -18717,6 +20521,760 @@ class SimplePreviewer:
                                     stderr=subprocess.DEVNULL, creationflags=flags)
         except Exception:
             return None
+
+    # 静态图片扩展名（movie= 子输入 seek_point 注入时跳过 —— 图片没有时间轴）
+    _MOVIE_IMG_EXT = (".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".bmp", ".webp",
+                      ".tif", ".tiff", ".gif", ".ico", ".avif", ".heic")
+
+    @staticmethod
+    def _inject_seek_point_into_spec(spec, sec):
+        r"""给 movie= 子句「spec」部分（不含 `movie=` 前缀、不含 `[label]`）按整段转义口径注入
+        `:seek_point=sec`。已含 :seek_point / sec 非法 → 原样返回 spec。
+
+        插入点 = 文件名之后、第一个未转义 `,` 或 `:` 之前。若文件名后紧跟流选择器 `:s=`
+        （音频 movie=path:s=a），把 :seek_point 放到 `:s=` 之后
+        （`movie=path:s=a:seek_point=S`），顺序不可反（反了会先按默认视频流 seek 再切音频流
+        → 音频分支错位/空 → 整张复杂滤镜失败「不出画面」）。
+
+        ⚠️ 整段转义扫描（2026-09-21 修，用户实测报错）：生产口径 `.replace(":", "\\\\:")` 是
+        **两个**反斜杠 + 冒号，扫描见到反斜杠必须把「连续反斜杠串 + 其后被转义的那一个字符」一起吃掉，
+        否则会落在盘符冒号上把它当选项分隔符 → 注入点跑进盘符
+        （`movie=C\\:seek_point=S:/dir/a.mp4` ⇒ ffmpeg `Failed to avformat_open_input 'C:seek_point=…'`、
+        整张图失败）。兼容单反斜杠 `\:`（另一处 helper 口径）与双反斜杠 `\\:`（生产口径）。
+
+        被 `_inject_movie_seek_point`（uniform 兜底）与 `_inject_movie_seek_point_per_sub`（逐子）
+        共用，消灭两处重复的插入点扫描逻辑。
+        """
+        if not spec or ":seek_point" in spec:
+            return spec
+        try:
+            _off_s = "%.6f" % float(sec)
+        except (TypeError, ValueError):
+            return spec
+        _fn_end = len(spec)
+        i = 0
+        while i < len(spec):
+            _c = spec[i]
+            if _c == "\\":
+                while i < len(spec) and spec[i] == "\\":
+                    i += 1
+                i += 1
+                continue
+            if _c == "," or _c == ":":
+                _fn_end = i
+                break
+            i += 1
+        if spec[_fn_end:_fn_end + 3] == ":s=":
+            j = _fn_end + 3
+            while j < len(spec):
+                _c2 = spec[j]
+                if _c2 == "\\":
+                    while j < len(spec) and spec[j] == "\\":
+                        j += 1
+                    j += 1
+                    continue
+                if _c2 == "," or _c2 == ":":
+                    break
+                j += 1
+            _fn_end = j
+        return spec[:_fn_end] + ":seek_point=" + _off_s + spec[_fn_end:]
+
+    # ⚠️ 本方法必须是 @classmethod（首参 cls），与 base 同名方法一致。
+    # port 工具整段替换方法体时若起点落在 def 行会**丢掉这行装饰器** → cls 错位。
+    # 审计：tests/_audit_port_decorators.py
+    @classmethod
+    def _inject_movie_seek_point(cls, graph, offset, pts_bridge=None):
+        """给图内**视频** movie= 子输入注入 seek_point（管道预览 seek 同步，2026-09-20）。
+
+        ⚠️ 2026-09-20 二次修正：本方法已降级为**兜底**。首选是 `_rewrite_movie_inputs`
+        （把视频类 movie= 改写成外部 `-ss -i` 输入 = 帧精确）。原因见该方法 docstring：
+        `seek_point` 是**向后关键帧 seek**，不做解码丢弃 → 误差上限一个 GOP（默认可达 10s），
+        而主输入是帧精确的输入级 `-ss`，两路口径不同 ⇒ 子视频永远差一截（用户实测）。
+        只有在「静态图片 / 路径还原失败 / `[N:v]` 标签撞车」时才走到这里。
+
+        pts_bridge：非 None 时在 seek_point 后追加 `,setpts=PTS+<pts_bridge>/TB` —— 主输入
+        已被图头桥接平移回素材时间轴，movie= 子输入（pts=子素材时间）必须同幅平移才能与
+        主输入 pts 配对（framesync 按 pts 取帧，不平移则子流被立即耗尽 → 子画面冻结）。
+
+        为什么需要：管道预览的 seek 走命令行 `-ss`，它**只作用于外部 -i 主输入**；图内
+        movie= 子输入完全不受影响（各自从自己文件的 0 起）。于是拖动进度条后，主的画面跳了、
+        子视频还在原地 —— 播到后面主已播完、子还在播（用户实测）。
+
+        偏移口径（与正式导出一致）：成片里主视频从 pipe_start 起算、子视频从 0 起算，输出时刻
+        T 时主 = pipe_start+T、子 = T ⇒ **子视频时间 = 主视频时间 − pipe_start**。预览窗口的时间轴
+        就是素材原始时间，故此处注入 `seek_point = sec − pipe_start`（≤0 不注入）。
+
+        静态图片的 movie= 跳过：单帧无时间轴，注入了也无意义（gif 等已归入图片）。
+        offset <= 0 或图为空 → 原样返回（零行为变化）。
+        """
+        try:
+            off = float(offset or 0.0)
+        except (TypeError, ValueError):
+            return graph
+        if not graph or off <= 0:
+            return graph
+        _img = cls._MOVIE_IMG_EXT
+
+        def _rep(m):
+            raw = m.group(1)
+            if raw.lower().endswith(_img):
+                return m.group(0)
+            _new = cls._inject_seek_point_into_spec(raw, off)
+            if pts_bridge and ":seek_point" in _new:
+                _new += ",setpts=PTS+%s/TB" % pts_bridge
+            return "movie=%s" % _new
+        # 扫描器口径：路径 `:` 已按 filtergraph 语法转义，`movie=((?:\\.|[^,;\[\]\\])+)`
+        # 遇转义对/非分隔符吞掉路径，遇 , ; [ ] 收尾（插入点整段转义口径见 _inject_seek_point_into_spec）。
+        try:
+            return re.sub(r"movie=((?:\\.|[^,;\[\]\\])+)", _rep, graph)
+        except Exception:
+            return graph
+
+    @classmethod
+    def _inject_movie_seek_point_per_sub(cls, graph):
+        """回退播放器（mpv/ffplay）路径：给图内每个 movie= 子输入（视频 / 音频 :s=a）注入其各自
+        trim/atrim 起点的 seek_point（2026-09-21，concat 串行合并预览提速核心）。
+
+        与 `_inject_movie_seek_point`（管道引擎 uniform 注入）的区别：回退路径每个子输入的 trim
+        起点 S_sub 各不相同（PiP 多子、画布多 cell、concat 多轨、轨迹多预设），必须「一个 movie= 一个 S_sub」。
+
+        对齐无损（tests/kli_ffplay_seek_probe.py 实证）：子链 `[L]trim=start=S,setpts=PTS-STARTPTS`
+        （视频）或 `[L]atrim=start=S,...`（音频）已把子 pts 归零到「0 基 from S」。给 `movie=X`
+        注入 `:seek_point=S` 后跳到 ≤S 的最近 I 帧开始解码、`trim/atrim=start=S` 再丢弃 [0,S)
+        → 输出帧与「未注入 seek_point」逐字节相同（md5 一致）。⇒ 纯解码跳过优化、零画质/对齐变化，
+        可安全用于任何含 movie= 子输入的图；远起点子输入「秒开」而非从 0 空解到 S_sub。
+
+        覆盖三种 movie 形态（同一正则，按插入点自适应）：
+          · `movie=path[0:v]`（PiP/画布子视频，无后缀）
+          · `movie=path:s=a[am0]`（concat 音频源）
+          · `movie=path,format=yuv420p[1:v]`（concat 视频源，带滤镜后缀）
+        插入点 = 文件名之后、第一个未转义 `,`/`:` 之前。⚠️ 判据是「**整段转义**」而非「两个字符」：
+        Windows 盘符冒号按生产口径写成 `F\\\\:`（**两**个反斜杠 + 冒号），扫描时必须把
+        「连续反斜杠串 + 其后被转义的那一个字符」一起吃掉，否则会落在冒号上、把它误当选项分隔符 →
+        注入点跑进盘符 ⇒ ffmpeg `Failed to avformat_open_input 'F:seek_point=…'`、整张图失败
+        （2026-09-21 用户报「画中画预览 mpv/ffplay 都报错」，真机探针
+        `tests/_probe_pip_seekpoint_drive.py` A/B 锁定：未注入 PASS / 旧扫描 FAIL / 新扫描 PASS）。
+        已含 `:seek_point` 幂等跳过；S<=0 / 静态图片 / 异常 → 原样返回。
+        """
+        if not graph:
+            return graph
+        _img = cls._MOVIE_IMG_EXT
+        try:
+            # 每个 movie= 子句：捕获 spec（到 [label] 之前）与 label
+            _re_mv = re.compile(r"movie=((?:\\.|[^\[])*?)\[([A-Za-z0-9_]+)\]")
+            _lbl_s = {}
+            for _m in _re_mv.finditer(graph):
+                _lbl = _m.group(2)
+                if _lbl in _lbl_s:
+                    continue  # 一个 movie 定义只认领一处
+                _seg = graph[_m.end():]
+                # trim/atrim 必须紧跟标签（[lbl] 后不允许隔滤镜）：音频 `movie=:s=a[amN]`
+                # 后先 aresample/aformat 再 atrim → 不命中，音频不注入 seek_point（解码从 0 起，
+                # 慢但正确，避免注入点顺序错导致整图失败「不出画面」）；视频 `[i:v]` 因标签含冒号
+                # 不被 movie= 标签正则 `[A-Za-z0-9_]+` 认领（不注入，走 --start）。
+                # 提速仅来自主视频 --start + 主 movie :seek_point（_concat_graph_to_ffplay）。
+                _tm = re.search(
+                    r"\[" + re.escape(_lbl) + r"\](?:a)?trim=start=([0-9]+(?:\.[0-9]+)?)", _seg)
+                if not _tm:
+                    continue
+                try:
+                    _s = float(_tm.group(1))
+                except (TypeError, ValueError):
+                    continue
+                _spec = _m.group(1)
+                if _s <= 0 or _spec.lower().endswith(_img) or ":seek_point" in _spec:
+                    continue
+                _lbl_s[_lbl] = _s
+
+            if not _lbl_s:
+                return graph
+
+            def _rep(m):
+                _lbl = m.group(2)
+                if _lbl not in _lbl_s:
+                    return m.group(0)
+                _spec = m.group(1)
+                return "movie=%s[%s]" % (cls._inject_seek_point_into_spec(_spec, _lbl_s[_lbl]), _lbl)
+
+            return _re_mv.sub(_rep, graph)
+        except Exception:
+            return graph
+
+    @staticmethod
+    def _unescape_movie_path(raw):
+        """movie= 里的转义路径 → 真实文件路径（改写外部 -i 输入用）。
+
+        生成端口径（全部调用点一致，含 PiP 子视频 39588 / 画布 / 水印）：
+        `_movie_path_safe(p).replace("\\", "/").replace(":", "\\\\:")`
+        → 先把反斜杠全变正斜杠，再把盘符冒号写成 `\\\\:`（**两个**反斜杠，因为该字符串要过
+        filtergraph + filter-args **两层**转义解析）。
+
+        实测（tests/_probe_movie_escape_roundtrip.py）这个逆变换对普通英文 / 含空格 / 含中文 /
+        含 `[ ] ' , ;`（走 `_movie_path_safe` 硬链接分支）**全部无损**，且还原出的路径
+        `ffmpeg -i` 直接 rc=0；`movie=<转义串>` 建图同样 rc=0。故「转义串 → 真实路径」不需要
+        把文件表从生成端透传下来，可完全收敛在管道启动处。
+        """
+        if not raw:
+            return None
+        s = raw.replace("\\\\:", ":")
+        if "\\" in s:
+            # 兜底：还有别的转义形态 → 逐字符剥一层（生成端口径下本不会走到这里）
+            out = []
+            i = 0
+            while i < len(s):
+                if s[i] == "\\" and i + 1 < len(s):
+                    out.append(s[i + 1])
+                    i += 2
+                else:
+                    out.append(s[i])
+                    i += 1
+            s = "".join(out)
+        return s
+
+    @classmethod
+    def _rewrite_movie_inputs(cls, graph, offset, pts_bridge=None):
+        """把图内**视频类** `movie=` 子输入改写成外部 `-i` 输入，让子输入也走输入级 `-ss`。
+
+        返回 `(新图, 输入路径列表, 未改写数)`；输入路径列表下标 i ↔ ffmpeg 输入序号 i+1
+        （0 恒为主输入）。`未改写数 > 0` 时调用方应退回 `_inject_movie_seek_point` 近似兜底。
+
+        为什么必须这么改（2026-09-20 实测，推翻了原先的 seek_point 方案）：
+        命令行 `-ss` 只作用于外部 `-i` 主输入，图内 `movie=` 只能用 `seek_point`，而
+        `seek_point` 是**向后关键帧 seek**（跳到「不晚于目标时间的最近 I 帧」，不做解码丢弃）
+        → 误差上限一整个 GOP（x264 默认 25fps 下 10 秒）。主输入却是帧精确的输入级 `-ss`
+        （关键帧定位 + 解码丢弃）。两路口径不同 ⇒ 拖进度条后子视频永远差一截，且差值随目标
+        时间跳动（用户实测「有时候慢一点、有时候快一点」）。
+        改写后主/子都走输入级 `-ss`：帧精确，且 seek 依然快（不退化成像输出侧 trim 那样从 0 解码）。
+
+        子输入 -ss（2026-09-20 方案A 终版）：固定取 **0**（子素材从 0 解码，与旧 `movie=`
+        解码口径一致）。原因：图内子链 `trim=start=S_sub,setpts=PTS-STARTPTS` 已把子 pts 归零
+        到「0 基 from S_sub」，与父预览「0 基 from pipe_start」的主视频按 pts 帧同步配对
+        （见 _launch_video_pipe 0 基模型注释）。旧 三次修正把子 -ss 取成 scrub 偏移
+        back=sec−pipe_start，导致子素材被整体平移 back−S_sub → 拖进度条后子画面「漂」= 子
+        seek 错位（用户实测）。固定 0 则子 pts 恒为 s−S_sub，与 scrub 无关 → 子画面钉死正确
+        素材位置。pts_bridge 参数保留为接口兼容，但本方法不再注入桥接（0 基模型下子链自带
+        STARTPTS 归零，注入量会被 STARTPTS 吸收，无意义）。
+        ⚠️ 2026-09-21 补正：本方法返回的 `-ss` 只是**默认值 0**；调用方随后用
+        `_split_sub_trims` 把带「绝对 trim」的子链各自算成 `-ss = S_sub + T`（并同步把 trim
+        改相对、`setpts=PTS-STARTPTS` 换成 `setpts=PTS+T/TB`），这才是真正生效的 seek。
+        保留 0 作为无 trim 子链（如视频水印整条播放）的语义 = 从 0 解码，与旧行为一致。
+        安全边界（任一不满足 → **不改写**，
+        由调用方兜底，保证零回归）：
+          · 静态图片扩展名 → 单帧无时间轴，注入 `-ss` 无意义（gif 等已归入图片）；
+          · 还原出的真实路径不存在 → 不改写（`_movie_path_safe` 建链接失败时会原样返回带
+            `[ ] ' , ;` 的路径，这种串本身也无法作为 `-i` 参数）；
+          · 图内已存在同名 `[N:v]` 标签 → **整图放弃**改写（外部输入流标签是 ffmpeg 固定的，
+            不能改名，撞车会让图引用到错流）。
+          · 图为空 → 原样返回（零行为变化）。
+            ⚠️ 2026-09-21 修正：旧判据是 `offset <= 0`，会在**刚好打开预览、还没拖进度条**
+            （back = sec − pipe_start = 0）时整段跳过改写 ⇒ 子输入退回图内 `movie=` 且**不带
+            任何 seek** ⇒ 必须从 0 一秒一秒解码到 S_sub。用户 10 分钟起点的项目实测「等到死
+            都不出画面」正是这条（诊断行 back=0.000000）。back=0 恰恰是最常见的入口，
+            必须改写；新判据 `offset < 0`（实际不会发生，_back 已 max(0.0, …)）。
+        """
+        try:
+            off = float(offset or 0.0)
+        except (TypeError, ValueError):
+            return graph, [], 0
+        if not graph or off < 0:
+            return graph, [], 0
+        _img = cls._MOVIE_IMG_EXT
+        _re_mv = re.compile(r"movie=((?:\\.|[^,;\[\]\\])+)")
+        # ⚠️ 2026-09-21 修正：**一处 movie= 一个输入，禁止任何形式的去重**（旧实现按「转义串」
+        # 和「真实路径」两级去重）。同一素材的多条子链位于**不同素材起点**，共用一个 [N:v]
+        # 输入就共用一个 -ss，必然只有第一条是对的：
+        #   · _split_sub_trims 一个输入序号只认领一处 trim ⇒ 第二条子链保留绝对
+        #     trim=start=181.141，却挂在 -ss 93.848 的输入上 ⇒ 实际显示素材
+        #     93.848+181.141 = 274.99s（用户实测「第 3 个画面不准」）；
+        #   · 且它要额外空解 181 秒才产出第一帧 ⇒ 又是 overlay 的一层 ⇒ 复合图长时间停摆。
+        # 按下标位置建索引，天然支持同一转义串在图中多次出现。
+        _plan = {}      # 出现处起点下标 → 输入序号（1 起）
+        _subs = []      # (真实路径, 子内容起点S_sub=0.0)，顺序 = 输入序号 1,2,3…
+        try:
+            for m in _re_mv.finditer(graph):
+                raw = m.group(1)
+                if raw.lower().endswith(_img):
+                    continue
+                real = cls._unescape_movie_path(raw)
+                if not real or not os.path.exists(real):
+                    continue
+                _subs.append((real, 0.0))
+                _plan[m.start()] = len(_subs)
+            if not _plan:
+                return graph, [], 0
+            # 标签撞车检查：图内已用 [N:v] 就不能再占用（外部输入流标签不可改名）
+            for _n in range(1, len(_subs) + 1):
+                if ("[%d:v]" % _n) in graph:
+                    return graph, [], 0
+
+            def _rep(m):
+                # 按出现位置取序号（同串多次出现 → 各自一个输入，见上方 2026-09-21 修正）
+                _i = _plan.get(m.start())
+                # ⚠️ 必须带 `null`：movie= 是「源滤镜」，后面通常跟着它自己的输出标签
+                # （`movie=X[sub0]`）或逗号续链（`movie=X,format=…[i1]`）。只替换成 `[N:v]`
+                # 会产出 `[1:v][sub0]` —— 裸相邻标签不是合法 filtergraph（空滤镜名），
+                # ffmpeg 直接 parse error → 管道出不了帧（用户实测「正在加载预览」卡死）。
+                # `[N:v]null` 把输入流直通进原链，两种形态都成立。0 基模型下不再注入 pts 桥接。
+                if _i is None:
+                    return m.group(0)
+                return "[%d:v]null" % _i
+
+            _new = _re_mv.sub(_rep, graph)
+        except Exception:
+            return graph, [], 0
+        _left = sum(1 for m in _re_mv.finditer(_new)
+                    if not m.group(1).lower().endswith(_img))
+        return _new, _subs, _left
+
+    @classmethod
+    def _rewrite_abs_trims(cls, graph, t_off, jobs):
+        """方案A「绝对 trim → 相对 trim + 输入级 -ss + setpts 桥接」重写核心。
+
+        `_split_zero_branches`（主输入多分支消费 [0:v]）与 `_split_sub_trims`（movie= 子链）
+        算法同款，仅"命中点怎么收集"与"end 口径"不同 —— 抽出本函数统一重写，两处只留收集器。
+
+        jobs: [(seg_start, seg_end, idx, x, end_abs, new_label)]，每个 job 描述一处命中：
+          · seg_start/seg_end —— graph 中待替换片段 [seg_start:seg_end]（零分支含前导
+            `[0:v]setpts=PTS-STARTPTS`，子链仅 `trim=…,setpts=PTS-STARTPTS`，由收集器按各自
+            正则截取）；
+          · idx —— 该处对应输入序号（零分支 = 0 或新分配；子链 = idx_list 中的序号）；
+          · x —— 命中 `trim=start` 的绝对素材秒；end_abs —— 命中 `trim=end` 的绝对秒（无则 None）；
+          · new_label —— 零分支传新输入标签 `[<idx>:v]`（替换前导 `[0:v]`），子链传 None
+            （标签不动，只重写 trim 段）。
+        ⚠️ end 口径差异（不可抹平）：子链版 end 额外减 t（窗口 [S+T, E]），零分支版不减
+        （窗口 [S, E]）。本函数按 new_label 是否为 None 决定减 t —— 与两版历史行为一致。
+        返回 (新图, [(idx, seek), …])；seek = max(0, x + t)。
+        """
+        try:
+            t = float(t_off or 0.0)
+        except (TypeError, ValueError):
+            t = 0.0
+        _out = []
+        _last = 0
+        _seeks = []
+        for (seg_start, seg_end, idx, x, end_abs, new_label) in jobs:
+            try:
+                _x = float(x)
+            except (TypeError, ValueError):
+                _x = 0.0
+            _seeks.append((idx, max(0.0, _x + t)))
+            if end_abs is None:
+                _trim = "trim=start=0"
+            else:
+                # 子链版（new_label=None）end 额外减 t；零分支版不减 —— 见 docstring 口径说明
+                _sub = t if new_label is None else 0.0
+                _d = max(0.001, float(end_abs) - _x - _sub)
+                _trim = "trim=start=0:end=%.6f" % _d
+            if new_label is None:
+                # 子链：只重写 trim 段本身（前导 [<i>:v]… 不动）
+                _rep = "%s,setpts=PTS+%.6f/TB" % (_trim, t)
+            else:
+                # 零分支：把前导 `[0:v]setpts=PTS-STARTPTS` 换成新标签的同款，再接相对 trim + 桥接
+                _rep = "%ssetpts=PTS-STARTPTS,%s,setpts=PTS+%.6f/TB" % (new_label, _trim, t)
+            _out.append(graph[_last:seg_start])
+            _out.append(_rep)
+            _last = seg_end
+        _out.append(graph[_last:])
+        return "".join(_out), _seeks
+
+    # ⚠️ 本方法必须是 @classmethod（首参 cls），与 base 同名方法一致。
+    # port 工具整段替换方法体时若起点落在 def 行会**丢掉这行装饰器** → cls 错位。
+    # 审计：tests/_audit_port_decorators.py
+    @classmethod
+    def _split_zero_branches(cls, graph, t_off, first_idx):
+        """把图内多条消费 [0:v] 的「绝对 trim」分支拆成独立输入，各自 -ss（方案A）。
+
+        为什么必须拆（2026-09-21 实测，推翻「单输入 -ss + 常量桥接」旧模型）：
+        导出图每条分支写成
+            [0:v]setpts=PTS-STARTPTS,trim=start=<X>:end=<Y>,setpts=PTS-STARTPTS,…
+        X/Y 是**素材绝对秒**。管道给主输入加 -ss 后，分支开头的 `setpts=PTS-STARTPTS`
+        会把任何常量桥接**精确抵消**（实测：桥 +pre 与桥 +pre−pipe_start 抽出的帧 md5
+        完全相同 ⇒ 桥接对分支是 no-op）⇒ `trim=start=X` 变成「从 seek 点再向前走 X
+        秒」，两条后果：
+          ① 内容整体平移 pre 秒（用户实测「子画面不准」，其实主画面同样错了 pre 秒）；
+          ② 每条分支必须先解码 X 秒才产出第一帧，总解码量 = pre + max(X) —— 4K + 远
+             片段要几分钟；且 pre+X 越过文件尾时该分支**永远不出帧** ⇒ overlay 缺层
+             ⇒ 复合图死锁 ⇒ 永久「正在加载预览」（用户实测）。
+        单输入 -ss 无法同时服务位于不同素材位置的分支，故**一分支一输入**。
+
+        拆法：分支 k 改用独立输入，`-ss = X_k + T`（T = 预览合成时间 = sec−pipe_start），
+        分支内 trim 改相对 `start=0:end=Y−X`，第 2 个 `setpts=PTS-STARTPTS` 换成
+        `setpts=PTS+T/TB` —— 各分支输出 pts 统一为【合成时间 τ】：
+            pts_in = 素材 − (X_k+T) ； τ = 素材 − X_k  ⇒ 补偿量恒为 T（与 X_k 无关）。
+        于是 framesync 按 τ 对齐各分支，enable 表达式也直接读到 τ（delogo 等不再偏移）。
+
+        返回 (新图, [(输入序号, ss), ...])：分支 0 复用输入 0，其余从 first_idx 起。
+        无匹配分支 / 目标标签已被占用 / 时长非正 ⇒ 原样返回 (graph, None)，
+        调用方退回旧桥接路径（零行为变化）。
+        """
+        if not graph:
+            return graph, None
+        try:
+            t = float(t_off or 0.0)
+        except (TypeError, ValueError):
+            return graph, None
+        _re = re.compile(
+            r"\[0:v\]setpts=PTS-STARTPTS,trim=start=([0-9.]+)"
+            r"(?::end=([0-9.]+))?,setpts=PTS-STARTPTS")
+        _hits = list(_re.finditer(graph))
+        if not _hits:
+            return graph, None
+        # 目标标签撞车检查（外部输入流标签不可改名）→ 整图放弃，退回旧路径
+        for _k in range(len(_hits) - 1):
+            if ("[%d:v]" % (first_idx + _k)) in graph:
+                return graph, None
+        _jobs = []
+        _n = 0
+        for m in _hits:
+            try:
+                x = float(m.group(1))
+            except (TypeError, ValueError):
+                return graph, None
+            end_abs = None
+            if m.group(2):
+                try:
+                    end_abs = float(m.group(2))
+                except (TypeError, ValueError):
+                    end_abs = None
+                if end_abs is not None and end_abs - x <= 0:
+                    return graph, None
+            _idx = 0 if _n == 0 else first_idx + _n - 1
+            # 零分支版：前导 [0:v] 换成新输入标签（n==0 时即 [0:v]，等价不变），end 不减 t
+            _jobs.append((m.start(), m.end(), _idx, x, end_abs, "[%d:v]" % _idx))
+            _n += 1
+        return cls._rewrite_abs_trims(graph, t, _jobs)
+
+    @classmethod
+    def _split_sub_trims(cls, graph, t_off, idx_list):
+        """movie= 改写出来的**子输入链**里的「绝对 trim」也改成各自 seek（方案A 补完）。
+
+        为什么必须做（2026-09-21 用户真实命令实测，2K/4K 项目「等到死都不出画面」）：
+        子素材链形如
+            [1:v]null[sub0];[sub0]trim=start=<绝对素材秒>:end=<绝对秒>,setpts=PTS-STARTPTS,…
+        · 旧「三次修正」在子链头注入 `setpts=PTS+sec/TB`，把 trim 门限**抵消掉 sec 秒**
+          ⇒ 只需解码 `S_sub − sec` 秒（本例 221.2−143.2 = 78s，4K 实测约 16s 出画面），
+          代价是**子画面内容是错的**（显示的是第 78s 的画面 = 用户实测「子画面不准」）；
+        · 6d7c867 改 0 基后不再注入桥接 ⇒ 子链必须**从头解码到 S_sub**（本例 221s 的 4K）
+          才产出第一帧；而它是 overlay 的一层，framesync 要等两路都有帧 ⇒ **整个复合图
+          停摆** ⇒ 永久「正在加载预览」（用户实测）。解码量 78s→221s 正是「旧版 16s 能出、
+          新版等到死」的量化解释。
+
+        修法与 _split_zero_branches 同款：子输入 `-ss = S_sub + T`，链内 trim 改相对
+        （start=0, end=E−S−T），`setpts=PTS-STARTPTS` 换成 `setpts=PTS+T/TB`
+        ⇒ 输出 pts 统一为【合成时间 τ】，且**解码量≈0**（直接从 S_sub 开解）。
+        数学：pts_in = m − (S_sub+T)，τ 应为 m − S_sub ⇒ 补偿量恒为 T（与 S_sub 无关）。
+
+        返回 (新图, {输入序号: ss})。子链无 trim / 解析异常 ⇒ 该子不入字典，保持 -ss 0
+        （旧行为，零回归）。
+        """
+        if not graph:
+            return graph, {}
+        try:
+            t = float(t_off or 0.0)
+        except (TypeError, ValueError):
+            return graph, {}
+        _re = re.compile(r"trim=start=([0-9.]+)(?::end=([0-9.]+))?,setpts=PTS-STARTPTS")
+        _jobs = []          # 传给 _rewrite_abs_trims 的命中（标签不动 → new_label=None，end 减 t）
+        _used = set()       # 同一处 trim 不许被两个输入重复认领
+        for _i in idx_list:
+            _pos = graph.find("[%d:v]" % _i)
+            if _pos < 0:
+                continue
+            m = _re.search(graph, _pos)
+            if not m or m.start() in _used:
+                continue
+            try:
+                x = float(m.group(1))
+            except (TypeError, ValueError):
+                continue
+            e = None
+            if m.group(2):
+                try:
+                    e = float(m.group(2))
+                except (TypeError, ValueError):
+                    e = None
+            _used.add(m.start())
+            _jobs.append((m.start(), m.end(), _i, x, e, None))
+        if not _jobs:
+            return graph, {}
+        _new_graph, _seeks = cls._rewrite_abs_trims(graph, t, _jobs)
+        return _new_graph, {_idx: _s for (_idx, _s) in _seeks}
+
+    def _launch_video_pipe(self, sec, flags):
+        """管道合成模式启动（时间预览引擎，2026-09-20 Phase 1）：
+
+        ffmpeg -ss pre -i 主文件 -ss post -filter_complex <合成图;[pv_src]缩放[pv_out]>
+               -map [pv_out] -t <上限> -an -sn -f rawvideo -pix_fmt rgb24 pipe:1
+        （主输入是静态图片时改为 `-loop 1 -i <图>`、不加任何 -ss —— 图片不能 seek，
+          靠 -loop 1 造连续流，管道里这个参数是有效的。）
+
+        与普通路径的三处关键差别（研究 research/preview/README1.md §四）：
+        1. 末尾不是裸 scale=W:H —— 合成图尺寸常≠源（pad 画布/split 网格），直接 scale 会拉伸
+           变形。改用 `scale=...:force_original_aspect_ratio=decrease` + `pad=W:H`（letterbox），
+           保证输出【恰好】WxH ⇒ 帧字节恒定 = _frame_bytes，_pump 节奏模型不被破坏。
+        2. 必须补 `fps=<源帧率>` —— 位置模型 = anchor + 帧号/fps；图内若含 fps=/变速滤镜会改
+           输出帧率，不加则时间显示系统性偏移。
+        3. 必须加【输出级】-t 封顶 —— 图内可能有 color=c=black@0 无限源（旋转水印/倒计时/画布）。
+           管道里 -t 有效（与 ffplay 的 -autoexit 按主输入 EOF 退窗正好相反）。上限取值：
+           pipe_duration（调用方已知）→ 主输入时长（探测）→ 图内有 =999999 时 1h 兜底。
+        4. 素材时间轴模式下，图内**视频类** `movie=` 子输入会先被改写成外部 `-ss -i` 输入
+           （`_rewrite_movie_inputs`），让子输入也吃到输入级 `-ss` = 帧精确；改不到的才退回
+           `seek_point` 近似。详见该方法 docstring。
+        """
+        _fps_s = "%.6f" % max(self._fps, 1.0)
+        _tail = ("[pv_src]scale=%d:%d:force_original_aspect_ratio=decrease:flags=fast_bilinear,"
+                 "pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black,"
+                 "fps=%s,setsar=1,format=rgb24[pv_out]"
+                 % (self._vw, self._vh, self._vw, self._vh, _fps_s))
+        try:
+            _pstart = float(self._pipe_start or 0.0)
+        except (TypeError, ValueError):
+            _pstart = 0.0
+        _back = max(0.0, sec - _pstart)
+        _out_mode = bool(getattr(self, "_pipe_out_mode", False))
+        _sub_inputs = []      # 从图内 movie= 改写出来的子输入路径（仅素材时间轴模式用）
+        _branch_inputs = []   # 方案A：[0:v] 分支拆分出的额外输入 [(输入序号, -ss), ...]
+        _bridge_tail = ""     # 桥接模式的图尾钳制段（trim=start=sec:end=..），非桥接为空
+        _bridge = False       # pts 桥接开关（仅素材时间轴 + 视频主文件 + sec>0 时为 True）
+        _pre = 0.0            # 主输入 -ss 值（= 图头桥接量；out_mode 下不使用）
+        # 下方仅在 bridge 分支内赋值；先给默认值，保证「诊断留痕」在非桥接场景也能取到
+        # （否则取用时 NameError，会被 try/except 吞掉 → 临时文件整个不写 = 丢了线索）。
+        _lim_pre = None       # 时长上限（pipe_dur → _dur → 无限源兜底）
+        _remain = 0.0         # 图尾 trim 的窗口长度 = 上限 − sec
+        if _out_mode:
+            # 输出时间轴模式（串行合并）：图 = 多段 xfade 的成片时间轴，seek 到 sec 只能靠
+            # **输出侧裁剪**（在末标签后 trim=start=sec）—— ffmpeg 仍从头解码到该点再丢弃，
+            # 故 seek 比素材时间轴模式慢，但内容与时间显示都正确（不能用 -ss 主输入：图的
+            # trim/xfade 偏移都是素材绝对时间，整体平移会全部错位）。
+            _pipe_graph = self._pipe_graph
+            if _back > 1e-6:
+                _t2 = _tail.replace("[pv_src]", "[pv_sk]", 1)
+                _pipe_graph = (_pipe_graph
+                               + ";[pv_src]trim=start=%.6f,setpts=PTS-STARTPTS[pv_sk]" % _back)
+                _tail = _t2
+        else:
+            # 素材时间轴模式：图内视频 movie= 子输入跟随 seek（2026-09-20）—— 命令行 -ss 只管
+            # 外部 -i 主输入，图内 movie= 完全不受影响，否则拖进度条后「主的画面跳了、子还在
+            # 原地」→ 主播完子还在播（用户实测）。
+            # ⚠️ 二次修正：优先把视频类 movie= **改写成外部 -i 输入**（子输入也走输入级 -ss =
+            # 帧精确）；改不到的（图片 / 路径还原失败 / 标签撞车）才退回 seek_point 近似兜底。
+            # ⚠️ 方案A 终版（2026-09-20，修「delogo/enable 在管道预览里时间提前」）：
+            # 图内 enable/轨迹/画布等时间表达式按项目铁律写的是【0 基 from motion_trim_start
+            # = pipe_start】（导出主链自带 setpts=PTS-STARTPTS 归零；外部 mpv/ffplay 预览天然
+            # 满足——它们不吃管道桥接、主链同样归零，故时间表达式直接对齐，见 27776/28419
+            # 铁律注释）。管道里必须把各路 pts 平移到同一「0 基 from pipe_start」，而非旧
+            # 三次修正的「绝对素材时间」——后者会让 delogo/drawtext/overlay 的 enable 整体右偏
+            # pipe_start 秒（用户实测：该遮的画面前移 pipe_start 秒 = 提前显示）。
+            #   · 主输入 -ss pre（pre = sec − 2帧）→ 图头 [0:v]setpts=PTS+(pre−pipe_start)/TB
+            #     （输入级 -ss 把 pts 归零到「0 基 from pre」，再 +(pre−pipe_start) 平移到
+            #     「0 基 from pipe_start」= 与外部预览/时间表达式同一基准）；
+            #   · color=c= 源（画布基/旋转水印载体，pts 从 0 起代表段起点）→ 0 基模型下与主
+            #     输入同基准，无需桥接（旧 +pre/TB 反而令画布 overlay 配对悬空，故移除）；
+            #   · 子输入 -ss 固定取 0（子素材从 0 解码，子链 trim=start=S_sub,setpts=PTS-
+            #     STARTPTS 已归零到「0 基 from S_sub」），与 scrub 无关 → 子画面钉死正确素材
+            #     位置（旧 三次修正取 back=sec−pipe_start 会让子素材整体平移 back−S_sub = 子
+            #     seek 错位，用户实测拖条后子画面漂）；子链 STARTPTS 已归零，桥接量被吸收故
+            #     _pb_sub 恒 None。
+            #   时长钳制从输出 -t 改为图尾 trim（0 基：start=_back、end=_back+剩余），-t 按输出
+            #   ts 计会被误截；fps/trim 均保时间线，实测证实。
+            #   sec≈0（无截取且未 seek）时不注入任何桥接 = 与旧管道行为逐字节一致。
+            _sec_s = "%.6f" % max(0.0, sec)
+            _back_s = "%.6f" % _back
+            _pre = max(0.0, sec - 2.0 / max(self._fps, 1.0))
+            _bridge = (not _is_static_image_file(self.file)) and sec > 1e-6
+            # 0 基模型（方案A 终版）：_pb_sub 恒 None（子链 STARTPTS 归零吸收桥接量）。
+            _pb_sub = None
+            _pipe_graph, _sub_inputs, _left = self._rewrite_movie_inputs(
+                self._pipe_graph, _back, pts_bridge=_pb_sub)
+            if _left:
+                _pipe_graph = self._inject_movie_seek_point(
+                    _pipe_graph, _back, pts_bridge=_pb_sub)
+            if _sub_inputs:
+                # 方案A 补完（2026-09-21）：子输入链里的「绝对 trim」同样要各自 seek ——
+                # 否则子素材得从头解码到 S_sub（用户 4K 项目实测 221s）才产出第一帧，而
+                # 它是 overlay 的一层 ⇒ 整个复合图停摆 ⇒ 永久「正在加载预览」。
+                # 旧版靠「子链头注入 +sec/TB」把门限抵消掉 sec 秒来偷懒（78s 就出画面，
+                # 但子画面内容错），0 基模型不能再用这种抵消 ⇒ 改成真 seek。
+                _pg3, _sseek = self._split_sub_trims(
+                    _pipe_graph, _back, list(range(1, len(_sub_inputs) + 1)))
+                if _sseek:
+                    _pipe_graph = _pg3
+                    _sub_inputs = [(_p, _sseek.get(_k + 1, _ss))
+                                   for (_k, (_p, _ss)) in enumerate(_sub_inputs)]
+            if _bridge:
+                # 方案A（2026-09-21）：多条 [0:v] 分支各自独立 seek —— 单输入 -ss 服务不了
+                # 位于不同素材位置的分支（根因见 _split_zero_branches docstring）。
+                # 分支 0 复用输入 0 ⇒ 用它的 -ss 覆盖 _pre（下方桥接量 = _pre−pipe_start
+                # 随之自动正确）；其余分支生成额外 -i 输入。拆分失败 ⇒ _branch_inputs 为空
+                # = 与旧行为逐字一致（退回桥接路径，零回归）。
+                _pg2, _sp = self._split_zero_branches(
+                    _pipe_graph, _back, 1 + len(_sub_inputs))
+                if _sp:
+                    _pipe_graph = _pg2
+                    _branch_inputs = _sp[1:]
+                    _pre = _sp[0][1]
+                    # 防死锁钳制（2026-09-21）：分支 seek 绝不能越过素材末尾 —— 越界的分支
+                    # **永远产不出任何一帧**，而它是 overlay 的一层 ⇒ 整个复合图等不到输入
+                    # ⇒ 永久「正在加载预览」（用户实测 2K 项目「等到死都不出画面」）。
+                    # 已知素材时长时把 seek 钳到「末尾前 0.5s」：内容可能落在末尾帧（若时间
+                    # 模型本身还有偏差，画面会不准），但**保证一定有帧、绝不卡死**——卡死比
+                    # 不准更糟。必须放在下方桥接量计算之前（桥接量 = _pre − pipe_start 自动
+                    # 跟随，主链保持自洽）。
+                    try:
+                        _dk = float(self._dur or 0.0)
+                    except (TypeError, ValueError):
+                        _dk = 0.0
+                    if _dk > 0:
+                        _cap = max(0.0, _dk - 0.5)
+                        if _pre > _cap:
+                            _pre = _cap
+                        _branch_inputs = [(_i, min(_s, _cap))
+                                          for (_i, _s) in _branch_inputs]
+            if _bridge:
+                # 主输入桥接：[0:v] 可能被 split 多路消费 → 全部改挂到桥接链输出 [pv_m0]。
+                # 偏移量 = pre − pipe_start：输入级 -ss pre 把图内 pts 归零到「0 基 from pre」，
+                # 再 +(pre − pipe_start) 平移到「0 基 from pipe_start」= 与外部预览/时间表达式
+                # 同一基准。旧 三次修正用 +pre/TB（绝对素材时间）会把 enable 整体右偏 pipe_start
+                # → 该遮的画面前移 pipe_start 秒（用户实测「提前」）。
+                _pre_tbase = _pre - _pstart
+                _pre_tbase_s = "%.6f" % _pre_tbase
+                _pipe_graph = ("[0:v]setpts=PTS+%s/TB[pv_m0];" % _pre_tbase_s
+                               + _pipe_graph.replace("[0:v]", "[pv_m0]"))
+                # 注：color=c= 源桥接已移除——0 基模型下 color 从 PTS 0 起代表段起点，本就与主
+                # 输入同基准，无需桥接；旧 +pre/TB 反而会令画布 overlay 配对悬空，故不再注入。
+            _bridge_tail = ""
+            if _bridge:
+                # 时长上限先算好（图尾 trim 需要）：语义与旧 -t 一致（剩余可播时长），但 trim
+                # 起点/终点按 0 基（_back / _back+剩余），因输出 pts 已是 0 基 from pipe_start。
+                _lim_pre = None
+                try:
+                    if self._pipe_dur and float(self._pipe_dur) > 0:
+                        _lim_pre = float(self._pipe_dur)
+                except (TypeError, ValueError):
+                    _lim_pre = None
+                if _lim_pre is None and self._dur and self._dur > 0:
+                    _lim_pre = float(self._dur)
+                if _lim_pre is None and "=999999" in _pipe_graph:
+                    _lim_pre = 3600.0   # 图内有无限源且时长未知 → 兜底防跑飞（关窗即 kill）
+                if _lim_pre:
+                    # ⚠️ 口径修正（2026-09-21 实测复现）：这里必须用 **_back**（0 基段内偏移），
+                    # 不能减 sec（素材绝对秒）。_lim_pre 首选 self._pipe_dur = **成片时长**（0 基
+                    # 长度，如 50s），而 sec 是素材绝对秒（如 205s）⇒ 两者相减恒为负 → 被
+                    # max(0.5,…) 兜成 0.5s ⇒ 图尾 trim 窗口只剩 0.5 秒 ⇒ **预览出半秒帧就 EOF**
+                    # （用户实测「画面一闪就没 / 加载不出来」）。非桥接路径的 -t 用的正是
+                    # `_lim - _back`，此处保持同口径；_lim_pre 退化为素材总长时也只是放宽上限
+                    # （上限偏大无害，偏小才会截断）。
+                    _remain = max(0.5, _lim_pre - _back)
+                    _bridge_tail = ("trim=start=%s:end=%.6f,setpts=PTS-STARTPTS,"
+                                    % (_back_s, _back + _remain))
+        if _bridge_tail:
+            # 桥接模式：图尾钳制插在 fps 之后（fps/trim 均保时间线，实测 pts 走查证实），
+            # 丢弃 seek 点前的 2 帧回退帧并封顶剩余时长（承担旧输出侧 -ss post + -t 的职责）
+            _tail = _tail.replace("fps=%s,setsar=1" % _fps_s,
+                                  "fps=%s,%ssetsar=1" % (_fps_s, _bridge_tail), 1)
+        # 性能优化（2026-09-20 实测 4K 同文件「主+子」两段预览很卡）：
+        #  · -probesize/-analyzeduration 缩减：本地已知文件无需全量探测，每次 spawn（含同文件
+        #    两段各一次）启动更快；取值保守，避免 TS/MKV 误判流。
+        # ⚠️ 已移除 -hwaccel auto（2026-09-21 实测为**负优化**，勿再加回）：
+        #    本管道滤镜链 100% 是**软件滤镜**（setpts/trim/crop/overlay/delogo/scale/pad/
+        #    format=rgb24），硬件解出的帧在显存里必须先 hwdownload 回内存才能进图，一来一回
+        #    比直接软解更贵 —— 实测 320x240：带 0.44s / 不带 0.12s（慢 3.7 倍）；
+        #    4K：带 1.08s / 不带 0.51s（慢 2 倍）。且 Windows 任务管理器通常**不把硬件解码
+        #    计入 GPU 占用率**，表现就是「GPU 没动静、ffmpeg 还是 60% CPU」—— 那是滤镜在
+        #    CPU 上跑，属预期，不是没生效。
+        _probe_opts = ["-probesize", "500000", "-analyzeduration", "200000"]
+        cmd = [self.ff, "-hide_banner", "-nostdin"] + _probe_opts
+        if _is_static_image_file(self.file):
+            # 静态图片：不能 seek，用 -loop 1 让单帧变成连续流（ffmpeg 管道里 -loop 1 有效，
+            # 与 ffplay 下无效正好相反）；时长由输出侧 -t = pipe_duration(图片显示时长) 封顶。
+            cmd.extend(["-loop", "1"] + _probe_opts + ["-i", self.file])
+            # 图内视频 movie= 若已被改写成外部输入（图片主 + 视频水印等场景），同样必须补上
+            # 这批 -i —— 否则图里引用的 [N:v] 标签没有对应输入，ffmpeg 直接报 Stream map 错。
+            for (_p, _ss) in _sub_inputs:
+                cmd.extend(["-ss", "%.6f" % _ss] + _probe_opts + ["-i", _p])
+        elif _out_mode:
+            # 输出时间轴模式：主输入不 seek（图内各段时间锚点必须保持原样）
+            cmd.extend(_probe_opts + ["-i", self.file])
+        else:
+            pre = _pre
+            cmd.extend(["-ss", "%.6f" % pre] + _probe_opts + ["-i", self.file])
+            # 子输入（原图内 movie=）各带一份 -ss：0 基模型下固定取 0（子素材从 0 解码，
+            # 子链自带 trim=start=S_sub+STARTPTS 归零，与 scrub 无关，见 _rewrite_movie_inputs）。
+            for (_p, _ss) in _sub_inputs:
+                cmd.extend(["-ss", "%.6f" % _ss] + _probe_opts + ["-i", _p])
+            # 方案A 拆出来的分支输入：与主输入同一文件，各带自己的 -ss(=X_k+T)，
+            # 每条分支只解码自己那几帧 ⇒ 不再从 seek 点向前空解 X_k 秒（4K 秒开）。
+            for (_bi, _bss) in _branch_inputs:
+                cmd.extend(["-ss", "%.6f" % _bss] + _probe_opts + ["-i", self.file])
+            if not _bridge:
+                # 旧两段式精定位：输出侧 -ss post 丢弃 2 帧回退。桥接模式下输出侧 -ss 会
+                # 撞上素材口径 pts（全部被误丢）→ 改由图尾 trim=start=sec 承担同样的丢弃。
+                post = max(0.0, sec - pre)
+                cmd.extend(["-ss", "%.6f" % post])
+        cmd.extend(["-filter_complex", _pipe_graph + ";" + _tail,
+                    "-map", "[pv_out]"])
+        # 输出级时长上限（必须在输出文件名 pipe:1 之前）；seek 后按剩余时长收敛。
+        # 桥接模式已改用图尾 trim=end 钳制（pts 是素材口径，-t 会误截），跳过 -t。
+        _lim = None
+        if not _bridge:
+            try:
+                if self._pipe_dur and float(self._pipe_dur) > 0:
+                    _lim = float(self._pipe_dur)
+            except (TypeError, ValueError):
+                _lim = None
+            if _lim is None and self._dur and self._dur > 0:
+                _lim = float(self._dur)
+            if _lim is None and "=999999" in _pipe_graph:
+                _lim = 3600.0      # 图内有无限源且时长未知 → 兜底防跑飞（用户关窗即 kill）
+            if _lim:
+                _lim = max(0.5, _lim - _back)
+                cmd.extend(["-t", "%.6f" % _lim])
+        cmd.extend(["-an", "-sn", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
+        # ── 诊断留痕（2026-09-21）───────────────────────────────────────────────
+        # 管道 ffmpeg 的 stderr 走 DEVNULL：一旦图/seek 有问题，ffmpeg 立即退出而我们
+        # 一条线索都没有，表现就是「正在加载预览」永久卡住（用户实测 4K/2K 项目）。
+        # 故每次 spawn 把【完整命令 + 关键时间量】写进主界面右上「关键信息」日志 ——
+        # 与其它预览工具（mpv / ffplay 回退）的 `执行命令: …` 落在同一处、同一口径：
+        #   · 命令是一整行，可直接在日志框里选中复制进 cmd 复跑；
+        #   · 时间量（sec/pipe_start/back/pre/各分支 seek/时长上限）是判「时间轴对不对」
+        #     的核心依据 —— 用户多次反馈「管道引擎看不到命令、没法验证时间」。
+        # ⚠️ 2026-09-21 用户要求：**不再落盘** %TEMP%\kli_pipe_cmd.txt（"保存到文件里不好"）。
+        # 同一组参数只记一次（_pipe_diag_last 去重）：循环预览 / 重复 seek 不刷屏。
+        # 诊断脚本要原始明细可自带落盘，程序端不给文件。
+        # 需要 ffmpeg 报错原文时：在 %TEMP% 放一个空文件 kli_pipe_debug.on，stderr 即
+        # 改写到 %TEMP%\kli_pipe_err.txt（默认仍 DEVNULL，避免进度行把文件撑爆）。
+        try:
+            _diag = (_("[管道预览] sec=%.6f pipe_start=%.6f back=%.6f pre=%.6f "
+                     "bridge=%s out_mode=%s | sub=%s branch=%s | "
+                     "lim_pre=%s remain=%s dur=%s pipe_dur=%s")
+                     % (sec, _pstart, _back, _pre, _bridge, _out_mode,
+                        _sub_inputs, _branch_inputs,
+                        _lim_pre, _remain, self._dur, self._pipe_dur))
+            if _diag != getattr(self, "_pipe_diag_last", None):
+                self._pipe_diag_last = _diag
+                if self._app is not None:
+                    self._app._append_info_ui(_diag)
+                    self._app._append_info_ui(
+                        _("[管道预览] 执行命令: ") + format_cmd_for_display(cmd))
+        except Exception:
+            pass
+        _td = ""
+        try:
+            _td = tempfile.gettempdir()
+        except Exception:
+            _td = ""
+        _err = subprocess.DEVNULL
+        if _td and os.path.exists(os.path.join(_td, "kli_pipe_debug.on")):
+            try:
+                _err = open(os.path.join(_td, "kli_pipe_err.txt"), "wb")
+            except Exception:
+                _err = subprocess.DEVNULL
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                 stderr=_err, creationflags=flags)
+        except Exception:
+            return None
+        return p
 
     def _v_stop_proc(self):
         """kill 当前 ffmpeg + 清空缓冲 + 递增代际（防孤儿/防旧帧串入）。"""
@@ -19062,426 +21620,52 @@ class SimplePreviewer:
 
 
 # ================== 区域可视化编辑器（delogo / 遮罩独立选区） ==================
-class RegionVisualEditor:
-    """通用单/双框区域可视化编辑器：delogo 与遮罩各自独立的可视化选区入口。
+class RectSelectEditor:
+    """统一矩形选区编辑器。
 
-    - 画布显示视频帧，拖拽绘制主选区（红色实线），实时写回 x/y/w/h 变量；
-    - 可选显示裁剪框辅助（蓝色虚线，只读）——勾选了裁剪时同时显示两框，
-      避免 delogo/遮罩选到裁剪区域之外（与主视频/子视频位置辅助框同理）；
-    - 时间跳转重新取帧（复用调用方的 extract_video_frame_scaled）；
-    - safe_border=True（delogo）时应用前做四周留边安全化（x/y=0 或越界滤镜失败）。
+    实现借 FFmpegBatchGUI.open_crop_editor（同一套富 UI）。裁剪语境传完整参数；
+    delogo / 局部滤镜语境只取坐标（show_simple_pos/show_black_border 关掉、
+    safe_border 留边、helper_rect 显示裁剪辅助框）。
     """
-
-    def __init__(self, app, file_path,
-                 x_var, y_var, w_var, h_var,
-                 frame_extractor,
-                 helper_rect=None, helper_label=_("裁剪框"),
-                 safe_border=False, title=_("可视化选区"),
-                 on_apply=None):
+    def __init__(self, app, file_path, x_var, y_var, w_var, h_var,
+                 frame_extractor=None, helper_rect=None, helper_label=_("裁剪框"),
+                 safe_border=False, title=None, on_apply=None,
+                 initial_time_override=None, show_simple_pos=False, simple_pos_cb=None,
+                 show_black_border=False, black_border_cb=None,
+                 allow_alt_move=True, preload_points=None,
+                 apply_label=_("应用"), clear_label=_("清除选区"), info_extra=None, modal=False):
         self.app = app
-        self.root = app.root
-        self.ff = app.ffmpeg_cmd
-        self.file = file_path
-        self.x_var, self.y_var = x_var, y_var
-        self.w_var, self.h_var = w_var, h_var
-        self.extract = frame_extractor
-        self.helper_rect = helper_rect
-        self.helper_label = helper_label
-        self.safe_border = safe_border
-        self.title = title
-        self.on_apply = on_apply
-
-        # 原始尺寸
-        try:
-            ow, oh = app._get_video_dimensions_cached(file_path)
-        except Exception:
-            ow = oh = None
-        self.orig_w, self.orig_h = (ow or 1920), (oh or 1080)
-
-        # SAR（非方形像素，2026-09-07）：显示基准改用播放显示几何（如 1080x1080 显示为
-        # 1080x1920），坐标仍经 scale_x/scale_y 反算回编码像素网格，所见即所得。
-        try:
-            _sar = get_video_pixel_aspect(app.ffprobe_cmd, file_path)
-        except Exception:
-            _sar = None
-        _fw, _fh = self.orig_w, self.orig_h
-        self.sar_note = ""
-        if _sar is not None:
-            _sn, _sd = _sar
-            if _sd > _sn:
-                _fh = max(1, int(round(self.orig_h * _sd / _sn)))
-            else:
-                _fw = max(1, int(round(self.orig_w * _sn / _sd)))
-            self.sar_note = f", 播放显示 SAR {_sn}:{_sd}"
-            try:
-                app._append_info_ui(
-                    _("[选区] 检测到非方形像素 (SAR {0}:{1})：编码 {2}x{3}，播放器显示约 {4}x{5}；"
-                    "预览已按显示比例拉伸，坐标仍按编码像素换算").format(
-                        _sn, _sd, self.orig_w, self.orig_h, _fw, _fh))
-            except Exception:
-                pass
-        self.full_w, self.full_h = _fw, _fh
-
-        # 显示尺寸（屏幕内）。2026-08-26：与裁剪可视化一致——窗口高度=画布高+小余量，
-        # 右侧按钮行不占画布空间，无需为它们加窗口高度（加高只会让画布 expand 撑出底部空白）
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        RIGHT = 270
-        avail_w = min(int(sw * 0.9), 1200) - RIGHT - 40
-        avail_h = min(int(sh * 0.85), 800) - 30
-        scale = min(1.0, avail_w / self.full_w, avail_h / self.full_h)
-        self.disp_w = max(1, int(self.full_w * scale))
-        self.disp_h = max(1, int(self.full_h * scale))
-        self.scale_x = self.orig_w / self.disp_w
-        self.scale_y = self.orig_h / self.disp_h
-        self.PAD = 10
-
-        # 状态
-        self.points = []          # [(x1,y1),(x2,y2)] 原始坐标
-        self.rect_id = None
-        self.drag_rect_id = None
-        self.drag_start = None
-        self.img = None
-
-        self._build_ui()
-        # 初始框：从现有变量恢复
-        self._load_from_vars()
-        self._initial_load(0.0)
-
-    # ---------- UI ----------
-    def _build_ui(self):
-        self.win = tk.Toplevel(self.root)
-        self.win.title(f"{self.title} (显示 {self.disp_w}x{self.disp_h}, 原始 {self.orig_w}x{self.orig_h}{self.sar_note})")
-        self.win.resizable(False, False)
-        try:
-            self.win.transient(self.root)
-            # 禁 -topmost（项目铁律）：置顶会压掉本窗自身的 ToolTip。
-            # 唯一调用方（去水印/局部滤镜弹窗）打开本窗前已 grab_release()，
-            # 本窗作为后建的 transient 天然盖在其上，无需置顶。
-        except Exception:
-            pass
-        cw = self.disp_w + self.PAD * 2
-        ch = self.disp_h + self.PAD * 2
-        # 简单居中（窗口高=画布高+10，与裁剪可视化一致，画布 expand 后恰好占满，无底部空白）
-        try:
-            sw = self.root.winfo_screenwidth()
-            sh = self.root.winfo_screenheight()
-            x = max(0, (sw - cw - 290) // 2)
-            y = max(0, (sh - ch - 30) // 2)
-            self.win.geometry(f"{cw + 290}x{ch + 10}+{x}+{y}")
-        except Exception:
-            pass
-        self.win.protocol("WM_DELETE_WINDOW", self.win.destroy)
-
-        main = ttk.Frame(self.win)
-        main.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        right = ttk.Frame(main, width=270)
-        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
-        right.pack_propagate(False)
-
-        self.canvas = tk.Canvas(main, bg='gray', width=cw, height=ch, highlightthickness=0)
-        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self._loading = self.canvas.create_text(cw // 2, ch // 2, text=_("正在加载画面…"),
-                                                fill="#666666", font=("Arial", 12))
-
-        # 信息
-        self.info_var = tk.StringVar(value=_("👉 按住左键拖拽绘制选区"))
-        tk.Label(right, textvariable=self.info_var, wraplength=250, justify=tk.LEFT,
-                 bg="#FFFFCC", relief=tk.SUNKEN, padx=5, pady=5).pack(pady=5, fill=tk.X)
-        # 辅助框提示
-        if self.helper_rect:
-            hx, hy, hw, hh = self.helper_rect
-            tk.Label(right, text=_("辅助:{0} ({1},{2},{3},{4})").format(self.helper_label, hx, hy, hw, hh),
-                     foreground="blue", wraplength=250, justify=tk.LEFT).pack(pady=2, fill=tk.X)
-
-        # 时间
-        row = ttk.Frame(right)
-        row.pack(fill=tk.X, pady=4)
-        ttk.Label(row, text=_("时间:")).pack(side=tk.LEFT)
-        self.time_var = tk.StringVar(value="0")
-        ttk.Entry(row, textvariable=self.time_var, width=10).pack(side=tk.LEFT, padx=4)
-        ttk.Button(row, text=_("取帧"), command=self._refresh_frame).pack(side=tk.LEFT)
-
-        # 数值（实时显示 + 可编辑；2026-08-26：4 行改 2 行紧凑布局，腾空间给微调按钮）
-        nf = ttk.LabelFrame(right, text=_("选区坐标 (x / y / 宽 / 高)"), padding=5)
-        nf.pack(fill=tk.X, pady=4)
-        nf_r1 = ttk.Frame(nf)
-        nf_r1.pack(fill=tk.X, pady=1)
-        nf_r2 = ttk.Frame(nf)
-        nf_r2.pack(fill=tk.X, pady=1)
-        for i, (lab, var, row) in enumerate([("X", self.x_var, nf_r1), ("Y", self.y_var, nf_r1),
-                                             (_("宽"), self.w_var, nf_r2), (_("高"), self.h_var, nf_r2)]):
-            ttk.Label(row, text=lab + ":").pack(side=tk.LEFT)
-            e = ttk.Entry(row, textvariable=var, width=6)
-            e.pack(side=tk.LEFT, padx=2)
-
-        # 微调按钮：移动 / 减 / 加 三行，各自带步进（2026-08-26 与裁剪可视化同套语义）
-        nudge_frame = ttk.LabelFrame(right, text=_("微调 (像素)"), padding=3)
-        nudge_frame.pack(fill=tk.X, pady=4)
-        _nudge_step = {}
-        for _kind, _labels in [("move", [(_("上移"), "up"), (_("下移"), "down"), (_("左移"), "left"), (_("右移"), "right")]),
-                               ("shrink", [(_("上减"), "top"), (_("下减"), "bottom"), (_("左减"), "left"), (_("右减"), "right")]),
-                               ("grow", [(_("上加"), "top"), (_("下加"), "bottom"), (_("左加"), "left"), (_("右加"), "right")])]:
-            _row = ttk.Frame(nudge_frame)
-            _row.pack(fill=tk.X, pady=1)
-            for _label, _dir in _labels:
-                ttk.Button(_row, text=_label, width=4,
-                           command=lambda k=_kind, d=_dir: self._nudge_rect(k, d, _nudge_step_get(_kind))).pack(
-                    side=tk.LEFT, padx=1)
-            ttk.Label(_row, text=_("步进:")).pack(side=tk.LEFT, padx=(6, 2))
-            _sv = tk.StringVar(value="1")
-            _nudge_step[_kind] = _sv
-            ttk.Spinbox(_row, textvariable=_sv, from_=1, to=999, width=4).pack(side=tk.LEFT)
-
-        def _nudge_step_get(kind):
-            try:
-                return int(_nudge_step[kind].get())
-            except (ValueError, TypeError, KeyError):
-                return 1
-
-        # 清除/应用/取消
-        bf = ttk.Frame(right)
-        bf.pack(fill=tk.X, pady=8)
-        ttk.Button(bf, text=_("清除选区"), command=self._clear).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bf, text=_("应用"), command=self._apply).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bf, text=_("取消"), command=self.win.destroy).pack(side=tk.LEFT, padx=2)
-
-        tip = _("拖拽绘制主选区（红色）。辅助框（蓝色虚线）= 裁剪区域，仅供参考。")
-        tk.Label(right, text=tip, foreground="gray", wraplength=250, justify=tk.LEFT).pack(pady=6)
-
-        # 事件
-        self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
-        self.canvas.bind("<B1-Motion>", self._on_drag_motion)
-        self.canvas.bind("<ButtonRelease-1>", self._on_drag_end)
-
-    # ---------- 坐标转换 ----------
-    def _c2d(self, cx, cy):
-        x = self.canvas.canvasx(cx) - self.PAD
-        y = self.canvas.canvasy(cy) - self.PAD
-        return max(0, min(x, self.disp_w)), max(0, min(y, self.disp_h))
-
-    def _d2o(self, dx, dy):
-        return int(dx * self.scale_x), int(dy * self.scale_y)
-
-    def _o2d(self, ox, oy):
-        return ox / self.scale_x, oy / self.scale_y
-
-    # ---------- 画框 ----------
-    def _redraw(self):
-        if self.rect_id:
-            self.canvas.delete(self.rect_id)
-            self.rect_id = None
-        # 辅助框（只读）
-        self.canvas.delete("aux")
-        if self.helper_rect:
-            hx, hy, hw, hh = self.helper_rect
-            _ax1, _ay1 = self._o2d(hx, hy)
-            _ax2, _ay2 = self._o2d(hx + hw, hy + hh)
-            self.canvas.create_rectangle(
-                _ax1 + self.PAD, _ay1 + self.PAD,
-                _ax2 + self.PAD, _ay2 + self.PAD,
-                outline="blue", width=1, dash=(4, 2), tags="aux")
-        if len(self.points) == 2:
-            x1, y1 = self.points[0]
-            x2, y2 = self.points[1]
-            self.rect_id = self.canvas.create_rectangle(
-                self._o2d(x1, y1)[0] + self.PAD, self._o2d(x1, y1)[1] + self.PAD,
-                self._o2d(x2, y2)[0] + self.PAD, self._o2d(x2, y2)[1] + self.PAD,
-                outline="red", width=2)
-            self._sync_vars()
-        self._update_info()
-
-    def _sync_vars(self):
-        if len(self.points) != 2:
-            return
-        x1, y1 = self.points[0]
-        x2, y2 = self.points[1]
-        try:
-            self.x_var.set(str(int(min(x1, x2))))
-            self.y_var.set(str(int(min(y1, y2))))
-            self.w_var.set(str(int(abs(x2 - x1))))
-            self.h_var.set(str(int(abs(y2 - y1))))
-        except Exception:
-            pass
-
-    def _update_info(self):
-        if len(self.points) == 2:
-            self.info_var.set(_("✅ 选区已确定，可继续拖拽覆盖"))
-        else:
-            self.info_var.set(_("👉 按住左键拖拽绘制选区"))
-
-    def _load_from_vars(self):
-        """打开时从目标变量恢复旧框（任务1同款逻辑）。"""
-        try:
-            x = int(float(str(self.x_var.get()).strip() or 0))
-            y = int(float(str(self.y_var.get()).strip() or 0))
-            w = int(float(str(self.w_var.get()).strip() or 0))
-            h = int(float(str(self.h_var.get()).strip() or 0))
-            if w > 0 and h > 0:
-                self.points = [(x, y), (x + w, y + h)]
-        except (ValueError, TypeError):
-            pass
-
-    def _nudge_rect(self, kind, direction, step):
-        """微调矩形（2026-08-26，与裁剪可视化同套语义）：
-        - kind='move'   平移（up/down/left/right）
-        - kind='shrink' 收缩边界（top/bottom/left/right）
-        - kind='grow'   扩大边界（top/bottom/left/right）
-        操作后 _redraw 自动写回 x/y/w/h 变量。"""
-        if len(self.points) != 2 or not step:
-            return
-        x1, y1 = self.points[0]
-        x2, y2 = self.points[1]
-        l = min(x1, x2); r = max(x1, x2)
-        t = min(y1, y2); b = max(y1, y2)
-        if kind == "move":
-            if direction == "left":   l -= step; r -= step
-            elif direction == "right": l += step; r += step
-            elif direction == "up":    t -= step; b -= step
-            elif direction == "down":  t += step; b += step
-        elif kind == "shrink":
-            if direction == "left":   l += step
-            elif direction == "right": r -= step
-            elif direction == "top":   t += step
-            elif direction == "bottom": b -= step
-        elif kind == "grow":
-            if direction == "left":   l -= step
-            elif direction == "right": r += step
-            elif direction == "top":   t -= step
-            elif direction == "bottom": b += step
-        else:
-            return
-        l = max(0, min(l, self.orig_w)); t = max(0, min(t, self.orig_h))
-        r = max(0, min(r, self.orig_w)); b = max(0, min(b, self.orig_h))
-        if r <= l or b <= t:
-            return
-        self.points = [(l, t), (r, b)]
-        self._redraw()
-
-    # ---------- 拖拽 ----------
-    def _on_drag_start(self, ev):
-        self.drag_start = self._c2d(ev.x, ev.y)
-        if self.drag_rect_id:
-            self.canvas.delete(self.drag_rect_id)
-            self.drag_rect_id = None
-        if self.rect_id:
-            self.canvas.delete(self.rect_id)
-            self.rect_id = None
-
-    def _on_drag_motion(self, ev):
-        if self.drag_start is None:
-            return
-        cur = self._c2d(ev.x, ev.y)
-        if self.drag_rect_id:
-            self.canvas.delete(self.drag_rect_id)
-        sx, sy = self.drag_start
-        self.drag_rect_id = self.canvas.create_rectangle(
-            sx + self.PAD, sy + self.PAD, cur[0] + self.PAD, cur[1] + self.PAD,
-            outline="yellow", width=2, dash=(4, 2))
-
-    def _on_drag_end(self, ev):
-        if self.drag_start is None:
-            return
-        sx, sy = self.drag_start
-        ex, ey = self._c2d(ev.x, ev.y)
-        ox1, oy1 = self._d2o(sx, sy)
-        ox2, oy2 = self._d2o(ex, ey)
-        if abs(ox2 - ox1) > 0 and abs(oy2 - oy1) > 0:
-            self.points = [(ox1, oy1), (ox2, oy2)]
-        else:
-            self.points = []
-        if self.drag_rect_id:
-            self.canvas.delete(self.drag_rect_id)
-            self.drag_rect_id = None
-        self.drag_start = None
-        self._redraw()
-
-    # ---------- 帧 ----------
-    def _initial_load(self, sec):
-        try:
-            w, h, data = self.extract(self.file, frame_sec=sec,
-                                      target_width=self.disp_w, target_height=self.disp_h)
-            if w is None or h is None:
-                return
-            self._show_img(data)
-        except Exception:
-            pass
-
-    def _show_img(self, data):
-        try:
-            img = tk.PhotoImage(data=data)
-            self.canvas.delete("bg_img")
-            self.canvas.create_image(self.PAD, self.PAD, anchor=tk.NW, image=img, tags="bg_img")
-            self.canvas.image = img
-            self.img = img
-            try:
-                self.canvas.delete(self._loading)
-            except Exception:
-                pass
-            self._redraw()  # 图像显示后画框（图像会盖住先画的）
-        except Exception:
-            pass
-
-    def _refresh_frame(self):
-        sec = time_to_seconds(self.time_var.get().strip() or "0") or 0.0
-        try:
-            w, h, data = self.extract(self.file, frame_sec=sec,
-                                      target_width=self.disp_w, target_height=self.disp_h)
-            if w is not None and h is not None:
-                self._show_img(data)
-                self.info_var.set(_("✅ 已更新画面 ({0:.2f}s)").format(sec))
-        except Exception:
-            pass
-
-    # ---------- 操作 ----------
-    def _clear(self):
-        self.points = []
-        self._redraw()
-
-    def _apply(self):
-        if len(self.points) != 2:
-            messagebox.showwarning(_("提示"), _("请先拖拽绘制一个选区"))
-            return
-        x1, y1 = self.points[0]
-        x2, y2 = self.points[1]
-        x, y = int(min(x1, x2)), int(min(y1, y2))
-        w, h = int(abs(x2 - x1)), int(abs(y2 - y1))
-        if w <= 0 or h <= 0:
-            messagebox.showerror(_("错误"), _("选区尺寸无效"))
-            return
-        if self.safe_border:
-            # delogo 四周留 ≥1px 边界（x/y=0 贴边或越界 → 滤镜失败）
-            if x < 1:
-                w -= (1 - x)
-                x = 1
-            if y < 1:
-                h -= (1 - y)
-                y = 1
-            if w > self.orig_w - x - 1:
-                w = self.orig_w - x - 1
-            if h > self.orig_h - y - 1:
-                h = self.orig_h - y - 1
-            if w <= 0 or h <= 0:
-                messagebox.showerror(_("错误"), _("选区贴近画面边缘，无法安全应用（delogo 需四周留边）"))
-                return
-        self.x_var.set(str(x))
-        self.y_var.set(str(y))
-        self.w_var.set(str(w))
-        self.h_var.set(str(h))
-        if self.on_apply:
-            try:
-                self.on_apply()
-            except Exception:
-                pass
-        self.win.destroy()
+        if frame_extractor is None:
+            frame_extractor = getattr(app, "extract_video_frame_scaled", None)
+        # open_crop_editor 是定义在 VideoFilterFrame 上的富方法（依赖 self.crop_* 等
+        # 滤镜帧自身属性）；传入的 app 若是 FFmpegBatchGUI（无此方法），
+        # 回退到主转换页 filter frame（app.video_filter）。
+        host = app
+        if not hasattr(host, "open_crop_editor"):
+            _vf = getattr(app, "video_filter", None)
+            if _vf is not None and hasattr(_vf, "open_crop_editor"):
+                host = _vf
+        host.open_crop_editor(
+            file_path=file_path, x_var=x_var, y_var=y_var, w_var=w_var, h_var=h_var,
+            frame_extractor=frame_extractor, helper_rect=helper_rect, helper_label=helper_label,
+            safe_border=safe_border, title=title, on_apply=on_apply,
+            initial_time_override=initial_time_override, show_simple_pos=show_simple_pos,
+            simple_pos_cb=simple_pos_cb, show_black_border=show_black_border,
+            black_border_cb=black_border_cb, allow_alt_move=allow_alt_move,
+            preload_points=preload_points, apply_label=apply_label, clear_label=clear_label,
+            info_extra=info_extra, modal=modal,
+        )
 
 
-# ================== 公共组件：循环与绿幕 ==================
 class LoopChromaFrame(ttk.LabelFrame):
     """循环播放与绿幕抠像设置组件 - 左右并排（grid布局）"""
-    def __init__(self, master, filt_frame=None, **kwargs):
+    def __init__(self, master, filt_frame=None, page_scope="merge", **kwargs):
         super().__init__(master, text=_("循环/绿幕控制"), padding="5", **kwargs)
         self.filt_frame = filt_frame
+        # 2026-09-23：主视频作用域（'merge'=封装页 / 'convert'=转换页水印编辑器）。
+        # edit_video_settings 三处调用方（封装页轨道/转换页水印/队列任务）都会实例化本组件，
+        # 遮罩可视化/轨迹弹窗的次级兜底帧按此作用域取「本页自己的主视频」，两页不互相兜底。
+        self.page_scope = page_scope or "merge"
         # 控件构建已内联在下方（历史残留的 _create_widgets 调用无定义，已移除）
         # 使用 grid 布局，将窗口分为左右两列，权重相等
         self.columnconfigure(0, weight=1)
@@ -19897,16 +22081,15 @@ class LoopChromaFrame(ttk.LabelFrame):
         if _app is None:
             _ff = getattr(self, "filt_frame", None)
             _app = getattr(_ff, "app", None) if _ff is not None else None
-        # 背景帧源（轨迹弹窗 + 下面「起始/结尾坐标」可视化编辑器共用）：主视频优先，回落输入文件
+        # 背景帧源（轨迹弹窗 + 下面「起始/结尾坐标」可视化编辑器共用）：本页主视频
         _vf = ""
         _ffm = _fprobe = None
         if _app is not None:
             try:
-                if getattr(_app, "merge_video", None):
-                    _vf = _app.merge_video.get().strip()
-                if not _vf or not os.path.exists(_vf):
-                    if getattr(_app, "input_file", None):
-                        _vf = _app.input_file.get().strip()
+                # 2026-09-23 修正：本组件也被转换页水印编辑器实例化 → 按 page_scope 取
+                # 本页主视频（'merge'=封装页 / 'convert'=转换页 input_file），不跨页兜底。
+                _pf, _unused = _page_main_video(_app, self.page_scope)
+                _vf = _pf or ""
             except Exception:
                 _vf = ""
             _ffm = getattr(_app, "ffmpeg_cmd", None)
@@ -19965,11 +22148,7 @@ class LoopChromaFrame(ttk.LabelFrame):
         t_ptype_hint = tk.StringVar(value="")
 
         # ---------- 工具 / 状态 ----------
-        def _to_f(s, d=0.0):
-            try:
-                return float(str(s).strip())
-            except (ValueError, TypeError):
-                return d
+        _to_f = _opt_float  # 宽容转 float，失败回 default（2026-09-22 抽公共）
 
         def _fmt_t(v):
             try:
@@ -20260,8 +22439,10 @@ class LoopChromaFrame(ttk.LabelFrame):
             app = getattr(_ff, "app", None)  # LoopChromaFrame 自身无 app，必须从 filt_frame 取
             file_path = getattr(_ff, "current_file", "") or ""
             if not file_path or not os.path.exists(file_path):
-                if app is not None and app.input_file is not None:
-                    file_path = app.input_file.get().strip()
+                # 2026-09-23：按 page_scope 回落本页主视频（不拿另一页的 input_file）
+                if app is not None:
+                    _pf, _unused = _page_main_video(app, self.page_scope)
+                    file_path = _pf or ""
             if not file_path or not os.path.exists(file_path):
                 messagebox.showwarning(_("提示"), _("请先选择子视频文件（水印/画中画）"))
                 return
@@ -20301,6 +22482,11 @@ class LoopChromaFrame(ttk.LabelFrame):
                 aspect_ratio=None,   # 遮罩挡板宽高独立：自由绘制矩形
                 # ⚠️ 遮罩不支持角度（钉死防误改）：遮罩链只消费 x/y，转动手柄所见非所得。
                 angle_editable=False,
+                # 2026-09-22：画布=子视频缩放后尺寸，显示层允许放大适配窗口。
+                allow_upscale=True,
+                # ⚠️ 节点语境：遮罩背景帧走「节点时间轴取帧器」（=节点输出画面，含像素类效果、
+                # 排除几何效果）；非节点语境 node_frame_extractor 为 None → 旧行为（主视频 bg_file）。
+                frame_extractor=getattr(self.filt_frame, "node_frame_extractor", None),
             )
 
         # ---------- 轨迹（起始/结尾坐标）回调 ----------
@@ -20356,7 +22542,10 @@ class LoopChromaFrame(ttk.LabelFrame):
                 # 偏移基准 = 遮罩画布尺寸 _cw x _ch（挡板保持原尺寸，只挪位置）。
                 corner_dirs=CORNER_DIR_PRESETS,
                 corner_src_w=_cw, corner_src_h=_ch,
-                start_end=start_end)
+                start_end=start_end,
+                # 2026-09-22：遮罩画布=子视频缩放后尺寸（语义要求），子视频缩小时画布极小，
+                # 编辑器显示层允许放大适配窗口（坐标空间不受影响）。
+                allow_upscale=True)
             try:
                 apply_xy(float(vx.get()), float(vy.get()))
             except (ValueError, TypeError):
@@ -20404,7 +22593,8 @@ class LoopChromaFrame(ttk.LabelFrame):
                 video_file=_vf, ffmpeg_cmd=_ffm, ffprobe_cmd=_fprobe,
                 app=_app,
                 # 遮罩链只消费航点 x/y：预设动效/角度/缩放链路不消费 → 隐藏
-                show_presets=False, allow_angle=False, allow_empty=True)
+                show_presets=False, allow_angle=False, allow_empty=True,
+                consume_alpha=False)
 
         # ---------- 外部形状图 ----------
         def _pick_png():
@@ -20579,10 +22769,10 @@ class LoopChromaFrame(ttk.LabelFrame):
         _coord_lf.pack(fill=tk.X, pady=3)
         _c1 = ttk.Frame(_coord_lf)
         _c1.pack(fill=tk.X, pady=2)
-        ttk.Label(_c1, text="X:").pack(side=tk.LEFT)
+        ttk.Label(_c1, text=_("左:")).pack(side=tk.LEFT)
         e_x = ttk.Entry(_c1, textvariable=t_x, width=6)
         e_x.pack(side=tk.LEFT, padx=2)
-        ttk.Label(_c1, text="Y:").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(_c1, text=_("上:")).pack(side=tk.LEFT, padx=(8, 0))
         e_y = ttk.Entry(_c1, textvariable=t_y, width=6)
         e_y.pack(side=tk.LEFT, padx=2)
         ttk.Label(_c1, text=_("宽:")).pack(side=tk.LEFT, padx=(8, 0))
@@ -20867,14 +23057,7 @@ class LoopChromaFrame(ttk.LabelFrame):
     def set_duration_info(self, duration_sec: Optional[float]):
         """设置时长显示信息"""
         if duration_sec is not None and duration_sec > 0:
-            # 格式化为 时:分:秒.毫秒
-            hours = int(duration_sec // 3600)
-            minutes = int((duration_sec % 3600) // 60)
-            seconds = duration_sec % 60
-            if hours > 0:
-                text = _("视频时长: {0:02d}:{1:02d}:{2:05.2f}").format(hours, minutes, seconds)
-            else:
-                text = _("视频时长: {0:02d}:{1:05.2f}").format(minutes, seconds)
+            text = _('视频时长: {0}').format(format_seconds_short(duration_sec))
             self.duration_label.config(text=text)
         else:
             self.duration_label.config(text="")
@@ -20894,10 +23077,17 @@ class OverlayPositionFrame(ttk.LabelFrame):
     仅用于画中画或水印模式，始终显示控件。
     """
     def __init__(self, master, app, mode='sub', track_idx=None, track_obj=None,
-                 filt_frame=None, visual_callback=None, **kwargs):
+                 filt_frame=None, visual_callback=None,
+                 page_scope="merge", ctx_main_file=None, ctx_main_settings=None, **kwargs):
         super().__init__(master, **kwargs)
         self.app = app
         self.mode = mode
+        # 2026-09-23 修正：本组件不只封装页用——edit_video_settings 还把它用于
+        # 转换页水印编辑器（page_scope='convert'）与队列任务水印（ctx_main_file=任务输入）。
+        # 轨迹/坐标编辑器的主视频解析按此作用域取「本页自己的主视频」，两页绝不互相兜底。
+        self.page_scope = page_scope or "merge"
+        self.ctx_main_file = ctx_main_file      # 显式语境主视频（队列任务编辑=task.input）优先
+        self.ctx_main_settings = ctx_main_settings  # 与 ctx_main_file 同源设置（队列=task.settings）
         self.track_idx = track_idx
         self.track_obj = track_obj
         self.filt_frame = filt_frame
@@ -20989,8 +23179,8 @@ class OverlayPositionFrame(ttk.LabelFrame):
         # 列各自左对齐 → 右侧 Y 标签与 Y 编辑框天然左对齐（不受 X 宽度影响）。
         pos_frame = ttk.Frame(self)
         pos_frame.pack(anchor=tk.W, fill=tk.X, pady=(2, 4))
-        self.overlay_x = tk.StringVar(value="W-w-10")
-        self.overlay_y = tk.StringVar(value="H-h-10")
+        self.overlay_x = tk.StringVar(value=DEFAULT_OVERLAY_X)
+        self.overlay_y = tk.StringVar(value=DEFAULT_OVERLAY_Y)
         ttk.Label(pos_frame, text=_("X 位置 (支持表达式，如 W-w-10):")).grid(row=0, column=0, sticky="w")
         ttk.Label(pos_frame, text=_("Y 位置 (支持表达式):")).grid(row=0, column=1, sticky="w", padx=(24, 0))
         x_entry = ttk.Entry(pos_frame, textvariable=self.overlay_x, width=28)
@@ -21006,9 +23196,9 @@ class OverlayPositionFrame(ttk.LabelFrame):
 
         positions = {
             _("左上角"): ("10", "10"),
-            _("右上角"): ("W-w-10", "10"),
-            _("左下角"): ("10", "H-h-10"),
-            _("右下角"): ("W-w-10", "H-h-10"),
+            _("右上角"): (DEFAULT_OVERLAY_X, "10"),
+            _("左下角"): ("10", DEFAULT_OVERLAY_Y),
+            _("右下角"): (DEFAULT_OVERLAY_X, DEFAULT_OVERLAY_Y),
             _("居中"): ("(W-w)/2", "(H-h)/2")
         }
         def set_position(x_val, y_val):
@@ -21110,16 +23300,25 @@ class OverlayPositionFrame(ttk.LabelFrame):
         _bg_render_size = None   # pad 时主视频实际渲染尺寸（画布含 pad 留黑）
         _src_from_merge = False   # ⚠️ 2026-08-27 修复：主视频画布设置的来源（封装页/转换页）
         try:
-            if getattr(app, "merge_video", None):
-                _mf = app.merge_video.get().strip()
-                _src_from_merge = bool(_mf and os.path.exists(_mf))
-            if not _mf or not os.path.exists(_mf):
-                if getattr(app, "input_file", None):
-                    _mf = app.input_file.get().strip()
-                    _src_from_merge = False
-            if not _mf or not os.path.exists(_mf):
-                messagebox.showinfo(_("提示"),
-                                    _("请先设置主视频（封装页「主视频」或转换页输入文件）后再使用可视化坐标编辑"))
+            # 2026-09-23 修正：OverlayPositionFrame 不只封装页用——edit_video_settings 还把
+            # 它用于转换页水印编辑器（page_scope='convert'）与队列任务水印（ctx_main_file）。
+            # 主视频解析按宿主语境取「本页自己的主视频」，两页绝不互相兜底：
+            #   1) ctx_main_file（队列任务编辑显式传入的 task.input）优先；
+            #   2) 否则按 page_scope 取本页主视频（'merge'=封装页主视频 / 'convert'=input_file）。
+            # 本页没有主视频 → 提示并退出（等价纯黑），绝不拿另一页的文件抽帧。
+            if self.ctx_main_file:
+                _mf = self.ctx_main_file if os.path.exists(self.ctx_main_file) else ""
+                _src_from_merge = False
+                _no_video_hint = _("未找到该任务的主视频文件，请确认任务输入有效")
+            else:
+                _pf, _unused = _page_main_video(app, self.page_scope)
+                _mf = _pf or ""
+                _src_from_merge = bool(_mf and os.path.exists(_mf)) and self.page_scope == "merge"
+                _no_video_hint = (_("请先在封装页设置主视频后再使用可视化坐标编辑")
+                                  if self.page_scope == "merge" else
+                                  _("请先在转换页设置输入文件后再使用可视化坐标编辑"))
+            if not _mf:
+                messagebox.showinfo(_("提示"), _no_video_hint)
                 return
             _wd, _hd = app._cached_video_dimensions(_mf)
             mw, mh = _wd, _hd
@@ -21158,15 +23357,21 @@ class OverlayPositionFrame(ttk.LabelFrame):
                 if not _bg_file:
                     _bg_file = _mf
             else:
-                # 转换页：渲染画布 = get_current_settings()（主视频 crop/scale/rotate 后），
-                # 背景帧 = input_file。⚠️ 切勿从 self.filt_frame 读设置——OverlayPositionFrame
+                # 转换页/队列：渲染画布 = 本语境主视频设置（队列=ctx_main_settings=task.settings，
+                # 转换页=get_current_settings()，主视频 crop/scale/rotate 后），背景帧 = 本语境主视频。
+                # ⚠️ 切勿从 self.filt_frame 读设置——OverlayPositionFrame
                 # 的 filt_frame 是【子视频/水印自己】的滤镜框架（scale_width/height=子视频尺寸），
-                # 上一版误用导致画布变成子视频缩放大小。正确来源：app.get_current_settings() +
+                # 上一版误用导致画布变成子视频缩放大小。正确来源：语境设置 +
                 # app._main_render_size（与正式命令 _compute_output_canvas 同源）。
                 _bg_file = _mf
                 if getattr(app, "_main_render_size", None):
                     try:
-                        _ms0 = app.get_current_settings() if hasattr(app, "get_current_settings") else {}
+                        if self.ctx_main_settings is not None:
+                            _ms0 = (self.ctx_main_settings
+                                    if isinstance(self.ctx_main_settings, dict)
+                                    else dict(self.ctx_main_settings))
+                        else:
+                            _ms0 = app.get_current_settings() if hasattr(app, "get_current_settings") else {}
                         _rw0, _rh0 = app._main_render_size(_ms0 or {}, _mf)
                         if _rw0 and _rh0:
                             mw, mh = _rw0, _rh0
@@ -21408,11 +23613,14 @@ class OverlayPositionFrame(ttk.LabelFrame):
         _ffm = _fprobe = None
         if self.app is not None:
             try:
-                if getattr(self.app, "merge_video", None):
-                    _vf = self.app.merge_video.get().strip()
-                if not _vf or not os.path.exists(_vf):
-                    if getattr(self.app, "input_file", None):
-                        _vf = self.app.input_file.get().strip()
+                # 2026-09-23 修正：按宿主语境取本页主视频（转换页水印编辑器/队列任务也会
+                # 实例化本组件），绝不跨页兜底：队列=ctx_main_file（任务输入）优先，
+                # 否则 page_scope（'merge'=封装页 / 'convert'=转换页 input_file）。
+                if self.ctx_main_file and os.path.exists(self.ctx_main_file):
+                    _vf = self.ctx_main_file
+                else:
+                    _pf, _unused = _page_main_video(self.app, self.page_scope)
+                    _vf = _pf or ""
             except Exception:
                 _vf = ""
             _ffm = getattr(self.app, "ffmpeg_cmd", None)
@@ -21459,11 +23667,12 @@ class OverlayPositionFrame(ttk.LabelFrame):
     
         if self.app:
             def fetch_size():
-                main_file = self.app.merge_video.get().strip() if self.app.merge_video else ""
+                # 2026-09-23：按宿主页取本页主视频（不跨页兜底，拿到另一页的视频尺寸）；
+                # 画布偏移控件只出现在封装页轨道设置 → page_scope 恒为 'merge'。
+                main_file, _unused = _page_main_video(self.app, self.page_scope)
+                main_file = main_file or ""
                 if not main_file or not os.path.exists(main_file):
-                    main_file = self.app.input_file.get().strip() if self.app.input_file else ""
-                if not main_file or not os.path.exists(main_file):
-                    messagebox.showerror(_("错误"), _("未找到主视频文件，请先设置主视频"))
+                    messagebox.showerror(_("错误"), _("未找到主视频文件，请先在封装页设置主视频"))
                     return
                 w, h = self.app._get_video_dimensions_cached(main_file)
                 if w is not None and h is not None:
@@ -21540,6 +23749,23 @@ class OverlayPositionFrame(ttk.LabelFrame):
         ToolTip(btn_reset_sub,
                 _("将所有子视频（非主视频）的「启用缩放」和「启用裁剪」复选框取消勾选，\n"
                 "恢复子视频为原始尺寸。"))
+
+        # --- 统一坐标（左 / 上） ---
+        btn_unify_xy = ttk.Button(row1, text=_("统一坐标"), command=self._apply_unified_coords, width=10)
+        btn_unify_xy.pack(side=tk.LEFT, padx=(12, 2))
+        self.unify_x_var = tk.StringVar(value="")
+        ttk.Label(row1, text=_("左:")).pack(side=tk.LEFT)
+        entry_unify_x = ttk.Entry(row1, textvariable=self.unify_x_var, width=6)
+        entry_unify_x.pack(side=tk.LEFT, padx=2)
+        self.unify_y_var = tk.StringVar(value="")
+        ttk.Label(row1, text=_("上:")).pack(side=tk.LEFT, padx=(6, 0))
+        entry_unify_y = ttk.Entry(row1, textvariable=self.unify_y_var, width=6)
+        entry_unify_y.pack(side=tk.LEFT, padx=2)
+        ToolTip(btn_unify_xy,
+                _("把所有子视频（非主视频）的叠加位置统一设为这里填的坐标，主视频不动。\n"
+                "左 = 距左边的距离，上 = 距上边的距离，两栏留空的那一项保持原值不变。\n"
+                "可直接填数字，也支持 ffmpeg 表达式（如 W-w-10 表示贴右边留 10 像素）。\n"
+                "典型用途：先把所有子视频排到同一位置，再逐个微调或做重叠对比。"))
 
         row2 = ttk.Frame(right_frame)
         row2.pack(anchor=tk.W, fill=tk.X, pady=(0, 5))
@@ -21879,6 +24105,53 @@ class OverlayPositionFrame(ttk.LabelFrame):
         else:
             self.app._append_info_ui(_("[取消子视频滤镜] 没有需要修改的子视频"))
 
+    def _apply_unified_coords(self):
+        """把所有子视频（非主视频）的叠加位置统一设为「统一坐标」里填的左 / 上值。"""
+        if not self.app:
+            return
+        tracks = self.app.merge_tracks
+        if not tracks:
+            return
+
+        x_str = self.unify_x_var.get().strip()
+        y_str = self.unify_y_var.get().strip()
+        if not x_str and not y_str:
+            messagebox.showwarning(_("提示"), _("请先填写要统一的坐标（左 / 上，至少填一项）"))
+            return
+
+        # 确定主视频轨道（与「取消子视频缩放/裁剪」同一口径）
+        main_idx = self.track_idx
+        if main_idx is None:
+            for i, t in enumerate(tracks):
+                if t.type == "video" and t.enabled:
+                    main_idx = i
+                    break
+        if main_idx is None:
+            self.app._append_info_ui(_("[统一坐标] 未找到主视频轨道"))
+            return
+
+        modified = 0
+        for i, track in enumerate(tracks):
+            if i == main_idx:
+                continue   # 跳过主视频
+            if track.type != "video" or not track.enabled:
+                continue
+            if x_str:
+                track.enc_settings["overlay_x"] = x_str
+            if y_str:
+                track.enc_settings["overlay_y"] = y_str
+            modified += 1
+
+        if modified:
+            self.app.merge_update_track_list()
+            self.app.merge_update_command_preview()
+            self.app._append_info_ui(
+                _("[统一坐标] 已将 {0} 个子视频的位置设为 左={1}, 上={2}".format(modified, x_str or '不变', y_str or '不变')))
+        else:
+            self.app._append_info_ui(_("[统一坐标] 没有需要修改的子视频"))
+
+
+
 
     def get_settings(self):
         if self.mode == 'sub':
@@ -21910,8 +24183,8 @@ class OverlayPositionFrame(ttk.LabelFrame):
     def set_settings(self, settings):
         if self.mode == 'sub':
             self.overlay_enabled.set(settings.get("overlay_enabled", True))
-            self.overlay_x.set(settings.get("overlay_x", "W-w-10"))
-            self.overlay_y.set(settings.get("overlay_y", "H-h-10"))
+            self.overlay_x.set(settings.get("overlay_x", DEFAULT_OVERLAY_X))
+            self.overlay_y.set(settings.get("overlay_y", DEFAULT_OVERLAY_Y))
             self.blend_mode.set(settings.get("blend_mode", "normal"))
             if hasattr(self, "_blend_display"):
                 self.blend_mode_display.set(self._blend_display.get(self.blend_mode.get(), _("正常(透明叠加)")))
@@ -22025,6 +24298,9 @@ class AdvancedFrame(ttk.LabelFrame):
         # ---- 滤镜硬件加速模式（软件 / NVIDIA / Intel QSV / AMD） ----
         _lbltt33 = ttk.Label(hw_frame, text=_("滤镜加速:"))
         _lbltt33.pack(side=tk.LEFT, padx=(10, 0))
+        # ⚠️ multi 专有双变量（base 是单变量，勿合并）：
+        #   hw_filter_mode_var  —— 存中文规范标签，与 HW_FILTER_MODE_MAP 的键一致（存盘恒为 cpu/cuda/... token）
+        #   hw_filter_mode_disp —— 存当前语言显示文本，供下拉框显示
         self.hw_filter_mode_var = tk.StringVar(value="软件 (CPU)")
         self.hw_filter_mode_disp = tk.StringVar(value=_("软件 (CPU)"))
         self.hw_filter_mode_combo = ttk.Combobox(
@@ -22047,6 +24323,8 @@ class AdvancedFrame(ttk.LabelFrame):
             "   否则帧在内存，会自动退回纯软件滤镜。"),
             wraplength=500
         )
+        # 下拉框的 textvariable 是显示值(hw_filter_mode_disp)，选中后按索引回填中文规范标签
+        # 到 hw_filter_mode_var（存盘用），再触发联动。
         def _hw_mode_sel(_e):
             _idx = self.hw_filter_mode_combo.current()
             if 0 <= _idx < len(HW_FILTER_MODE_OPTIONS):
@@ -22087,7 +24365,8 @@ class AdvancedFrame(ttk.LabelFrame):
                 "【滤镜智能合并】\n"
                 "• 直接输入裸滤镜串（如 drawtext=text='hello':x=10:y=10），会自动识别为视频/音频滤镜，\n"
                 "  按滤镜类型自动替换或插入到界面生成的 -vf/-af 链的正确位置。\n"
-                "• 使用 -vf / -af / -filter_complex 前缀的滤镜串同样会智能合并，而不是覆盖。\n"
+                "• 使用 -vf / -af 前缀（或 -filter_complex 后接不带 [标签] 的滤镜串）同样会智能合并，而不是覆盖。\n"
+                "• -filter_complex 里写了 [标签] 的完整滤镜图会整体替换，界面生成的画布/水印图不再生效。\n"
                 "• 同名滤镜默认替换（如 scale=1920:-2 会替换界面生成的 scale=1280:-2），\n"
                 "  drawtext / subtitles / overlay 除外——这些会叠加保留，允许多个文字水印共存。\n\n"
                 "【其余参数】\n"
@@ -22113,7 +24392,7 @@ class AdvancedFrame(ttk.LabelFrame):
         wm_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         
         def browse_wm():
-            path = filedialog.askopenfilename(title="选择水印文件", filetypes=[("媒体", "*.png *.jpg *.jpeg *.bmp *.gif *.webp *.mp4 *.mkv *.avi *.mov")])
+            path = filedialog.askopenfilename(title=_("选择水印文件"), filetypes=media_filetypes())
             if path:
                 self.wm_path_var.set(normalize_path(path))
         ttk.Button(wm_frame, text=_("浏览"), command=browse_wm, width=6).pack(side=tk.LEFT, padx=2)
@@ -22200,9 +24479,9 @@ class AdvancedFrame(ttk.LabelFrame):
             _btn_end.pack(side=tk.LEFT, padx=20)
             ToolTip(_btn_end,
                     _("末端处理：多画面拼接 / 末尾追加图片（如二维码）或视频。\n"
-                      "主界面设置作用于转码/新入队任务；队列任务在「任务编辑」里用同一按钮\n"
-                      "设置各自的末端处理（互不影响）。\n"
-                      "图片自动缩放适配输出尺寸，不足则黑底居中，再 concat 到视频末尾。"),
+                    "主界面设置作用于转码/新入队任务；队列任务在「任务编辑」里用同一按钮\n"
+                    "设置各自的末端处理（互不影响）。\n"
+                    "图片自动缩放适配输出尺寸，不足则黑底居中，再 concat 到视频末尾。"),
                     wraplength=400)
         
         # 刷新下拉列表
@@ -22315,7 +24594,8 @@ class AdvancedFrame(ttk.LabelFrame):
                             settings_container=self.tw_settings_container,
                             refresh_cb=self.update_callback,
                             canvas_file=getattr(self, "tw_canvas_file", None),
-                            canvas_settings=getattr(self, "tw_full_settings", None))
+                            canvas_settings=getattr(self, "tw_full_settings", None),
+                            canvas_scope="convert")
 
     def open_watermark_editor(self):
         """打开图片/视频水印的参数编辑窗口（缩放、裁剪、旋转、位置等）。
@@ -22353,7 +24633,8 @@ class AdvancedFrame(ttk.LabelFrame):
             overlay_mode='sub',
             parent=self,
             track_obj=None,
-            main_video_size=main_video_size  # 传入正确的最终尺寸
+            main_video_size=main_video_size,  # 传入正确的最终尺寸
+            page_scope="convert"   # 2026-09-23：转换页语境 → 轨迹坐标编辑器取转换页主视频
         )
     
     def _on_watermark_saved(self, new_settings):
@@ -22390,31 +24671,17 @@ class AdvancedFrame(ttk.LabelFrame):
 
     def _tw_canvas_size(self):
         """文字水印位置编辑器画布尺寸（优先级从高到低）：
-        1. tw_canvas_file（队列任务编辑显式传入 task.input）→ 任务渲染后尺寸
-           （不受注入标志影响：任务文字水印不注入封装页）；
-        2. 「注入到封装页」开启且封装页有主视频（仅主界面场景）→ 封装页主视频
-           渲染后画布（_get_canvas_size：pad/裁剪/缩放/旋转后的最终 overlay 画布）；
-        3. 主界面输入文件 → 渲染后尺寸；
-        4. 兜底 1280x720。"""
+        1. tw_canvas_file（队列任务编辑显式传入 task.input）→ 任务渲染后尺寸；
+        2. 主界面输入文件 → 渲染后尺寸；
+        3. 兜底 1280x720。
+        ⚠️ 2026-09-23：删除旧的第 2 条「勾了『注入到封装页』就取封装页主视频画布」——
+        该功能已下线（封装页有独立文字水印），留着只会让转换页画布错取封装页主视频。"""
         # 1) 队列任务编辑：任务自己的文件优先
         if self.tw_canvas_file:
             r = self._tw_canvas_from_file(self.tw_canvas_file, self.tw_full_settings)
             if r:
                 return r
-        # 2) 主界面 + 勾选「注入到封装页」：文字水印叠加在封装页主视频上，
-        #    画布必须取封装页当前主视频尺寸（而不是转换页主界面输入文件）
-        if self.app is not None and self.tw_canvas_file is None and \
-                bool(self.tw_settings.get("inject_to_packaging", False)):
-            try:
-                main_track = next((t for t in self.app.merge_tracks
-                                   if t.enabled and t.type == "video"), None)
-                if main_track is not None:
-                    w, h = self.app._get_canvas_size(main_track)
-                    if w and h and w > 0 and h > 0:
-                        return int(w), int(h)
-            except Exception:
-                pass
-        # 3) 主界面输入文件（2026-08-29：渲染后尺寸——旧代码传 None 取原始尺寸，
+        # 2) 主界面输入文件（2026-08-29：渲染后尺寸——旧代码传 None 取原始尺寸，
         #    主视频有裁剪/缩放时画布错位 =「原始尺寸画布+裁剪背景帧」变形）
         if self.app is not None:
             _fs = getattr(self, "tw_full_settings", None)
@@ -22431,10 +24698,11 @@ class AdvancedFrame(ttk.LabelFrame):
     def _tw_bg_context(self):
         """文字水印位置编辑器背景帧上下文 (file, settings)——源顺序与 _tw_canvas_size 严格一致：
         1. tw_canvas_file（队列任务编辑=task.input）+ tw_full_settings（task.settings）；
-        2. 转换页「注入到封装页」→ merge 主轨 file_path + enc_settings；
-        3. 转换页主界面 input_file + get_current_settings()。
+        2. 转换页主界面 input_file + get_current_settings()。
         无有效主视频 → (None, None)（编辑器保持纯黑）。2026-09-03（问题②③根因：
-        impl 此前无条件封装页 merge_video 优先，队列/转换页语境第一顺位错源）。"""
+        impl 此前无条件封装页 merge_video 优先，队列/转换页语境第一顺位错源）。
+        ⚠️ 2026-09-23：删除旧的「转换页『注入到封装页』→ merge 主轨」分支——功能已下线，
+        留着就是转换页没主视频却显示封装页画面帧（本轮用户报的问题①）。"""
         f, s = None, None
         app = self.app
         try:
@@ -22446,16 +24714,6 @@ class AdvancedFrame(ttk.LabelFrame):
                     s = getattr(self, "tw_full_settings", None)
         except Exception:
             pass
-        if f is None and app is not None:
-            try:
-                if getattr(self, "tw_settings", {}).get("inject_to_packaging", False):
-                    mt = next((t for t in app.merge_tracks
-                               if t.enabled and t.type == "video"), None)
-                    if mt is not None and mt.file_path and os.path.exists(mt.file_path):
-                        f = mt.file_path
-                        s = mt.enc_settings
-            except Exception:
-                pass
         if f is None and app is not None:
             try:
                 if getattr(app, "input_file", None):
@@ -22482,11 +24740,14 @@ class AdvancedFrame(ttk.LabelFrame):
         parent.tw_settings 为陈旧/被清空对象，导致「绘制不生效，须关窗重开才生效」）。"""
         tw = tw_override if tw_override is not None else self.tw_settings
         canvas_w, canvas_h = self._tw_canvas_size()
-        # 背景帧语境随调用方（队列=task.input/task.settings、转换页注入=merge 主轨…）
+        # 背景帧语境随调用方（队列=task.input/task.settings）；转换页无 pad，不传 pad 几何。
+        # ⚠️ 2026-09-23：封装页已有独立文字水印、「注入到封装页」已下线 → 这里与本页
+        # 主视频一一对应，绝不再掺封装页主视频（scope='convert'）。
         _ctx_f, _ctx_s = self._tw_bg_context()
         _open_tw_position_editor_impl(self.app, tw, canvas_w, canvas_h,
                                       self.update_callback, self,
-                                      ctx_file=_ctx_f, ctx_settings=_ctx_s)
+                                      ctx_file=_ctx_f, ctx_settings=_ctx_s,
+                                      scope="convert")
 
 
     def _get_wm_templates_path(self):
@@ -22766,8 +25027,9 @@ def xfade_display_name(ttype):
 
 
 def xfade_display_choices():
-    """下拉用的显示名列表，顺序与 XFADE_TRANSITIONS 一一对应（回写按索引取 canonical）。"""
-    return [xfade_display_name(t) for t in XFADE_TRANSITIONS]
+    """下拉用的中文显示名列表，顺序与 XFADE_TRANSITIONS 一一对应（回写按索引取 canonical）。"""
+    return _canon_disp_list(XFADE_TRANSITIONS,
+                            {t: xfade_display_name(t) for t in XFADE_TRANSITIONS})
 
 
 def xfade_canonical_by_index(idx):
@@ -22812,9 +25074,10 @@ class Track:
         if enc_settings is None:
             if typ == "video":
                 # 初始化视频轨道的 enc_settings 和属性（兼容旧代码）
-                self.overlay_enabled = False
-                self.overlay_x = "W-w-10"
-                self.overlay_y = "H-h-10"
+                # 默认 True 与下面 enc_settings 的默认值保持一致（2026-09-24）
+                self.overlay_enabled = True
+                self.overlay_x = DEFAULT_OVERLAY_X
+                self.overlay_y = DEFAULT_OVERLAY_Y
                 self.pad_enabled = False
                 self.pad_width = ""
                 self.pad_height = ""
@@ -22836,9 +25099,14 @@ class Track:
                     "transition_type": "fade",
                     "transition_duration": "1.0",
                     # 新增的叠加/偏移/循环/绿幕字段（默认值）
-                    "overlay_enabled": False,
-                    "overlay_x": "W-w-10",
-                    "overlay_y": "H-h-10",
+                    # ⚠️ 2026-09-24 改 True：画中画的「子视频位」语义就是叠加，默认关闭会让
+                    # 从【不设叠加的入口】进来的轨道（如串联模式添加图片 L37152）切到画中画后
+                    # 成片里整条消失（正式命令 L26707 严格读此键 → 走 L26882 的 nullsink 分支）。
+                    # 主视频不需要它（主视频不进 sub_infos）；主视频的叠加由
+                    # _ensure_main_video(disable_scale=True) 显式关掉，不受此默认值影响。
+                    "overlay_enabled": True,
+                    "overlay_x": DEFAULT_OVERLAY_X,
+                    "overlay_y": DEFAULT_OVERLAY_Y,
                     "pad_enabled": False,
                     "pad_width": "",
                     "pad_height": "",
@@ -22892,9 +25160,10 @@ class Track:
 
             # 对于视频，从 enc_settings 恢复属性（兼容旧代码）
             if typ == "video":
-                self.overlay_enabled = self.enc_settings.get("overlay_enabled", False)
-                self.overlay_x = self.enc_settings.get("overlay_x", "W-w-10")
-                self.overlay_y = self.enc_settings.get("overlay_y", "H-h-10")
+                # 默认 True 与 Track 默认 enc_settings 保持一致（2026-09-24）
+                self.overlay_enabled = self.enc_settings.get("overlay_enabled", True)
+                self.overlay_x = self.enc_settings.get("overlay_x", DEFAULT_OVERLAY_X)
+                self.overlay_y = self.enc_settings.get("overlay_y", DEFAULT_OVERLAY_Y)
                 self.pad_enabled = self.enc_settings.get("pad_enabled", False)
                 self.pad_width = self.enc_settings.get("pad_width", "")
                 self.pad_height = self.enc_settings.get("pad_height", "")
@@ -22915,8 +25184,8 @@ def _apply_default_watermark_overlay(track):
     track.enc_settings["scale_height"] = ""
     track.enc_settings["scale_method"] = "width"
     track.enc_settings["overlay_enabled"] = True
-    track.enc_settings["overlay_x"] = "W-w-10"
-    track.enc_settings["overlay_y"] = "H-h-10"
+    track.enc_settings["overlay_x"] = DEFAULT_OVERLAY_X
+    track.enc_settings["overlay_y"] = DEFAULT_OVERLAY_Y
     track.overlay_enabled = True
 
 
@@ -23080,6 +25349,40 @@ class ScrolledFrame(ttk.Frame):
 # ================== 主界面类 ==================
 # 预览 movie 临时硬链接缓存：{源路径: 临时硬链接路径}，同源复用；程序退出统一清理
 _PREVIEW_LINKS = {}
+
+
+def _jsonable_node_fx(app):
+    """self.node_fx → 可安全 json.dump 的普通 dict（2026-09-26）。
+
+    逐个试 dumps，不可序列化的那一项**跳过**而不是让整个项目保存失败。
+    （「保存项目」挂掉比丢一个节点效果严重得多。）
+    """
+    _out = {}
+    for _k, _v in (getattr(app, "node_fx", None) or {}).items():
+        try:
+            json.dumps({"v": _v})
+        except Exception:
+            continue
+        try:
+            _out[str(_k)] = copy.deepcopy(_v)
+        except Exception:
+            continue
+    return _out
+
+
+def _jsonable_node_audio_fx(app):
+    """self.node_audio_fx → 可安全 json.dump 的普通 dict（与 _jsonable_node_fx 同口径）。"""
+    _out = {}
+    for _k, _v in (getattr(app, "node_audio_fx", None) or {}).items():
+        try:
+            json.dumps({"v": _v})
+        except Exception:
+            continue
+        try:
+            _out[str(_k)] = copy.deepcopy(_v)
+        except Exception:
+            continue
+    return _out
 
 
 class FFmpegBatchGUI:
@@ -23258,10 +25561,6 @@ class FFmpegBatchGUI:
         self.custom_output_name = tk.StringVar(value="")
         self.output_container = tk.StringVar(value="mp4")
 
-        # 界面语言（zh / en），持久化于 player_settings["language"]
-        self.language_var = tk.StringVar(value="zh")
-        self.language_display_var = tk.StringVar(value="中文")
-
         self.log_enabled_var = tk.BooleanVar(value=True)
         default_log_path = normalize_path(os.path.join(get_script_dir(), "editlog.txt"))
         self.log_path_var = tk.StringVar(value=default_log_path)
@@ -23361,6 +25660,47 @@ class FFmpegBatchGUI:
         self._merge_refresh_paused = tk.BooleanVar(value=False)  # 临时关闭命令刷新（设置滤镜期间免卡顿）
         
         self._clipboard_filter_params = None   # 存储复制的参数字典
+        # ---- 图节点效果（2026-09-25，「节点标签」功能的状态）----
+        # node_fx = {指纹: 设置dict}。⚠️ key 刻意用 node_fingerprint(段序号, 末滤镜名)
+        # 而不是标签名 —— 标签是随开关增减的 f-string（v_out_i / v_temp_i…），配置一变
+        # 名字就漂 ⇒ 存了也对不上；指纹失配时由 _apply_node_fx 日志提示并跳过。
+        # 详见 research/graph-node-tap/README.md。
+        self.node_fx = {}
+        # 音频节点效果（2026-09-26，与 node_fx 平行）：{指纹: 音频设置dict}。
+        # 作用于音频链（画中画 / 串行合并都走各自主图），详见下方「图节点」相关方法。
+        self.node_audio_fx = {}
+        # 最近一次 _build_overlay_filter_complex 产出的**原始图**（未叠加节点效果）——
+        # 节点列表与指纹都以它为基准；若这里存的是叠加后的图，段序号会自己漂。
+        self._last_graph = ""
+        self._last_graph_sig = ""              # 与 _last_graph 配套：媒体签名，用于节点分析快速复用判据
+        # -print_graphs 边属性缓存：{图串: {标签: 边属性}}。图不变就复用（探测要跑一次
+        # ffmpeg 空跑，不该每次开对话框都重跑）。见 _probe_node_graph_info。
+        self._pg_info_cache = {}
+        # ⚠️ PiP 路径下 _last_graph 实为「叠加视频节点效果之后」的图（视频效果在
+        #    _build_overlay_filter_complex 内部就已插入）——节点对话框照常读它（「插入效果」
+        #    段需要显示），但**实时预览重锚**不能拿它当 anchor：自己插入的效果段让
+        #    overlay/crop 等同名滤镜出现计数比预览图多 → node_key_alias「数量对等」校验
+        #    整层拒绝 → 预览看不到插入的局部效果（split 分叉链实测，2026-09-27）。
+        #    _last_graph_raw_v = 应用节点效果**前**的视频原始图，专供预览重锚
+        #    （node_fx_record_raw 门控，仅正式构图写入）。音频侧不需要对应快照：
+        #    _last_graph 两处写入（_build_pip_cmd / _build_concat_reencode_mode）都在
+        #    音频节点效果应用**之前**，音频锚点本来就干净。
+        self._last_graph_raw_v = ""
+        # ---- 节点分析专用「基准图」+ 构代号（2026-09-28 修：跨模式 / 跨代假命中）----
+        # 背景：节点列表必须用「应用节点效果前」的干净图当基准，否则段序号漂移
+        # （机理见 _ensure_node_graphs_current）。旧实现直接拿 _last_graph_raw_v 当基准，
+        # 但它有两个坑：① 只有画中画构图会写它 —— 串行模式里它永远是空串 ⇒ 串行
+        # 每次开节点窗都要整条命令重构图（慢）；② 正因为串行不写，上一代「画中画」
+        # 的基准图会残留到串行阶段，而"媒体签名"（各轨道文件路径）切模式时根本不变
+        # ⇒ 复用判据误以为"没变"，直接把画中画的图当成串行的图交给节点窗（实测：
+        # 载入串行工程可见音频节点 → 切画中画 → 切回串行，音频节点全消失且不重新构图）。
+        # 修法：基准图独立成 _last_graph_base（串行构图也写），并给两张图各打一个
+        # 「构代号」—— 号不同 = 不是同一次构图产出的，绝不复用。
+        self._last_graph_base = ""
+        self._graph_gen = 0            # 每进入一次 merge_build_cmd_list +1
+        self._last_graph_gen = -1      # _last_graph 诞生于哪一代
+        self._last_graph_base_gen = -1 # _last_graph_base 诞生于哪一代
+        self._graph_dirty = False      # 「临时关闭刷新」期间有设置变动 ⇒ 图可能已过期
         self._clipboard_va_filter = None       # V→A 专用：视频截取/变速/倒放快照（映射到音频键名）
 
         self._global_temp_files = []
@@ -23382,8 +25722,17 @@ class FFmpegBatchGUI:
         self.preview_max_h = tk.IntVar(value=_GLOBAL_SETTINGS["preview_max_h"])
         self.ffprobe_timeout = tk.IntVar(value=_GLOBAL_SETTINGS["ffprobe_timeout"])
         self.preview_margin = tk.IntVar(value=80)
+        # 2026-09-21：预览音量（单一参数，默认 10）—— 同时管 A/V 设置弹窗里的「音量」、内置时间
+        # 预览的音频引擎、以及各预览播放器（ffplay -volume：实时预览复杂图回退 / 轨道预览 /
+        # 转换页预览）。走 _GLOBAL_SETTINGS 通道：SimplePreviewer 在另一个类里读它。
+        self.preview_volume = tk.IntVar(value=_GLOBAL_SETTINGS["preview_volume"])
         # 2026-08-30：上限 / 预览选项（更多设置）
-        self.sub_video_preview_max = tk.IntVar(value=15)   # 画中画实时预览子视频上限 1~30
+        # 预览轨数上限 1~30：约束「画中画实时预览」「串行合并预览（滤镜版 lavfi）」两条外部播放器
+        # 路径，以及内置「时间预览引擎」（_live_preview_pipe，2026-09-20 Phase 2 复用同一函数体走
+        # pipe_engine=True）—— 三者共用 self.sub_video_preview_max，行为已统一。
+        # 入口现已合并为「实时预览（复杂滤镜）」，分发后还是2部分
+        # （一处设置管两处，2026-09-19）；轨数越多 mpv 首次加载越慢，故统一设限。
+        self.sub_video_preview_max = tk.IntVar(value=15)
         self.waypoint_max_rows = tk.IntVar(value=15)        # 列表轨迹行上限 1~99
         self.crop_pos_max_rows = tk.IntVar(value=8)         # 裁剪平移行上限 1~99
         # 2026-09-02：画布模式（位置、尺寸、旋转）关键帧列表
@@ -23427,6 +25776,7 @@ class FFmpegBatchGUI:
         # _sync_global_settings 的重入守卫（见该函数 docstring：13 个变量互写会自激）
         self._syncing_global = False
         for _mv in (self.preview_max_w, self.preview_max_h, self.ffprobe_timeout,
+                    self.preview_volume,
                     self.sub_video_preview_max, self.waypoint_max_rows,
                     self.crop_pos_max_rows, self.canvas_max_rows,
                     # 2026-09-18 第二批：走 _GLOBAL_SETTINGS 通道的 6 项
@@ -23520,8 +25870,8 @@ class FFmpegBatchGUI:
             "chroma_similarity": 0.2,
             "chroma_blend": 0.1,
             "overlay_enabled": True,
-            "overlay_x": "W-w-10",
-            "overlay_y": "H-h-10",
+            "overlay_x": DEFAULT_OVERLAY_X,
+            "overlay_y": DEFAULT_OVERLAY_Y,
             "pad_enabled": False,
             "pad_width": "",
             "pad_height": "",
@@ -23556,7 +25906,9 @@ class FFmpegBatchGUI:
             "move_margin": "W*0.03",
             "border_w": 0,
             "border_color": "#000000",
-            "inject_to_packaging": False,
+            # 富文本换行（2026-09-25）：关=拼成一行（历史行为）；开=保留换行（竖排/@字体式）。
+            # 与「启用倒计时」互斥。
+            "multiline": False,
         }
 
         # 转码页末端处理设置（与封装页 _merge_end_handling 结构一致、互相独立）：
@@ -23598,6 +25950,10 @@ class FFmpegBatchGUI:
         self.preset_manager = PresetManager(self.preset_file_path)
         self.settings_file_path = self.preset_manager.settings_path
 
+        # 界面语言状态变量（i18n）：language_var 存语言代码 zh/en，language_display_var 供语言下拉框显示
+        self.language_var = tk.StringVar(value="en")
+        self.language_display_var = tk.StringVar(value="English")
+
         self._loading_settings = True
         self.load_player_settings()
         self._loading_settings = False
@@ -23631,10 +25987,10 @@ class FFmpegBatchGUI:
                 self.input_file.set(normalize_path(file_path))
                 if not self.output_dir.get():
                     self.output_dir.set(os.path.dirname(file_path))
-                self._append_info_ui(_("已从命令行加载文件: {0}").format(os.path.basename(file_path)))
+                self._append_info_ui(f"已从命令行加载文件: {os.path.basename(file_path)}")
                 self.update_command_preview()
             else:
-                self._append_info_ui(_("命令行参数文件不存在: {0}").format(file_path))
+                self._append_info_ui(f"命令行参数文件不存在: {file_path}")
 
         self.update_task_list()
         self.update_command_preview()
@@ -23815,7 +26171,7 @@ class FFmpegBatchGUI:
                 self._last_logged_percent = -1
             if percent == 0 or percent == 100 or (percent - self._last_logged_percent >= 5):
                 self._last_logged_percent = percent
-                progress_str = f"{percent}% ({int(current)}/{int(total)} 秒)"
+                progress_str = _('{0}% ({1}/{2} 秒)').format(percent, int(current), int(total))
                 elapsed_str = ""
                 if task and task.start_time:
                     elapsed = time.time() - task.start_time
@@ -23918,7 +26274,7 @@ class FFmpegBatchGUI:
         # 标记任务为已停止
         # ⚠️ 循环变量禁用 `_`：本函数内 `_()` 是翻译函数，用 `_` 当循环变量会让
         #    Python 把 `_` 判成局部变量 → 上面的 _("确认停止") 直接 UnboundLocalError。
-        for _task_i, task in self._running_tasks:
+        for _unused, task in self._running_tasks:
             task.stopped_by_user = True
     
         # 发送 'q' 给每个进程（ffmpeg 收到 q 会走完整收尾：写 moov atom / 编码器统计）
@@ -24269,8 +26625,14 @@ class FFmpegBatchGUI:
             pass
         return None
 
-    def _get_media_duration(self, file_path):
-        """获取媒体文件时长（秒），带缓存，失败返回 None"""
+    def _get_media_duration(self, file_path, frame_align_fps=None):
+        """获取媒体文件时长（秒），带缓存，失败返回 None
+
+        frame_align_fps：给定时把时长向下对齐到该帧率的整帧格（floor 到 1/fps）。
+        画中画供帧窗口用——format duration 是容器时长（常被音频流撑长 8~19ms），
+        不对齐会让窗口比视频真实帧覆盖多 1 帧 → 交界处 loop 回放闪第一帧 /
+        eof_action=pass 透出 tpad 黑底。floor 而非 round：宁可窗口短半帧，不可多一帧。
+        """
         if not file_path or not os.path.exists(file_path):
             return None
         # 获取文件修改时间作为缓存键的一部分
@@ -24278,10 +26640,10 @@ class FFmpegBatchGUI:
             mtime = os.path.getmtime(file_path)
         except OSError:
             mtime = None
-        cache_key = (file_path, mtime)
+        cache_key = (file_path, mtime, frame_align_fps)
         if cache_key in self._duration_cache:
             return self._duration_cache[cache_key]
-        
+
         # 原有 ffprobe 调用
         if not self.ffprobe_cmd:
             return None
@@ -24293,6 +26655,14 @@ class FFmpegBatchGUI:
                                     creationflags=_ffmpeg_spawn_flags())
             if result.returncode == 0 and result.stdout.strip():
                 duration = float(result.stdout.strip())
+                if frame_align_fps and frame_align_fps > 0 and duration > 0:
+                    duration = int(duration * frame_align_fps + 1e-4) / frame_align_fps
+                    # ⚠️ +1e-4 浮点容差（2026-09-26）：841 帧 @30fps 素材 ffprobe 给
+                    # 28.033333（6 位小数），×30 = 840.99999 → 裸 int() 砍成 840 帧 = 28.0 整，
+                    # 「转场对齐/一键设置开始」跟着填出 27/28 整值（用户观感「省略小数点」，
+                    # 实为最后一帧被丢）。ffprobe 截断误差 ≤5e-7s → ×fps（≤120）= 6e-5，
+                    # 容差取 1e-4（0.1ms，帧格 33ms 的 1/300）恰好放行；真实半帧位置
+                    # （x.5）与「宁短勿长」防交界闪帧的初衷不变。
                 self._duration_cache[cache_key] = duration
                 return duration
         except:
@@ -24343,7 +26713,7 @@ class FFmpegBatchGUI:
                 ch = safe_eval_expr(crop_h, {"iw": orig_w, "ih": orig_h})
                 if cw and ch and cw > 0 and ch > 0:
                     w, h = cw, ch
-                    steps.append(f"裁剪 {w}x{h}")
+                    steps.append(_('裁剪 {0}x{1}').format(w, h))
                 else:
                     # 表达式无效，保留原尺寸（但注明裁剪无效）
                     steps.append(_("裁剪(无效)"))
@@ -24352,7 +26722,7 @@ class FFmpegBatchGUI:
         rotate = track.enc_settings.get("rotate", "none")
         if rotate in ("90", "270"):
             w, h = h, w
-            steps.append(f"旋转 {w}x{h}")
+            steps.append(_('旋转 {0}x{1}').format(w, h))
     
         # ----- 缩放 -----
         if track.enc_settings.get("scale_enabled", False):
@@ -24370,7 +26740,7 @@ class FFmpegBatchGUI:
                     w, h = target_w, target_h
                 elif method == "exact" and sw and sh:
                     w, h = int(float(sw)), int(float(sh))
-                steps.append(f"缩放 {w}x{h}")
+                steps.append(_('缩放 {0}x{1}').format(w, h))
             except (ValueError, ZeroDivisionError):
                 steps.append(_("缩放(无效)"))
     
@@ -25122,7 +27492,8 @@ class FFmpegBatchGUI:
         _ensure_tw_duration_limit(
             self, cmd, input_path=input_path,
             main_duration=self._calc_segments_total_duration(settings),
-            audio_enabled=True)
+            audio_enabled=True,
+            image_display_duration=_eff_image_display_duration(settings))
 
         cmd.append(output_path)
         return cmd
@@ -25210,16 +27581,596 @@ class FFmpegBatchGUI:
         parts.append(f"[{ol}][{bl}]overlay={ov_x}:{ov_y}{ov_suffix}[{out_label}]")
         return parts
 
+    def _pip_overlay_xy(self, sub_file, sub_settings, wp_res, wp_rot, spin_on, ra, wp_zoom):
+        """子视频叠加进「输出画布」的 x/y 表达式（两处共用，改一处必查另一处）：
+        ① 阶段 B 非链成员直接叠加到主视频；② 链成员在图层内「烙进透明画布」时的定位。
+
+        语义：返回坐标相对输出画布（主视频渲染尺寸或 pad 画布）左上角。
+        overlay_x/y 的 w/h 指**内容盒**（未旋转渲染尺寸）；旋转（spin/静态角度/航点自转）
+        时叠加盒是 d×d 包装盒 → 减中心对齐偏移 (d-w)/2；航点缩放时偏移随 z(t) 同乘。
+        返回 (x, y) 表达式字符串。
+        """
+        x = sub_settings.get('overlay_x', '0').strip() or '0'
+        y = sub_settings.get('overlay_y', '0').strip() or '0'
+        _content_w, _content_h = self._overlay_content_size(sub_file, sub_settings)
+        try:
+            _spv = float(sub_settings.get("spin_speed", 60.0) or 60.0)
+        except (ValueError, TypeError):
+            _spv = 60.0
+        _rot_ov = (spin_on and _spv != 0) or (ra != 0) or wp_rot
+        _mv = (sub_settings.get('move_mode', '') or '').strip()
+        if _mv == "waypoints":
+            # 列表轨迹：x/y 为画布绝对像素（数字），直接使用；无效时回退基准位置
+            if wp_res is not None and wp_res[0] is not None:
+                x, y = wp_res[0], wp_res[1]
+            else:
+                x = _content_box_expr(x, _content_w, _content_h)
+                y = _content_box_expr(y, _content_w, _content_h)
+        elif _mv:
+            # 轨迹范围/基准都按内容盒（sw/sh=内容盒数字，x0/y0 的 w/h 内容盒化）
+            _mx, _my = build_move_xy_expr(
+                _mv, _content_box_expr(x, _content_w, _content_h),
+                _content_box_expr(y, _content_w, _content_h),
+                sub_settings, sw=str(_content_w), sh=str(_content_h))
+            if _mx is not None:
+                x, y = _mx, _my
+            else:
+                x = _content_box_expr(x, _content_w, _content_h)
+                y = _content_box_expr(y, _content_w, _content_h)
+        elif _rot_ov:
+            # 静态位置：数字求值（内容盒语义），旋转时下面统一减中心偏移
+            x = _content_box_expr(x, _content_w, _content_h)
+            y = _content_box_expr(y, _content_w, _content_h)
+        if _rot_ov:
+            # 旋转中心对齐：叠加盒(d×d)中心=内容盒中心 → 减 (d-w)/2
+            _sw_b, _sh_b = self._overlay_sub_size(sub_file, sub_settings)
+            _offx, _offy = _content_box_shift(_content_w, _content_h, _sw_b, _sh_b)
+            if wp_zoom:
+                # 轨迹缩放把叠加盒整体放大 z(t) 倍 → 中心对齐偏移同乘 z(t)，
+                # 否则「旋转 + 缩放」时内容会随放大逐渐偏离航点坐标。
+                x = f"({x}) - ({wp_res[3]})*{_offx:.6g}"
+                y = f"({y}) - ({wp_res[3]})*{_offy:.6g}"
+            else:
+                x = f"({x}) - {_offx:.6g}"
+                y = f"({y}) - {_offy:.6g}"
+        return x, y
+
+    def _pip_transition_chains(self, sub_infos, main_settings=None, main_file_path=None,
+                               main_duration=None):
+        """画中画：规划「转场链」（串行转场字段的画中画版消费端）。
+
+        画中画的子视频本来就是各占一条 overlay 层、摆在时间轴任意位置；当**相邻两段
+        首尾相接**且前一段开了转场（transition_enabled/type/duration —— 与串行合并共用
+        同一组字段，串行那套 UI 直接复用），就把它们合成一条「转场链」：
+        段内各自不位移 → xfade 链 → 整体 setpts 位移回时间轴。
+
+        与串行一致的语义：xfade 吞掉 d 秒 → 后段在链内提前 d 秒出现（非 bug）。
+
+        **主视频也可作为链首**（main_settings 开了转场 且 某子视频的显示时段起点 ≈
+        主视频有效时长）：此时 members[0] == -1，链输出直接当「底之上的第一层」。
+
+        画布统一方案（2026-09-25）：**所有链**的尺寸一律=输出画布（_compute_output_canvas）、
+        帧率一律=主视频帧率（探不到时回退链首段）；每个成员图层先把内容（含位置/轨迹/旋转）
+        烙进统一透明画布（color=black@0，见 _build_sub_layer_node 的 canvas 参数），
+        norm 只做 限长/帧率/SAR/format=yuva420p 归一（**不再 scale 拉伸**）——
+        链内天然同尺寸，位置随段保留，透明处透出主视频。blend 模式仍不进链
+        （需要与主视频像素混合，链是独立流做不到）。
+
+        返回 (chains, chain_of, shift_of)：
+          chains   [{members, start, lens, norm, trans, size, fps}]（按时间序，≥2 段）
+          chain_of {i: chain_index}（不含 -1）
+          shift_of {normalize_path(子视频文件): 音频相对摆放起点的偏移}
+                   = −Σ(该段之前所有转场时长)（≤0）。xfade 让视频提前，音频必须同步提前，
+                   否则声画错开（用户实测：转场后声音滞后一个转场时长）。
+        任一环节探不到参数 → 整链不成立（降级为各自独立叠加，与旧行为逐字节一致）。
+        """
+        chains, chain_of, shift_of = [], {}, {}
+        try:
+            cand = []
+            for i, (_si, _sf, _ss) in enumerate(sub_infos):
+                if not _ss.get('overlay_enabled', True):
+                    continue
+                if (_ss.get('blend_mode', 'normal') or 'normal').strip().lower() != 'normal':
+                    continue          # blend 要和主视频像素混合，链是独立流做不到 → 不进链
+                # 旋转 / 子画布 / 航点（含航点缩放）：全部在图层内完成、烙进统一透明画布
+                # （2026-09-25 画布统一方案），不再需要排除——位置/轨迹/旋转随段保留。
+                # 帧对齐（floor 到源帧格）：链 lens/cbase d/offset 全链帧格化
+                _dur = self._get_media_duration(
+                    _sf, frame_align_fps=self._get_video_framerate(_sf))
+                _ws, _we, _bd = self._resolve_display_window(_ss, _dur, input_path=_sf)
+                if not _bd or _we is None or _we <= _ws:
+                    continue          # 无界窗口（无限循环）→ 链长算不出来
+                cand.append((i, _sf, _ss, float(_ws), float(_we)))
+            cand.sort(key=lambda _x: _x[3])
+            # ---- 主视频作为链首（可选）：插到「起点 ≈ 主视频时长」的那一段之前 ----
+            # ⚠️ 必须插在 sort 之后：主视频头的窗口是 [0, main_len]，按 ws 排序会被顶到最前，
+            # 但它在时间轴上接的是 ws≈main_len 的那一段。
+            if (main_settings is not None and main_file_path and main_duration
+                    and main_duration > 0
+                    and bool(main_settings.get('transition_enabled', False))
+                    and not self._is_static_image(main_file_path)):
+                _mf0 = self._get_video_framerate(main_file_path)
+                _mw0, _mh0 = self._compute_output_canvas(main_settings, main_file_path)
+                if _mf0 and _mw0 and _mh0:
+                    _tol0 = 0.5 / _mf0
+                    # 主视频自己挂了转场 → 子视频按「对齐后」的起点摆（= 主时长 - 转场时长），
+                    # 也算接在末尾（与下方相邻判定同一条放宽规则，见注释）。
+                    try:
+                        _md0 = max(0.0, float(str(main_settings.get(
+                            'transition_duration', '1.0') or '1.0').strip()))
+                    except (ValueError, TypeError):
+                        _md0 = 0.0
+                    _pos = None
+                    for _k, _it in enumerate(cand):
+                        if abs(_it[3] - float(main_duration)) <= _tol0 or \
+                                abs(_it[3] - (float(main_duration) - _md0)) <= _tol0:
+                            _pos = _k
+                            break
+                    if _pos is not None:
+                        cand.insert(_pos, (-1, main_file_path, main_settings,
+                                           0.0, float(main_duration)))
+            if len(cand) < 2:
+                return chains, chain_of, shift_of
+            # 相邻相接 + 前段开了转场 → 同一链（主视频头恒为新链起点，不与前面的段合并）
+            groups, cur = [], []
+            for _it in cand:
+                if _it[0] < 0:
+                    if cur:
+                        groups.append(cur)
+                    cur = [_it]
+                    continue
+                if not cur:
+                    cur = [_it]
+                    continue
+                _p = cur[-1]
+                _tol = 0.5 / (self._get_video_framerate(_p[1]) or 25.0)
+                # 衔接判定两种都算：
+                #   ① 首尾相接（前段结束 ≈ 后段起始）—— 原口径；
+                #   ② 转场对齐（后段提前「转场时长」让位，gap ≈ -d）—— 「转场对齐」把界面上的
+                #      起点改成画面真正切换的时刻后必然是这种。不放宽的话，一键转场把起点
+                #      一改就把链拆了，xfade 静默不生效（看起来像功能没了）。
+                _p_on = bool(_p[2].get('transition_enabled', False))
+                _dp = 0.0
+                if _p_on:
+                    try:
+                        _dp = max(0.0, float(str(_p[2].get(
+                            'transition_duration', '1.0') or '1.0').strip()))
+                    except (ValueError, TypeError):
+                        _dp = 0.0
+                _gap = _it[3] - _p[4]      # 负数 = 后段提前
+                if _p_on and (abs(_gap) <= _tol or abs(_gap + _dp) <= _tol):
+                    cur.append(_it)
+                else:
+                    groups.append(cur)
+                    cur = [_it]
+            if cur:
+                groups.append(cur)
+            for _g in groups:
+                if len(_g) < 2:
+                    continue
+                # 画布统一方案（2026-09-25）：链尺寸一律=输出画布、帧率一律=主视频帧率。
+                # 每段先把内容（含位置/轨迹/旋转）烙进一张透明画布（黑@0）再 xfade，
+                # 链内天然同尺寸，不再有「链首是谁就用谁的尺寸」的分支。
+                # 回退链：主视频上下文缺失（畸形调用）时退到主视频缓存尺寸，
+                # 再退到链首段叠加盒——保证链内至少统一（静默丢链比摆错更糟）。
+                _hw = _hh = _hf = None
+                if main_settings is not None and main_file_path:
+                    try:
+                        _hw, _hh = self._compute_output_canvas(main_settings, main_file_path)
+                    except Exception:
+                        _hw = _hh = None
+                if not _hw or not _hh:
+                    try:
+                        _hw, _hh = self._get_video_dimensions_cached(main_file_path)
+                    except Exception:
+                        _hw = _hh = None
+                if not _hw or not _hh:
+                    _hw, _hh = self._overlay_sub_size(_g[0][1], _g[0][2])
+                if main_file_path:
+                    _hf = self._get_video_framerate(main_file_path)
+                if not _hf:
+                    _hf = self._get_video_framerate(_g[0][1])
+                if not _hw or not _hh or not _hf:
+                    continue
+                _hw, _hh = int(_hw), int(_hh)
+                _lens, _norm, _ok = {}, {}, True
+                for _it in _g:
+                    _len = float(_it[4]) - float(_it[3])
+                    if _len <= 0:
+                        _ok = False
+                        break
+                    _lens[_it[0]] = _len
+                    # xfade 硬门槛（实测直接报错）：尺寸/时基/像素格式不同都不行。
+                    # 画布统一方案：尺寸由「图层烙进透明画布」保证（不再 scale 拉伸），
+                    # 这里只做 限长/帧率/SAR/像素格式 归一（yuva420p 带 alpha，全链一致）。
+                    # 主视频头额外加 setpts=PTS-STARTPTS：主的编码链起点不一定归零（trim 等）
+                    _pre0 = "setpts=PTS-STARTPTS," if _it[0] < 0 else ""
+                    _norm[_it[0]] = (f"{_pre0}trim=0:{_len:.6g},fps={_hf:.6g},"
+                                     f"setsar=1,format=yuva420p")
+                if not _ok:
+                    continue
+                _trans = []
+                for _k in range(len(_g) - 1):
+                    try:
+                        _d = float(str(_g[_k][2].get('transition_duration', '1.0') or '1.0').strip())
+                    except (ValueError, TypeError):
+                        _d = 1.0
+                    # 必须 < min(两段)/2，否则 xfade 退化（T5 实测静默失效）
+                    _lim = min(_lens[_g[_k][0]], _lens[_g[_k + 1][0]]) * 0.5 - 0.01
+                    if _lim <= 0.02:
+                        _ok = False
+                        break
+                    _d = max(0.01, min(_d, _lim))
+                    _tt = str(_g[_k][2].get('transition_type', 'fade') or 'fade').strip()
+                    if _tt not in XFADE_TRANSITIONS:
+                        _tt = "fade"
+                    _trans.append((_tt, _d))
+                if not _ok:
+                    continue
+                _ci = len(chains)
+                chains.append({"members": [_it[0] for _it in _g],
+                               "start": float(_g[0][3]),
+                               "lens": _lens, "norm": _norm, "trans": _trans,
+                               "size": (_hw, _hh), "fps": _hf})
+                for _it in _g:
+                    if _it[0] >= 0:
+                        chain_of[_it[0]] = _ci
+                # 音频偏移：xfade 吞掉 d 秒 → 链内第 k 段的音频要提前 Σ(前面的转场时长)，
+                # 否则画面已经切过去了、声音还在原位置响（用户实测的「延迟」）。
+                _acc = 0.0
+                for _k, _it in enumerate(_g):
+                    if _it[0] >= 0:
+                        shift_of[normalize_path(_it[1])] = -_acc
+                    if _k < len(_g) - 1:
+                        _acc += _trans[_k][1]
+        except Exception:
+            return [], {}, {}
+        return chains, chain_of, shift_of
+
+    def _build_sub_layer_node(self, i, sub_idx, sub_file, sub_settings,
+                              main_settings, win_override=None, extra_tail=None,
+                              canvas=None, include_fade: bool = True):
+        """构建**单个子视频的图层**（滤镜链 + 最终标签），不含叠加。
+
+        从 _build_overlay_filter_complex 的子循环里整段抽出（逻辑逐行照搬），
+        以便主循环拆成「阶段A 建层 → 阶段A2 转场链合成 → 阶段B 叠加」三步：
+        转场链需要**先把所有成员的图层都建好**再做 xfade 链，单趟循环做不到。
+
+        win_override=(ws, we)：None=按 sub_settings 原样（含位移到 show_start）；
+          给了则改用该窗口——转场链成员传 (0, 段长)，即「不位移 + 精确限长」。
+        extra_tail：追加到图层末尾的滤镜串（转场链用它塞 trim/fps/setsar/format 归一）。
+        canvas=(W,H,fps,len)：画布统一方案（2026-09-25）——转场链成员把内容
+          （含位置/轨迹/旋转，定位走 _pip_overlay_xy）烙进一张统一透明画布
+          （color=black@0），链内天然同尺寸，透明处透出主视频；None=不合成。
+
+        返回 (filter_parts, current_sub, meta)。
+        """
+        filter_parts = []
+        # 判断是否使用 loop 滤镜：截取(trim)循环模式，或「启用循环控制」的有限模式(count)
+        # 即使未勾选截取也按整段子视频时长计算 loop_size —— 用户实测旧版只需勾选
+        # 「启用循环控制」即可有限循环（2026-09-02 修正：不再强制要求勾选「截取」）。
+        _loop_finite = bool(sub_settings.get("loop_enabled", False)) and \
+            str(sub_settings.get("loop_mode", "infinite") or "infinite") == "count"
+        use_loop = bool(sub_settings.get("trim_enabled", False)) or _loop_finite
+        if use_loop:
+            if sub_settings.get("loop_enabled", False) and sub_settings.get("loop_mode") == "once":
+                use_loop = False
+
+        # 获取子视频的增强设置
+        sub_enhance = sub_settings.get("enhance", {})
+
+        # 计算循环帧数：use_loop（trim 循环模式）→ 片段帧数，由 chain 内 trim+loop 处理；
+        # once/未启用 → loop_size=None（chain 内单次 trim 或无；正式命令靠 -stream_loop -1 输入级循环整段）
+        loop_size = None
+        if use_loop:
+            # 获取帧率
+            fps = self._get_video_framerate(sub_file)
+            if fps is None:
+                use_loop = False
+            else:
+                start_str = sub_settings.get("trim_start", "0").strip()
+                end_str = sub_settings.get("trim_end", "").strip()
+                start_sec = time_to_seconds(start_str) if start_str else 0.0
+                end_sec = time_to_seconds(end_str) if end_str else None
+                if end_sec is not None and end_sec > start_sec:
+                    duration = end_sec - start_sec
+                else:
+                    # 帧对齐时长（floor 到源帧格）：loop_size = 内容真实帧数，
+                    # 不被容器时长（音频撑长）多算 1 帧 → 回放缓冲不闪首帧
+                    raw_duration = self._get_media_duration(sub_file, frame_align_fps=fps)
+                    if raw_duration is not None:
+                        duration = raw_duration - start_sec
+                    else:
+                        use_loop = False
+                if use_loop:
+                    loop_size = int(round(duration * fps))
+                    if loop_size <= 0:
+                        use_loop = False
+                        loop_size = None
+
+        # ---- 子视频「显示时段」优化（2026-09-02，抄统一尝试版）：把 show_start/show_end
+        # 升级为子链时间边界，窗口外重滤镜不跑（省 CPU）。仅当窗口合法时生效；标记
+        # _has_window 供下方 overlay/blend 追加 eof_action=pass（子链在窗口结束正常 EOF，
+        # 避免默认 repeat 冻帧/截断）。
+        # ⚠️ _sub_dur 必须先于本段绑定（没开「截取」时 use_loop 分支不执行，会导致
+        # _resolve_display_window 引用未绑定变量而抛 UnboundLocalError）。
+        # 帧对齐（floor 到源帧格）：显示窗口 = 内容真实帧覆盖 → 窗口末格恰好由内容
+        # 最后一帧填满，杜绝「窗口多 1 帧 → loop 回放闪首帧 / EOF 后 pass 透黑底」。
+        _sub_dur = self._get_media_duration(
+            sub_file, frame_align_fps=self._get_video_framerate(sub_file))
+        _win_start, _win_end, _has_window = self._resolve_display_window(
+            sub_settings, _sub_dur, input_path=sub_file)
+        if win_override:
+            # 转场链成员：图层**不位移**（PTS 从 0 起），长度取链内窗口长度。
+            # xfade 的两个输入必须同起点，整体位移留给链合成后的 setpts。
+            _win_start, _win_end = float(win_override[0]), float(win_override[1])
+        # 有限循环次数：仅覆盖窗口时长（节 CPU）。
+        # loop 参数 = **重复次数**（总供给 = N+1 遍）→ N = ceil(窗口帧/片段帧) - 1：
+        # 窗口=一遍时 N=0（不加 loop），多遍时恰好供满，绝不多回放一整遍
+        # （旧公式 ceil 多供一遍 → 回放帧 pts 回退泄漏到 enable 闭区间边界 → 闪首帧）。
+        _win_loop = 0
+        if _has_window and loop_size and _win_end is not None:
+            _wfps = self._get_video_framerate(sub_file)
+            if _wfps:
+                _win_frames = max(1, int(round((_win_end - _win_start) * _wfps)))
+                _win_loop = -(-_win_frames // int(loop_size)) - 1
+                if _win_loop < 0:
+                    _win_loop = 0
+
+        # ---- 列表轨迹（waypoints）提前解析（2026-09-02 回归修复）----
+        # ⚠️ 必须早于下方 need_alpha 判定：航点带显式旋转（ra/rb）或自旋转段时，
+        # 子视频要走 rotate=...:c=black@0，而 rotate 在「无 alpha 的输入」上不会产生透明，
+        # 边角是「不透明黑」→ 叠加到主视频留黑方块。need_alpha 必须先知道 _wp_rot
+        # 才能补 format=rgba。原代码把这段放在 rotate 分支前（晚于 need_alpha），
+        # need_alpha 因此看不见航点旋转 → 隐藏回归。
+        # 解析结果 _wp_res / _wp_rot 由下方旋转分支与叠加分支直接复用，绝不重复调用。
+        _wp_res = None
+        _mv_all = (sub_settings.get('move_mode', '') or '').strip()
+        if _mv_all == "waypoints":
+            try:
+                _wp_spv = float(sub_settings.get("spin_speed", 60.0) or 60.0)
+            except (ValueError, TypeError):
+                _wp_spv = 60.0
+            _cw0, _ch0 = self._overlay_content_size(sub_file, sub_settings)
+            _ts0, _sp0 = _trim_speed_from_settings(main_settings)
+            _wp_res = build_waypoint_expr(sub_settings.get("move_waypoints"),
+                                          sw=str(_cw0), sh=str(_ch0), spin_speed=_wp_spv,
+                                          trim_start=_ts0, speed_factor=_sp0)
+        # 本版 build_waypoint_expr 返回 (x_expr, y_expr, angle_expr)：angle_expr 已把
+        # 「航点显式旋转(ra/rb)」与「自旋转段(mode=spin)」合并在一起 → 非 None 即需要 alpha。
+        _wp_rot = (_wp_res is not None and _wp_res[2] is not None)
+
+        # 是否需要 alpha 通道：透明度 / 持续旋转 / 遮罩 / 源视频自带 alpha / 列表轨迹旋转。
+        # 仅这些场景才需要 format=rgba；普通不透明叠加保持 YUV，避免多余色域往返（4:4:4）与带宽浪费。
+        # （绿幕 chromakey 已由 chain 输出 rgba，无需在此判定）
+        need_alpha = (
+            sub_settings.get("alpha_enabled", False) or
+            sub_settings.get("mask_enabled", False)
+        )
+        if sub_settings.get("spin_enabled", False):
+            try:
+                _sp_val = float(sub_settings.get("spin_speed", 60.0))
+            except (ValueError, TypeError):
+                _sp_val = 60.0
+            if _sp_val != 0:
+                need_alpha = True
+        try:
+            _ra_val = float(sub_settings.get("rotate_angle", 0) or 0)
+        except (ValueError, TypeError):
+            _ra_val = 0.0
+        if _ra_val != 0:
+            need_alpha = True
+        # ⚠️ 列表轨迹旋转 → 需要 alpha（2026-09-02 回归修复）：
+        # 不透明源 + 航点旋转时，子链不补 format=rgba → rotate=c=black@0 在无 alpha 输入上
+        # 不产生透明（实测 alpha 全 255）→ 叠加到主视频留「不透明黑方块」。
+        # 适配水印(_wp_rot2) / 画中画预览(_wp_rotP) 两处 need_alpha 早已含航点旋转 → 无此 bug，
+        # 仅子视频正式命令漏（_wp_rot 原本算得太晚，need_alpha 看不见）。
+        if _wp_rot:
+            need_alpha = True
+        # 列表轨迹透明度（oa→ob）：轨道 alpha_expr 非 None → 需 rgba 通道承载
+        if _wp_res is not None and _wp_res[4] is not None:
+            need_alpha = True
+        # 源视频本身带 alpha（透明 mov/webm/APNG/pal8 等）
+        _src_pf = self._get_video_pix_fmt(sub_file)
+        if _src_pf and self._pix_fmt_has_alpha(_src_pf):
+            need_alpha = True
+
+        # 构建子视频滤镜串：统一走 chain（trim/loop/裁剪/旋转/缩放/绿幕/色彩校正/反色 全在 chain 内，
+        # 顺序：trim→loop→裁剪→旋转→缩放→绿幕→色彩→反色；绿幕在缩放后=小图抠，色彩段在绿幕后不影响抠像）。
+        # 仅当 need_alpha 时补 format=rgba。
+        # 画布模式（2026-08-31 两段式）：画布段已接管裁剪/旋转/缩放 → 前置链三者全关，
+        # 缩放挪到画布之后做（同一个内容只允许缩一次，否则会被缩两次）。
+        _sub_cv_on = self._sub_canvas_on(sub_settings)
+        _vf_settings = {**sub_settings, "hw_filter_mode": "cpu", "precise_trim": True}
+        if _sub_cv_on:
+            _vf_settings["crop_enabled"] = False
+            _vf_settings["rotate"] = "none"
+            _vf_settings["scale_enabled"] = False
+        base_vf = build_video_filter_chain(
+            _vf_settings,
+            include_subtitle=False,
+            include_speed=True,                # 子视频变速生效（音频变速已由 _build_audio_filters 处理）
+            include_trim=True,                 # trim 由 chain 内处理（precise_trim + trim_enabled）
+            include_format=False,
+            reverse=sub_settings.get('reverse_enabled', False),
+            enhance_settings=sub_enhance,
+            graph_id=f"s{sub_idx}",
+            include_fade=include_fade,
+            chroma_settings=sub_settings if sub_settings.get("chroma_enabled", False) else None,
+            loop_size=loop_size,
+            window_start=_win_start, window_end=_win_end, window_loop_count=_win_loop,
+        )
+        if base_vf == "null":
+            base_vf = ""
+        if base_vf:
+            # 时间基准统一：子视频 PTS 归零（与主视频/画布对齐，避免多输入 overlay 同步基准不一致黑屏）
+            sub_vf = f"setpts=PTS-STARTPTS,{base_vf},format=rgba" if need_alpha else f"setpts=PTS-STARTPTS,{base_vf}"
+        else:
+            sub_vf = "setpts=PTS-STARTPTS,format=rgba" if need_alpha else "setpts=PTS-STARTPTS"
+        filter_parts.append(f"[{sub_idx}:v]{sub_vf}[v_temp_{i}]")
+        current_sub = f"v_temp_{i}"
+
+        # ---- 子视频画布模式 第 1 段：内容贴到透明画布 → 独立数据流 ----
+        # 之后 current_sub 指向画布输出，下游（缩放/自旋转/透明度/轨迹/混合/叠加）
+        # 一律把它当独立文件消费，与硬盘上加载一个视频没有区别。
+        if _sub_cv_on:
+            _tsc, _spc = _trim_speed_from_settings(sub_settings)
+            _scg = self._build_sub_canvas_graph(
+                sub_settings, sub_file, f"s{i}", f"[v_temp_{i}]", f"v_sc_{i}",
+                trim_start=_tsc, speed_factor=_spc)
+            if _scg:
+                filter_parts.append(_scg)
+                current_sub = f"v_sc_{i}"
+                # ---- 第 2 段：当作独立文件自由缩放（画布尺寸 → 内容盒尺寸）----
+                # 内容盒已随画布模式重算（画布尺寸 × 用户缩放），故叠加尺寸与不开画布
+                # 时完全等价 → 下游 overlay 定位 / blend 区域 / spin 对角线零改动。
+                _scw, _sch = self._sub_canvas_size(sub_settings, sub_file)[2:4]
+                _boxw, _boxh = self._overlay_content_size(sub_file, sub_settings)
+                if (_boxw, _boxh) != (_scw, _sch):
+                    filter_parts.append(f"[{current_sub}]scale={_boxw}:{_boxh}[v_scs_{i}]")
+                    current_sub = f"v_scs_{i}"
+
+        # 透明度
+        alpha_enabled = sub_settings.get("alpha_enabled", False)
+        alpha_val = sub_settings.get("alpha_value", 1.0)
+        # 静态透明度：轨迹透明度存在时跳过——由下方 geq 一并折入（避免两道滤镜重复设 alpha）。
+        if alpha_enabled and 0.0 <= alpha_val <= 1.0 and not (_wp_res is not None and _wp_res[4] is not None):
+            filter_parts.append(f"[{current_sub}]colorchannelmixer=aa={alpha_val:.2f}[v_alpha_{i}]")
+            current_sub = f"v_alpha_{i}"
+
+        # 列表轨迹透明度（oa→ob 段内线性插值）：与静态 alpha_value 串联合成（相乘）；
+        # 全 1.0 时 _wp_res[4] 为 None → 跳过（与无任何透明度的老工程行为一致）。
+        # 置于静态透明度之后：两道 colorchannelmixer=aa 串联 = alpha_val × 轨迹表达式。
+        if _wp_res is not None and _wp_res[4] is not None:
+            # ⚠️ colorchannelmixer=aa 在本 ffmpeg 构建为 init 模式，拒绝求值时变表达式
+            #   （含 t 或 max() 会被拒，且逗号会被 filtergraph 当成滤镜分隔符 → "No such filter: 'lt(t'"）。
+            #   改用 geq（per-frame 求值）承载时变 alpha：
+            #     · geq 时间戳变量是 T（非 t），表达式里独立的 t 须替换为 T：
+            #       re.sub(r'\bt\b','T',expr) 只换独立的 t（不动 lt/gte 内的 t，也不动 t0/t_first 等变量名）。
+            #     · 必须 format=rgba 确保 alpha 平面，并原样拷贝 r/g/b（r='r(X,Y)' 等函数式取输入像素）。
+            #     · ⚠️ geq 表达式返回的是 0~255 原始平面值（非 0~1 归一化，实测 a='1'≈全透明隐形），
+            #       故 alpha 乘 255 缩放：a='(静态×255)*(traj_T)'，>255 由 ffmpeg 自动钳到不透明。
+            #   ⚠️ 已知限制：geq 在本构建无法读取输入 alpha，故 a 直接设为 轨迹×静态（不乘源素材自带 alpha）。
+            #     对不透明水印/视频完全正确；透明 PNG 徽标 + 轨迹淡入会让透明底变不透明（边缘情况，后续可换 alphamerge 方案）。
+            _traj_T = re.sub(r'\bt\b', 'T', _wp_res[4])
+            _sa = alpha_val if (alpha_enabled and 0.0 <= alpha_val <= 1.0) else 1.0
+            filter_parts.append(
+                f"[{current_sub}]format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{_sa*255:.0f}*({_traj_T})'[v_tralpha_{i}]")
+            current_sub = f"v_tralpha_{i}"
+
+        # 持续旋转（绕中心动态旋转）：在 overlay 之前对子视频图层做 rotate。
+        # angle = 转速(度/秒) × π/180 × t，t 为帧时间戳 → 匀速连续旋转。
+        # 关键：ow/oh 固定为对角线长度 hypot(iw,ih)（以缩放后水印宽高为基准），
+        # 使输出是一个恒大小的正方形画布，旋转全程不裁切、且不随角度抖动；
+        # 水印在该正方形内居中旋转，边角填充透明 c=black@0，与现有 rgba/遮罩管线兼容。
+        # overlay 的 w/h 自动取该正方形（见 _overlay_sub_size），故 W-w-10 等表达式仍正确。
+        # 静态角度(自由角度) + 持续旋转：合并为单个 rotate，避免两次 hypot 旋转变大。
+        # 静态角度与文字水印旋转一致：透明层上绕中心旋转、边角透明(c=black@0)，叠加无黑边。
+        try:
+            _ra = float(sub_settings.get("rotate_angle", 0) or 0)
+        except (ValueError, TypeError):
+            _ra = 0.0
+        # ⚠️ spin 必须由 spin_enabled 显式启用：只设静态角度(rotate_angle≠0)而 spin 关闭时，
+        # 绝不能把 spin_speed 默认值(60)拼进表达式，否则「只转角度」会变成「角度+自旋转」
+        # （预览代码按 _spin and _spd != 0 判定，此处分叉会导致预览与转换不一致）。
+        _spin_on = bool(sub_settings.get("spin_enabled", False))
+        # ⚠️ _wp_res / _wp_rot 已在上方「列表轨迹提前解析」段算好（必须早于 need_alpha，
+        # 否则航点旋转不补 format=rgba → 不透明黑方块）。此处只复用，禁止再算一遍。
+        if _spin_on or _ra != 0 or _wp_rot:
+            _sp = sub_settings.get("spin_speed", 60.0)
+            try:
+                _sp = float(_sp)
+            except (ValueError, TypeError):
+                _sp = 60.0
+            # 判定必须走唯一真相源（与 _overlay_sub_size 的中心补偿同一口径）：
+            # 只要真的要挂 rotate，输出就变成 d×d 包装盒，下游必须做中心对齐补偿。
+            if overlay_rotation_active(sub_settings, wp_rot=_wp_rot):
+                _angle_expr = ""
+                if _ra != 0:
+                    _angle_expr = f"{_ra}*PI/180"
+                if _wp_rot:
+                    # 列表自旋转覆盖全局 spin：仅列表标记「自旋转」的时段旋转（边移边转）
+                    if _angle_expr:
+                        _angle_expr += " + "
+                    _angle_expr += f"({_wp_res[2]})"
+                elif _spin_on and _sp != 0:
+                    if _angle_expr:
+                        _angle_expr += " + "
+                    _angle_expr += f"{_sp}*PI/180*t"
+                filter_parts.append(
+                    f"[{current_sub}]rotate=angle='{_angle_expr}':"
+                    f"ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=black@0[v_spin_{i}]"
+                )
+                current_sub = f"v_spin_{i}"
+
+        # ---- 列表轨迹缩放（2026-09-04）：必须挂在 rotate 之后 ----
+        # 实测（ffmpeg n9.0.1）：逐帧变尺寸的 scale 若排在 rotate 前，rotate 的 ow/oh
+        # 锁死在首帧对角线 → 放大后的内容被裁；排在 rotate 之后则 overlay 的 w/h 逐帧
+        # 跟随（eval 默认 frame），位置正确。
+        # 用 iw/ih **相对**表达 → 不必知道旋转画布 d×d / 画布模式 / 静态角度下盒子的实际尺寸。
+        # max(2,...) 兜底：倍率极小时 2*round(iw*z/2) 会被 round 成 0（scale w=0 直接报错）；
+        # setsar=1：变尺寸会让 SAR 逐帧漂移（实测 16/15→33/31）。
+        _wp_zoom = bool(_wp_res is not None and _wp_res[3] is not None)
+        if _wp_zoom:
+            filter_parts.append(
+                f"[{current_sub}]scale=w='max(2,2*round(iw*({_wp_res[3]})/2))'"
+                f":h='max(2,2*round(ih*({_wp_res[3]})/2))':eval=frame,setsar=1[v_zm_{i}]"
+            )
+            current_sub = f"v_zm_{i}"
+        if canvas:
+            # 画布统一方案（2026-09-25）：把内容（含位置/轨迹/旋转，定位走 _pip_overlay_xy）
+            # 烙进一张统一透明画布（黑@0，尺寸=输出画布）——xfade 链内天然同尺寸，
+            # 各段的位置/轨迹/旋转全部保留；透明处在最终 overlay 时透出主视频。
+            _cw, _chh, _cfps, _clen = canvas
+            _x, _y = self._pip_overlay_xy(sub_file, sub_settings,
+                                          _wp_res, _wp_rot, _spin_on, _ra, _wp_zoom)
+            filter_parts.append(
+                f"color=c=black@0:s={int(_cw)}x{int(_chh)}:r={_cfps:.6g}:d={_clen:.6g}[cbase_{i}]")
+            # shortest=1：画布是链成员时长的权威。子 movie 实际帧数可能比画布 d 多 1 帧
+            # （帧率取整悬摆，如 14.233s 素材 vs 14.2s 画布），overlay 默认 repeatlast 会把
+            # 这 1 帧喂进 xfade 链 ⇒ 下级 xfade 的 blend 终点帧与本级 EOF 交界死锁，
+            # ffmpeg/mpv 双双内存爆炸卡死（2026-09-26 实测：41.2s 处 25GB，加 shortest=1 后
+            # 全片干净跑完 548MB）。
+            filter_parts.append(
+                f"[cbase_{i}][{current_sub}]overlay=x='{_x}':y='{_y}':shortest=1[vc_{i}]")
+            current_sub = f"vc_{i}"
+        if extra_tail:
+            # 转场链归一：精确限长 + 统一帧率/SAR/像素格式（尺寸已由画布合成保证）
+            filter_parts.append(f"[{current_sub}]{extra_tail}[v_xt_{i}]")
+            current_sub = f"v_xt_{i}"
+
+        return filter_parts, current_sub, {
+            "wp_res": _wp_res, "wp_rot": _wp_rot, "spin_on": _spin_on, "ra": _ra,
+            "wp_zoom": _wp_zoom, "has_window": _has_window,
+            "need_alpha": need_alpha,
+            "win_start": _win_start, "win_end": _win_end,
+        }
+
+
     def _build_overlay_filter_complex(self, main_idx: int, main_settings: dict,
                                        sub_infos: List[Tuple[int, str, dict]],
                                        include_subtitle_main: bool = False,
                                        enhance_settings: Optional[dict] = None,
                                        reverse: bool = False,
-                                       main_file_path: str = "") -> Tuple[str, str]:
+                                       main_file_path: str = "",
+                                       main_tail_pad: Optional[float] = None,
+                                      main_effective_duration: Optional[float] = None,
+                                      include_fade: bool = True,
+                                      node_fx_override: Optional[dict] = None,
+                                      node_fx_record_raw: bool = False
+                                      ) -> Tuple[str, str]:
         """
         构建主视频 + 多个子视频（画中画/水印）的 filter_complex 字符串。
         注意：此函数不会在 overlay 中添加 shortest=1，避免子视频流结束导致输出提前截断。
         输出结束由全局 -shortest 控制。
+
+        main_tail_pad（秒，画中画专用）：主视频尾部需补的黑帧时长——子素材被摆到主视频
+        之后时，底必须真的接长（overlay 主输入 EOF = 整链 EOF，只改 -t 无效）。
+        None / 0 = 不补帧，行为与旧调用方（缩略图/contact sheet/水印）逐字节一致。
+
+        main_effective_duration（秒，画中画专用）：主视频有效时长（与 -t 同源）。只在该参数
+        给出、且主视频自身也勾了转场时，主视频才可能成为转场链的首段。None = 主视频不进链
+        （其余 4 处调用方的旧行为，逐字节一致）。
         """
         filter_parts = []
         # ---- 多子视频混合模式提示（仅日志，不阻止生成） ----
@@ -25259,6 +28210,7 @@ class FFmpegBatchGUI:
             reverse=main_settings.get('reverse_enabled', False),
             enhance_settings=enhance_settings,
             graph_id=f"m{main_idx}",
+            include_fade=include_fade,
             clip_duration=self._get_media_duration(main_file_path) if main_file_path else None
         )
         if main_vf and main_vf != "null":
@@ -25333,6 +28285,36 @@ class FFmpegBatchGUI:
                 filter_parts.append(f"[canvas][{current_v}]overlay={ox}:{oy}[v_main_pad]")
                 current_v = "v_main_pad"
 
+        # ---- 画中画：转场链规划（未开转场 → 空链，逐字节走原路径）----
+        # ⚠️ 必须在「底 tpad 延长」之前：主视频进链时要从**未延长**的主视频 split 出一份给链
+        # （理由见下方 _main_in_chain）。
+        # 第三个返回值 shift_of（音频偏移）不由本函数消费——音频侧 `_build_pip_audio` 独立
+        # 重算一次（同一纯函数、同参数，结果必然一致；本函数签名不返回值以免牵动 5 处调用方）。
+        _chains, _chain_of, _shift_of = self._pip_transition_chains(
+            sub_infos, main_settings if main_effective_duration else None,
+            main_file_path if main_effective_duration else None,
+            main_effective_duration)
+        _main_in_chain = any(_c["members"][0] < 0 for _c in _chains)
+        _v_main_raw = None
+        if _main_in_chain:
+            # 主视频进链 → 必须先 split。⚠️ 让「延长后的底标签」与「链的 trim 分支」共享
+            # 同一个中间标签，会让整链在 trim 结束处（=主视频时长）提前 EOF —— 实测输出被
+            # 截回主视频时长（_verify_pip_transition S8 第一轮就炸在这）。split 是帧引用，
+            # 零拷贝；且只在主视频真的进链时才插（其余场景逐字节不变）。
+            filter_parts.append(f"[{current_v}]split=2[v_main_base0][v_main_chain0]")
+            current_v = "v_main_base0"
+            _v_main_raw = "v_main_chain0"
+
+        # ---- 画中画时间轴延长：子素材被摆到主视频之后 → 底补黑帧 ----
+        # ⚠️ 必须补在「主视频全部处理（滤镜/画布/pad）之后、子视频叠加之前」：
+        # 主视频画面本身保持零变化，只是尾部接黑，语义等同 NLE 时间轴空白处。
+        # 不补的话 overlay 主输入 EOF 会让整条链提前结束，超出部分静默丢失
+        # （实测见 research/concat-overlay-alt §13.1）。
+        if main_tail_pad and main_tail_pad > 0:
+            filter_parts.append(
+                f"[{current_v}]tpad=stop_mode=add:stop_duration={main_tail_pad:.6f}[v_main_ext]")
+            current_v = "v_main_ext"
+
         # ---- 多混合模式子视频隔离：主视频 split 出原始帧副本 ----
         # 非 normal blend 子视频 ≥2 个时，blend 的主区域必须从主视频【原始帧】取
         # （而不是已被前面 blend 修改过的主干 current_v），否则多个 blend 区域重叠时
@@ -25351,240 +28333,83 @@ class FFmpegBatchGUI:
             filter_parts.append(f"[{current_v}]split={_blend_count + 1}{_split_out}")
             current_v = "v_main_base"
     
-        # 处理每个子视频
+        _layers = {}
+
+        # ---- 阶段 A：逐个构建子视频图层（不叠加）----
+        # 转场链成员按「链内窗口」构建：不位移（PTS 从 0 起）+ 精确限长，
+        # 交由阶段 A2 的 xfade 链合成后，再整体位移回时间轴（xfade 要求两输入同起点）。
         for i, (sub_idx, sub_file, sub_settings) in enumerate(sub_infos):
-            # 判断是否使用 loop 滤镜：截取(trim)循环模式，或「启用循环控制」的有限模式(count)
-            # 即使未勾选截取也按整段子视频时长计算 loop_size —— 用户实测旧版只需勾选
-            # 「启用循环控制」即可有限循环（2026-09-02 修正：不再强制要求勾选「截取」）。
-            _loop_finite = bool(sub_settings.get("loop_enabled", False)) and \
-                str(sub_settings.get("loop_mode", "infinite") or "infinite") == "count"
-            use_loop = bool(sub_settings.get("trim_enabled", False)) or _loop_finite
-            if use_loop:
-                if sub_settings.get("loop_enabled", False) and sub_settings.get("loop_mode") == "once":
-                    use_loop = False
+            _ci = _chain_of.get(i)
+            _wo = _xt = _cv = None
+            if _ci is not None:
+                _wo = (0.0, _chains[_ci]["lens"][i])
+                _xt = _chains[_ci]["norm"][i]
+                # 画布统一：链成员图层烙进透明画布（尺寸/帧率取链的统一值）
+                _cv = (_chains[_ci]["size"][0], _chains[_ci]["size"][1],
+                       _chains[_ci]["fps"], _chains[_ci]["lens"][i])
+            _parts, _lbl, _meta = self._build_sub_layer_node(
+                i, sub_idx, sub_file, sub_settings, main_settings,
+                win_override=_wo, extra_tail=_xt, canvas=_cv,
+                include_fade=include_fade)
+            filter_parts.extend(_parts)
+            _layers[i] = (_lbl, _meta)
 
-            # 获取子视频的增强设置
-            sub_enhance = sub_settings.get("enhance", {})
-
-            # 计算循环帧数：use_loop（trim 循环模式）→ 片段帧数，由 chain 内 trim+loop 处理；
-            # once/未启用 → loop_size=None（chain 内单次 trim 或无；正式命令靠 -stream_loop -1 输入级循环整段）
-            loop_size = None
-            if use_loop:
-                # 获取帧率
-                fps = self._get_video_framerate(sub_file)
-                if fps is None:
-                    use_loop = False
-                else:
-                    start_str = sub_settings.get("trim_start", "0").strip()
-                    end_str = sub_settings.get("trim_end", "").strip()
-                    start_sec = time_to_seconds(start_str) if start_str else 0.0
-                    end_sec = time_to_seconds(end_str) if end_str else None
-                    if end_sec is not None and end_sec > start_sec:
-                        duration = end_sec - start_sec
-                    else:
-                        raw_duration = self._get_media_duration(sub_file)
-                        if raw_duration is not None:
-                            duration = raw_duration - start_sec
-                        else:
-                            use_loop = False
-                    if use_loop:
-                        loop_size = int(round(duration * fps))
-                        if loop_size <= 0:
-                            use_loop = False
-                            loop_size = None
-
-            # ---- 子视频「显示时段」优化（2026-09-02，抄统一尝试版）：把 show_start/show_end
-            # 升级为子链时间边界，窗口外重滤镜不跑（省 CPU）。仅当窗口合法时生效；标记
-            # _has_window 供下方 overlay/blend 追加 eof_action=pass（子链在窗口结束正常 EOF，
-            # 避免默认 repeat 冻帧/截断）。
-            # ⚠️ _sub_dur 必须先于本段绑定（没开「截取」时 use_loop 分支不执行，会导致
-            # _resolve_display_window 引用未绑定变量而抛 UnboundLocalError）。
-            _sub_dur = self._get_media_duration(sub_file)
-            _win_start, _win_end, _has_window = self._resolve_display_window(
-                sub_settings, _sub_dur, input_path=sub_file)
-            # 有限循环次数：仅覆盖窗口时长（节 CPU）。窗口帧数 / 片段帧数 向上取整。
-            _win_loop = 1
-            if _has_window and loop_size and _win_end is not None:
-                _wfps = self._get_video_framerate(sub_file)
-                if _wfps:
-                    _win_frames = max(1, int(round((_win_end - _win_start) * _wfps)))
-                    _win_loop = max(1, -(-_win_frames // int(loop_size)))
-
-            # ---- 列表轨迹（waypoints）提前解析（2026-09-02 回归修复）----
-            # ⚠️ 必须早于下方 need_alpha 判定：航点带显式旋转（ra/rb）或自旋转段时，
-            # 子视频要走 rotate=...:c=black@0，而 rotate 在「无 alpha 的输入」上不会产生透明，
-            # 边角是「不透明黑」→ 叠加到主视频留黑方块。need_alpha 必须先知道 _wp_rot
-            # 才能补 format=rgba。原代码把这段放在 rotate 分支前（晚于 need_alpha），
-            # need_alpha 因此看不见航点旋转 → 隐藏回归。
-            # 解析结果 _wp_res / _wp_rot 由下方旋转分支与叠加分支直接复用，绝不重复调用。
-            _wp_res = None
-            _mv_all = (sub_settings.get('move_mode', '') or '').strip()
-            if _mv_all == "waypoints":
-                try:
-                    _wp_spv = float(sub_settings.get("spin_speed", 60.0) or 60.0)
-                except (ValueError, TypeError):
-                    _wp_spv = 60.0
-                _cw0, _ch0 = self._overlay_content_size(sub_file, sub_settings)
-                _ts0, _sp0 = _trim_speed_from_settings(main_settings)
-                _wp_res = build_waypoint_expr(sub_settings.get("move_waypoints"),
-                                              sw=str(_cw0), sh=str(_ch0), spin_speed=_wp_spv,
-                                              trim_start=_ts0, speed_factor=_sp0)
-            # 本版 build_waypoint_expr 返回 (x_expr, y_expr, angle_expr)：angle_expr 已把
-            # 「航点显式旋转(ra/rb)」与「自旋转段(mode=spin)」合并在一起 → 非 None 即需要 alpha。
-            _wp_rot = (_wp_res is not None and _wp_res[2] is not None)
-
-            # 是否需要 alpha 通道：透明度 / 持续旋转 / 遮罩 / 源视频自带 alpha / 列表轨迹旋转。
-            # 仅这些场景才需要 format=rgba；普通不透明叠加保持 YUV，避免多余色域往返（4:4:4）与带宽浪费。
-            # （绿幕 chromakey 已由 chain 输出 rgba，无需在此判定）
-            need_alpha = (
-                sub_settings.get("alpha_enabled", False) or
-                sub_settings.get("mask_enabled", False)
-            )
-            if sub_settings.get("spin_enabled", False):
-                try:
-                    _sp_val = float(sub_settings.get("spin_speed", 60.0))
-                except (ValueError, TypeError):
-                    _sp_val = 60.0
-                if _sp_val != 0:
-                    need_alpha = True
-            try:
-                _ra_val = float(sub_settings.get("rotate_angle", 0) or 0)
-            except (ValueError, TypeError):
-                _ra_val = 0.0
-            if _ra_val != 0:
-                need_alpha = True
-            # ⚠️ 列表轨迹旋转 → 需要 alpha（2026-09-02 回归修复）：
-            # 不透明源 + 航点旋转时，子链不补 format=rgba → rotate=c=black@0 在无 alpha 输入上
-            # 不产生透明（实测 alpha 全 255）→ 叠加到主视频留「不透明黑方块」。
-            # 适配水印(_wp_rot2) / 画中画预览(_wp_rotP) 两处 need_alpha 早已含航点旋转 → 无此 bug，
-            # 仅子视频正式命令漏（_wp_rot 原本算得太晚，need_alpha 看不见）。
-            if _wp_rot:
-                need_alpha = True
-            # 源视频本身带 alpha（透明 mov/webm/APNG/pal8 等）
-            _src_pf = self._get_video_pix_fmt(sub_file)
-            if _src_pf and self._pix_fmt_has_alpha(_src_pf):
-                need_alpha = True
-
-            # 构建子视频滤镜串：统一走 chain（trim/loop/裁剪/旋转/缩放/绿幕/色彩校正/反色 全在 chain 内，
-            # 顺序：trim→loop→裁剪→旋转→缩放→绿幕→色彩→反色；绿幕在缩放后=小图抠，色彩段在绿幕后不影响抠像）。
-            # 仅当 need_alpha 时补 format=rgba。
-            # 画布模式（2026-08-31 两段式）：画布段已接管裁剪/旋转/缩放 → 前置链三者全关，
-            # 缩放挪到画布之后做（同一个内容只允许缩一次，否则会被缩两次）。
-            _sub_cv_on = self._sub_canvas_on(sub_settings)
-            _vf_settings = {**sub_settings, "hw_filter_mode": "cpu", "precise_trim": True}
-            if _sub_cv_on:
-                _vf_settings["crop_enabled"] = False
-                _vf_settings["rotate"] = "none"
-                _vf_settings["scale_enabled"] = False
-            base_vf = build_video_filter_chain(
-                _vf_settings,
-                include_subtitle=False,
-                include_speed=True,                # 子视频变速生效（音频变速已由 _build_audio_filters 处理）
-                include_trim=True,                 # trim 由 chain 内处理（precise_trim + trim_enabled）
-                include_format=False,
-                reverse=sub_settings.get('reverse_enabled', False),
-                enhance_settings=sub_enhance,
-                graph_id=f"s{sub_idx}",
-                chroma_settings=sub_settings if sub_settings.get("chroma_enabled", False) else None,
-                loop_size=loop_size,
-                window_start=_win_start, window_end=_win_end, window_loop_count=_win_loop,
-            )
-            if base_vf == "null":
-                base_vf = ""
-            if base_vf:
-                # 时间基准统一：子视频 PTS 归零（与主视频/画布对齐，避免多输入 overlay 同步基准不一致黑屏）
-                sub_vf = f"setpts=PTS-STARTPTS,{base_vf},format=rgba" if need_alpha else f"setpts=PTS-STARTPTS,{base_vf}"
-            else:
-                sub_vf = "setpts=PTS-STARTPTS,format=rgba" if need_alpha else "setpts=PTS-STARTPTS"
-            filter_parts.append(f"[{sub_idx}:v]{sub_vf}[v_temp_{i}]")
-            current_sub = f"v_temp_{i}"
-
-            # ---- 子视频画布模式 第 1 段：内容贴到透明画布 → 独立数据流 ----
-            # 之后 current_sub 指向画布输出，下游（缩放/自旋转/透明度/轨迹/混合/叠加）
-            # 一律把它当独立文件消费，与硬盘上加载一个视频没有区别。
-            if _sub_cv_on:
-                _tsc, _spc = _trim_speed_from_settings(sub_settings)
-                _scg = self._build_sub_canvas_graph(
-                    sub_settings, sub_file, f"s{i}", f"[v_temp_{i}]", f"v_sc_{i}",
-                    trim_start=_tsc, speed_factor=_spc)
-                if _scg:
-                    filter_parts.append(_scg)
-                    current_sub = f"v_sc_{i}"
-                    # ---- 第 2 段：当作独立文件自由缩放（画布尺寸 → 内容盒尺寸）----
-                    # 内容盒已随画布模式重算（画布尺寸 × 用户缩放），故叠加尺寸与不开画布
-                    # 时完全等价 → 下游 overlay 定位 / blend 区域 / spin 对角线零改动。
-                    _scw, _sch = self._sub_canvas_size(sub_settings, sub_file)[2:4]
-                    _boxw, _boxh = self._overlay_content_size(sub_file, sub_settings)
-                    if (_boxw, _boxh) != (_scw, _sch):
-                        filter_parts.append(f"[{current_sub}]scale={_boxw}:{_boxh}[v_scs_{i}]")
-                        current_sub = f"v_scs_{i}"
-
-            # 透明度
-            alpha_enabled = sub_settings.get("alpha_enabled", False)
-            alpha_val = sub_settings.get("alpha_value", 1.0)
-            if alpha_enabled and 0.0 <= alpha_val <= 1.0:
-                filter_parts.append(f"[{current_sub}]colorchannelmixer=aa={alpha_val:.2f}[v_alpha_{i}]")
-                current_sub = f"v_alpha_{i}"
-
-            # 持续旋转（绕中心动态旋转）：在 overlay 之前对子视频图层做 rotate。
-            # angle = 转速(度/秒) × π/180 × t，t 为帧时间戳 → 匀速连续旋转。
-            # 关键：ow/oh 固定为对角线长度 hypot(iw,ih)（以缩放后水印宽高为基准），
-            # 使输出是一个恒大小的正方形画布，旋转全程不裁切、且不随角度抖动；
-            # 水印在该正方形内居中旋转，边角填充透明 c=black@0，与现有 rgba/遮罩管线兼容。
-            # overlay 的 w/h 自动取该正方形（见 _overlay_sub_size），故 W-w-10 等表达式仍正确。
-            # 静态角度(自由角度) + 持续旋转：合并为单个 rotate，避免两次 hypot 旋转变大。
-            # 静态角度与文字水印旋转一致：透明层上绕中心旋转、边角透明(c=black@0)，叠加无黑边。
-            try:
-                _ra = float(sub_settings.get("rotate_angle", 0) or 0)
-            except (ValueError, TypeError):
-                _ra = 0.0
-            # ⚠️ spin 必须由 spin_enabled 显式启用：只设静态角度(rotate_angle≠0)而 spin 关闭时，
-            # 绝不能把 spin_speed 默认值(60)拼进表达式，否则「只转角度」会变成「角度+自旋转」
-            # （预览代码按 _spin and _spd != 0 判定，此处分叉会导致预览与转换不一致）。
-            _spin_on = bool(sub_settings.get("spin_enabled", False))
-            # ⚠️ _wp_res / _wp_rot 已在上方「列表轨迹提前解析」段算好（必须早于 need_alpha，
-            # 否则航点旋转不补 format=rgba → 不透明黑方块）。此处只复用，禁止再算一遍。
-            if _spin_on or _ra != 0 or _wp_rot:
-                _sp = sub_settings.get("spin_speed", 60.0)
-                try:
-                    _sp = float(_sp)
-                except (ValueError, TypeError):
-                    _sp = 60.0
-                # 判定必须走唯一真相源（与 _overlay_sub_size 的中心补偿同一口径）：
-                # 只要真的要挂 rotate，输出就变成 d×d 包装盒，下游必须做中心对齐补偿。
-                if overlay_rotation_active(sub_settings, wp_rot=_wp_rot):
-                    _angle_expr = ""
-                    if _ra != 0:
-                        _angle_expr = f"{_ra}*PI/180"
-                    if _wp_rot:
-                        # 列表自旋转覆盖全局 spin：仅列表标记「自旋转」的时段旋转（边移边转）
-                        if _angle_expr:
-                            _angle_expr += " + "
-                        _angle_expr += f"({_wp_res[2]})"
-                    elif _spin_on and _sp != 0:
-                        if _angle_expr:
-                            _angle_expr += " + "
-                        _angle_expr += f"{_sp}*PI/180*t"
-                    filter_parts.append(
-                        f"[{current_sub}]rotate=angle='{_angle_expr}':"
-                        f"ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=black@0[v_spin_{i}]"
-                    )
-                    current_sub = f"v_spin_{i}"
-
-            # ---- 列表轨迹缩放（2026-09-04）：必须挂在 rotate 之后 ----
-            # 实测（ffmpeg n9.0.1）：逐帧变尺寸的 scale 若排在 rotate 前，rotate 的 ow/oh
-            # 锁死在首帧对角线 → 放大后的内容被裁；排在 rotate 之后则 overlay 的 w/h 逐帧
-            # 跟随（eval 默认 frame），位置正确。
-            # 用 iw/ih **相对**表达 → 不必知道旋转画布 d×d / 画布模式 / 静态角度下盒子的实际尺寸。
-            # max(2,...) 兜底：倍率极小时 2*round(iw*z/2) 会被 round 成 0（scale w=0 直接报错）；
-            # setsar=1：变尺寸会让 SAR 逐帧漂移（实测 16/15→33/31）。
-            _wp_zoom = bool(_wp_res is not None and _wp_res[3] is not None)
-            if _wp_zoom:
+        # ---- 阶段 A2：转场链合成（xfade 链 + 整体位移）----
+        # 段长按用户摆的窗口；xfade 吞掉 d 秒 → 后段在链内提前 d 秒出现
+        # （与串行合并的转场语义一致，非 bug）。
+        for _ci, _ch in enumerate(_chains):
+            _mem = _ch["members"]
+            if _mem[0] < 0:
+                # 链首 = 主视频层本身，取 split 出的**未延长**副本（_v_main_raw），
+                # trim=0:{主时长} 正好等于主视频全部内容。
+                _acc = f"v_mxt_{_ci}"
                 filter_parts.append(
-                    f"[{current_sub}]scale=w='max(2,2*round(iw*({_wp_res[3]})/2))'"
-                    f":h='max(2,2*round(ih*({_wp_res[3]})/2))':eval=frame,setsar=1[v_zm_{i}]"
-                )
-                current_sub = f"v_zm_{i}"
+                    f"[{_v_main_raw or current_v}]{_ch['norm'][-1]}[{_acc}]")
+                _acc_len = _ch["lens"][-1]
+            else:
+                _acc = _layers[_mem[0]][0]
+                _acc_len = _ch["lens"][_mem[0]]
+            for _k in range(1, len(_mem)):
+                _mi = _mem[_k]
+                _tt, _dd = _ch["trans"][_k - 1]
+                _off = max(0.0, _acc_len - _dd)
+                _out_lbl = f"v_tc{_ci}_{_k}"
+                filter_parts.append(
+                    f"[{_acc}][{_layers[_mi][0]}]xfade=transition={_tt}"
+                    f":duration={_dd:.6g}:offset={_off:.6g}[{_out_lbl}]")
+                _acc = _out_lbl
+                _acc_len = _acc_len + _ch["lens"][_mi] - _dd
+            _chain_lbl = f"v_tchain_{_ci}"
+            filter_parts.append(f"[{_acc}]setpts=PTS+{_ch['start']:.6g}/TB[{_chain_lbl}]")
+            _ch["label"] = _chain_lbl
+            _ch["len"] = _acc_len
+            _ch["enable"] = f"between(t,{_ch['start']:.6g},{_ch['start'] + _acc_len:.6g})"
+            try:
+                _who = (_("主视频→子视频 %d") % (_mem[1] + 1)) if _mem[0] < 0 else \
+                       (_("子视频 %d…%d") % (_mem[0] + 1, _mem[-1] + 1))
+                self._append_info_ui(
+                    f"[转场] {_who} 已合成转场链：{_ch['start']:.2f}s~{_ch['start'] + _acc_len:.2f}s"
+                    f"（{len(_mem)} 段，链内统一 {_ch['size'][0]}x{_ch['size'][1]}）")
+            except Exception:
+                pass
+
+        # ---- 阶段 B：叠加 ----
+        for i, (sub_idx, sub_file, sub_settings) in enumerate(sub_infos):
+            _ci = _chain_of.get(i)
+            if _ci is not None:
+                _m0 = _chains[_ci]["members"]
+                # 链首为主视频(-1)时，由链内第一个真实成员代表整条链做叠加
+                if i != (_m0[1] if _m0[0] < 0 else _m0[0]):
+                    continue      # 链内非首成员：图层已被 xfade 消费，不单独叠加
+            _lbl, _meta = _layers[i]
+            current_sub = _chains[_ci]["label"] if _ci is not None else _lbl
+            _wp_res = _meta["wp_res"]
+            _wp_rot = _meta["wp_rot"]
+            _spin_on = _meta["spin_on"]
+            _ra = _meta["ra"]
+            _wp_zoom = _meta["wp_zoom"]
+            _has_window = _meta["has_window"]
+            _chain_enable = _chains[_ci]["enable"] if _ci is not None else None
 
             # 叠加（不添加 shortest=1）
             blend_mode = (sub_settings.get('blend_mode', 'normal') or 'normal').strip().lower()
@@ -25604,67 +28429,32 @@ class FFmpegBatchGUI:
                 _dgp = self._blend_downgrade_pad(main_settings, main_file_path)
                 if _dgp:
                     self._append_info_ui(
-                        _("[混合模式] pad 画布 {0}x{1} 大于主视频渲染尺寸，"
-                        "blend({2}) 已降级为普通叠加（脱离主视频像素的混合无意义）").format(_dgp[0], _dgp[1], blend_mode))
+                        f"[混合模式] pad 画布 {_dgp[0]}x{_dgp[1]} 大于主视频渲染尺寸，"
+                        f"blend({blend_mode}) 已降级为普通叠加（脱离主视频像素的混合无意义）")
                     blend_mode = 'normal'
             if sub_settings.get('overlay_enabled', True):
-                x = sub_settings.get('overlay_x', '0').strip() or '0'
-                y = sub_settings.get('overlay_y', '0').strip() or '0'
                 if blend_mode == 'normal':
-                    # 动态水印（轨迹控制）：move_mode 非空时用动效表达式替换 x/y。
-                    # 基准 overlay_x/overlay_y 保留不变（独立字段，可随时改回）。
-                    # ⚠️ 定位语义（2026-08-25 理顺）：overlay_x/y 的 w/h 始终指**内容盒**
-                    # （未旋转渲染尺寸 w×h）；旋转时 overlay 输入是 d×d 旋转画布（w/h 变量=d），
-                    # 必须先把表达式 w/h 替换成内容盒数字，再减中心对齐偏移 (d-w)/2，
-                    # 否则内容整体偏左上 (d-w)/2（子视频越大越明显）。
-                    _content_w, _content_h = self._overlay_content_size(sub_file, sub_settings)
-                    try:
-                        _spv = float(sub_settings.get("spin_speed", 60.0) or 60.0)
-                    except (ValueError, TypeError):
-                        _spv = 60.0
-                    _rot_ov = (_spin_on and _spv != 0) or (_ra != 0) or _wp_rot
-                    _mv = (sub_settings.get('move_mode', '') or '').strip()
-                    if _mv == "waypoints":
-                        # 列表轨迹：x/y 为画布绝对像素（数字），直接使用；无效时回退基准位置
-                        if _wp_res is not None and _wp_res[0] is not None:
-                            x, y = _wp_res[0], _wp_res[1]
-                        else:
-                            x = _content_box_expr(x, _content_w, _content_h)
-                            y = _content_box_expr(y, _content_w, _content_h)
-                    elif _mv:
-                        # 轨迹范围/基准都按内容盒（sw/sh=内容盒数字，x0/y0 的 w/h 内容盒化）
-                        _mx, _my = build_move_xy_expr(
-                            _mv, _content_box_expr(x, _content_w, _content_h),
-                            _content_box_expr(y, _content_w, _content_h),
-                            sub_settings, sw=str(_content_w), sh=str(_content_h))
-                        if _mx is not None:
-                            x, y = _mx, _my
-                        else:
-                            x = _content_box_expr(x, _content_w, _content_h)
-                            y = _content_box_expr(y, _content_w, _content_h)
-                    elif _rot_ov:
-                        # 静态位置：数字求值（内容盒语义），旋转时下面统一减中心偏移
-                        x = _content_box_expr(x, _content_w, _content_h)
-                        y = _content_box_expr(y, _content_w, _content_h)
-                    if _rot_ov:
-                        # 旋转中心对齐：叠加盒(d×d)中心=内容盒中心 → 减 (d-w)/2
-                        _sw_b, _sh_b = self._overlay_sub_size(sub_file, sub_settings)
-                        _offx, _offy = _content_box_shift(_content_w, _content_h, _sw_b, _sh_b)
-                        if _wp_zoom:
-                            # 轨迹缩放把叠加盒整体放大 z(t) 倍 → 中心对齐偏移同乘 z(t)，
-                            # 否则「旋转 + 缩放」时内容会随放大逐渐偏离航点坐标。
-                            x = f"({x}) - ({_wp_res[3]})*{_offx:.6g}"
-                            y = f"({y}) - ({_wp_res[3]})*{_offy:.6g}"
-                        else:
-                            x = f"({x}) - {_offx:.6g}"
-                            y = f"({y}) - {_offy:.6g}"
-                    duration = self._get_media_duration(sub_file)
-                    enable_expr = self._calc_enable_expr(sub_settings, duration)
+                    x = sub_settings.get('overlay_x', '0').strip() or '0'
+                    y = sub_settings.get('overlay_y', '0').strip() or '0'
+                    if _ci is None:
+                        # 定位表达式统一走 _pip_overlay_xy（与链成员「烙进画布」共用同一套）。
+                        # 链成员的定位已在图层内画布合成时完成，这里整链铺满即可（见下）。
+                        x, y = self._pip_overlay_xy(sub_file, sub_settings,
+                                                    _wp_res, _wp_rot, _spin_on, _ra, _wp_zoom)
+                    if _chain_enable is not None:
+                        # 转场链：整条链只有一次叠加，窗口=链的合成时长（非单段的显示时段）。
+                        # 画布统一方案（2026-09-25）：每段内容（含位置/轨迹/旋转）已烙进透明画布
+                        # → 链尺寸=输出画布，整条链一律铺满 (0,0)，透明处透出主视频。
+                        enable_expr = _chain_enable
+                        x, y = "0", "0"
+                    else:
+                        duration = self._get_media_duration(sub_file)
+                        enable_expr = self._calc_enable_expr(sub_settings, duration)
                     # x/y 用引号包裹：动效表达式含逗号（mod/min/max），不包会被 filtergraph 当滤镜分隔符
                     # 窗口生效时子链在窗口结束正常 EOF，追加 eof_action=pass 透传主视频，
                     # 避免默认 eof_action=repeat 把末帧定格在主画面上（与统一尝试版一致）。
                     overlay_filter = f"overlay=x='{x}':y='{y}':enable='{enable_expr}'"
-                    if _has_window:
+                    if _has_window or _ci is not None:
                         overlay_filter += ":eof_action=pass"
                     filter_parts.append(f"[{current_v}][{current_sub}]{overlay_filter}[v_out_{i}]")
                     current_v = f"v_out_{i}"
@@ -25724,9 +28514,9 @@ class FFmpegBatchGUI:
                         # 区域位置 = 内容盒位置 - 中心对齐偏移，再 clamp 到画布内（crop 不越界）
                         _ms2 = dict(sub_settings)
                         _ms2["overlay_x"] = _content_box_expr(
-                            _ms2.get("overlay_x", "W-w-10"), _content_w, _content_h)
+                            _ms2.get("overlay_x", DEFAULT_OVERLAY_X), _content_w, _content_h)
                         _ms2["overlay_y"] = _content_box_expr(
-                            _ms2.get("overlay_y", "H-h-10"), _content_w, _content_h)
+                            _ms2.get("overlay_y", DEFAULT_OVERLAY_Y), _content_w, _content_h)
                         _dx, _dy = _blend_move_exprs(_mv, _ms2, _content_w, _content_h)
                         if _dx is not None:
                             _offx2, _offy2 = _content_box_shift(_content_w, _content_h, _bw_c, _bh_c)
@@ -25779,25 +28569,182 @@ class FFmpegBatchGUI:
                         else:
                             # 子视频完全在画布外，跳过混合（保持主画面，不报错）。
                             # ⚠️ current_sub 必须消费（nullsink），否则子视频链输出悬空
-                            # → filtergraph "unconnected" 报错（同下方叠加关闭分支）。
+                            # → filtergraph "unconnected" 报错（同 22659 叠加关闭分支）。
                             filter_parts.append(f"[{current_v}]null[{current_v}]")
                             filter_parts.append(f"[{current_sub}]nullsink")
             else:
-                # 叠加关闭：主视频直通 + 必须消费子视频流。子视频链（循环内）是无条件
+                # 叠加关闭：主视频直通 + 必须消费子视频流。子视频链（22378 附近）是无条件
                 # 生成的——绿幕/遮罩/缩放等滤镜都在里面；不消费会悬空，filtergraph 直接报
                 # "Filter 'format:default' has output 0 (v_temp_N) unconnected"，
                 # 转换/预览全炸（2026-09-10 用户实测：绿幕+遮罩轨道未勾「启用叠加」）。
-                # ⚠️ 本 else 必须缩进在上方 if（overlay_enabled）之下（12 空格）——base 曾误写成
+                # ⚠️ 本 else 必须缩进在上方 if（overlay_enabled）之下（12 空格）——曾误写成
                 # 8 空格挂成 for-else：单子视频歪打正着（循环尾消费了 current_sub），但
                 # 多子视频时非末位关叠加的流照样悬空、且勾了叠加也误报日志（2026-09-10 修正）。
                 filter_parts.append(f"[{current_v}]null[{current_v}]")
                 filter_parts.append(f"[{current_sub}]nullsink")
                 self._append_info_ui(
-                    _("[封装] 子视频 {0} 未勾选「启用叠加」：其滤镜链（绿幕/遮罩/缩放等）"
-                      "已生成但不会叠加显示；如需显示请到轨道编辑勾选「启用叠加」").format(i + 1))
+                    f"[封装] 子视频 {i + 1} 未勾选「启用叠加」：其滤镜链（绿幕/遮罩/缩放等）"
+                    f"已生成但不会叠加显示；如需显示请到轨道编辑勾选「启用叠加」")
     
         complex_filter = ";".join(filter_parts)
+        # 「预览重锚原始图」快照（2026-09-27）：仅 node_fx_record_raw=True 的调用方
+        # （目前只有 _build_pip_cmd 正式构图）在应用节点效果**前**留下视频原始图
+        # → 实时预览重锚（merge_preview_pip_live）拿它当 anchor，避免 anchor 被
+        # 自己插入的效果段污染（同名滤镜计数虚增 → node_key_alias 整层拒绝）。
+        # 取帧快照 / 水印预览 / contact sheet 等其它调用方一律 False（不覆盖），
+        # 且 override 构图（可视化编辑器替身）也不写 —— 旧调用方零回归。
+        if node_fx_record_raw and node_fx_override is None:
+            self._last_graph_raw_v = complex_filter or ""
+            # 节点分析的「基准图」与预览重锚用的是同一张干净图，但**必须独立存一份**：
+            # raw_v 只有画中画正式构图会写，串行构图永远不写 ⇒ 直接拿它当基准会残留
+            # 上一代画中画的图，切回串行时复用判据误判"没变"（2026-09-28 实测 bug）。
+            self._last_graph_base = complex_filter or ""
+            self._last_graph_base_gen = getattr(self, "_graph_gen", 0)
+        # ⚠️ 「节点标签」的原始图快照（self._last_graph）与音频节点效果，
+        #    不能在这里定稿 —— 此刻只有**视频图**，PiP 的音频段（[amain]/[afinal]/[subN]）
+        #    是由调用方 _build_pip_cmd 在 _build_pip_audio 之后才拼进 complex_filter 的。
+        #    提前快照/应用 ⇒ 对话框读不到音频节点、音频效果也插不进音频链。
+        #    正确位置见 _build_pip_cmd（拼完音频后）。串行合并在 _build_concat_reencode_mode
+        #    里定稿（那里音频本就在同一张图里）。
+        complex_filter, current_v = self._apply_node_fx(complex_filter, current_v,
+                                                          override=node_fx_override)
         return complex_filter, f"[{current_v}]"
+
+    def _apply_node_fx(self, graph, final_label_name, override=None, anchor_nodes=None):
+        """把用户挂在图节点上的效果（self.node_fx）插回这张图里。
+
+        ⚠️ node_fx 为空时逐字节原样返回 —— 老工程/未用该功能的用户零回归。
+
+        按指纹定位：先重解析当前图算出「段序号+末滤镜名 → 标签」的映射，
+        再逐个 key 找位置。找不到的（处理链变了）**只日志提示并跳过**，
+        绝不静默插到别的节点上 —— 宁可不生效，也不能生效错地方。
+
+        override（2026-09-26「节点效果编辑器按时间取帧」）：调用方临时提供的
+        node_fx 替身 dict（只用于本次构图，不写 self）。可视化编辑器取背景帧时
+        用它在后台线程排除 crop/delogo/rotate/flip 等几何效果，避免与正在编辑的
+        矩形坐标空间冲突；传 None = 用 self.node_fx（默认行为，零回归）。
+
+        anchor_nodes（2026-09-26「节点标签同步到预览」）：给出**另一张图**的 nodes
+        （= 产生这些指纹的原始图）时，允许对这里没命中的 key 走 node_key_alias 重锚。
+        预览图（mpv/ffplay 与管道引擎）与正式命令图是两套构图，同一个「第 N 步」的
+        段序号不同 ⇒ 不重锚就几乎全部落空。None = 只用本图算 key（默认行为，零回归）。
+        """
+        fx = override if override is not None else getattr(self, "node_fx", None)
+        if not fx or not graph:
+            return graph, final_label_name
+        key2seg = {}
+        for _i, _name, _lastf in graph_nodes(graph):
+            key2seg.setdefault(node_fingerprint(_i, _lastf), _i)
+        _alias = {}
+        _anchor = bool(anchor_nodes)
+        if _anchor:
+            _alias = node_key_alias(anchor_nodes, graph_nodes(graph))
+        cur = graph
+        try:
+            # 主路径按「段序号」插入（insert_after_at，与 _apply_node_audio_fx 同机制）：
+            # 同名标签多段复用时按标签找只会命中第一个；多个效果按段序号降序防漂移。
+            # 指纹来自另一张图（anchor_nodes 有值）时一律走 alias 对齐（防序号巧合撞车）。
+            def _ord(kv):
+                _s = _alias.get(kv[0])[1] if (_anchor and kv[0] in _alias) else key2seg.get(kv[0])
+                return (1, 0) if _s is None else (0, -_s)
+            for _k, _settings in sorted(fx.items(), key=_ord):
+                _chain = node_effect_chain(_settings)
+                if not _chain:
+                    continue
+                if _anchor:
+                    _hit = _alias.get(_k)
+                    _seg = _hit[1] if _hit else None
+                else:
+                    _seg = key2seg.get(_k)
+                if _seg is None:
+                    self._append_info_ui(
+                        _('[节点] 处理链已变化，找不到 key「{0}」对应的位置 → 已跳过该节点效果。如需继续，请到右键「视频节点」里重新选择节点插入。').format(_k))
+                    continue
+                _new = insert_after_at(cur, _seg, _chain)
+                if _new is None:
+                    self._append_info_ui(
+                        _('[节点] key「{0}」插入失败（该段输出不是单标签，可能是分叉）→ 已跳过。').format(_k))
+                    continue
+                cur = _new
+        except Exception as e:
+            self._append_info_ui(_('[节点] 应用节点效果失败（已按原图继续）: {0}').format(e))
+        return cur, final_label_name
+    def node_audio_effect_chain(self, settings):
+        """音频节点效果链：复用 _build_audio_filters，但关闭动时间轴的项（与视频节点同口径）。
+
+        关闭：截取 / 变速 / 倒放 / 分段 / 淡入淡出（节点处插这些会改变流向时间轴，语义不对）。
+        保留：音量 / 响度标准化(loudnorm) / 降噪 / EQ / 声道 / 高低频截止 —— 即「响度统一」类需求。
+        """
+        s = dict(settings or {})
+        # 与视频节点同口径：自定义命令优先（2026-09-27）。
+        _custom = (s.get(NODE_FX_CUSTOM_KEY) or "").strip()
+        if _custom:
+            return _custom
+        return self._build_audio_filters(
+            s,
+            include_trim=False, include_speed=False, include_reverse=False,
+            include_fade=False, include_loudnorm=True, include_denoise=True,
+            include_channel=True, include_hp=True, include_lp=True,
+            include_segments=False)
+
+    def _apply_node_audio_fx(self, graph, final_label_name, override=None, anchor_nodes=None):
+        """把音频节点效果（self.node_audio_fx）插回这张图的音频节点后（与 _apply_node_fx 同机制）。
+
+        按指纹定位；找不到的只日志跳过，绝不插到错节点。node_audio_fx 为空时逐字节原样返回。
+        """
+        fx = override if override is not None else getattr(self, "node_audio_fx", None)
+        if not fx or not graph:
+            return graph, final_label_name
+        key2seg = {}
+        for _i, _name, _lastf in graph_nodes(graph):
+            key2seg.setdefault(node_fingerprint(_i, _lastf), _i)
+        _alias = {}
+        _anchor = bool(anchor_nodes)
+        if _anchor:
+            _alias = node_key_alias(anchor_nodes, graph_nodes(graph))
+        cur = graph
+        try:
+            # 同名标签多段复用（PiP 级联 amix 的 [amain]）时按标签插入只会命中第一个
+            # → 主路径按「段序号」插入（insert_after_at，指纹里的段序号直接用上）。
+            # 多个效果按段序号降序逐个插：先插后面的段，前面段的序号不漂移。
+            # 指纹来自另一张图（anchor_nodes 有值）时**一律走 alias 对齐**：本图
+            # 「同序号同滤镜」可能只是段序漂移后的巧合（#3:amix 恰好都在，但指向
+            # 不同段），直接命中会插错位置；alias 带数量对等 + 第 n 次出现校验。
+            def _ord(kv):
+                _s = _alias.get(kv[0])[1] if (_anchor and kv[0] in _alias) else key2seg.get(kv[0])
+                return (1, 0) if _s is None else (0, -_s)
+            for _k, _settings in sorted(fx.items(), key=_ord):
+                _chain = self.node_audio_effect_chain(_settings)
+                if not _chain:
+                    continue
+                if _anchor:
+                    _hit = _alias.get(_k)
+                    _seg = _hit[1] if _hit else None
+                else:
+                    _seg = key2seg.get(_k)
+                if _seg is None:
+                    self._append_info_ui(
+                        _('[音频节点] 处理链已变化，找不到 key「{0}」对应的位置 → 已跳过。').format(_k))
+                    continue
+                _new = insert_after_at(cur, _seg, _chain)
+                if _new is None:
+                    self._append_info_ui(
+                        _('[音频节点] key「{0}」插入失败（该段输出不是单标签，可能是分叉）→ 已跳过。').format(_k))
+                    continue
+                cur = _new
+        except Exception as e:
+            self._append_info_ui(_('[音频节点] 应用失败（已按原图继续）: {0}').format(e))
+        return cur, final_label_name
+
+    def _save_node_audio_fx(self, key, settings):
+        """把某个音频节点的效果存进 self.node_audio_fx（按指纹，不是按标签名）。"""
+        try:
+            self.node_audio_fx[key] = dict(settings or {})
+            self._append_info_ui(
+                _('[音频节点] 已记录 {0} 的效果（当前共 {1} 个音频节点效果）。⚠️ 效果按「段序号+滤镜名」定位 —— 处理链结构变了会提示重选。').format(key, len(self.node_audio_fx)))
+            self.merge_update_command_preview()
+        except Exception as e:
+            self._append_info_ui(_('[音频节点] 保存失败: {0}').format(e))
 
     def _compute_output_canvas(self, main_settings, main_file_path):
         """计算最终输出画布尺寸（优先 pad 画布，否则主视频【渲染后】尺寸）。
@@ -25814,6 +28761,57 @@ class FFmpegBatchGUI:
         if w is None or h is None:
             return 1280, 720
         return max(2, w), max(2, h)
+
+    def _check_image_main_even_size(self, main_file, main_settings, queue_pos=None) -> bool:
+        """图片主视频 + 输出尺寸非偶数 → 提示并取消（**不自动偶数化**）。
+
+        只在「开始编码 / 开始合并 / 开始队列」这种真要跑起来的阶段调用；命令预览阶段不拦。
+
+        queue_pos：由「开始队列」调用时传该任务在本次待跑队列里的序号（1 基）；
+        None = 单次转换（开始编码 / 开始合并），文案与旧行为完全一致。
+
+        ⚠️ 为什么只提示、绝不自动补 1 像素（用户 2026-09-20 拍板）：
+        主视频与子视频常常是同一张图、只有局部不同（例如只差一件衣服），
+        自动做偶数化会悄悄把其中一边缩放/裁掉 1 像素，合成时两边错开、对不齐。
+        改成偶数的方式（缩放成正确尺寸 / 裁掉 1 像素）必须由用户自己定方向。
+
+        尺寸口径与 _compute_output_canvas 同源（先 pad 画布，否则裁剪/旋转/缩放后的渲染尺寸），
+        这样「已经缩放到偶数」的情况不会误报。
+
+        返回 True = 可以继续；False = 已阻断，调用方应直接 return。
+        """
+        if not main_file or not self._is_static_image(main_file):
+            return True
+        try:
+            w, h = self._compute_output_canvas(main_settings or {}, main_file)
+            w, h = int(w), int(h)
+        except Exception:
+            return True          # 探不到尺寸就不拦，交回给 ffmpeg 自己判
+        if w <= 0 or h <= 0 or (w % 2 == 0 and h % 2 == 0):
+            return True
+        try:
+            src_w, src_h = get_video_dimensions(self.ffprobe_cmd, main_file)
+        except Exception:
+            src_w, src_h = None, None
+        _axis = "/".join(n for n, v in ((_("宽"), w % 2), (_("高"), h % 2)) if v)
+        _src = "{0}×{1}".format(src_w, src_h) if (src_w and src_h) else _("未知")
+        _tag = _("队列任务 #{0}：").format(queue_pos) if queue_pos else ""
+        _cancel = _("该任务未启动") if queue_pos else _("本次转换已取消")
+        # ⚠️ 刻意【不弹窗】（用户 2026-09-20 要求）：模态弹窗会打断操作、很不友善。
+        # 统一打到右上的「信息」区；取消动作由返回值 False 交给调用方 return。
+        self._append_info_ui(
+            _("[尺寸] {0}主视频是图片、输出尺寸不是偶数 → {1}\n"
+              "  文件：{2}\n"
+              "  图片原始尺寸：{3}\n"
+              "  实际输出尺寸：{4}×{5}（{6}为奇数）\n"
+              "  原因：ffmpeg 编码常用像素格式（yuv420p 等）要求宽、高都为偶数，奇数会直接报错。\n"
+              "  请自行改成偶数后再转换：\n"
+              "    · 缩放：在「缩放」里填一个偶数尺寸（如 1920×1080）\n"
+              "    · 裁剪：把宽或高裁掉 1 像素（如 1921×1081 → 1920×1080）\n"
+              "  程序不会自动补这 1 像素 —— 主/子视频可能是同一张图只差一点细节，\n"
+              "  自动偶数化可能会让两边错开、对不齐，偶数方式只能由你定。").format(
+                  _tag, _cancel, os.path.basename(main_file), _src, w, h, _axis))
+        return False
 
     def _main_render_size(self, main_settings, main_file_path):
         """主视频滤镜链后的实际渲染尺寸：源旋转尺寸 + crop/scale。
@@ -25953,7 +28951,7 @@ class FFmpegBatchGUI:
                         float(sub_settings.get("rotate_angle", 0) or 0) != 0:
                     _note = _("；第 2 段自旋转同时开启 → 与画布内旋转叠加（预期效果，非 bug）")
                 self._append_info_ui(
-                    f"[画布模式] 子视频画布 {cw}x{ch}（透明底），内容基准 {W}x{H}{_note}")
+                    _('[画布模式] 子视频画布 {0}x{1}（透明底），内容基准 {2}x{3}{4}').format(cw, ch, W, H, _note))
             except Exception:
                 pass
         return _cg
@@ -26068,14 +29066,7 @@ class FFmpegBatchGUI:
 
     def _build_cycle_once_expr(self, enc_settings: dict) -> str:
         """循环显示（周期/单次）enable 子表达式；未填时返回空串。"""
-        def _f(v):
-            v = (v or "").strip()
-            if v == "":
-                return None
-            try:
-                return float(v)
-            except (ValueError, TypeError):
-                return None
+        _f = _opt_float  # 空串/None/非法 → None（2026-09-22 抽公共，原局部 _f 上移）
         cycle = _f(enc_settings.get("show_cycle"))
         once = _f(enc_settings.get("show_once"))
         if cycle is not None and once is not None and cycle > 0 and once > 0:
@@ -26087,14 +29078,7 @@ class FFmpegBatchGUI:
         仅设开始(非0)且设了有限循环次数 → 与 _resolve_display_window 一致收口为
         between(t,开始,开始+有效时长×次数)，避免窗口有界而 enable 无界→EOF 后冻帧；
         无限循环/无次数 → 维持 gte(t,开始) 无界。开始=0 视为未设置。"""
-        def _f(v):
-            v = (v or "").strip()
-            if v == "":
-                return None
-            try:
-                return float(v)
-            except (ValueError, TypeError):
-                return None
+        _f = _opt_float  # 空串/None/非法 → None（2026-09-22 抽公共，原局部 _f 上移）
         start = _f(enc_settings.get("show_start"))
         end = _f(enc_settings.get("show_end"))
         # 开始=0 视为未设置（与 _resolve_display_window 一致）
@@ -26139,14 +29123,7 @@ class FFmpegBatchGUI:
             · count → T = effective_duration * loop_count
         - loop_mode=infinite → 无界（恒显示，不优化）。
         """
-        def _f(v):
-            v = (v or "").strip()
-            if v == "":
-                return None
-            try:
-                return float(v)
-            except (ValueError, TypeError):
-                return None
+        _f = _opt_float  # 空串/None/非法 → None（2026-09-22 抽公共，原局部 _f 上移）
         s = _f(enc_settings.get("show_start"))
         e = _f(enc_settings.get("show_end"))
         # 开始=0 视为「未设置开始」（用户规则：开始0+无结束 → 等同没设开始，按次数收口）
@@ -26241,6 +29218,7 @@ class FFmpegBatchGUI:
             self.preview_max_h.set(settings.get("preview_max_h", _GLOBAL_SETTINGS["preview_max_h"]))
             self.ffprobe_timeout.set(settings.get("ffprobe_timeout", _GLOBAL_SETTINGS["ffprobe_timeout"]))
             self.preview_margin.set(settings.get("preview_margin", 80))
+            self.preview_volume.set(max(0, min(100, int(settings.get("preview_volume", 10)))))
             # 2026-08-30：上限 / 预览选项
             self.sub_video_preview_max.set(max(1, min(30, int(settings.get("sub_video_preview_max", 15)))))
             self.waypoint_max_rows.set(max(1, min(99, int(settings.get("waypoint_max_rows", 15)))))
@@ -26333,6 +29311,7 @@ class FFmpegBatchGUI:
             "preview_max_h": self.preview_max_h.get(),
             "ffprobe_timeout": self.ffprobe_timeout.get(),
             "preview_margin": self.preview_margin.get(),
+            "preview_volume": self.preview_volume.get(),
             # 2026-08-30：上限 / 预览选项
             "sub_video_preview_max": self.sub_video_preview_max.get(),
             "waypoint_max_rows": self.waypoint_max_rows.get(),
@@ -26381,6 +29360,8 @@ class FFmpegBatchGUI:
             self.ffprobe_timeout.set(ft)
             self.preview_max_w.set(pw)
             self.preview_max_h.set(ph)
+            pv = max(0, min(100, self.preview_volume.get()))
+            self.preview_volume.set(pv)
             # 2026-08-30：上限设置 clamp
             sv = max(1, min(30, self.sub_video_preview_max.get()))
             self.sub_video_preview_max.set(sv)
@@ -26413,6 +29394,7 @@ class FFmpegBatchGUI:
                 "wave_sr": wsr,
                 "frame_cache_max": fcm,
                 "fonts_recent_max": frm,
+                "preview_volume": pv,
             })
             self.save_player_settings()
         finally:
@@ -26474,6 +29456,7 @@ class FFmpegBatchGUI:
         _ph = tk.IntVar(value=self.preview_max_h.get())
         _ft = tk.IntVar(value=self.ffprobe_timeout.get())
         _pm = tk.IntVar(value=self.preview_margin.get())
+        _pv = tk.IntVar(value=self.preview_volume.get())
         # 2026-08-30：上限 / 预览选项
         _sv = tk.IntVar(value=self.sub_video_preview_max.get())
         _wr = tk.IntVar(value=self.waypoint_max_rows.get())
@@ -26577,26 +29560,40 @@ class FFmpegBatchGUI:
               "波形铺满整条时间轴，比画面模式更吃宽度，故默认给得更宽。"))
         _cell(g, 2, 0, _("预览屏幕边距:"), _pm, 20, 400, "px",
               _("播放预览/轨道预览缩放时屏幕四周保留的边距；小屏可调小，多屏可调大。"))
+        _cell(g, 2, 1, _("预览音量:"), _pv, 0, 100, "(0~100)",
+              _("所有预览播放的音量（ffplay -volume，0~100），一处调整处处生效：\n"
+              "· A/V 设置弹窗里的「音量」与内置时间预览的音频引擎；\n"
+              "· 实时预览（复杂滤镜）走 ffplay 时的回退；轨道预览 / 转换页预览。\n"
+              "在 A/V 设置弹窗里改音量也会写回这里（同一个数）。"))
         # 变速/倒放预览（2026-08-30）：滤镜变速 setpts（与转换一致）↔ mpv 整体变速 --speed 互斥；
         # mpv 整体倒放 --play-direction=backward 独立开关（滤镜倒放 reverse 预览已取消）。
-        _check(g, 3, 0, _("滤镜变速预览（setpts）"), _ft_speed,
-               _("开启后，预览滤镜链真正生成 setpts=1/倍率*PTS（与转换命令一致）——\n"
-               "子视频/轨道的独立变速效果直接可见，不受播放器整体变速影响。\n"
-               "⚠️ 与「mpv 整体变速预览」互斥（二选一，勾选本项自动取消另一项）。\n"
-               "⚠️ 主视频开启时，文字水印时段/简易位置等按变速后时间显示（滤镜链语义）。"),
-               cmd=_excl(_ft_speed, _rt_speed), span=2)
-        _check(g, 4, 0, _("mpv 整体变速预览（--speed）"), _rt_speed,
-               _("开启后，「播放预览」用 mpv 整体变速（--speed=倍率，整个画面播放速度，\n"
-               "mpv 独有命令），不生成临时文件，仅预览、不影响导出。\n"
-               "⚠️ 整体变速≠滤镜变速：子视频自己的变速请用「滤镜变速预览（setpts）」。\n"
-               "⚠️ 与滤镜变速互斥（二选一）；大文件建议自转短视频片段检查，小文件实时预览没问题。"),
-               cmd=_excl(_rt_speed, _ft_speed), span=2)
-        _check(g, 5, 0, _("mpv 整体倒放预览（--play-direction）"), _rt_rev,
-               _("开启后，「播放预览」用 mpv 整体倒放（--play-direction=backward，整个画面倒放，\n"
-               "mpv 独有命令，逐段向后 seek），不生成临时文件，仅预览、不影响导出。\n"
-               "⚠️ 滤镜倒放（reverse）预览不支持，子视频倒放请用转换导出验证。\n"
-               "⚠️ 大文件/长文件实时倒放会卡顿，建议自转短视频片段检查。"),
-               span=2)
+        # 2026-09-21：三个开关并排一行（原各占整行，纵向太占地方）；文案与 tooltip 不变。
+        _sw_row = ttk.Frame(g)
+        _sw_row.grid(row=3, column=0, columnspan=2, sticky="w", pady=1)
+        for _txt, _var, _tip, _cmd in (
+            (_("滤镜变速预览（setpts）"), _ft_speed,
+             _("开启后，预览滤镜链真正生成 setpts=1/倍率*PTS（与转换命令一致）——\n"
+             "子视频/轨道的独立变速效果直接可见，不受播放器整体变速影响。\n"
+             "⚠️ 与「mpv 整体变速预览」互斥（二选一，勾选本项自动取消另一项）。\n"
+             "⚠️ 主视频开启时，文字水印时段/简易位置等按变速后时间显示（滤镜链语义）。"),
+             _excl(_ft_speed, _rt_speed)),
+            (_("mpv 整体变速预览（--speed）"), _rt_speed,
+             _("开启后，「播放预览」用 mpv 整体变速（--speed=倍率，整个画面播放速度，\n"
+             "mpv 独有命令），不生成临时文件，仅预览、不影响导出。\n"
+             "⚠️ 整体变速≠滤镜变速：子视频自己的变速请用「滤镜变速预览（setpts）」。\n"
+             "⚠️ 与滤镜变速互斥（二选一）；大文件建议自转短视频片段检查，小文件实时预览没问题。"),
+             _excl(_rt_speed, _ft_speed)),
+            (_("mpv 整体倒放预览（--play-direction）"), _rt_rev,
+             _("开启后，「播放预览」用 mpv 整体倒放（--play-direction=backward，整个画面倒放，\n"
+             "mpv 独有命令，逐段向后 seek），不生成临时文件，仅预览、不影响导出。\n"
+             "⚠️ 滤镜倒放（reverse）预览不支持，子视频倒放请用转换导出验证。\n"
+             "⚠️ 大文件/长文件实时倒放会卡顿，建议自转短视频片段检查。"),
+             None),
+        ):
+            _cb = ttk.Checkbutton(_sw_row, text=_txt, variable=_var, command=_cmd)
+            _cb.pack(side=tk.LEFT, padx=(0, 14))
+            ToolTip(_cb, _tip, wraplength=440)
+            _cb.configure(cursor="question_arrow")
 
         # ==================== ③ 波形与缓存 ====================
         g = _group(_("波形与缓存"))
@@ -26618,9 +29615,13 @@ class FFmpegBatchGUI:
 
         # ==================== ④ 数量上限 ====================
         g = _group(_("数量上限"))
-        _cell(g, 0, 0, _("子视频上限(预览):"), _sv, 1, 30, "(1~30)",
-              _("画中画实时预览支持的子视频数量上限。\n"
-              "超过则预览仅渲染前 N 个（正常导出不受影响，导出无此上限）。"))
+        _cell(g, 0, 0, _("预览轨数上限:"), _sv, 1, 30, "(1~30)",
+              _("预览时最多渲染的视频轨/子视频数量——一处设置同时约束「实时预览（复杂滤镜，外部播放器）」\n"
+              "与「实时预览（简易时间引擎，内置管道）」两条入口：\n"
+              "① 画中画：主视频 + 最多前 N 个子视频；\n"
+              "② 串行合并：最多前 N 个视频轨拼接。\n"
+              "轨数越多滤镜图越大、mpv 首次加载越慢（60+ 轨可能等 20 秒以上），内置引擎 CPU 逐帧\n"
+              "blit 更吃力，故设上限。超过则预览仅渲染前 N 个（正常导出不受影响，导出无此上限）。"))
         _cell(g, 0, 1, _("多流同步最大轨数:"), _smt, 2, 16, _("轨"),
               _("一次最多同时比对多少条视频轨的波形偏移。\n"
               "默认 6 条；需要更多轨一起对齐时可加大，但轨数越多波形越密、生成越慢。"))
@@ -26699,6 +29700,7 @@ class FFmpegBatchGUI:
             self.preview_max_h.set(_clamp(_ph.get(), 240, 960))
             self.ffprobe_timeout.set(_clamp(_ft.get(), 2, 60))
             self.preview_margin.set(_clamp(_pm.get(), 20, 400))
+            self.preview_volume.set(_clamp(_pv.get(), 0, 100))
             # 2026-08-30：上限 / 预览选项（_sync_global_settings 内会再 clamp；互斥由 trace 兜底）
             self.sub_video_preview_max.set(_clamp(_sv.get(), 1, 30))
             self.waypoint_max_rows.set(_clamp(_wr.get(), 1, 99))
@@ -26761,10 +29763,17 @@ class FFmpegBatchGUI:
         - 截取 + once：None（单次截取不循环，chain 内 trim 单次处理）
         - 截取 + 循环：片段帧数（trim 后循环片段，先 trim 再无限 loop）
         - 拿不到帧率/时长 → None（不循环）
+        - 静态图片：**恒为 1**（整段就是 1 帧）
         与正式命令 _build_overlay_filter_complex 的循环语义对齐（先 trim 后 loop）。"""
         # 循环模式 once：单次显示，不循环
         if s.get("loop_enabled", False) and s.get("loop_mode") == "once":
             return None
+        # 静态图片子视频：整段只有 1 帧 → 循环帧数恒为 1（封装页 / 封面预览同款 size=1 口径）。
+        # 为什么必须显式短路：图片的 fps / 时长探测都不可靠（avg_frame_rate 可能是 0/0，
+        # format=duration 可能是 N/A / 0.04）→ 探测失败就返回 None = 不循环 → 子视频只出
+        # 1 帧「瞬间消失」（用户报的现象）。图片永远有 1 帧可循环，不必探测。
+        if self._is_static_image(file_path):
+            return 1
         try:
             fps = self._get_video_framerate(file_path)
         except Exception:
@@ -26780,14 +29789,15 @@ class FFmpegBatchGUI:
             d = (esec - ssec) if (esec is not None and ssec is not None and esec > ssec) else None
             if d is None:
                 try:
-                    rd = self._get_media_duration(file_path)
+                    # 帧对齐（floor 到源帧格）：loop 缓冲=真实帧数，防回放泄漏闪首帧
+                    rd = self._get_media_duration(file_path, frame_align_fps=fps)
                 except Exception:
                     rd = None
                 if rd is not None:
                     d = rd - (ssec or 0.0)
         else:
             try:
-                d = self._get_media_duration(file_path)
+                d = self._get_media_duration(file_path, frame_align_fps=fps)
             except Exception:
                 d = None
         if d is None or d <= 0:
@@ -26895,23 +29905,160 @@ class FFmpegBatchGUI:
                 _("[预览] mpv 不可用（{0} 无法启动），已回退 ffplay").format(raw or '未设置'))
         return bool(self._mpv_usable)
 
-    def preview_with_player(self, input_path, filters=None, audio_only=False, volume=10,
+
+
+    def _retarget_lavfi_labels(self, lavfi_complex, in_label, out_label,
+                               drop_amovie=False, require_out=False):
+        """mpv --lavfi-complex 图（占位 [VIN]/[VOUT]/[vid1]/[vo]）→ 目标标签体系的重定向。
+
+        2026-09-22 合并：原 `_lavfi_complex_to_ffplay` 与 `_lavfi_complex_to_ffmpeg_pipe`
+        是**逐行同构的两份实现**，只差三件事 —— 输入标签名、输出标签名、是否连 amovie=
+        混音段一起删（外加管道版要校验输出标签确实存在）。差异全部收成本方法的参数，两处
+        调用方只剩一行委托，避免改一处漏一处。
+
+        :param in_label:   主视频输入标签（ffplay "[in]" / ffmpeg 管道 "[0:v]"）
+        :param out_label:  末段输出标签（ffplay "[out]" / 管道 "[pv_src]" 等临时标签）
+        :param drop_amovie: True 时连含 amovie= 的混音段一并删除（管道只出画面时用）
+        :param require_out: True 时输出标签不在结果里就返回 ''（管道靠它判「图不可用」）
+        """
+        if not lavfi_complex:
+            return ""
+        g = lavfi_complex.replace("[VIN]", in_label).replace("[vid1]", in_label)
+        g = g.replace("[VOUT]", out_label).replace("[vo]", out_label)
+        # 音频段整体删除：目标侧的主音轨不在这张视频图里引用（ffplay 随 -i 自动播放、
+        # 管道由 SimplePreviewer 的 ffplay 引擎按原文件放）。
+        # [amain_pv]/[asw]/[asub]：画中画预览的混音/替换子声段（amovie 源 + amix），
+        # ffplay 路线一并删除——子声混音仅 mpv 预览合成，ffplay 退回主音频直放。
+        segs = g.split(";")
+        kept = [s for s in segs
+                if not ("[AIN]" in s or "[AOUT]" in s or "[aid1]" in s or "[ao]" in s
+                        or "[amain_pv]" in s or "[asw" in s or "[asub" in s
+                        or (drop_amovie and "amovie=" in s))]
+        g = ";".join(kept)
+        if require_out and out_label not in g:
+            return ""
+        return g
+
+    def _lavfi_complex_to_ffplay(self, lavfi_complex):
+        """mpv --lavfi-complex 图（占位 [VIN]/[VOUT]/[vid1]/[vo] 等）→ ffplay -vf 图。
+
+        依据 research/ffplay-preview 真机实测（n9.0.1）：ffplay 的 -vf 就是一条完整 filtergraph，
+        支持分号多段图 + [in]/[out] 显式标签 + movie=/amovie= 任意数量额外输入。所以画布、PiP
+        （多子视频）、xfade 转场、concat 串行合并、BGM 混音 ffplay 全能出画面，无需 mpv。
+
+        转换规则（README §3 映射表 + §4 机制）：
+          - [VIN] 或 [vid1] → [in]（主视频；ffplay 的 -i 输入，固定标签）
+          - [VOUT] 或 [vo]  → [out]
+          - [AIN]/[AOUT]/[aid1]/[ao] 音频 passthrough 段整体删除：ffplay 主音频由 -i 直接播放，
+            无需在 -vf 内引用（删掉后主音轨自动透传；若图内含 amovie= 混音则另行走 -af）。
+          - 图内不得出现输入序号标签（[0:v] 等）：ffplay 无 -map，主输入固定 [in]，调用方
+            构建时须已用 [VIN]/[vid1] 占位（本文件各预览函数均遵守）。
+          - movie=/amovie= 路径沿用调用方已做的盘符冒号转义（C\\:/...，复用 base 5273 口径），
+            ffplay 与 mpv 同款转义，无需再处理。
+        返回 ffplay 可直接 -vf 的字符串；若转换后为空则返回 ''（调用方应回退普通路径或报错）。
+        """
+        return self._retarget_lavfi_labels(lavfi_complex, "[in]", "[out]")
+
+    def _lavfi_mix_audio_to_ffplay_af(self, graph):
+        """画中画预览图的混音段 → ffplay -af 图（[aid1]→[in]、[ao]→[out]）。
+
+        ffplay 的 -af 与 -vf 同一机制（完整 filtergraph，research/ffplay-preview 实测）。
+        此前 ffplay 一律删除混音段、退回主音频直放；真时间轴下子声段占时间轴后半，
+        直放 = 用户实测「ffplay 只有第一段声音」。把 [aid1] 主声床 + [asub/asw] amovie
+        子声段整体搬进 -af，与 mpv --lavfi-complex 同口径出声。
+        返回 '' 表示图内无混音段（调用方走原直放/裁切口径）。"""
+        if not graph or "[amain_pv]" not in graph:
+            return ""
+        _segs = [s for s in graph.split(";")
+                 if ("[aid1]" in s or "[amain_pv]" in s
+                     or "[asub" in s or "[asw" in s or "[ao]" in s)]
+        _g = ";".join(_segs).replace("[aid1]", "[in]").replace("[ao]", "[out]")
+        if "[in]" not in _g or "[out]" not in _g:
+            return ""
+        return _g
+
+    def _lavfi_mix_audio_standalone(self, graph, main_file):
+        """画中画预览图的混音段 → 独立 lavfi 音频图（管道时间预览引擎用）。
+
+        管道引擎的合成音频走 ffplay -f lavfi（SimplePreviewer._a_start 的 _pipe_audio_graph
+        分支），该模式**没有任何外部输入** → 与 _lavfi_mix_audio_to_ffplay_af（ffplay -af，
+        主输入 [in]）不同：[aid1] 主声床必须改成 amovie=主文件 自供；子声段本就是 amovie 源，
+        原样保留。末标签固定 [ao]，由调用方作 pipe_audio_map 传引擎（引擎在其后接
+        atrim=start=at 精定位，与串行合并管道音频同口径）。
+        返回 '' 表示图内无音频段（调用方不传，引擎回退直读主文件音轨）。"""
+        if not graph or ("[amain_pv]" not in graph and "[aid1]" not in graph):
+            return ""
+        _segs = [s for s in graph.split(";")
+                 if ("[aid1]" in s or "[amain_pv]" in s
+                     or "[asub" in s or "[asw" in s or "[ao]" in s)]
+        if not _segs:
+            return ""
+        _esc = self._movie_path_safe(main_file).replace("\\", "/").replace(":", "\\\\:")
+        _out = []
+        for _s in _segs:
+            if "[aid1]" in _s:
+                _out.append(f"amovie={_esc}[pv_amsrc]")
+                _out.append(_s.replace("[aid1]", "[pv_amsrc]"))
+            else:
+                _out.append(_s)
+        _g = ";".join(_out)
+        if "[ao]" not in _g:
+            return ""
+        return _g
+
+    def _lavfi_complex_to_ffmpeg_pipe(self, lavfi_complex, src_label="pv_src"):
+        """预览复杂图（[VIN]/[VOUT]/[vid1]/[vo] 占位）→ SimplePreviewer 管道用 -filter_complex 图。
+
+        与 _lavfi_complex_to_ffplay 的区别：ffplay 用 -vf（主输入是固定标签 [in]/[out]），
+        而 ffmpeg 管道用 -filter_complex + -map，主输入标签是 [0:v]，末段输出改成一个临时
+        标签（默认 [pv_src]），由调用方（SimplePreviewer._launch_video_pipe）追加预览缩放
+        后再映射。转换规则：
+          - [VIN] / [vid1] → [0:v]（外部 -i 主输入，ffmpeg 的输入流标签）
+          - [VOUT] / [vo]  → [src_label]（占位，调用方接 scale/pad/fps 后 -map）
+          - 音频段整体删除：含 [AIN]/[AOUT]/[aid1]/[ao] 的段，以及 amovie= 混音段——
+            管道只输出画面，音频由 SimplePreviewer 的 ffplay 引擎按原文件播放。
+          - ⚠️ 本函数【不做 seek 对齐】：图内 movie= 子输入不吃命令行 -ss，多输入图 seek 后
+            会与主输入错位（见 research/preview/README1.md 修正表 #2）→ 调用方必须在**【单输入】
+            场景**才启用本管道（转换页水印/裁剪/变速/旋转/画布、合并页单视频轨）。
+        返回可直接 -filter_complex 的字符串；'' 表示不可用（图内无视频输出段）。"""
+        return self._retarget_lavfi_labels(
+            lavfi_complex, "[0:v]", "[%s]" % src_label,
+            drop_amovie=True, require_out=True)
+
+
+    def preview_with_player(self, input_path, filters=None, audio_only=False, volume=None,
                             extra_args=None, start_time=None, duration=None,
-                            lavfi_complex=None, mpv_only_args=None):
+                            lavfi_complex=None, mpv_only_args=None,
+                            image_duration=None):
         """
         启动播放器预览
         :param start_time: 起始时间（秒或时间字符串），仅 ffplay 使用，mpv 通过 extra_args 传递 --start
         :param duration: 播放时长（秒），仅 ffplay 使用
         :param filters: 普通 -vf 链（mpv 用 --vf=lavfi=[...] 包装，ffplay 直接 -vf）。
-        :param lavfi_complex: mpv 复杂图（如文字水印旋转/轨迹），用 --lavfi-complex= 传递
-               （与 -vf 互斥）。占位标签：[VIN]=视频输入 [AIN]=音频输入(可选)
-               [VOUT]=视频输出 [AOUT]=音频输出(可选)，按 mpv 约定替换为 [vid1]/[aid1]/[vo]/[ao]
-               （注意音频输入是 aid1，不是 a1）。ffplay 不支持复杂图（无 -filter_complex），
-               其 -vf 直接支持分号多段图（文字水印旋转走此路线）。
+        :param lavfi_complex: mpv 复杂图（如文字水印旋转/轨迹/画布/PiP），用 --lavfi-complex= 传递
+               （与 -vf 互斥）。占位标签：[VIN]/[vid1]=视频输入 [AIN]/[aid1]=音频输入(可选)
+               [VOUT]/[vo]=视频输出 [AOUT]/[ao]=音频输出(可选)。mpv 不可用（本机常无 mpv）时，
+               经 _lavfi_complex_to_ffplay 改写成 ffplay -vf 分号多段图（[VIN]→[in]、[VOUT]→[out]、
+               音频 passthrough 段删除），ffplay 同样能出合成画面——不再是「只播原始画面」。
+               实测参见 research/ffplay-preview：ffplay 的 -vf 即为完整 filtergraph。
         :param mpv_only_args: 仅 mpv 生效的播放器参数（如 --speed / --play-direction=backward，
                实时变速/倒放预览用）。回退 ffplay 时自动丢弃并打一条提示日志。
         """
+        # 音量：单一参数（更多设置 → 预览音量，默认 10）。调用方不再各自写死 10/30 ——
+        # 传 None 即用当前设置值（2026-09-21 统一）。
+        if volume is None:
+            try:
+                volume = int(self.preview_volume.get())
+            except Exception:
+                volume = 10
+        volume = max(0, min(100, int(volume)))
         file_path = normalize_path(input_path)
+        # 【mpv/ffplay 回退路径】复杂图内视频 movie= 子输入注入各自 trim 起点的 seek_point
+        # （与管道引擎同效、纯解码跳过优化、输出逐字节不变）。仅当图含 `movie=X[L];[L]trim=start=S`
+        # 才生效，图片/无 trim 子输入自动跳过，零回归。mpv(--lavfi-complex) 与 ffplay(-vf) 共用
+        # 同一 lavfi_complex，注入一次即两路同时受益。
+        if lavfi_complex:
+            lavfi_complex = SimplePreviewer._inject_movie_seek_point_per_sub(lavfi_complex)
         extra_args = extra_args or []
         used_mpv = False  # 记录本次实际走了 mpv（Popen 异常兜底回退时用）
 
@@ -26930,8 +30077,29 @@ class FFmpegBatchGUI:
                     c.append(f"--vf=lavfi=[{filters}]")
             if start_time is not None:
                 c.append(f"--start={start_time}")
+                # 【秒开】关掉 hr-seek（mpv 精确 seek）。原因（research/mpv-seek §8 实测）：
+                # 预览图是「主/子各经 trim=start=S,setpts=PTS-STARTPTS 归零」的 0 基模型，
+                # 而 mpv --start=S 的时钟仍从 S 起 ⇒ 输出与时钟错位，mpv 必须**先把 S 秒的
+                # 滤镜输出消耗掉**才显示首帧（实测 S=285：1.97s；且首帧画面本身是错的——
+                # 主链先 EOF 定格段末、子画面被拉到素材第 285 秒）。
+                # 关掉 hr-seek 后 mpv 落到关键帧即出画、不再等精确时刻，而图内 trim 会精确
+                # 裁掉「关键帧→S」⇒ **画面仍准**：首帧 1.97s→0.29s，且与「不 seek 的正确
+                # 渲染」首帧 MD5 完全相同。仅随 --start 一起加（不 seek 的预览零变化）。
+                c.append("--hr-seek=no")
             if duration is not None:
                 c.append(f"--length={duration}")
+            if image_duration is not None and _is_static_image_file(file_path):
+                # 图片主视频：按用户「显示时长」停留 N 秒。
+                # 关键分支：若 lavfi_complex 已被 wrap_image_static_timed_complex 改写
+                # （含 [cd_base] 连续基源，使 [v0] 变连续流），则必须用 --length 驱动播放，
+                # 绝不能再用 --image-display-duration —— 后者只让单帧停留 N 秒，复杂图时间变量
+                # t 仍卡死，倒计时/轨迹/旋转不动（即用户最初报告的现象）。这精确镜像用户
+                # 已验证可用的 fade 命令：color r=d + --length，连续基源作主时间轴。
+                # 未改写的图片+复杂图（如画布图，首节点非 [VIN]{base_vf}[v0]）保持原行为。
+                if lavfi_complex and "[cd_base]" in lavfi_complex:
+                    c.append(f"--length={image_duration:g}")
+                else:
+                    c.append(f"--image-display-duration={image_duration:g}")
             if mpv_only_args:
                 c.extend(mpv_only_args)
             if extra_args:
@@ -26947,21 +30115,62 @@ class FFmpegBatchGUI:
                     c.extend(["-ss", str(start_time)])
                 if duration is not None:
                     c.extend(["-t", str(duration)])
+                if image_duration is not None and _is_static_image_file(file_path):
+                    # 图片（无音轨）按显示时长限输入时长，纯防御（图片不会走 audio_only 预览）
+                    c.extend(["-t", f"{image_duration:g}"])
                 c.append(file_path)
             else:
                 c = [self.ffplay_cmd]
-                if start_time is not None:
+                # 图片主视频：无时间轴可言 —— -ss 只会取到空帧（图片素材 seek 无意义），
+                # 截取派生时长也不能拿来限输入时长（图片 ffprobe 只有 ~0.04s / N/A）。
+                # 时长统一由「图片显示时长」走下面的 -t + 图内 trim 收尾（对齐 mpv --image-display-duration）。
+                _img_main = image_duration is not None and _is_static_image_file(file_path)
+                if start_time is not None and not _img_main:
                     c.extend(["-ss", str(start_time)])
-                if duration is not None:
+                if duration is not None and not _img_main:
                     c.extend(["-t", str(duration)])
+                if _img_main:
+                    # 循环交给【图内 loop 滤镜】（下方 ffplay_image_main_vf）：
+                    # ffplay 的 -loop 1 对 image2 实测无效（1 帧即退，0.64s）。
+                    c.append("-autoexit")
                 c.extend(["-i", file_path])
-                if filters:
-                    c.extend(["-vf", filters])
+                if _img_main:
+                    # 输出级 -t 限制播放时长（N 秒后 EOF → autoexit 关窗）
+                    c.extend(["-t", f"{image_duration:g}"])
+                _vf_val = ""
+                if lavfi_complex:
+                    # mpv 不可用时的复杂图回退：转 ffplay -vf 分号多段图。
+                    # 研究 ffplay-preview 实证：画布/文字水印旋转/图片水印真实合成/PiP/串行合并
+                    # 全都能出合成画面，不再是「只播原始画面」。
+                    _vf_val = self._lavfi_complex_to_ffplay(lavfi_complex)
+                    if _vf_val:
+                        self._append_info_ui(
+                            _("[预览] 复杂图经 ffplay -vf 回退渲染（合成画面，非原始画面）"))
+                    else:
+                        self._append_info_ui(
+                            _("[预览] 复杂图转 ffplay -vf 失败，已回退原始画面"))
+                        _vf_val = filters or ""
+                elif filters:
+                    _vf_val = filters
+                if _vf_val:
+                    if _img_main:
+                        # 图片主视频：图首注入 loop=loop=-1:size=1（无限流）+ 图尾 trim=0:N 收尾
+                        # → -autoexit 转为等【输出】结束，窗口不再 1 帧就消失。见函数 docstring。
+                        _looped = ffplay_image_main_vf(_vf_val, image_duration)
+                        if _looped != _vf_val:
+                            self._append_info_ui(
+                                _('[预览] 图片主视频：图内 loop 单帧 + 末端 trim=0:{0:g} 收尾（ffplay 的 -loop 1 对图片无效）').format(image_duration))
+                        else:
+                            self._append_info_ui(
+                                _("[预览] 图片主视频：滤镜图无 [in] 占位，无法注入 loop 前缀"
+                                "（可能只显示 1 帧）"))
+                        _vf_val = _looped
+                    c.extend(["-vf", _vf_val])
                 c.extend(["-volume", str(volume)])
                 if extra_args:
                     c.extend(extra_args)
                 if "-window_title" not in c:
-                    c.extend(["-window_title", _("预览: {0}").format(os.path.basename(file_path))])
+                    c.extend(["-window_title", _('预览: {0}').format(os.path.basename(file_path))])
             return c
 
         if self._mpv_ready():
@@ -26976,37 +30185,142 @@ class FFmpegBatchGUI:
                 self._append_info_ui(_("[预览] 实时变速/倒放预览仅 mpv 支持，当前用 ffplay，已忽略。"))
 
         self._append_info_ui(_("执行命令: ") + format_cmd_for_display(cmd))
+        # 研究 §4.7：ffplay 滤镜图（复杂图/-vf）出错 rc 仍 0，Popen 不抛异常、拿不到失败信号，
+        # 故 _spawn_player_stderr_scan 落 stderr 到临时文件、进程退出后回读扫错。
+        # 仅 ffplay 路径（非 mpv）需要扫；mpv 走 lavfi-complex 保留原行为（stderr 丢弃）。
+        _has_vf = lavfi_complex is not None or filters is not None
+        _proc = self._spawn_player_stderr_scan(cmd, scan_ffplay=(not used_mpv and _has_vf))
+        if _proc is None and used_mpv:
+            # 兜底：标志检测后 mpv 仍可能被删/移动（竞态）——Popen 抛 OSError 说明
+            # 进程根本起不来（=mpv 不可用），置标志并回退 ffplay。
+            # 注意：滤镜图错误时 mpv 进程能启动、只是退出码非零，Popen 不抛异常，
+            # 永远不会进到这里（滤镜错误绝不回退）。
+            self._mpv_usable = False
+            self._mpv_verified = True   # 已实测失败，后续预览直接回退不再重试子进程
+            raw = self.mpv_path.get().strip()
+            _e = getattr(self, "_last_spawn_err", None)
+            self._append_info_ui(_('[预览] mpv 启动失败（{0}）：{1}，已回退 ffplay').format(raw, _e))
+            fb = _build_ffplay()
+            if fb is None:
+                self._append_info_ui(_("未找到 ffplay，无法预览。"))
+                return
+            if lavfi_complex and not audio_only:
+                self._append_info_ui(_("[预览] 提示：原预览为 mpv 复杂图（lavfi-complex），"
+                                     "已改写为 ffplay -vf 渲染合成画面（ffplay 的 -vf 即完整 filtergraph，"
+                                     "实测支持画布/PiP/串行合并/水印合成）。"))
+            if mpv_only_args and not audio_only:
+                self._append_info_ui(_("[预览] 实时变速/倒放预览仅 mpv 支持，回退后已忽略。"))
+            self._append_info_ui(_("执行命令: ") + format_cmd_for_display(fb))
+            self._spawn_player_stderr_scan(fb, scan_ffplay=_has_vf)
+    def _reap_prev_preview_player(self):
+        """结束「上一次预览启动的」播放器进程（mpv / ffplay）。
+
+        为什么需要（2026-09-20 用户报「重音」）：视频预览的 ffplay 不带 -autoexit
+        （播完停在末帧、窗口常开由用户自行关闭），mpv 同理 —— 窗口会一直留着。
+        此时再点一次预览就变成**两个播放器同时出声** → 听到重音。画布/画中画这类
+        需要反复调参的场景会连点多次，最明显。
+
+        ⚠️ 只结束本程序上一次预览自己启动的进程：绝不按进程名全量 taskkill
+        （用户可能另外开着独立播放器）。进程可能已自然退出/句柄失效 → 静默忽略。
+        """
+        _p = getattr(self, "_preview_player_proc", None)
+        self._preview_player_proc = None
+        if _p is None:
+            return
         try:
-            flags = _ffmpeg_spawn_flags()
-            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
-        except Exception as e:
-            if used_mpv:
-                # 兜底：标志检测后 mpv 仍可能被删/移动（竞态）——Popen 抛 OSError 说明
-                # 进程根本起不来（=mpv 不可用），置标志并回退 ffplay。
-                # 注意：滤镜图错误时 mpv 进程能启动、只是退出码非零，Popen 不抛异常，
-                # 永远不会进到这里（滤镜错误绝不回退）。
-                self._mpv_usable = False
-                self._mpv_verified = True   # 已实测失败，后续预览直接回退不再重试子进程
-                raw = self.mpv_path.get().strip()
-                self._append_info_ui(_("[预览] mpv 启动失败（{0}）：{1}，已回退 ffplay").format(raw, e))
-                fb = _build_ffplay()
-                if fb is None:
-                    self._append_info_ui(_("未找到 ffplay，无法预览。"))
-                    return
-                if lavfi_complex and not audio_only:
-                    self._append_info_ui(_("[预览] 提示：原预览为 mpv 复杂图（lavfi-complex），"
-                                         "ffplay 不支持复杂图，回退后为原始画面；如需合成效果请用快照预览"))
-                if mpv_only_args and not audio_only:
-                    self._append_info_ui(_("[预览] 实时变速/倒放预览仅 mpv 支持，回退后已忽略。"))
-                self._append_info_ui(_("执行命令: ") + format_cmd_for_display(fb))
-                try:
-                    flags = _ffmpeg_spawn_flags()
-                    subprocess.Popen(fb, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
-                except Exception as e2:
-                    self._append_info_ui(_("预览失败: {0}").format(e2))
-            else:
-                self._append_info_ui(_("预览失败: {0}").format(e))
+            if _p.poll() is None:
+                _p.terminate()
+        except Exception:
+            pass
     
+    def _spawn_player_stderr_scan(self, cmd, scan_ffplay=False):
+        """启动播放器并（按需）捕获 stderr 回读扫错。
+
+        研究 ffplay-preview §4.7：ffplay 的滤镜图（复杂图 / -vf）出错时**进程退出码仍为 0**
+        （mpv 同样静默），subprocess.Popen 永不抛异常、也拿不到失败信号——单看 rc 会误判成功。
+        所以必须落 stderr 到临时文件、等进程退出后回读扫错，才能发现「合成画面实际没渲染出来」。
+
+          - 正常播放（无错）：进程随窗口关闭而退，守护线程自然结束，无提示。
+          - 滤镜图错误：ffplay 立即退出（rc=0），线程读回 stderr 命中错误标记 → 打提示日志。
+          - 守护线程：长播放下挂起无害，不阻塞主线程、不拦窗口。
+          - 临时文件（非 PIPE）：Windows 跨进程安全，避免 PIPE 缓冲撑爆导致子进程卡死。
+
+        :param scan_ffplay: True 时扫 stderr 命中即提示（仅 ffplay 走 -vf 的复杂图风险路径需要）；
+                            mpv lavfi-complex 分支不扫（保留原行为，stderr 直接丢弃）。
+        :return: Popen 对象；进程根本起不来（OSError）时返回 None 并记 self._last_spawn_err。
+        """
+        flags = _ffmpeg_spawn_flags()
+        self._last_spawn_err = None
+        # 开新预览前先关掉上一次预览的播放器（防两个播放器同时出声 = 用户报的「重音」）。
+        self._reap_prev_preview_player()
+
+        def _spawn(_cmd, **_kw):
+            """Popen 后登记句柄：下一次预览启动前由 _reap_prev_preview_player 关闭。"""
+            _p = subprocess.Popen(_cmd, creationflags=flags, **_kw)
+            self._preview_player_proc = _p
+            _register_preview_proc(_p)
+            return _p
+
+        if not scan_ffplay:
+            try:
+                return _spawn(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as e:
+                self._last_spawn_err = e
+                self._append_info_ui(_('预览失败: {0}').format(e))
+                return None
+        # 需要扫 stderr：落临时文件（Windows 跨进程安全）
+        try:
+            _fh = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".ffplay.err", delete=False,
+                encoding="utf-8", errors="replace")
+            _path = _fh.name
+            _fh.close()
+        except Exception:
+            try:
+                return _spawn(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as e:
+                self._last_spawn_err = e
+                self._append_info_ui(_('预览失败: {0}').format(e))
+                return None
+        try:
+            _stderr_fh = open(_path, "w", encoding="utf-8", errors="replace")
+            proc = _spawn(cmd, stdout=subprocess.DEVNULL, stderr=_stderr_fh)
+            _stderr_fh.close()   # 父本句柄关闭；子进程已继承自身 fd，不受影响
+        except Exception as e:
+            self._last_spawn_err = e
+            self._append_info_ui(_('预览失败: {0}').format(e))
+            return None
+        _markers = ("Error processing filtergraph", "No such filter",
+                    "Error reinitializing filters", "Failed to configure",
+                    "Cannot find a matching stream", "Option not found",
+                    "Invalid argument")
+        _pp = _path
+
+        def _watch():
+            try:
+                proc.wait()
+            except Exception:
+                pass
+            try:
+                with open(_pp, "r", encoding="utf-8", errors="replace") as fh:
+                    _txt = fh.read()
+            except Exception:
+                return
+            if any(m in _txt for m in _markers):
+                _snip = _txt.strip()
+                if _snip:
+                    _snip = _snip[-800:]
+                self._append_info_ui(
+                    _("[预览] ffplay 滤镜图可能出错（进程退出码为 0，但 stderr 含错误，"
+                    "合成画面可能未渲染，请改用 mpv 或检查滤镜参数）：\n") + _snip)
+            try:
+                os.remove(_pp)
+            except Exception:
+                pass
+        threading.Thread(target=_watch, daemon=True).start()
+        return proc
+
+
     def _canvas_fit_scale(self, cw, ch):
         """画布预览屏幕自适应缩放（保持比例、偶数化），返回 scale=W:H 或 ''。"""
         try:
@@ -27033,10 +30347,76 @@ class FFmpegBatchGUI:
         if th < 2: th = 2
         return f"scale={tw}:{th}"
 
+    def _open_pipe_time_preview(self, file_path, settings, lavfi_complex_str,
+                                filter_chain, start_sec=None, duration=None,
+                                aspect=None, out_dur=None, out_start=0.0,
+                                pipe_audio_graph=None, pipe_audio_map=None):
+        """「时间预览引擎」入口（2026-09-20 Phase 1）：把预览合成图喂给内置时间预览窗口。
+
+        与其它预览入口的区别：不启动 mpv/ffplay，而是用 ffmpeg -filter_complex 渲染合成画面
+        → rawvideo 管道 → SimplePreviewer 显示。因此**保留标记 / 波形 / 逐帧步进 / 循环预览 /
+        A-V 仲裁**这些内置交互，且零外部播放器依赖。
+
+        多输入口径（2026-09-20 Phase 2 开放 + 当日二次修正）：图内 movie= 子输入不吃命令行 -ss，
+        故 _launch_video_pipe 按「子视频时间 = 主视频时间 − pipe_start」处理每个视频类 movie=：
+        **优先改写成外部 `-ss -i` 输入**（`_rewrite_movie_inputs`）→ 子输入也吃输入级 `-ss`，
+        与主输入同为帧精确；只有改不到的（静态图片 / 路径还原失败 / `[N:v]` 标签撞车）才退回
+        `seek_point` 近似（`_inject_movie_seek_point`，向后关键帧 seek、误差可达一个 GOP）。
+        两者都与正式导出口径一致（成片里主从 pipe_start 起算、子从 0 起算）。
+
+        aspect：合成图【真实输出】画面比（宽/高）。不传时预览框按源文件比例算 —— 而 split
+        平铺网格 / 画布 / 裁剪的合成尺寸常≠源尺寸 → 画面框比例错，图被 letterbox 后看着
+        「没铺满」（用户实测：2 格平铺时最明显）。故多输入路径必须下传真实比例。
+
+        out_dur / out_start：**输出时间轴**模式的时长与起点（目前仅串行合并用）。串行合并的图是
+        「输出时间轴」（多段 + xfade），与素材时间轴锚点不同，不能用素材时间轴 seek，故走
+        「输出侧 trim」：拖动时从头解码到目标点再显示（正确但 seek 慢）。
+        """
+        if not self.ffmpeg_cmd:
+            messagebox.showwarning(_("提示"), _("未找到 ffmpeg，无法预览"))
+            return
+        if lavfi_complex_str:
+            _graph = self._lavfi_complex_to_ffmpeg_pipe(lavfi_complex_str)
+            if not _graph:
+                self._append_info_ui(_("[时间预览] 合成图无法转为 ffmpeg 管道图，已取消"))
+                return
+        else:
+            _chain = (filter_chain or "").strip().strip(",")
+            _graph = "[0:v]%s[pv_src]" % (_chain if _chain else "null")
+        # 图片主视频：输出时长必须按「图片显示时长」封顶 —— ffprobe 给图片的时长只有 ~0.04s，
+        # 用它做输出级 -t 会导致预览只出一帧。
+        _pdur = out_dur
+        if _pdur is None and _is_static_image_file(file_path):
+            try:
+                _pdur = _eff_image_display_duration(settings)
+            except Exception:
+                _pdur = 10.0
+        self._append_info_ui(
+            _("[时间预览] 管道合成预览启动：ffmpeg -filter_complex → rawvideo（无需 mpv；"
+            "保留标记 / 波形 / 逐帧步进）"))
+        # 释放调用方弹窗的模态 grab（与 _open_simple_preview 同款，否则预览窗点击被吞）
+        try:
+            g = self.root.grab_current()
+            if g is not None:
+                g.grab_release()
+        except Exception:
+            pass
+        self.show_time_picker(
+            self.root, file_path,
+            use_output_context=False,   # 时间轴 = 窗口自身时间（单文件=素材原始时间；串行合并=成片时间）
+            lavfi_complex=_graph,
+            pipe_aspect=aspect,
+            pipe_duration=_pdur,
+            pipe_start=(out_start if out_dur is not None else start_sec),
+            pipe_out_mode=(out_dur is not None),
+            pipe_audio_graph=pipe_audio_graph,
+            pipe_audio_map=pipe_audio_map)
 
 
 
-    def _preview_with_settings(self, file_path: str, settings: dict, with_snapshot: bool = False):
+
+    def _preview_with_settings(self, file_path: str, settings: dict, with_snapshot: bool = False,
+                               pipe_engine: bool = False):
         """
         预览（2026-08-30）：滤镜变速 setpts（preview_filter_speed，与转换一致）与
         mpv 整体变速 --speed / 整体倒放 --play-direction=backward（preview_realtime_*，
@@ -27044,7 +30424,7 @@ class FFmpegBatchGUI:
         视频自适应缩放，截取通过播放器原生跳转参数（-ss/--start）实现。
         """
         if not file_path or not os.path.exists(file_path):
-            self._append_info_ui(_("文件不存在: {0}").format(file_path))
+            self._append_info_ui(_('文件不存在: {0}').format(file_path))
             return
 
         # ---- 快照模式：只弹合成快照窗口，不启动播放器预览 ----
@@ -27104,26 +30484,82 @@ class FFmpegBatchGUI:
         elif _orig_reverse_enabled:
             self._append_info_ui(_("[预览] 预览不支持倒放，已忽略 reverse。"))
     
+        # ---- 尺寸基准（帧尺寸）与管道引擎工作分辨率上限 ----
+        # 基准统一用「帧尺寸」= 链内 crop→rotate→scale / pad 画布 / 画布模式之后的真实产出
+        # （用户设了「分辨率」就是那个尺寸），与正式命令 / 可视化编辑器
+        # （compute_final_size_with_order）同源。
+        # ⚠️ 绝不能用原始探测尺寸当定位基准：链内已把画面缩到目标尺寸，下游 overlay 定位与播放器
+        # 窗口比例若仍按原尺寸算 → 水印/子视频错位、播放器窗口按原尺寸开（用户实测「主视频很大
+        # 没缩放、只显示一半（约 2 倍大小、只看到左上 1/4）」，mpv/ffplay/内置管道三条路都在内）。
+        _md0 = self._get_video_dimensions_cached(file_path)
+        _mw0 = (_md0[0] if _md0 and _md0[0] else 1280)
+        _mh0 = (_md0[1] if _md0 and _md0[1] else 720)
+        _rend_w, _rend_h = self.compute_final_size_with_order(_mw0, _mh0, settings)
+        _canvas_mode = bool(settings.get("canvas_mode")) and bool(settings.get("canvas_segments"))
+        _pg0 = _pad_canvas_geometry(settings)
+        if _canvas_mode:
+            _frame_w, _frame_h = _mw0, _mh0        # 画布帧 = 原始尺寸（内容缩放由画布段按 settings 自算）
+        elif _pg0:
+            _frame_w, _frame_h = _pg0[0], _pg0[1]  # pad 画布帧 = pad 尺寸
+        else:
+            _frame_w, _frame_h = _rend_w, _rend_h
+        # 工作分辨率上限（_PIPE_WORK_MAX_W，仅 pipe_engine；GPU 路线 mpv/ffplay 全分辨率由硬件跑，
+        # 不动）：帧宽 > 上限时把帧整体乘 f，并**改写链内分辨率**为降采样尺寸（精确模式）→ 图里
+        # 真实产出即降采样尺寸，下游定位基准同步乘 f → 布局逐像素一致、仅像素变少（图计算量按
+        # f² 下降）。**不能改成在图首另插一个 scale**：链内自带用户「分辨率」scale，插在图首会被
+        # 它整段顶回去（图按原分辨率产出、几何按降采样算）。实测收益见 _PIPE_WORK_MAX_W 注释。
+        _pwf = 1.0
+        # 画布模式（canvas_mode）不降采样（2026-09-21）：与画中画预览同源——画布段由
+        # build_canvas_filtergraph 按 canvas_segments 的**绝对像素**生成，输出尺寸无法跟着 f 缩
+        # → 只缩内容基准会让画布与内容互相错位（同款「很大空隙」，且随原始尺寸变大）。
+        if (not _canvas_mode) and pipe_engine and _frame_w > _PIPE_WORK_MAX_W and _frame_h > 0:
+            _pwf = _PIPE_WORK_MAX_W / float(_frame_w)
+            _frame_w, _frame_h = (max(2, int(_frame_w * _pwf) // 2 * 2),
+                                  max(2, int(_frame_h * _pwf) // 2 * 2))
+            settings["scale_enabled"] = True
+            settings["scale_method"] = "exact"
+            settings["scale_width"] = str(max(2, int(_rend_w * _pwf) // 2 * 2))
+            settings["scale_height"] = str(max(2, int(_rend_h * _pwf) // 2 * 2))
         # ----- 1. 构建基础视频滤镜（变速按上方滤镜开关决定） -----
         enhance_settings = settings.get("enhance", {})
+        # 管道模式时间基准（2026-09-21 修「管道预览里简易位置时段整体偏 pipe_start」）：
+        # 管道图内 t 已被 _launch_video_pipe 桥接成「0 基 from pipe_start」（素材 τ → τ−pipe_start），
+        # 而 crop_pos（简易位置）/delogo/mask/文字水印 的时段表达式按**素材原始时间**书写，只在链内
+        # 含 trim 时才由 _trim_speed_from_settings 换算 st−trim_start。预览已把 trim_enabled 置 False
+        # （截取起点改由管道 seek 承担）⇒ 换算基准退化为 0 ⇒ 表达式不换算，与 0 基时间轴整体错位
+        # pipe_start 秒（用户实测：简易位置该动的时候不动、前后 seek 也找不到）。
+        # 故管道路径把基准显式设为 pipe_start（= 截取起点 start_sec；未截取=0），并**同步 speed 因子**
+        # （build_video_filter_chain 一旦收到 motion_trim_start，就不再自取 _trim_speed_from_settings，
+        # 而改读 motion_speed_factor，缺省当 1.0 —— 不一起传会把变速换算打成 1.0）。
+        # GPU 路线（mpv/ffplay）滤镜 t = 素材原始时间、不吃管道桥接 ⇒ 不传，行为逐字节不变。
+        _pipe_ts = None
+        _pipe_sp = None
+        if pipe_engine and _preview_trim_enabled and _preview_trim_start:
+            _pipe_ts = time_to_seconds(_preview_trim_start)
+            if _pipe_ts:
+                _pipe_sp = _trim_speed_from_settings(settings)[1]
+            else:
+                _pipe_ts = None
         base_vf = build_video_filter_chain(
             settings,
             include_subtitle=True,
             include_speed=_ft_speed,
             include_trim=False,
             enhance_settings=enhance_settings,
-            reverse=False
+            reverse=False,
+            motion_trim_start=_pipe_ts,
+            motion_speed_factor=_pipe_sp,
         )
         filter_parts = []
         if base_vf and base_vf != "null":
             filter_parts.append(base_vf)
-    
+
         # ----- 2. 水印虚拟框 -----
         wm_settings = settings.get("watermark", {})
         drawbox_expr = None
         if wm_settings.get("enabled", False) and wm_settings.get("file_path", "").strip():
             wm_file = wm_settings.get("file_path", "").strip()
-            main_w, main_h = self._get_video_dimensions_cached(file_path)
+            main_w, main_h = _frame_w, _frame_h
             if main_w is None or main_h is None:
                 self._append_info_ui(_("[预览] 无法获取视频尺寸，跳过水印虚拟框"))
             else:
@@ -27151,8 +30587,8 @@ class FFmpegBatchGUI:
                 # 旋转时蓝色 d×d 正方形中心与内容盒中心对齐 → 正方形位置 = 内容盒位置 - (d-w)/2。
                 # clamp 仅当内容盒 ≤ 画布时启用（防丢）；内容盒 > 画布时放开（开放边界可拉出）。
                 ctx = {"W": main_w, "H": main_h, "w": wm_w, "h": wm_h}
-                x_expr = adapted_wm.get("overlay_x", "W-w-10")
-                y_expr = adapted_wm.get("overlay_y", "H-h-10")
+                x_expr = adapted_wm.get("overlay_x", DEFAULT_OVERLAY_X)
+                y_expr = adapted_wm.get("overlay_y", DEFAULT_OVERLAY_Y)
                 x_val = safe_eval_expr(x_expr, ctx)
                 y_val = safe_eval_expr(y_expr, ctx)
                 if x_val is None:
@@ -27165,13 +30601,12 @@ class FFmpegBatchGUI:
                     y_val = max(0, min(y_val, main_h - wm_h))
                 eff_w, eff_h = wm_w, wm_h
                 if _rot_ph:
+                    # 旋转：eff_w/eff_h 记蓝色 d×d 外接正方形尺寸（仅下方日志用），红框仍按 wm_w/wm_h 画
                     d = int(round(((wm_w * wm_w + wm_h * wm_h) ** 0.5)))
                     eff_w = eff_h = d
                     x_val = x_val - (d - wm_w) / 2.0
                     y_val = y_val - (d - wm_h) / 2.0
-                    self._append_info_ui(_("[预览] 水印启用了旋转，蓝色正方形占位 {0}x{0} 与红色原始矩形同时显示").format(d, d))
-                if _rot_ph:
-                    d = eff_w
+                    self._append_info_ui(_('[预览] 水印启用了旋转，蓝色正方形占位 {0}x{1} 与红色原始矩形同时显示').format(d, d))
                     cx = x_val + d / 2.0
                     cy = y_val + d / 2.0
                     # 蓝色正方形占位 + 红色斜矩形；仅 spin 时红框轴对齐
@@ -27185,7 +30620,7 @@ class FFmpegBatchGUI:
                     drawbox_expr = ",".join(parts)
                 else:
                     drawbox_expr = f"x={x_val:.1f}:y={y_val:.1f}:w={wm_w}:h={wm_h}:color=red@0.3:t=3"
-                self._append_info_ui(_("[预览] 水印虚拟框: 位置({0:.1f}, {1:.1f}) 尺寸{2}x{3}").format(x_val, y_val, eff_w, eff_h))
+                self._append_info_ui(_('[预览] 水印虚拟框: 位置({0:.1f}, {1:.1f}) 尺寸{2}x{3}').format(x_val, y_val, eff_w, eff_h))
     
         # ----- 3. 文字水印判定：旋转/spin/轨迹需复杂图，普通 drawtext 走 -vf 链 -----
         # 2026-08-26 多实例：_tw_rotate = 任一启用项需要旋转子图（不只看首条）；
@@ -27253,9 +30688,13 @@ class FFmpegBatchGUI:
             if target_w < 2: target_w = 2
             if target_h < 2: target_h = 2
             scale_expr = f"scale={target_w}:{target_h}"
-            self._append_info_ui(_("[预览] 视频总尺寸 {0}x{1} 超出屏幕，单份缩放到 {2}x{3}").format(_total_w, _total_h, target_w, target_h))
+            self._append_info_ui(_('[预览] 视频总尺寸 {0}x{1} 超出屏幕，单份缩放到 {2}x{3}').format(_total_w, _total_h, target_w, target_h))
         else:
-            self._append_info_ui(_("[预览] 视频尺寸 {0}x{1} 适合屏幕，保持原始").format(_total_w, _total_h))
+            self._append_info_ui(_('[预览] 视频尺寸 {0}x{1} 适合屏幕，保持原始').format(_total_w, _total_h))
+        # 管道预览画面框基准（2026-09-20）：末端处理前的【单格】输出尺寸——超屏时 scale 已把
+        # tile 缩到 target_w×target_h，未超屏就是 final 尺寸。画布模式会在下方画布分支覆盖成
+        # 画布尺寸（比例与源不同）。管道分支用它 × 网格行列 + 边框边距算真实输出比例。
+        _pipe_base_w, _pipe_base_h = (target_w, target_h) if scale_expr else (final_w, final_h)
         
         # ----- 4b. 复杂预览：mpv --lavfi-complex（文字水印旋转/图片水印真实合成），
         #            ffplay -vf 分号图（文字水印旋转，用户实测格式：-vf 直接支持分号多段图）；
@@ -27275,8 +30714,11 @@ class FFmpegBatchGUI:
         except Exception:
             manual_t = None
 
-        if use_mpv and (_tw_rotate or wm_active):
-            # ================= mpv：--lavfi-complex 复杂图（用户实测格式） =================
+        if (_tw_rotate or wm_active):
+            # ================= 复杂图（mpv --lavfi-complex / ffplay -vf 共用，[VIN]/[VOUT] 占位） =================
+            # 研究 ffplay-preview 实证：ffplay 的 -vf 即完整 filtergraph，故同一张图 mpv 与 ffplay
+            # 都能渲染合成画面。preview_with_player 按 mpv 可用性选播放器：mpv 走 --lavfi-complex，
+            # ffplay 走 _lavfi_complex_to_ffplay 改写（[VIN]→[in]、[VOUT]→[out]、删音频 passthrough 段）。
             fc_parts = []
             cur = "[VIN]"
             if base_vf and base_vf != "null":
@@ -27294,8 +30736,9 @@ class FFmpegBatchGUI:
                     if _wm_ow is None or _wm_oh is None:
                         _wm_ow, _wm_oh = 320, 240
                     _mdim = self._get_video_dimensions_cached(file_path)
-                    _main_w = _mdim[0] or 1280
-                    _main_h = _mdim[1] or 720
+                    # 定位基准 = 帧尺寸（渲染尺寸；上限触发时为降采样后尺寸）——不能用原始探测
+                    # 尺寸，链内「分辨率」已把画面缩小，按原尺寸算会错位（见本函数开头说明）。
+                    _main_w, _main_h = _frame_w, _frame_h
                     # 源尺寸副本：自适应按主视频内容缩放，不随 pad 画布变（用户拍板 2026-08-25）
                     _src_main_w, _src_main_h = _main_w, _main_h
                     adapted_wm2 = self._adapt_sub_settings(wm_settings, _src_main_w, _src_main_h,
@@ -27313,6 +30756,11 @@ class FFmpegBatchGUI:
                     _src_main_w, _src_main_h = _main_w, _main_h
                 # 画布模式（2026-08-31 两段式）：定位/对角线基准 = 内容盒（画布尺寸 × 用户缩放），
                 # 与不开画布时的叠加尺寸完全等价 → 下游定位 / blend 区域零改动。
+                # 绝对像素坐标同步换算（2026-09-21）：与画中画预览同源——上限把帧乘 f 缩小后，
+                # 水印定位里写死的数字（简易位置）不会跟着缩 → 水印相对更靠右下（越界被裁）。
+                # 含 W/H/w/h 的表达式在图内按当前空间求值，不缩放；f=1 时同一对象、零行为变化。
+                if _pwf != 1.0:
+                    adapted_wm2 = _pipe_scale_pos_settings(adapted_wm2, _pwf)
                 _wm_cv_on = self._sub_canvas_on(adapted_wm2)
                 if _wm_cv_on:
                     wm_w2, wm_h2 = self._overlay_content_size(wm_file, adapted_wm2)
@@ -27320,13 +30768,26 @@ class FFmpegBatchGUI:
                 _pg = _pad_canvas_geometry(settings)
                 if _pg:
                     _pwc, _phc, _pox, _poy = _pg
+                    # 管道引擎工作分辨率上限：主视频画布几何（尺寸 + 偏移）等比降到降采样尺寸，
+                    # 否则主视频（已图首降采样）与原始画布错位。
+                    if _pwf != 1.0:
+                        _pwc = max(2, int(_pwc * _pwf) // 2 * 2)
+                        _phc = max(2, int(_phc * _pwf) // 2 * 2)
+                        _pox = int(round(_pox * _pwf))
+                        _poy = int(round(_poy * _pwf))
                     # 画布限时防无限延长：manual_t（用户 -t）优先，否则主视频时长；都没有 → shortest=1
                     _pad_dur2 = ""
                     if manual_t is not None:
                         _pad_dur2 = f":duration={_ffsec(manual_t)}"
                     else:
                         try:
-                            _main_dur2 = self._get_media_duration(file_path)
+                            # 图片主视频：ffprobe 只给 ~0.04s / N/A ⇒ 画布 0.04s 就结束，
+                            # 画布之上的子视频/文字水印跟着「瞬间消失」。图片按「显示时长」算
+                            # （与封装页 _IMAGE_PREVIEW_SEC / merge_preview_pip_live 同口径）。
+                            if _is_static_image_file(file_path):
+                                _main_dur2 = _eff_image_display_duration(settings)
+                            else:
+                                _main_dur2 = self._get_media_duration(file_path)
                             if _main_dur2 and _main_dur2 > 0:
                                 _pad_dur2 = f":duration={_ffsec(_main_dur2)}"
                         except Exception:
@@ -27339,7 +30800,7 @@ class FFmpegBatchGUI:
                     cur = "[v_main_pad]"
                     # 画布基准更新：blend clamp/基准求值按 pad 画布（overlay 目标流=v_main_pad）
                     _main_w, _main_h = _pwc, _phc
-                    self._append_info_ui(_("[预览] 主视频画布偏移：{0}x{1} @ ({2},{3})").format(_pwc, _phc, _pox, _poy))
+                    self._append_info_ui(_('[预览] 主视频画布偏移：{0}x{1} @ ({2},{3})').format(_pwc, _phc, _pox, _poy))
                 # movie 源：路径统一正斜杠 + 冒号转义 \\:（movie 滤镜参数解析中 \ 是转义符，
                 # Windows 反斜杠路径必须转成正斜杠，否则 \U \A 等会被当作无效转义）；
                 # 含 [ ] ' , ; 等 filtergraph 特殊字符的路径先用临时硬链接/副本规避
@@ -27393,15 +30854,26 @@ class FFmpegBatchGUI:
                     _wp2 = build_waypoint_expr(adapted_wm2.get("move_waypoints"),
                                                sw=str(wm_w2), sh=str(wm_h2), spin_speed=_sp2)
                     _wp_rot2 = (_wp2 is not None and _wp2[2] is not None)
-                if _alpha2 or (_spin2 and _sp2 != 0) or _ra2 != 0 or _wp_rot2:
+                if _alpha2 or (_spin2 and _sp2 != 0) or _ra2 != 0 or _wp_rot2 or \
+                   (_wp2 is not None and _wp2[4] is not None):
                     sub_vf_parts.append("format=rgba")
                 if _alpha2:
                     try:
                         _av = float(adapted_wm2.get("alpha_value", 1.0))
                     except (ValueError, TypeError):
                         _av = 1.0
-                    if 0.0 <= _av <= 1.0:
+                    # 静态透明度：轨迹透明度存在时跳过——由下方 geq 一并折入。
+                    if 0.0 <= _av <= 1.0 and not (_wp2 is not None and _wp2[4] is not None):
                         sub_vf_parts.append(f"colorchannelmixer=aa={_av:.2f}")
+                # 列表轨迹透明度（oa→ob）：与静态 alpha_value 串联合成（相乘）；全 1.0 时 _wp2[4] 为 None 跳过。
+                # ⚠️ colorchannelmixer=aa 在本构建为 init 模式（拒绝 t/max 时变表达式），改用 geq 承载：
+                #    时间戳变量为 T（独立 t 用 re.sub 换 T），上游已挂 format=rgba，静态 _av 折入 a='(_av*255)*(traj_T)'。
+                #    geq 表达式取 0~255 平面值（非 0~1），alpha 须 ×255 缩放（见子视频处说明）。
+                #    已知限制：geq 读不到输入 alpha，不乘源素材自带 alpha（见子视频处说明）。
+                if _wp2 is not None and _wp2[4] is not None:
+                    _traj_T2 = re.sub(r'\bt\b', 'T', _wp2[4])
+                    _sa2 = _av if (_alpha2 and 0.0 <= _av <= 1.0) else 1.0
+                    sub_vf_parts.append(f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{_sa2*255:.0f}*({_traj_T2})'")
                 if (_spin2 and _sp2 != 0) or _ra2 != 0 or _wp_rot2:
                     _angle_expr2 = ""
                     if _ra2 != 0:
@@ -27446,8 +30918,8 @@ class FFmpegBatchGUI:
                         fc_parts.append(f"{_cur_lbl}null[sub_rot]")
                 else:
                     fc_parts.append(f"[sub]{sub_chain}[sub_rot]")
-                x_expr = str(adapted_wm2.get("overlay_x", "W-w-10") or "W-w-10")
-                y_expr = str(adapted_wm2.get("overlay_y", "H-h-10") or "H-h-10")
+                x_expr = str(adapted_wm2.get("overlay_x", DEFAULT_OVERLAY_X) or DEFAULT_OVERLAY_X)
+                y_expr = str(adapted_wm2.get("overlay_y", DEFAULT_OVERLAY_Y) or DEFAULT_OVERLAY_Y)
                 # 定位语义（2026-08-25 理顺）：overlay_x/y 的 w/h = 内容盒（wm_w2/wm_h2）；
                 # 旋转时叠加盒 d×d 中心与内容盒中心对齐 → 位置减 (d-w)/2（与正式命令一致）。
                 _rot2v = overlay_rotation_active(adapted_wm2, wp_rot=_wp_rot2)
@@ -27505,7 +30977,12 @@ class FFmpegBatchGUI:
                         _ov_expr = f"lt(t,{_ffsec(manual_t)})"
                     else:
                         try:
-                            _main_dur = self._get_media_duration(file_path)
+                            # 图片主视频：时长探测只有 ~0.04s ⇒ enable=lt(t,0.04) 会让子视频
+                            # 只显示 0.04 秒（用户报的「瞬间消失」）。图片按「显示时长」算。
+                            if _is_static_image_file(file_path):
+                                _main_dur = _eff_image_display_duration(settings)
+                            else:
+                                _main_dur = self._get_media_duration(file_path)
                         except Exception:
                             _main_dur = None
                         if _main_dur and _main_dur > 0:
@@ -27517,15 +30994,14 @@ class FFmpegBatchGUI:
                     _dgp = self._blend_downgrade_pad(settings, file_path)
                     if _dgp:
                         self._append_info_ui(
-                            _("[混合模式] pad 画布 {0}x{1} 大于主视频渲染尺寸，"
-                            "blend({2}) 已降级为普通叠加（脱离主视频像素的混合无意义）").format(_dgp[0], _dgp[1], _blend2))
+                            _('[混合模式] pad 画布 {0}x{1} 大于主视频渲染尺寸，blend({2}) 已降级为普通叠加（脱离主视频像素的混合无意义）').format(_dgp[0], _dgp[1], _blend2))
                         _blend2 = 'normal'
                 if _blend2 != 'normal' and _wp_zoom2:
                     # 冲突点标注（融合铁律）：blend 区域按**静态**尺寸计算，逐帧缩放时无法跟随
                     # → 与正式命令/预览一致降级普通叠加，避免预览与输出不一致。
                     self._append_info_ui(
-                        f"[混合模式] 列表轨迹缩放与 blend({_blend2}) 暂不兼容"
-                        f"（blend 区域按静态尺寸计算，无法跟随逐帧缩放），已降级为普通叠加")
+                        _('[混合模式] 列表轨迹缩放与 blend({0}) 暂不兼容（blend 区域按静态尺寸计算，无法跟随逐帧缩放），已降级为普通叠加').format(_blend2)
+)
                     _blend2 = 'normal'
                 if _blend2 != 'normal':
                     # 区域化 blend（与正式命令/合并页预览共用 _make_blend_region）：
@@ -27553,9 +31029,9 @@ class FFmpegBatchGUI:
                         # 区域位置 = 内容盒位置 - 中心对齐偏移，再 clamp 到画布内（crop 不越界）
                         _ms2b = dict(adapted_wm2)
                         _ms2b["overlay_x"] = _content_box_expr(
-                            _ms2b.get("overlay_x", "W-w-10"), wm_w2, wm_h2)
+                            _ms2b.get("overlay_x", DEFAULT_OVERLAY_X), wm_w2, wm_h2)
                         _ms2b["overlay_y"] = _content_box_expr(
-                            _ms2b.get("overlay_y", "H-h-10"), wm_w2, wm_h2)
+                            _ms2b.get("overlay_y", DEFAULT_OVERLAY_Y), wm_w2, wm_h2)
                         _dx2, _dy2 = _blend_move_exprs(_mv2, _ms2b, wm_w2, wm_h2)
                         if _dx2 is not None:
                             _off2b, _off2c = _content_box_shift(wm_w2, wm_h2, _bw2, _bh2)
@@ -27579,10 +31055,10 @@ class FFmpegBatchGUI:
                         # 中心对齐内容盒（减偏移）；区域尺寸由 _blend_static_geometry clamp。
                         _ctx2b = {"W": _main_w, "H": _main_h, "w": wm_w2, "h": wm_h2}
                         _tb = safe_eval_expr(_content_box_expr(
-                            str(adapted_wm2.get("overlay_x", "W-w-10")), wm_w2, wm_h2), _ctx2b)
+                            str(adapted_wm2.get("overlay_x", DEFAULT_OVERLAY_X)), wm_w2, wm_h2), _ctx2b)
                         _bxv2 = int(round(float(_tb))) if _tb is not None else _main_w - wm_w2 - 10
                         _tb = safe_eval_expr(_content_box_expr(
-                            str(adapted_wm2.get("overlay_y", "H-h-10")), wm_w2, wm_h2), _ctx2b)
+                            str(adapted_wm2.get("overlay_y", DEFAULT_OVERLAY_Y)), wm_w2, wm_h2), _ctx2b)
                         _byv2 = int(round(float(_tb))) if _tb is not None else _main_h - wm_h2 - 10
                         if _rot2:
                             _off2d, _off2e = _content_box_shift(wm_w2, wm_h2, _bw2, _bh2)
@@ -27600,7 +31076,7 @@ class FFmpegBatchGUI:
                             # 水印完全在画布外，跳过混合（保持主画面）
                             fc_parts.append(f"{cur}null[v_wm]")
                     cur = "[v_wm]"
-                    self._append_info_ui(_("[预览] 图片水印：mpv 区域化 blend 真实合成（{0}）").format(_blend2))
+                    self._append_info_ui(_('[预览] 图片水印：mpv 区域化 blend 真实合成（{0}）').format(_blend2))
                 else:
                     if _ov_expr != "1":
                         fc_parts.append(f"{cur}[sub_rot]overlay=x='{x_expr}':y='{y_expr}':"
@@ -27609,12 +31085,23 @@ class FFmpegBatchGUI:
                         # 兜底：拿不到任何时长信息退回 shortest=1
                         fc_parts.append(f"{cur}[sub_rot]overlay=x='{x_expr}':y='{y_expr}':enable='1':shortest=1[v_wm]")
                     cur = "[v_wm]"
-                self._append_info_ui(_("[预览] 图片水印：mpv movie 真实合成（{0}x{1}）").format(wm_w2, wm_h2))
+                self._append_info_ui(_('[预览] 图片水印：mpv movie 真实合成（{0}x{1}）').format(wm_w2, wm_h2))
             # ---- 文字水印：普通 drawtext（含显示时段/循环 enable）或旋转子图都接入 ----
             # 旋转时走透明层子图（eof_action=pass）；非旋转直接 drawtext 片段（enable 由
             # _build_drawtext_enable 生成：显示时段 between / 循环 lt(mod(t,L),D)）。
             if _tw_enabled:
-                tw_frag = build_text_watermark_chain(settings, main_label=cur, out_label="[v_tw]")
+                # 文字水印定位同含「原始画面空间」的绝对像素（overlay_x/y 默认 "10"、列表
+                # 轨迹航点）→ 与图片水印同款换算（用 settings 副本，不改原 dict）。
+                _tw_in = settings
+                if _pwf != 1.0:
+                    _tw_in = dict(settings)
+                    _tw_in["text_watermark_items"] = [
+                        _pipe_scale_pos_settings(_i, _pwf) if isinstance(_i, dict) else _i
+                        for _i in (settings.get("text_watermark_items") or [])]
+                    if isinstance(settings.get("text_watermark"), dict):
+                        _tw_in["text_watermark"] = _pipe_scale_pos_settings(
+                            settings["text_watermark"], _pwf)
+                tw_frag = build_text_watermark_chain(_tw_in, main_label=cur, out_label="[v_tw]")
                 if tw_frag:
                     if manual_t is not None:
                         tw_frag = tw_frag.replace(":format=auto",
@@ -27635,33 +31122,9 @@ class FFmpegBatchGUI:
                 fc_parts.append("[AIN]anull[AOUT]")
             lavfi_complex_str = ";".join(fc_parts)
 
-        elif _tw_rotate and not use_mpv:
-            # ================= ffplay：-vf 分号多段图（用户实测格式，无需 lavfi 包装） =================
-            vf_parts = []
-            if base_vf and base_vf != "null":
-                vf_parts.append(f"{base_vf}[v0]")
-                cur = "[v0]"
-            else:
-                vf_parts.append("format=yuv420p[v0]")
-                cur = "[v0]"
-            if drawbox_expr:
-                vf_parts.append(f"{cur}drawbox={drawbox_expr}[v1]")
-                cur = "[v1]"
-            tw_out = "[v_tw]" if scale_expr else ""
-            tw_frag = build_text_watermark_chain(settings, main_label=cur, out_label=tw_out)
-            if tw_frag:
-                if manual_t is not None:
-                    tw_frag = tw_frag.replace(":format=auto",
-                                              f":format=auto:eof_action=pass:enable='lt(t,{_ffsec(manual_t)})'")
-                else:
-                    tw_frag = tw_frag.replace(":format=auto", ":format=auto:eof_action=pass")
-                vf_parts.append(tw_frag)
-                if scale_expr:
-                    vf_parts.append(f"[v_tw]{scale_expr}")
-                filter_chain = ";".join(vf_parts)
-                self._append_info_ui(_("[预览] 文字水印旋转/轨迹：ffplay -vf 分号图预览"))
-
         # ----- 5. 普通路径：文字水印 drawtext + 图片水印占位框 + 缩放 -----
+        # 注：文字水印旋转/图片水印真实合成统一走上方复杂图分支（[VIN]/[VOUT] 占位），
+        # mpv 不可用时间接经 _lavfi_complex_to_ffplay 出合成画面；此处仅处理普通 drawtext + 占位框。
         if not lavfi_complex_str and not filter_chain:
             if drawbox_expr:
                 filter_parts.append(f"drawbox={drawbox_expr}")
@@ -27741,6 +31204,11 @@ class FFmpegBatchGUI:
             _cw, _ch = self._get_video_dimensions_cached(file_path)
             if not _cw or not _ch:
                 _cw, _ch = 1280, 720
+            # 工作分辨率上限（2026-09-21）：画布尺寸等比降到降采样尺寸（画布图把主视频缩放进
+            # 内容盒，画布小了主视频跟着小 → 图计算量按 f² 下降；GPU 路线不动）。
+            if _pwf != 1.0:
+                _cw = max(2, int(_cw * _pwf) // 2 * 2)
+                _ch = max(2, int(_ch * _pwf) // 2 * 2)
             _cg = build_canvas_filtergraph(settings, _cw, _ch, 0.0, 1.0)
             if _cg:
                 # 第 2 段（2026-09-02 修复）：主视频画布尊重「缩放」，与正式命令/封装页预览一致
@@ -27755,32 +31223,27 @@ class FFmpegBatchGUI:
                         _cw, _ch = _mbbw, _mbbh
                 except Exception:
                     _canvas_scale = ""
-                use_mpv = bool(self.use_mpv.get()) and self._mpv_ready(log=False)
-                if use_mpv:
-                    # mpv --lavfi-complex：输入 [0:v]→[VIN]，最终输出 [v_canvas]→[VOUT]
-                    _lc = _cg.replace("[0:v]", "[VIN]")
-                    # 先把唯一终端标签 [v_canvas] 改名，避免下方插入屏幕缩放后出现标签重复冲突
-                    _lc = _lc.replace("[v_canvas]", "[v_cvs]")
-                    if _canvas_scale:
-                        _lc = _lc + f";[v_cvs]{_canvas_scale}[v_cvs_s]"
-                        _term = "[v_cvs_s]"
-                    else:
-                        _term = "[v_cvs]"
-                    _sc = self._canvas_fit_scale(_cw, _ch)
-                    if _sc:
-                        _lc = _lc + f";{_term}{_sc}[VOUT]"
-                    else:
-                        _lc = _lc.replace(_term, "[VOUT]")
-                    lavfi_complex_str = _lc
-                    filter_chain = ""
-                    self._append_info_ui(_("[预览] 画布模式预览（mpv lavfi-complex）"))
+                # 画布图（color 源 + overlay 多输入）mpv/ffplay 都能渲染：mpv 走 --lavfi-complex，
+                # ffplay 走 _lavfi_complex_to_ffplay（[VIN]→[in]、[VOUT]→[out]）。不再因
+                # 「ffplay 无 -filter_complex」而回退原始画面（研究 ffplay-preview 实证 -vf 即完整 filtergraph）。
+                _lc = _cg.replace("[0:v]", "[VIN]")
+                # 先把唯一终端标签 [v_canvas] 改名，避免下方插入屏幕缩放后出现标签重复冲突
+                _lc = _lc.replace("[v_canvas]", "[v_cvs]")
+                if _canvas_scale:
+                    _lc = _lc + f";[v_cvs]{_canvas_scale}[v_cvs_s]"
+                    _term = "[v_cvs_s]"
                 else:
-                    # ffplay 实测不支持 -filter_complex（2026-08-30 实测报 "Option not found"），
-                    # 画布图含 color 源+overlay 多输入，ffplay 的 -vf 也无法表达 → ffplay 下
-                    # 无法预览画布效果，回退原始画面并提示。画布效果预览需 mpv（--lavfi-complex）。
-                    lavfi_complex_str = None
-                    filter_chain = ""
-                    self._append_info_ui(_("[预览] 画布模式预览需 mpv（ffplay 不支持 filter_complex），已回退原始画面"))
+                    _term = "[v_cvs]"
+                _sc = self._canvas_fit_scale(_cw, _ch)
+                if _sc:
+                    _lc = _lc + f";{_term}{_sc}[VOUT]"
+                else:
+                    _lc = _lc.replace(_term, "[VOUT]")
+                lavfi_complex_str = _lc
+                # 画布图输出 = 画布尺寸（比例可与源不同）→ 管道预览框按画布比例算（2026-09-20）
+                _pipe_base_w, _pipe_base_h = _cw, _ch
+                filter_chain = ""
+                self._append_info_ui(_("[预览] 画布模式预览（mpv/ffplay 共用复杂图，ffplay 无 mpv 时改写 -vf 渲染）"))
             else:
                 self._append_info_ui(_("[预览] 画布模式段数据无效，已忽略画布预览"))
 
@@ -27869,16 +31332,75 @@ class FFmpegBatchGUI:
                     else:
                         filter_chain = ",".join(_tail_comma)
 
-        # ----- 6. 调用播放器 -----
+        # ===== 图片主视频 + 带时间滤镜的动画修复（2026-09-19，2026-09-21 起 mpv/ffplay 共用）=====
+        # 静态图片只解码单帧：最终输出主输入是图片([VIN])时，滤镜图只求值一次，
+        # 时间变量 t 卡死（倒计时/轨迹不动）。前置连续 color 基源、图片作被保持次输入，
+        # 使 [v0] 变连续流（精确镜像用户验证可用的 fade 写法：连续 color 作主时间轴驱动）。
+        # ⚠️ 2026-09-21：此前仅 use_mpv 时 wrap（旧注释称「ffplay 走 -loop 1 天然连续」），
+        # 但 ffplay 的 -loop 1 对 image2 实测无效 ⇒ ffplay 图片主既没画面也没有动画。
+        # 现 mpv / ffplay 共用同一张图（ffplay 另由图内 loop 前缀续命，见 ffplay_image_main_vf）；
+        # 仍不含管道合成模式（pipe_engine 有自己的时长口径，behavior 保持不变）。
+        if lavfi_complex_str and _is_static_image_file(file_path) and not pipe_engine:
+            try:
+                _md = self._get_video_dimensions_cached(file_path)
+                _iw = int(_md[0]) if _md and _md[0] else 0
+                _ih = int(_md[1]) if _md and _md[1] else 0
+            except Exception:
+                _iw = _ih = 0
+            if _iw <= 0 or _ih <= 0:
+                _iw, _ih = 1280, 720
+            _img_dur = _eff_image_display_duration(settings)
+            lavfi_complex_str = wrap_image_static_timed_complex(
+                lavfi_complex_str, base_vf, _iw, _ih, _img_dur)
+            self._append_info_ui(
+                _('[预览] 图片主视频含时间滤镜：前置连续基源驱动动画（color r=30 d={0:g}，图片作被保持次输入）').format(_img_dur))
+
+        # ----- 6. 调用播放器（或：管道合成模式走内置时间预览引擎） -----
+        if pipe_engine:
+            # 「时间预览引擎」（2026-09-20 Phase 1）：同一张合成图改喂 ffmpeg -filter_complex
+            # → rawvideo 管道（内置 SimplePreviewer 渲染），零 mpv 依赖 + 保留标记/波形/步进。
+            # 仅单输入安全：转换页是单文件，图内除图片水印（movie=）外无其它子输入。
+            #
+            # aspect（2026-09-20 末端处理修复，照抄封装页画中画分支的口径）：预览框必须按
+            # 【末端处理后的真实输出比例】算——split 网格把输出放大 cols×/rows×、边框 pad
+            # 再加边距，按源比例算框会被 letterbox（用户实测：转换页平铺拼接 2 格 → 画面缩小
+            # 且四周黑边；封装页画中画传了网格比例所以铺满）。网格/边框是否真渲染以插入结果
+            # 为准（字符串里查得到才算），与实际渲染路径严格一致：
+            #   · 复杂图（lavfi_complex_str）：完整 rows×cols 网格（插入锚点 [v_split_out]）；
+            #   · 普通链（filter_chain）：仅单级网格（rows==1 横排 / cols==1 竖排，
+            #     split=N,hstack/vstack 纯逗号链）；多级网格普通链不渲染（既有限制）；
+            #   · 边框 before（每格带框）仅在网格真渲染时生效；after/无网格 = 加在整体。
+            _pe_rows, _pe_cols = 1, 1
+            _bp_applied = bool(_bp) and (_bp in (lavfi_complex_str or "")
+                                         or _bp in (filter_chain or ""))
+            if _split_ok:
+                if lavfi_complex_str and "[v_split_out]" in lavfi_complex_str:
+                    _pe_rows, _pe_cols = _psr, _psc
+                elif ("split=" in (filter_chain or "")
+                      and ("hstack=" in filter_chain or "vstack=" in filter_chain)):
+                    if _psr == 1:
+                        _pe_cols = _psc
+                    elif _psc == 1:
+                        _pe_rows = _psr
+            _pow, _poh = _pipe_base_w * _pe_cols, _pipe_base_h * _pe_rows
+            if _bp_applied:
+                if _split_ok and _bp_before and (_pe_rows > 1 or _pe_cols > 1):
+                    _pow, _poh = (_pipe_base_w + _sc_w) * _pe_cols, (_pipe_base_h + _sc_h) * _pe_rows
+                else:
+                    _pow, _poh = _pow + _sc_w, _poh + _sc_h
+            _par = (float(_pow) / _poh) if _poh > 0 else None
+            self._open_pipe_time_preview(file_path, settings, lavfi_complex_str,
+                                         filter_chain, start_sec, duration, aspect=_par)
+            return
         self.preview_with_player(
             file_path,
             filter_chain,
-            volume=10,
             extra_args=extra_args,
             start_time=start_sec,
             duration=duration,
             lavfi_complex=lavfi_complex_str,
-            mpv_only_args=mpv_only_args
+            mpv_only_args=mpv_only_args,
+            image_duration=_eff_image_display_duration(settings),
         )
 
     # ---------- 输出路径生成与命令构建 ----------
@@ -27892,7 +31414,7 @@ class FFmpegBatchGUI:
         dir_path = settings.get("output_dir") or os.path.dirname(input_path)
         dir_path = normalize_path(dir_path)
         base_name = os.path.basename(input_path)
-        name, _ = os.path.splitext(base_name)
+        name, _unused = os.path.splitext(base_name)
         if settings.get("only_audio", False):
             container = settings.get("audio_format", "m4a")
             _ac = settings.get("audio_codec", "aac")
@@ -28506,9 +32028,9 @@ class FFmpegBatchGUI:
             _ts0, _sp0 = _main_trim_speed(self, override_settings=settings)
             if _ts0 > 0 or _sp0 != 1.0:
                 self._append_info_ui(
-                    f"[时间线] 主视频已截取(起点 {_ts0:.3f}s)/变速(×{_sp0:g})："
-                    f"子功能时间按原始时间填、已自动换算输出时间线"
-                    f"（st_out=(st−{_ts0:.3f})/{_sp0:g}）")
+                    _('[时间线] 主视频已截取(起点 {0}:.3fs)/变速(×{1}:g)：子功能时间按原始时间填、已自动换算输出时间线（st_out=(st−{2}:.3f)/{3}:g）').format(_ts0, _sp0, _ts0, _sp0)
+
+)
             self._warn_sub_times_oob(settings)
         except Exception:
             pass
@@ -28728,7 +32250,11 @@ class FFmpegBatchGUI:
                 self._add_hwaccel_params(cmd_list, settings)
             # 输入文件
             if self._is_static_image(input_path):
-                # 图片主视频：image2 单帧，必须 -loop 1 无限源，否则输出仅 1 帧
+                # 图片主视频：image2 单帧，必须 -loop 1 无限源，否则输出仅 1 帧。
+                # ⚠️ 此处【刻意不烘焙输入级 -t】，勿"统一"成下面普通分支的写法：
+                # 组合跳转靠输出侧 -ss(post_seek) + -t 从无限源里裁段；输入若被限成 N 秒，
+                # 输出 -ss 会越过流尾，实际时长变成 N-post_seek 而非 duration_for_audio。
+                # （图片素材 trim_active() 恒 False，组合跳转对图片本就不进本分支，保留仅为兜底。）
                 _img_fps = settings.get("frame_rate_custom", "30") if settings.get("frame_rate_type") == "custom" else "30"
                 cmd_list.extend(["-loop", "1", "-framerate", _img_fps])
             cmd_list.extend(["-i", input_path])
@@ -28751,9 +32277,13 @@ class FFmpegBatchGUI:
                 self._add_hwaccel_params(cmd_list, settings)
 
             if self._is_static_image(input_path):
-                # 图片主视频：image2 单帧，必须 -loop 1 无限源，否则输出仅 1 帧
+                # 图片主视频：image2 单帧，必须 -loop 1 无限源，否则输出仅 1 帧。
+                # 「显示时长」(「截取」面板) 一并烘焙进本输入 —— 与「主图+水印图」路径、
+                # 封装页图片输入同款：图片 = 自带时长的有限长素材标签（-t 在 -i 之前 = 输入级）。
+                # 末尾仍会补一个输出级 -t（取同一时长），两条路径的命令形态保持一致。
                 _img_fps = settings.get("frame_rate_custom", "30") if settings.get("frame_rate_type") == "custom" else "30"
                 cmd_list.extend(["-loop", "1", "-framerate", _img_fps])
+                cmd_list.extend(["-t", f"{_eff_image_display_duration(settings):.3f}"])
 
             cmd_list.extend(["-i", input_path])
 
@@ -28924,13 +32454,17 @@ class FFmpegBatchGUI:
         _ensure_tw_duration_limit(
             self, cmd_list, input_path=input_path,
             main_duration=self._get_media_duration(input_path) if input_path else None,
-            audio_enabled=settings.get("audio_enabled", True))
+            audio_enabled=settings.get("audio_enabled", True),
+            image_display_duration=_eff_image_display_duration(settings))
 
         # 图片主视频：image2 单帧 + -loop 1 无限源，必须显式 -t 收尾，
         # 否则输出仅 1 帧（无 loop）或无限输出（有 loop 但靠 -shortest 不终止）。
-        # 已有 -t/-to（trim 或组合跳转）时不叠加。
-        if self._is_static_image(input_path) and "-t" not in cmd_list and "-to" not in cmd_list:
-            cmd_list.extend(["-t", "10"])
+        # ⚠️ 只判【输出侧】（_cmd_has_output_option）：图片输入已自带输入级 -t
+        # （-loop 1 -framerate 30 -t 16 -i img），裸判会让这个收尾 -t 被误判成已存在而漏加。
+        # 已有的组合跳转/trim 输出级 -t 仍会正确跳过（不叠加）。
+        if self._is_static_image(input_path) and not _cmd_has_output_option(cmd_list, "-t", "-to"):
+            # 图片主视频：用「截取」面板设定的「显示时长」(img_duration)，不再硬编码 10 秒
+            cmd_list.extend(["-t", f"{_eff_image_display_duration(settings):.3f}"])
 
         cmd_list.append(output_path)
 
@@ -29035,9 +32569,12 @@ class FFmpegBatchGUI:
     
         # 主视频输入
         if self._is_static_image(input_path):
-            # 图片主视频：image2 单帧，必须 -loop 1 无限源，否则输出仅 1 帧
+            # 图片主视频：image2 单帧，必须 -loop 1 无限源，否则输出仅 1 帧。
+            # 「显示时长」(「截取」面板) 同时烘焙进本输入：该图成为有限长的素材标签
+            # （与封装页图片输入、转换页普通路径同款），时长不再只靠末尾那个输出级 -t。
             _img_fps = settings.get("frame_rate_custom", "30") if settings.get("frame_rate_type") == "custom" else "30"
             cmd_list.extend(["-loop", "1", "-framerate", _img_fps])
+            cmd_list.extend(["-t", f"{_eff_image_display_duration(settings):.3f}"])
         cmd_list.extend(["-i", input_path])
     
         # ----- 计算主视频有效时长（截取或总时长） -----
@@ -29092,6 +32629,10 @@ class FFmpegBatchGUI:
             else:
                 fps = settings.get("frame_rate_custom", "30") if settings.get("frame_rate_type") == "custom" else "30"
                 cmd_list.extend(["-loop", "1", "-framerate", fps])
+                # 水印图片自己的「显示时长」也烘焙进它的输入（在「水印参数编辑 → 截取片段」
+                # 里设置，键 img_duration）：这张图同样是一个有限长的素材标签。
+                # 静态图超出该时长后 overlay 会保持末帧（eof_action=repeat），画面不变。
+                cmd_list.extend(["-t", f"{_eff_image_display_duration(adapted_wm):.3f}"])
             cmd_list.extend(["-i", wm_file])
     
         # ---- 构建叠加滤镜 ----
@@ -29133,7 +32674,7 @@ class FFmpegBatchGUI:
                 self._apply_audio_trim_and_encode(cmd_list, settings, input_path, start_sec, duration_for_sub, map_audio=True)
             else:
                 cmd_list.extend(["-map", "0:a:0"])
-                cmd_list = self._build_audio_encoding_params(cmd_list, settings)
+                cmd_list = self._build_audio_encoding_params(cmd_list, settings, input_path)
         else:
             cmd_list.append("-an")
     
@@ -29153,10 +32694,12 @@ class FFmpegBatchGUI:
             if info and any(s.get("codec_type") == "audio" for s in info.get("streams", [])):
                 has_audio_stream = True
     
-        # 用户在「自定义参数」里显式写了 -t / -to（如 -t 10 试片）时，这里不再补时长：
+        # 用户在「自定义参数」里显式写了输出级 -t / -to（如 -t 10 试片）时，这里不再补时长：
         # ffmpeg 同一输出选项是「后写覆盖前写」，此处补的 -t 会让用户的时长限制静默失效。
-        # 与 26747（图片主视频）和 _ensure_tw_duration_limit(5612) 保持同一纪律。
-        _user_t = "-t" in cmd_list or "-to" in cmd_list
+        # ⚠️ 只认【输出级】：图片素材已把「显示时长」烘焙成输入级 -t
+        # （-loop 1 -framerate 30 -t 16 -i img），裸判 "-t" in cmd_list 会把它误当成
+        # 输出已有限制而漏加收尾 -t。与 _ensure_tw_duration_limit(6131) 同一纪律。
+        _user_t = _cmd_has_output_option(cmd_list, "-t", "-to")
         # 旋转文字水印的无限透明画布（color=c=black@0）先交给统一兜底处理：
         # 它会自己探测时长并按「有音频 -shortest / 无音频 -t」决策，比这里内联重抄
         # 一遍更完整（旧实现漏了这一步，且 -shortest 对无限源不终止）。
@@ -29166,6 +32709,7 @@ class FFmpegBatchGUI:
                 self, cmd_list, input_path=input_path,
                 main_duration=main_duration,
                 audio_enabled=settings.get("audio_enabled", True),
+                image_display_duration=_eff_image_display_duration(settings),
                 tag=_("[水印]"))
         except Exception:
             pass
@@ -29178,10 +32722,9 @@ class FFmpegBatchGUI:
             else:
                 if self._is_static_image(input_path):
                     # 图片主视频：-loop 1 无限源，无音频时 -shortest 不终止 → 必须用 -t 收尾。
-                    # ffprobe 对图片常返回 0.04 之类的小值，探测值 <1s 一律按 10s 处理
-                    # （与 _ensure_tw_duration_limit 5626「图片强制 10s」同源），
-                    # 否则会拿到 -t 0.040 这种几乎空的输出。
-                    _img_dur = main_duration if (main_duration and main_duration >= 1.0) else 10.0
+                    # 长度取「截取」面板的「显示时长」(img_duration)，不再硬编码 10 秒；
+                    # ffprobe 对图片返回的 0.04 之类小值绝不能当真实时长用。
+                    _img_dur = _eff_image_display_duration(settings)
                     cmd_list.extend(["-t", f"{_img_dur:.3f}"])
                 elif main_duration and main_duration > 0:
                     cmd_list.extend(["-t", f"{main_duration:.3f}"])
@@ -29519,6 +33062,15 @@ class FFmpegBatchGUI:
                                                      # None=自适应：start_end 非 None 用 RK_SE_GHOST_COLOR
                                                      #       （互补青色），其余窗口沿用 rect_color（旧行为不变）。
                                                      # 显式传颜色字符串则强制该值。仅影响幽灵框，不动 rect_color。
+                                allow_upscale=False, # 2026-09-22：画布小于显示区时允许放大显示（scale 解除 1.0 上限）。
+                                                     # 用于画布=子视频缩放后尺寸的遮罩编辑器（子视频当水印缩小后
+                                                     # 画布只有几百像素，1.0 钳制导致帧显示极小）；坐标空间不受影响
+                                                     # （scale_x/y 按显示/编码反推，>1 同样成立），背景帧按显示尺寸
+                                                     # 从原文件提取反而更清晰。水印/PiP/画布等旧窗口不传=行为不变。
+                                                     # ⚠️ 必须放签名末尾——旧调用点有按位置传参的约定。
+                                frame_extractor=None,  # ⚠️ 节点语境：背景帧走「节点时间轴取帧器」而非主视频 bg_file；
+                                                      # None=旧行为（_extract_frame_scaled 主视频）。透传来源：
+                                                      # _open_mask_visual 传 filt_frame.node_frame_extractor。
                                 ):
         """
         通用叠加/偏移可视化编辑器（核心重构函数）
@@ -29564,27 +33116,25 @@ class FFmpegBatchGUI:
         # （= 与改动前逐像素一致，PiP/水印/主视频偏移/画布等窗口零变化）。
         GHOST_COLOR = ghost_color or (RK_SE_GHOST_COLOR if start_end is not None else rect_color)
 
-        # ---- 目标显示区（2026-09-12）----
+        # ---- 目标显示区（2026-09-12 立，2026-09-23 全量放开）----
         # 参照可视化裁剪窗口 open_crop_editor 的画布可用区（画布约占屏幕 90%）：
         #   · 本窗口「图像区 + 2*PAD 灰边」总量 = 裁剪窗口的画布区；
         #   · 于是图像区比裁剪窗口少 2*PAD（PAD=20 → 少 40；PAD=10 → 少 20）。
-        # 布局改左右两栏后纵向不再是瓶颈，画布可以更高更大；其余窗口
-        # （PiP/水印/主视频偏移…）保持旧上限 800×600，行为完全不变。
+        # 2026-09-23 用户拍板：全部窗口（含 PiP/水印/文字水印/主视频偏移/遮罩单块等
+        # 非双端入口）统一走此口径，废除旧 800×600 上限——大画布预览精度提升，
+        # 窗口最终仍被 0.95/0.94 屏幕钳制（见函数尾 geometry）。
         RIGHT_PANEL_WIDTH = 320   # 控件右栏定宽（照可视化裁剪窗口 RIGHT_PANEL_WIDTH 思路）
         try:
             _scr_w = parent.winfo_screenwidth()
             _scr_h = parent.winfo_screenheight()
         except Exception:
             _scr_w, _scr_h = 1280, 800
-        if start_end is not None:
-            # 与 open_crop_editor 同口径：RIGHT_PANEL 280 + 间隔 20 + PADDING*2 → 宽减 320；
-            # EXTRA_HEIGHT 10 + PADDING*2 → 高减 30。
-            _crop_avail_w = int(_scr_w * 0.9) - 320
-            _crop_avail_h = int(_scr_h * 0.9) - 30
-            max_display_w = max(320, _crop_avail_w - 2 * PAD)
-            max_display_h = max(240, _crop_avail_h - 2 * PAD)
-        else:
-            max_display_w, max_display_h = 800, 600
+        # 与 open_crop_editor 同口径：RIGHT_PANEL 280 + 间隔 20 + PADDING*2 → 宽减 320；
+        # EXTRA_HEIGHT 10 + PADDING*2 → 高减 30。
+        _crop_avail_w = int(_scr_w * 0.9) - 320
+        _crop_avail_h = int(_scr_h * 0.9) - 30
+        max_display_w = max(320, _crop_avail_w - 2 * PAD)
+        max_display_h = max(240, _crop_avail_h - 2 * PAD)
 
         # ---- 主视频背景帧（可选）状态 ----
         bg_file = main_video_file
@@ -29606,7 +33156,7 @@ class FFmpegBatchGUI:
             _sar_pair = _sar_effective_after_prefilter(_sar_pair, bg_pre_filter)
             if _sar_pair is not None:
                 _sn, _sd = _sar_pair
-                _sar_note = f" (SAR {_sn}:{_sd} 拉伸预览)"
+                _sar_note = _(' (SAR {0}:{1} 拉伸预览)').format(_sn, _sd)
 
         def _sar_stretch(cw, ch):
             """画布编码尺寸 → 播放显示几何（SAR 拉伸；方形像素原样返回）"""
@@ -29618,7 +33168,13 @@ class FFmpegBatchGUI:
             return max(1, int(round(cw * _sn / _sd))), ch
 
         _sar_fw, _sar_fh = _sar_stretch(canvas_w, canvas_h)
-        scale = min(max_display_w / _sar_fw, max_display_h / _sar_fh, 1.0)
+        # allow_upscale=True（遮罩）：画布小于显示区时放大显示（解除 1.0 钳制）——
+        # 画布=子视频缩放后尺寸（语义要求，坐标必须落在最终渲染帧），子视频当水印
+        # 缩小后画布只有几百像素，1.0 钳制会让帧显示极小。坐标换算 scale_x/y 按
+        # 显示/编码反推，>1 同样成立；背景帧按显示尺寸从原文件提取，反而更清晰。
+        scale = min(max_display_w / _sar_fw, max_display_h / _sar_fh)
+        if not allow_upscale:
+            scale = min(scale, 1.0)
         disp_w = int(_sar_fw * scale)
         disp_h = int(_sar_fh * scale)
         # x/y 因子均为「显示 px / 编码 px」（to_canvas 乘、to_real 除），恒从 disp/canvas 反推。
@@ -29755,7 +33311,7 @@ class FFmpegBatchGUI:
                 try:
                     _img = tk.PhotoImage(data=data)
                 except Exception as _e:
-                    _on_fail(_("加载图像失败: {0}").format(_e))
+                    _on_fail(_('加载图像失败: {0}').format(_e))
                     return
                 try:
                     if bg_loading_id is not None:
@@ -29801,7 +33357,7 @@ class FFmpegBatchGUI:
                     except Exception:
                         pass
                 except Exception as _e:
-                    _on_fail(_("绘制失败: {0}").format(_e))
+                    _on_fail(_('绘制失败: {0}').format(_e))
 
             def _on_fail(msg):
                 nonlocal bg_loading_id
@@ -29812,7 +33368,7 @@ class FFmpegBatchGUI:
                 except Exception:
                     pass
                 try:
-                    status_var.set(_("背景帧获取失败：{0}").format(msg))
+                    status_var.set(_('背景帧获取失败：{0}').format(msg))
                 except Exception:
                     pass
                 try:
@@ -29830,12 +33386,20 @@ class FFmpegBatchGUI:
                         # （=段前基准），注入 setpts=PTS+取帧时间/TB 让 crop 表达式
                         # 在 bg_cur_time 时刻求值（背景=该时刻真实裁剪画面）
                         _pf = f"setpts=PTS+{bg_cur_time}/TB,{_pf}"
-                    w, h, data = _extract_frame_scaled(
-                        app.ffmpeg_cmd, bg_file,
-                        frame_sec=bg_cur_time, target_width=_tw, target_height=_th,
-                        pre_vf=_pf)
+                    if frame_extractor is not None:
+                        # 节点语境：背景帧走「节点时间轴取帧器」（由 _make_node_frame_extractor
+                        # 生成，tap_seek=bg_cur_time 取节点输出第 T 秒画面，含节点像素类效果、
+                        # 排除几何效果以保持坐标空间不被打乱）。bg_file（主视频）在此被忽略。
+                        w, h, data = frame_extractor(
+                            bg_file, frame_sec=bg_cur_time,
+                            target_width=_tw, target_height=_th, pre_vf=_pf)
+                    else:
+                        w, h, data = _extract_frame_scaled(
+                            app.ffmpeg_cmd, bg_file,
+                            frame_sec=bg_cur_time, target_width=_tw, target_height=_th,
+                            pre_vf=_pf)
                 except Exception as _e:
-                    app.root.after(0, lambda e=_e: _on_fail(_("提取异常: {0}").format(e)))
+                    app.root.after(0, lambda e=_e: _on_fail(_('提取异常: {0}').format(e)))
                     return
                 if bg_cancel.is_set():
                     return
@@ -30145,7 +33709,7 @@ class FFmpegBatchGUI:
                 p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                      stderr=subprocess.DEVNULL, creationflags=flags)
                 try:
-                    data, _ = p.communicate(timeout=20)
+                    data, _unused = p.communicate(timeout=20)
                 except Exception:
                     try:
                         p.kill()
@@ -30195,18 +33759,16 @@ class FFmpegBatchGUI:
 
         def update_coord_display():
             if coord_mode == 'offset':
-                coord_var.set(_("偏移: X={0}, Y={1}").format(current_x, current_y))
+                coord_var.set(_('偏移: X={0}, Y={1}').format(current_x, current_y))
             else:
                 # 用真实角度判定：角度 0 显示纯矩形语义（左上角=矩形左上角）
                 if current_angle != 0:
                     if rot_square:
-                        coord_var.set(_("左上角: ({0}, {1})  宽: {2}  高: {3}  角度: {4}°\n"
-                                      "（有旋转时 X/Y 为内容盒左上角，旋转正方形自动居中）").format(current_x, current_y, current_w, current_h, current_angle))
+                        coord_var.set(_('左上角: ({0}, {1})  宽: {2}  高: {3}  角度: {4}°\n（有旋转时 X/Y 为内容盒左上角，旋转正方形自动居中）').format(current_x, current_y, current_w, current_h, current_angle))
                     else:
-                        coord_var.set(_("左上角: ({0}, {1})  宽: {2}  高: {3}  角度: {4}°\n"
-                                      "（档位旋转：90°顺/180°/90°逆，角度应用时吸附 90° 档）").format(current_x, current_y, current_w, current_h, current_angle))
+                        coord_var.set(_('左上角: ({0}, {1})  宽: {2}  高: {3}  角度: {4}°\n（档位旋转：90°顺/180°/90°逆，角度应用时吸附 90° 档）').format(current_x, current_y, current_w, current_h, current_angle))
                 else:
-                    coord_var.set(_("左上角: ({0}, {1})  宽: {2}  高: {3}").format(current_x, current_y, current_w, current_h))
+                    coord_var.set(_('左上角: ({0}, {1})  宽: {2}  高: {3}').format(current_x, current_y, current_w, current_h))
 
         def _sync_scale_display():
             """缩放倍率滑块模式：把当前矩形宽高同步回「缩放%」滑块与数字框（双向同步）。
@@ -30241,7 +33803,9 @@ class FFmpegBatchGUI:
                     raise ValueError
                 current_canvas_w, current_canvas_h = new_w, new_h
                 _nfw, _nfh = _sar_stretch(current_canvas_w, current_canvas_h)
-                scale = min(max_display_w / _nfw, max_display_h / _nfh, 1.0)
+                scale = min(max_display_w / _nfw, max_display_h / _nfh)
+                if not allow_upscale:
+                    scale = min(scale, 1.0)
                 disp_w = int(_nfw * scale)
                 disp_h = int(_nfh * scale)
                 scale_x = disp_w / current_canvas_w
@@ -30271,7 +33835,7 @@ class FFmpegBatchGUI:
                 _draw_ghost()
                 _schedule_content_render()
                 update_coord_display()
-                status_var.set(_("画布已调整为 {0}x{1}").format(current_canvas_w, current_canvas_h))
+                status_var.set(_('画布已调整为 {0}x{1}').format(current_canvas_w, current_canvas_h))
                 win.update_idletasks()
                 # 重新居中窗口
                 x = self.root.winfo_x() + (self.root.winfo_width() - win.winfo_width()) // 2
@@ -30347,12 +33911,12 @@ class FFmpegBatchGUI:
             new_angle = (rot_start_angle + delta + 180.0) % 360.0 - 180.0
             current_angle = round(new_angle, 1)
             update_rect_position()
-            status_var.set(_("旋转角度: {0}°（可负角）").format(current_angle))
+            status_var.set(_('旋转角度: {0}°（可负角）').format(current_angle))
 
         def stop_rotate(event):
             nonlocal rotating
             rotating = False
-            status_var.set(_("旋转完成，当前角度 {0}°，点「应用」写回角度框").format(current_angle))
+            status_var.set(_('旋转完成，当前角度 {0}°，点「应用」写回角度框').format(current_angle))
             # 2026-09-03：松手即回写角度（angle_cb）+ 坐标（on_drag_commit），
             # 使航点列表的「起始角度/结尾角度」「起始坐标/结尾坐标」实时刷新。
             if angle_cb is not None:
@@ -30591,11 +34155,11 @@ class FFmpegBatchGUI:
                 _sec = time_to_seconds(_ts)
                 if _sec is None:
                     messagebox.showerror(_("错误"),
-                        _("无效的时间格式: {0}\n支持格式: 秒数(如 10.5) 或 HH:MM:SS[.mmm]").format(_ts))
+                        _('无效的时间格式: {0}\n支持格式: 秒数(如 10.5) 或 HH:MM:SS[.mmm]').format(_ts))
                     return
                 bg_cur_time = max(0.0, float(_sec))
                 bg_refresh_btn.config(state=tk.DISABLED, text=_("提取中…"))
-                status_var.set(_("⏳ 正在提取 {0:.2f}s 画面…").format(bg_cur_time))
+                status_var.set(_('⏳ 正在提取 {0:.2f}s 画面…').format(bg_cur_time))
                 _draw_bg_frame()
             bg_refresh_btn = ttk.Button(bg_ctrl, text=_("重新获取帧"), command=_on_bg_refresh)
             bg_refresh_btn.pack(side=tk.LEFT, padx=4)
@@ -30869,7 +34433,7 @@ class FFmpegBatchGUI:
                 return
             clamp_rect()
             update_rect_position()
-            status_var.set(_("方向键微调: ({0}, {1})  [可用 ↑↓←→ 继续调整]").format(current_x, current_y))
+            status_var.set(_('方向键微调: ({0}, {1})  [可用 ↑↓←→ 继续调整]').format(current_x, current_y))
         canvas.bind("<Left>", arrow_move)
         canvas.bind("<Right>", arrow_move)
         canvas.bind("<Up>", arrow_move)
@@ -30901,9 +34465,8 @@ class FFmpegBatchGUI:
             draw_btn_frame.pack_forget()
     
         # 2026-09-12：两栏布局后，窗口宽 = 画布宽 + 右栏宽（不再为「下方控件区」留高度）。
-        # 高度：起始/结尾类窗口的画布已按「可视化裁剪窗口画布区」口径放大（见函数开头），
-        # 窗口随之变高；其余窗口画布仍按 800×600 上限，窗口高度下限 720（保证右栏控件完整显示），
-        # 并统一钳进屏幕内。
+        # 2026-09-23：画布显示区全量放开到「可视化裁剪窗口画布区」口径（见函数开头），
+        # 窗口随之变大；高度下限 720（保证右栏控件完整显示），统一钳进屏幕内。
         _scr_w = win.winfo_screenwidth()
         _scr_h = win.winfo_screenheight()
         _win_w = min(disp_w + 2 * PAD + RIGHT_PANEL_WIDTH + 40, int(_scr_w * 0.95))
@@ -31040,10 +34603,14 @@ class FFmpegBatchGUI:
                                       ghost_color=None,    # 2026-09-12：幽灵框颜色（透传；None=自适应青色）
                                       content_src_w=None,  # 2026-09-14：内容源宽（透传 _generic_overlay_editor；
                                                            #   非空即启用「缩放 (倍率)」滑块，100%=content_src_w）
-                                      content_src_h=None): # 2026-09-14：内容源高（透传；缩放滑块模式）
+                                      content_src_h=None,  # 2026-09-14：内容源高（透传；缩放滑块模式）
+                                      allow_upscale=False, # 2026-09-22：允许放大显示（透传；遮罩画布=子视频缩放后尺寸时帧极小）
+                                      frame_extractor=None): # ⚠️ 节点语境：透传「节点时间轴取帧器」给 _generic_overlay_editor._extract；None=旧行为（主视频 bg_file）
         """
         水印可视化编辑器，支持回写位置和缩放尺寸，以及更新水印字典和滤镜框架。
         free_layout=True 时放开边界（子视频可拖出画布、可比主视频大）。
+        allow_upscale: False（默认）=画布大于显示区时钳 1.0（旧行为）；True=允许放大显示
+                       （画布小于显示区时放大适配窗口）。透传 _generic_overlay_editor 同名参数。
         ov_angle_var: OverlayPositionFrame 的 rotate_angle DoubleVar（应用时写回角度）
         aspect_ratio: "auto"（默认）=按水印/挡板当前宽高比锁定「绘制新矩形」的比例；
                       None=自由矩形（遮罩挡板宽高独立，2026-09-10 修「只能画正方形」）。
@@ -31111,7 +34678,7 @@ class FFmpegBatchGUI:
                 filt_frame.scale_method.set("exact")
                 filt_frame.scale_width.set(str(new_w))
                 filt_frame.scale_height.set(str(new_h))
-            self._append_info_ui(_("[可视化-水] 已保存位置: ({0}, {1}) 尺寸: {2}x{3}").format(new_x, new_y, new_w, new_h))
+            self._append_info_ui(_('[可视化-水] 已保存位置: ({0}, {1}) 尺寸: {2}x{3}').format(new_x, new_y, new_w, new_h))
 
         def apply_wm_angle(new_angle):
             # 2026-09-02：轨迹航点编辑——angle_cb 优先（写回航点 ra/rb），否则回退水印静态旋转
@@ -31128,7 +34695,6 @@ class FFmpegBatchGUI:
                     ov_angle_var.set(float(new_angle or 0.0))
                 except Exception:
                     pass
-            self._append_info_ui(_("[可视化-水] 已保存旋转角度: {0}°").format(new_angle))
 
         title = _("可视化编辑水印位置及大小")
         # aspect_ratio 语义（2026-09-10）："auto"（默认）=旧行为，按水印/挡板当前宽高比锁定
@@ -31169,7 +34735,9 @@ class FFmpegBatchGUI:
                                      reset_origin=reset_origin,
                                      ghost_color=ghost_color,   # 2026-09-12：幽灵框颜色（透传）
                                      content_src_w=content_src_w,   # 2026-09-14：缩放倍率滑块（透传）
-                                     content_src_h=content_src_h)
+                                     content_src_h=content_src_h,
+                                     allow_upscale=allow_upscale,  # 2026-09-22：画布放大显示（透传；遮罩用）
+                                     frame_extractor=frame_extractor)  # ⚠️ 节点语境：透传「节点时间轴取帧器」（遮罩背景=节点输出画面）
     
     # ---------- 从视频位置可视化编辑器 ----------
     def open_visual_overlay_editor(self, track_idx, ov_x_var=None, ov_y_var=None, ov_angle_var=None,
@@ -31251,7 +34819,6 @@ class FFmpegBatchGUI:
                 except Exception:
                     pass
             self.merge_update_command_preview()
-            self._append_info_ui(_("[可视化-从] 已保存旋转角度: {0}°").format(new_angle))
     
         main_pad_enabled = main_track.enc_settings.get('pad_enabled', False)
         if main_pad_enabled:
@@ -31261,7 +34828,7 @@ class FFmpegBatchGUI:
             offset_y = safe_eval_expr(off_y_expr, {"W": canvas_w, "H": canvas_h}) or 0
         else:
             offset_x, offset_y = 0, 0
-        extra_info = f"主视频偏移: X={offset_x}, Y={offset_y}"
+        extra_info = _('主视频偏移: X={0}, Y={1}').format(offset_x, offset_y)
 
         # ----- 定义背景绘制函数（现在内部只需使用 offset_x/offset_y 而不需定义 extra_info）-----
         def draw_bg(canvas, scale_x, scale_y=None):
@@ -31274,7 +34841,7 @@ class FFmpegBatchGUI:
                                   offset_x, offset_y, main_render_size, current_edit_track=track, tag="bg",
                                   scale_y=scale_y)
     
-        title = f"可视化编辑叠加位置 - {os.path.basename(track.file_path)}"
+        title = _('可视化编辑叠加位置 - {0}').format(os.path.basename(track.file_path))
         aspect = None
         # 主视频渲染尺寸（pad 时=主视频实际内容尺寸，画布含 pad 留黑）；供背景帧按 offset 摆放
         main_render_size = self._get_video_render_size(main_track) or (canvas_w, canvas_h)
@@ -31470,9 +35037,9 @@ class FFmpegBatchGUI:
         try:
             with open(file_path, 'w', encoding='utf-8') as f:
                 json.dump(state, f, indent=2, ensure_ascii=False)
-            self._append_info_ui(f"✅ 转换项目已导出到: {os.path.basename(file_path)}")
+            self._append_info_ui(_('✅ 转换项目已导出到: {0}').format(os.path.basename(file_path)))
         except Exception as e:
-            self._append_info_ui(f"❌ 导出转换项目失败: {e}")
+            self._append_info_ui(_('❌ 导出转换项目失败: {0}').format(e))
             messagebox.showerror(_("导出失败"), str(e))
 
     def import_convert_project(self):
@@ -31487,7 +35054,7 @@ class FFmpegBatchGUI:
             with open(file_path, 'r', encoding='utf-8') as f:
                 state = json.load(f)
         except Exception as e:
-            self._append_info_ui(f"❌ 读取转换项目失败: {e}")
+            self._append_info_ui(_('❌ 读取转换项目失败: {0}').format(e))
             messagebox.showerror(_("读取失败"), str(e))
             return
         if not isinstance(state, dict) or state.get("project_type") != "convert":
@@ -31514,7 +35081,7 @@ class FFmpegBatchGUI:
         if state.get("input_file"):
             self.input_file.set(state["input_file"])
         self.load_settings_into_ui(state)
-        self._append_info_ui(f"✅ 转换项目已导入: {os.path.basename(file_path)}")
+        self._append_info_ui(_('✅ 转换项目已导入: {0}').format(os.path.basename(file_path)))
 
     # ---------- 预览与 UI 辅助 ----------
     def preview_current_file(self, with_snapshot: bool = False):
@@ -31589,6 +35156,12 @@ class FFmpegBatchGUI:
         if not hasattr(self, 'watermark_settings'):
             return
         self._preview_after_id = None
+        # 素材类型切换（图片/视频）：「截取」面板随当前输入自动切换
+        # （图片→仅「显示时长」；视频→常规截取控件）。放在命令生成之前，
+        # 保证本次刷新消费的就是切换后的设置。幂等，重复调用无副作用。
+        _tf = getattr(self, 'trim_frame', None)
+        if _tf is not None:
+            _tf.refresh_source_mode()
         if getattr(self, '_loading_preset', False):
             return
         if hasattr(self, '_updating_preview') and self._updating_preview:
@@ -31621,7 +35194,7 @@ class FFmpegBatchGUI:
                     cmd_list = self.generate_ffmpeg_command(input_file, output_path, settings, preview=True)
                 cmd_str = format_cmd_for_display(cmd_list)
             except Exception as e:
-                cmd_str = f"生成命令时出错: {e}"
+                cmd_str = _('生成命令时出错: {0}').format(e)
     
             # 更新预览区（根据全局开关控制状态）
             preview = self.cmd_preview
@@ -31637,7 +35210,7 @@ class FFmpegBatchGUI:
             try:
                 watermark_enabled = self.watermark_settings.get("enabled", False)
                 # 2026-09-12：删去 pip_enabled——同上，画中画只在封装页，转换页只看水印。
-                if watermark_enabled and self.trim_frame.trim_enabled.get():
+                if watermark_enabled and self.trim_frame.trim_active():
                     if not self.trim_frame.precise_trim.get():
                         self.trim_frame.precise_trim.set(True)
                     self.trim_frame.precise_check.config(state='disabled')
@@ -31723,7 +35296,7 @@ class FFmpegBatchGUI:
             output_path = self.generate_output_path(input_path, settings)
             self._append_info_ui(_("生成输出路径: {0}").format(output_path))
         except Exception as e:
-            err_msg = f"生成输出路径失败: {e}"
+            err_msg = _('生成输出路径失败: {0}').format(e)
             self._append_info_ui(err_msg)
             import traceback
             self._append_info_ui(traceback.format_exc())
@@ -31741,7 +35314,7 @@ class FFmpegBatchGUI:
             task.cmd = cmd_list
             self._append_info_ui(_("命令生成成功，参数个数: {0}").format(len(cmd_list)))
         except Exception as e:
-            err_msg = f"命令生成错误: {e}"
+            err_msg = _('命令生成错误: {0}').format(e)
             self._append_info_ui(err_msg)
             import traceback
             self._append_info_ui(traceback.format_exc())
@@ -31926,12 +35499,12 @@ class FFmpegBatchGUI:
                         pass
                     self.update_task_list()
                     self._append_info_ui(
-                        f"[批量去黑边] {os.path.basename(task.input)} -> crop={w}:{h}:{x}:{y}")
+                        _('[批量去黑边] {0} -> crop={1}:{2}:{3}:{4}').format(os.path.basename(task.input), w, h, x, y))
 
                 self.root.after(0, apply)
             except Exception as e:
                 try:
-                    self.root.after(0, lambda: self._append_info_ui(f"[批量去黑边] 出错: {e}"))
+                    self.root.after(0, lambda: self._append_info_ui(_('[批量去黑边] 出错: {0}').format(e)))
                 except Exception:
                     pass  # 窗口已销毁（程序退出中），静默丢弃
 
@@ -31989,6 +35562,21 @@ class FFmpegBatchGUI:
         self.pending_tasks = [t for t in self.tasks if t.status == _("等待")]
         if not self.pending_tasks:
             messagebox.showinfo(_("提示"), _("没有等待中的任务"))
+            return
+        # 图片主视频 + 输出尺寸非偶数 → 拦下（不自动偶数化，理由见 _check_image_main_even_size）
+        # 逐个过一遍：有问题的任务会在信息区单独报出，本次队列整体不启动，
+        # 用户把尺寸改成偶数后重新点「开始队列」即可。非图片任务只按扩展名判，不跑 ffprobe。
+        _bad_img = []
+        for _qi, _t in enumerate(self.pending_tasks, 1):
+            if not self._check_image_main_even_size(
+                    getattr(_t, "input", ""), getattr(_t, "settings", None), queue_pos=_qi):
+                _bad_img.append(_qi)
+        if _bad_img:
+            self._append_info_ui(
+                _("[队列] 共 {0} 个任务的图片主视频输出尺寸不是偶数"
+                  "（序号：{1}），队列未启动。"
+                  "把尺寸改成偶数后重新点「开始队列」即可。").format(
+                      len(_bad_img), "、".join("#%d" % i for i in _bad_img)))
             return
         self.is_processing = True
         self.stop_flag = False
@@ -32155,7 +35743,7 @@ class FFmpegBatchGUI:
                     self._append_info_ui(_("[校验] ⚠ {0}: {1}{2}").format(os.path.basename(task.output), issues[0], extra))
             else:
                 task.status = _("失败")
-                task.error_msg = f"返回码 {retcode}"
+                task.error_msg = _('返回码 {0}').format(retcode)
                 self._append_info_ui(_("任务失败: {0} (返回码 {1})").format(os.path.basename(task.input), retcode))
             self._update_task_list_ui()
         except Exception as e:
@@ -32193,12 +35781,15 @@ class FFmpegBatchGUI:
             self.executor.shutdown(wait=False)
             self.executor = None
         self.current_hw_encoding_count = 0
+        # ⚠️「先读旧值 → 立刻复位 → 再判断」，顺序不可颠倒：
+        #    更早（修复前）写成在 if 之前就 self.stop_flag = False → 条件恒假，
+        #    「队列已停止」一次都打不出来，点停止也显示「所有任务处理完成」。
+        stopped = bool(self.stop_flag)
         self.stop_flag = False
-        if self.stop_flag:
+        if stopped:
             self._append_info_ui(_("\n队列已停止"))
         else:
             self._append_info_ui(_("\n所有任务处理完成"))
-        self.stop_flag = False
 
         # 转后校验汇总段（#2）：成功/疑似/失败 + 详情行；不弹窗、不落 txt（输出目录洁癖）
         run_tasks = list(getattr(self, "_queue_run_tasks", []) or [])
@@ -32240,7 +35831,9 @@ class FFmpegBatchGUI:
     def show_time_picker(self, parent, file_path, *, on_set_start=None, on_set_end=None,
                          initial_marks=None, on_send_segments=None, on_send_waypoints=None,
                          on_send_tw_items=None, on_send_chapters=None, use_output_context=True,
-                         start_mode="video"):
+                         start_mode="video", lavfi_complex=None, pipe_aspect=None,
+                         pipe_duration=None, pipe_start=None, pipe_out_mode=False,
+                         pipe_audio_graph=None, pipe_audio_map=None):
         """统一时间预览入口（2026-08-29 阶段2）：构造 SimplePreviewer 的薄封装。
 
         内部自动读取 get_time_context() 提供成片时间换算，调用方无需再传
@@ -32257,10 +35850,18 @@ class FFmpegBatchGUI:
                             on_send_tw_items=on_send_tw_items,
                             on_send_chapters=on_send_chapters,
                             use_output_context=use_output_context,
-                            start_mode=start_mode)
+                            start_mode=start_mode,
+                            # 管道合成模式（时间预览引擎）：None = 完全旧行为
+                            lavfi_complex=lavfi_complex,
+                            pipe_aspect=pipe_aspect,
+                            pipe_duration=pipe_duration,
+                            pipe_start=pipe_start,
+                            pipe_out_mode=pipe_out_mode,
+                            pipe_audio_graph=pipe_audio_graph,
+                            pipe_audio_map=pipe_audio_map)
         except Exception as e:
             try:
-                self._append_info_ui(_("[时间预览] 打开失败: {0}").format(e))
+                self._append_info_ui(_('[时间预览] 打开失败: {0}').format(e))
             except Exception:
                 pass
 
@@ -32284,6 +35885,9 @@ class FFmpegBatchGUI:
             messagebox.showerror(_("错误"), _("请选择有效的输入文件"))
             return
         settings = self.get_current_settings()
+        # 图片主视频 + 输出尺寸非偶数 → 拦下（不自动偶数化，理由见 _check_image_main_even_size）
+        if not self._check_image_main_even_size(input_file, settings):
+            return
         output_file = self.generate_output_path(input_file, settings)
         # ---- 新增：处理冲突 ----
         output_file = self._resolve_path_conflict(output_file)
@@ -32627,7 +36231,9 @@ class FFmpegBatchGUI:
                         except (ValueError, TypeError):
                             fs = 48
                         # 内容盒估算（2026-09-03 与 impl/渲染端同源：estimate_text_size + 2×pad8）
-                        _est2w, _est2h = estimate_text_size(str(text), "", fs)
+                        # 2026-09-25：与渲染端统一用 _tw_effective_text（multiline 开=高盒、关=矮盒）。
+                        _eff_text2 = _tw_effective_text(tw)
+                        _est2w, _est2h = estimate_text_size(_eff_text2, "", fs)
                         wm_w = _est2w + 16
                         wm_h = _est2h + 16
                         x_var = tk.StringVar(value=tw.get("overlay_x", "10"))
@@ -32638,7 +36244,7 @@ class FFmpegBatchGUI:
                             # 矩形高度反推字体大小（与 impl 同款：(nh−16)/(1.2×行数)）
                             try:
                                 if nh > 0:
-                                    _nlines = max(1, str(text).count("\n") + 1)
+                                    _nlines = max(1, _eff_text2.count("\n") + 1)
                                     _nf = max(8, int(round((nh - 16) / (1.2 * _nlines))))
                                     _of = int(tw.get("font_size", 48))
                                     if _nf != _of:
@@ -32795,7 +36401,7 @@ class FFmpegBatchGUI:
                     new_cmd_list = self.generate_ffmpeg_command(task.input, new_out, new_settings, preview=True)
                     new_cmd_str = format_cmd_for_display(new_cmd_list)
                 except ValueError as e:
-                    new_cmd_str = f"参数错误: {e}"
+                    new_cmd_str = _('参数错误: {0}').format(e)
             
                 # 更新预览，保持用户状态
                 current_state = preview_text.cget('state')
@@ -32858,6 +36464,8 @@ class FFmpegBatchGUI:
             trim_frame.trim_enabled.trace_add("write", update_preview)
             trim_frame.trim_start.trace_add("write", update_preview)
             trim_frame.trim_end.trace_add("write", update_preview)
+            # 图片素材的「显示时长」也是命令输入（图片主视频/水印画布时长取它）→ 必须联动
+            trim_frame.img_duration.trace_add("write", update_preview)
             adv_frame.hwaccel_enabled.trace_add("write", update_preview)
             adv_frame.hwaccel_decoder.trace_add("write", update_preview)
             adv_frame.custom_args.trace_add("write", update_preview)
@@ -33053,6 +36661,11 @@ class FFmpegBatchGUI:
         self.oneclick_fade_duration = tk.StringVar(value="1.0")
         # 一键转场（All）独立时长框（逐轨转场已移入视频编辑窗，此框仅供批量按钮使用）
         self.oneclick_transition_duration = tk.StringVar(value="1.0")
+        # 一键统一时长（All）独立时长框：图片轨「显示时长(秒)」批量基准
+        # （图片无媒体时长，只能由用户指定；默认与 TrimFrame 的单轨默认 10s 一致）
+        self.oneclick_image_duration = tk.StringVar(value="10")
+        # 一键有限循环（All）次数框：子视频「循环控制」批量基准（子视频控制页，画中画主视频编辑窗）
+        self.oneclick_loop_count = tk.StringVar(value="1")
         concat_chk = ttk.Checkbutton(btn_frame, text=_("串行合并（首尾拼接）"), variable=self.concat_enabled)
         concat_chk.pack(side=tk.LEFT, padx=5)
         ToolTip(concat_chk,
@@ -33077,8 +36690,19 @@ class FFmpegBatchGUI:
                 "提示：串行合并拖拽额外支持文件夹解析。"),
                 wraplength=700)
 
-        ttk.Button(btn_frame, text=_("添加外部视频（画中画/串行）"), 
-            command=self.merge_add_external_video).pack(side=tk.LEFT, padx=2)
+        _btn_ext_video = ttk.Button(btn_frame, text=_("添加外部视频（画中画/串行）"), 
+            command=self.merge_add_external_video)
+        _btn_ext_video.pack(side=tk.LEFT, padx=2)
+        ToolTip(_btn_ext_video,
+                _("给当前列表追加一段外部素材（视频或图片都可选）：\n"
+                "• 画中画：作为叠加在画面上的子视频 / 图片水印；\n"
+                "• 串行合并：作为串联的一段（图片按「显示时长」显示，默认 10 秒，\n"
+                "  可在该轨道的编辑窗「截取片段」页改，或用「一键统一时长(all)」批量改）。\n"
+                "两种模式都不勾选时会提示先勾一个。"),
+                wraplength=460)
+
+        # （「时间分配总览」只面向画中画模式 → 不放这里，收在轨道列表右键菜单里，
+        #   与「视频节点 / 音频节点」同列，非画中画时自动置灰。）
 
         # ----- 手动时长控制 -----
         # 变量定义
@@ -33217,9 +36841,8 @@ class FFmpegBatchGUI:
             row_frame, textvariable=self.merge_output_dir,
             values=tuple(_load_output_history().get("merge", [])))
         self.merge_output_dir_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 4))
-        ToolTip(_lbltt35,
-                _("输出目录：可直接输入，也可下拉选择历史目录。\n"
-                "历史单独存于 output_dir_history.json，不污染全局设置。"))
+        ToolTip(_lbltt35, _("输出目录：可直接输入，也可下拉选择历史目录。\n"
+                                             "历史单独存于 output_dir_history.json，不污染全局设置。"))
         ttk.Button(
             row_frame, text=_("浏览..."),
             command=self.merge_browse_output_dir, width=8
@@ -33422,9 +37045,7 @@ class FFmpegBatchGUI:
         def _pick_concat_file():
             p = filedialog.askopenfilename(
                 title=_("选择末端追加文件（图片或视频）"),
-                filetypes=[(_("媒体文件"), "*.png *.jpg *.jpeg *.bmp *.webp *.gif *.mp4 *.mkv *.avi *.mov *.flv *.webm *.ts"),
-                           (_("图片文件"), "*.png *.jpg *.jpeg *.bmp *.webp *.gif"),
-                           (_("视频文件"), "*.mp4 *.mkv *.avi *.mov *.flv *.webm *.ts")]
+                filetypes=media_filetypes()
             )
             if p:
                 path_var.set(p)
@@ -33554,7 +37175,7 @@ class FFmpegBatchGUI:
             cols = max(1, int(cols_var.get() or 1))
             n = rows * cols
             if split_on.get() and not (2 <= n <= 5):
-                messagebox.showwarning(_("提示"), _("总格数 {0}×{1}={2} 超出限制，需为 2-5。").format(rows, cols, n), parent=win)
+                messagebox.showwarning(_("提示"), _('总格数 {0}×{1}={2} 超出限制，需为 2-5。').format(rows, cols, n), parent=win)
                 return
             eh["split_enabled"] = bool(split_on.get())
             eh["split_rows"] = rows
@@ -33957,7 +37578,7 @@ class FFmpegBatchGUI:
         self._popup_merge_tree_menu(event.x_root, event.y_root)
     
     def _popup_merge_tree_menu(self, x, y):
-        """在指定位置弹出轨道菜单（复用于按钮）"""
+        _("""在指定位置弹出轨道菜单（复用于按钮）""")
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label=_("复制滤镜设置"), command=self._copy_filter_from_selected)
         if self._clipboard_filter_params is not None:
@@ -33982,12 +37603,27 @@ class FFmpegBatchGUI:
         menu.add_command(label=_("编辑轨道"), command=self.merge_edit_selected)
         menu.add_command(label=_("预览轨道"), command=self.merge_preview_selected)
         menu.add_command(label=_("预览轨道（快照 - 画中画合成）"), command=lambda: self.merge_preview_selected(with_snapshot=True))
-        menu.add_command(label=_("实时预览（画中画，可能卡顿）"), command=self.merge_preview_pip_live)
+        # 实时预览（简易时间引擎）：同一张合成图改走内置时间预览窗口（ffmpeg 管道，不依赖 mpv，
+        # 但画面小、性能有限，子视频多 / 滤镜重时同样可能卡顿；外部播放器（mpv/ffplay）性能通常更好）
+        # —— 按当前模式自动选图：串行合并图 / 画中画图 / 单轨合成图。
+        # （名称与顺序按用户提交 f28dffd 保留：「，画面小」是用户的标注，AI 不得改动）
+        menu.add_command(label=_("实时预览（简易时间引擎，画面小）"), command=self._live_preview_pipe)
+        # 实时预览（复杂滤镜）：入口收敛（2026-09-21 用户拍板）——原「实时预览（画中画，可能卡顿）」
+        # 与「串行合并预览 (支持滤镜 lavfi)」走的是同一套外壳、只差合成图内核，现合成一条，由
+        # _live_preview_player 按当前模式自动分派（实现体仍保留两个，理由见该函数 docstring）。
+        # 置灰口径跟随将要走的分支：串行合并模式需 mpv 或 ffplay；画中画模式恒可点。
+        menu.add_command(label=_("实时预览（复杂滤镜）"),
+                         command=self._live_preview_player,
+                         state=("normal" if (not self.concat_enabled.get()
+                                             or self.use_mpv.get() or self.ffplay_cmd)
+                                else "disabled"))
+
         if self.concat_enabled.get():
             # EDL 预览要真起 mpv 进程 → 未启用 mpv 时直接置灰，别等用户点了才被告知。
             # 这里只读 BooleanVar（零开销）；二进制级验证（--version 子进程）留到点击后
             # 由 _mpv_ready 补，避免每次右键弹菜单都卡一下。
-            menu.add_command(label=_("串行合并预览 (mpv EDL)"), command=self.merge_preview_concat_edl,
+            # （「串行合并预览 (支持滤镜 lavfi)」已由上方统一按钮覆盖 → 该项删除，2026-09-21。）
+            menu.add_command(label=_("串行合并预览 (无滤镜 mpv EDL)"), command=self.merge_preview_concat_edl,
                              state=("normal" if self.use_mpv.get() else "disabled"))
             # 导出只是生成文本文件，不依赖 mpv → 恒可用（末尾提示按 mpv 是否可用分两种写法）
             menu.add_command(label=_("串行合并导出 EDL 文件"), command=self.merge_export_concat_edl)
@@ -34005,8 +37641,1310 @@ class FFmpegBatchGUI:
 #        menu.add_command(label="保存项目", command=self.save_merge_project)
 #        menu.add_command(label="加载项目", command=self.load_merge_project)
         menu.add_separator()
+        # 图节点（2026-09-25）：列出当前处理链里的中间标签，选中后可对它整组套用
+        # 「视频轨道设置」。视频节点仅画中画可用（串行合并无意义 → 置灰）。
+        menu.add_command(label=_("视频节点"), command=self._open_node_tap_dialog,
+                         state=("normal" if self.pip_enabled.get() else "disabled"))
+        # 音频节点（2026-09-26）：与视频节点平行，作用于音频链；画中画 / 串行合并都可用。
+        menu.add_command(label=_("音频节点"), command=self._open_node_audio_dialog,
+                         state=("normal" if (self.pip_enabled.get() or self.concat_enabled.get())
+                                else "disabled"))
+        # 时间分配总览（2026-09-27）：画中画专用 —— 子视频按「显示时段」摆在主视频的时间轴上；
+        # 串行合并没有「显示时段」语义（就是首尾拼接的长度）→ 非画中画时置灰。
+        # 入口只放右键菜单（+ 「更多」按钮复用同一份菜单），不占封装页按钮行。
+        menu.add_command(label=_("时间分配总览"), command=self.open_timeline_overview,
+                         state=("normal" if self.pip_enabled.get() else "disabled"))
         menu.add_command(label=_("恢复列宽"), command=self.merge_reset_column_widths)
         menu.post(x, y)
+
+    def _graph_media_signature(self):
+        """轻量媒体签名：判断「暂停刷新」期间项目媒体是否变化，决定节点分析要不要重算。
+        只覆盖改变 graph 拓扑的输入（各启用轨道的文件路径，按序）；不含设置项 ——
+        设置项在暂停期变更导致的图变化属可接受边界（与旧版「暂停复用旧图」行为一致）。"""
+        sig = []
+        for _t in getattr(self, "merge_tracks", []) or []:
+            if not getattr(_t, "enabled", False):
+                continue
+            sig.append(getattr(_t, "file_path", None))
+        # ⚠️ 模式（画中画 / 串行合并）必须进签名（2026-09-28 修）：切模式时素材一个没换、
+        # 媒体签名一模一样，但画出来的图完全是另一张。旧签名只看素材 ⇒ 切回串行时
+        # 复用判据说"没变"，把上一代画中画的图交出去 ⇒ 音频节点凭空消失且不重新构图。
+        sig.append(("mode", bool(self.pip_enabled.get()), bool(self.concat_enabled.get())))
+        return tuple(sig)
+
+    def _ensure_node_graph_current(self):
+        """（旧签名，保留）→ 完整图 self._last_graph。语义见 _ensure_node_graphs_current。"""
+        return self._ensure_node_graphs_current()[1]
+
+    def _ensure_node_graphs_current(self):
+        """节点分析前确保拿到**两张**当前项目的图 → (base_graph, full_graph)。
+
+        - **base_graph = 应用节点效果「前」的干净图**（`_last_graph_raw_v`）
+          ⇒ 段序号稳定，**专供节点列表显示与指纹定位**（rows / node_fx 的 key）。
+        - **full_graph = 完整图**（`_last_graph`，含已插入的效果段 + 音频段）
+          ⇒ 音频节点窗与其它旧调用方继续用它（音频效果是在它之后才应用的，本就干净；
+          且 base 图只有视频段，给不了音频节点）。
+
+        ★ 为什么节点列表必须用 base（2026-09-28 实测修复）：用 full 时插入一个效果就
+        多一段 —— ① 内部临时标签 `v_out_0_nf` 泄漏成一行；② 其后段序号 +1，指纹整体
+        漂移 ⇒ 效果挂到错行；③ 用户在漂移后的行上再存效果，key 在干净图里根本不存在
+        ⇒ 永久失效、每次载入都提示（**孤儿效果的真正来源**）。
+
+        复用判据（2026-09-28 收紧，三条必须**同时**满足，缺一即重算）：
+          ① 两张图都非空；
+          ② 状态签名一致 —— 各启用轨道文件路径（按序）＋ **当前模式**；
+          ③ 两张图诞生于**同一次构图**（_last_graph_gen == _last_graph_base_gen）。
+        另：勾选「临时关闭刷新」期间收到过任何设置变动通知 ⇒ _graph_dirty=True，
+        也强制重算（那段时间命令预览根本没跑，缓存里的图是上一代的）。
+
+        ②③ 是本次修的两个洞：旧判据只看媒体签名，于是 ①切模式（素材没变、图换了）
+        和 ②串行构图不写 base（残留上一代画中画的 base）两种情况都会被判成"没变"
+        ⇒ 用户载入串行工程能看到音频节点，切画中画再切回串行就永远看不到、且不重新构图。
+        设置项仍不进签名（不逐项指纹化），但由 _graph_dirty 兜住"暂停期改过设置"。
+        base 缺失时（例如只跑过预览构图、没跑过正式构图）回退 full —— 绝不因拿不到
+        干净图就让节点窗打不开。
+        """
+        _sig = self._graph_media_signature()
+        _full = getattr(self, "_last_graph", "") or ""
+        _base = getattr(self, "_last_graph_base", "") or ""
+        if (_full and _base
+                and getattr(self, "_last_graph_sig", None) == _sig
+                and getattr(self, "_last_graph_gen", -1) == getattr(self, "_last_graph_base_gen", -2)
+                and not getattr(self, "_graph_dirty", False)):
+            return _base, _full
+        try:
+            self._do_merge_update_command_preview()
+        except Exception as _e:
+            self._append_info_ui(_("[节点] 刷新命令预览失败: %s") % _e)
+        _full = getattr(self, "_last_graph", "") or ""
+        _base = getattr(self, "_last_graph_base", "") or ""
+        return (_base or _full), _full
+
+
+    def _node_context(self):
+        """当前的 (主视频轨, 子视频轨列表)；不满足画中画前提返回 (None, None)。"""
+        vids = [t for t in self.merge_tracks if getattr(t, "enabled", False)
+                and getattr(t, "type", "") == "video"]
+        if not vids or not self.pip_enabled.get():
+            return None, None
+        return vids[0], vids[1:]
+
+    def _save_node_fx(self, key, settings):
+        """把某个节点的效果存进 self.node_fx（按指纹，不是按标签名）。"""
+        try:
+            self.node_fx[key] = dict(settings or {})
+            self._append_info_ui(
+                _('[节点] 已记录 {0} 的效果（当前共 {1} 个节点效果）。⚠️ 效果按「段序号+滤镜名」定位 —— 若之后增删/开关的处理环节导致处理链变化，会提示找不到位置并跳过，届时到这里重新选节点即可。').format(key, len(self.node_fx))
+
+)
+            self.merge_update_command_preview()
+        except Exception as e:
+            self._append_info_ui(_('[节点] 保存失败: {0}').format(e))
+
+    def _node_tap_frame(self, track, sub_videos, label, seek=None):
+        """生成某个中间标签在**指定时刻**的一帧 —— 返回 PPM 字节（内存帧，零磁盘写）。
+
+        seek = 产物时间轴秒数（None/0 = 第 0 帧）。区区一帧却必须真跑一次 ffmpeg：
+        那些可视化编辑器是靠 current_file 打开真实文件取画面的，给不了文件就取不到帧。
+
+        返回内存 PPM 字节（而非落盘路径）：与程序其余处（缩略图抽帧 / 快照窗口 /
+        `_ffmpeg_ppm_to_bytes`）同款「image2pipe + ppm」内存帧范式，避免写盘、也避免
+        固定文件名残留被误当结果（2026-09-27 复盘：节点预览曾因此显示测试素材）。
+        """
+        out_png = os.path.join(tempfile.gettempdir(), "node_%s.png" % label)
+        cmd, out_png = self._build_pip_snapshot_cmd(
+            track, sub_videos, tap_label=label, out_png=out_png, tap_seek=seek)
+        # 把「写文件」末尾改写成「内存管道」：去掉 '... -vframes 1 -update 1 <out_png>'，
+        # 换成 '-f image2pipe -vcodec ppm pipe:1'（与 _ffmpeg_ppm_to_bytes 同款改写）。
+        # 否则直接跑原 cmd 会把帧写进文件、stdout 为空，导致误判失败。
+        _rew = []
+        _i = 0
+        _n = len(cmd)
+        while _i < _n:
+            if cmd[_i] == out_png:
+                _i += 1
+                continue
+            if cmd[_i] == "-update":
+                _i += 2  # 跳过 -update 及其值（image2 单帧写盘选项，管道下不需要）
+                continue
+            _rew.append(cmd[_i])
+            _i += 1
+        _rew += ["-f", "image2pipe", "-vcodec", "ppm", "pipe:1"]
+        try:
+            self.root.config(cursor="watch")
+            self.root.update_idletasks()
+            proc = subprocess.Popen(
+                _rew, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=_ffmpeg_spawn_flags())
+            try:
+                data, err = proc.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                data, err = proc.communicate()
+        finally:
+            try:
+                self.root.config(cursor="")
+            except Exception:
+                pass
+        if proc.returncode != 0 or not data:
+            raise RuntimeError(
+                _("节点参考帧生成失败：\n") +
+                (err or b"").decode("utf-8", "replace")[-500:])
+        return data
+
+    def _probe_node_frames(self, track, sub_videos, labels, seek=None):
+        """**一趟** ffmpeg 取回所有节点同一时刻的一帧（内存 PPM 字节）→ {标签: PPM字节}。
+
+        为什么能一趟（2026-09-27「节点窗预览」，原为尺寸列+预览；尺寸列 2026-09-28
+        已并入「格式」列，本函数只服务预览）：旧做法是每个节点
+        `truncate_at` 截断后单独跑一次（因为中间标签被下游消费时不能 -map），N 个节点
+        就是 N 次解码。这里改走 `probe_tap_graph` 的 split 旁路 —— 原链一字不动，
+        只给每个节点接一个没人消费的出口，于是一次解码就能把所有节点都 map 出来。
+
+        内存帧（2026-09-27 复盘后改造）：不再写盘成 PNG，而是把所有节点帧经**单个
+        image2pipe 管道**依次吐进 stdout（单输出 + 多 `-map` + 一个 `pipe:1`，顺序与
+        -map 一致，已实测），再按 `_pmap` 顺序用 `split_ppm_frames` 拆成 N 个独立
+        PPM 字节块。这样：① 零磁盘写（与程序其余处 ppm 内存帧范式一致）② 绝无「旧
+        文件串台」风险（没有文件名、没有落盘）③ 仍保住「一趟解码」优化。
+
+        ⚠️ 不抛异常、不碰 Tk（会被工作线程调用）：图构建失败 / ffmpeg rc!=0 / 个别
+        输出为 0 字节，一律按「成功的部分」返回（预览降级为「—」，由调用方决定提示
+        方式）。尺寸信息由「格式」列（-print_graphs）提供，不依赖取帧。
+        """
+        _labels = [l for l in (labels or []) if l]
+        if not _labels:
+            return {}
+        try:
+            _base, _ = self._build_pip_snapshot_cmd(
+                track, sub_videos,
+                out_png=os.path.join(tempfile.gettempdir(), "_np_dummy.png"),
+                tap_seek=seek)
+        except Exception:
+            return {}
+        try:
+            _gi = _base.index("-filter_complex")
+            _graph = _base[_gi + 1]
+        except (ValueError, IndexError):
+            return {}
+        _new_graph, _pmap = probe_tap_graph(_graph, _labels)
+        if not _pmap:
+            return {}
+        # 单输出 + 多 -map + 一个 image2pipe 管道：一趟解码、N 帧按序进 stdout
+        cmd = list(_base[:_gi + 1]) + [_new_graph]
+        for _lab, _pl in _pmap.items():
+            cmd += ["-map", "[%s]" % _pl]
+        cmd += ["-frames:v", "1", "-f", "image2pipe", "-vcodec", "ppm", "pipe:1"]
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                creationflags=_ffmpeg_spawn_flags())
+            try:
+                data, _ = proc.communicate(timeout=60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                data, _ = proc.communicate()
+        except Exception:
+            return {}
+        if proc.returncode != 0 or not data:
+            # 失败宁可预览空着（显示「—」），也绝不给假数据 / 陈旧数据。
+            return {}
+        _frames = split_ppm_frames(data, len(_pmap))
+        # 按 _pmap 顺序配对；不足则只返回解析到的（best-effort）
+        return {_lab: _frames[_i] for _i, _lab in enumerate(_pmap)
+                if _i < len(_frames) and _frames[_i]}
+
+    def _probe_node_graph_info(self, track, sub_videos, timeout=25):
+        """量出**每个节点标签处的真实格式与尺寸** → {标签: 边属性}；不可用时返回 {}。
+
+        与 _probe_node_frames（取画面）互补：那边给的是**画面**（PPM 恒为 rgb24，
+        看不出节点的真实 pix_fmt）；这里给的是 ffmpeg **整图协商后**的真实边属性
+        （pix_fmt / 分辨率 / 声道 / 采样率）—— 例：子视频一接 overlay 就被协商成
+        yuva420p（带 alpha），纯字符串解析永远看不出来，而它决定了「能不能挂抠像滤镜」。
+
+        成本：一趟 `-frames:v 1 -f null -` 空跑（只初始化图，不解码整段），结果按图串缓存。
+
+        ⚠️ 失败一律静默返回 {}（老 ffmpeg 无 -print_graphs / 图初始化失败 / 对齐不上），
+        由调用方显示「—」。绝不阻塞、绝不猜、绝不拿旧数据充数。
+        """
+        try:
+            _base, _ = self._build_pip_snapshot_cmd(
+                track, sub_videos,
+                out_png=os.path.join(tempfile.gettempdir(), "_np_dummy.png"))
+        except Exception:
+            return {}
+        try:
+            _gi = _base.index("-filter_complex")
+            _graph = _base[_gi + 1]
+        except (ValueError, IndexError):
+            return {}
+        return self._probe_graph_edge_info(_base[:_gi], _graph, timeout=timeout)
+
+    def _probe_graph_edge_info(self, pre_args, graph, timeout=25):
+        """跑一次 `-print_graphs` 空跑 → {标签: 边属性}（带图串缓存）。
+
+        pre_args = ffmpeg 本体 + 输入与全局选项（即命令里 -filter_complex 之前的部分）。
+        """
+        if not graph:
+            return {}
+        if graph in self._pg_info_cache:
+            return self._pg_info_cache[graph]
+        _res = {}
+        try:
+            # 能力探测：老 ffmpeg 没有 -print_graphs（4.x/5.x）→ 直接回落，不报错
+            if not ffmpeg_has_option(self.ffmpeg_cmd, "-print_graphs"):
+                self._pg_info_cache[graph] = {}
+                return {}
+            # 探测命令要 -map 一个输出：取**最后一段**的输出标签（通常是成片出口）
+            _last_out = ""
+            for _s in reversed(graph_split(graph)):
+                _o = graph_parse_chain(_s)[2]
+                if _o:
+                    _last_out = _o[0]
+                    break
+            if not _last_out:
+                return {}
+            _fd, _fp = tempfile.mkstemp(prefix="kli_pg_", suffix=".json")
+            os.close(_fd)
+            try:
+                cmd = list(pre_args) + [
+                    "-filter_complex", graph, "-map", "[%s]" % _last_out,
+                    "-frames:v", "1", "-f", "null", "-",
+                    "-print_graphs", "-print_graphs_format", "json",
+                    "-print_graphs_file", _fp]
+                proc = subprocess.run(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    timeout=timeout, creationflags=_ffmpeg_spawn_flags())
+                if os.path.exists(_fp) and os.path.getsize(_fp) > 0:
+                    with open(_fp, "r", encoding="utf-8") as f:
+                        _data = json.load(f)
+                    _ok, _m = pg_map_labels(_data, graph)
+                    if _ok:
+                        _res = _m
+                    else:
+                        # 对齐不上：写日志备查，界面显示「—」（不是错误，不打扰用户）。
+                        # ⚠️ 本方法会被后台线程调用 → 必须走 safe_append_detail（线程安全），
+                        # 不能用 _append_info_ui（直接碰 Tk 控件）。
+                        self.safe_append_detail(
+                            _("[节点] -print_graphs 与处理链对不上，格式列留空（不影响使用）\n"))
+            finally:
+                try:
+                    if os.path.exists(_fp):
+                        os.remove(_fp)
+                except Exception:
+                    pass
+        except Exception:
+            _res = {}
+        self._pg_info_cache[graph] = _res
+        return _res
+
+    def _probe_insertion_ok(self, track, sub_videos, timeout=30):
+        """把「插入效果之后」的图真跑一次 → (ok, 错误摘要)。
+
+        为什么不用静态校验代替：`validate_node_custom_chain` 只能查 `[ ]` / `;` 这类
+        **语法**问题，查不出「滤镜名拼错 / 参数非法 / 该像素格式不支持」—— 这些只有
+        ffmpeg 自己跑一遍才知道，让它判是**零误报**的（项目与 tests 一律以 rc=0 为准）。
+
+        ⚠️ 误报防护：只有在「插入前」的图**本来就能跑通**的前提下，才把失败归因于本次
+        插入（否则是项目本身的问题，不该拦用户）—— 所以基线只在失败时才补跑一次。
+        """
+        try:
+            _base, _ = self._build_pip_snapshot_cmd(
+                track, sub_videos,
+                out_png=os.path.join(tempfile.gettempdir(), "_np_dummy.png"))
+            _gi = _base.index("-filter_complex")
+            _graph = _base[_gi + 1]
+        except Exception:
+            return True, ""                      # 构建不了就不校验（不拦用户）
+
+        def _try(_g):
+            _last = ""
+            for _s in reversed(graph_split(_g)):
+                _o = graph_parse_chain(_s)[2]
+                if _o:
+                    _last = _o[0]
+                    break
+            if not _last:
+                return True, ""
+            try:
+                _p = subprocess.run(
+                    list(_base[:_gi + 1]) + [_g, "-map", "[%s]" % _last,
+                                             "-frames:v", "1", "-f", "null", "-"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    timeout=timeout, creationflags=_ffmpeg_spawn_flags())
+            except Exception:
+                return True, ""
+            if _p.returncode == 0:
+                return True, ""
+            _err = (_p.stderr or b"").decode("utf-8", "replace")
+            _ls = [l.strip() for l in _err.splitlines() if l.strip()]
+            # 取「最后一条像报错的行」：ffmpeg 的收尾往往是无信息量的
+            # "Error initializing filters" / "Conversion failed!"，真正原因在它前面。
+            _hit = [l for l in _ls
+                    if ("No such filter" in l or "Invalid" in l or "Error" in l
+                        or "failed" in l or "Unable" in l or "does not exist" in l)]
+            _msg = (_hit[-1] if _hit else (_ls[-1] if _ls else ""))
+            return False, _msg[:180]
+
+        _ok, _msg = _try(_graph)
+        if _ok:
+            return True, ""
+        # 失败可能是项目本身就有问题（不是这次插入造成的）→ 补跑一次无插入的基线判定
+        try:
+            _raw = getattr(self, "_last_graph_raw_v", "") or ""
+            if _raw and _raw != _graph:
+                _okb, _ = _try(_raw)
+                if not _okb:
+                    return True, ""              # 基线本来就跑不通 ⇒ 不归因于插入
+        except Exception:
+            pass
+        return False, _msg
+
+    def _open_node_tap_dialog(self):
+        """右键「视频节点」：列出当前处理链里的中间视频标签，选中后对它套用「视频轨道设置」。
+
+        流程：①重刷一次命令预览 → 取「应用效果前」的干净图当基准（_ensure_node_graphs_current）
+             ②解析出可插入点（只收「单个输出标签」的段，分叉段语义不明，本轮不给插）
+             ③选中 → 截断到它生成一张参考帧 PNG（数据结构够分类器用: 真实画面+真实尺寸）
+             ④打开「视频轨道设置」窗口编辑（把它当成一条视频轨道）
+             ⑤保存 → 按指纹进 self.node_fx → 之后每次拼图都会自动插回该节点之后
+
+        ⚠️ ① 必须是**干净图**（2026-09-28）：成品图里已插入的效果会多出一段，段序号整体
+        漂移 ⇒ 列表出现 `v_out_0_nf` 这类内部临时标签、效果挂错行、新存的效果永久失效。
+        """
+        track, sub_videos = self._node_context()
+        if track is None:
+            messagebox.showinfo(_("提示"), _("「节点标签」目前只支持**画中画模式**（需启用画中画，"
+                                        "且有主视频轨道与子视频轨道）。"))
+            return
+        # ① 确保拿到当前项目的基准图（速度优先：图还在且媒体未变就复用，不重算；
+        # 仅当无图或「暂停期间换了项目」才强制重算一次，避免大项目每次点菜单都卡）
+        graph, _full_graph = self._ensure_node_graphs_current()
+        if not graph:
+            messagebox.showinfo(_("提示"), _("没能取到当前的处理链。\n"
+                                        "请确认：画中画已启用、主视频与子视频都已加载。"))
+            return
+
+        # 只收视频段：音频段交给「音频节点」对话框，互不交叉（见 is_audio_segment）。
+        nodes = [n for n in graph_nodes_full(graph) if not is_audio_segment(n[3])]
+        if not nodes:
+            messagebox.showinfo(_("提示"), _("这条处理链里没有可插入的视频中间节点。"))
+            return
+        rows = []
+        for _i, _name, _lastf, _body in nodes:
+            _k = node_fingerprint(_i, _lastf)
+            rows.append((_k, _i, _lastf, _name))
+        # 同名标签重复时标签列追加「同名 n/m」（与音频节点对话框同口径；视频图标签
+        # 目前唯一，属防御性统一显示）。
+        _lbl_cnt = {}
+        for _r in rows:
+            _lbl_cnt[_r[3]] = _lbl_cnt.get(_r[3], 0) + 1
+
+        with self.SafeToplevel(self.root) as win:
+            win.title(_("视频节点"))
+            # 右侧预览要「看得清」：Tk 只能整数倍 subsample，可用高度越大 → 倍率越小 →
+            # 画面越大（1080×1920 竖图：252 高的框只够 1/8=135×240，~520 高就能 1/4=270×480）。
+            # 所以窗口尽量开高，屏幕小则自动收，不硬撑出屏（center_window 不夹屏）。
+            _scr_w, _scr_h = win.winfo_screenwidth(), win.winfo_screenheight()
+            center_window(win,
+                          min(1000, max(760, _scr_w - 100)),
+                          min(700, max(560, _scr_h - 140)))
+            win.transient(self.root)
+            top = ttk.Frame(win, padding="10")
+            top.pack(fill=tk.BOTH, expand=True)
+            ttk.Label(top, text=(
+                _("选择要处理的节点 —— 效果会插在这一段之后，它后面的画面都会带上。\n"
+                "「格式」列是 ffmpeg 实测的**该节点处的真实像素格式与尺寸**（子视频接 overlay\n"
+                "会被协商成带 alpha 的 yuva420p，这类信息看画面是看不出来的）；"
+                "右侧是该节点在「取帧时间」的画面。"))
+            ).pack(anchor=tk.W, pady=(0, 6))
+
+            _body = ttk.Frame(top)
+            _body.pack(fill=tk.BOTH, expand=True)
+            _left = ttk.Frame(_body)
+            _left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            # 右栏：固定宽度 + 满高（pack_propagate(False) 锁宽，height 由 _body 撑满）
+            # —— 预览框靠它拿到「整个右栏的可用高度」，不必自己猜。
+            _right = ttk.Frame(_body, width=340)
+            _right.pack(side=tk.LEFT, fill=tk.BOTH, padx=(10, 0))
+            _right.pack_propagate(False)
+
+            _cols = ("idx", "filter", "fmt", "fx")
+            # 两级树：一级 = 阶段分组（主链/子链/叠加/转场/收尾），二级 = 节点
+            # 「格式」列 = ffmpeg -print_graphs 实测的 pix_fmt + 分辨率；它量的是**插入
+            # 效果之后**的真实尺寸（2026-09-28 实测与取帧逐节点一致）⇒ 原独立「尺寸」列
+            # 已冗余，2026-09-28 删除（尺寸靠真实取帧、格式靠整图协商，两者恒等）。
+            tv = ttk.Treeview(_left, columns=_cols, show="tree headings", height=14)
+            for _c, _t, _w, _st in (("#0", _("节点"), 190, False), ("idx", "#", 46, False),
+                                    ("filter", _("末滤镜"), 100, False),
+                                    ("fmt", _("格式"), 170, False),
+                                    ("fx", _("插入效果"), 130, True)):
+                tv.heading(_c, text=_t)
+                tv.column(_c, width=_w, stretch=_st)
+            tv.pack(fill=tk.BOTH, expand=True)
+            # 「原始标签」随选中联动：友好名只是显示层，对命令 / 排查仍要能拿到真名。
+            _raw_var = tk.StringVar(value=_("原始标签：—"))
+            ttk.Label(_left, textvariable=_raw_var).pack(anchor=tk.W, pady=(4, 0))
+            _name_of = {_r[0]: _r[3] for _r in rows}
+
+            # ---- 右侧：窗内预览（E）+ 格式列（F）----
+            # 为什么放窗内而不是弹大窗：挑节点要「边翻边看」，弹窗会抢焦点、还得一层层关。
+            # 所有取帧都在后台线程跑、结果经队列回主线程显示 —— 取帧期间列表照样能点。
+            # 预览框：宽 = 栏宽（固定，不随画面跳），高 = 按画面宽高比自适应（_render 里设）
+            # —— 竖图占满竖向、横图不留一大片空白，比「固定 4:3 框」实在得多。
+            _box = ttk.Frame(_right, width=336, height=300, relief="sunken")
+            _box.pack(fill=tk.X)
+            _box.pack_propagate(False)
+            _prev_lbl = ttk.Label(_box, text=_("（选中节点后显示画面）"), anchor=tk.CENTER)
+            _prev_lbl.pack(fill=tk.BOTH, expand=True)
+            _st_var = tk.StringVar(value="—")
+            ttk.Label(_right, textvariable=_st_var, wraplength=330,
+                      justify=tk.LEFT).pack(anchor=tk.W, pady=(6, 0))
+
+            _frames = {}       # (标签, 时刻key) -> PPM 字节
+            _fmts = {}         # 标签 -> "yuv420p 320×240"（ffmpeg -print_graphs 实测边属性）
+            _fmt_done = [False]
+            _pending = set()
+            _q = queue.Queue()
+            _alive = [True]
+
+            def _skey(_sk):
+                """秒数 → 缓存 key。**必须幂等**：队列回传时手里只有 key 没有原始秒数，
+                会拿 key 再调一次本函数（"%g" % "0" 会抛 must be real number, not str）。"""
+                if _sk in (None, ""):
+                    return "0"
+                try:
+                    return "%g" % float(_sk)
+                except Exception:
+                    return str(_sk)
+
+            def _render(_lab, _ppm, _sk=None):
+                """PPM 内存帧字节 → 右侧预览。
+
+                Tk 只能**整数倍** subsample（1/n），所以画面大小是被「框多大」卡住的：
+                可用高度越大 → 倍率越小 → 画面越大；框宽也要够，否则宽度先到顶。
+                故按**右栏的真实可用尺寸**算倍率（不再写死 330×246），并把框高收紧到
+                「画面高+边框」—— 竖图不留上下空白、横图不留一大片空白。
+                """
+                try:
+                    _pi = tk.PhotoImage(data=_ppm)
+                    _w, _h = _pi.width(), _pi.height()
+                    _max_w, _max_h = 330, 246          # 兜底（控件还没 mapped 时用）
+                    try:
+                        _cw, _ch = _right.winfo_width(), _right.winfo_height()
+                        if _cw < 50 or _ch < 50:       # 首帧可能早于布局完成
+                            win.update_idletasks()
+                            _cw, _ch = _right.winfo_width(), _right.winfo_height()
+                        if _cw >= 50 and _ch >= 50:
+                            _max_w = max(_cw - 10, 60)         # 10 ≈ 框的 sunken 边距
+                            _max_h = max(_ch - 42, 60)         # 42 ≈ 尺寸标签行 + 框边距
+                    except Exception:
+                        pass
+                    _f = 1
+                    while (_w / _f) > _max_w or (_h / _f) > _max_h:
+                        _f += 1
+                    if _f > 1:
+                        _pi = _pi.subsample(_f, _f)
+                    try:
+                        _box.configure(height=_pi.height() + 10)   # 框高贴着画面
+                    except Exception:
+                        pass
+                    _prev_lbl.config(image=_pi, text="")
+                    _prev_lbl.image = _pi      # ⚠️ 不留引用会被 GC，画面变空白
+                    # 尺寸不再由独立列提供：优先用「格式」列（pix_fmt + 分辨率，含插入效果），
+                    # 尚未量到时退回本帧的真实宽高（PPM 帧未缩放，就是节点输出尺寸）。
+                    _st_var.set(_("%s · 取帧 %ss") % (
+                        _fmts.get(_lab) or ("%d×%d" % (_w, _h)), _skey(_sk)))
+                except Exception as _e:
+                    _prev_lbl.config(image="", text=_("（画面无法显示）"))
+                    _st_var.set(_("画面加载失败：%s") % _e)
+
+            def _fill_fmts():
+                """格式列：ffmpeg -print_graphs 实测的**边属性**（pix_fmt + 分辨率）。
+
+                与「尺寸」列的区别：尺寸来自**画面**（PPM 恒 rgb24，看不出真实格式）；
+                格式来自 **ffmpeg 整图协商结果**（子视频接 overlay 会被协商成 yuva420p
+                带 alpha）。测不到一律「—」，绝不猜。
+                """
+                for _k2, _i2, _f2, _n2 in rows:
+                    if _n2 in _fmts:
+                        tv.set(_k2, column="fmt", value=_fmts[_n2])
+                    elif _fmt_done[0]:
+                        tv.set(_k2, column="fmt", value="—")
+
+            def _request_frame(_k, _sk=None, _force=False):
+                """取该节点在 _sk 秒的一帧（缓存命中直接用，否则后台跑一次）。"""
+                _lab = _name_of.get(_k)
+                if not _lab:
+                    return
+                _s = _skey(_sk)
+                if not _force and (_lab, _s) in _frames:
+                    _render(_lab, _frames[(_lab, _s)], _sk)
+                    return
+                if (_lab, _s) in _pending:
+                    return
+                _pending.add((_lab, _s))
+                _st_var.set(_("正在生成「%s」的画面…") % node_label_friendly(_lab))
+
+                def _job():
+                    # ⚠️ 工作线程绝不碰 Tk（只跑 ffmpeg），结果一律塞队列回主线程
+                    try:
+                        _q.put(("ok", _lab, _s,
+                                self._node_tap_frame(track, sub_videos, _lab, seek=_sk), ""))
+                    except Exception as _e:
+                        _q.put(("err", _lab, _s, None, str(_e)))
+
+                threading.Thread(target=_job, daemon=True).start()
+
+            def _bg_batch():
+                """一趟跑完所有节点的首帧 → 预热预览缓存（split 旁路，见
+                probe_tap_graph：直接 -map 中间标签会被 ffmpeg 拒，只能用旁路）。"""
+                try:
+                    _res = self._probe_node_frames(track, sub_videos, [_r[3] for _r in rows])
+                    _q.put(("batch", None, None, _res, ""))
+                except Exception as _e:
+                    _q.put(("batch", None, None, {}, str(_e)))
+
+            def _bg_fmt():
+                """一趟 `-print_graphs` 空跑 → 所有节点的真实格式/尺寸（详见
+                _probe_node_graph_info）。与取帧**并行**跑在另一个线程，互不阻塞。"""
+                try:
+                    _q.put(("fmt", None, None,
+                            self._probe_node_graph_info(track, sub_videos), ""))
+                except Exception as _e:
+                    _q.put(("fmt", None, None, {}, str(_e)))
+
+            def _poll():
+                try:
+                    while True:
+                        _kind, _lab, _s, _png, _err = _q.get_nowait()
+                        if _kind == "batch":
+                            # 预热首帧缓存（预览用）。⚠️ 尺寸不再从这里取 —— 由「格式」列
+                            # 统一提供（两者实测恒等，见 _fill_fmts 注释）。
+                            for _l, _p in (_png or {}).items():
+                                _frames.setdefault((_l, "0"), _p)
+                            if _err:
+                                self._append_info_ui(f"[节点] 批量取帧失败: {_err}")
+                            _cur = tv.selection()
+                            if _cur and not _cur[0].startswith("g:") and _auto_var.get():
+                                _request_frame(_cur[0], _read_seek())
+                        elif _kind == "fmt":
+                            _fmt_done[0] = True
+                            for _l, _info in (_png or {}).items():
+                                _b = pg_node_brief(_info)
+                                if _b:
+                                    _fmts[_l] = _b
+                            _fill_fmts()
+                        elif _kind == "ok":
+                            _pending.discard((_lab, _s))
+                            _frames[(_lab, _s)] = _png
+                            _cur = tv.selection()
+                            if _cur and _name_of.get(_cur[0]) == _lab:
+                                _render(_lab, _png, _s)
+                        elif _kind == "err":
+                            _pending.discard((_lab, _s))
+                            _cur = tv.selection()
+                            if _cur and _name_of.get(_cur[0]) == _lab:
+                                _st_var.set(_("取帧失败：%s") % (_err or "")[-120:])
+                except queue.Empty:
+                    pass
+                except Exception:
+                    return
+                if _alive[0]:
+                    try:
+                        win.after(200, _poll)
+                    except Exception:
+                        pass
+
+            def _on_sel(_e=None):
+                _s = tv.selection()
+                if not _s or _s[0].startswith("g:"):
+                    _raw_var.set(_("原始标签：—"))
+                    return
+                _raw_var.set(_("原始标签：[%s]") % _name_of[_s[0]])
+                if _auto_var.get():
+                    _request_frame(_s[0], _read_seek())
+
+            tv.bind("<<TreeviewSelect>>", _on_sel)
+            def _rebuild_tree():
+                """清空并重插两级节点树（从当前 rows/_name_of/_lbl_cnt 读，不重新发现节点）。"""
+                for _c0 in tv.get_children():
+                    tv.delete(_c0)
+                _last_seg = max([_r[1] for _r in rows]) if rows else -1
+                _grp = {}
+                for _k, _i, _lastf, _name in rows:
+                    _grp.setdefault(node_group_of(_name, _lastf, is_last=(_i == _last_seg)),
+                                    []).append((_k, _i, _lastf, _name))
+                _lbl_seen = {}
+                for _g in _NODE_GROUP_ORDER:
+                    _mem = _grp.get(_g)
+                    if not _mem:
+                        continue
+                    _gid = "g:" + _g
+                    tv.insert("", tk.END, iid=_gid, text="%s（%d）" % (_g, len(_mem)),
+                              values=("", "", "", ""), open=True)
+                    for _k, _i, _lastf, _name in _mem:
+                        _n = _lbl_seen.get(_name, 0) + 1
+                        _lbl_seen[_name] = _n
+                        _fname = node_label_friendly(_name)
+                        _disp = (_("%s（同名 %d/%d）") % (_fname, _n, _lbl_cnt[_name])
+                                 if _lbl_cnt[_name] > 1 else _fname)
+                        tv.insert(_gid, tk.END, iid=_k, text=_disp,
+                                  values=(_i, _lastf, "…",
+                                          node_effect_summary(self.node_fx.get(_k))))
+
+            _of_holder = [None]   # 失效效果区 LabelFrame（重建时先销毁旧的）
+            _avail = set()
+            _orph = []
+
+            def _rebuild_orphans():
+                """重建「失效效果」区：销毁旧 LabelFrame，按当前 self.node_fx 重算并重建。"""
+                if _of_holder[0] is not None:
+                    try:
+                        _of_holder[0].destroy()
+                    except Exception:
+                        pass
+                    _of_holder[0] = None
+                _avail.clear()
+                _avail.update({node_fingerprint(_n0, _n2)
+                               for _n0, _n1, _n2, _n3 in nodes})
+                _new = orphan_node_fx_keys(_avail, self.node_fx)
+                _orph[:] = _new
+                if not _orph:
+                    return
+                _of = ttk.LabelFrame(top, text=_("⚠ %d 个效果已失效（处理链已变化，找不到插入位置）")
+                                              % len(_orph))
+                _of.pack(fill=tk.X, pady=(8, 0))
+                _of_holder[0] = _of
+                _olv = tk.Listbox(_of, height=min(4, len(_orph)), selectmode=tk.EXTENDED)
+                _olv.pack(fill=tk.X, padx=6, pady=(4, 0))
+
+                def _orph_fill():
+                    _olv.delete(0, tk.END)
+                    for _k in _orph:
+                        _olv.insert(tk.END, "%s    %s" % (
+                            _k, node_effect_summary(self.node_fx.get(_k, {})) or _("（无效果）")))
+
+                _orph_fill()
+
+                _obar = ttk.Frame(_of)
+                _obar.pack(fill=tk.X, padx=6, pady=(4, 6))
+
+                def _orph_del(_sel_only=True):
+                    if _sel_only:
+                        _idx = [int(i) for i in _olv.curselection()]
+                        if not _idx:
+                            messagebox.showinfo(_("提示"), _("请先在上方列表中选中要清理的失效效果"))
+                            return
+                    else:
+                        _idx = list(range(len(_orph)))
+                    for _i in sorted(_idx, reverse=True):
+                        self.node_fx.pop(_orph[_i], None)
+                        _orph.pop(_i)
+                    self.merge_update_command_preview()
+                    self._append_info_ui(_("[节点] 已清理 %d 个失效效果（它们本来就不生效）。")
+                                         % len(_idx))
+                    # 清完即原地刷新（等价于关窗重开：重取图 + 重建列表 + 重取帧）
+                    _rebuild()
+
+                ttk.Button(_obar, text=_("清理选中"),
+                           command=lambda: _orph_del(True)).pack(side=tk.LEFT)
+                ttk.Button(_obar, text=_("全部清理"),
+                           command=lambda: _orph_del(False)).pack(side=tk.LEFT, padx=6)
+                ttk.Label(_obar, text=_("（这些效果已不生效、只占项目文件；清理不影响当前处理链）")
+                         ).pack(side=tk.LEFT)
+
+            def _rebuild():
+                """窗口内原地刷新：等价于「关窗重开」，但窗口不关。
+
+                根因修复（2026-09-29）：对话框打开时捕获的 nodes/_name_of/rows 是**打开那一刻
+                的图快照**；之后处理链变了（加素材 / 清插入命令）仍用旧标签去 truncate_at
+                取帧 → 各种节点「取帧失败」。这里重跑 _ensure_node_graphs_current 拿到当前
+                图，原地重建列表 / 失效区 / 取帧缓存，使清除操作立即生效，无需关窗重开。
+                """
+                _g, _fg = self._ensure_node_graphs_current()
+                _new_nodes = ([n for n in graph_nodes_full(_g)
+                               if not is_audio_segment(n[3])] if _g else [])
+                if not _new_nodes:
+                    # 图没了（极少见）：清掉陈旧显示，避免误导
+                    for _c0 in tv.get_children():
+                        tv.delete(_c0)
+                    nodes[:] = []
+                    rows[:] = []
+                    _name_of.clear()
+                    _frames.clear()
+                    _fmts.clear()
+                    _fmt_done[0] = False
+                    _pending.clear()
+                    _rebuild_orphans()
+                    return
+                # 原地更新共享可变对象（不用 = 重绑定，保证其它闭包同步看到）
+                nodes[:] = _new_nodes
+                rows[:] = []
+                for _i, _name, _lastf, _body in _new_nodes:
+                    _k = node_fingerprint(_i, _lastf)
+                    rows.append((_k, _i, _lastf, _name))
+                _name_of.clear()
+                _name_of.update({_r[0]: _r[3] for _r in rows})
+                _lbl_cnt.clear()
+                for _r in rows:
+                    _lbl_cnt[_r[3]] = _lbl_cnt.get(_r[3], 0) + 1
+                _rebuild_tree()
+                _rebuild_orphans()
+                # 清取帧缓存 & 重启后台取帧（标签可能已变）
+                _frames.clear()
+                _fmts.clear()
+                _fmt_done[0] = False
+                _pending.clear()
+                threading.Thread(target=_bg_batch, daemon=True).start()
+                threading.Thread(target=_bg_fmt, daemon=True).start()
+
+            _rebuild_tree()   # open 时先建树（失效区在下方单独初始化）
+
+
+            def _release_grab():
+                # 与 VideoFilterFrame._open_simple_preview 同款：本窗 grab 会把次级窗口
+                # （快照窗 / 视频轨道设置）的焦点吃掉，点不动；开之前先释放。
+                try:
+                    g = self.root.grab_current()
+                    if g is not None:
+                        g.grab_release()
+                except Exception:
+                    pass
+
+            # ---- 取帧时间 ----
+            # 语义：**该节点输出的时间轴**（= 成片时间轴），不是素材原始时间。
+            # 0/空 = 第 0 帧。走**输入级 -ss + setpts 恢复**（见 _build_pip_snapshot_cmd
+            # 的 tap_seek 快路径长注释）：直接跳到目标秒附近的关键帧，不再从 0 解码，
+            # 与缩略图 8 张抽帧同款口径 —— 快；setpts 把时间戳还原，叠加物时段仍保住。
+            _tim = ttk.Frame(top)
+            _tim.pack(fill=tk.X, pady=(8, 0))
+            _seek_lbl = ttk.Label(_tim, text=_("取帧时间(秒):"))
+            _seek_lbl.pack(side=tk.LEFT)
+            _seek_var = tk.StringVar(value="0")
+            _ent_seek = ttk.Entry(_tim, textvariable=_seek_var, width=12)
+            _ent_seek.pack(side=tk.LEFT, padx=(4, 0))
+            # 「选中时自动取帧」默认开 —— 挑节点本来就是靠看画面。关掉后只在按回车 /
+            # 点「刷新画面」/「看它这一帧」时才跑 ffmpeg（大素材 + 远时间点可省时间）。
+            _auto_var = tk.BooleanVar(value=True)
+            ttk.Checkbutton(_tim, text=_("选中时自动取帧"),
+                            variable=_auto_var).pack(side=tk.LEFT, padx=(12, 0))
+
+            def _on_seek_return(_e=None):
+                """改了时间按回车 → 按新时间重取当前节点（旧时间的帧仍留在缓存里）。"""
+                _s = tv.selection()
+                if _s and not _s[0].startswith("g:"):
+                    _request_frame(_s[0], _read_seek(), _force=True)
+
+            _ent_seek.bind("<Return>", _on_seek_return)
+            # tooltip 绑在**文字**上（不是整行 Frame）：鼠标扫过这一行就弹，容易误触。
+            # ⚠️ 必须是**单个 str**（多行也只是字符串里带 \n）；传 list/tuple 会被 Tk 按
+            # repr 渲染成一列一列的样子（2026-09-26 用户实测：每行只剩一两个字）。
+            ToolTip(_seek_lbl, (
+                _("针对「产物时间轴」的秒号，也就是最终成片第 N 秒的画面。\n"
+                "支持两种写法：8 或 00:00:08。留空 / 0 = 取第一帧（最快）。\n"
+                "\n"
+                "为什么现在快了：\n"
+                "· 和「缩略图 8 张」抽到的是同一套机制 —— 输入级 -ss 直接跳到目标秒\n"
+                "  附近的关键帧，不再从 0 把整条滤镜链解一遍。\n"
+                "· 跳转后节点上的画面仍由前面所有环节合成，但只需解到那一处即可，\n"
+                "  所以 N 越大、分辨率越高，省下的时间越明显。\n"
+                "· setpts 会把时间戳还原回真实时刻，旋转 / 叠加显示时段都不会错位。\n"
+                "\n"
+                "说明：取的是「跳转落点那一帧」（现代 ffmpeg 输入级 -ss 帧级精确，\n"
+                "通常就是你要的第 N 秒；个别封装下可能落在最近的关键帧，差 ≤ 1~2 秒）。\n"
+                "\n"
+                "建议：先用默认的第一帧确认节点选对了，\n"
+                "需要核对具体时刻时再填秒数。")), wraplength=430)
+
+            def _read_seek():
+                """输入框 → 秒（float）；0/空/非法 → None（取第 0 帧，最快）。"""
+                _s = (_seek_var.get() or "").strip()
+                if not _s:
+                    return None
+                try:
+                    _v = time_to_seconds(_s) if (":" in _s) else float(_s)
+                except Exception:
+                    return None
+                return _v if (_v and _v > 0) else None
+
+            def _selected():
+                _s = tv.selection()
+                if not _s:
+                    messagebox.showinfo(_("提示"), _("请先选择一个节点"))
+                    return None, None
+                _k = _s[0]
+                if _k.startswith("g:"):      # 两级树的一级（分组行）不是可操作节点
+                    messagebox.showinfo(_("提示"), _("请选择具体节点（不要选分组行）"))
+                    return None, None
+                _lab = next((n[3] for n in rows if n[0] == _k), None)
+                return _k, _lab
+
+            def _on_preview():
+                _k, _lab = _selected()
+                if not _lab:
+                    return
+                _sk = _read_seek()
+                try:
+                    cmd, out_png = self._build_pip_snapshot_cmd(
+                        track, sub_videos, tap_label=_lab,
+                        out_png=os.path.join(tempfile.gettempdir(), "node_%s.png" % _lab),
+                        tap_seek=_sk)
+                except Exception as e:
+                    messagebox.showerror(_("提示"), f"构建失败: {e}")
+                    return
+                _release_grab()
+                self._show_snapshot_async(
+                    cmd, out_png, "pip",
+                    f"节点 [{_lab}] 的画面" + (f" @ {_sk:g}s" if _sk else _(" (第一帧)")),
+                    _("正在生成节点画面…"), self._display_pip_snapshot)
+
+            def _on_apply():
+                _k, _lab = _selected()
+                if not _lab:
+                    return
+                _sk = _read_seek()
+                # 复用窗内预览已经取到的那一帧（同标签 + 同时间）→ 省一次 ffmpeg
+                png = _frames.get((_lab, _skey(_sk)))
+                if not png:
+                    try:
+                        png = self._node_tap_frame(track, sub_videos, _lab, seek=_sk)
+                    except Exception as e:
+                        messagebox.showerror(_("提示"), str(e))
+                        return
+                    _frames[(_lab, _skey(_sk))] = png
+                _release_grab()
+                _prev = dict(self.node_fx.get(_k, {}))
+                # 节点输出真实尺寸（取帧器产出的内存帧就是它）→ 编辑器坐标空间基准；
+                # 同时作为「节点时间轴取帧器」的来源，供编辑器内部「重新获取画面」按节点
+                # 时间轴取背景帧（与「看它这一帧」同源；外部那张帧仅供量尺寸，不参与显示）。
+                # 读 PPM 头即可（ppm_size），不必为此把整图塞进 PhotoImage。
+                _orig = ppm_size(png)
+                _sub_file = track.file_path
+                _extractor = self._make_node_frame_extractor(
+                    track, sub_videos, _k, _lab, _orig or (1280, 720),
+                    sub_file=_sub_file)
+                self.edit_video_settings(
+                    title=f"节点效果 [{_lab}]",
+                    initial_settings=_prev,
+                    on_save=lambda new: self._save_node_fx(_k, new),
+                    file_path=_sub_file,
+                    is_watermark=False,
+                    parent=self.root,
+                    overlay_mode="sub",
+                    pip_enabled_var=self.pip_enabled,
+                    frame_extractor=_extractor,
+                    frame_orig_size=_orig,
+                )
+                tv.set(_k, column="fx", value=node_effect_summary(self.node_fx.get(_k)))
+
+            def _on_clear():
+                _k, _lab = _selected()
+                if not _lab:
+                    return
+                if _k in self.node_fx:
+                    del self.node_fx[_k]
+                    self._append_info_ui(f"[节点] 已清除 {_k} 的效果")
+                    self.merge_update_command_preview()
+                    _rebuild()   # 原地刷新：重取图 + 重建列表与预览缓存（等价于关窗重开）
+                else:
+                    messagebox.showinfo(_("提示"), _("该节点没有已保存的效果"))
+
+            def _on_custom():
+                """自由插入命令（2026-09-27）：直接写 ffmpeg 滤镜串，插在该节点之后。
+
+                与「对此节点套用效果」（参数面板）**互斥并存于同一个 key**：写了自定义命令
+                就以它为准，参数面板的效果不再参与构图（node_effect_chain 优先返回自定义串）。
+                """
+                _k, _lab = _selected()
+                if not _lab:
+                    return
+                _prev = dict(self.node_fx.get(_k, {}))
+                _init = (_prev.get(NODE_FX_CUSTOM_KEY) or "").strip()
+                _res = [None]
+                with self.SafeToplevel(self.root) as _w:
+                    _w.title(_("自定义命令 · %s") % node_label_friendly(_lab))
+                    center_window(_w, 560, 300)
+                    _w.transient(self.root)
+                    _f = ttk.Frame(_w, padding="10")
+                    _f.pack(fill=tk.BOTH, expand=True)
+                    ttk.Label(_f, text=(
+                        _("直接写 ffmpeg 滤镜串，插在这个节点之后（多个滤镜用逗号分隔）。\n"
+                        "例：drawbox=x=10:y=10:w=100:h=50:color=red@0.5:t=fill\n"
+                        "⚠️ 暂不支持方括号 [ ] 和分号 ; —— 它们会引入标签 / 分段，破坏处理链。"))
+                    ).pack(anchor=tk.W, pady=(0, 6))
+                    _txt = tk.Text(_f, width=64, height=6, wrap=tk.WORD)
+                    _txt.pack(fill=tk.BOTH, expand=True)
+                    if _init:
+                        _txt.insert("1.0", _init)
+                    _bar = ttk.Frame(_f)
+                    _bar.pack(fill=tk.X, pady=(10, 0))
+                    _in2 = ttk.Frame(_bar)
+                    _in2.pack(anchor=tk.CENTER)
+
+                    def _ok():
+                        _okk, _v = validate_node_custom_chain(_txt.get("1.0", tk.END))
+                        if not _okk:
+                            messagebox.showerror(_("提示"), _v)
+                            return
+                        _res[0] = _v
+                        _w.destroy()
+
+                    ttk.Button(_in2, text=_("确定"), command=_ok).pack(side=tk.LEFT, padx=4)
+                    ttk.Button(_in2, text=_("取消"), command=_w.destroy).pack(side=tk.LEFT, padx=4)
+                    # ⚠️ 必须阻塞到窗口关闭：SafeToplevel.__exit__ 无条件 destroy，
+                    # 漏这句就是「窗口一闪而过」（见 graph-node-tap 档案 §14.1）。
+                    _w.wait_window()
+                if _res[0] is None:
+                    return
+                # 先让 ffmpeg 真跑一次「插入后」的图（只解 1 帧到 null）：语法校验查不出的
+                # 「滤镜名拼错 / 参数非法 / 该格式不支持」当场发现，不用等导出才报错。
+                # 先写进去再验（校验的就是真实构图），验不通过再撤回。
+                self.node_fx[_k] = {NODE_FX_CUSTOM_KEY: _res[0]}
+                _okk2, _msg2 = self._probe_insertion_ok(track, sub_videos)
+                if not _okk2 and _msg2:
+                    if not messagebox.askyesno(
+                            _("提示"),
+                            _("插入这条命令后，ffmpeg 跑不通：\n\n%s\n\n"
+                            "仍要保存吗？（选「否」可以回去改）") % _msg2):
+                        self.node_fx.pop(_k, None)
+                        return
+                tv.set(_k, column="fx", value=node_effect_summary(self.node_fx[_k]))
+                self._append_info_ui(
+                    f"[节点] {node_label_friendly(_lab)} 已设为自定义命令：{_res[0]}"
+                    + (_("（原参数面板效果已替换）") if _prev and not _init else ""))
+                self.merge_update_command_preview()
+
+            def _on_refresh():
+                """按当前取帧时间重取选中节点的画面（改了时间又不想按回车时用）。"""
+                _s = tv.selection()
+                if not _s or _s[0].startswith("g:"):
+                    messagebox.showinfo(_("提示"), _("请先选择一个节点"))
+                    return
+                _request_frame(_s[0], _read_seek(), _force=True)
+
+            def _on_dbl(_e=None):
+                _s = tv.selection()
+                if _s and not _s[0].startswith("g:"):
+                    _on_apply()
+
+            tv.bind("<Double-1>", _on_dbl)
+
+            # ---- 失效（孤儿）效果区 + 后台取帧线程：open 时各初始化一次 ----
+            _rebuild_orphans()
+            threading.Thread(target=_bg_batch, daemon=True).start()
+            threading.Thread(target=_bg_fmt, daemon=True).start()
+
+
+            bar = ttk.Frame(top)
+            bar.pack(fill=tk.X, pady=(10, 0))
+            _inner = ttk.Frame(bar)
+            _inner.pack(anchor=tk.CENTER)   # Windows 惯例：按钮居中，不右对齐
+            ttk.Button(_inner, text=_("对此节点套用效果"), command=_on_apply).pack(side=tk.LEFT, padx=4)
+            ttk.Button(_inner, text=_("自定义命令…"), command=_on_custom).pack(side=tk.LEFT, padx=4)
+            ttk.Button(_inner, text=_("看它这一帧"), command=_on_preview).pack(side=tk.LEFT, padx=4)
+            ttk.Button(_inner, text=_("刷新画面"), command=_on_refresh).pack(side=tk.LEFT, padx=4)
+            ttk.Button(_inner, text=_("清除效果"), command=_on_clear).pack(side=tk.LEFT, padx=4)
+
+            def _on_close():
+                _alive[0] = False      # 停掉 200ms 轮询，否则回调会打到已销毁的控件
+                win.destroy()
+
+            ttk.Button(_inner, text=_("关闭"), command=_on_close).pack(side=tk.LEFT, padx=4)
+            # 兜底：点标题栏 X 关闭时同样要停轮询
+            win.bind("<Destroy>", lambda e: _alive.__setitem__(0, False))
+            _poll()
+
+            # ⚠️ 必须阻塞到窗口关闭 —— SafeToplevel.__exit__ 无条件 destroy()，
+            # 没有这句就是「窗口一闪而过」（本项目其余所有 with SafeToplevel 都以
+            # wait_window 收尾，见 merge_edit_audio_track / edit_video_settings）。
+            win.wait_window()
+
+    def _open_node_audio_dialog(self):
+        """右键「音频节点」：列出当前处理链里的中间音频标签，选中后对它套用「音频轨道设置」。
+
+        与视频节点对称但范围更广：视频节点只给画中画；音频节点给**画中画 + 串行合并**
+        （音量 / 响度统一在两种模式末尾都常用）。流程与视频节点一致：
+        ① 重刷命令预览 → 取 _last_graph 基准图
+        ② 解析音频可插入点（is_audio_segment 过滤，与视频节点互斥）
+        ③ 选中 → 打开「音频轨道设置」窗口（节点模式，落点 = self.node_audio_fx）
+        """
+        if not (self.pip_enabled.get() or self.concat_enabled.get()):
+            messagebox.showinfo(_("提示"), _("「音频节点」需要在**画中画**或**串行合并**模式下使用。"))
+            return
+        # ① 确保拿到当前项目的基准图（与视频节点同款速度优先逻辑）
+        graph = self._ensure_node_graph_current()
+        if not graph:
+            messagebox.showinfo(_("提示"), _("没能取到当前的处理链。\n"
+                                        "请确认：画中画/串行合并已启用，且已加载素材。"))
+            return
+        # 只收音频段（视频段交给「视频节点」对话框，互不交叉）。
+        nodes = [n for n in graph_nodes_full(graph) if is_audio_segment(n[3])]
+        if not nodes:
+            messagebox.showinfo(_("提示"), _("这条处理链里没有可插入的音频中间节点。"))
+            return
+        rows = []
+        for _i, _name, _lastf, _body in nodes:
+            _k = node_fingerprint(_i, _lastf)
+            rows.append((_k, _i, _lastf, _name))
+        # 同名标签重复（PiP 级联 amix 每段输出都叫 [amain]）：标签列追加「同名 n/m」
+        # 让用户能直观区分；定位仍靠指纹（段序号+末滤镜名），插入已按段序号精确命中。
+        _lbl_cnt = {}
+        for _r in rows:
+            _lbl_cnt[_r[3]] = _lbl_cnt.get(_r[3], 0) + 1
+        # 格式列（声道数 / 采样率）：与视频节点同款，走 -print_graphs 实测边属性。
+        # 开窗口**前**先起后台线程（ffmpeg 空跑要一点时间），窗口照常立刻弹出，
+        # 测回来再填列；测不到一律「—」。
+        _fmt_q = queue.Queue()
+        _fmt_alive = [True]
+        _fmt_started = [False]
+
+        def _bg_fmt_audio():
+            try:
+                _t2, _sv2 = self._node_context()
+                _info = self._probe_node_graph_info(_t2, _sv2) if _t2 is not None else {}
+                _fmt_q.put(_info)
+            except Exception:
+                _fmt_q.put({})
+
+        def _poll_fmt_audio():
+            """主线程取回格式并填列。⚠️ 关窗必须停轮询（否则回调打到已销毁控件）。"""
+            if not _fmt_alive[0]:
+                return
+            try:
+                _info = _fmt_q.get_nowait()
+                for _k3, _i3, _f3, _n3 in rows:
+                    _b = pg_node_brief((_info or {}).get(_n3))
+                    tv.set(_k3, column="fmt", value=_b or "—")
+                return
+            except queue.Empty:
+                pass
+            except Exception:
+                return
+            try:
+                win.after(200, _poll_fmt_audio)
+            except Exception:
+                pass
+
+        # 失效（孤儿）效果区会额外占一截高度：固定 360 高装不下，底部按钮会被挤出窗外。
+        # 开窗前先算好失效条数，窗高按它自适应（列表最多 4 行，更多在列表内滚动）。
+        _avail = {node_fingerprint(_n0, _n2) for _n0, _n1, _n2, _n3 in nodes}
+        _orph = orphan_node_fx_keys(_avail, self.node_audio_fx)
+        _win_h = 360 + (92 + 22 * min(4, len(_orph)) if _orph else 0)
+        with self.SafeToplevel(self.root) as win:
+            win.title(_("音频节点"))
+            center_window(win, 720, _win_h)
+            win.transient(self.root)
+            top = ttk.Frame(win, padding="10")
+            top.pack(fill=tk.BOTH, expand=True)
+            ttk.Label(top, text=(
+                _("选择要处理的音频节点 —— 效果会插在这一段之后，它后面的音频都会带上。\n"
+                "节点位置按「段序号+末滤镜名」定位；处理链结构变了会自动跳过并提示重选。"))
+            ).pack(anchor=tk.W, pady=(0, 6))
+
+            _cols = ("idx", "filter", "label", "fmt", "fx")
+            tv = ttk.Treeview(top, columns=_cols, show="headings", height=10)
+            for _c, _t, _w, _st in (("idx", "#", 50, False), ("filter", _("末滤镜"), 110, False),
+                                    ("label", _("节点"), 190, False),
+                                    ("fmt", _("格式"), 120, False),
+                                    ("fx", _("插入效果"), 140, True)):
+                tv.heading(_c, text=_t)
+                tv.column(_c, width=_w, stretch=_st)
+            tv.pack(fill=tk.BOTH, expand=True)
+            # 「原始标签」随选中联动：友好名只是显示层，对命令 / 排查仍要能拿到真名。
+            _raw_var = tk.StringVar(value=_("原始标签：—"))
+            ttk.Label(top, textvariable=_raw_var).pack(anchor=tk.W, pady=(4, 0))
+            _name_of = {_r[0]: _r[3] for _r in rows}
+
+            def _on_sel(_e=None):
+                _s = tv.selection()
+                _raw_var.set((_("原始标签：[%s]") % _name_of[_s[0]]) if _s else _("原始标签：—"))
+
+            tv.bind("<<TreeviewSelect>>", _on_sel)
+
+            def _asum(_st):
+                """音频效果摘要：chain 得走 node_audio_effect_chain（它是方法不是模块级函数）。"""
+                if not _st:
+                    return ""
+                return node_effect_summary(_st, chain=self.node_audio_effect_chain(_st))
+
+            _lbl_seen = {}
+            for _k, _i, _lastf, _name in rows:
+                _n = _lbl_seen.get(_name, 0) + 1
+                _lbl_seen[_name] = _n
+                _fname = node_label_friendly(_name)
+                _disp = (_("%s（同名 %d/%d）") % (_fname, _n, _lbl_cnt[_name])
+                         if _lbl_cnt[_name] > 1 else _fname)
+                tv.insert("", tk.END, iid=_k,
+                          values=(_i, _lastf, _disp, "…",
+                                  _asum(self.node_audio_fx.get(_k))))
+
+            def _release_grab():
+                # 与视频节点同款：本窗 grab 会把次级窗口（音频轨道设置）焦点吃掉。
+                try:
+                    g = self.root.grab_current()
+                    if g is not None:
+                        g.grab_release()
+                except Exception:
+                    pass
+
+            def _selected():
+                _s = tv.selection()
+                if not _s:
+                    messagebox.showinfo(_("提示"), _("请先选择一个音频节点"))
+                    return None
+                return _s[0]
+
+            def _on_apply():
+                _k = _selected()
+                if not _k:
+                    return
+                _release_grab()
+                self.merge_edit_audio_track(
+                    node_key=_k,
+                    initial_settings=self.node_audio_fx.get(_k),
+                    on_save=lambda new, _k=_k: self._save_node_audio_fx(_k, new))
+                tv.set(_k, column="fx", value=_asum(self.node_audio_fx.get(_k)))
+
+            def _on_clear():
+                _k = _selected()
+                if not _k:
+                    return
+                if _k in self.node_audio_fx:
+                    del self.node_audio_fx[_k]
+                    tv.set(_k, column="fx", value="")
+                    self._append_info_ui(f"[音频节点] 已清除 {_k} 的效果")
+                    self.merge_update_command_preview()
+                else:
+                    messagebox.showinfo(_("提示"), _("该音频节点没有已保存的效果"))
+
+            def _on_custom():
+                """自由插入命令（2026-09-27）：直接写 ffmpeg 音频滤镜串，插在该节点之后。"""
+                _k = _selected()
+                if not _k:
+                    return
+                _lab = _name_of.get(_k, "")
+                _prev = dict(self.node_audio_fx.get(_k, {}))
+                _init = (_prev.get(NODE_FX_CUSTOM_KEY) or "").strip()
+                _res = [None]
+                with self.SafeToplevel(self.root) as _w:
+                    _w.title(_("自定义命令 · %s") % node_label_friendly(_lab))
+                    center_window(_w, 560, 300)
+                    _w.transient(self.root)
+                    _f = ttk.Frame(_w, padding="10")
+                    _f.pack(fill=tk.BOTH, expand=True)
+                    ttk.Label(_f, text=(
+                        _("直接写 ffmpeg 音频滤镜串，插在这个节点之后（多个滤镜用逗号分隔）。\n"
+                        "例：volume=0.5,highpass=f=80\n"
+                        "⚠️ 暂不支持方括号 [ ] 和分号 ; —— 它们会引入标签 / 分段，破坏处理链。"))
+                    ).pack(anchor=tk.W, pady=(0, 6))
+                    _txt = tk.Text(_f, width=64, height=6, wrap=tk.WORD)
+                    _txt.pack(fill=tk.BOTH, expand=True)
+                    if _init:
+                        _txt.insert("1.0", _init)
+                    _bar = ttk.Frame(_f)
+                    _bar.pack(fill=tk.X, pady=(10, 0))
+                    _in2 = ttk.Frame(_bar)
+                    _in2.pack(anchor=tk.CENTER)
+
+                    def _ok():
+                        _okk, _v = validate_node_custom_chain(_txt.get("1.0", tk.END))
+                        if not _okk:
+                            messagebox.showerror(_("提示"), _v)
+                            return
+                        _res[0] = _v
+                        _w.destroy()
+
+                    ttk.Button(_in2, text=_("确定"), command=_ok).pack(side=tk.LEFT, padx=4)
+                    ttk.Button(_in2, text=_("取消"), command=_w.destroy).pack(side=tk.LEFT, padx=4)
+                    # ⚠️ 必须阻塞到窗口关闭：SafeToplevel.__exit__ 无条件 destroy。
+                    _w.wait_window()
+                if _res[0] is None:
+                    return
+                # 与视频节点同款：先写进去，让 ffmpeg 真跑一次「插入后」的图验一遍，
+                # 验不通过就撤回（详见 _probe_insertion_ok）。
+                self.node_audio_fx[_k] = {NODE_FX_CUSTOM_KEY: _res[0]}
+                _t3, _sv3 = self._node_context()
+                if _t3 is not None:
+                    _okk2, _msg2 = self._probe_insertion_ok(_t3, _sv3)
+                    if not _okk2 and _msg2:
+                        if not messagebox.askyesno(
+                                _("提示"),
+                                _("插入这条命令后，ffmpeg 跑不通：\n\n%s\n\n"
+                                "仍要保存吗？（选「否」可以回去改）") % _msg2):
+                            self.node_audio_fx.pop(_k, None)
+                            return
+                tv.set(_k, column="fx", value=_asum(self.node_audio_fx[_k]))
+                self._append_info_ui(
+                    f"[音频节点] {node_label_friendly(_lab)} 已设为自定义命令：{_res[0]}"
+                    + (_("（原参数面板效果已替换）") if _prev and not _init else ""))
+                self.merge_update_command_preview()
+
+            tv.bind("<Double-1>", lambda e: _on_apply())
+
+            # ---- 失效（孤儿）音频效果区（与视频节点窗同款；_orph 已在开窗前算好、用于定窗高）----
+            if _orph:
+                _of = ttk.LabelFrame(top, text=_("⚠ %d 个音频效果已失效（处理链已变化，找不到插入位置）")
+                                              % len(_orph))
+                _of.pack(fill=tk.X, pady=(8, 0))
+                _olv = tk.Listbox(_of, height=min(4, len(_orph)), selectmode=tk.EXTENDED)
+                _olv.pack(fill=tk.X, padx=6, pady=(4, 0))
+
+                def _orph_fill():
+                    _olv.delete(0, tk.END)
+                    for _k in _orph:
+                        _olv.insert(tk.END, "%s    %s" % (
+                            _k, _asum(self.node_audio_fx.get(_k)) or _("（无效果）")))
+
+                _orph_fill()
+                _obar = ttk.Frame(_of)
+                _obar.pack(fill=tk.X, padx=6, pady=(4, 6))
+
+                def _orph_del(_sel_only=True):
+                    if _sel_only:
+                        _idx = [int(i) for i in _olv.curselection()]
+                        if not _idx:
+                            messagebox.showinfo(_("提示"), _("请先在上方列表中选中要清理的失效效果"))
+                            return
+                    else:
+                        _idx = list(range(len(_orph)))
+                    for _i in sorted(_idx, reverse=True):
+                        self.node_audio_fx.pop(_orph[_i], None)
+                        _orph.pop(_i)
+                    _orph_fill()
+                    self.merge_update_command_preview()
+                    self._append_info_ui(
+                        _("[音频节点] 已清理 %d 个失效效果（它们本来就不生效）。") % len(_idx))
+                    if not _orph:
+                        _of.destroy()
+
+                ttk.Button(_obar, text=_("清理选中"),
+                           command=lambda: _orph_del(True)).pack(side=tk.LEFT)
+                ttk.Button(_obar, text=_("全部清理"),
+                           command=lambda: _orph_del(False)).pack(side=tk.LEFT, padx=6)
+                ttk.Label(_obar, text=_("（这些效果已不生效、只占项目文件；清理不影响当前处理链）")
+                         ).pack(side=tk.LEFT)
+
+            bar = ttk.Frame(top)
+            bar.pack(fill=tk.X, pady=(10, 0))
+            _inner = ttk.Frame(bar)
+            _inner.pack(anchor=tk.CENTER)   # Windows 惯例：按钮居中，不右对齐
+            ttk.Button(_inner, text=_("对此音频节点套用效果"), command=_on_apply).pack(side=tk.LEFT, padx=4)
+            ttk.Button(_inner, text=_("自定义命令…"), command=_on_custom).pack(side=tk.LEFT, padx=4)
+            ttk.Button(_inner, text=_("清除效果"), command=_on_clear).pack(side=tk.LEFT, padx=4)
+
+            def _on_close_audio():
+                _fmt_alive[0] = False      # 停掉格式列轮询，否则回调会打到已销毁的控件
+                win.destroy()
+
+            ttk.Button(_inner, text=_("关闭"), command=_on_close_audio).pack(side=tk.LEFT, padx=4)
+            # 兜底：点标题栏 X 关闭时同样要停轮询
+            win.bind("<Destroy>", lambda e: _fmt_alive.__setitem__(0, False))
+            # 起后台线程量格式（窗口已经显示，测量期间列表照样能点）
+            if not _fmt_started[0]:
+                _fmt_started[0] = True
+                threading.Thread(target=_bg_fmt_audio, daemon=True).start()
+            _poll_fmt_audio()
+            win.wait_window()
 
     def open_multi_sync_reference(self):
         """右键「多流同步参考」：把选中的视频轨送进多流比对窗口。
@@ -34063,7 +39001,15 @@ class FFmpegBatchGUI:
         count = 0
         for t in enabled:
             if t.type == "video":
-                dur = self._get_effective_duration(t.enc_settings, input_path=t.file_path)
+                if self._is_static_image(t.file_path):
+                    # 图片轨没有媒体时长（ffprobe 对图片 format=duration 返回 N/A →
+                    # _get_media_duration 返 None），必须用「截取」面板的「显示时长(秒)」
+                    # (img_duration) 作基准，与串行命令端同一真源 _eff_image_display_duration。
+                    # 2026-09-22 修：此前走 _get_effective_duration → None → 兜底成 fade_base(1.0)
+                    # → 再被 40% 钳制打成 0.4s，与用户填的时长框对不上。
+                    dur = _eff_image_display_duration(t.enc_settings)
+                else:
+                    dur = self._get_effective_duration(t.enc_settings, input_path=t.file_path)
                 if dur is None or dur <= 0:
                     dur = fade_base
                 f = min(fade_base, dur * 0.4)
@@ -34089,7 +39035,8 @@ class FFmpegBatchGUI:
         self.merge_update_track_list()
         self.merge_update_command_preview()
         self._refresh_at_total_ref()
-        self._append_info_ui(_("[淡入淡出] 已为 {0} 个视频/音频轨道启用淡入淡出（时长取自一键淡入淡出框：{1:.2f}s，短片段自动钳制）").format(count, fade_base))
+        self._append_info_ui(_('[淡入淡出] 已为 {0} 个视频/音频轨道启用淡入淡出（时长取自一键淡入淡出框：{1:.2f}s，短片段自动钳制）').format(count, fade_base))
+
 
     def _apply_transition_all_tracks(self, current_track_obj=None, current_transition_vars=None):
         """一键为所有已启用的视频轨道（除末段）开启串行转场。
@@ -34105,15 +39052,19 @@ class FFmpegBatchGUI:
         if not vids:
             messagebox.showinfo(_("提示"), _("没有已启用的视频轨道。"))
             return
+        # 画中画模式：主视频也可以是链首（与「起始≈主视频时长」的子视频转场），故不排除 vids[0]
+        _pip_only = bool(getattr(self, "pip_enabled", None) and self.pip_enabled.get()) \
+            and not self.concat_enabled.get()
+        _src = vids
         # 末段无下一段，不参与
-        targets = vids[:-1] if len(vids) > 1 else []
+        targets = _src[:-1] if len(_src) > 1 else []
         if not targets:
             messagebox.showinfo(_("提示"), _("至少需要 2 个视频片段才能启用转场。"))
             return
         # 类型：优先取窗口当前下拉框值，否则默认 fade
         ttype = "fade"
         if current_transition_vars is not None:
-            _, _type_var, _dur_var = current_transition_vars
+            _unused, _type_var, _dur_var = current_transition_vars
             ttype = (_type_var.get().strip() or "fade")
         if ttype not in XFADE_TRANSITIONS:
             ttype = "fade"
@@ -34135,12 +39086,105 @@ class FFmpegBatchGUI:
             en_var.set(bool(cs.get("transition_enabled", False)))
             type_var.set(cs.get("transition_type", "fade") or "fade")
             dur_var.set(str(cs.get("transition_duration", "1.0") or "1.0"))
+        # ⚠️ 2026-09-27：这里原本在画中画下顺带跑一次「转场对齐」（等价「一键设置开始」的
+        #    起点重排），2026-09-27 用户拍板去掉 —— 点「一键转场」不该偷偷改各段的显示时段起点。
+        #    现在本函数只动转场开关/类型/时长；要重排起点请显式点「转场对齐」或「一键设置开始」。
         self.merge_update_track_list()
         self.merge_update_command_preview()
         self._refresh_at_total_ref()
         self._append_info_ui(
-            _("[转场] 已为 {0} 个视频轨道开启串行转场（类型 {1}，时长 {2:.2f}s，末段自动跳过）").format(len(targets), ttype, td)
+            _("[转场] 已为 {0} 个视频轨道开启{1}（类型 {2}，时长 {3:.2f}s，末段自动跳过）").format(
+                len(targets),
+                _("转场（含主视频→子视频）") if _pip_only else _("串行转场"),
+                xfade_display_name(ttype), td)
+            + _("；起点不变，需要按转场让位请点「转场对齐」")
         )
+
+
+    def _clear_fade_transition_all_tracks(self, current_track_obj=None,
+                                          current_fade_vars=None,
+                                          current_transition_vars=None):
+        """一键重置：关掉所有轨道的淡入淡出 + 串行转场（与「一键淡入淡出(all)/一键转场(all)」配对）。
+
+        「关开关」而不是「清数值」：fade_in / fade_out / transition_type /
+        transition_duration 原样保留 —— 重新勾「一键淡入淡出 / 一键转场」时还是你
+        上次选的那套数值，不用重填。显示时段（show_start / show_end）也不动，
+        那是「时间分配总览」管的事。
+
+        current_track_obj / current_fade_vars / current_transition_vars：从视频编辑窗口
+        「淡入淡出」页点这个按钮时传入，把窗口里的勾选框 / 输入框同步成刚关掉的状态，
+        否则点「保存」时局部变量（还是旧的 True）会把设置再写回去。
+        """
+        n_fade = n_tr = 0
+        for t in self.merge_tracks:
+            cs = t.enc_settings
+            if not isinstance(cs, dict):
+                continue
+            if cs.get("fade_enabled"):
+                n_fade += 1
+            if cs.get("transition_enabled"):
+                n_tr += 1
+            cs["fade_enabled"] = False
+            cs["fade_in"] = ""
+            cs["fade_out"] = ""
+            cs["transition_enabled"] = False
+        if not n_fade and not n_tr:
+            self._append_info_ui(_("[淡入淡出] 当前没有开启的淡入淡出 / 转场，无需重置。"))
+            return
+        if current_track_obj is not None and current_fade_vars is not None:
+            en_var, in_var, out_var = current_fade_vars
+            en_var.set(False)
+            in_var.set("")
+            out_var.set("")
+        if current_track_obj is not None and current_transition_vars is not None:
+            en_var, _t_var, _d_var = current_transition_vars
+            en_var.set(False)      # 类型 / 时长保留，重新一键开启时还是原值
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+        self._refresh_at_total_ref()
+        self._append_info_ui(
+            f"[淡入淡出] 已重置：关掉 {n_fade} 条轨道的淡入淡出、{n_tr} 条串行转场"
+            f"（数值保留，重新一键开启时还是原值）")
+
+
+    def _apply_image_duration_all_tracks(self, current_track_obj=None, current_img_var=None):
+        """一键把所有已启用图片轨道的「显示时长(秒)」统一为本行时长框的数值。
+
+        图片本身没有时间长度，显示几秒只能由用户指定（命令端按它给图片段限时：
+        `-loop 1 -framerate fps -t 显示时长 -i 图`）。多图串行（相册 / 幻灯片）时逐张改很慢，
+        故提供与「一键淡入淡出(all) / 一键转场(all)」同款的批量入口。
+
+        时长取自 self.oneclick_image_duration（编辑窗「截取片段」页本行「时长(秒)」框，默认 10s）。
+
+        current_track_obj / current_img_var：从视频编辑窗口内点击时传入，用于把新值同步回
+        窗口内「显示时长」输入框（trim_frame.img_duration），避免点「保存」时局部变量
+        （仍是旧值）把刚写入的时长覆盖掉。
+        """
+        try:
+            dur = float(self.oneclick_image_duration.get().strip() or "10")
+        except ValueError:
+            dur = 10.0
+        if dur <= 0:
+            dur = 10.0
+        txt = f"{dur:g}"
+        targets = [t for t in self.merge_tracks
+                   if t.enabled and t.type == "video" and self._is_static_image(t.file_path)]
+        # 当前轨是图片但未启用时不在 targets 里 —— 单独补写，保证「当前这张图」也被改到
+        cur = current_track_obj
+        if cur is not None and cur not in targets and self._is_static_image(getattr(cur, "file_path", "")):
+            targets = list(targets) + [cur]
+        if not targets:
+            messagebox.showinfo(_("提示"), _("没有图片轨道（图片素材的显示时长才需要设置）。"))
+            return
+        for t in targets:
+            t.enc_settings["img_duration"] = txt
+        # 同步编辑窗局部变量（保存时不会覆盖）
+        if current_img_var is not None:
+            current_img_var.set(txt)
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+        self._refresh_at_total_ref()
+        self._append_info_ui(_('[显示时长] 已把 {0} 个图片轨道的显示时长统一为 {1}s').format(len(targets), txt))
 
     def _copy_filter_from_selected(self):
         """从选中的第一个轨道复制滤镜参数。
@@ -34194,7 +39238,7 @@ class FFmpegBatchGUI:
                 continue
             track = self.merge_tracks[idx]
             if track.type != clip_type:
-                self._append_info_ui(_("跳过 {0} 轨道（类型不匹配）").format(track.type))
+                self._append_info_ui(_('跳过 {0} 轨道（类型不匹配）').format(track.type))
                 continue
             
             # 应用参数，跳过 None
@@ -34208,9 +39252,9 @@ class FFmpegBatchGUI:
             
             # 同步视频轨道的独立属性
             if track.type == "video":
-                track.overlay_enabled = track.enc_settings.get("overlay_enabled", False)
-                track.overlay_x = track.enc_settings.get("overlay_x", "W-w-10")
-                track.overlay_y = track.enc_settings.get("overlay_y", "H-h-10")
+                track.overlay_enabled = track.enc_settings.get("overlay_enabled", True)
+                track.overlay_x = track.enc_settings.get("overlay_x", DEFAULT_OVERLAY_X)
+                track.overlay_y = track.enc_settings.get("overlay_y", DEFAULT_OVERLAY_Y)
                 track.pad_enabled = track.enc_settings.get("pad_enabled", False)
                 track.pad_width = track.enc_settings.get("pad_width", "")
                 track.pad_height = track.enc_settings.get("pad_height", "")
@@ -34220,7 +39264,7 @@ class FFmpegBatchGUI:
             applied_count += 1
         
         if applied_count:
-            self._append_info_ui(_("已将滤镜设置应用到 {0} 个轨道").format(applied_count))
+            self._append_info_ui(_('已将滤镜设置应用到 {0} 个轨道').format(applied_count))
             self.merge_update_track_list()
             self.merge_update_command_preview()
         else:
@@ -34454,7 +39498,7 @@ class FFmpegBatchGUI:
             "speed_enabled": False, "speed_factor": "1.0",
             "reverse_enabled": False,
             "trim_enabled": False, "trim_start": "0", "trim_end": "", "precise_trim": False,
-            "overlay_enabled": True, "overlay_x": "W-w-10", "overlay_y": "H-h-10",
+            "overlay_enabled": True, "overlay_x": DEFAULT_OVERLAY_X, "overlay_y": DEFAULT_OVERLAY_Y,
             "blend_mode": "normal", "overlay_free_layout": False,
             # 画中画/水印子视频的旋转(spin)与轨迹(move)：还原时必须一并清空，否则残留导致仍旋转/移动
             "spin_enabled": False, "spin_speed": 60.0, "rotate_angle": 0.0,
@@ -34489,8 +39533,8 @@ class FFmpegBatchGUI:
                     track.enc_settings[key] = value
                 # 同步独立属性
                 track.overlay_enabled = True
-                track.overlay_x = "W-w-10"
-                track.overlay_y = "H-h-10"
+                track.overlay_x = DEFAULT_OVERLAY_X
+                track.overlay_y = DEFAULT_OVERLAY_Y
                 track.pad_enabled = False
                 track.pad_width = ""
                 track.pad_height = ""
@@ -34596,7 +39640,7 @@ class FFmpegBatchGUI:
 
         def eval_grid(cols):
             """评估某个列数下的布局得分：空单元格越少、画布比例越接近 16:9 越好。"""
-            _, cw, ch = calculate_layout(cols)
+            _unused, cw, ch = calculate_layout(cols)
             rows = (n + cols - 1) // cols
             empty = rows * cols - n
             ratio = (cw / ch) if ch > 0 else float('inf')
@@ -34827,6 +39871,7 @@ class FFmpegBatchGUI:
             "concat_enabled": self.concat_enabled.get(),
             "concat_norm_global": self._concat_norm_global_on(),
             "oneclick_fade_duration": self.oneclick_fade_duration.get(),
+            "oneclick_image_duration": self.oneclick_image_duration.get(),
             "merge_only_audio": self.merge_only_audio.get(),
             "merge_manual_duration_enabled": self.merge_manual_duration_enabled.get(),
             "merge_manual_duration": self.merge_manual_duration.get(),
@@ -34836,9 +39881,15 @@ class FFmpegBatchGUI:
             "merge_verify": self.merge_verify.get(),
             "merge_delete_source": self.merge_delete_source.get(),
             "end_handling": dict(self._merge_end_handling),
-            # 封装页独立文字水印（2026-08-26；轨道 enc_settings 里的注入键不落盘）
+            # 封装页独立文字水印（2026-08-26）；主轨 enc_settings 里那份是
+            # _apply_merge_text_watermark 运行时写入的，不落盘
             "text_watermark": dict(self._merge_tw.get("text_watermark") or {}),
             "text_watermark_items": copy.deepcopy(self._merge_tw.get("text_watermark_items") or []),
+            # 挂在处理链节点上的效果（2026-09-26「视频节点」）。
+            # ⚠️ 逐个自查可序列化：混进 Tk 变量/非 JSON 类型时只丢这一个节点效果，
+            # 绝不能让整个「保存项目」失败（保存失败比丢失一个效果严重得多）。
+            "node_fx": _jsonable_node_fx(self),
+            "node_audio_fx": _jsonable_node_audio_fx(self),
             "tracks": []
         }
         for track in self.merge_tracks:
@@ -34920,6 +39971,7 @@ class FFmpegBatchGUI:
             if hasattr(self, "concat_norm_global"):
                 self.concat_norm_global.set(state.get("concat_norm_global", False))
             self.oneclick_fade_duration.set(state.get("oneclick_fade_duration", "1.0"))
+            self.oneclick_image_duration.set(state.get("oneclick_image_duration", "10"))
             self.merge_only_audio.set(state.get("merge_only_audio", False))
             self.merge_manual_duration_enabled.set(state.get("merge_manual_duration_enabled", False))
             self.merge_manual_duration.set(state.get("merge_manual_duration", ""))
@@ -34942,6 +39994,35 @@ class FFmpegBatchGUI:
             _twmi = state.get("text_watermark_items")
             if isinstance(_twmi, list):
                 self._merge_tw["text_watermark_items"] = [dict(i) for i in _twmi]
+
+            # 节点效果（2026-09-26）。缺失时**清空**而不是保留 —— 否则载入新项目后
+            # 上一个项目的节点效果还挂在实例上，会按指纹插进新项目的图里。
+            self.node_fx = {}
+            _nfx = state.get("node_fx")
+            if isinstance(_nfx, dict):
+                for _k, _v in _nfx.items():
+                    try:
+                        if isinstance(_v, dict):
+                            self.node_fx[str(_k)] = dict(_v)
+                    except Exception:
+                        continue
+            if self.node_fx:
+                self._append_info_ui(
+                    _('[节点效果] 已载入 {0} 个；链的结构没变就会自动插回，变了会跳过并提示重选（视频节点里可查看/清除）').format(len(self.node_fx)))
+
+            # 音频节点效果（2026-09-26）：与 node_fx 同口径，缺失时清空。
+            self.node_audio_fx = {}
+            _nafx = state.get("node_audio_fx")
+            if isinstance(_nafx, dict):
+                for _k, _v in _nafx.items():
+                    try:
+                        if isinstance(_v, dict):
+                            self.node_audio_fx[str(_k)] = dict(_v)
+                    except Exception:
+                        continue
+            if self.node_audio_fx:
+                self._append_info_ui(
+                    _('[音频节点] 已载入 {0} 个；链的结构没变就会自动插回，变了会跳过并提示重选（音频节点里可查看/清除）').format(len(self.node_audio_fx)))
     
             # 恢复轨道
             self.merge_tracks = []
@@ -34958,9 +40039,9 @@ class FFmpegBatchGUI:
                 track.language = track_dict.get("language", "")
                 track.title = track_dict.get("title", "")
                 if track.type == "video":
-                    track.overlay_enabled = track.enc_settings.get("overlay_enabled", False)
-                    track.overlay_x = track.enc_settings.get("overlay_x", "W-w-10")
-                    track.overlay_y = track.enc_settings.get("overlay_y", "H-h-10")
+                    track.overlay_enabled = track.enc_settings.get("overlay_enabled", True)
+                    track.overlay_x = track.enc_settings.get("overlay_x", DEFAULT_OVERLAY_X)
+                    track.overlay_y = track.enc_settings.get("overlay_y", DEFAULT_OVERLAY_Y)
                     track.pad_enabled = track.enc_settings.get("pad_enabled", False)
                     track.pad_width = track.enc_settings.get("pad_width", "")
                     track.pad_height = track.enc_settings.get("pad_height", "")
@@ -34972,6 +40053,12 @@ class FFmpegBatchGUI:
             self._suppress_main_video_trace = False
             self._batch_update = False
     
+        if self.pip_enabled.get():
+            # 项目是以【画中画】保存的 → 等同「切进画中画」，一次性补齐从未启用叠加的子视频。
+            # ⚠️ 必须放在轨道恢复之后：上方 self.pip_enabled.set（L36685）触发的 _on_pip_toggle
+            # 此刻 merge_tracks 还是空的，迁移跑了个寂寞（老项目加载后子视频仍然不显示）。
+            self._migrate_sub_overlay_enabled_on_pip()
+
         # 手动刷新（新格式项目：重算派生输出路径，内部带出命令预览；
         # 旧格式项目 merge_output 已恢复为保存的完整路径，不可覆盖）
         self.merge_update_track_list()
@@ -35028,9 +40115,43 @@ class FFmpegBatchGUI:
         self.merge_sort_tracks(key_func=get_mtime)
 
 
+    def _migrate_sub_overlay_enabled_on_pip(self):
+        """切到画中画时，把「未启用叠加」的子视频位一次性补成启用（只补一次，之后不干预）。
+
+        背景（2026-09-24 用户拍板）：串联（拼接）模式添加图片/视频的入口不设
+        overlay_enabled（Track 里该键曾默认 False）→ 这些轨道切到画中画后成片里整条消失：
+        正式命令 _build_overlay_filter_complex（L26707）严格读此键，为假就走 L26882 的
+        else → [v_temp_N]nullsink，输出只剩主视频；而预览此前不读该键 →「预览有、成片没有」。
+        用户实测工程（F:/Temp/抖音工具/k绿幕/张玉琼.fflgproject）里两条子图轨道就是 False。
+
+        ⚠️ 只在【勾选「启用画中画」的那一刻】补一次，且只补当前为假的；之后用户怎么勾
+        都不再干预（用户明确要求：后续不再检查）。主视频（第一个视频轨道）不参与。
+        """
+        video_tracks = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
+        if len(video_tracks) < 2:
+            return
+        fixed = []
+        for i, t in enumerate(video_tracks):
+            if i == 0:
+                continue      # 第一个视频轨道 = 主视频（画中画的底），不叠加
+            if t.enc_settings.get("overlay_enabled", True):
+                continue
+            t.enc_settings["overlay_enabled"] = True
+            t.overlay_enabled = True
+            fixed.append(os.path.basename(t.file_path))
+        if fixed:
+            self._append_info_ui(
+                _("[画中画] 已自动勾选 %d 个子视频的「启用叠加」（原本是关的，成片里不会显示）：%s。\n"
+                "  如需隐藏其中某条，到该轨道的「视频轨道设置」里取消勾选即可（之后不再自动改）。")
+                % (len(fixed), _("、").join(fixed)))
+
+
     def _on_pip_toggle(self, *args):
         if self.pip_enabled.get() and self.concat_enabled.get():
             self.concat_enabled.set(False)
+        if self.pip_enabled.get():
+            # 切进画中画：一次性补齐「从未启用叠加」的子视频（见 _migrate_sub_overlay_enabled_on_pip）
+            self._migrate_sub_overlay_enabled_on_pip()
         # 当画中画被禁用时（切回普通模式），重置水印提示
         if not self.pip_enabled.get():
             self._trim_precise_hint_shown = False
@@ -35103,35 +40224,45 @@ class FFmpegBatchGUI:
         强制添加视频作为串联片段（不弹出询问对话框，自动添加所有音频和字幕流）
         """
         if os.path.isdir(path):
-            self._append_info_ui(_("[封装] 忽略文件夹: {0}，请选择文件").format(os.path.basename(path)))
+            self._append_info_ui(_('[封装] 忽略文件夹: {0}，请选择文件').format(os.path.basename(path)))
             return
         info = self._get_cached_stream_info(path)
         if not info:
-            self._append_info_ui(_("[封装] 无法解析文件: {0}").format(path))
+            self._append_info_ui(_('[封装] 无法解析文件: {0}').format(path))
             return
 
-    
+        # 图片素材：作为串联的一段（2026-09-22 开放「添加外部视频(串联)」的图片选择后补，
+        # 与拖拽路径同款 → codec 标 image2、无音轨）。裸 -i 图片只有 1 帧无法拼接，
+        # 命令端会按「显示时长」烘焙成 `-loop 1 -framerate fps -t N -i 图` 的有限时长流。
+        # ⚠️ 判定必须用 _MEDIA_IMAGE_EXTS（含 gif），不能用 _is_static_image /
+        # _STATIC_IMAGE_EXTS（那是可视化抽帧口径，不含 gif）→ 否则 gif 会掉进视频分支，
+        # 与拖拽添加同一文件的行为不一致（2026-09-22 审计修复）。
+        if os.path.splitext(str(path))[1].lower() in _MEDIA_IMAGE_EXTS:
+            self.merge_tracks.append(Track(0, "video", "image2", path, True))
+            self._append_info_ui(_('[串联] 已添加图片素材: {0}（显示时长默认 10 秒，可在轨道编辑窗「截取片段」页改）').format(os.path.basename(path)))
+            return
+
         # 添加所有视频流（通常只有一个）
         video_streams = [s for s in info["streams"] if s.get("codec_type") == "video"]
         for s in video_streams:
             track = Track(s["index"], "video", s.get("codec_name", "unknown"), path, True)
             # 串联模式不需要 overlay 属性
             self.merge_tracks.append(track)
-            self._append_info_ui(_("[封装] 已添加串联视频流: {0}").format(os.path.basename(path)))
+            self._append_info_ui(_('[封装] 已添加串联视频流: {0}').format(os.path.basename(path)))
     
         # 添加所有音频流
         audio_streams = [s for s in info["streams"] if s.get("codec_type") == "audio"]
         for s_audio in audio_streams:
             audio_track = Track(s_audio["index"], "audio", s_audio.get("codec_name", "unknown"), path, True)
             self.merge_tracks.append(audio_track)
-            self._append_info_ui(_("[封装] 已添加音频流: {0}").format(s_audio.get('codec_name', 'unknown')))
+            self._append_info_ui(_('[封装] 已添加音频流: {0}').format(s_audio.get('codec_name', 'unknown')))
     
         # 添加所有字幕流
         subtitle_streams = [s for s in info["streams"] if s.get("codec_type") == "subtitle"]
         for s_sub in subtitle_streams:
             sub_track = Track(s_sub["index"], "subtitle", s_sub.get("codec_name", "unknown"), path, True)
             self.merge_tracks.append(sub_track)
-            self._append_info_ui(_("[封装] 已添加字幕流: {0}").format(s_sub.get('codec_name', 'unknown')))
+            self._append_info_ui(_('[封装] 已添加字幕流: {0}').format(s_sub.get('codec_name', 'unknown')))
 
     def _expand_files_and_folders(self, file_paths):
         """
@@ -35202,7 +40333,7 @@ class FFmpegBatchGUI:
                     track = Track(0, "video", "image2", img, True)
                     self.merge_tracks.insert(0, track)   # 插最前，确保是第一个视频=主视频
                     _has_main = True   # 后续图片作为子视频
-                    self._append_info_ui(_("[封装] 无主视频，已将图片设为主视频: {0}").format(os.path.basename(img)))
+                    self._append_info_ui(_('[封装] 无主视频，已将图片设为主视频: {0}').format(os.path.basename(img)))
                 else:
                     self._add_pip_video_forced(img, add_audio=False)
             # 音频直接添加
@@ -35218,13 +40349,13 @@ class FFmpegBatchGUI:
             # 立即刷新列表
             self.merge_update_track_list()
             if video_files:
-                self._append_info_ui(_("[封装] 已添加 {0} 个视频文件（正在后台解析…）").format(len(video_files)))
+                self._append_info_ui(_('[封装] 已添加 {0} 个视频文件（正在后台解析…）').format(len(video_files)))
             if image_files:
-                self._append_info_ui(_("[封装] 已添加 {0} 个图片水印").format(len(image_files)))
+                self._append_info_ui(_('[封装] 已添加 {0} 个图片水印').format(len(image_files)))
             if audio_files:
-                self._append_info_ui(_("[封装] 已添加 {0} 个音频轨道").format(len(audio_files)))
+                self._append_info_ui(_('[封装] 已添加 {0} 个音频轨道').format(len(audio_files)))
             if other_files:
-                self._append_info_ui(_("[拖拽] 忽略不支持的文件类型: {0}").format(', '.join(os.path.basename(f) for f in other_files)))
+                self._append_info_ui(_('[拖拽] 忽略不支持的文件类型: {0}').format(', '.join((os.path.basename(f) for f in other_files))))
         finally:
             self._batch_update = original_batch
     
@@ -35246,12 +40377,12 @@ class FFmpegBatchGUI:
             elif len(video_files) > 1:
                 add_audio = messagebox.askyesno(
                     _("添加音频"),
-                    _("是否同时添加这 {0} 个视频文件的音频流？\n选“是”将添加所有音频流，选“否”仅添加视频作为水印。").format(len(video_files))
+                    _('是否同时添加这 {0} 个视频文件的音频流？\n选“是”将添加所有音频流，选“否”仅添加视频作为水印。').format(len(video_files))
                 )
             else:
                 add_audio = messagebox.askyesno(
                     _("添加音频"),
-                    _("是否同时添加文件「{0}」的音频流？\n选“是”将添加音频，选“否”仅添加视频作为水印。").format(os.path.basename(video_files[0]))
+                    _('是否同时添加文件「{0}」的音频流？\n选“是”将添加音频，选“否”仅添加视频作为水印。').format(os.path.basename(video_files[0]))
                 )
     
             def parse_and_add():
@@ -35259,9 +40390,21 @@ class FFmpegBatchGUI:
                     self._parse_files_concurrently(video_files, description=_("画中画视频文件"))
                     self.root.after(0, lambda: self._finish_drop_pip(video_files, add_audio))
                 except Exception as e:
-                    self.root.after(0, lambda e=e: self._append_info_ui(_("[封装] 解析异常: {0}").format(e)))
+                    self.root.after(0, lambda e=e: self._append_info_ui(_('[封装] 解析异常: {0}').format(e)))
     
             threading.Thread(target=parse_and_add, daemon=True).start()
+        else:
+            # 纯图片素材（画中画模式：首个图片已自动设为主视频）：无后台解析步骤，
+            # 但必须像普通/串行模式那样刷新【输出路径 + 命令预览】——否则 merge_output 为空，
+            # merge_build_cmd_list 直接返回 []，命令区显示「参数不完整，无法生成命令」，
+            # 且切换模式也救不回来（输出空是三种模式的公共前提）。
+            # （用户 2026-09-19 反馈：画中画拖图片作主视频后，任何模式都报参数不足。）
+            try:
+                self.merge_auto_recommend_container()
+                self.merge_update_output_preview()
+            except Exception as e:
+                self._append_info_ui(_('[封装] 刷新输出路径失败: {0}').format(e))
+            self.merge_update_command_preview()
     
     def _finish_drop_pip(self, video_files, add_audio):
         """
@@ -35337,22 +40480,54 @@ class FFmpegBatchGUI:
     
         # 分类（使用 all_files）
         video_exts = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.ts', '.webm')
+        img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
         audio_exts = ('.mp3', '.aac', '.m4a', '.wav', '.flac', '.ogg', '.opus', '.ac3', '.dts')
         subtitle_exts = ('.srt', '.ass', '.ssa', '.vtt', '.idx', '.sup')
     
         video_files = []
+        image_files = []
         other_files = []
         for f in all_files:
             ext = os.path.splitext(f)[1].lower()
             if ext in video_exts:
                 video_files.append(f)
+            elif ext in img_exts:
+                image_files.append(f)   # 图片：直接作为串行段（无需后台解析）
             else:
                 other_files.append(f)  # 音频/字幕稍后处理
     
-        if not video_files:
-            self._append_info_ui(_("[封装] 未检测到视频文件"))
+        if not video_files and not image_files:
+            self._append_info_ui(_("[封装] 未检测到视频或图片文件"))
             return
     
+        # ---- 立即添加图片轨道（图片作为串行段，与画中画一样接纳图片素材） ----
+        if image_files:
+            _orig_batch_img = self._batch_update
+            self._batch_update = False
+            try:
+                _has_main = bool(self.merge_video.get().strip()) or any(
+                    t.type == "video" for t in self.merge_tracks)
+                for img in image_files:
+                    _img_trk = Track(0, "video", "image2", img, True)
+                    if not _has_main:
+                        self.merge_tracks.insert(0, _img_trk)   # 首个图片=主视频
+                        _has_main = True
+                        self._append_info_ui(_('[串联] 无主视频，已将图片设为主视频: {0}').format(os.path.basename(img)))
+                    else:
+                        self.merge_tracks.append(_img_trk)
+                self.merge_update_track_list()
+                self._append_info_ui(_('[串联] 已添加 {0} 个图片素材').format(len(image_files)))
+            finally:
+                self._batch_update = _orig_batch_img
+            self._ensure_main_video()
+            self.merge_auto_recommend_container()
+            self.merge_update_output_preview()
+
+        if not video_files:
+            # 纯图片素材：无需后台解析，刷新命令预览后直接收尾
+            self.merge_update_command_preview()
+            return
+
         # ========== 关键修改：强制立即刷新 ==========
         # 保存原有批处理标志，临时关闭以确保立即刷新
         original_batch = self._batch_update
@@ -35364,7 +40539,7 @@ class FFmpegBatchGUI:
                 self.merge_tracks.append(track)
             # 立即刷新列表（此时会显示“解析中…”）
             self.merge_update_track_list()
-            self._append_info_ui(_("[封装] 已添加 {0} 个视频文件（正在后台解析…）").format(len(video_files)))
+            self._append_info_ui(_('[封装] 已添加 {0} 个视频文件（正在后台解析…）').format(len(video_files)))
         finally:
             self._batch_update = original_batch
     
@@ -35374,7 +40549,7 @@ class FFmpegBatchGUI:
                 self._parse_files_concurrently(video_files, description=_("串联视频文件"))
                 self.root.after(0, lambda: self._finish_drop_concat(video_files, other_files))
             except Exception as e:
-                self.root.after(0, lambda e=e: self._append_info_ui(_("[封装] 解析异常: {0}").format(e)))
+                self.root.after(0, lambda e=e: self._append_info_ui(_('[封装] 解析异常: {0}').format(e)))
     
         threading.Thread(target=parse_and_add, daemon=True).start()
     
@@ -35474,11 +40649,7 @@ class FFmpegBatchGUI:
     def _add_pip_video(self):
         path = filedialog.askopenfilename(
             title=_("选择视频或图片文件（画中画）"),
-            filetypes=[
-                (_("媒体文件"), "*.mp4 *.mkv *.avi *.mov *.flv *.webm *.png *.jpg *.jpeg *.bmp *.gif *.webp"),
-                (_("视频文件"), "*.mp4 *.mkv *.avi *.mov *.flv *.webm"),
-                (_("图片文件"), "*.png *.jpg *.jpeg *.bmp *.gif *.webp")
-            ]
+            filetypes=media_filetypes()
         )
         if not path:
             return
@@ -35486,7 +40657,7 @@ class FFmpegBatchGUI:
 
         info = ffprobe_json(self.ffprobe_cmd, path)
         if not info:
-            self._append_info_ui(_("[封装] 无法解析文件: {0}").format(path))
+            self._append_info_ui(_('[封装] 无法解析文件: {0}').format(path))
             return
     
         # 检测是否为图片
@@ -35496,15 +40667,15 @@ class FFmpegBatchGUI:
         if is_image:
             # 图片直接添加（无音频）
             self._add_pip_video_forced(path, add_audio=False)
-            self._append_info_ui(_("[封装] 已添加图片水印: {0}").format(os.path.basename(path)))
+            self._append_info_ui(_('[封装] 已添加图片水印: {0}').format(os.path.basename(path)))
         else:
             # 视频：询问是否添加音频
             add_audio = messagebox.askyesno(
                 _("添加音频"),
-                _("是否同时添加文件「{0}」的音频流？\n选“是”将添加音频，选“否”仅添加视频作为水印。").format(os.path.basename(path))
+                _('是否同时添加文件「{0}」的音频流？\n选“是”将添加音频，选“否”仅添加视频作为水印。').format(os.path.basename(path))
             )
             self._add_pip_video_forced(path, add_audio=add_audio)
-            self._append_info_ui(_("[封装] 已添加画中画视频: {0}").format(os.path.basename(path)))
+            self._append_info_ui(_('[封装] 已添加画中画视频: {0}').format(os.path.basename(path)))
     
         # 统一更新界面
         self.merge_update_track_list()
@@ -35515,21 +40686,26 @@ class FFmpegBatchGUI:
     
     def _add_concat_video(self):
         path = filedialog.askopenfilename(
-            title=_("选择视频文件（串联）"),
-            filetypes=[(_("媒体文件"), "*.mp4 *.mkv *.avi *.mov *.flv *.webm")]
+            title=_("选择视频或图片文件（串联）"),
+            # 图片也可作为串联的一段（命令端按「显示时长」把它烘焙成有限时长流后拼接），
+            # 此前只列视频 → 图片选不到（2026-09-22 开放，与拖拽路径口径一致）。
+            filetypes=media_filetypes()
         )
         if not path:
             return
 
-
         info = ffprobe_json(self.ffprobe_cmd, path)
         if not info:
-            self._append_info_ui(_("[封装] 无法解析文件: {0}").format(path))
+            self._append_info_ui(_('[封装] 无法解析文件: {0}').format(path))
             return
     
         # 串联模式：直接添加所有流（不询问）
+        # 判定与 _add_concat_video_forced / 拖拽同集合（_MEDIA_IMAGE_EXTS，含 gif），
+        # 保证「图片/视频」回执文案与轨道构建口径一致（不用 _is_static_image：那是抽帧口径）。
+        _is_img = os.path.splitext(str(path))[1].lower() in _MEDIA_IMAGE_EXTS
         self._add_concat_video_forced(path)
-        self._append_info_ui(_("[封装] 已添加串联视频: {0}").format(os.path.basename(path)))
+        self._append_info_ui(
+            _('[封装] 已添加串联{0}: {1}').format(_('图片') if _is_img else _('视频'), os.path.basename(path)))
     
         # 统一更新界面
         self.merge_update_track_list()
@@ -35671,19 +40847,23 @@ class FFmpegBatchGUI:
 
             if f_norm == main_video_path:                                   # 主视频截取
                 if (main_video.enc_settings.get("trim_enabled", False) and
-                    not main_video.enc_settings.get("precise_trim", False)):
+                    not main_video.enc_settings.get("precise_trim", False) and
+                    not self._is_static_image(f_norm)):
                     start = main_video.enc_settings.get("trim_start", "").strip()
                     end = main_video.enc_settings.get("trim_end", "").strip()
                     if start:
                         cmd.extend(["-ss", start])
                     if end:
                         cmd.extend(["-to", end])
-                # 主视频静态图片：image2 循环（否则只有 1 帧；输出时长由 _add_pip_duration_control
-                # 给默认 10s 或用户手动时长控制）
+                # 主视频静态图片：image2 循环（否则只有 1 帧；输出时长由「截取」面板的
+                # 「显示时长」(img_duration) 经后续 -t 控制，默认 10s）
                 if self._is_static_image(f_norm):
                     fps = main_video.enc_settings.get("frame_rate_custom", "30") \
                           if main_video.enc_settings.get("frame_rate_type") == "custom" else "30"
-                    cmd.extend(["-loop", "1", "-framerate", fps])
+                    # 把本图「显示时长」烘焙进输入：每张图成为有限长的独立素材标签，
+                    # 总时长由 concat/xfade 自然得出，不再依赖末尾单一 -t 钳制。
+                    _img_dur = _eff_image_display_duration(main_video.enc_settings)
+                    cmd.extend(["-loop", "1", "-framerate", fps, "-t", f"{_img_dur:.3f}"])
 
             elif sub_videos and f_norm in sub_paths:                        # 子视频循环
                 sv = next((sv for sv in sub_videos if normalize_path(sv.file_path) == f_norm), None)
@@ -35693,10 +40873,12 @@ class FFmpegBatchGUI:
                         # GIF 动画，使用 -stream_loop -1 保证无限循环，不加 -loop 和 -framerate
                         cmd.extend(["-stream_loop", "-1"])
                     elif ext in ('.png', '.jpg', '.jpeg', '.bmp', '.webp'):
-                        # 静态图片，使用 image2 循环
+                        # 静态图片，使用 image2 循环；同样把本图「显示时长」烘焙进输入，
+                        # 使每张图成为有限长的独立素材标签。
                         fps = main_video.enc_settings.get("frame_rate_custom", "30") \
                               if main_video.enc_settings.get("frame_rate_type") == "custom" else "30"
-                        cmd.extend(["-loop", "1", "-framerate", fps])
+                        _img_dur = _eff_image_display_duration(sv.enc_settings)
+                        cmd.extend(["-loop", "1", "-framerate", fps, "-t", f"{_img_dur:.3f}"])
                     else:
                         # 其他视频
                         cmd.extend(["-stream_loop", "-1"])
@@ -35802,35 +40984,70 @@ class FFmpegBatchGUI:
         return _m if _m in ("default", "ignore", "mix", "replace") else "default"
 
 
-    def _pip_sub_audio_node(self, sub_audio, file_index, venc, main_duration, label="subX"):
+    def _pip_sub_audio_node(self, sub_audio, file_index, venc, main_duration, label="subX",
+                            total_duration=None, audio_shift=None):
         """子视频音频 → filter_complex 段（标签 [label]），或 None（子视频无音轨/查不到输入）。
-        含：子声自身滤镜 + 显示时段起始延迟(adelay) + loop 镜像(aloop) + 采样率/声道对齐(aformat+aresample)。"""
+        含：子声自身滤镜 + 显示时段起始延迟(adelay) + loop 镜像(aloop) + 采样率/声道对齐(aformat+aresample)。
+
+        total_duration：时间轴总长（子素材摆到主视频之后时的延长值）。子声必须**有界**到它，
+        否则无界子声（aloop=-1）在 amix duration=longest 下永不结束。窗外部分由调用方
+        volume=enable 静音，截断本身不改变可闻内容。
+
+        audio_shift：{normalize_path(文件): 秒} —— 转场链内该段的音频偏移（≤0）。
+        xfade 吞掉 d 秒让**画面**提前出现，音频必须同步提前，否则声画错开一个转场时长。
+        """
         _idx = file_index.get(sub_audio.file_path)
         if _idx is None:
             return None
+        # PiP 子声的 enc_settings 不自带 _file_path，_audio_effective_duration 取不到源时长
+        # → afade=t=out 落到 st=0 兜底（子声只开头 1s 有声）。按转换页惯例注入源路径。
+        sub_audio.enc_settings["_file_path"] = sub_audio.file_path
         _af = self._build_audio_filters(
             sub_audio.enc_settings, include_trim=True, include_volume=True,
             include_speed=True, include_reverse=sub_audio.enc_settings.get("audio_reverse", False))
         _parts = [_af] if _af else []
-        # 显示时段起始 → 子声整体延迟（与视频 overlay enable='gte(t,START)' 对齐）
-        _start = time_to_seconds(venc.get("show_start", "") or "") or 0.0
-        if _start > 0:
-            _parts.append(f"adelay=delays={_start*1000:.0f}:all=1")
-        # loop 镜像视频决策（与 _resolve_display_window + build_video_filter_chain 的 loop= 一致）：
-        # 有界窗口→有限 aloop（次数 = 窗口时长/源时长 向上取整，正好填充窗口）；
-        # 无界（仅 show_start / loop_mode=infinite / 无窗口无循环）→ 无限 aloop=-1（由 -t 截断）。
-        # 这样声画同循环、且窗口外不产生音频（配合下方 volume 窗口化）。
+        # ⚠️ 归一必须在 aloop **之前**：aloop 的 size 按样本数计，采样率固定成 48000 后才
+        # 算得出精确 size；沿用旧的 size=2000000000 会让每遍循环之间出现空档（实测 2s 静音洞）。
+        _parts.append("aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000")
+        # loop 镜像视频决策（与 _resolve_display_window 同判定）：
+        # 有界窗口 → 有限遍（正好铺满窗口）；无界 → 无限（由下方 atrim 收口）。
         _sub_dur = self._get_media_duration(sub_audio.file_path) or 0.0
         _ws, _we, _bounded = self._resolve_display_window(venc, _sub_dur, input_path=sub_audio.file_path)
         if _bounded and _we is not None and _we > _ws and _sub_dur > 0:
-            _fps = self._get_video_framerate(sub_audio.file_path) or 30
-            _loop_size = max(1, int(round(_sub_dur * _fps)))
-            _win_frames = max(1, int(round((_we - _ws) * _fps)))
-            _wc = max(1, -(-_win_frames // int(_loop_size)))
-            _parts.append(f"aloop=loop={_wc}:size=2000000000")
+            _win_ms = max(1, int(round((_we - _ws) * 1000)))
+            _src_ms = max(1, int(round(_sub_dur * 1000)))
+            _w = min(64, max(1, -(-_win_ms // _src_ms)))   # 覆盖窗口所需遍数（向上取整）
+            _size = max(1, int(_sub_dur * 48000))
+            _parts.append(f"aloop=loop={_w - 1}:size={_size}")
+            # 精确裁到窗口长度：窗外天然没有内容 → 调用方不必再用 volume=enable 静音窗外。
+            # （不重叠的地方本来就没声，静音表达式只算重叠部分就够了。）
+            _parts.append(f"atrim=0:{_ffsec(_we - _ws)}")
         else:
             _parts.append("aloop=loop=-1:size=2000000000")
-        _parts.append("aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000")
+        # 显示时段起始 → 子声整体延迟（与视频 overlay enable='gte(t,START)' 对齐）
+        # ⚠️ 必须在循环**之后**：放在前面会让每遍循环都重复那一段前导静音，窗口内出现静音洞。
+        _start = time_to_seconds(venc.get("show_start", "") or "") or 0.0
+        # 转场链偏移：画面被 xfade 提前了 Σd → 声音跟着提前同样的量
+        _sh = 0.0
+        if audio_shift:
+            try:
+                _sh = float(audio_shift.get(normalize_path(sub_audio.file_path), 0.0) or 0.0)
+            except (TypeError, ValueError):
+                _sh = 0.0
+        _start = max(0.0, _start + _sh)
+        if _start > 0:
+            _parts.append(f"adelay=delays={_start*1000:.0f}:all=1")
+            # ⚠️ adelay 的静音头 pts 为负（n9.0.1 实测：内容右移、头部静音 pts<0）——
+            # 下方 atrim=0:T 会把负 pts 静音头整段剥掉 ⇒ 流只剩内容长 ⇒ amix 逐样本
+            # 叠加**不看 pts** ⇒ 子声从输出 0s 开始混（用户实测「最后一段混进第一段、
+            # 自己位置没声」；最小复现 tests/_dbg_adelay_amix_probe.py，两链序均复现，
+            # adelay 后接 asetpts=PTS-STARTPTS 归零后 23s/23.8s 静音头完整保留）。
+            # 预览侧同款坑见 merge_preview_pip_live 的 adelay 注释（amovie 源 adelay 负 pts）。
+            _parts.append("asetpts=PTS-STARTPTS")
+        # 有界化到时间轴总长：无界子声是无限流，amix duration=longest 下永不结束。
+        _T = total_duration if (total_duration and total_duration > 0) else main_duration
+        if _T and _T > 0:
+            _parts.append(f"atrim=0:{_ffsec(_T)}")
         return f"[{_idx}:a]" + ",".join(_parts) + f"[{label}]"
 
 
@@ -35848,8 +41065,19 @@ class FFmpegBatchGUI:
 
 
     def _build_pip_audio(self, enabled_tracks, file_index, main_video,
-                         bgm_on, bgm_idx, bgm_vol, main_duration):
+                         bgm_on, bgm_idx, bgm_vol, main_duration,
+                         total_duration=None, audio_shift=None):
         """画中画音频组装（方案 A：BGM 仅垫主视频音频之下，子视频音频保持独立音轨）。
+
+        total_duration：画中画「时间轴跨度」（`_pip_timeline_extent` 算得，含子素材被摆到
+        主视频之后所需的延长）。None = 按 main_duration（旧调用方行为）。
+        ⚠️ 参与 amix 的每条音频都必须**有界**到它，否则：
+          · 主音频短于时间轴 → amix 输出被截断，延长段子声凭空消失（混音/替换失效）；
+          · 无界子声（aloop=-1）→ amix 永不结束。
+
+        audio_shift：{normalize_path(文件): 秒} —— 转场链的音频偏移（见
+        `_pip_transition_chains`）。子声延迟与「替换窗静主声」的窗口都要跟着偏移，
+        否则画面已转场、声音还在原位置（用户实测：转场后声音滞后）。
 
         返回 (audio_parts, a_maps, a_enc)：
           audio_parts : 需追加进 -filter_complex 的音频滤镜段（列表）
@@ -35864,6 +41092,22 @@ class FFmpegBatchGUI:
         main_path = normalize_path(main_video.file_path)
         main_audio = next((t for t in audio_tracks if normalize_path(t.file_path) == main_path), None)
         sub_audios = [t for t in audio_tracks if normalize_path(t.file_path) != main_path]
+
+        # 音频时间轴总长：子素材摆到主视频之后时，音频床要跟画面一起延长，
+        # 否则 amix 只出到主音频长度、延长段静音（混音/替换看起来"没生效"）。
+        _aud_total = total_duration if (total_duration and total_duration > 0) else main_duration
+        # 主声床截断段：apad 补静音到无限 → atrim 精确截到总长（主声短于时间轴时后半静音）。
+        _apad_trim = (f",apad,atrim=0:{_ffsec(_aud_total)}"
+                      if (_aud_total and _aud_total > 0) else "")
+
+        def _sh_of(_p):
+            """转场链给该文件的音频偏移（秒，≤0）；无转场链 → 0。"""
+            if not audio_shift:
+                return 0.0
+            try:
+                return float(audio_shift.get(normalize_path(_p), 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
 
         a_parts, a_maps, a_enc = [], [], []
 
@@ -35903,14 +41147,19 @@ class FFmpegBatchGUI:
                 if af:
                     a_parts.append(
                         f"[{_mi}:a]{af},"
-                        f"aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000[amain]")
+                        f"aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000"
+                        f"{_apad_trim}[amain]")
                 else:
                     a_parts.append(
-                        f"[{_mi}:a]aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000[amain]")
+                        f"[{_mi}:a]aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000"
+                        f"{_apad_trim}[amain]")
             else:
                 # 主视频无音频：静音源垫底（替换窗内主声本就静音；混音=仅子声）；
                 # BGM 留到子视频混音/替换之后才叠加（见函数末）。
-                a_parts.append("anullsrc=r=48000:cl=stereo[amain]")
+                # anullsrc 是无限源 → 必须 atrim 到时间轴总长，否则 amix 永不结束。
+                _anull_trim = (f",atrim=0:{_ffsec(_aud_total)}"
+                               if (_aud_total and _aud_total > 0) else "")
+                a_parts.append(f"anullsrc=r=48000:cl=stereo{_anull_trim}[amain]")
             a_maps.append("-map")
             a_maps.append("[afinal]")
             # [afinal] 编码：amix 输出必须重编码；沿用主音频设置（无主音频则 aac）
@@ -35947,31 +41196,40 @@ class FFmpegBatchGUI:
                 (_rep_subs if _mode == "replace" else _mix_subs).append((sub, _venc))
             # replace 窗并集 → 主声一次性静音（仅当存在 replace 子声；BGM 不在此列）
             if _rep_subs:
-                _union = "+".join(
-                    f"between(t,{_s:.3f},{_e:.3f})"
-                    for (_rs, _re) in (
-                        self._pip_window_seconds(_rv, main_duration, _rp.file_path)
-                        for (_rp, _rv) in _rep_subs
-                    )
-                )
+                # ⚠️ 原写法是嵌套生成器表达式 + f-string 里写 `_s/_e`，但循环变量叫 `_rs/_re`
+                # → py3.12+（PEP 709 推导式内联）直接抛 NameError，「替换」命令构建崩溃、
+                # 命令预览出不来。改为显式循环。
+                _terms = []
+                for (_rp, _rv) in _rep_subs:
+                    _ws_, _we_ = self._pip_window_seconds(_rv, main_duration, _rp.file_path)
+                    _sh_ = _sh_of(_rp.file_path)
+                    _terms.append(f"between(t,{max(0.0, _ws_ + _sh_):.3f},"
+                                  f"{max(0.0, _we_ + _sh_):.3f})")
+                _union = "+".join(_terms)
                 a_parts.append(f"[amain]volume=enable='{_union}':volume=0[amain]")
             # 所有 混音/替换 子声：窗外静音后叠加（主声已按并集静音，重叠区自然求和）
             _k = 0
+            _made = False   # 是否真的产出过子声节点（全为 None 时 [afinal] 不会被创建）
             for (sub, _venc) in (_mix_subs + _rep_subs):
                 _lbl = f"sub{_k}"
-                _node = self._pip_sub_audio_node(sub, file_index, _venc, main_duration, label=_lbl)
+                _node = self._pip_sub_audio_node(sub, file_index, _venc, main_duration,
+                                                 label=_lbl, total_duration=_aud_total, audio_shift=audio_shift)
                 if _node is None:
                     continue  # 子视频无音轨 → 降级忽略
                 a_parts.append(_node)
-                _s, _e = self._pip_window_seconds(_venc, main_duration, sub.file_path)
-                a_parts.append(f"[{_lbl}]volume=enable='1-between(t,{_s:.3f},{_e:.3f})':volume=0[{_lbl}w]")
-                a_parts.append(f"[amain][{_lbl}w]amix=inputs=2:duration=first:normalize=0[afinal]")
+                # 子声已由 _pip_sub_audio_node 裁到自身显示窗口（窗外无内容），
+                # 不再需要 volume=enable 静音窗外 —— 不重叠的地方本来就没声。
+                # ⚠️ duration=first 会把输出锁死成「第一条输入(主声)」的长度 → 子素材摆到
+                # 主视频之后时，延长段的子声被整段切掉（混音/替换看起来完全没生效）。
+                # 各输入已各自 atrim 到时间轴总长 → longest 才是正确语义。
+                a_parts.append(f"[amain][{_lbl}]amix=inputs=2:duration=longest:normalize=0[afinal]")
                 _k += 1
+                _made = True
             # BGM 最后叠加（方案 A 修正）：子视频混音/替换已汇入 [afinal]，此时才与
             # 主声/子声床叠加 BGM。替换窗内只静主声（[amain] 并集静音），BGM 在静音之后
             # 才加入 → 替换窗内仍保留 BGM 垫底（旧写法把 BGM 与主声同节点一起被静掉）。
-            if not (_mix_subs or _rep_subs):
-                # 无 混音/替换 子声时子派发未产出 [afinal]，先透传 [amain]→[afinal]
+            if not _made:
+                # 无 混音/替换 子声（或子声全部查不到输入）时未产出 [afinal] → 透传 [amain]
                 a_parts.append(f"[amain]anull[afinal]")
             a_parts.append(f"[afinal][bgm]amix=inputs=2:duration=longest:normalize=0[afinal]")
             return a_parts, a_maps, a_enc
@@ -36003,13 +41261,17 @@ class FFmpegBatchGUI:
             if _maf:
                 a_parts.append(
                     f"[{_mi}:a]{_maf},"
-                    f"aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000[amain]")
+                    f"aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000"
+                    f"{_apad_trim}[amain]")
             else:
                 a_parts.append(
-                    f"[{_mi}:a]aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000[amain]")
+                    f"[{_mi}:a]aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000"
+                    f"{_apad_trim}[amain]")
         else:
             # 主视频无音频：用静音源垫底（替换窗内主声本就静音；混音=仅子声）
-            a_parts.append("anullsrc=r=48000:cl=stereo[amain]")
+            _anull_trim2 = (f",atrim=0:{_ffsec(_aud_total)}"
+                            if (_aud_total and _aud_total > 0) else "")
+            a_parts.append(f"anullsrc=r=48000:cl=stereo{_anull_trim2}[amain]")
         a_maps.append("-map")
         a_maps.append("[amain]")
         _enc_src = main_audio.enc_settings if main_audio is not None else main_video.enc_settings
@@ -36038,31 +41300,37 @@ class FFmpegBatchGUI:
                 continue
             (_rep_subs if _mode == "replace" else _mix_subs).append((sub, _venc))
         if _rep_subs:
-            _union = "+".join(
-                f"between(t,{_s:.3f},{_e:.3f})"
-                for (_rs, _re) in (
-                    self._pip_window_seconds(_rv, main_duration, _rp.file_path)
-                    for (_rp, _rv) in _rep_subs
-                )
-            )
+            # 同上方 BGM 分支：改为显式循环（原嵌套生成器 + 错名 `_s/_e` 会 NameError）
+            _terms = []
+            for (_rp, _rv) in _rep_subs:
+                _ws_, _we_ = self._pip_window_seconds(_rv, main_duration, _rp.file_path)
+                _sh_ = _sh_of(_rp.file_path)
+                _terms.append(f"between(t,{max(0.0, _ws_ + _sh_):.3f},"
+                              f"{max(0.0, _we_ + _sh_):.3f})")
+            _union = "+".join(_terms)
             a_parts.append(f"[amain]volume=enable='{_union}':volume=0[amain]")
         _k = 0
         for (sub, _venc) in (_mix_subs + _rep_subs):
             _lbl = f"sub{_k}"
-            _node = self._pip_sub_audio_node(sub, file_index, _venc, main_duration, label=_lbl)
+            _node = self._pip_sub_audio_node(sub, file_index, _venc, main_duration,
+                                             label=_lbl, total_duration=_aud_total, audio_shift=audio_shift)
             if _node is None:
                 continue  # 子视频无音轨 → 降级忽略
             a_parts.append(_node)
-            _s, _e = self._pip_window_seconds(_venc, main_duration, sub.file_path)
-            a_parts.append(f"[{_lbl}]volume=enable='1-between(t,{_s:.3f},{_e:.3f})':volume=0[{_lbl}w]")
-            a_parts.append(f"[amain][{_lbl}w]amix=inputs=2:duration=first:normalize=0[amain]")
+            # 子声已裁到自身窗口（窗外无内容），无需 volume=enable 静音窗外
+            # duration=longest（同 BGM 分支）：first 会把输出锁死成主声长度、切掉延长段子声
+            a_parts.append(f"[amain][{_lbl}]amix=inputs=2:duration=longest:normalize=0[amain]")
             _k += 1
         return a_parts, a_maps, a_enc
+
 
     def _pip_main_duration(self, main_video):
         """画中画输出主视频时长（秒）：静态图默认 10s；启用截取则按起止裁剪。
         供 BGM 循环截断与 _add_pip_duration_control 的 -t 保持一致。"""
-        raw_duration = self._get_media_duration(main_video.file_path)
+        # 帧对齐（floor 到源帧格）：与 _pip_main_effective_duration / -t 三处同口径
+        raw_duration = self._get_media_duration(
+            main_video.file_path,
+            frame_align_fps=self._get_video_framerate(main_video.file_path))
         if (raw_duration is None or raw_duration <= 0) and self._is_static_image(main_video.file_path):
             raw_duration = 10.0
         main_duration = raw_duration
@@ -36076,6 +41344,426 @@ class FFmpegBatchGUI:
             elif raw_duration:
                 main_duration = raw_duration - start_sec
         return main_duration if (main_duration and main_duration > 0) else 0.0
+
+    def _pip_main_effective_duration(self, main_video):
+        """画中画主视频有效时长（秒）：与 `_add_pip_duration_control` 的 -t 口径严格一致
+        （静态图片取「截取」面板的显示时长，而非 `_pip_main_duration` 的 10.0 兜底）。
+
+        ⚠️ 时间轴延长（见 `_pip_timeline_extent`）必须以此为基准算补帧量，
+        两处口径不同会导致「底补的长度」与「-t 截断的长度」错位。
+        """
+        # 帧对齐（floor 到源帧格）：主视频段长（进链 trim=0:len0 / tpad 基准）帧格化
+        raw_duration = self._get_media_duration(
+            main_video.file_path,
+            frame_align_fps=self._get_video_framerate(main_video.file_path))
+        if (raw_duration is None or raw_duration <= 0) and self._is_static_image(main_video.file_path):
+            raw_duration = _eff_image_display_duration(main_video.enc_settings)
+        main_duration = raw_duration
+        if main_video.enc_settings.get("trim_enabled", False):
+            start = main_video.enc_settings.get("trim_start", "0").strip()
+            end = main_video.enc_settings.get("trim_end", "").strip()
+            start_sec = time_to_seconds(start) if start else 0.0
+            end_sec = time_to_seconds(end) if end else None
+            if end_sec and end_sec > start_sec:
+                main_duration = end_sec - start_sec
+            elif raw_duration:
+                main_duration = raw_duration - start_sec
+        return main_duration if (main_duration and main_duration > 0) else 0.0
+
+    def _pip_sub_window_end(self, sub_settings, sub_file):
+        """子视频「有界显示窗口」的结束时刻（输出时间线秒）；无界 / 取不到 → None。
+
+        口径复用 `_resolve_display_window`（与 enable 表达式同源），避免两处判定漂移。
+        无界（无限循环 / 仅设起始且无次数）不参与延长——它本来就会一直显示到输出结束。
+        """
+        try:
+            # 帧对齐（floor 到源帧格）：窗口结束喂 _pip_timeline_extent → tpad/-t，
+            # 与图层供帧窗口同源，防「底比内容多 1 帧」的交界瑕疵
+            _dur = self._get_media_duration(
+                sub_file, frame_align_fps=self._get_video_framerate(sub_file))
+            _ws, _we, _bounded = self._resolve_display_window(
+                sub_settings, _dur, input_path=sub_file)
+        except Exception:
+            return None
+        if _bounded and _we is not None and _we > 0:
+            return float(_we)
+        return None
+
+    def _pip_timeline_extent(self, main_duration, sub_items):
+        """画中画「时间轴实际跨度」（秒）= max(主视频有效时长, 所有启用子视频的有界窗口结束)。
+
+        ⚠️ 为什么必须延长底（实测见 `research/concat-overlay-alt` §13.1）：
+        overlay 的**主输入 EOF = 整条链 EOF**——子素材被摆到主视频之后时，只把 `-t`
+        加大**拿不到后面的帧**（输出仍在主视频结束处终止，超出部分静默丢失）。
+        所以底必须真的接长（`tpad=stop_mode=add` 补黑帧），不能只改 `-t`。
+
+        sub_items: `[(file_path, enc_settings), ...]`；未启用叠加的子视频跳过。
+        无任何子视频窗口超出主视频时长 → 返回 main_duration（调用方据此不补帧 = 零行为变化）。
+        """
+        end = float(main_duration or 0.0)
+        for _f, _s in (sub_items or []):
+            if not _s.get("overlay_enabled", True):
+                continue
+            we = self._pip_sub_window_end(_s, _f)
+            if we is not None and we > end:
+                end = we
+        return end
+
+    def _pip_warn_cut_off_subs(self, sub_infos, extent):
+        """提示「起点 ≥ 输出时长」的启用子视频——这些段完全落在输出之外（会被 -t 整段截掉）。
+
+        根因几乎总是**显示窗口无限**（没填「显示 结束」且无限循环 → 探不到长度，
+        不参与时间轴延长、也不参与转场链）。此前全程静默（用户实测 4/5/6 段被截掉、
+        5&6 没成链，日志无一提示，只能靠对比命令才发现）→ 在时长计算点点名提醒。
+        只提示不改行为：无界窗口「一直显示到输出结束」的语义保持不变。
+        """
+        _hits = []
+        for _i, (_p, _s) in enumerate(sub_infos or []):
+            if not _s.get("overlay_enabled", True):
+                continue
+            try:
+                _dur = self._get_media_duration(_p)
+                _ws, _we, _bd = self._resolve_display_window(_s, _dur, input_path=_p)
+            except Exception:
+                continue
+            if _bd and _we is not None:
+                continue      # 有界窗口已被 extent 计入，不可能整段落在输出之外
+            if float(_ws or 0.0) >= float(extent or 0.0) - 1e-6:
+                _hits.append(_i + 1)
+        if _hits:
+            self._append_info_ui(
+                _('[封装-画] ⚠️ 子视频 %s 的起点在输出时长之外，但显示窗口无限（没填「显示 结束」也没设有限循环次数）→ 探不到长度，未计入输出时长、也无法与相邻段合成转场，整段不会出现在成片里。是否有素材忘了开有限时长？')
+
+
+                % "、".join(str(_h) for _h in _hits))
+
+    def _pip_segment_span(self, track, is_main=False):
+        """画中画：某视频轨在时间轴上的 (显示起点, 显示长度)；长度 None = 探不到。
+
+        口径与命令端严格一致：子视频走 `_resolve_display_window`（显示时段 + 循环次数），
+        主视频走 `_pip_main_effective_duration`（trim 后有效时长，起点恒 0）。
+        无界窗口（无限循环 / 只设起点且无次数）→ 长度回退「素材有效时长（一次播放）」：
+        对齐只是摆位置，给个近似值比直接失败好用（转场链那边无界仍然不参与）。
+        """
+        try:
+            if is_main:
+                _ln = self._pip_main_effective_duration(track)
+                return 0.0, (float(_ln) if (_ln and _ln > 0) else None)
+            if self._is_static_image(track.file_path):
+                _eff = _eff_image_display_duration(track.enc_settings)
+            else:
+                # 帧对齐 raw 时长（floor 到源帧格）：段长/接缝/画布 d 全链帧格化
+                _raw = self._get_media_duration(
+                    track.file_path, frame_align_fps=self._get_video_framerate(track.file_path))
+                _eff = self._get_effective_duration(track.enc_settings, raw_duration=_raw)
+            _ws, _we, _bd = self._resolve_display_window(
+                track.enc_settings, _eff, input_path=track.file_path)
+            _ws = float(_ws or 0.0)
+            if _bd and _we is not None and _we > _ws:
+                return _ws, float(_we) - _ws
+            return _ws, (float(_eff) if (_eff and _eff > 0) else None)
+        except Exception:
+            return 0.0, None
+
+    def _pip_trans_duration(self, track):
+        """画中画：某段「挂在本段的转场」时长（未启用 / 非法 → 0.0）。"""
+        if not bool(track.enc_settings.get("transition_enabled", False)):
+            return 0.0
+        try:
+            _d = float(str(track.enc_settings.get("transition_duration", "1.0") or "1.0").strip())
+        except (ValueError, TypeError):
+            return 0.0
+        return _d if _d > 0 else 0.0
+
+    def _pip_audio_follow_shift(self, sub_videos, chains, sub_infos, main_video):
+        """音频跟随转场：每个子视频独立的相对偏移（delta，秒）。
+
+        开启「音频跟随转场」的视频：其音频直接落在它进入画面那一刻的**转场链真实输出位置**
+        P_k（xfade 的交叉起点，逐帧对齐，类似 concat 的音频跟随），而非「显示起点 + 手动偏移」。
+            delta = P_k − 该段显示起点 ws
+        这样即使手动把显示起点摆错，音频也会被自动校正回画面位置（声画逐帧对齐）。
+
+        未开启 / 未成链（前段没开转场、或与前后段不相邻） → delta = 0.0（留在原显示位置，
+        声画可能错开 —— 这是用户显式不选「跟随」时的预期行为）。
+
+        返回 {normalize_path(子视频文件): delta}。主视频是链首（P=0，无入口转场），
+        不在返回表内（其音频恒从 0 起，无需偏移）。
+        """
+        _pos = {}
+        for _ch in (chains or []):
+            _mem = _ch["members"]
+            _lens = _ch["lens"]
+            _trans = _ch["trans"]
+            _p = float(_ch["start"])
+            for _mi, _m in enumerate(_mem):
+                _afp = (normalize_path(main_video.file_path) if _m < 0
+                        else normalize_path(sub_infos[_m][1]))
+                _pos[_afp] = _p
+                if _mi < len(_mem) - 1:
+                    _p = _p + float(_lens[_m]) - float(_trans[_mi][1])
+        _out = {}
+        for _sv in sub_videos:
+            _fp = normalize_path(_sv.file_path)
+            if not _sv.enc_settings.get("pip_audio_follow_transition", False):
+                _out[_fp] = 0.0
+                continue
+            if _fp in _pos:
+                try:
+                    _ws = self._resolve_display_window(
+                        _sv.enc_settings, self._get_media_duration(_sv.file_path),
+                        input_path=_sv.file_path)[0] or 0.0
+                except Exception:
+                    _ws = 0.0
+                # delta 夹在 [-ws, +∞)：ws 为负（非法）时也不让 adelay 变负
+                _out[_fp] = max(-_ws, _pos[_fp] - _ws)
+            else:
+                _out[_fp] = 0.0
+        return _out
+
+    def _pip_align_transition_starts(self, only_track=None, current_start_var=None,
+                                     current_end_var=None):
+        """画中画：按转场重排各段「显示时段起点」。
+
+        公式（用户拍板）：本段起点 = 前一段起点 + 前一段长度 − 前一段转场时长。
+        xfade 吞掉转场时长 d（后段在链内提前 d 秒出现）—— 按「前段末尾」摆放时画面其实
+        提前 d 秒切换，界面数字与真实切换时刻差一个 d。对齐即把起点改成真实切换时刻，
+        之后手动微调 / 简易时间预览粘贴才不会错位（顺带修掉尾部多出的黑帧：链实际比
+        摆放位置短 Σd，底却按摆放位置补长）。
+
+        ⚠️ 只在画中画生效：concat 段落首尾天然相接，改起点无意义（且会破坏现有行为）。
+        ⚠️ 平移必须连 show_end 一起平移：段长 = 结束 − 起始，只改起始会把段拉长 d 秒。
+
+        only_track：只对齐这一段（编辑窗 / 总览窗口「转场对齐」按钮 = 作用于选中片段）；
+                    None = 对齐全部（预留入口，不弹窗只写日志）。
+        ⚠️ 2026-09-27：「一键转场」不再调用本函数（原为画中画下顺带对齐）。
+           要重排起点就显式点「转场对齐」或「一键设置开始」。
+        current_start_var / current_end_var：编辑窗「显示 起始/结束」输入框变量，
+                    对齐当前轨时同步回写，避免点「保存」时旧局部变量把新值覆盖。
+        """
+        vids = [t for t in self.merge_tracks
+                if getattr(t, "type", None) == "video" and (t.enabled or t is only_track)]
+        _msg_noseg = _('画中画需要至少 2 个视频（主视频 + 子视频）才能对齐。')
+        if len(vids) < 2:
+            if only_track is not None:
+                messagebox.showinfo(_('提示'), _msg_noseg)
+            else:
+                self._append_info_ui(_('[转场对齐] {0}').format(_msg_noseg))
+            return 0
+        # 主视频 = track 顺序里第一个视频轨（恒为时间轴起点，起点 0，不参与重排）。
+        # ⚠️ 参考段一律按「track 顺序的紧邻前一段」取，不按当前 show_start 排序 ——
+        # 否则某段被摆到后面（show_start 偏大）时，排序会把它的「前一段」错认成更后面的段
+        # （表现：第2个视频对齐却用了第3个的时间；第3个对齐把自己当第2个、拿主视频当参考）。
+        _main = vids[0]
+        spans = {}
+        for _t in vids:
+            spans[_t] = self._pip_segment_span(_t, _t is _main)
+
+        if only_track is not None:
+            # 单段对齐（编辑窗「转场对齐」按钮 = 作用于当前视频）：
+            # 参考 = track 顺序里紧邻的前一段，按它「当前起点 + 长度 - 转场时长」算。
+            try:
+                _idx = vids.index(only_track)
+            except ValueError:
+                return 0
+            if _idx <= 0:
+                messagebox.showinfo(_('提示'), "主视频是时间轴起点，前面没有可参考的片段，无需对齐。")
+                return 0
+            _pt = vids[_idx - 1]
+            _pws, _pln = spans[_pt]
+            if _pln is None:
+                messagebox.showinfo(
+                    _('提示'),
+                    "前一段的显示长度探不到（无限循环 / 没设显示时段又取不到时长），无法对齐；\n"
+                    "给前一段填「显示 起始+结束」（或设有限循环次数）后重试。")
+                return 0
+            _d = self._pip_trans_duration(_pt)
+            _new = max(0.0, _pws + _pln - _d)
+            _es = only_track.enc_settings
+            _cws = spans[only_track][0]
+            _oe = _opt_float(_es.get("show_end"))
+            if _oe is not None and _oe > _cws:
+                _es["show_end"] = _ffsec(_oe + (_new - _cws))   # 整体平移，段长不变
+            _es["show_start"] = _ffsec(_new)
+            if current_start_var is not None:
+                current_start_var.set(_ffsec(_new))
+            if current_end_var is not None:
+                current_end_var.set(str(_es.get("show_end", "") or ""))
+            self.merge_update_track_list()
+            self.merge_update_command_preview()
+            self._refresh_at_total_ref()
+            self._append_info_ui(
+                _('[转场对齐] 本段显示起点 = {0:g} + {1:g} - {2:g} = {3:g}s（段长不变，已同步「循环/绿幕控制」页）').format(_pws, _pln, _d, _new)
+)
+            return 1
+
+        # 全量对齐（「一键转场」顺带对齐，不弹窗只写日志）：按 track 顺序串行累计，
+        # 每段 = 前一段(新)起点 + 前一段长度 - 前一段转场时长；前一段长度探不到则跳过本段续算。
+        prev_ws, prev_ln = spans[_main]
+        prev_trans = self._pip_trans_duration(_main)
+        changed, skipped = 0, 0
+        for _t in vids[1:]:
+            if prev_ln is None:
+                # 前一段长度探不到：以本段当前起点续算，不重排本段
+                _cws, _cln = spans[_t]
+                prev_ws, prev_ln = _cws, _cln
+                prev_trans = self._pip_trans_duration(_t)
+                skipped += 1
+                continue
+            _cws, _cln = spans[_t]
+            _new = max(0.0, prev_ws + prev_ln - prev_trans)
+            _es = _t.enc_settings
+            _oe = _opt_float(_es.get("show_end"))
+            if _oe is not None and _oe > _cws:
+                _es["show_end"] = _ffsec(_oe + (_new - _cws))
+            _es["show_start"] = _ffsec(_new)
+            prev_ws, prev_ln = _new, _cln
+            prev_trans = self._pip_trans_duration(_t)
+            changed += 1
+        if changed == 0:
+            _msg = ("前一段的显示长度探不到，无法对齐；给前一段填「显示 起始+结束」"
+                    "（或设有限循环次数）后重试。" if skipped else "没有可对齐的片段。")
+            self._append_info_ui(_('[转场对齐] {0}').format(_msg))
+            return 0
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+        self._refresh_at_total_ref()
+        self._append_info_ui(
+            _('[转场对齐] 已按转场重排 {0} 个片段的显示起点（起点 = 前一段起点 + 前一段时长 - 转场时长）').format(changed)
+)
+        return changed
+
+    def _pip_finite_loop_all(self, count_str=None):
+        """画中画「一键有限循环」：所有子视频启用循环控制并设次数（count 模式）。
+
+        子视频窗口有界（有限次数 / 显示结束）才能被转场链收录、时长统计才算得准；
+        本按钮把「启用循环控制 + 次数」一次铺到全部子视频（不含主视频）。
+        count_str 取「子视频控制」页次数框；不传 = 1（只播一遍）。
+        """
+        try:
+            n = int(str(count_str if count_str is not None else "1").strip())
+        except (ValueError, TypeError):
+            messagebox.showinfo(_('提示'), "循环次数需为正整数。")
+            return
+        if n < 1:
+            messagebox.showinfo(_('提示'), "循环次数需为正整数。")
+            return
+        vids = [t for t in self.merge_tracks
+                if getattr(t, "type", None) == "video" and t.enabled]
+        if len(vids) < 2:
+            messagebox.showinfo(_('提示'), "画中画需要至少 2 个视频（主视频 + 子视频）。")
+            return
+        subs = vids[1:]     # 主视频 = 第一个视频轨，不参与
+        for _t in subs:
+            _t.enc_settings["loop_enabled"] = True
+            _t.enc_settings["loop_mode"] = "count"
+            _t.enc_settings["loop_count"] = n
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+        self._refresh_at_total_ref()
+        self._append_info_ui(
+            _('[子视频控制] 已为 {0} 个子视频启用有限循环 ×{1}（次数 = 每段播放遍数，1 = 只播一遍；窗口有界后转场链/时长统计才能收录）').format(len(subs), n)
+)
+
+    def _pip_mix_all(self):
+        """画中画「一键混音」：所有子视频（不含主视频）的音频模式切到「混音」(audio_mode=mix)。
+
+        与「音频跟随转场」勾选框自动切混音同源（都写 enc_settings["audio_mode"]，
+        即循环/绿幕控制页那条「音频:」下拉）；批量版一次铺到全部子视频。
+        子视频无音轨时由 _build_pip_audio 自动降级为忽略，零副作用。
+        """
+        vids = [t for t in self.merge_tracks
+                if getattr(t, "type", None) == "video" and t.enabled]
+        if len(vids) < 2:
+            messagebox.showinfo(_('提示'), _("画中画需要至少 2 个视频（主视频 + 子视频）。"))
+            return
+        subs = vids[1:]     # 主视频 = 第一个视频轨，不参与
+        for _t in subs:
+            _t.enc_settings["audio_mode"] = "mix"
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+        self._refresh_at_total_ref()
+        self._append_info_ui(
+            _('[子视频控制] 已为 {0} 个子视频把音频模式设为「混音」（不含主视频；子视频本身无音轨时自动降级为忽略）').format(len(subs)))
+
+    def _pip_chain_show_starts(self):
+        """画中画「一键设置开始」（硬切接龙）：子视频按列表顺序首尾相接。
+
+        第 1 个子视频接在主视频之后，之后每段 =
+        前一段(新)起点 + 前一段显示长度 − 前一段转场时长（2026-09-26 用户拍板：考虑转场，
+        与「转场对齐」同公式——前段挂了转场时画面会提前 d 秒切换，接龙摆位同步让位；
+        硬切项目前段转场时长=0，公式自然退化为首尾相接，行为不变）；
+        前一段长度探不到则跳过本段续算。
+        show_end 有值时随起点整体平移（段长不变）。
+        音频（混音/替换/跟随）读 show_start 派发 → 画面接龙后声音自动跟上。
+        """
+        vids = [t for t in self.merge_tracks
+                if getattr(t, "type", None) == "video" and t.enabled]
+        if len(vids) < 2:
+            messagebox.showinfo(_('提示'), "画中画需要至少 2 个视频（主视频 + 子视频）才能接龙。")
+            return
+        _main = vids[0]     # 主视频 = 时间轴起点（起点恒 0），只当参考段
+        prev_ws, prev_ln = self._pip_segment_span(_main, is_main=True)
+        prev_trans = self._pip_trans_duration(_main)
+        changed, skipped, _placed = 0, 0, []
+        for _t in vids[1:]:
+            _cws, _cln = self._pip_segment_span(_t)
+            if prev_ln is None:
+                # 前一段长度探不到：本段不动，以它当前起点续算
+                prev_ws, prev_ln = _cws, _cln
+                prev_trans = self._pip_trans_duration(_t)
+                skipped += 1
+                continue
+            # 2026-09-26 用户拍板：接龙考虑转场——前段挂了转场时画面提前 d 秒切换，
+            # 摆位同步让位（与「转场对齐」同公式）；硬切项目 prev_trans=0 退化首尾相接。
+            _new = max(0.0, prev_ws + prev_ln - prev_trans)
+            _es = _t.enc_settings
+            _oe = _opt_float(_es.get("show_end"))
+            if _oe is not None and _oe > _cws:
+                _es["show_end"] = _ffsec(_oe + (_new - _cws))   # 整体平移，段长不变
+            _es["show_start"] = _ffsec(_new)
+            _placed.append(f"{os.path.basename(_t.file_path)[:18]}→{_ffsec(_new)}s")
+            prev_ws, prev_ln = _new, _cln
+            prev_trans = self._pip_trans_duration(_t)
+            changed += 1
+        if changed == 0:
+            self._append_info_ui(
+                _('[子视频控制] 没有可接龙的片段：主视频时长探不到。'))
+            return
+        self.merge_update_track_list()
+        self.merge_update_command_preview()
+        self._refresh_at_total_ref()
+        self._append_info_ui(
+            _('[子视频控制] 已按列表顺序接龙 {0} 个子视频的显示起点（第 1 个接在主视频之后，之后每段 = 前一段起点 + 前一段时长 − 前一段转场时长；跳过 {1} 段：前一段时长探不到）').format(changed, skipped)
+
+
+            + ("；落位：" + "、".join(_placed) if _placed else ""))
+
+    def open_timeline_overview(self):
+        """封装页「时间分配总览」入口：一条时间轴看全部片段（画中画专用）。
+
+        窗口本身只读/写各视频轨的「显示时段」(show_start / show_end)，
+        与 `_resolve_display_window` / `_pip_timeline_extent` 同源。
+        """
+        if not self.pip_enabled.get():
+            messagebox.showinfo(
+                _("提示"),
+                _("时间分配总览面向【画中画】模式：子视频按「显示时段」摆在主视频的时间轴上，\n"
+                "这个窗口就是那条时间轴（拖动粗调 + 数值微调）。\n\n"
+                "当前未启用画中画，请先在封装页勾选「启用画中画」并加入子视频。"))
+            return
+        _vids = [t for t in (self.merge_tracks or [])
+                 if getattr(t, "type", None) == "video" and t.enabled]
+        if len(_vids) < 2:
+            messagebox.showinfo(_("提示"), _("画中画至少需要 2 个视频（主视频 + 子视频）才有时间可分配。"))
+            return
+        try:
+            _win = TimelineOverviewDialog(self.root, self)
+            _win.transient(self.root)
+            _win.grab_set()
+            self.root.wait_window(_win)
+        except Exception as _e:
+            self._append_info_ui(_("[时间分配] 打开总览窗口失败：{0}".format(_e)))
+
 
     def _add_subtitles_and_chapters(self, cmd, enabled_tracks, file_index, input_files):
         """字幕 + 章节处理"""
@@ -36095,10 +41783,10 @@ class FFmpegBatchGUI:
                     orig_codec = getattr(sub, 'codec', '').lower()
                     if orig_codec not in ("mov_text", "mp4s"):
                         enc = "mov_text"
-                        self._append_info_ui("[封装] 字幕格式 {0} 不兼容 MP4，自动转换为 mov_text".format(orig_codec))
+                        self._append_info_ui(_('[封装] 字幕格式 {0} 不兼容 MP4，自动转换为 mov_text').format(orig_codec))
                 elif enc not in ("mov_text", "mp4s"):
                     enc = "mov_text"
-                    self._append_info_ui("[封装] 字幕编码 {0} 不兼容 MP4，自动转换为 mov_text".format(enc))
+                    self._append_info_ui(_('[封装] 字幕编码 {0} 不兼容 MP4，自动转换为 mov_text').format(enc))
 
             cmd.extend([f"-c:s:{sub_map_count}", enc])
 
@@ -36145,8 +41833,12 @@ class FFmpegBatchGUI:
             cmd.extend(["-movflags", "+faststart"])
 
 
-    def _add_pip_duration_control(self, cmd, main_video, enabled_tracks):
-        """PIP 时长控制：根据主音频和子视频音频存在情况选择 -shortest 或 -t"""
+    def _add_pip_duration_control(self, cmd, main_video, enabled_tracks, total_duration=None):
+        """PIP 时长控制：根据主音频和子视频音频存在情况选择 -shortest 或 -t
+
+        total_duration：画中画「时间轴跨度」（由 `_pip_timeline_extent` 算得，含子素材
+        摆到主视频之后所需的延长）。None = 内部按子视频窗口自行算一遍（旧调用方行为）。
+        """
         # 如果启用了手动时长，则跳过内部时长控制
         if self.merge_manual_duration_enabled.get():
             dur_str = self.merge_manual_duration.get().strip()
@@ -36182,12 +41874,17 @@ class FFmpegBatchGUI:
         # 多子视频流(-stream_loop/loop 无限) + filter_complex 下，-shortest 依赖 muxer
         # 在最短流 EOF 时截断，实测在部分 ffmpeg 版本无法收尾（卡在结尾不结束）。
         # -t 强制在 T 秒结束最可靠，与主音频时长一致，不影响音频长度。
-        raw_duration = self._get_media_duration(main_video.file_path)
-        # 主视频静态图片：无时长概念（探测为 0/None），给默认 10s，
-        # 否则回退 -shortest 会被无限循环的子视频拖到不结束
+        # 帧对齐（floor）：与 _pip_main_effective_duration（tpad 基准）同口径，防 -t 错位
+        raw_duration = self._get_media_duration(
+            main_video.file_path,
+            frame_align_fps=self._get_video_framerate(main_video.file_path))
+        # 主视频静态图片：无时长概念（探测为 0/None），改用「截取」面板的「显示时长」
+        # (img_duration)，否则回退 -shortest 会被无限循环的子视频拖到不结束。
+        # （曾硬编码 10s，导致图片设了显示时长在画中画模式也一直是 10 秒。）
         if (raw_duration is None or raw_duration <= 0) and self._is_static_image(main_video.file_path):
-            raw_duration = 10.0
-            self._append_info_ui(_("[封装] 主视频为静态图片，已自动按 10 秒输出；可在「手动时长」调整。"))
+            raw_duration = _eff_image_display_duration(main_video.enc_settings)
+            self._append_info_ui(
+                _('[封装] 主视频为静态图片，已按「显示时长」{0:.3f} 秒输出；可在主视频「截取」面板调整。').format(raw_duration))
         main_duration = raw_duration
         if main_video.enc_settings.get("trim_enabled", False):
             start = main_video.enc_settings.get("trim_start", "0").strip()
@@ -36199,14 +41896,31 @@ class FFmpegBatchGUI:
             elif raw_duration:
                 main_duration = raw_duration - start_sec
 
+        # ---- 时间轴延长：子素材被摆到主视频之后 → -t 用「时间轴跨度」----
+        # 底已由 `_build_overlay_filter_complex` 的 tpad 补黑帧，两者必须同源，
+        # 否则「补的长度」与「截断的长度」错位（画面尾部被切 / 多出黑帧）。
+        # total_duration 由 `_build_pip_cmd` 单点计算传入；None 时自行按子视频窗口算一遍。
+        if total_duration is None:
+            total_duration = self._pip_timeline_extent(
+                main_duration or 0.0, [(sv.file_path, sv.enc_settings) for sv in sub_videos])
+            # 兜底路径（上游未单点传入时）同样点名无界段（正常路径已在 _build_pip_cmd 提示过）
+            self._pip_warn_cut_off_subs(
+                [(sv.file_path, sv.enc_settings) for sv in sub_videos], total_duration)
+        if total_duration and main_duration and total_duration > main_duration + 1e-6:
+            self._append_info_ui(
+                _('[封装-画] 输出时长已按子素材显示时段延长：{0}:.3fs → {1}:.3fs').format(main_duration, total_duration)
+)
+        if total_duration and total_duration > 0:
+            main_duration = total_duration
+
         if main_duration and main_duration > 0:
             cmd.extend(["-t", f"{main_duration:.3f}"])
             if has_sub_audio:
-                self._append_info_ui(_("[封装] 检测到子视频音频，使用 -t {0:.3f}s 控制输出时长。").format(main_duration))
+                self._append_info_ui(_('[封装] 检测到子视频音频，使用 -t {0:.3f}s 控制输出时长。').format(main_duration))
             elif has_main_audio:
-                self._append_info_ui(_("[封装] 使用 -t {0:.3f}s 控制输出时长（多无限子流下 -shortest 不可靠）。").format(main_duration))
+                self._append_info_ui(_('[封装] 使用 -t {0:.3f}s 控制输出时长（多无限子流下 -shortest 不可靠）。').format(main_duration))
             else:
-                self._append_info_ui(_("[封装] 主视频无音频，使用 -t {0:.3f}s 控制输出时长。").format(main_duration))
+                self._append_info_ui(_('[封装] 主视频无音频，使用 -t {0:.3f}s 控制输出时长。').format(main_duration))
         else:
             # 无法计算时长，回退 -shortest
             cmd.append("-shortest")
@@ -36478,7 +42192,8 @@ class FFmpegBatchGUI:
                             refresh_cb=self.merge_update_command_preview,
                             position_editor_cb=self._open_merge_text_wm_position_editor,
                             canvas_file=self._merge_context_main_video(),
-                            canvas_settings=_mctx_s)
+                            canvas_settings=_mctx_s,
+                            canvas_scope="merge")
 
     def _open_merge_text_wm_position_editor(self, dlg):
         """封装页文字水印位置编辑器：直接编辑对话框当前选中项（dlg.settings）。
@@ -36502,15 +42217,31 @@ class FFmpegBatchGUI:
         # 背景帧语境：封装页主视频（主轨 enc_settings 与画布/背景预处理同源，2026-09-03 问题④）
         _ctx_f = self._merge_context_main_video()
         _ctx_s = None
+        # 2026-09-23 pad 几何：画布=_get_canvas_size（pad 时=pad 尺寸），主视频内容必须按
+        # 自身渲染尺寸 (main_render_size) 摆到 (offset_x, offset_y)，超出画布的部分留黑——
+        # 与子视频位置编辑器 open_visual_overlay_editor 完全同口径。此前不传这两个参数，
+        # 背景帧被拉伸铺满 pad 画布 → 「尺寸是 pad 尺寸、画面却是主视频拉伸版」。
+        _ctx_off = (0, 0)
+        _ctx_rsz = None
         try:
             mt = next((t for t in self.merge_tracks if t.enabled and t.type == "video"), None)
             if mt is not None:
                 _ctx_s = mt.enc_settings
+                _rw, _rh = self._get_video_render_size(mt)
+                _ctx_rsz = (int(_rw), int(_rh))
+                if mt.enc_settings.get("pad_enabled", False):
+                    _ox = safe_eval_expr(str(mt.enc_settings.get("offset_x", "0") or "0"),
+                                         {"W": canvas_w, "H": canvas_h}) or 0
+                    _oy = safe_eval_expr(str(mt.enc_settings.get("offset_y", "0") or "0"),
+                                         {"W": canvas_w, "H": canvas_h}) or 0
+                    _ctx_off = (int(_ox), int(_oy))
         except Exception:
-            _ctx_s = None
+            _ctx_off, _ctx_rsz = (0, 0), None
         _open_tw_position_editor_impl(self, tw, int(canvas_w), int(canvas_h),
                                       self.merge_update_command_preview, dlg,
-                                      ctx_file=_ctx_f or None, ctx_settings=_ctx_s)
+                                      ctx_file=_ctx_f or None, ctx_settings=_ctx_s,
+                                      scope="merge",
+                                      main_offset=_ctx_off, main_render_size=_ctx_rsz)
 
     def _build_normal_cmd(self, enabled_tracks, output_norm, only_audio=False):
         """
@@ -36555,7 +42286,7 @@ class FFmpegBatchGUI:
                 self._append_info_ui(_("[封装] 没有启用的视频轨道"))
                 return []
             main_video = video_tracks[0]
-            # 注入到封装页（按需）：把全局文字水印带入封装普通模式
+            # 封装页独立文字水印：self._merge_tw 写入主轨 enc_settings（封装普通模式）
             self._apply_merge_text_watermark(video_tracks)
 
             # 在添加输入之前插入硬件解码参数（使用主视频设置）
@@ -36668,11 +42399,11 @@ class FFmpegBatchGUI:
                 if af_str:
                     if enc == "copy":
                         enc = "aac"
-                        self._append_info_ui(f"音频轨 {audio_map_count+1} 应用了滤镜，编码器自动改为 aac")
+                        self._append_info_ui(_("音频轨 {0} 应用了滤镜，编码器自动改为 aac").format(audio_map_count+1))
                     cmd.extend(["-filter:a" + sfx, af_str])
                 enc, fb = self._opus_copy_fallback(enc, audio)
                 if fb:
-                    self._append_info_ui(f"音频轨 {audio_map_count+1} {fb}")
+                    self._append_info_ui(_("音频轨 {0} {1}").format(audio_map_count+1, fb))
                 if enc == "copy":
                     cmd.extend([f"-c:a:{audio_map_count}", "copy"])
                 else:
@@ -36721,7 +42452,7 @@ class FFmpegBatchGUI:
                     cmd.extend(["-af", af_str])
                 enc, fb = self._opus_copy_fallback(enc, audio)
                 if fb:
-                    self._append_info_ui(f"[封装] {fb}")
+                    self._append_info_ui(_('[封装] {0}').format(fb))
                 if enc == "copy":
                     cmd.extend(["-c:a", "copy"])
                 else:
@@ -36807,8 +42538,22 @@ class FFmpegBatchGUI:
         if not only_audio and main_video is not None:
             _ensure_tw_duration_limit(
                 self, cmd, input_path=main_video.file_path,
-                main_duration=self._get_media_duration(main_video.file_path),
-                audio_enabled=True)
+                # 帧对齐：与 _pip_main_effective_duration / -t 同口径
+                main_duration=self._get_media_duration(
+                    main_video.file_path,
+                    frame_align_fps=self._get_video_framerate(main_video.file_path)),
+                audio_enabled=True,
+                image_display_duration=_merge_output_total_duration(self, enabled_tracks))
+
+        # 主视频为静态图片（无真实时长概念）：用「截取」面板的「显示时长」控制输出长度，
+        # 否则 -loop 1 无限源会无限输出。文字水印路径已由 _ensure_tw_duration_limit 注入 -t，
+        # 这里兜底「无文字水印 / 无音频」的情况（与 串行合并 37790、转换页 28901 同源）。
+        if (not only_audio and main_video is not None and
+                self._is_static_image(main_video.file_path) and
+                "-t" not in cmd and "-to" not in cmd and "-shortest" not in cmd):
+            _img_dur = _eff_image_display_duration(main_video.enc_settings)
+            if _img_dur and _img_dur > 0:
+                cmd.extend(["-t", f"{_img_dur:.3f}"])
 
         cmd.append(output_norm)
         return cmd
@@ -36828,7 +42573,7 @@ class FFmpegBatchGUI:
             self._append_info_ui(_("[封装-画] 没有启用的视频轨道"))
             return []
         main_video = video_tracks[0]
-        # 注入到封装页（按需）：把全局文字水印带入封装画中画模式
+        # 封装页独立文字水印：self._merge_tw 写入主轨 enc_settings（封装画中画模式）
         self._apply_merge_text_watermark(video_tracks)
         sub_videos = video_tracks[1:]
 
@@ -36856,7 +42601,7 @@ class FFmpegBatchGUI:
             
             if sv_settings.get("encoder") == "copy":
                 sv_settings["encoder"] = "libx265"
-                self._append_info_ui(_("[封装-画] 从视频 {0} copy 已临时改为 libx265（画中画必须重新编码）").format(os.path.basename(sv.file_path)))
+                self._append_info_ui(f"[封装-画] 从视频 {os.path.basename(sv.file_path)} copy 已临时改为 libx265（画中画必须重新编码）")
             
             sub_infos.append((file_index[sv.file_path], sv.file_path, sv_settings))
     
@@ -36872,13 +42617,44 @@ class FFmpegBatchGUI:
         # （2026-08-27 曾临时恒 False 隐藏接口，用户澄清要的是 UI 隐藏——恢复读取；
         #  封装页 UI 已隐藏烧录字幕行，enc_settings 无来源，恒 False 等效）
         include_subtitle_main = main_video.enc_settings.get("subtitle_enabled", False) and bool(main_video.enc_settings.get("subtitle_path", "").strip())
+        # ---- 画中画时间轴跨度：子素材被摆到主视频之后时，底补黑帧 + 输出 -t 跟着延长 ----
+        # 单点计算（这里算一次，传给滤镜构建与 -t 两处），避免两处口径漂移。
+        _pip_main_dur = self._pip_main_effective_duration(main_video)
+        _pip_total_dur = self._pip_timeline_extent(
+            _pip_main_dur, [(_p, _s) for (_i, _p, _s) in sub_infos])
+        # 起点 ≥ 输出时长的无界段 = 整段会被截掉 → 点名提醒（忘了开有限时长）
+        # ⚠️ 函数按 (path, settings) 二元组解包 → 必须先剥掉 file_index（与上行 extent 同口径）
+        self._pip_warn_cut_off_subs(
+            [(_p, _s) for (_i, _p, _s) in sub_infos], _pip_total_dur)
+        _pip_tail_pad = max(0.0, _pip_total_dur - _pip_main_dur)
+        if _pip_tail_pad > 0:
+            self._append_info_ui(
+                f"[封装-画] 子素材显示时段超出主视频时长（{_pip_main_dur:.3f}s），"
+                f"已自动延长输出时间轴到 {_pip_total_dur:.3f}s（主视频尾部补黑帧）")
         complex_filter, final_v_label = self._build_overlay_filter_complex(
             main_idx, main_video.enc_settings, sub_infos,
             include_subtitle_main=include_subtitle_main,
             enhance_settings=main_video.enc_settings.get("enhance", {}),
             reverse=reverse_flag,
-            main_file_path=main_video.file_path
+            main_file_path=main_video.file_path,
+            main_tail_pad=_pip_tail_pad,
+            main_effective_duration=(_pip_main_dur if _pip_main_dur > 0 else None),
+            node_fx_record_raw=True
         )
+        # 音频跟随转场（每个子视频独立开关，默认取消）：
+        # 开启的视频，其音频按转场链真实输出位置 P_k（xfade 交叉起点）定位 —— 与画面逐帧对齐，
+        # 类似 concat 的音频跟随。delta = P_k − 该段显示起点 ws（手动错位也能自动校正）；
+        # 未开启 / 未成链 → delta=0（原位置）。
+        # ⚠️ 旧实现用 shift_of=−Σ转场时长，与 xfade 已压缩的时间轴**重复扣减**，导致音频比画面
+        # 提前一截（用户实测 2nd→3rd 子声早 6s、口型对不上）。改为直接用链的真实位置 P_k。
+        try:
+            _chains = self._pip_transition_chains(
+                sub_infos, main_video.enc_settings, main_video.file_path,
+                _pip_main_dur)[0]
+        except Exception:
+            _chains = []
+        _pip_audio_shift = self._pip_audio_follow_shift(
+            sub_videos, _chains, sub_infos, main_video)
         # 追加文字水印（在 overlay 之后；旋转时走透明层+rotate+overlay 子图）
         tw_settings = main_video.enc_settings.get("text_watermark", {})
         tw_frag = build_text_watermark_chain(main_video.enc_settings, main_label=final_v_label, out_label="[v_dtext]")
@@ -36891,16 +42667,39 @@ class FFmpegBatchGUI:
         _bgm_idx = None
         _bgm_vol = 0.3
         _pip_dur = self._pip_main_duration(main_video)
+        # 时间轴被延长时 BGM 也跟着铺满（否则后半段静音）。
+        # 零延长时 _pip_total_dur == 主视频时长口径 → 本行不触发，BGM 行为逐字不变。
+        if _pip_total_dur and _pip_total_dur > _pip_dur:
+            _pip_dur = _pip_total_dur
         if _bgm_on:
             _bgm_idx = file_index.get(normalize_path(_bgm_path))
             try:
                 _bgm_vol = float(main_video.enc_settings.get("bgm_volume", 0.3) or 0.3)
             except (ValueError, TypeError):
                 _bgm_vol = 0.3
+        # 音频床与画面同源：时间轴延长后，参与 amix 的各条音频都要跟着有界到 _pip_total_dur，
+        # 否则延长段静音（子素材摆到主视频之后时「混音/替换」看起来没生效）。
         a_parts, a_maps, a_enc = self._build_pip_audio(
-            enabled_tracks, file_index, main_video, _bgm_on, _bgm_idx, _bgm_vol, _pip_dur)
+            enabled_tracks, file_index, main_video, _bgm_on, _bgm_idx, _bgm_vol, _pip_dur,
+            total_duration=(_pip_total_dur if (_pip_total_dur and _pip_total_dur > 0) else None),
+            audio_shift=(_pip_audio_shift or None))
         if a_parts:
             complex_filter = complex_filter + ";" + ";".join(a_parts)
+        # 「音频节点」定稿：PiP 音频段由上方 _build_pip_audio 追加进 complex_filter，
+        # 必须等音频拼进来后，才能把完整图（视频+音频）存为 self._last_graph
+        # —— 它是右键「节点」对话框（视频/音频节点列表）的数据源，也是音频节点效果
+        # 的插入基准。提前在 _build_overlay_filter_complex 里快照只会拿到纯视频图
+        # ⇒ 对话框读不到音频节点、音频效果也插不进音频链（2026-09-26 修复）。
+        self._last_graph = complex_filter
+        self._last_graph_sig = self._graph_media_signature()
+        self._last_graph_gen = getattr(self, "_graph_gen", 0)
+        self._graph_dirty = False      # 本次构图产出 ⇒ 缓存重新可信
+        if getattr(self, "node_audio_fx", None):
+            try:
+                complex_filter, _fx_final_lbl = self._apply_node_audio_fx(
+                    complex_filter, "out", anchor_nodes=None)
+            except Exception as _e:
+                self._append_info_ui(f"[音频节点] 应用失败（按原图继续）: {_e}")
         cmd.extend(["-filter_complex", complex_filter])
         cmd.extend(["-map", final_v_label])
 
@@ -36922,11 +42721,51 @@ class FFmpegBatchGUI:
             cmd.append("-an")
 
         self._add_subtitles_and_chapters(cmd, enabled_tracks, file_index, input_files)
-        self._add_pip_duration_control(cmd, main_video, enabled_tracks)
+        self._add_pip_duration_control(cmd, main_video, enabled_tracks,
+                                       total_duration=_pip_total_dur)
         self._add_container_optimization(
             cmd, main_video.enc_settings if main_video is not None else None)
         cmd.append(output_norm)
         return cmd
+
+    def _compute_concat_transitions(self, video_tracks):
+        """复算串行合并各段「处理后时长」与「生效转场」(type, dur)，与 _build_concat_video_graph 完全对齐。
+        供 _generate_concat_chapters 复用，使章节起点与 xfade offset 公式一致。
+        返回 (seg_durations, trans_effective)：
+          - seg_durations[i]：段 i 处理后时长（秒，含图片显示时长 / 截取 / 变速；<=0 回退 10.0）
+          - trans_effective[i]：(type, dur) 或 None（段 i 未开转场 / 末段 / 被钳制丢弃）
+        """
+        seg_durations = []
+        for _t in video_tracks:
+            if self._is_static_image(_t.file_path):
+                _d = _eff_image_display_duration(_t.enc_settings)
+            else:
+                _d = self._get_effective_duration(_t.enc_settings, input_path=_t.file_path)
+            if _d is None or _d <= 0:
+                _d = 10.0
+            seg_durations.append(_d)
+        n = len(video_tracks)
+        trans_effective = [None] * n
+        for i in range(n):
+            if i >= n - 1:
+                break
+            _ts = video_tracks[i].enc_settings
+            if not _ts.get("transition_enabled", False):
+                continue
+            _ttype = str(_ts.get("transition_type", "fade") or "fade").strip()
+            if _ttype not in XFADE_TRANSITIONS:
+                _ttype = "fade"
+            try:
+                _td = float(str(_ts.get("transition_duration", "1.0") or "1.0").strip())
+            except ValueError:
+                _td = 1.0
+            if _td <= 0 or seg_durations[i] <= 0 or seg_durations[i + 1] <= 0:
+                continue
+            _td = min(_td, min(seg_durations[i], seg_durations[i + 1]) / 2.0)
+            if _td < 0.05:
+                continue
+            trans_effective[i] = (_ttype, _td)
+        return seg_durations, trans_effective
 
     def _generate_concat_chapters(self, video_tracks):
         """为串行合并生成 FFmetadata 临时文件，返回 (path, cleanup_list)。
@@ -36940,20 +42779,23 @@ class FFmpegBatchGUI:
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 f.write(";FFMETADATA1\n")
                 cumulative_ms = 0
+                # 与 _build_concat_video_graph 对齐：复算各段时长与生效转场，
+                # 段 i(i>=1) 的章节起点回退「前一段」转场时长，消除 xfade 重叠导致的章节后移。
+                seg_durations, trans_effective = self._compute_concat_transitions(video_tracks)
                 for i, track in enumerate(video_tracks):
                     label = track.enc_settings.get("chapter_label", "").strip()
-                    # 计算该片段的实际时长（秒）
-                    settings = track.enc_settings
-                    effective_dur = self._get_effective_duration(settings, input_path=track.file_path)
-                    if effective_dur is None or effective_dur <= 0:
-                        effective_dur = 0.0
+                    # 该片段的处理后时长（秒），与成片视频链一致（含图片/截取/变速）
+                    effective_dur = seg_durations[i]
                     dur_ms = int(effective_dur * 1000)
-                    
-                    title = label if label else f"片段 {i+1}"
-                    end_ms = cumulative_ms + dur_ms
+                    # 转场重叠：段 i 起点 = 前段累计 - 前一段转场时长（xfade offset 公式）
+                    start_ms = cumulative_ms
+                    if i > 0 and trans_effective[i - 1] is not None:
+                        start_ms = max(0, start_ms - int(trans_effective[i - 1][1] * 1000))
+                    title = label if label else _('片段 {0}').format(i+1)
+                    end_ms = start_ms + dur_ms
                     f.write("[CHAPTER]\n")
                     f.write("TIMEBASE=1/1000\n")
-                    f.write(f"START={cumulative_ms}\n")
+                    f.write(f"START={start_ms}\n")
                     f.write(f"END={end_ms}\n")
                     f.write(f"title={title}\n")
                     cumulative_ms = end_ms
@@ -37005,7 +42847,7 @@ class FFmpegBatchGUI:
 
         audio_tracks = [t for t in enabled_tracks if t.type == "audio"]
         main_video = video_tracks[0]
-        # 注入到封装页（按需）：把全局文字水印带入封装串行模式
+        # 封装页独立文字水印：self._merge_tw 写入主轨 enc_settings（封装串行模式）
         self._apply_merge_text_watermark(video_tracks)
 
         # 判断使用哪种模式
@@ -37031,6 +42873,12 @@ class FFmpegBatchGUI:
             for t in video_tracks)
         if use_copy_mode and _canvas_any_c:
             self._append_info_ui(_("[串联] 画布模式（位置、尺寸、旋转）需要重新编码，自动切换到重新编码模式。"))
+            use_copy_mode = False
+
+        # 图片素材无法走 concat demuxer 流复制（-c:v copy 只能拼视频流）→ 强制重编码。
+        _img_any_c = any(self._is_static_image(t.file_path) for t in video_tracks)
+        if use_copy_mode and _img_any_c:
+            self._append_info_ui(_("[串联] 含图片素材，自动切换到重新编码模式（图片无法流复制拼接）。"))
             use_copy_mode = False
 
         cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
@@ -37187,11 +43035,13 @@ class FFmpegBatchGUI:
         _v = getattr(self, "concat_norm_global", None)
         return bool(_v is not None and _v.get())
 
-    def _build_concat_video_graph(self, video_tracks, global_norm=False):
+    def _build_concat_video_graph(self, video_tracks, global_norm=False, preview_work_cap=None):
         """构建串行合并「纯视频」filter_complex：主视频规格计算 + 逐轨滤镜 + 强制归一 + 逐轨转场/硬切拼接。
 
-        供 _build_concat_reencode_mode（正式命令）与 _build_concat_contact_sheet_cmd（缩略图预览）复用，
-        保证缩略图画面与最终成片的视频链完全一致（单一来源，避免两处逻辑漂移）。
+        供 _build_concat_reencode_mode（正式命令）与 merge_preview_concat_lavfi（串行合并
+        lavfi 预览）复用，保证预览画面与最终成片的视频链完全一致（单一来源，避免两处逻辑漂移）。
+        （注：串行缩略图早已不走本图 —— 现为按段 -ss seek 抽帧 + 纯内存拼图，见
+        _show_concat_contact_sheet_async；同名的 _build_concat_contact_sheet_cmd 已于 2026-09-24 删除。）
 
         global_norm：False（默认）= 历史行为，6 个归一滤镜逐段写；
                      True = 精简命令，只把 concat 的硬门槛留在段前，其余挪到 concat 后写一次。
@@ -37215,11 +43065,20 @@ class FFmpegBatchGUI:
             main_orig_w, main_orig_h, main_video.enc_settings)
         if main_target_w <= 0 or main_target_h <= 0:
             main_target_w, main_target_h = main_orig_w, main_orig_h
+        # 预览管道引擎工作分辨率上限（仅 pipe_engine 预览传入 preview_work_cap=上限宽；
+        # 其余路径 None → 与旧行为逐字节一致）。主视频宽超上限时把「目标输出尺寸」整体
+        # 等比降到上限 → pre_norm 的逐段 scale 同步变小，图计算量按 f² 下降（xfade/concat
+        # 是时间维、不吃空间；只有逐段 scale 吃空间）。调用方须用同一 capped 值做 color 基源
+        # /边框几何，否则图片基源与逐段 scale 尺寸不一致 → 画面错位。
+        if preview_work_cap and main_target_w > preview_work_cap and main_target_h > 0:
+            _cf = preview_work_cap / float(main_target_w)
+            main_target_w = max(2, int(main_target_w * _cf) // 2 * 2)
+            main_target_h = max(2, int(main_target_h * _cf) // 2 * 2)
 
         if main_video.enc_settings.get("pix_fmt_enabled", True):
             target_pix_fmt = main_video.enc_settings.get("pix_fmt", "yuv420p")
         else:
-            target_pix_fmt = self._get_stream_pix_fmt(main_video.file_path, 0) or "yuv420p"
+            target_pix_fmt = self._get_video_pix_fmt(main_video.file_path, 0) or "yuv420p"
 
         if main_video.enc_settings.get("frame_rate_type") == "custom":
             try:
@@ -37233,7 +43092,12 @@ class FFmpegBatchGUI:
         # ----- 2. 每段处理后时长 -----
         seg_durations = []
         for _t in video_tracks:
-            _d = self._get_effective_duration(_t.enc_settings, input_path=_t.file_path)
+            if self._is_static_image(_t.file_path):
+                # 图片素材：时长取自「截取」面板的「显示时长(秒)」(img_duration)；
+                # 图片无媒体时长，_get_effective_duration 会返回 None。
+                _d = _eff_image_display_duration(_t.enc_settings)
+            else:
+                _d = self._get_effective_duration(_t.enc_settings, input_path=_t.file_path)
             if _d is None or _d <= 0:
                 _d = 10.0
             seg_durations.append(_d)
@@ -37416,7 +43280,20 @@ class FFmpegBatchGUI:
                 concat_input_files.append(_bgm_norm)
         file_index = {p: i for i, p in enumerate(concat_input_files)}
         for p in concat_input_files:
-            cmd.extend(["-i", normalize_path(p)])
+            _pn = normalize_path(p)
+            if self._is_static_image(p):
+                # 图片素材：把本图「显示时长」烘焙成有限时长流（与普通/转换页图片输入一致）。
+                # 裸 -i 图片只产生 1 帧，concat/xfade 无法拼接。
+                _img_trk_c = next((t for t in video_tracks
+                                   if normalize_path(t.file_path) == _pn), None)
+                _img_set_c = _img_trk_c.enc_settings if _img_trk_c is not None else {}
+                _img_dur_c = _eff_image_display_duration(_img_set_c)
+                _img_fps_c = self._get_video_framerate(p) or 30
+                cmd.extend(["-loop", "1",
+                            "-framerate", f"{_img_fps_c:.6f}".rstrip('0').rstrip('.'),
+                            "-t", f"{_img_dur_c:.3f}", "-i", _pn])
+            else:
+                cmd.extend(["-i", _pn])
     
         # ----- 3. 构建纯视频 filter_complex（复用公共函数 _build_concat_video_graph） -----
         n = len(video_tracks)
@@ -37461,7 +43338,8 @@ class FFmpegBatchGUI:
             filter_parts.append(f"[0:a]{_at_chain}[amain]")
             a_labels.append("[amain]")
             self._append_info_ui(
-                _('[串联-编] 音频独立截取（不分段）已接管全部音频输出（源文件 {0}，起始 {1} 结束 {2}）').format(os.path.basename(main_video.file_path), _astr or '0', _aend or _('末尾')))
+                f"[串联-编] 音频独立截取（不分段）已接管全部音频输出（源文件 {os.path.basename(main_video.file_path)}，"
+                f"起始 {_astr or '0'} 结束 {_aend or '末尾'}）")
         elif audio_tracks:
             for j, audio in enumerate(audio_tracks):
                 a_idx = file_index[audio.file_path]
@@ -37508,7 +43386,11 @@ class FFmpegBatchGUI:
             for i, track in enumerate(video_tracks):
                 settings = track.enc_settings.copy()
                 audio_type = settings.get("audio_source_type", "self")
-                effective_duration = self._get_effective_duration(settings, input_path=track.file_path)
+                if self._is_static_image(track.file_path):
+                    # 图片段：静音底噪时长跟随「显示时长」，否则 10s 兜底会让音画长度错位
+                    effective_duration = _eff_image_display_duration(settings)
+                else:
+                    effective_duration = self._get_effective_duration(settings, input_path=track.file_path)
                 if effective_duration is None or effective_duration <= 0:
                     effective_duration = 10.0
                 has_audio = False
@@ -37687,7 +43569,30 @@ class FFmpegBatchGUI:
                 )
 
         # ----- 8. 组合所有滤镜 -----
-        all_filters = ";".join(filter_parts)
+        # 音频节点效果（2026-09-26）：拼接完成的音频链上按指纹插入（串行合并也走这张图）。
+        # 先把原始图记到 _last_graph —— 既是音频节点对话框的数据源，也是指纹锚点基准
+        # （必须在叠加节点效果之前，否则段序号因自己插入的效果而漂移 ⇒ 指纹永远对不上）。
+        self._last_graph = ";".join(filter_parts)
+        self._last_graph_sig = self._graph_media_signature()
+        self._last_graph_gen = getattr(self, "_graph_gen", 0)
+        self._graph_dirty = False      # 本次构图产出 ⇒ 缓存重新可信
+        # 串行合并也必须写「基准图」：这里记下的图在音频节点效果应用**之前**，
+        # 且串行根本不应用视频节点效果 ⇒ 它本身就是干净图，可直接当节点分析基准。
+        # 不写 ⇒ 上一代画中画的 base 残留 + 媒体签名没变 ⇒ 切回串行读到画中画的图。
+        self._last_graph_base = self._last_graph
+        self._last_graph_base_gen = self._last_graph_gen
+        if getattr(self, "node_audio_fx", None):
+            try:
+                all_filters, _fx_final_lbl = self._apply_node_audio_fx(
+                    self._last_graph,
+                    "afinal" if "[afinal]" in self._last_graph
+                    else ("aout" if "[aout]" in self._last_graph else "out"),
+                    anchor_nodes=graph_nodes(self._last_graph))
+            except Exception as _e:
+                self._append_info_ui(f"[音频节点] 串行合并叠加失败（按原图继续）: {_e}")
+                all_filters = self._last_graph
+        else:
+            all_filters = self._last_graph
         cmd.extend(["-filter_complex", all_filters])
         cmd.extend(["-map", vmap, "-map", amap])
     
@@ -37716,10 +43621,13 @@ class FFmpegBatchGUI:
     
         # 容器优化
         self._add_container_optimization(cmd, v_settings)
-        # 文字水印（旋转/spin）无限源时长限制：各段有限流，-shortest 正确截断到总时长
+        # 文字水印（旋转/spin）无限源时长限制：各段有限流，-shortest 正确截断到总时长。
+        # 图片主视频无真实时长，用 concat 实际总时长 total_dur（Σ段长 − Σ转场重叠）兜底，
+        # 不能用单张图的「显示时长」，否则无限画布会把输出拉长/截短。
         _ensure_tw_duration_limit(
             self, cmd, input_path=main_video.file_path,
-            main_duration=None, audio_enabled=True)
+            main_duration=None, audio_enabled=True,
+            image_display_duration=total_dur)
 
         cmd.append(output_norm)
         self._append_info_ui(f"[串联-编] 使用 filter_complex 重新编码模式（{n} 个片段）")
@@ -37729,6 +43637,9 @@ class FFmpegBatchGUI:
         """
         根据当前模式生成合并/封装的 FFmpeg 命令列表。
         """
+        # 构代号 +1（节点分析据此判断「两张图是不是同一次构图产出的」，
+        # 见 _ensure_node_graphs_current）。放最前面：本次构图写下的图都打同一个号。
+        self._graph_gen = getattr(self, "_graph_gen", 0) + 1
 
         if not self.ffmpeg_cmd:
             self._append_info_ui(_("未找到 ffmpeg，无法生成合并命令。"))
@@ -37754,8 +43665,9 @@ class FFmpegBatchGUI:
 
         # ⚠️ 2026-08-19 用户拍板：转换页的文字/图片水印设置【不得】影响封装页（3 个模式）。
         # 原先这里把 self.text_watermark_settings 塞进主视频轨道 enc_settings，
-        # 导致封装普通/画中画/串行全部被转换页文字水印污染。已删除该种子点；
-        # 封装页如需水印，走各轨道自己的叠加/水印设置（默认关闭）。
+        # 导致封装普通/画中画/串行全部被转换页文字水印污染。已删除该种子点。
+        # 2026-08-26 起封装页有自己的文字水印（self._merge_tw，页底部「文字水印」按钮），
+        # 由各模式入口的 _apply_merge_text_watermark 写入主轨 enc_settings。
 
         output_norm = normalize_path(output)
     
@@ -37768,7 +43680,7 @@ class FFmpegBatchGUI:
             base, ext = os.path.splitext(output_norm)
             if ext.lower() not in ('.m4a', '.mp3', '.flac', '.wav', '.aac', '.opus', '.ac3', '.ogg'):
                 output_norm = base + ".m4a"
-                self._append_info_ui(_('[封装] 仅音频模式，输出扩展名自动改为 .m4a'))
+                self._append_info_ui(f"[封装] 仅音频模式，输出扩展名自动改为 .m4a")
             cmd_list = self._build_normal_cmd(enabled_tracks, output_norm, only_audio=True)
         else:
             # 根据模式选择命令生成函数
@@ -37782,6 +43694,15 @@ class FFmpegBatchGUI:
         if not cmd_list:
             self._append_info_ui(_("[封装] 命令生成失败，请检查设置"))
             return []
+
+        # 本次构图**没产出图**（普通封装 / 串行 copy 等不带 filter_complex 的模式）⇒ 旧图作废。
+        # 不然节点窗会拿上一代（很可能是别的模式）的图列出节点 —— 与「切回串行却看到画中画
+        # 的图」是同一类假数据。判据：_last_graph 的构代号不等于本次构代号 = 本次没写过。
+        if getattr(self, "_last_graph_gen", -1) != self._graph_gen:
+            self._last_graph = ""
+            self._last_graph_base = ""
+            self._last_graph_sig = ""
+            self._graph_dirty = False
 
         # ---- 帧同步统一注入（2026-09-16「帧设置」；普通/画中画/串行三种模式通用）----
         # 来源 =【主视频轨道】的 enc_settings（与 -g/-keyint_min 同源，见 append_video_output_extras）。
@@ -37807,19 +43728,28 @@ class FFmpegBatchGUI:
         try:
             cmd_list = self._apply_end_handling(cmd_list, enabled_tracks)
         except Exception as e:
-            self._append_info_ui(_('[末端] 末端处理注入失败，已跳过: {0}').format(e))
+            self._append_info_ui(f"[末端] 末端处理注入失败，已跳过: {e}")
 
         # ---- 图片主视频默认时长：普通模式单视频图片（-loop 1 无限循环）无天然结束点，
-        # 未勾选手动时长时自动 -t 10s（画中画由 _add_pip_duration_control 处理） ----
+        # 未勾选手动时长时自动 -t（取「截取」面板的「显示时长」；画中画由 _add_pip_duration_control 处理） ----
+        # ⚠️ 这里的 `"-t" not in cmd_list` 必须是【裸判】、不能改写成 _cmd_has_output_option：
+        # 图片素材已把显示时长烘焙成输入级 -t，串行模式多张图（16s+10s）时若改成输出侧判定，
+        # 这里会补一个「第一张图的时长」-t 把整条 concat 输出截断掉。裸判在此正好让位给输入级时长。
         if not self.merge_manual_duration_enabled.get():
             try:
                 _mv_path = self.merge_video.get().strip()
                 if _mv_path and self._is_static_image(_mv_path):
                     if "-t" not in cmd_list and "-shortest" not in cmd_list:
+                        # 图片主视频：用「截取」面板设定的「显示时长」(img_duration)，不再硬编码 10 秒
+                        _mv_track = next((t for t in enabled_tracks
+                                          if getattr(t, "type", "video") == "video"), None)
+                        _img_dur = _eff_image_display_duration(
+                            _mv_track.enc_settings if _mv_track is not None else None)
                         _out_path = cmd_list.pop()
-                        cmd_list.extend(["-t", "10.000"])
+                        cmd_list.extend(["-t", f"{_img_dur:.3f}"])
                         cmd_list.append(_out_path)
-                        self._append_info_ui(_("[封装] 主视频为静态图片，已自动按 10 秒输出；可在「手动时长」调整。"))
+                        self._append_info_ui(
+                            f"[封装] 主视频为静态图片，已按 {_img_dur:.3f} 秒输出；可在「截取」面板调整显示时长。")
             except Exception:
                 pass
     
@@ -37829,14 +43759,18 @@ class FFmpegBatchGUI:
             if dur_str:
                 dur_sec = time_to_seconds(dur_str)
                 if dur_sec is not None and dur_sec > 0:
-                    # 移除已有的 -t 和 -shortest 及其参数
+                    # 移除已有的【输出级】-t 和 -shortest 及其参数。
+                    # 只动输出侧（最后一个 -i 之后）：输入级 -t 是图片素材的「显示时长」
+                    # （-loop 1 -framerate fps -t N -i img），剥掉会让该图变回无限源、
+                    # 吞掉后面所有素材。
+                    _last_i = max((k for k, a in enumerate(cmd_list) if a == "-i"), default=-1)
                     new_cmd = []
                     skip_next = False
                     for i, arg in enumerate(cmd_list):
                         if skip_next:
                             skip_next = False
                             continue
-                        if arg in ('-t', '-shortest'):
+                        if i > _last_i and arg in ('-t', '-shortest'):
                             if arg == '-t':
                                 if i+1 < len(cmd_list) and not cmd_list[i+1].startswith('-'):
                                     skip_next = True
@@ -37966,6 +43900,10 @@ class FFmpegBatchGUI:
         # 免去每次停顿都重建命令的卡顿。播放预览/快照独立于本函数，不受影响；
         # 手动点「刷新命令」按钮走 _do_merge_update_command_preview 跳过本开关。
         if getattr(self, "_merge_refresh_paused", None) and self._merge_refresh_paused.get():
+            # 自动刷新被关 ⇒ 这次（以及之后到下次手动刷新前）命令预览都不会跑，
+            # 缓存里的图就此停在上一代。标记脏 → 节点分析下次必须自己重算，
+            # 否则会把上一代的图当成当前的（切模式 / 改设置后节点莫名其妙消失）。
+            self._graph_dirty = True
             return
         # 取消之前排队的更新
         if hasattr(self, '_merge_preview_after_id') and self._merge_preview_after_id:
@@ -38369,20 +44307,20 @@ class FFmpegBatchGUI:
         """右键「替换素材」：只换选中轨道的源文件，enc_settings 整块保留
         （位置 / 缩放 / 旋转 / 裁剪 / 滤镜 / 截取 / 转场 一律不动）。
 
-        2026-09-11 从 base port（用户拍板：先只做单轨右键替换；校验只做日志提示，
+        2026-09-11 新增（用户拍板：先只做单轨右键替换；校验只做日志提示，
         **绝不自动改动任何参数**——剪映式「换源后自动适配」不做）。
 
         ⚠️ 主视频两处存源：self.merge_video 变量 + 主视频轨的 file_path，二者靠
-           **路径相等**配对（_ensure_main_video 用 normalize_path 比对）。
+           **路径相等**配对（_ensure_main_video 20683-20707 用 normalize_path 比对）。
            只改一处 → 主视频轨会「自己叠自己」或路径失配，故换主视频轨必须两处同改。
 
         ⚠️ 设 self.merge_video 必须抑制 trace：merge_video 的 write trace 指向
-           merge_load_video_info，它会 self.merge_tracks = [] 后按新文件流
-           重建全部轨道 → 子视频被清空。参照 _ensure_main_video 用
-           _suppress_main_video_trace 门卫。
+           merge_load_video_info（33188），它会 self.merge_tracks = [] 后按新文件流
+           重建全部轨道（33214-33220）→ 子视频被清空。参照 _ensure_main_video（20693）
+           用 _suppress_main_video_trace 门卫。
 
         布局为何能保留：子视频 overlay_x/y 默认是相对表达式 W-w-10 / H-h-10
-        （Track 初始化），crop_width 默认 iw/2 → 换源后自适应新尺寸。
+        （Track 初始化 19894-19895），crop_width 默认 iw/2（19883）→ 换源后自适应新尺寸。
         """
         indices = self._get_selected_track_indices()
         if not indices:
@@ -38394,22 +44332,18 @@ class FFmpegBatchGUI:
         track = self.merge_tracks[idx]
 
         path = filedialog.askopenfilename(
-            title=_("替换素材 - 轨道 {0}（{1}）：仅换源文件，保留位置/缩放/旋转/滤镜").format(idx + 1, track.type),
-            filetypes=[(_("媒体文件"), "*.png *.jpg *.jpeg *.bmp *.webp *.gif *.mp4 *.mkv *.avi *.mov "
-                                    "*.flv *.webm *.ts *.m4a *.aac *.mp3 *.wav *.flac *.ogg *.opus *.ass *.srt"),
-                       (_("视频文件"), "*.mp4 *.mkv *.avi *.mov *.flv *.webm *.ts *.png *.jpg *.jpeg *.bmp *.webp *.gif"),
-                       (_("音频文件"), "*.m4a *.aac *.mp3 *.wav *.flac *.ogg *.opus"),
-                       (_("所有文件"), "*.*")])
+            title=_('替换素材 - 轨道 {0}（{1}）：仅换源文件，保留位置/缩放/旋转/滤镜').format(idx + 1, track.type),
+            filetypes=media_filetypes(include_audio=True, include_subtitle=True))
         if not path:
             return
         path = normalize_path(path)
         if not os.path.exists(path):
-            self._append_info_ui(f"[替换素材] 所选文件不存在，未做改动：{path}")
+            self._append_info_ui(_('[替换素材] 所选文件不存在，未做改动：{0}').format(path))
             return
 
         old_path = track.file_path or ""
         if old_path and normalize_path(old_path) == path:
-            self._append_info_ui("[替换素材] 与当前源相同，未做改动")
+            self._append_info_ui(_("[替换素材] 与当前源相同，未做改动"))
             return
 
         enc = track.enc_settings if isinstance(track.enc_settings, dict) else {}
@@ -38422,20 +44356,20 @@ class FFmpegBatchGUI:
             info = self._get_cached_stream_info(path)   # 顺带预热缓存
             streams = (info or {}).get("streams", [])
             if not streams:
-                warns.append("无法解析媒体信息或没有任何流（ffprobe 失败 / 文件损坏）")
+                warns.append(_("无法解析媒体信息或没有任何流（ffprobe 失败 / 文件损坏）"))
             else:
                 _want = "video" if track.type == "video" else "audio"
                 if not any(s.get("codec_type") == _want for s in streams):
-                    warns.append(f"新源没有 {_want} 流")
+                    warns.append(_('新源没有 {0} 流').format(_want))
                 _has_audio = any(s.get("codec_type") == "audio" for s in streams)
                 if track.type == "audio" and not _has_audio:
-                    warns.append("新源无音频流，该音频轨将无输出")
+                    warns.append(_("新源无音频流，该音频轨将无输出"))
                 elif track.type == "video" and not _has_audio:
                     # 视频轨音源=自身时才引用 0:a:?；silence / external 不受影响
                     if enc.get("audio_source_type", "self") == "self":
-                        warns.append("新源无音频流，而本轨音源=自身（audio_source_type=self），命令可能失败")
+                        warns.append(_("新源无音频流，而本轨音源=自身（audio_source_type=self），命令可能失败"))
                 if track.type == "video" and enc.get("chroma_enabled", False):
-                    warns.append("本轨已启用绿幕抠像，抠像颜色 / 相似度需按新素材重调")
+                    warns.append(_("本轨已启用绿幕抠像，抠像颜色 / 相似度需按新素材重调"))
             # 时长相关（绝对秒参数不会自动适配）
             _new_dur = self._get_media_duration(path)
             _old_dur = self._get_media_duration(old_path) if old_path else None
@@ -38446,9 +44380,9 @@ class FFmpegBatchGUI:
                     except (ValueError, TypeError):
                         _te = None
                     if _te is not None and _te > _new_dur:
-                        warns.append(f"截取片段结束 {_te:.2f}s 超出新源时长 {_new_dur:.2f}s，输出会被静默截断")
+                        warns.append(_('截取片段结束 {0}:.2fs 超出新源时长 {1}:.2fs，输出会被静默截断').format(_te, _new_dur))
                 if _old_dur and abs(_old_dur - _new_dur) > 0.01:
-                    warns.append(f"时长 {_old_dur:.2f}s → {_new_dur:.2f}s（转场 / 淡入淡出 / 轨迹等绝对秒参数不自动适配）")
+                    warns.append(_('时长 {0}:.2fs → {1}:.2fs（转场 / 淡入淡出 / 轨迹等绝对秒参数不自动适配）').format(_old_dur, _new_dur))
 
         # ---- 换源：enc_settings 整块不动 ----
         track.file_path = path
@@ -38465,10 +44399,10 @@ class FFmpegBatchGUI:
         self.merge_update_track_list()
         self.merge_update_command_preview()
         self._append_info_ui(
-            f"[替换素材] 轨道 {idx + 1}：{os.path.basename(old_path) or '(空)'} → "
-            f"{os.path.basename(path)}（布局与滤镜已保留）")
+            _('[替换素材] 轨道 {0}：{1} → {2}（布局与滤镜已保留）').format(idx+1, os.path.basename(old_path)or'(空)', os.path.basename(path))
+)
         for _w in warns:
-            self._append_info_ui(f"[替换素材] ⚠️ {_w}")
+            self._append_info_ui(_('[替换素材] ⚠️ {0}').format(_w))
 
     def merge_preview_selected(self, with_snapshot: bool = False):
         indices = self._get_selected_track_indices()
@@ -38477,24 +44411,66 @@ class FFmpegBatchGUI:
             return
         self.merge_preview_track(indices[0], with_snapshot=with_snapshot)
 
-    def merge_preview_pip_live(self):
+    def _ffplay_fit_scale(self, out_w, out_h):
+        """返回 ffplay 缩放参数列表（按需），口径与旧预览路径（_canvas_fit_scale /
+        _preview_with_settings 27477-27520）**完全一致**：预留「更多设置 → 播放预览屏幕边距」
+        preview_margin（默认 80，钳制 20-400）—— 覆盖窗口标题栏 + 任务栏 + 左右边框。
+
+        旧实现硬编码 48/16 比 preview_margin 小得多 → 用户实测「缩放还是不够、标题栏被挤出去」。
+        仅当输出尺寸超过可用区时才缩放（正常预览不缩，与 mpv/旧路径一致）；缩放后尺寸偶数化
+        并二次钳制到可用区以内。返回 [] 表示无需缩放。"""
+        try:
+            _scr_w = int(self.root.winfo_screenwidth())
+            _scr_h = int(self.root.winfo_screenheight())
+        except Exception:
+            _scr_w, _scr_h = 1920, 1080
+        try:
+            _margin = int(self.preview_margin.get())
+        except Exception:
+            _margin = 80
+        _avail_w = max(320, _scr_w - _margin)
+        _avail_h = max(240, _scr_h - _margin)
+        if out_w <= 0 or out_h <= 0 or (out_w <= _avail_w and out_h <= _avail_h):
+            return []
+        _scale = min(float(_avail_w) / out_w, float(_avail_h) / out_h)
+        _dw = max(2, int(round(out_w * _scale / 2) * 2))
+        _dh = max(2, int(round(out_h * _scale / 2) * 2))
+        # 二次钳制（极端比例时 round 可能越界）
+        if _dw > _avail_w:
+            _dw = _avail_w - (_avail_w % 2)
+        if _dh > _avail_h:
+            _dh = _avail_h - (_avail_h % 2)
+        return ["-x", str(_dw), "-y", str(_dh)]
+
+
+    def merge_preview_pip_live(self, pipe_engine=False):
         """画中画实时预览（mpv --lavfi-complex）：主视频 + 各子视频走 movie 滤镜真实合成。
+
+        ⚠️ 菜单入口已收敛（2026-09-21）：不再有独立菜单项。外部播放器路线由
+        `_live_preview_player`（右键「实时预览（复杂滤镜）」）分派，内置引擎路线由
+        `_live_preview_pipe`（右键「实时预览（简易时间引擎）」）分派。
         所有子视频渲染滤镜与正式命令一致（截取/裁剪/缩放/绿幕/透明度/旋转/轨迹）；
         mpv 的 lavfi-complex 多输入只能引用主文件流，子视频必须用 movie 滤镜（防卡顿）。
-        子视频最多 15 个（防止复杂图过大卡死），超出在日志提示。"""
+        子视频最多前 N 个（N = 更多设置「预览轨数上限」，默认 15，防止复杂图过大卡死），
+        超出在日志提示（内置时间预览引擎走同一函数体，同样受此上限约束）。
+
+        pipe_engine（2026-09-20 Phase 2，「时间预览引擎」封装页开放）：True 时**不启动
+        mpv/ffplay**，把同一张 PiP 合成图改喂内置时间预览窗口（ffmpeg -filter_complex →
+        rawvideo 管道）→ 保留标记 / 波形 / 逐帧步进 / 循环 / A-V 仲裁。默认 False ⇒
+        mpv / ffplay 两条既有路径行为**完全不变**。
+        子视频时间轴口径（用户拍板，与上面两条路径及正式导出一致）：movie= 子输入不吃
+        命令行 -ss → 各自从自己文件的 0 起、不跟随主视频 seek（正式命令 _add_input_options
+        同样只对主视频加 -ss、子视频只加 -stream_loop -1）。"""
         if not self.pip_enabled.get():
             self._append_info_ui(_("[预览] 实时预览仅画中画模式可用"))
             return
-        if not self.use_mpv.get():
-            messagebox.showinfo(_("提示"), _("实时预览需要 mpv 播放器（lavfi-complex 复杂图）"))
-            return
-        if not self._mpv_ready(log=False):
-            # lavfi-complex 复杂图 ffplay 无法播放（无 -filter_complex）→ 不回退，
-            # 明确提示修复 mpv 路径或用快照预览（避免 WinError 2 报错）
-            messagebox.showwarning(
-                _("提示"),
-                _("mpv 不可用（{0} 无法启动），\n实时预览依赖 mpv 的 lavfi-complex 复杂图能力，无法回退 ffplay。\n请检查 mpv 路径是否正确，或使用「快照」预览查看合成效果。").format(self.mpv_path.get().strip() or '未设置'))
-            return
+        # mpv 优先；mpv 不可用时（本机常未安装）改走 ffplay -vf：研究 ffplay-preview 实证
+        # ffplay 的 -vf 即完整 filtergraph，支持 movie 多子视频合成，无需 mpv 的 lavfi-complex。
+        mpv_ok = bool(self.use_mpv.get()) and self._mpv_ready(log=False)
+        if not mpv_ok:
+            self._append_info_ui(
+                _("[预览] mpv 不可用，画中画实时预览改走 ffplay -vf（movie 多子视频合成，"
+                "无需 mpv；如想用 mpv 请检查 mpv 路径）"))
         if not self.ffmpeg_cmd:
             self._append_info_ui(_("[预览] 未找到 ffmpeg，无法生成实时预览"))
             return
@@ -38508,14 +44484,83 @@ class FFmpegBatchGUI:
         _sv_max = max(1, min(30, self.sub_video_preview_max.get()))
         if len(sub_videos) > _sv_max:
             self._append_info_ui(
-                f"[预览] 子视频数量 {len(sub_videos)} 超过 {_sv_max} 个，实时预览仅支持前 {_sv_max} 个")
+                _('[预览] 子视频数量 {0} 超过 {1} 个，实时预览仅支持前 {2} 个').format(len(sub_videos), _sv_max, _sv_max))
             sub_videos = sub_videos[:_sv_max]
         main_file = normalize_path(main_video.file_path)
+
+        # ---- 混音/替换子声预收集：子声走 amovie= 源（本 ffmpeg 版本
+        # movie 只有视频输出），建层前就要定好哪些子视频挂音频。派发口径与正式命令
+        # _build_pip_audio 一致：按音频轨遍历、audio_mode 读对应视频轨设置；
+        # 没有音频轨条目的子视频与导出一致不混。
+        # 2026-09-25 放开 pipe_engine 门控：管道视频图会整体删除音频段
+        # （_retarget_lavfi_labels drop_amovie 全覆盖 [asub/asw/amain_pv/amovie=/aid1/ao]），
+        # 混音段进图对视频侧零影响；而管道 out_mode 的合成音频下传
+        # （_lavfi_mix_audio_standalone）必须要图里有混音段可抽——原门控导致管道时间预览
+        # 的波形/出声只有主视频（用户实测 123412：12s 转场后子声全无）。
+        _pv_audio_plan = {}   # 子视频序号 -> 音频轨
+        _pv_audio_src = {}    # 已建 amovie 节点的子视频序号（建层时回填）
+        _main_path_n = normalize_path(main_file)
+        for _at in [t for t in enabled_tracks if t.type == "audio"]:
+            if normalize_path(_at.file_path) == _main_path_n:
+                continue
+            if self._pip_audio_mode(self._pip_sub_video_enc(enabled_tracks, _at)) not in ("mix", "replace"):
+                continue
+            for _kx, _svx in enumerate(sub_videos):
+                if normalize_path(_svx.file_path) == normalize_path(_at.file_path):
+                    _pv_audio_plan.setdefault(_kx, _at)
+                    break
+        # 文件探不到音轨 → amovie 会整图报错，剔除（与「子视频无音轨降级忽略」同口径）
+        for _kx in list(_pv_audio_plan.keys()):
+            _hasx = False
+            try:
+                _infox = self._get_cached_stream_info(normalize_path(sub_videos[_kx].file_path))
+                _hasx = any(x.get("codec_type") == "audio" for x in (_infox or {}).get("streams", []))
+            except Exception:
+                _hasx = False
+            if not _hasx:
+                _pv_audio_plan.pop(_kx)
 
         parts = []
         # ---- 主视频（[vid1]）：支持截取（trim），与正式命令 precise_trim 语义一致 ----
         _ms = dict(main_video.enc_settings)
         _ms["hw_filter_mode"] = "cpu"
+        # 主视频时长（enable 上限，防 movie 音频截断）——提前探测：截取只设起点时，管道分支
+        # 要用它当「素材尾」推相对终点（见下），故必须早于 trim 前缀构建。
+        _main_dur = None
+        try:
+            # 帧对齐：与导出端 _pip_main_duration 同口径（floor 到源帧格）
+            _main_dur = self._get_media_duration(
+                main_file, frame_align_fps=self._get_video_framerate(main_file))
+        except Exception:
+            _main_dur = None
+        # ---- 转场链规划（提前到主 trim 前缀之前）：pipe_engine 有链时走 out_mode
+        # （路线A，research/pipe-pip-chain），其主 trim 前缀必须烘焙绝对 start/end
+        # 而非「相对终点」，故 _pv_out_mode 判定必须先于 trim 前缀构建。
+        _chain_member_lbl = {}
+        _pip_chains, _chain_of = [], {}
+        _pv_main_chain_raw = None
+        # 时间轴总量提前探测（out_mode 判定要用）：_pv_main_eff/_pv_total 原在下方
+        # tpad 段计算，现提前——硬切无链但接龙/循环延长时也要能进 out_mode。
+        _pv_main_eff = self._pip_main_effective_duration(main_video)
+        try:
+            _pv_total = self._pip_timeline_extent(
+                _pv_main_eff, [(sv.file_path, sv.enc_settings) for sv in sub_videos])
+        except Exception:
+            _pv_total = None
+        _pv_ext = bool(_pv_total and _pv_total > 0 and _pv_main_eff
+                       and _pv_total > _pv_main_eff + 1e-6)
+        try:
+            _pip_chains, _chain_of, _shift_pv = self._pip_transition_chains(
+                [(i, sv.file_path, sv.enc_settings) for i, sv in enumerate(sub_videos)],
+                _ms, main_file, _pv_main_eff)
+        except Exception:
+            _pip_chains, _chain_of = [], {}
+        # pipe_engine 进 out_mode（输出时间轴模式：不 seek 任何输入、拖动走图尾输出侧
+        # trim）的两个条件：①有转场链（链图本身=输出时间轴）；②无链但子素材接龙/循环
+        # 把时间轴延长到主视频之外——桥接模型时间轴只有主视频时长、主 EOF 即整链断
+        # （用户实测 444441 硬切项目「只播放第一个视频」），必须同走 out_mode。
+        _pv_out_mode = bool(pipe_engine and (_pip_chains or _pv_ext))
+
         # 解析主视频截取（起始/结束）→ 起始链 trim 前缀 + 截取后时长
         _main_trim_prefix = ""
         _main_trim_dur = None
@@ -38523,17 +44568,42 @@ class FFmpegBatchGUI:
         _te = str(_ms.get("trim_end", "") or "").strip()
         _ssec = time_to_seconds(_ts) if _ts else None
         _esec = time_to_seconds(_te) if _te else None
+        # pipe_engine（时间预览引擎管道模式）：截取**起点**交给 pipe_start —— 主输入吃输入级 -ss、
+        # 图内时间轴已由 [0:v]setpts 桥接归零成「0 基 from pipe_start」（见 _launch_video_pipe），
+        # 若再在图内套绝对 trim=start=S 会二次偏移（画面从 2S 处起、越拖越偏），故起点不烘焙。
+        # ⚠️ 但**终点与起点无关、必须继续在图内显式收尾**：overlay 默认 eof_action=repeat ⇒ 主链
+        # 不结束则子视频无限循环、主画面一路播到素材尾（用户实测「子视频循环填满选段、主视频过了
+        # 选段还在放」）。旧实现把起点终点一起跳过 → 整链退化回「源全长」（_main_limit 跟着退化成
+        # 源时长 ⇒ pad 黑画布 / 子视频 enable 窗口全部超长）。成片侧同款药见
+        # build_tail_concat_filtergraph 的「主链强制收尾 trim=0:main_dur」。
+        # 相对终点：图内 t=0 ⇔ 素材 S ⇒ t=(E−S) ⇔ 素材 E（与子链 trim=start/end 同 0 基口径）。
         if _ms.get("trim_enabled", False) and (_ssec is not None or _esec is not None):
             _tp = []
-            if _ssec is not None:
-                _tp.append(f"start={_ssec}")
-            if _esec is not None:
-                _tp.append(f"end={_esec}")
+            if pipe_engine and not _pv_out_mode:
+                # ⚠️ 起点必须**显式写 start=0**（不能省略、也不能只留 end）：图头
+                # `[0:v]setpts=PTS+(pre−pipe_start)/TB` 会带出 2 帧预卷（首帧 PTS=−2帧·负值），
+                # 而 trim 的 start 默认 INT64_MAX=无下界 ⇒ **不会**裁掉负 PTS 帧；于是随后共用的
+                # `setpts=PTS-STARTPTS` 就以这个预卷帧为基准归零 → 整链内容右移 2 帧
+                # （用户实测：主视频比选段起点早 1~2 帧、场景切换残留上一场景的画面）。
+                # 写 start=0 后首帧 PTS 恰为 0（STARTPTS 基准=0、平移量 0），与成片路径的
+                # `trim=start=S:end=E,setpts=PTS-STARTPTS` 逐帧等价（图内 t=0 ⇔ 素材 S）。
+                # 判据：tests/_dbg_pipe_pip_startframe.py（合成 luma 阶梯素材反查输出首帧帧号）。
+                _sel_end = _esec
+                if _sel_end is None and _main_dur:
+                    _sel_end = _main_dur          # 只设起点 → 选段到素材尾
+                if _sel_end is not None and (_sel_end - (_ssec or 0.0)) > 0:
+                    _tp.append("start=0")
+                    _tp.append("end=%s" % _ffsec(_sel_end - (_ssec or 0.0)))
+            else:
+                if _ssec is not None:
+                    _tp.append(f"start={_ssec}")
+                if _esec is not None:
+                    _tp.append(f"end={_esec}")
             if _tp:
                 _main_trim_prefix = f"trim={':'.join(_tp)},setpts=PTS-STARTPTS,"
         # 主视频静态图片：单帧无限循环（loop=-1:size=1）+ setpts 归零；给默认 10s 预览时长
         _main_is_image = self._is_static_image(main_file)
-        _IMAGE_PREVIEW_SEC = 10.0
+        _IMAGE_PREVIEW_SEC = _eff_image_display_duration(_ms)
         if _main_is_image:
             _main_prefix = "loop=loop=-1:size=1:start=0,setpts=PTS-STARTPTS,"
         else:
@@ -38545,6 +44615,44 @@ class FFmpegBatchGUI:
         # 预览与成片唯一差别：预览下游子视频定位用手工 _ctx={"W":_main_w,"H":_main_h}，
         # 故画布生效后必须把 _main_w/_main_h 同步为画布尺寸（否则子视频定位基准错位）。
         _canvas_on = bool(_ms.get("canvas_mode")) and bool(_ms.get("canvas_segments"))
+        # ---- 尺寸基准（帧尺寸）与管道引擎工作分辨率上限 ----
+        # 帧尺寸 = 链内 crop→rotate→scale / pad 画布 / 画布模式之后主视频帧的真实产出，与正式命令
+        # / 可视化编辑器（compute_final_size_with_order）同源。
+        # ⚠️ 绝不能用原始探测尺寸当定位基准，更**不能去掉链内「分辨率」缩放**（主链 base_vf 必须
+        # 保留 include_scale 默认 True）：链内已把画面缩到目标尺寸，下游子视频定位/播放器窗口比例
+        # 若仍按原尺寸算 → 子视频错位、窗口按原尺寸开（用户实测「主视频很大没缩放、只显示一半
+        # （约 2 倍大小、只看到左上 1/4）」，mpv/ffplay/内置管道三条路都在内）。
+        _mdim = self._get_video_dimensions_cached(main_file)
+        _mw0, _mh0 = (_mdim[0] or 1280), (_mdim[1] or 720)
+        _rend_w, _rend_h = self.compute_final_size_with_order(_mw0, _mh0, _ms)
+        _pg1 = _pad_canvas_geometry(_ms)
+        if _canvas_on:
+            _frame_w, _frame_h = _mw0, _mh0        # 画布帧 = 原始尺寸（内容缩放由画布段按 _ms 自算）
+        elif _pg1:
+            _frame_w, _frame_h = _pg1[0], _pg1[1]  # pad 画布帧 = pad 尺寸
+        else:
+            _frame_w, _frame_h = _rend_w, _rend_h
+        _main_w, _main_h = _frame_w, _frame_h
+        # 工作分辨率上限（2026-09-21）：4K+ 主视频在 CPU 滤镜图上跑全分辨率 overlay 极吃力（mpv 走
+        # GPU 不显；实测 4K 缩放后 hqdn3d/unsharp 5.2x、nlmeans 15.9x 提速，见 _PIPE_WORK_MAX_W）。
+        # 做法：帧尺寸整体乘 f = 上限/帧宽，并**改写链内分辨率**为降采样尺寸（精确模式）→ 图里真实
+        # 产出就是降采样尺寸，下游 _main_w/_main_h、子尺寸、pad 画布同步乘 f → 布局逐像素一致、仅
+        # 像素变少（图计算量按 f² 下降）。**不能改成在图首另插一个 scale**：链内自带用户「分辨率」
+        # scale，插在图首会被它整段顶回去。f=1 时完全不改设置。
+        _pwf = 1.0
+        # 画布模式（canvas_mode）不降采样（2026-09-21）：画布段由 build_canvas_filtergraph 按
+        # canvas_segments 的**绝对像素**生成，输出尺寸无法跟着 f 缩 → 只缩内容基准会让画布与
+        # 内容互相错位（用户实测同款「主视频和子视频中间很大空隙」，且随原始尺寸变大）。
+        # 保持 f=1 即与 mpv/ffplay 逐像素一致。
+        if (not _canvas_on) and pipe_engine and _frame_w > _PIPE_WORK_MAX_W and _frame_h > 0:
+            _pwf = _PIPE_WORK_MAX_W / float(_frame_w)
+            _frame_w, _frame_h = (max(2, int(_frame_w * _pwf) // 2 * 2),
+                                  max(2, int(_frame_h * _pwf) // 2 * 2))
+            _main_w, _main_h = _frame_w, _frame_h
+            _ms["scale_enabled"] = True
+            _ms["scale_method"] = "exact"
+            _ms["scale_width"] = str(max(2, int(_rend_w * _pwf) // 2 * 2))
+            _ms["scale_height"] = str(max(2, int(_rend_h * _pwf) // 2 * 2))
         _ms_cv = dict(_ms)
         if _canvas_on:
             _ms_cv["crop_enabled"] = False
@@ -38555,15 +44663,29 @@ class FFmpegBatchGUI:
             enhance_settings=_ms.get("enhance", {}), reverse=False,
         )
         cur = "[vid1]"
-        if base_vf and base_vf != "null":
-            parts.append(f"[vid1]{_main_prefix}{base_vf}[v0]")
+        _first_vf = base_vf if (base_vf and base_vf != "null") else "format=yuv420p"
+        if _main_is_image:
+            # 图片主视频帧率修复（2026-09-21，用户实测 mpv「一跳一跳」）：mpv 对静态图片
+            # 输入流的帧率=1fps（编码探针实锤：loop 循环限 5 帧只出 PTS=0/1 两帧、间隔 1s），
+            # 直接 loop 它当主时间轴 → overlay 输出帧率跟随主输入 ≈1fps；ffplay image2
+            # 默认 25fps 所以同图不卡；转换页不卡是因 wrap 前置了 color r=30 连续基源。
+            # 修复=同款口径：前置 color 基源(r=30 d=显示时长)驱动主时间轴，图片降为被保持
+            # 次输入 → 输出 30fps（编码探针：同图 90 帧/2.97s）。[vid1] 段保留 loop 前缀：
+            # ffplay -autoexit 盯主输入 EOF（图片 1 帧即退窗）必须续命；mpv 下次输入无限流
+            # 无副作用（overlay repeatlast 保持）。基源尺寸=首节点帧尺寸 _frame_w/_frame_h
+            # （画布模式=原始尺寸、管道 f 降采样=缩放后尺寸，与 [cd_v0] 实际输出逐像素一致）。
+            # 三处 color 基源包裹（转换页 mpv / 本处 / 串行合并图片轨）统一走同一份实现；
+            # 返回串按 ";" 恰好切成 3 段（基源 / 图片次输入 / overlay），直接落到 parts。
+            _img_segs = wrap_image_static_timed_complex(
+                f"[vid1]{_main_prefix}{_first_vf}[v0]", _first_vf,
+                _frame_w, _frame_h, _IMAGE_PREVIEW_SEC,
+                vin="[vid1]", prefix=_main_prefix).split(";")
+            parts.insert(0, _img_segs[0])
+            parts.extend(_img_segs[1:])
             cur = "[v0]"
         else:
-            parts.append(f"[vid1]{_main_prefix}format=yuv420p[v0]")
+            parts.append(f"[vid1]{_main_prefix}{_first_vf}[v0]")
             cur = "[v0]"
-        _mdim = self._get_video_dimensions_cached(main_file)
-        _main_w = _mdim[0] or 1280
-        _main_h = _mdim[1] or 720
         # 主视频画布段（第 1 段）：内容贴到不透明黑画布 → 独立数据流（与子视频画布同结构）
         if _canvas_on:
             try:
@@ -38592,17 +44714,11 @@ class FFmpegBatchGUI:
                     cur = "[v_main_canvas_s]"
                 _main_w, _main_h = _mbbw, _mbbh
                 self._append_info_ui(
-                    f"[预览] 主视频画布模式已启用：内容基准 {_mdim[0] or 1280}x{_mdim[1] or 720}，"
-                    f"画布 {_main_w}x{_main_h}")
+                    _('[预览] 主视频画布模式已启用：内容基准 {0}x{1}，画布 {2}x{3}').format(_mdim[0] or 1280, _mdim[1] or 720, _main_w, _main_h))
             else:
                 self._append_info_ui(_("[预览] 主视频画布模式生成失败，已按普通主视频处理"))
-        # 主视频时长（enable 上限，防 movie 音频截断）
-        _main_dur = None
-        try:
-            _main_dur = self._get_media_duration(main_file)
-        except Exception:
-            _main_dur = None
         # 主视频有效结束时长（结尾强制收尾 trim 用）：截取后时长优先，图片给默认 10s
+        # （_main_dur 已在主视频截取解析前探测，见上）
         if _main_trim_prefix:
             if _esec is not None and _ssec is not None and _esec > _ssec:
                 _main_trim_dur = _esec - _ssec
@@ -38614,10 +44730,32 @@ class FFmpegBatchGUI:
             _IMAGE_PREVIEW_SEC if _main_is_image else None)
         # 统一时长上限：结束时长优先（pad 画布 duration / 子视频 enable 都按它）
         _main_limit = _main_end_dur if (_main_end_dur and _main_end_dur > 0) else _main_dur
+        # 图片主视频：循环由图内 `loop=loop=-1` 滤镜承担（_main_prefix 已注入，ffplay 实测可持续
+        # 出帧），末端 trim=0:N（N=图片显示时长 _IMAGE_PREVIEW_SEC）负责在 N 秒后收尾 → -autoexit
+        # 等到【输出】结束自动关闭（不再依赖无效的 -loop 1，后者在 ffplay 下图片不循环、实测 1 秒消失）。
+        # 故此处保留 _main_end_dur=显示时长（不置 0）：画布 color 源 / 子视频 enable / 末端 trim / -t
+        # 全部按显示时长收敛，ffplay 窗口在 N 秒后正常关闭。
         # ---- 主视频画布偏移（pad）----
         _pg = _pad_canvas_geometry(_ms)
         if _pg:
             _pwc, _phc, _ox, _oy = _pg
+            # 工作分辨率上限（2026-09-21）：pad 画布宽/高/偏移是设置里的绝对像素，主视频帧已
+            # 按 f 缩放 → 这里必须把同一因子乘上去，否则 pad 比缩小后的主视频大、子叠加基准
+            # 错位。f=1 时不缩放（与旧行为一致）。
+            # ⚠️ 宽高必须与 _frame_w/_frame_h 同口径（向下取偶）：用 round 会得到奇数尺寸
+            # （如 2200×f → 939），yuv420p 奇数高在 rawvideo 管道里会错位，且与 `_main_w/_main_h`
+            # 差 1 px → 预览框比例与画布不一致。
+            if _pwf < 1.0:
+                _pwc = max(2, int(_pwc * _pwf) // 2 * 2)
+                _phc = max(2, int(_phc * _pwf) // 2 * 2)
+                try:
+                    _ox = "%g" % (float(_ox) * _pwf)
+                except (ValueError, TypeError):
+                    pass
+                try:
+                    _oy = "%g" % (float(_oy) * _pwf)
+                except (ValueError, TypeError):
+                    pass
             # 画布必须限制时长：color 默认无限源，主视频播完后会只剩黑画布继续输出
             # （movie 子视频 loop=0 已播完消失）。有主视频时长 → color:duration=主视频时长，
             # 画布与主视频同长一起结束；拿不到时长 → overlay shortest=1（任一输入结束即结束，
@@ -38635,7 +44773,35 @@ class FFmpegBatchGUI:
             # 必须同步为 pad 尺寸——轨迹 clamp / 基准位置求值 ctx / _blend_static_geometry
             # 全用它，否则轨迹被锁死主视频源尺寸、普通叠加基准位置也错位。
             _main_w, _main_h = _pwc, _phc
-            self._append_info_ui(_("[预览] 主视频画布偏移：{0}x{1} @ ({2},{3})").format(_pwc, _phc, _ox, _oy))
+            self._append_info_ui(_('[预览] 主视频画布偏移：{0}x{1} @ ({2},{3})').format(_pwc, _phc, _ox, _oy))
+
+        # ---- 转场链：主视频进链 split + 真时间轴延长（与正式命令
+        # _build_overlay_filter_complex 的「链规划 → 主进链 split → 底 tpad」同序）----
+        # 链规划已提前到 _ms 定义处（pipe_engine 有链 → _pv_out_mode，见上）。
+        # 主视频进链：split 出「未延长」副本给链（链内 trim=主时长正好等于全部内容）。
+        # ⚠️ 让链的 trim 分支与「延长后的底」共享同一中间标签，会让整链在主视频
+        # 结束处提前 EOF —— 正式命令同款坑（_verify_pip_transition S8）。
+        if _pip_chains and any(_ch["members"][0] < 0 for _ch in _pip_chains):
+            parts.append(f"{cur}split=2[v_pv_mbase][v_pv_mchain]")
+            cur = "[v_pv_mbase]"
+            _pv_main_chain_raw = "v_pv_mchain"
+        # 真时间轴：子素材摆到主视频之后 → 底 tpad 补黑帧。overlay 主输入 EOF=整链
+        # EOF，不补的话超出部分静默丢失（用户实测「画面 12 秒就结束、没有持续到 40 秒」）。
+        # _pv_main_eff/_pv_total 已提前到 out_mode 判定处（见上）；桥接模型（非 out_mode
+        # 的 pipe_engine）不延长：tpad/绝对窗口会随 seek 错位，维持原状（零行为变化）。
+        try:
+            self._pip_warn_cut_off_subs(
+                [(sv.file_path, sv.enc_settings) for sv in sub_videos], _pv_total)
+        except Exception:
+            pass
+        if (_pv_total and _pv_total > 0 and _pv_main_eff
+                and _pv_total > _pv_main_eff + 1e-6
+                and ((not pipe_engine) or _pv_out_mode)):
+            parts.append(
+                f"{cur}tpad=stop_mode=add:stop_duration={_pv_total - _pv_main_eff:.6f}[v_main_ext_pv]")
+            cur = "[v_main_ext_pv]"
+            self._append_info_ui(
+                _('[预览] 子素材显示时段超出主视频时长（{0:.3f}s），已延长预览时间轴到 {1:.3f}s（尾部补黑帧）').format(_pv_main_eff, _pv_total))
 
         # ---- 多 blend 子视频区域隔离（需求3）：主视频 split 出原始帧副本 ----
         # 非 normal blend 子视频 ≥2 个时，blend 主区域从主视频【原始帧】副本取
@@ -38655,10 +44821,22 @@ class FFmpegBatchGUI:
             cur = "[cur]"  # 运行主干 = split 第一个输出（与正式命令 current_v=v_main_base 一致）
         _bj = 0
 
-        # ---- 子视频：movie 滤镜路线（最多 4 个）----
-        for _k, _sv in enumerate(sub_videos):
+        # ---- 子视频图层构建（闭包，与正式命令 _build_sub_layer_node 同源镜像）----
+        # 只建层不叠加（cur 不动）；叠加/blend 留在下方主循环。win_override 给链成员传
+        # (0, 段长)——链内不位移 + 精确限长（与正式命令 win_override 同语义）。
+        def _pv_build_layer(_k, _sv, win_override=None):
             _s = _sv.enc_settings
             _sfile = _sv.file_path
+            # ⚠️ 与正式命令 _build_overlay_filter_complex（L26707）同口径：未启用叠加的子视频
+            # 预览里也不显示（2026-09-24 修正）。此前本循环**完全不读**这个开关 → 出现
+            # 「预览里三个图都叠上了、成片却只剩主图」的假象（用户实测：全图片工程，正式命令
+            # 里子图走进 L26882 的 else → [v_temp_N]nullsink）。预览必须与成片同源，否则
+            # 用户无从判断到底是设置问题还是渲染问题。
+            if not _s.get('overlay_enabled', True):
+                self._append_info_ui(
+                    _("[预览] 子视频 {0} 未勾选「启用叠加」：预览与成片都不显示它"
+                      "（如需显示，请到该轨道的「视频轨道设置」里勾选「启用叠加」）").format(_k + 1))
+                return None
             try:
                 _ow, _oh = get_video_rotated_dimensions(self.ffprobe_cmd, _sfile, _s)
                 if _ow is None or _oh is None:
@@ -38673,6 +44851,16 @@ class FFmpegBatchGUI:
             _sub_cv_on = self._sub_canvas_on(_s)
             if _sub_cv_on:
                 _rw, _rh = self._overlay_content_size(_sfile, _s)
+            # 工作分辨率降采样（2026-09-21）：子尺寸同步乘 f，保持子占画布比例不变
+            # （仅 f<1 触发；f=1 不缩放，与旧行为一致）。
+            if _pwf < 1.0:
+                _rw = max(2, int(round(_rw * _pwf)))
+                _rh = max(2, int(round(_rh * _pwf)))
+            # 绝对像素坐标同步换算（2026-09-21）：简易位置写死的数字 / 列表轨迹航点 / 四角边距是
+            # 「原始画面空间」的量，帧已乘 f → 不换算会让子视频在缩小后的画布里相对更靠右下
+            # （用户实测「主视频和子视频中间很大空隙」，只有管道预览有；f=上限/原始宽 → 原始越大
+            # 空隙越大）。换算见 _pipe_scale_pos_settings（与转换页水印/文字水印同一实现）。
+            _s_pos = _pipe_scale_pos_settings(_s, _pwf)
             _path_esc = self._movie_path_safe(_sfile, _k).replace("\\", "/").replace(":", "\\\\:")
             # 子视频滤镜链：复用主滤镜构建函数（字幕/像素格式等 mpv 预览不支持的排除），
             # trim/loop/裁剪/缩放/绿幕/颜色校正/反色/变速 全在 chain 内（movie 层只载入，chain 统一循环）；
@@ -38685,17 +44873,25 @@ class FFmpegBatchGUI:
             # ⚠️ _s_dur 必须先于 _resolve_display_window 绑定（原本只在 overlay 分支内定义，
             # 首个子视频在此引用会 UnboundLocalError，与正式命令同根因）。
             try:
-                _s_dur = self._get_media_duration(_sfile)
+                # 帧对齐（floor）：与正式命令 _build_sub_layer_node 同口径
+                _s_dur = self._get_media_duration(
+                    _sfile, frame_align_fps=self._get_video_framerate(_sfile))
             except Exception:
                 _s_dur = None
             _pwin_start, _pwin_end, _phas_win = self._resolve_display_window(_s, _s_dur, input_path=_sfile)
+            if win_override is not None:
+                # 转场链成员：链内窗口（不位移 + 精确限长），与正式命令 win_override 同语义
+                _pwin_start, _pwin_end, _phas_win = float(win_override[0]), float(win_override[1]), True
             # 有限循环次数：仅覆盖窗口时长（与正式命令一致）。无界窗口不计算。
-            _pwin_loop = 1
+            # loop 参数 = 重复次数（总供给 = N+1 遍）→ N = ceil - 1；0 = 不加 loop（防回放泄漏闪首帧）
+            _pwin_loop = 0
             if _phas_win and _loop_size and _pwin_end is not None:
                 _pfps = self._get_video_framerate(_sfile)
                 if _pfps:
                     _pwin_frames = max(1, int(round((_pwin_end - _pwin_start) * _pfps)))
-                    _pwin_loop = max(1, -(-_pwin_frames // int(_loop_size)))
+                    _pwin_loop = -(-_pwin_frames // int(_loop_size)) - 1
+                    if _pwin_loop < 0:
+                        _pwin_loop = 0
             _ft_speed_on = bool(self.preview_filter_speed.get())
             # 画布模式：裁剪/旋转/缩放交给画布段 → 前置链三者全关（缩放挪到画布之后，防缩两次）
             _sb_settings = dict(_s, hw_filter_mode="cpu", precise_trim=True)
@@ -38735,19 +44931,31 @@ class FFmpegBatchGUI:
             _wp_rotP = False
             if _mv == "waypoints":
                 _ts0, _sp0 = _trim_speed_from_settings(_ms)
-                _wpP = build_waypoint_expr(_s.get("move_waypoints"),
+                _wpP = build_waypoint_expr(_s_pos.get("move_waypoints"),
                                            sw=str(_rw), sh=str(_rh), spin_speed=_spd,
                                            trim_start=_ts0, speed_factor=_sp0)
                 _wp_rotP = (_wpP is not None and _wpP[2] is not None)
-            if _alpha or (_spin and _spd != 0) or _rad != 0 or _wp_rotP:
+            if _alpha or (_spin and _spd != 0) or _rad != 0 or _wp_rotP or \
+               (_wpP is not None and _wpP[4] is not None):
                 _sp.append("format=rgba")
             if _alpha:
                 try:
                     _av = float(_s.get("alpha_value", 1.0))
                 except (ValueError, TypeError):
                     _av = 1.0
-                if 0.0 <= _av <= 1.0:
+                # 静态透明度：轨迹透明度存在时跳过——由下方 geq 一并折入。
+                if 0.0 <= _av <= 1.0 and not (_wpP is not None and _wpP[4] is not None):
                     _sp.append(f"colorchannelmixer=aa={_av:.2f}")
+            # 轨迹透明度（oa→ob 段内线性插值 0~1 倍率）：与静态 alpha_value 串联合成（相乘）。
+            # 全 1.0 时 _wpP[4] 为 None 跳过 → 与无任何透明度的老工程行为一致。
+            # ⚠️ colorchannelmixer=aa 在本构建为 init 模式（拒绝 t/max 时变表达式），改用 geq 承载：
+            #    时间戳变量为 T（独立 t 用 re.sub 换 T），上游已挂 format=rgba，静态 _av 折入 a='(_av*255)*(traj_T)'。
+            #    geq 表达式取 0~255 平面值（非 0~1），alpha 须 ×255 缩放（见子视频处说明）。
+            #    已知限制：geq 读不到输入 alpha，不乘源素材自带 alpha（见子视频处说明）。
+            if _wpP is not None and _wpP[4] is not None:
+                _traj_TP = re.sub(r'\bt\b', 'T', _wpP[4])
+                _saP = _av if (_alpha and 0.0 <= _av <= 1.0) else 1.0
+                _sp.append(f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{_saP*255:.0f}*({_traj_TP})'")
             if overlay_rotation_active(_s, wp_rot=_wp_rotP):
                 _angle_exprd = ""
                 if _rad != 0:
@@ -38771,8 +44979,15 @@ class FFmpegBatchGUI:
                     f"scale=w='max(2,2*round(iw*({_wpP[3]})/2))'"
                     f":h='max(2,2*round(ih*({_wpP[3]})/2))':eval=frame,setsar=1")
             _sub_chain = ",".join(_sp) if _sp else "null"
-            # movie 层只载入（无 loop 参数=默认播一次）；循环统一由 chain 的 loop_size 处理
-            parts.append(f"movie={_path_esc}[sub{_k}]")
+            # movie 层只载入（无 loop 参数=默认播一次）；循环统一由 chain 的 loop_size 处理。
+            # 混音/替换子视频：另挂 amovie= 源出音频（本 ffmpeg 版本 movie 只有视频输出，
+            # 视频/音频各开一路；两条路径解码同一文件、pts 同源 0 基，天然对齐）
+            if _k in _pv_audio_plan:
+                parts.append(f"movie={_path_esc}[sub{_k}]")
+                parts.append(f"amovie={_path_esc}[asub{_k}]")
+                _pv_audio_src[_k] = True
+            else:
+                parts.append(f"movie={_path_esc}[sub{_k}]")
             if _sub_cv_on:
                 # 第 1 段：前置链 → 透明画布合成 → 独立数据流；
                 # 第 2 段：当独立文件自由缩放。最终一律落回 [subr{k}]，下游零改动。
@@ -38792,10 +45007,136 @@ class FFmpegBatchGUI:
                     parts.append(f"{_cur_lbl}null[subr{_k}]")
             else:
                 parts.append(f"[sub{_k}]{_sub_chain}[subr{_k}]")
+            return {
+                "label": f"subr{_k}", "s": _s, "sfile": _sfile,
+                "rw": _rw, "rh": _rh, "s_pos": _s_pos,
+                "wpP": _wpP, "wp_rotP": _wp_rotP, "wp_zoomP": _wp_zoomP,
+                "spin": _spin, "spd": _spd, "rad": _rad,
+            }
+
+        # ---- 转场链：预构建成员图层 + 画布烙印 + xfade 合成（仅外部播放器路线）----
+        # 与正式命令 _build_overlay_filter_complex 阶段 A/A2 同源（链规划已在上方完成，
+        # 主视频进链的 split 与底 tpad 也已按正式命令同序处理，主视频参与链不再降级）；
+        # 主循环在**链首成员的栈位**把整链一次叠入（栈序=列表序，与正式命令阶段 B 一致）。
+        if _pip_chains:
+            _pv_main_fps = self._get_video_framerate(main_file) or 30.0
+            _drop_ci = set()
+            for _ci, _ch in enumerate(_pip_chains):
+                # 预览口径：链尺寸/帧率对齐本图的底（_main_w/_main_h 已含 pad/画布处理）
+                _ch["size"] = (_main_w, _main_h)
+                _ch["fps"] = _pv_main_fps
+                _mem_bm = _ch["members"]
+                _ok_chain = True
+                if _mem_bm[0] < 0:
+                    # 主视频成员：图层 = split 出的「未延长」副本 + 归一（与正式命令
+                    # 阶段 A2 同口径：setpts 归零 → trim=主时长 → fps/SAR/yuva420p）。
+                    # xfade 期间子段透明画布与主画面混色 → 转场主画面参与混合。
+                    _len0 = float(_ch["lens"][-1])
+                    parts.append(
+                        f"[{_pv_main_chain_raw}]setpts=PTS-STARTPTS,"
+                        f"trim=0:{_len0:.6g},fps={_pv_main_fps:.6g},"
+                        f"setsar=1,format=yuva420p[pmx{_ci}]")
+                    _chain_member_lbl[-1] = f"pmx{_ci}"
+                for _m in _mem_bm:
+                    if _m < 0:
+                        continue
+                    _Lm = _pv_build_layer(_m, sub_videos[_m],
+                                          win_override=(0.0, _ch["lens"][_m]))
+                    if _Lm is None:
+                        _ok_chain = False
+                        break
+                    _len_m = float(_ch["lens"][_m])
+                    _x_cv, _y_cv = self._pip_overlay_xy(
+                        _Lm["sfile"], _Lm["s"], _Lm["wpP"], _Lm["wp_rotP"],
+                        _Lm["spin"], _Lm["rad"], _Lm["wp_zoomP"])
+                    # 画布烙印（与正式命令 _build_sub_layer_node canvas= 逐字同口径）
+                    parts.append(
+                        f"color=c=black@0:s={int(_main_w)}x{int(_main_h)}"
+                        f":r={_pv_main_fps:.6g}:d={_len_m:.6g}[cbase{_m}]")
+                    parts.append(
+                        f"[cbase{_m}][{_Lm['label']}]overlay=x='{_x_cv}':y='{_y_cv}':shortest=1[vc{_m}]")
+                    # ⚠️ shortest=1 必须有：预览链成员不像正式命令那样有 win_override 终点
+                    # 限长，子 movie 比 画布 d 多出的悬摆帧会喂进 xfade 链 ⇒ 下级 xfade
+                    # blend 终点与本级 EOF 交界死锁 + 内存爆炸（2026-09-26，正式命令同款
+                    # 注释见 _build_sub_layer_node canvas= 分支）。
+                    # 转场链归一：统一帧率/SAR/像素格式（限长已由窗口 override 完成）
+                    parts.append(
+                        f"[vc{_m}]fps={_pv_main_fps:.6g},setsar=1,format=yuva420p[subx{_m}]")
+                    _chain_member_lbl[_m] = f"subx{_m}"
+                if not _ok_chain:
+                    # 成员建层失败 → 整链降级，成员回到普通叠加
+                    for _m in _mem_bm:
+                        if _m >= 0:
+                            _chain_member_lbl.pop(_m, None)
+                    if _mem_bm[0] < 0 and _chain_member_lbl.pop(-1, None) is not None:
+                        # 主视频成员已产出归一段 → 悬空输出必须显式消费（防整图报错）
+                        parts.append(f"[pmx{_ci}]nullsink")
+                    _drop_ci.add(_ci)
+            if _drop_ci:
+                _pip_chains = [_ch for _ci, _ch in enumerate(_pip_chains)
+                               if _ci not in _drop_ci]
+                _chain_of = {}
+                for _ci, _ch in enumerate(_pip_chains):
+                    for _m in _ch["members"]:
+                        _chain_of[_m] = _ci
+        if _pip_chains:
+                # xfade 链合成（与正式命令阶段 A2 逐字同口径：offset=累计输出长−转场时长）
+                for _ci, _ch in enumerate(_pip_chains):
+                    _mem = _ch["members"]
+                    _acc = _chain_member_lbl.get(_mem[0])
+                    if _acc is None:
+                        continue
+                    _acc_len = float(_ch["lens"][_mem[0]])
+                    for _kk in range(1, len(_mem)):
+                        _mi = _mem[_kk]
+                        _mlbl = _chain_member_lbl.get(_mi)
+                        if _mlbl is None:
+                            _acc = None
+                            break
+                        _tt, _dd = _ch["trans"][_kk - 1]
+                        _off = max(0.0, _acc_len - _dd)
+                        _out_lbl = f"p_tc{_ci}_{_kk}"
+                        parts.append(
+                            f"[{_acc}][{_mlbl}]xfade=transition={_tt}"
+                            f":duration={_dd:.6g}:offset={_off:.6g}[{_out_lbl}]")
+                        _acc = _out_lbl
+                        _acc_len = _acc_len + float(_ch["lens"][_mi]) - _dd
+                    if _acc is None:
+                        continue
+                    parts.append(f"[{_acc}]setpts=PTS+{_ch['start']:.6g}/TB[p_tchain{_ci}]")
+                    _ch["plabel"] = f"p_tchain{_ci}"
+                    _ch["penable"] = f"between(t,{_ch['start']:.6g},{_ch['start'] + _acc_len:.6g})"
+                    try:
+                        self._append_info_ui(
+                            _('[预览] 子视频 {0}…{1} 已合成转场链：{2:.2f}s~{3:.2f}s（{4} 段，链内统一 {5}x{6}）').format(_mem[0] + 1, _mem[-1] + 1, _ch['start'], _ch['start'] + _acc_len, len(_mem), _ch['size'][0], _ch['size'][1]))
+                    except Exception:
+                        pass
+
+        # ---- 子视频叠加（栈序=列表序）：链在首成员位置整链叠入 ----
+        for _k, _sv in enumerate(sub_videos):
+            if _k in _chain_member_lbl:
+                _ci = _chain_of[_k]
+                _ch = _pip_chains[_ci]
+                # 链首为主视频(-1)时，由链内第一个真实成员代表整条链做叠加（与正式命令阶段 B 一致）
+                _m0 = _ch["members"][0]
+                _first_real = _m0 if _m0 >= 0 else _ch["members"][1]
+                if _k == _first_real and _ch.get("plabel"):
+                    parts.append(
+                        f"{cur}[{_ch['plabel']}]overlay=x='0':y='0':"
+                        f"enable='{_ch['penable']}':eof_action=pass[v_pchain{_ci}]")
+                    cur = f"[v_pchain{_ci}]"
+                continue
+            _L = _pv_build_layer(_k, _sv)
+            if _L is None:
+                continue
+            _s, _sfile = _L["s"], _L["sfile"]
+            _rw, _rh = _L["rw"], _L["rh"]
+            _s_pos = _L["s_pos"]
+            _wpP, _wp_rotP, _wp_zoomP = _L["wpP"], _L["wp_rotP"], _L["wp_zoomP"]
             # 位置：move 轨迹或数值化基准
             _mv = (_s.get("move_mode", "") or "").strip()
-            _x_raw = str(_s.get("overlay_x", "W-w-10") or "W-w-10")
-            _y_raw = str(_s.get("overlay_y", "H-h-10") or "H-h-10")
+            _x_raw = str(_s_pos.get("overlay_x", DEFAULT_OVERLAY_X) or DEFAULT_OVERLAY_X)
+            _y_raw = str(_s_pos.get("overlay_y", DEFAULT_OVERLAY_Y) or DEFAULT_OVERLAY_Y)
             # 定位语义（2026-08-25 理顺）：overlay_x/y 的 w/h = 内容盒（_rw/_rh）；旋转时
             # 叠加盒 d×d 中心与内容盒中心对齐 → 位置减 (d-w)/2（与正式命令/转换页预览一致）。
             _rot_pv = overlay_rotation_active(_s, wp_rot=_wp_rotP)
@@ -38827,7 +45168,7 @@ class FFmpegBatchGUI:
                 _mx, _my = build_move_xy_expr(
                     _mv, _content_box_expr(_x_raw, _rw, _rh),
                     _content_box_expr(_y_raw, _rw, _rh),
-                    _s, sw=str(_rw), sh=str(_rh))
+                    _s_pos, sw=str(_rw), sh=str(_rh))
                 if _mx is not None:
                     # 预览 overlay 约定用 main_w/main_h（ffmpeg overlay 合法变量，与正式命令 W/H 等价）
                     _x = _mx.replace("W", "main_w").replace("H", "main_h")
@@ -38847,12 +45188,16 @@ class FFmpegBatchGUI:
             # enable：显示时段/循环控制（起始/结束/周期/单次）优先，同正式命令 _calc_enable_expr；
             # 未设显示控制时用主视频时长上限 + eof_action=pass（防 movie 音频截断），拿不到才 shortest 兜底
             try:
-                _s_dur = self._get_media_duration(_sfile)
+                # 帧对齐（floor）：enable 窗口与图层供帧同源（与正式命令一致）
+                _s_dur = self._get_media_duration(
+                    _sfile, frame_align_fps=self._get_video_framerate(_sfile))
             except Exception:
                 _s_dur = None
             _ov_expr = self._calc_enable_expr(_s, _s_dur)
             if _ov_expr == "1" and _main_limit and _main_limit > 0:
-                _ov_expr = f"lt(t,{_ffsec(_main_limit)})"
+                # 真时间轴延长后，无界子视频要显示到时间轴总长（不再是主视频时长）
+                _ov_limit = _pv_total if (((not pipe_engine) or _pv_out_mode) and _pv_total and _pv_total > 0) else _main_limit
+                _ov_expr = f"lt(t,{_ffsec(_ov_limit)})"
             # blend 混合模式（区域隔离 + RGBA 剥离，与正式命令 _build_overlay_filter_complex 共用 _make_blend_region）
             _blend_mode = (str(_s.get('blend_mode', 'normal') or 'normal')).strip().lower()
             if _blend_mode != 'normal':
@@ -38861,15 +45206,13 @@ class FFmpegBatchGUI:
                 _dgp = self._blend_downgrade_pad(_ms, main_file)
                 if _dgp:
                     self._append_info_ui(
-                        _("[混合模式] pad 画布 {0}x{1} 大于主视频渲染尺寸，"
-                        "blend({2}) 已降级为普通叠加（脱离主视频像素的混合无意义）").format(_dgp[0], _dgp[1], _blend_mode))
+                        _('[混合模式] pad 画布 {0}x{1} 大于主视频渲染尺寸，blend({2}) 已降级为普通叠加（脱离主视频像素的混合无意义）').format(_dgp[0], _dgp[1], _blend_mode))
                     _blend_mode = 'normal'
             if _blend_mode != 'normal' and _wp_zoomP:
                 # 冲突点标注（融合铁律）：blend 区域按**静态**尺寸计算，逐帧缩放时无法跟随
                 # → 预览与正式命令一致降级普通叠加，避免预览/输出不一致。
                 self._append_info_ui(
-                    f"[混合模式] 列表轨迹缩放与 blend({_blend_mode}) 暂不兼容"
-                    f"（blend 区域按静态尺寸计算，无法跟随逐帧缩放），已降级为普通叠加")
+                    _('[混合模式] 列表轨迹缩放与 blend({0}) 暂不兼容（blend 区域按静态尺寸计算，无法跟随逐帧缩放），已降级为普通叠加').format(_blend_mode))
                 _blend_mode = 'normal'
             if _blend_mode != 'normal':
                 # 自旋转/静态角度时子视频链输出为 hypot 正方形画布 → blend 区域必须用对角线
@@ -38896,11 +45239,11 @@ class FFmpegBatchGUI:
                         _bh = 2
                     # 定位语义：轨迹范围/基准按内容盒（x0/y0 的 w/h 内容盒化，sw/sh=内容盒），
                     # 区域位置 = 内容盒位置 - 中心对齐偏移，再 clamp 到画布内（crop 不越界）
-                    _ms3 = dict(_s)
+                    _ms3 = dict(_s_pos)
                     _ms3["overlay_x"] = _content_box_expr(
-                        _ms3.get("overlay_x", "W-w-10"), _rw, _rh)
+                        _ms3.get("overlay_x", DEFAULT_OVERLAY_X), _rw, _rh)
                     _ms3["overlay_y"] = _content_box_expr(
-                        _ms3.get("overlay_y", "H-h-10"), _rw, _rh)
+                        _ms3.get("overlay_y", DEFAULT_OVERLAY_Y), _rw, _rh)
                     _dx, _dy = _blend_move_exprs(_mv, _ms3, _rw, _rh)
                     if _dx is not None:
                         _offP2, _offP3 = _content_box_shift(_rw, _rh, _bw, _bh)
@@ -38926,7 +45269,7 @@ class FFmpegBatchGUI:
                     else:
                         # mode 未知（理论不发生）→ 兜底静态基准位置 blend
                         self._append_info_ui(
-                            _("[预览] 子视频 {0} 混合模式+轨迹控制：轨迹模式不支持，已按基准位置 blend").format(_k+1))
+                            _('[预览] 子视频 {0} 混合模式+轨迹控制：轨迹模式不支持，已按基准位置 blend').format(_k + 1))
                         _bbx, _bby, _bbw, _bbh, _bsx, _bsy = self._blend_static_geometry(
                             int(_bxv - _offPx), int(_byv - _offPy), _bw_src, _bh_src, _main_w, _main_h)
                         if _bbw >= 2 and _bbh >= 2:
@@ -38971,8 +45314,8 @@ class FFmpegBatchGUI:
                     parts.append(f"{cur}[subr{_k}]overlay=x='{_x}':y='{_y}':enable='1':shortest=1[v_sub{_k}]")
                 cur = f"[v_sub{_k}]"
 
-        # ---- 注入到封装页的文字水印（普通/复杂，与正式命令 _build_pip_cmd 一致）----
-        # 实时预览不经过 merge_build_cmd_list 的注入，这里按同一开关逻辑补一次
+        # ---- 封装页独立文字水印（self._merge_tw，与正式命令 _build_pip_cmd 一致）----
+        # 实时预览不经过 merge_build_cmd_list，这里补写一次主轨 enc_settings 再取片段
         self._apply_merge_text_watermark([main_video])
         _tw_pip = main_video.enc_settings.get("text_watermark", {})
         _tw_frag = build_text_watermark_chain(main_video.enc_settings, main_label=cur, out_label="[v_tw]")
@@ -38981,7 +45324,7 @@ class FFmpegBatchGUI:
             _tw_frag = _tw_frag.replace(":format=auto", ":format=auto:eof_action=pass")
             parts.append(_tw_frag)
             cur = "[v_tw]"
-            self._append_info_ui(_("[预览] 画中画实时预览：已叠加注入的文字水印"))
+            self._append_info_ui(_("[预览] 画中画实时预览：已叠加文字水印"))
 
         # ---- 末端处理（2026-08-27 预览接入）：split 网格（尽力支持，mpv lavfi 支持 hstack/vstack）
         #      + 边框 pad（链尾最外层，包住网格/叠加产物）。concat 预览不支持（需额外输入流）。 ----
@@ -39025,13 +45368,13 @@ class FFmpegBatchGUI:
             cur = "[v_bp]"
             parts.extend(_pip_split_parts(cur, "[v_po2]"))
             cur = "[v_po2]"
-            self._append_info_ui(_("[预览] 实时预览：多画面拼接 {0}x{1}（每格带框）").format(_pip_rows, _pip_cols))
+            self._append_info_ui(_('[预览] 实时预览：多画面拼接 {0}x{1}（每格带框）').format(_pip_rows, _pip_cols))
             parts.append(f"{cur}null[vo]")
         else:
             if _pip_split_ok:
                 parts.extend(_pip_split_parts(cur, "[v_split]"))
                 cur = "[v_split]"
-                self._append_info_ui(_("[预览] 实时预览：多画面拼接 {0}x{1}").format(_pip_rows, _pip_cols))
+                self._append_info_ui(_('[预览] 实时预览：多画面拼接 {0}x{1}').format(_pip_rows, _pip_cols))
             if _bp_pip:
                 _bp_tail = "," + _bp_pip
                 self._append_info_ui(_("[预览] 实时预览：已叠加末端边框"))
@@ -39039,12 +45382,23 @@ class FFmpegBatchGUI:
                 _bp_tail = ""
 
             # 结尾强制收尾：主视频启用截取（或为静态图片给默认时长）时，输出按有效结束时长精确截止
-            # （movie 子视频无限循环 + color 画布/文字水印无限源时，主视频结束不一定终止输出）
+            # （movie 子视频无限循环 + color 画布/文字水印无限源时，主视频结束不一定终止输出）。
+            # 真时间轴延长（外部播放器路线）时收口到时间轴总长——底已 tpad 到该长度。
+            _pv_trim_dur = None
             if _main_end_dur and _main_end_dur > 0:
-                parts.append(f"{cur}trim=0:{_ffsec(_main_end_dur)},setpts=PTS-STARTPTS{_bp_tail}[vo]")
+                if (not pipe_engine) or _pv_out_mode:
+                    # out_mode（有链）与外部播放器路线同款：底已 tpad → 收口到时间轴总长；
+                    # 素材时间轴模式（无链）不延长（tpad 未应用，维持原状）。
+                    _pv_trim_dur = max(_main_end_dur, _pv_total or 0.0)
+                else:
+                    _pv_trim_dur = _main_end_dur
+            elif (not pipe_engine) and _pv_total and _pv_total > 0:
+                _pv_trim_dur = _pv_total
+            if _pv_trim_dur and _pv_trim_dur > 0:
+                parts.append(f"{cur}trim=0:{_ffsec(_pv_trim_dur)},setpts=PTS-STARTPTS{_bp_tail}[vo]")
             else:
                 parts.append(f"{cur}null{_bp_tail}[vo]")
-        # 音频：主视频音频 passthrough（多音轨混音预览暂不合成，仅主视频声音）
+        # 音频：主视频音频 passthrough；有混音/替换子声时走 amix（与正式命令 _build_pip_audio 同模型）
         _has_audio = False
         try:
             _info = self._get_cached_stream_info(main_file)
@@ -39052,22 +45406,359 @@ class FFmpegBatchGUI:
                 _has_audio = any(x.get("codec_type") == "audio" for x in _info.get("streams", []))
         except Exception:
             _has_audio = False
-        if _has_audio:
-            parts.append("[aid1]anull[ao]")
+        # 2026-09-25 去掉 (not pipe_engine)：混音段进图对管道视频侧零影响（drop_amovie 删净），
+        # 管道 out_mode 的音频下传靠它才有混音段可抽（见上方 _pv_audio_plan 收集处注释）。
+        _pv_mix_mode = bool(_pv_audio_plan) and bool(_pv_audio_src)
+        if not _pv_mix_mode:
+            if _has_audio:
+                if _main_trim_prefix and not pipe_engine:
+                    # 【音频必须与主视频同段同归零】主视频走了 trim=start=_ssec[,end=_esec],setpts=PTS-STARTPTS，
+                    # 音频若只 anull 直通 → 从素材 0 秒起播（用户实测：画面跳到 143s，音乐却从头放）。
+                    # 本路径不给播放器 --start，主视频与主音频同源同时间轴 → atrim 用与 trim **完全相同**的
+                    # start/end 即精确对齐；末端再按 [vo] 的 _main_end_dur 等长收尾（apad 防比画面短）。
+                    # 仅在「启用主视频截取 且 非管道模式」时替换：管道模式音频段整段被
+                    # _lavfi_complex_to_ffmpeg_pipe 删除、无需校准（无论无链的相对终点还是
+                    # 有链 out_mode 的绝对 trim）→ 保持 anull 直通 = 与旧行为逐字节一致；
+                    # 未截取同样 anull 直通。
+                    _a_tr = []
+                    if _ssec is not None:
+                        _a_tr.append(f"start={_ssec}")
+                    if _esec is not None:
+                        _a_tr.append(f"end={_esec}")
+                    _a_chain = f"atrim={':'.join(_a_tr)},asetpts=PTS-STARTPTS"
+                    if _main_end_dur and _main_end_dur > 0:
+                        _a_chain += (f",atrim=0:{_ffsec(_main_end_dur)},"
+                                     f"apad=whole_dur={_main_end_dur:.3f}")
+                    parts.append(f"[aid1]{_a_chain}[ao]")
+                else:
+                    parts.append("[aid1]anull[ao]")
+        else:
+            # 混音/替换子声预览：主声床（有界到时间轴总长）+ 各子声（aloop 镜像显示窗口 +
+            # adelay 落位）逐条 amix 叠加；替换窗并集内主声静音。时间轴延长时各条一并有界，
+            # 否则 amix 截断/永不结束（与正式命令同因）。
+            _T = _pv_total if (_pv_total and _pv_total > 0) else (
+                _main_end_dur if (_main_end_dur and _main_end_dur > 0) else _main_dur)
+            # [ao] 的 0 基基准 = 主声床起点：mpv --start 后主声被 asetpts 归零到截取起点 S，
+            # 子声落位要减同一基准（S=0 时与导出的绝对时间轴逐值一致）
+            _s_off = _ssec if (_main_trim_prefix and _ssec is not None) else 0.0
+            # 音频跟随转场：delta = 链真实位置 P_k − 显示起点 ws（每子视频独立开关）
+            try:
+                _pv_follow = self._pip_audio_follow_shift(
+                    sub_videos, _pip_chains,
+                    [(i, sv.file_path, sv.enc_settings) for i, sv in enumerate(sub_videos)],
+                    main_video)
+            except Exception:
+                _pv_follow = {}
+
+            def _pv_shift_of(_kx):
+                try:
+                    return float(_pv_follow.get(normalize_path(sub_videos[_kx].file_path), 0.0) or 0.0)
+                except Exception:
+                    return 0.0
+
+            if _has_audio:
+                _a_tr = []
+                if _ssec is not None:
+                    _a_tr.append(f"start={_ssec}")
+                if _esec is not None:
+                    _a_tr.append(f"end={_esec}")
+                _a_chain = f"atrim={':'.join(_a_tr)},asetpts=PTS-STARTPTS" if _a_tr else "anull"
+                if _T and _T > 0:
+                    _a_chain += f",atrim=0:{_ffsec(_T)},apad=whole_dur={_T:.3f}"
+                parts.append(f"[aid1]{_a_chain}[amain_pv]")
+            else:
+                # 主视频无音频：静音源垫底（anullsrc 无限源 → atrim 收口）
+                _an = "anullsrc=r=48000:cl=stereo"
+                if _T and _T > 0:
+                    _an += f",atrim=0:{_ffsec(_T)}"
+                parts.append(f"{_an}[amain_pv]")
+            # 替换窗并集 → 主声一次性静音（replace 模式）
+            _rep_terms = []
+            for _kx, _at in sorted(_pv_audio_plan.items()):
+                if _kx not in _pv_audio_src:
+                    continue
+                if self._pip_audio_mode(self._pip_sub_video_enc(enabled_tracks, _at)) != "replace":
+                    continue
+                _ws3, _we3 = self._pip_window_seconds(
+                    sub_videos[_kx].enc_settings, self._pip_main_duration(main_video),
+                    sub_videos[_kx].file_path)
+                _sh3 = _pv_shift_of(_kx)
+                _rep_terms.append(
+                    f"between(t,{max(0.0, _ws3 + _sh3 - _s_off):.3f},"
+                    f"{max(0.0, _we3 + _sh3 - _s_off):.3f})")
+            if _rep_terms:
+                parts.append(f"[amain_pv]volume=enable='{'+'.join(_rep_terms)}':volume=0[amain_pv]")
+            # 子声节点：aloop 镜像视频循环决策 → atrim 窗口长 → adelay 落位 → 有界到总长
+            _pv_mixed = 0
+            for _kx, _at in sorted(_pv_audio_plan.items()):
+                if _kx not in _pv_audio_src:
+                    continue
+                _venc3 = sub_videos[_kx].enc_settings
+                _ap = []
+                # 同导出端：注入源路径让 _audio_effective_duration 取到时长，修正 afade=t=out:st=0
+                _at.enc_settings["_file_path"] = sub_videos[_kx].file_path
+                _afx = self._build_audio_filters(
+                    _at.enc_settings, include_trim=True, include_volume=True,
+                    include_speed=True, include_reverse=_at.enc_settings.get("audio_reverse", False))
+                if _afx:
+                    _ap.append(_afx)
+                _ap.append("aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000")
+                _sdur = 0.0
+                try:
+                    # 帧对齐：子声窗口与视频图层窗口同源（防音窗比画窗多 1 帧）
+                    _sdur = self._get_media_duration(
+                        sub_videos[_kx].file_path,
+                        frame_align_fps=self._get_video_framerate(sub_videos[_kx].file_path)) or 0.0
+                except Exception:
+                    _sdur = 0.0
+                _ws4, _we4, _bd4 = self._resolve_display_window(
+                    _venc3, _sdur, input_path=sub_videos[_kx].file_path)
+                if _bd4 and _we4 is not None and _we4 > _ws4 and _sdur > 0:
+                    _win_ms = max(1, int(round((_we4 - _ws4) * 1000)))
+                    _src_ms = max(1, int(round(_sdur * 1000)))
+                    _n4 = min(64, max(1, -(-_win_ms // _src_ms)))
+                    _ap.append(f"aloop=loop={_n4 - 1}:size={max(1, int(_sdur * 48000))}")
+                    _ap.append(f"atrim=0:{_ffsec(_we4 - _ws4)}")
+                else:
+                    _ap.append("aloop=loop=-1:size=2000000000")
+                _delay = max(0.0, (_ws4 or 0.0) + _pv_shift_of(_kx) - _s_off)
+                if _delay > 0:
+                    _ap.append(f"adelay=delays={_delay * 1000:.0f}:all=1")
+                    # ⚠️ adelay 静音头 pts 为负（n9.0.1 实测，与源是 amovie 还是 [N:a] 文件
+                    # 输入**无关**——早先「导出端 [N:a] 无此问题（T4 对照）」的结论是错的：
+                    # 2026-09-26 用户实测导出「最后一段混进第一段、自己位置没声」，探针
+                    # tests/_dbg_adelay_amix_probe.py 两链序均复现，asetpts 归零后治愈）。
+                    # atrim=0:T 会整段剥掉负 pts 静音头 → 流只剩内容 → amix 逐样本叠加
+                    # **不看 pts** ⇒ 声音从输出 0s 开始。PTS-STARTPTS 把静音头归到 0 起
+                    # 真实帧，amix 到达顺序即时间轴顺序。导出端 _pip_sub_audio_node 同款。
+                    _ap.append("asetpts=PTS-STARTPTS")
+                if _T and _T > 0:
+                    _ap.append(f"atrim=0:{_ffsec(_T)}")
+                parts.append(f"[asub{_kx}]" + ",".join(_ap) + f"[asw{_kx}]")
+                parts.append(
+                    f"[amain_pv][asw{_kx}]amix=inputs=2:duration=longest:normalize=0[amain_pv]")
+                _pv_mixed += 1
+            parts.append("[amain_pv]anull[ao]")
+            if _pv_mixed:
+                self._append_info_ui(
+                    _('[预览] 已混入 {0} 个子视频音频（混音/替换模式，与导出一致）').format(_pv_mixed))
         graph = ";".join(parts)
 
-        player = self.mpv_path.get().strip() or "mpv"
-        cmd = [player, main_file, f"--lavfi-complex={graph}"]
-        self._append_info_ui(_("[预览] 画中画实时预览：mpv lavfi-complex（{0} 个子视频 movie 合成，可能卡顿）").format(len(sub_videos)))
-        self._append_info_ui(_("执行命令: ") + format_cmd_for_display(cmd))
-        try:
-            flags = _ffmpeg_spawn_flags()
-            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
-        except Exception as e:
-            # 兜底：Popen 抛 OSError=mpv 进程起不来（不可用），标记标志供后续预览直接回退/提示
-            self._mpv_usable = False
-            self._mpv_verified = True   # 已实测失败，后续预览直接回退不再重试子进程
-            self._append_info_ui(_("[预览] mpv 启动失败: {0}（已标记 mpv 不可用，请检查路径或用快照预览）").format(e))
+        # ---- 「节点标签」同步到预览（2026-09-26）----
+        # 为什么要这一步：节点效果此前只作用在「正式命令 / 快照」那张图上，预览一直看不到。
+        # 难点：同一个「第 N 步」在**预览图**里的段序号与正式命令图不同（预览多了 movie=
+        # 源段、trim 收尾段、末尾 null 段）⇒ 直接按指纹找会全部落空（实测 3 个节点只命中
+        # 主链那 1 个）。所以把最近一次命令预览产出的**原始图**交给 _apply_node_fx 当
+        # anchor，走 node_key_alias「同名末滤镜第 n 次出现」重锚；数量不对等的层一律不猜、
+        # 跳过并提示（宁可不生效，也绝不插到别的节点上）。
+        # ⚠️ 位置在 parts 合成之后：管道路线（graph 直接喂 _open_pipe_time_preview）与
+        #    mpv/ffplay 路线（下面 _inject_movie_seek_point_per_sub）用的是**同一张图**，
+        #    在这里加一次就两条预览路径同时生效。
+        # node_fx 为空时 _apply_node_fx 逐字节原样返回 ⇒ 未用过节点标签的项目零回归。
+        if getattr(self, "node_fx", None):
+            if not (getattr(self, "_last_graph", "") or ""):
+                # anchor 还没有（例如刚载入工程、还没刷过命令预览）→ 先跑一次构图拿到原始图
+                try:
+                    self.merge_update_command_preview()
+                except Exception:
+                    pass
+            try:
+                # anchor 用「应用节点效果前」的原始图（_last_graph_raw_v）：_last_graph
+                # 是叠加效果后的图，效果段让同名滤镜计数比预览图多 → node_key_alias
+                # 整层拒绝 → 预览看不到插入的局部效果（split 分叉链实测，2026-09-27）。
+                # raw 缺失时回退 _last_graph（旧行为兜底）。音频锚点无需对应处理：
+                # _last_graph 写入在音频节点效果应用之前，本来就是干净图。
+                graph, _pv_node_lbl = self._apply_node_fx(
+                    graph, ("vo" if "[vo]" in graph else "out"),
+                    anchor_nodes=graph_nodes(
+                        getattr(self, "_last_graph_raw_v", "")
+                        or getattr(self, "_last_graph", "") or ""))
+            except Exception as _e:
+                self._append_info_ui(_('[节点] 预览叠加节点效果失败（按原图继续）: {0}').format(_e))
+            if getattr(self, "node_audio_fx", None):
+                try:
+                    graph, _pv_node_lbl = self._apply_node_audio_fx(
+                        graph, ("ao" if "[ao]" in graph else "out"),
+                        anchor_nodes=graph_nodes(getattr(self, "_last_graph", "") or ""))
+                except Exception as _e:
+                    self._append_info_ui(_('[音频节点] 预览叠加失败（按原图继续）: {0}').format(_e))
+
+        # ---- 【时间预览引擎】管道合成模式（2026-09-20 Phase 2，用户拍板开放封装页）----
+        # 同一张 PiP 合成图改喂内置时间预览窗口：ffmpeg -filter_complex → rawvideo 管道，
+        # **不启动 mpv/ffplay** → 保留标记 / 波形 / 逐帧步进 / A-V 仲裁。默认 False ⇒
+        # 旧调用方（mpv / ffplay 实时预览）零行为变化。
+        # 子视频 seek 同步：_launch_video_pipe 会按「子=主−pipe_start」处理每个视频类 movie=
+        # ——优先改写成外部 `-ss -i` 输入（帧精确），改不到的才注入 seek_point 近似；
+        # 拖进度条时子视频跟随（与正式导出「主从 pipe_start、子从 0」一致）。
+        # 主视频截取在管道模式下**只烘焙相对终点** trim=end=(E−S)：起点交 pipe_start
+        # （=截取起点 _ssec；图内时间轴已 0 基归零，再套绝对 trim=start 会二次偏移），
+        # 终点仍在此收口 ⇒ 主链不会播过选段、子视频循环窗口也随之收敛（见上方 pipe_engine 分支）。
+        if pipe_engine:
+            # 合成图真实输出画面比：平铺网格会把尺寸乘成 cols×rows 倍 → 不下传会导致预览框
+            # 比例错、图被 letterbox（用户实测「2 格平铺没铺满」）。未平铺时用主视频规格。
+            _pipe_w, _pipe_h = _main_w, _main_h
+            if _pip_split_ok:
+                _pipe_w = _main_w * _pip_cols
+                _pipe_h = _main_h * _pip_rows
+            _pipe_ar = (float(_pipe_w) / _pipe_h) if _pipe_h > 0 else None
+            self._append_info_ui(
+                _('[时间预览] 画中画管道合成预览：{0} 个子视频 movie 合成（ffmpeg -filter_complex → rawvideo；子视频跟随进度条同步 seek）').format(len(sub_videos)))
+            if _pv_out_mode:
+                # 路线A（research/pipe-pip-chain）：链图 = 输出时间轴——xfade offset / adelay /
+                # enable / cbase d 全是 0 基绝对值，管道的 pts 平移桥接会让整链错位（拖动后
+                # offset 钉在原地、链成员 0 基窗口被 _split_sub_trims 误当绝对 trim）⇒ 有链时
+                # 整图走 out_mode：不 seek 任何输入、拖动在图尾做输出侧 trim（与串行合并管道
+                # 预览同款；代价=每次拖动从 0 解码，串行合并已验证此代价可接受）。
+                _pv_out = _pv_total if (_pv_total and _pv_total > 0) else (
+                    _pv_main_eff if (_pv_main_eff and _pv_main_eff > 0) else _main_limit)
+                self._append_info_ui(
+                    _('[时间预览] 含转场链 → 输出时间轴模式（总长 {0:.2f}s；拖动从 0 解码后输出侧裁剪，seek 较慢但与导出逐帧一致）').format(_pv_out))
+                # 合成音频图下传（串行合并同款）：out_mode 的输出时间轴与主文件音轨时间轴
+                # 不对齐（图内主声床 atrim=_ssec 后 0 基 + 子声 adelay 落位），引擎直读主文件
+                # 只会放出「第一个视频的完整音频」（用户实测）→ 抽混音段成独立 lavfi 图，
+                # [aid1] 主声床改 amovie 自供，引擎在 [ao] 后接 atrim=at 精定位。
+                _pa_graph = self._lavfi_mix_audio_standalone(graph, main_file) or None
+                if _pa_graph:
+                    self._append_info_ui(_("[时间预览] 合成音频已下传管道引擎（混音段独立 lavfi 图）"))
+                self._open_pipe_time_preview(main_file, dict(_ms), graph, None, None,
+                                             aspect=_pipe_ar, out_dur=_pv_out, out_start=0.0,
+                                             pipe_audio_graph=_pa_graph, pipe_audio_map="[ao]")
+            else:
+                self._open_pipe_time_preview(main_file, dict(_ms), graph, None, _ssec,
+                                             aspect=_pipe_ar)
+            return
+
+        # 【mpv/ffplay 回退路径】子视频 movie= 注入各自 trim 起点的 seek_point：回退分支走
+        # 「主/子各经 trim=start,setpts=PTS-STARTPTS 归零」的 0 基对齐模型，子 movie= 注入其
+        # 自身 S_sub 即可跳过从 0 空解、又不破坏 pts 对齐（远起点子视频秒开）。输出逐字节不变
+        # （tests/kli_ffplay_seek_probe.py md5 校验）。管道引擎(pipe_engine)走自己的改写+uniform
+        # 兜底，上面已 return，不在此注入（避免重复 seek / 破坏其外部 -i 改写）。
+        graph = SimplePreviewer._inject_movie_seek_point_per_sub(graph)
+
+        if mpv_ok:
+            player = self.mpv_path.get().strip() or "mpv"
+            _mpv_input, _mpv_ext = main_file, []
+            cmd = [player, _mpv_input] + _mpv_ext + [f"--lavfi-complex={graph}"]
+            # 【主视频截取起点交给播放器原生 seek】否则 mpv 从素材 0 解码到 _ssec 才出首帧：
+            # 音频链先出帧驱动时钟、视频帧迟到被丢（画面花），与上方音频段的 atrim 同段口径配合。
+            # 真机实测（mpv.com + rc 零帧判据）：seek 后时间戳**不归零** ⇒ 图内 trim=start=_ssec
+            # 与 --start 共存、不会二次切（同 L28252「播放器原生 --start 跳转 → 滤镜 t=原始时间戳」）。
+            # --start 只作用主输入；子 movie= 仍靠各自 seek_point（上一行的逐子注入）。
+            if _main_trim_prefix and _ssec is not None:
+                cmd.append(f"--start={_ssec}")
+                # 【秒开】关掉 hr-seek（同 preview_with_player 的说明）：图内 trim=start=_ssec
+                # 已精确裁切，mpv 不必再消耗 _ssec 秒滤镜输出才出首帧；画面仍逐帧准确。
+                cmd.append("--hr-seek=no")
+            self._append_info_ui(_('[预览] 画中画实时预览：mpv lavfi-complex（{0} 个子视频 movie 合成，可能卡顿）').format(len(sub_videos)))
+            self._append_info_ui(_("执行命令: ") + format_cmd_for_display(cmd))
+            try:
+                flags = _ffmpeg_spawn_flags()
+                # 开新预览前先关掉上一次预览的播放器（防两窗口同时出声 = 用户报的「重音」）；
+                # 登记句柄供下一次预览关闭。
+                self._reap_prev_preview_player()
+                self._preview_player_proc = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
+                _register_preview_proc(self._preview_player_proc)
+            except Exception as e:
+                # 兜底：Popen 抛 OSError=mpv 进程起不来（不可用），标记标志供后续预览直接回退/提示
+                self._mpv_usable = False
+                self._mpv_verified = True   # 已实测失败，后续预览直接回退不再重试子进程
+                self._append_info_ui(_('[预览] mpv 启动失败: {0}（已标记 mpv 不可用，请检查路径或用快照预览）').format(e))
+        else:
+            # ffplay 回退：图内 [vid1]→[in]、[vo]→[out]，主音频 passthrough 段([aid1]anull[ao])删除
+            # （ffplay 主音轨随 -i 自动播放）。图片主视频的循环由图内 `loop=loop=-1` 滤镜承担
+            # （_main_prefix 已注入），末端 trim=0:N 收尾，-autoexit 等到【输出】结束自动关闭；
+            # 故此处不再剥 loop 滤镜、也不再给 -loop 1（ffplay 下 -loop 1 图片不生效，实测 1 秒消失）。
+            # 缩放尺寸先算（原在 -af 之后，提前供下方 lavfi 路径复用）：ffplay 窗口默认按输出
+            # 分辨率，画中画/画布/网格可能远超屏幕 → 标题栏被挤出屏幕。按 preview_margin
+            # （默认 80）预留，仅在超界时才缩（与旧预览路径一致）。
+            _out_w, _out_h = _main_w, _main_h
+            if _pip_split_ok:
+                _out_w = _main_w * _pip_cols
+                _out_h = _main_h * _pip_rows
+            # ---- 方案 A（2026-09-26）：尾垫>0 时改走 -f lavfi 整图形态 ----
+            # 真时间轴尾垫（tpad 延长输出）时输出比主文件长 ⇒ 文件当主输入的 -autoexit 盯
+            # **主文件 EOF**，主视频一放完就退窗（用户实测 28s 主视频 / 81s 总长，播完首段
+            # 即关窗；下方 -t 跟 _pv_total 只是读包上限，救不了 autoexit 的 EOF 判定——
+            # 昨天修的就是 -t，今天尾垫场景回归实锤）。与串行合并同款破法：不给主文件输入，
+            # 整张图交给 -f lavfi -i ⇒ 主输入 EOF = 图 EOF = 全片播完自动关窗。
+            # 改写失败（形态不符）→ 回退下方原 -i 写法，行为与旧版逐字一致（零回归）。
+            if _pv_total and _main_limit and _pv_total > _main_limit + 0.05:
+                _main_movie = (self._movie_path_safe(main_file, 0)
+                               .replace("\\", "/").replace(":", "\\\\:"))
+                _spt = _ssec if (_main_trim_prefix and _ssec is not None) else None
+                _ff_graph = self._pip_graph_to_ffplay(graph, _main_movie,
+                                                      seek_point=_spt, total=_pv_total)
+                if _ff_graph:
+                    _lav_cmd = [self.ffplay_cmd, "-autoexit", "-volume",
+                                str(self.preview_volume.get())]
+                    # ⚠️ 不给 -ss/-t/-af：lavfi 输入不可 seek（给了只会打一行
+                    #    "could not seek to position N" 然后从头播）；图 EOF 即关窗，
+                    #    -t 是主输入 pts 上限的读包判据，在这里多余且可能误丢包；
+                    #    音频已在图内 amovie 自供（含混音段），无需 -af 直挂。
+                    _lav_cmd.extend(["-f", "lavfi", "-i", _ff_graph])
+                    _lav_cmd.extend(self._ffplay_fit_scale(_out_w, _out_h))
+                    _lav_cmd.extend(["-window_title", _('预览(PiP): {0}').format(os.path.basename(main_file))])
+                    self._append_info_ui(
+                        _('[预览] 画中画实时预览：ffplay -f lavfi 整图（尾垫 {0:.2f}s → {1:.2f}s，autoexit 盯图 EOF 全片播完自动关窗；窗口内不支持 seek）').format(_main_limit, _pv_total))
+                    self._append_info_ui(_("执行命令: ") + format_cmd_for_display(_lav_cmd))
+                    self._spawn_player_stderr_scan(_lav_cmd, scan_ffplay=True)
+                    return
+                self._append_info_ui(_("[预览] 画中画实时预览：ffplay 整图改写失败，回退 -i 文件写法（尾垫场景会在主视频放完时提前关窗）"))
+            _ff_vf = self._lavfi_complex_to_ffplay(graph)
+            if not _ff_vf:
+                self._append_info_ui(_("[预览] 画中画实时预览：复杂图转 ffplay -vf 失败，无法预览"))
+                return
+            cmd = [self.ffplay_cmd, "-autoexit", "-volume", str(self.preview_volume.get())]
+            # 【主视频截取起点交给 ffplay 原生 -ss】（与上面 mpv 分支的 --start 同口径）
+            # 根因：不给 -ss 时 ffplay 从素材 0 解码，而命令行 -t=_main_limit 会把「素材时间戳 −
+            # start_time > _main_limit」的包**直接丢弃**（ffplay read_thread 的 pkt_in_play_range
+            # 判据）⇒ 图内 trim=start=_ssec 一帧都拿不到 =【画面永远不出】；与此同时主音轨是原生
+            # 直读、照常放满 _main_limit 秒 ⇒ 音频一放完 -autoexit 立刻退窗。
+            # 用户实测即此现象：「音乐放完就退出，画面还在 seek」→ 有 seek 时 ffplay 预览等于失效。
+            # 加 -ss 后 demuxer 直接定位到截取点（主音频同步从该点起播，-t 也随之变成相对该点计时）。
+            # ⚠️ 图内 trim=start=_ssec **必须保留**：ffplay 的 -ss 不归零时间戳（filtergraph 仍拿到
+            # 原始时间戳）。真机探针（SDL dummy 无头）：无 -ss + -t 4 + trim=start=8 → 0 帧；
+            # 加 -ss 8 后 → 100 帧、首帧 pts=8.000，与「不加 -ss 只去掉 -t」的帧集完全一致；
+            # 而同一探针下「-ss 8 + trim=start=0」→ 0 帧（反证 trim 起点不能改成相对 0）。
+            if _main_trim_prefix and _ssec is not None:
+                cmd.extend(["-ss", f"{_ssec}"])
+            cmd.extend(["-i", main_file, "-vf", _ff_vf])
+            # 【主音轨必须同段裁切 + 归零】与图内主视频的 trim=start=_ssec,setpts=PTS-STARTPTS 逐字同口径。
+            # 只加 -ss 而不管音频 ⇒ 图内视频已被 setpts 归零、原生音频却仍带**素材绝对时间戳** →
+            # ffplay 的 A/V 时钟差恒等于截取起点，音频为主时钟时判定「视频迟到 _ssec 秒」→ 疯狂丢帧追帧。
+            # 真机状态行实证（-ss 8 -t 4，不加 -af）：起始 "7.66 A-V: 7.544" → 收尾 "11.94 A-V: 4.418
+            # fd=49"（丢了 49 帧）；另 ffplay 的 -ss 只落在「≤截取起点的视频关键帧」上 → 不裁 audio 时
+            # 还会**提前最多一个 GOP** 出声。加了 -af 后 A-V≈0、fd=0（见探针 kli_ffplay_seek4）。
+            # 【子声混音同步升级】图内有混音段时把主声床 + amovie 子声整体搬进 -af，
+            # 与 mpv --lavfi-complex 同口径出声（此前 ffplay 一律删混音段退回主音频直放
+            # = 真时间轴后半段子声无声，用户实测「ffplay 只有第一段声音」）。
+            _ff_af = self._lavfi_mix_audio_to_ffplay_af(graph) if _has_audio else None
+            if _ff_af:
+                # 子声链每条一个段（[asubK]…[aswK]）；amix 段以 [amain_pv] 开头也含 "[asw"，
+                # 不能按包含计数（会把每条数成 2，9 个报 18）。
+                _n_mix = sum(1 for s in _ff_af.split(";") if s.strip().startswith("[asub"))
+                self._append_info_ui(
+                    _('[预览] ffplay -af 已混入 {0} 个子声（与 mpv 同口径）').format(_n_mix))
+                cmd.extend(["-af", _ff_af])
+            elif _main_trim_prefix and _ssec is not None and _has_audio:
+                cmd.extend(["-af", f"atrim=start={_ssec},asetpts=PTS-STARTPTS"])
+            # 缩放到屏幕内（_out_w/_out_h 已在 ffplay 分支开头算好，含画布/网格乘格）
+            cmd.extend(self._ffplay_fit_scale(_out_w, _out_h))
+            # -t 上限吃延长后的时间轴总长：真时间轴把输出延长到 _pv_total（尾部补黑帧），
+            # 仍用 _main_limit 会把画面在主视频时长处截断（用户实测 ffplay 12s 即断、
+            # 而 mpv 路线靠图内收口 trim 无此问题）。
+            _ff_t = _main_limit
+            if _pv_total and _pv_total > 0 and (not _ff_t or _pv_total > _ff_t):
+                _ff_t = _pv_total
+            if _ff_t and _ff_t > 0:
+                cmd.extend(["-t", f"{_ff_t:g}"])
+            if "-window_title" not in cmd:
+                cmd.extend(["-window_title", _('预览(PiP): {0}').format(os.path.basename(main_file))])
+            self._append_info_ui(
+                _('[预览] 画中画实时预览：ffplay -vf（{0} 个子视频 movie 合成）').format(len(sub_videos)))
+            self._append_info_ui(_("执行命令: ") + format_cmd_for_display(cmd))
+            self._spawn_player_stderr_scan(cmd, scan_ffplay=True)
 
     def merge_preview_concat_edl(self):
         """串行合并预览（mpv EDL 内联播放，不重编码、不滤镜）。
@@ -39116,7 +45807,7 @@ class FFmpegBatchGUI:
             if t.enc_settings.get("_error"):
                 continue
             if not t.file_path or not os.path.exists(t.file_path):
-                self._append_info_ui(_("[EDL 预览] 跳过不存在的文件: {0}").format(t.file_path))
+                self._append_info_ui(_('[EDL 预览] 跳过不存在的文件: {0}').format(t.file_path))
                 continue
             video_tracks.append(t)
         if not video_tracks:
@@ -39162,19 +45853,18 @@ class FFmpegBatchGUI:
     
         if skipped:
             self._append_info_ui(
-                _("[EDL 预览] ⚠ {0} 个文件路径含 `=` 被跳过"
-                  "（内联 URL 解析会截断，无法在 EDL 里转义）：").format(len(skipped)))
+                _('[EDL 预览] ⚠ {0} 个文件路径含 `=` 被跳过（内联 URL 解析会截断，无法在 EDL 里转义）：').format(len(skipped)))
             for p in skipped[:5]:
-                self._append_info_ui(_("    · {0}").format(os.path.basename(p)))
+                self._append_info_ui(f"    · {os.path.basename(p)}")
             if len(skipped) > 5:
-                self._append_info_ui(_("    …等 {0} 个（改名后重新预览即可）").format(len(skipped) - 5))
+                self._append_info_ui(_('    …等 {0} 个（改名后重新预览即可）').format(len(skipped) - 5))
             self._append_info_ui(
                 _("    改名建议：去掉 `=` 或替换成其他字符（如 `-` / `_`）。"))
     
         if not entries:
             messagebox.showwarning(
                 _("提示"),
-                _("所有 {0} 个轨道都因路径含 `=` 被跳过，无法预览。请改名后重试。").format(len(skipped)))
+                _('所有 {0} 个轨道都因路径含 `=` 被跳过，无法预览。请改名后重试。').format(len(skipped)))
             return
     
         edl_uri = "edl://" + ";".join(entries)
@@ -39182,6 +45872,9 @@ class FFmpegBatchGUI:
         # --hr-seek=yes：精确 seek（解码到目标帧，不是关键帧对齐）；
         # --hr-seek-framedrop=no：精确定位时不丢帧（避免"位置到了但画面没到"）；
         # --keep-open=no：末段播完自动退出（不卡在最后一帧）
+        # ⚠️ 这里与两条 lavfi 预览路径（preview_with_player / merge_preview_pip_live）**相反**：
+        # EDL 没有滤镜图、也没有图内 trim 兜底，关掉 hr-seek 会直接落到关键帧（最多偏一个
+        # GOP）⇒ 本路径必须保持 yes，不要去和那两处「统一」。
         cmd = [
             self.mpv_path.get().strip() or "mpv",
             "--hr-seek=yes",
@@ -39191,16 +45884,19 @@ class FFmpegBatchGUI:
         ]
     
         self._append_info_ui(
-            _("[EDL 预览] 串行合并预览：{0} 段，mpv 顺序播放（不重编码）；"
-              "⚠ 换段处短暂停顿/闪烁属正常现象（EDL 是「跳读」不是无缝拼接）").format(len(entries)))
+            _('[EDL 预览] 串行合并预览：{0} 段，mpv 顺序播放（不重编码）；⚠ 换段处短暂停顿/闪烁属正常现象（EDL 是「跳读」不是无缝拼接）').format(len(entries)))
         self._append_info_ui(_("执行命令: ") + format_cmd_for_display(cmd))
         try:
             flags = _ffmpeg_spawn_flags()
-            subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, creationflags=flags)
+            # 开新预览前先关掉上一次预览的播放器（防两窗口同时出声 = 重音）；登记句柄。
+            self._reap_prev_preview_player()
+            self._preview_player_proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, creationflags=flags)
+            _register_preview_proc(self._preview_player_proc)
         except Exception as e:
-            self._append_info_ui(_("[EDL 预览] mpv 启动失败: {0}").format(e))
-            messagebox.showerror(_("预览失败"), _("mpv 启动失败:\n{0}").format(e))
+            self._append_info_ui(_('[EDL 预览] mpv 启动失败: {0}').format(e))
+            messagebox.showerror(_("预览失败"), _('mpv 启动失败:\n{0}').format(e))
 
 
     def merge_export_concat_edl(self):
@@ -39256,22 +45952,889 @@ class FFmpegBatchGUI:
                 _("已保存 {0} 段到：\n{1}\n\n本机未启用 mpv，本 edl 可交给其他程序使用。").format(len(segs), path))
 
 
+    def _build_concat_audio_graph_mpv(self, video_tracks, seg_durations,
+                                      trans_effective, total_dur, main_video):
+        """构建「滤镜版串行合并预览」的音频链（mpv lavfi-complex 版）。
+
+        与正式串行合并命令 _build_concat_reencode_mode 的音频段【同规则、逐字镜像】
+        （源函数见「----- 4b/5/6/6b 音频」各节），唯一差别是**输入标签来源**：
+          · 正式命令用 ffmpeg 输入说明符 [{i}:a]（第 i 个 -i 的音轨）；
+          · mpv 只能引用 1 个位置文件，且其 [aid1]/[aid2] 编号按「含音轨的文件」独立计数
+            ——主文件是图片（无音轨）时第 1 个外部文件的音轨反而叫 [aid1]（真机实测：
+            图片主 + 外部视频时 [aid2] 报 "Pad aid2 is not connected" 直接 rc=2）。
+            该编号依赖数据、极脆弱 → 本函数统一改用 movie=<路径>:s=a 显式取音频，
+            完全不依赖 mpv 的 [aidN] 编号（真机实测 rc=0，PCM 落盘时长精确）。
+        ⚠️ 图纸来源单一性：音频「规则」的真源仍是 _build_concat_reencode_mode，
+        改那边必须同步改这里（tests/_test_merge_concat_preview.py A 系列锁定镜像结构）。
+
+        分支（与正式命令一一对应；串行模式下正式命令把独立音轨清空 audio_tracks=[] →
+        预览同样忽略独立音轨，外部音频统一走 BGM）：
+          ① 主视频「音频独立截取」(audio_trim_enabled) → 单段，从主视频源音频截取，接管全部音频；
+          ② 逐轨（默认）：图片 / 无音轨 / audio_source_type=silence → anullsrc 铺该段时长；
+                        否则源音频跟随该段的 截取/变速/倒放 + 段级钳制 + 淡入淡出；
+          ③ 拼接：段间开转场 → acrossfade，否则 concat（与视频段 1:1 对应）；
+          ④ 背景音乐(BGM)：循环铺满 + 压音量，amix 混在原音之下。
+        末尾统一 atrim+apad 到 total_dur —— 正式命令靠 -shortest 收敛，mpv 预览无 -shortest，
+        故显式钳到总时长（保证音画同长、不被 BGM 或跨段重叠拖偏）。
+
+        返回 (src_parts, audio_parts, amap, summary)：
+          src_parts   = movie= 音频源分句（需并入图首，供后续引用）
+          audio_parts = 音频处理/拼接分句（出口 [aout] 或 [afinal]）
+          amap        = 音频出口标签
+          summary     = 供日志的一句话（真实音频/静音底噪/是否含 BGM）
+        """
+        src_parts = []
+        audio_parts = []
+        at_set = main_video.enc_settings if main_video is not None else {}
+
+        def _add_src(path, idx, lbl):
+            """为某文件挂音频源 movie=<path>:s=a[lbl]；图片/无音轨返回 False（由调用方走 anullsrc）。"""
+            if not path or self._is_static_image(path):
+                return False
+            info = self._get_cached_stream_info(path)
+            has_a = bool(info) and any(
+                s.get("codec_type") == "audio" for s in (info.get("streams") or []))
+            if not has_a:
+                return False
+            safe = self._movie_path_safe(path, idx).replace("\\", "/").replace(":", "\\\\:")
+            src_parts.append(f"movie={safe}:s=a[{lbl}]")
+            return True
+
+        # 音频归一：concat / acrossfade 要求各段采样率/声道/采样格式一致（与正式命令同函数）
+        audio_concat_normalize = self._build_audio_normalize(video_tracks, [])
+        a_labels = []
+        summary_bits = []
+
+        _use_global_audio_trim = bool(at_set.get("audio_trim_enabled", False))
+        _main_file = normalize_path(main_video.file_path) if main_video is not None else ""
+        if _use_global_audio_trim and _main_file:
+            _astr = (at_set.get("audio_trim_start", "") or "").strip()
+            _aend = (at_set.get("audio_trim_end", "") or "").strip()
+            _as = time_to_seconds(_astr) if _astr else 0.0
+            _ae = time_to_seconds(_aend) if _aend else None
+            if _add_src(_main_file, 0, "am_main"):
+                _at_parts = []
+                if _as is not None and _ae is not None and _ae > _as:
+                    _at_parts.append(f"atrim=start={_ffsec(_as)}:end={_ffsec(_ae)}")
+                elif _as is not None and _as > 0:
+                    _at_parts.append(f"atrim=start={_ffsec(_as)}")
+                else:
+                    _at_parts.append("anull")
+                _at_parts.append("asetpts=PTS-STARTPTS")
+                _at_chain = ",".join(_at_parts)
+                if audio_concat_normalize:
+                    _at_chain = f"{audio_concat_normalize},{_at_chain}"
+                audio_parts.append(f"[am_main]{_at_chain}[aout]")
+                summary_bits.append(
+                    _('音频独立截取（源 {0}，起始 {1} 结束 {2}）').format(os.path.basename(_main_file), _astr or '0', _aend or '末尾'))
+            else:
+                # 正式命令此处直接取 [0:a]（图片主视频无音轨时会失败）；预览给安全兜底：
+                # 静音底噪 + 明确日志，避免整张图因一个不存在的音轨直接挂了。
+                audio_parts.append(
+                    f"anullsrc=r=44100:cl=stereo:duration={total_dur:.3f}[aout]")
+                summary_bits.append(_("音频独立截取已开启但主视频无音轨 → 静音底噪"))
+        else:
+            for i, trk in enumerate(video_tracks):
+                settings = trk.enc_settings.copy()
+                audio_type = settings.get("audio_source_type", "self")
+                effective_duration = seg_durations[i] if i < len(seg_durations) else 10.0
+                if effective_duration is None or effective_duration <= 0:
+                    effective_duration = 10.0
+                _fp = normalize_path(trk.file_path)
+                if audio_type == "silence" or not _add_src(_fp, i, f"am{i}"):
+                    norm_suffix = f",{audio_concat_normalize}" if audio_concat_normalize else ""
+                    audio_parts.append(
+                        f"anullsrc=r=44100:cl=stereo:duration={effective_duration:.3f}"
+                        f"{norm_suffix}[a{i}]")
+                else:
+                    audio_filters = []
+                    # 视频自带音轨跟随视频段截取（与正式命令逐字一致）
+                    if settings.get("trim_enabled", False):
+                        start = settings.get("trim_start", "").strip()
+                        end = settings.get("trim_end", "").strip()
+                        start_sec = time_to_seconds(start) if start else 0.0
+                        end_sec = time_to_seconds(end) if end else None
+                        total = self._get_media_duration(trk.file_path) if trk.file_path else None
+                        if end_sec is not None:
+                            trim_dur = end_sec - start_sec
+                        elif total is not None:
+                            trim_dur = total - start_sec
+                        else:
+                            trim_dur = None
+                        if trim_dur is not None and trim_dur > 0:
+                            audio_filters.append(
+                                f"atrim=start={_ffsec(start_sec)}:duration={_ffsec(trim_dur)}")
+                            audio_filters.append("asetpts=PTS-STARTPTS")
+                    if settings.get("speed_enabled", False):
+                        try:
+                            vfactor = float(settings.get("speed_factor", "1.0"))
+                        except (ValueError, TypeError):
+                            vfactor = 1.0
+                        if vfactor != 1.0 and vfactor > 0:
+                            atempo = build_atempo_chain(vfactor)
+                            if atempo:
+                                audio_filters.append(atempo)
+                    if settings.get("reverse_enabled", False):
+                        audio_filters.append("areverse")
+                    if not audio_filters:
+                        audio_filters.append("asetpts=PTS-STARTPTS")
+                    # 段级时长钳制（同正式命令：短了补静音、长了裁尾，防跨段累计错位）
+                    audio_filters.append(f"atrim=0:{_ffsec(effective_duration)}")
+                    audio_filters.append(f"apad=whole_dur={effective_duration:.3f}")
+                    audio_chain = ",".join(audio_filters)
+                    if audio_concat_normalize:
+                        audio_chain = f"{audio_concat_normalize},{audio_chain}"
+                    # 逐轨转场与音频淡入淡出互斥（与正式命令同规则）
+                    if settings.get("fade_enabled", False):
+                        if i < len(trans_effective) and trans_effective[i] is not None:
+                            settings["fade_out"] = ""
+                        if (i > 0 and i - 1 < len(trans_effective)
+                                and trans_effective[i - 1] is not None):
+                            settings["fade_in"] = ""
+                    f_suffix = self._build_afade_suffix(settings, effective_duration)
+                    if f_suffix:
+                        audio_chain = f"{audio_chain},{f_suffix}"
+                    audio_parts.append(f"[am{i}]{audio_chain}[a{i}]")
+                a_labels.append(f"[a{i}]")
+
+            # ----- 音频拼接 / 逐轨交叉溶解（跟随对应视频段的转场开关，与正式命令同规则）-----
+            prev_a = a_labels[0]
+            for k in range(1, len(a_labels)):
+                out_label = "[aout]" if k == len(a_labels) - 1 else f"[ax{k}]"
+                tr = trans_effective[k - 1] if k - 1 < len(trans_effective) else None
+                if tr is not None:
+                    audio_parts.append(
+                        f"{prev_a}[a{k}]acrossfade=c1=tri:c2=tri:d={tr[1]:.3f}{out_label}")
+                else:
+                    audio_parts.append(f"{prev_a}[a{k}]concat=n=2:v=0:a=1{out_label}")
+                prev_a = out_label
+            if len(a_labels) == 1:
+                audio_parts.append(f"{a_labels[0]}anull[aout]")
+
+        amap = "[aout]"
+        # ----- 背景音乐(BGM)：循环铺满 → 压音量 → amix 混在原音之下（正式命令 6b 节）-----
+        _bgm_path = (at_set.get("bgm_audio_path", "") or "").strip()
+        if (at_set.get("bgm_enabled", False) and _bgm_path and os.path.isfile(_bgm_path)
+                and _add_src(normalize_path(_bgm_path), 900, "am_bgm")):
+            try:
+                _bgm_vol = float(at_set.get("bgm_volume", 0.3) or 0.3)
+            except (ValueError, TypeError):
+                _bgm_vol = 0.3
+            _bgm_norm_str = (audio_concat_normalize or
+                             "aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=44100")
+            _bs = at_set.get("bgm_trim_start", "") or ""
+            _be = at_set.get("bgm_trim_end", "") or ""
+            _bs_sec = time_to_seconds(_bs) if _bs else None
+            _be_sec = time_to_seconds(_be) if _be else None
+            _src_trim_parts = []
+            if _bs_sec is not None:
+                _src_trim_parts.append(f"start={_ffsec(_bs_sec)}")
+            if _be_sec is not None:
+                _src_trim_parts.append(f"end={_ffsec(_be_sec)}")
+            # 帧精确片段截取必须带 atrim= 滤镜名（bare 的 start=/end= 会被当成孤立选项报错）
+            _bgm_src_trim = (("atrim=" + ":".join(_src_trim_parts) + ",asetpts=PTS-STARTPTS,")
+                             if _src_trim_parts else "")
+            audio_parts.append(
+                f"[am_bgm]{_bgm_norm_str},{_bgm_src_trim}"
+                f"aloop=loop=-1:size=2000000000,"
+                f"atrim=0:{_ffsec(total_dur)},"
+                f"volume={_bgm_vol:.3f},"
+                f"asetpts=PTS-STARTPTS[bgm]")
+            audio_parts.append(
+                "[aout][bgm]amix=inputs=2:duration=longest:normalize=0[afinal]")
+            amap = "[afinal]"
+            summary_bits.append(
+                _('背景音乐 {0}（音量 {1:.2f}）').format(os.path.basename(_bgm_path), _bgm_vol))
+
+        if not summary_bits:
+            summary_bits.append(_("逐轨音频（有音轨段用真实音轨、图片/无音轨段静音底噪）"))
+        return src_parts, audio_parts, amap, _("；").join(summary_bits)
+
+    def _concat_graph_to_ffplay(self, graph_str, main_movie):
+        """把「串行合并 lavfi 图」从 mpv 形态改写成 ffplay `-f lavfi -i` 形态（单图字符串版）。
+
+        为什么这条路走得通（2026-09-21 真机定案，见 research/ffplay-preview/README.md §4.5d）：
+        ffplay 的 `-autoexit` 盯的是**主 `-i` 输入的 EOF**，而串行合并的输出比「第一个文件」长
+        ⇒ 拿文件当主输入时首段一播完就退窗（旧版 2026-09-20 因此把 ffplay 回退整体删掉）。
+        破法是**不给主文件输入**：把整张图交给 `-f lavfi -i` —— 此时主输入的 EOF **就是图的
+        EOF**（= 整段拼接时长）⇒ 全播完才关窗，且**不需要 `-t`**、也不需要 mpv 的 `--length`。
+        真机实测（v1/v2 各 4s）：忠实图（图片主 color 基源+overlay + 视频次 + xfade + **无限
+        color 水印源** + 末端 trim + **aloop=loop=-1 BGM** + acrossfade/amix + out0/out1）
+        → 图长 7s、进程 7.68s 播完即退；四条不同总长（2/4/7/8s）存活都 = 图长 + 0.3~0.7s 启动。
+
+        与 mpv 图**只差两处**（滤镜本体、顺序、音频图一字不动）：
+          ① 主轨源 `[vid1]format=yuv420p[0:v]` → `movie=<同一转义主路径>,format=yuv420p[0:v]`
+             （main_movie 由调用方按图内其它 movie= 的同一口径算好：`_movie_path_safe` + 双反斜杠冒号）；
+             若主视频轨有 trim（[0:v]trim=start=S），改写后的主 movie 追加 `:seek_point=S` 快进
+             （ffplay -f lavfi 不可 --start，只能靠 movie=:seek_point，与 mpv --start 等效）。
+             ⚠️ 调用方须先对入参做 `_inject_movie_seek_point_per_sub`（音频 :s=a / 视频轨 i>0 的
+             seek_point 已注入）；本函数只补主视频轨（[vid1] 改写后的主 movie）这一处。
+          ② 视频末标签 `[vo]` → `[out0]`；音频末标签 `[ao]` → `[out1]`。
+        返回可直接当 `-f lavfi -i` 参数用的图串；任一步形态不符（缺 [vid1] / 末段非 [vo]）都返回 None。"""
+        try:
+            if not graph_str or not main_movie:
+                return None
+            if "[vid1]" not in graph_str:
+                return None
+            g = graph_str.replace("[vid1]", "movie=%s," % main_movie, 1)
+            # 主视频轨 trim 起点 → 改写后的主 movie 注入 seek_point（与 mpv --start 等效）
+            _mts = re.search(r"\[0:v\]trim=start=([0-9]+(?:\.[0-9]+)?)", g)
+            if _mts:
+                try:
+                    _mts_v = float(_mts.group(1))
+                except (TypeError, ValueError):
+                    _mts_v = 0.0
+                if _mts_v > 0:
+                    g = g.replace("movie=%s," % main_movie,
+                                  "movie=%s:seek_point=%.6f," % (main_movie, _mts_v), 1)
+            # 末段恒 `{vmap}trim=0:T,setpts=PTS-STARTPTS[vo]`（merge_preview_concat_lavfi 步骤5）
+            if "[vo]" not in g:
+                return None
+            g = g.replace("[vo]", "[out0]")
+            if "[ao]" in g:
+                g = g.replace("[ao]", "[out1]")
+            return g
+        except Exception:
+            return None
+
+    def _pip_graph_to_ffplay(self, graph_str, main_movie, seek_point=None, total=None):
+        """把「画中画 lavfi 图」从 mpv 形态改写成 ffplay `-f lavfi -i` 形态（方案 A）。
+
+        为什么要存在（2026-09-26 尾垫退窗修复）：真时间轴尾垫（tpad 延长输出）时输出比
+        主文件长 ⇒ 原写法（文件当主输入 + -vf）的 -autoexit 盯**主文件 EOF**，主视频一放
+        完就退窗（-t 跟 _pv_total 只是读包上限，救不了 autoexit 的 EOF 判定）。与串行合并
+        （_concat_graph_to_ffplay）同款破法：不给主文件输入，整张图交给 `-f lavfi -i` ⇒
+        主输入 EOF = 图 EOF = 全片播完自动关窗。代价：lavfi 输入不可 -ss（窗口内无 seek）。
+
+        ⚠️ 隐藏坑（2026-09-26 无头实测 t_old=8.24 / t_new=8.26 抓到）：ffplay 的 autoexit
+        在 lavfi 模式下是【任一输出流 EOF 就关窗】——串行侧图里所有轨末端都 atrim+apad
+        钳到 total_dur 所以从未暴露。PiP 的音频链（尤其 passthrough 主音频=主文件长度）
+        短于尾垫后的视频总长时，音频流先 EOF ⇒ 依旧提前退窗。故本函数在音频末段
+        [ao] 之前统一补 `apad=whole_dur=<total>,atrim=0:<total>`（total 由调用方传
+        _pv_total；串行同款口径），强制两输出流同时 EOF。
+
+        与 mpv 图的差异（对照 _concat_graph_to_ffplay，PiP 多两条）：
+          ① 视频主源 [vid1] → movie=<主>（调用方传 seek_point=主截取起点做关键帧快进，
+             图内 trim=start=_ssec,setpts=PTS-STARTPTS 保留负责精确裁切，与 mpv --start
+             同口径不二次切）。
+          ② 音频主源 [aid1] → amovie=<主> 自供 —— **与串行的关键差异**：PiP 音频主源是
+             mpv 提供的 [aid1] 流（串行图音频早已 movie=:s=a 自供），lavfi 模式没有任何
+             外部输入，必须 amovie= 主文件。分两形态：
+             · passthrough 段（[aid1]anull[ao]）：amovie 自供 + atrim=start=截取起点 +
+               asetpts 归零（与 -i 写法的 -af 兜底逐字同口径——mpv 的 [aid1] 与 amovie
+               同为素材绝对时间戳、图内视频时间轴已 0 基，不裁则 A/V 时钟差=截取起点）；
+             · 混音段（同段含 [amain_pv]/[asub]/[asw]）：内部已含对齐 trim，只换源不改链
+               （照抄 _lavfi_mix_audio_standalone 的 amovie 自供手法，管道引擎真机已验证）。
+          ③ [vo]→[out0]；[ao]→[out1]（total>0 时经 apad/atrim 钳制段中转，见上）。
+        调用方须已对入参做过 _inject_movie_seek_point_per_sub（子 movie seek_point 已注入）。
+        形态不符（缺 [vid1] / 改写后缺 [out0]）返回 None，调用方回退原 -i 文件写法。"""
+        try:
+            if not graph_str or not main_movie or "[vid1]" not in graph_str:
+                return None
+            _mm = "movie=%s," % main_movie
+            g = graph_str.replace("[vid1]", _mm, 1)
+            if seek_point and seek_point > 0:
+                g = g.replace(_mm, "movie=%s:seek_point=%.6f," % (main_movie, seek_point), 1)
+            if "[aid1]" in g:
+                _segs2 = []
+                for _s in g.split(";"):
+                    if "[aid1]" in _s and not ("[amain_pv]" in _s or "[asub" in _s or "[asw" in _s):
+                        # passthrough 主音频段：amovie 自供 + atrim 归零（与 -af 兜底同口径）
+                        if seek_point and seek_point > 0:
+                            _segs2.append("amovie=%s:seek_point=%.6f[pv_amsrc]"
+                                          % (main_movie, seek_point))
+                            _segs2.append("[pv_amsrc]atrim=start=%.6f,asetpts=PTS-STARTPTS[pv_am0]"
+                                          % seek_point)
+                        else:
+                            _segs2.append("amovie=%s[pv_am0]" % main_movie)
+                        _segs2.append(_s.replace("[aid1]", "[pv_am0]"))
+                    elif "[aid1]" in _s:
+                        # 混音主声床段：内部已含对齐 trim，只换源不改链
+                        _segs2.append("amovie=%s[pv_amsrc]" % main_movie)
+                        _segs2.append(_s.replace("[aid1]", "[pv_amsrc]"))
+                    else:
+                        _segs2.append(_s)
+                g = ";".join(_segs2)
+            if "[vo]" not in g:
+                return None
+            g = g.replace("[vo]", "[out0]")
+            if "[ao]" in g:
+                # 音频末端补钳制（与串行「末尾 atrim+apad 钳到 total_dur」同款）：否则音频流
+                # 先于视频 EOF ⇒ autoexit 任一流 EOF 即关窗（无头实测 8.26s vs 视频 12s）。
+                if total and total > 0:
+                    g = g.replace("[ao]", "[ao_pad]")
+                    g += (";[ao_pad]apad=whole_dur=%.6f,atrim=0:%.6f[out1]"
+                          % (total, total))
+                else:
+                    g = g.replace("[ao]", "[out1]")
+            if "[out0]" not in g:
+                return None
+            return g
+        except Exception:
+            return None
+
+    def merge_preview_concat_lavfi(self, pipe_engine=False):
+        """串行合并预览（mpv lavfi-complex 滤镜版）。
+
+        ⚠️ 菜单入口已收敛（2026-09-21）：不再有独立菜单项（原「串行合并预览 (支持滤镜 lavfi)」
+        已删）。外部播放器路线由 `_live_preview_player`（右键「实时预览（复杂滤镜）」）
+        分派，内置引擎路线由 `_live_preview_pipe` 分派。
+
+        与右键的「串行合并预览 (mpv EDL)」（仅跳读、
+        无滤镜/无转场）互补，本入口渲染【完整 filter_complex】——逐轨视频滤镜 + xfade/concat 转场 +
+        文字水印/倒计时 + 静音底噪音频，与正式串行合并命令的视频链【单一来源】（_build_concat_video_graph）
+        完全一致（预览即所见，避免两处逻辑漂移）。
+
+        输入挂接（mpv 限制：只能引用 1 个位置文件流 + 其余走 movie 滤镜）：
+          · 主视频轨(track 0) = 位置文件 → [vid1]；图片则 color 基源(有限时长 d=显示时长) + overlay 包裹；
+          · 其余轨（i>0）= movie 滤镜引入；图片同样 color+overlay 包裹撑出显示时长；
+          · 视频轨直接 movie/位置流 + format=yuv420p（连续流，无需 color 包裹）——「扩展到视频类型」即此。
+        音频：走 _build_concat_audio_graph_mpv，与正式串行合并命令的音频链同规则（真实音轨 /
+        段级钳制 / 淡入淡出 / acrossfade / BGM 混音），源用 movie=<路径>:s=a 显式取（绕开 mpv 的
+        [aidN] 编号陷阱）；图片/无音轨段静音底噪，末尾 atrim+apad 钳到 total_dur。
+        轨数上限：受「更多设置 → 预览轨数上限」约束（与画中画实时预览、内置时间预览引擎共用同一设置）。
+        输出：[vo] = 末端 trim=0:total_dur（防文字水印 color 无限源撑长）+ --length 双保险。
+
+        ffplay 路线（2026-09-21 重开）：mpv 未启用 / 起不来时改走 ffplay —— 用
+        `_concat_graph_to_ffplay` 把同一张图改写成 `ffplay -autoexit -f lavfi -i "<图>[out0];<音频>[out1]"`
+        （主轨 `[vid1]`→`movie=`、末标签 `[vo]`→`[out0]`/`[ao]`→`[out1]`；**不能加 `-t`**，
+        也不给 `-ss`）。因为主输入变成「图本身」，其 EOF = 图 EOF ⇒ 全播完才关窗
+        （旧版 2026-09-20 删除回退的病根是「用文件当主输入」）。代价：窗口内**无 seek**。
+        真机证据与取舍见 research/ffplay-preview/README.md §4.5d。
+
+        pipe_engine（2026-09-20「时间预览引擎」开放串行合并）：True 时**不启动播放器**，把同一张
+        串行合并图（只取视频链，音频段不带入）喂给内置时间预览窗口（ffmpeg -filter_complex →
+        rawvideo 管道）→ 保留标记 / 波形 / 逐帧步进 / A-V 仲裁，且无需 mpv 即可预览拼接+转场效果。
+        时间轴口径 = **输出时间轴**（pipe_out_mode）：图的 trim/xfade 偏移都是段内素材绝对时间，
+        seek 只能走输出侧 trim（正确但比素材时间轴模式慢）。默认 False ⇒ 走 mpv / ffplay 外部播放器。"""
+        if not self.concat_enabled.get():
+            messagebox.showinfo(_("提示"), _("请先勾选「串行合并（首尾拼接）」模式再使用滤镜版预览"))
+            return
+        if not self.ffmpeg_cmd:
+            self._append_info_ui(_("[预览] 未找到 ffmpeg，无法生成滤镜版预览"))
+            return
+        # ⚠️ 2026-09-21 **重开 ffplay 回退**（旧版 2026-09-20 因「-autoexit 按主输入 EOF 退窗 →
+        # 播完首段即退 / 去掉 -autoexit 又不关窗」把它整体删掉）。病根已定位为**主输入选错**：
+        # 改用 `-f lavfi -i "<全 movie= 合成图>"` 后，主输入的 EOF 就是**图的 EOF**（= 整段拼接
+        # 时长）⇒ 全播完才自动关窗、且不需要 -t。真机证据见 _concat_graph_to_ffplay docstring
+        # 与 research/ffplay-preview/README.md §4.5d。管道模式（pipe_engine）不启动播放器，跳过守卫。
+        _mpv_ok = False
+        if not pipe_engine:
+            if self.use_mpv.get() and self._mpv_ready(log=False):
+                _mpv_ok = True
+            elif not self.ffplay_cmd:
+                messagebox.showwarning(
+                    _("提示"),
+                    _("串行合并滤镜版预览需要 mpv 或 ffplay：\n"
+                    "mpv 不可用（%s 无法启动），且未找到 ffplay。\n"
+                    "请在「信息与播放器」页设置播放器路径，"
+                    "或改用右键「串行合并预览 (mpv EDL)」查看拼接效果。")
+                    % (self.mpv_path.get().strip() or _("未设置")))
+                return
+            else:
+                self._append_info_ui(
+                    _("[预览] mpv 不可用（%s 无法启动）→ 串行合并滤镜版预览改用 ffplay"
+                    "（-f lavfi 全 movie= 图：播完自动关窗；窗口内不支持 seek）")
+                    % (self.mpv_path.get().strip() or _("未设置")))
+
+        enabled_tracks = [t for t in self.merge_tracks if t.enabled]
+        video_tracks = [t for t in enabled_tracks if t.type == "video"]
+        if not video_tracks:
+            messagebox.showwarning(_("提示"), _("没有可用于预览的视频轨道"))
+            return
+        # 轨数上限：复用「更多设置 → 预览轨数上限」（与画中画实时预览同一设置）。
+        # 轨数越多滤镜图越大、mpv 首次加载越慢（实测 60+ 轨要等 20 秒以上，极易被误判成卡死），
+        # 故预览只渲染前 N 轨；正式合并输出不受此限制。
+        _sv_max = max(1, min(30, self.sub_video_preview_max.get()))
+        if len(video_tracks) > _sv_max:
+            self._append_info_ui(
+                _('[预览] 视频轨 {0} 个超过上限 {1}（「更多设置 → 预览轨数上限」可调），滤镜版预览仅渲染前 {2} 轨（正式合并输出不受影响）').format(len(video_tracks), _sv_max, _sv_max))
+            video_tracks = video_tracks[:_sv_max]
+        if len(video_tracks) == 1:
+            self._append_info_ui(
+                _("[预览] 仅 1 个视频轨：滤镜版预览等价于该轨单轨预览（无转场），"
+                "建议用主「预览」按钮查看该轨滤镜。"))
+        main_video = video_tracks[0]
+        main_file = normalize_path(main_video.file_path)
+        if not os.path.exists(main_file):
+            self._append_info_ui(_('[预览] 主视频文件不存在: {0}').format(main_file))
+            return
+
+        # ---- 主视频规格（color 基源尺寸/帧率用；移到图构建前，供管道引擎上限统一）----
+        main_orig_w, main_orig_h = self._cached_video_dimensions(main_video.file_path)
+        if (main_orig_w is None or main_orig_h is None or main_orig_w <= 0 or main_orig_h <= 0):
+            main_orig_w, main_orig_h = 1280, 720
+        main_target_w, main_target_h = self.compute_final_size_with_order(
+            main_orig_w, main_orig_h, main_video.enc_settings)
+        if main_target_w <= 0 or main_target_h <= 0:
+            main_target_w, main_target_h = main_orig_w, main_orig_h
+        # 管道引擎工作分辨率上限（与画中画分支同口径，复用 _PIPE_WORK_MAX_W）：
+        # 仅 pipe_engine 生效；GPU 路线（mpv/ffplay）全分辨率由硬件跑，不动。
+        _pw_cap_w = None
+        if pipe_engine and main_target_w > _PIPE_WORK_MAX_W and main_target_h > 0:
+            _pwf = _PIPE_WORK_MAX_W / float(main_target_w)
+            main_target_w = max(2, int(main_target_w * _pwf) // 2 * 2)
+            main_target_h = max(2, int(main_target_h * _pwf) // 2 * 2)
+            _pw_cap_w = _PIPE_WORK_MAX_W
+        if main_video.enc_settings.get("frame_rate_type") == "custom":
+            try:
+                target_fps = float(main_video.enc_settings.get("frame_rate_custom", "30") or "30")
+            except (ValueError, TypeError):
+                target_fps = 30.0
+        else:
+            target_fps = self._get_video_framerate(main_video.file_path) or 30.0
+
+        # ---- 1. 视频链：复用串行合并单一来源（与正式命令一致）----
+        # 先给一条「正在构建」日志：多轨时 mpv 首次加载可能数秒以上，没有回执很像卡死
+        self._append_info_ui(
+            _('[预览] 正在构建滤镜版预览（{0} 轨）…首次加载可能需数秒，请稍候').format(len(video_tracks)))
+        (filter_parts, v_labels, seg_durations,
+         trans_effective, total_dur) = self._build_concat_video_graph(
+            video_tracks, global_norm=self._concat_norm_global_on(),
+            preview_work_cap=_pw_cap_w)
+        if not filter_parts or total_dur is None or total_dur <= 0:
+            self._append_info_ui(_("[预览] 视频链构建失败，无法预览"))
+            return
+
+        # ---- 2. 输入挂接：为每个 [i:v] 定义源（位置文件 + movie）----
+        source_parts = []
+        for i, trk in enumerate(video_tracks):
+            fp = normalize_path(trk.file_path)
+            dur_i = seg_durations[i] if i < len(seg_durations) else 10.0
+            if dur_i is None or dur_i <= 0:
+                dur_i = 10.0
+            if self._is_static_image(fp):
+                # 图片：color 基源(有限时长) + overlay 包裹（单帧 eof_action=repeat 撑出 dur_i 秒）；
+                # 基源尺寸取图片原生尺寸，再由逐轨 scale 统一到主视频规格（与正式命令一致，避免 overlay 裁切）。
+                md = self._get_video_dimensions_cached(fp)
+                iw = int(md[0]) if md and md[0] else main_target_w
+                ih = int(md[1]) if md and md[1] else main_target_h
+                if iw <= 0: iw = main_target_w
+                if ih <= 0: ih = main_target_h
+                if i == 0:
+                    # 主位置文件：图片 → [vid1] 作次输入
+                    source_parts.append(f"[vid1]format=yuv420p[img{i}]")
+                else:
+                    safe = self._movie_path_safe(fp, i).replace("\\", "/").replace(":", "\\\\:")
+                    source_parts.append(f"movie={safe}[img{i}]")
+                # 基源段与图源段互不依赖（filtergraph 按标签拓扑排序）→ 两分支共用一行，
+                # 不再各写一遍（旧版 if/else 里两行完全相同）。
+                source_parts.append(
+                    f"color=c=black@0:s={iw}x{ih}:r={target_fps:g}:d={_ffsec(dur_i)}[base{i}]")
+                source_parts.append(
+                    f"[base{i}][img{i}]overlay=format=auto:eof_action=repeat,format=yuv420p[{i}:v]")
+            else:
+                # 视频：连续流，movie/位置流 + format 即可（无需 color 包裹——此为「扩展到视频类型」的核心）
+                if i == 0:
+                    source_parts.append(f"[vid1]format=yuv420p[{i}:v]")
+                else:
+                    safe = self._movie_path_safe(fp, i).replace("\\", "/").replace(":", "\\\\:")
+                    source_parts.append(f"movie={safe},format=yuv420p[{i}:v]")
+
+        # ---- 3. 文字水印/倒计时（与正式命令同开关；全子图 route [vout]→[v_tw]）----
+        # 注：正式命令把非旋转 drawtext 内联进 global_video_filters 以省子图；预览统一走
+        # build_text_watermark_chain 全子图（视觉等价，省去与正式命令的重复分叉）。
+        self._apply_merge_text_watermark([main_video])
+        tw_frag = build_text_watermark_chain(main_video.enc_settings,
+                                            main_label="[vout]", out_label="[v_tw]")
+        if tw_frag:
+            # 旋转子图含 color 无限源：eof_action=pass + 末端 trim 双保险（与画中画预览一致）
+            tw_frag = tw_frag.replace(":format=auto", ":format=auto:eof_action=pass")
+            filter_parts.append(tw_frag)
+            vmap = "[v_tw]"
+        else:
+            vmap = "[vout]"
+
+        # ---- 4. 音频：镜像正式串行合并音频链（真实音轨/静音底噪 + acrossfade + BGM）----
+        # 源用 movie=<路径>:s=a 显式取，绕开 mpv [aidN] 按「含音轨文件」独立计数的编号陷阱。
+        (audio_src_parts, audio_parts,
+         amap, audio_summary) = self._build_concat_audio_graph_mpv(
+            video_tracks, seg_durations, trans_effective, total_dur, main_video)
+        # 末端钳到 total_dur：正式命令靠 -shortest 收敛，mpv 预览无 -shortest → 显式等长，
+        # 避免跨段重叠/BGM 的 duration=longest 把音频拖得比视频长。
+        audio_parts.append(
+            f"{amap}atrim=0:{_ffsec(total_dur)},apad=whole_dur={total_dur:.3f},"
+            f"asetpts=PTS-STARTPTS[ao]")
+
+        # ---- 5. 末端收尾：trim 到 total_dur（防无限源撑长）+ [vo] ----
+        filter_parts.append(f"{vmap}trim=0:{_ffsec(total_dur)},setpts=PTS-STARTPTS[vo]")
+
+        # ---- 【时间预览引擎】管道合成模式（2026-09-20，开放串行合并）----
+        # 不启动 mpv：把同一张串行合并图改喂内置时间预览窗口（ffmpeg -filter_complex → rawvideo
+        # 管道）→ 保留标记 / 波形 / 逐帧步进 / A-V 仲裁。
+        # · 只取**视频链**（source_parts + filter_parts）：音频段整体不带入——管道只出画面，
+        #   声音由预览窗口的 ffplay 引擎按主文件播放（带音频段会让 movie=:s=a 源悬挂、图变脏）。
+        # · [i:v] 是串行视频图的内部标签，与 ffmpeg 输入流标签 [0:v] 同名 → 先整体改名成 [svi]，
+        #   再由 _lavfi_complex_to_ffmpeg_pipe 把主输入 [vid1] 映射成 [0:v]，避免自引用。
+        # · 时间轴 = **输出时间轴**（out_dur=total_dur → pipe_out_mode）：打开时定位在 0、不触发
+        #   任何 seek；拖动进度条走输出侧 trim（慢但正确）。
+        if pipe_engine:
+            # ---- 末端处理接入（2026-09-20 用户实测：串行合并管道预览无末端处理效果）----
+            # split 网格不需要额外输入流（split 自复制主画面）→ 管道可完整支持；末端 concat
+            # 图片/视频需要额外输入文件，预览不支持（与 mpv 预览同限），日志明示。
+            # 注入点 = 视频链终端段（{vmap}trim=0:T,setpts=PTS-STARTPTS[vo]）末尾，与正式命令
+            # 「末端处理链尾最外层」口径一致。split/concat 互斥、concat 优先（同 _apply_end_handling_cmd）。
+            _eh_c = self._merge_end_handling or {}
+            _bp_c = build_preview_border_frag(_eh_c)
+            try:
+                _cr = max(1, int(_eh_c.get("split_rows", 1) or 1))
+                _cc = max(1, int(_eh_c.get("split_cols", 1) or 1))
+            except (ValueError, TypeError):
+                _cr = _cc = 1
+            _cn_c = _cr * _cc
+            _split_c = (bool(_eh_c.get("split_enabled", False))
+                        and not bool(_eh_c.get("concat_enabled", False))
+                        and (2 <= _cn_c <= 5))
+            _bp_before_c = bool(_bp_c) and _split_c and (not bool(_eh_c.get("border_after_split", True)))
+            if (_eh_c.get("concat_enabled", False)
+                    and (_eh_c.get("concat_path", "") or "").strip()):
+                self._append_info_ui(
+                    _("[时间预览] 末端 concat（追加图片/视频）在预览中不支持（需额外输入流），仅正式导出生效"))
+            if (_split_c or _bp_c) and filter_parts and filter_parts[-1].endswith("[vo]"):
+                _seg0 = filter_parts[-1][:-4]     # 去掉末尾 [vo]，末端段以逗号接在其后
+                if _split_c and _bp_before_c:
+                    # 每格带框：先 pad → [v_cb]，再从 [v_cb] 进 split 网格 → [vo]
+                    filter_parts[-1] = (_seg0 + "," + _bp_c + "[v_cb];"
+                                        + build_end_split_filters(_cr, _cc, "[v_cb]", "[vo]"))
+                elif _split_c:
+                    # in_label 留空 = split 直接逗号接在前链后（无标签链继续，合法）
+                    filter_parts[-1] = (_seg0 + ","
+                                        + build_end_split_filters(_cr, _cc, "", "[vo]"))
+                else:
+                    filter_parts[-1] = _seg0 + "," + _bp_c + "[vo]"
+            _vg = ";".join(source_parts + filter_parts)
+            for _i in range(len(video_tracks)):
+                _vg = _vg.replace("[%d:v]" % _i, "[sv%d]" % _i)
+            # 输出比例（与画中画分支同口径）：网格把输出放大 cols×/rows×，边框再加边距——
+            # 不下传真实比例，2 格拼接会被按源比例的预览框 letterbox（用户实测黑边）。
+            _bw_c = _bh_c = 0
+            if _bp_c:
+                try:
+                    _bw_c = (max(0, int(_eh_c.get("border_left", 0) or 0))
+                             + max(0, int(_eh_c.get("border_right", 0) or 0)))
+                    _bh_c = (max(0, int(_eh_c.get("border_top", 0) or 0))
+                             + max(0, int(_eh_c.get("border_bottom", 0) or 0)))
+                except (ValueError, TypeError):
+                    _bw_c = _bh_c = 0
+            if _split_c and _bp_before_c:
+                _pow_c = (main_target_w + _bw_c) * _cc
+                _poh_c = (main_target_h + _bh_c) * _cr
+            else:
+                _pow_c = main_target_w * (_cc if _split_c else 1) + _bw_c
+                _poh_c = main_target_h * (_cr if _split_c else 1) + _bh_c
+            _pipe_ar = (float(_pow_c) / _poh_c) if _poh_c > 0 else None
+            # 合成音频图（2026-09-20）：不直读主文件音轨（主文件=第一段 → 播完第一段就无声，
+            # 用户实测），把 audio_src_parts + audio_parts 原样拼成**独立 lavfi 图**交给
+            # ffplay -f lavfi 播放——声音跨段连续、与 xfade 画面对齐，seek 由 _a_start 在
+            # 图末追加 atrim=start=at（输出时间轴，与视频 out_mode 同口径）。
+            _a_graph = None
+            # 图的**末输出标签恒为 [ao]**（上面音频段最后一截 atrim+apad 钳到 total_dur 的
+            # 输出）；amap 是钳制前的中间标签，别在这里用
+            _a_map = "[ao]"
+            try:
+                if audio_src_parts or audio_parts:
+                    _a_graph = ";".join(audio_src_parts + audio_parts)
+            except Exception:
+                _a_graph = None
+            self._append_info_ui(
+                _('[时间预览] 串行合并管道合成预览：{0} 段（ffmpeg -filter_complex → rawvideo；总时长 {1:.2f}s；含逐轨滤镜 + 转场 + 文字水印').format(len(video_tracks), total_dur)
+                + (_("；音频走合成图 ffplay -f lavfi）") if _a_graph else _("；无音频图，预览静音）")))
+            self._open_pipe_time_preview(
+                main_file, dict(main_video.enc_settings or {}), _vg, None, None,
+                aspect=_pipe_ar, out_dur=total_dur, out_start=0.0,
+                pipe_audio_graph=_a_graph, pipe_audio_map=(_a_map or "[ao]"))
+            return
+
+        graph = ";".join(source_parts + audio_src_parts + filter_parts + audio_parts)
+        # 音频节点效果（2026-09-26）：串行合并预览图同样叠加（与导出同口径；预览图与正式图结构
+        # 略异时走 anchor 重锚，对不上就跳过 —— 导出端保证生效）。
+        if getattr(self, "node_audio_fx", None):
+            try:
+                graph, _fx_final_lbl = self._apply_node_audio_fx(
+                    graph, "afinal" if "[afinal]" in graph else ("aout" if "[aout]" in graph else "out"),
+                    anchor_nodes=graph_nodes(getattr(self, "_last_graph", "") or ""))
+            except Exception as _e:
+                self._append_info_ui(_('[音频节点] 预览叠加失败（按原图继续）: {0}').format(_e))
+        # 回退路径提速：给 concat 图内 movie= 子输入（音频 :s=a / 视频轨 i>0）注入各自 trim/atrim
+        # 起点的 seek_point（向后关键帧 seek，避免从 0 空解到起点；与正常预览 --hr-seek=no 同效）。
+        # 主视频轨(track0) 走位置文件 [vid1]，无法用 seek_point → 改由下方 mpv --start 快进。
+        graph = SimplePreviewer._inject_movie_seek_point_per_sub(graph)
+        if not _mpv_ok:
+            # ---- ffplay 回退（2026-09-21 重开）：`-f lavfi` 当主输入 ----
+            # 主输入不再是文件而是**整张图** ⇒ 主输入 EOF = 图 EOF = 整段拼接时长 ⇒
+            # -autoexit 全播完才关窗（这正是旧版删掉这条回退的原因，现已破）。
+            _main_movie = (self._movie_path_safe(main_file, 0)
+                           .replace("\\", "/").replace(":", "\\\\:"))
+            # 与 mpv 同图：先注入 movie= 子输入 seek_point，再交给 _concat_graph_to_ffplay
+            # 改写 [vid1]→movie（并补主视频轨 seek_point）。ffplay 不可 --start，只靠 seek_point。
+            _inj_graph = SimplePreviewer._inject_movie_seek_point_per_sub(
+                ";".join(source_parts + audio_src_parts + filter_parts + audio_parts))
+            _ff_graph = self._concat_graph_to_ffplay(_inj_graph, _main_movie)
+            if not _ff_graph:
+                self._append_info_ui(
+                    _("[预览] 串行合并预览：mpv 不可用且 mpv 图转 ffplay 失败，无法预览"))
+                return
+            cmd = [self.ffplay_cmd, "-autoexit", "-volume", str(self.preview_volume.get())]
+            # ⚠️ 不给 -ss：-f lavfi 的输入不可 seek，给了只会打一行
+            #    "could not seek to position N" 然后**从头播**（实测 -ss 2 + 4s 图仍 4.37s）；
+            #    缩略图口径与管道引擎的「输出时间轴」一致 —— 要定位只能靠图内输出侧 trim。
+            # ⚠️ 不给 -t：图末端 trim 已把时长钳到 total_dur；-t 是「主输入 pts 上限」的读包级
+            #    判据，在这里既多余又可能误丢包（见 ffplay-preview README §3b/§4.5d）。
+            cmd.extend(["-f", "lavfi", "-i", _ff_graph])
+            # 缩放到屏幕内（复用与画中画/PiP 回退同口径的 preview_margin 算法）。
+            cmd.extend(self._ffplay_fit_scale(main_target_w, main_target_h))
+            cmd.extend(["-window_title", _("预览(串行合并): ") + os.path.basename(main_file)])
+            self._append_info_ui(
+                _('[预览] 滤镜版串行合并预览：ffplay -f lavfi（{0} 轨，总时长 {1:.2f}s；含逐轨滤镜 + 转场 + 文字水印；音频：{2}）').format(len(video_tracks), total_dur, audio_summary))
+            self._append_info_ui(_("执行命令: ") + format_cmd_for_display(cmd))
+            # ffplay 滤镜图出错时 rc 仍为 0（README §4.7）→ 必须走 stderr 扫描那条路。
+            self._spawn_player_stderr_scan(cmd, scan_ffplay=True)
+            return
+
+        # 主视频轨 trim 起点 → mpv --start 快进（位置文件无法走 seek_point，用输入级 seek 等效提速）；
+        # --hr-seek=no 落到关键帧（图内 trim 兜底吸收 GOP 偏移，预览「快」优先，与正常预览一致）。
+        # ffplay 不可 --start，故回退路径只注入 seek_point（见上方 _inj_graph），不要求本段。
+        _mpv_extra = ["--hr-seek=no"]
+        _ms0 = main_video.enc_settings if main_video is not None else {}
+        if _ms0.get("trim_enabled", False):
+            _s0 = (_ms0.get("trim_start", "") or "").strip()
+            if _s0:
+                try:
+                    _s0_sec = time_to_seconds(_s0)
+                except Exception:
+                    _s0_sec = 0.0
+                if _s0_sec and _s0_sec > 0:
+                    _mpv_extra.insert(0, f"--start={_s0_sec:g}")
+        player = self.mpv_path.get().strip() or "mpv"
+        cmd = [player, main_file, f"--lavfi-complex={graph}", f"--length={total_dur:g}"] + _mpv_extra
+        self._append_info_ui(
+            _('[预览] 滤镜版串行合并预览：mpv lavfi-complex（{0} 轨，总时长 {1:.2f}s；含逐轨滤镜 + 转场 + 文字水印；音频：{2}）').format(len(video_tracks), total_dur, audio_summary))
+        self._append_info_ui(_("执行命令: ") + format_cmd_for_display(cmd))
+        try:
+            flags = _ffmpeg_spawn_flags()
+            # 开新预览前先关掉上一次预览的播放器（防两窗口同时出声 = 重音）；
+            # 登记句柄供下一次预览关闭。
+            self._reap_prev_preview_player()
+            self._preview_player_proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=flags)
+            _register_preview_proc(self._preview_player_proc)
+        except Exception as e:
+            # 兜底：Popen 抛 OSError=mpv 进程起不来（不可用），标记标志供后续预览直接回退
+            self._mpv_usable = False
+            self._mpv_verified = True   # 已实测失败，后续预览直接回退不再重试子进程
+            self._append_info_ui(_('[预览] mpv 启动失败: {0}（已标记 mpv 不可用，请检查路径或用 EDL 预览）').format(e))
+    def _time_preview_pipe_current(self):
+        """转码页「时间预览引擎」：把当前设置的合成图（图片水印/旋转/裁剪/画布/文字水印/
+        变速）喂给内置时间预览窗口 —— ffmpeg -filter_complex → rawvideo 管道渲染合成画面，
+        不启动 mpv/ffplay，因此保留标记 / 波形 / 逐帧步进 / 循环预览 / A-V 仲裁。
+
+        为什么这里安全（Phase 1 只开单输入）：转码页是**单文件**，图内除图片水印（`movie=`
+        静态图、无时间轴）外没有别的子输入 → 双 -ss 语义完全正确。
+        多输入（画中画子视频 / 串行合并）的 seek 对齐属 Phase 2，见
+        research/preview/README1.md 修正表 #2/#3。"""
+        path = (self.input_file.get() or "").strip()
+        if not path or not os.path.exists(path):
+            messagebox.showwarning(_("提示"), _("请先选择有效的输入文件"))
+            return
+        if not self.ffmpeg_cmd:
+            messagebox.showwarning(_("提示"), _("未找到 ffmpeg，无法预览"))
+            return
+        try:
+            settings = self.get_current_settings()
+        except Exception as e:
+            self._append_info_ui(_('[时间预览] 读取当前设置失败: {0}').format(e))
+            return
+        try:
+            self._preview_with_settings(normalize_path(path), settings, pipe_engine=True)
+        except Exception as e:
+            self._append_info_ui(_('[时间预览] 打开失败: {0}').format(e))
+            messagebox.showwarning(_("提示"), _('时间预览引擎启动失败：{0}').format(e))
+
+
+
+    def _dispatch_merge_preview(self, pipe_engine=False, on_single=None, pip_enabled_gate=True):
+        """按当前合并模式选合成图并预览 —— 三个预览入口共用的唯一分派点（2026-09-22 收敛）。
+
+        此前 `_live_preview_pipe` / `_live_preview_player` / `_time_preview_pipe_merge` 各写
+        了一遍同款的 `if concat_enabled → … elif pip_enabled → …`，改一处忘两处（历史已发生：
+        串行合并刚接进管道引擎时只改了其中一个入口）。现把模式判定收成一处：
+          · 串行合并 → merge_preview_concat_lavfi(pipe_engine=...)
+          · 画中画   → merge_preview_pip_live(pipe_engine=...)
+          · 单轨     → 调 on_single()（有传）或返回 False（调用方继续自己的单轨逻辑）
+        ⚠️ 两者的**图构建内核**刻意不合并（concat 是多段 + xfade 的输出时间轴，画中画是主 +
+        movie= 子视频的叠加图），且命令行三轴也不同（串行走 `-f lavfi -i` 且不给 -ss/-t），
+        强行并成一个函数体会变成架构重写 —— 见 `_live_preview_player` docstring 的定案。
+
+        :param pip_enabled_gate: 仅当为 True 时 `pip_enabled` 才触发画中画分派（默认 True）。
+            `_time_preview_pipe_merge` 单轨兜底传 False：仅 1 视频轨无可叠加子视频，画中画分派
+            无意义，落到 on_single（单轨实现）与旧行为一致；两入口分派器不传则保持「画中画优先」。
+        :return: True = 已分派并处理；False = 单轨且无 on_single（调用方自行兜底）
+        """
+        if self.concat_enabled.get():
+            self.merge_preview_concat_lavfi(pipe_engine=pipe_engine)
+            return True
+        if self.pip_enabled.get() and pip_enabled_gate:
+            self.merge_preview_pip_live(pipe_engine=pipe_engine)
+            return True
+        if on_single is not None:
+            on_single()
+            return True
+        return False
+
+    def _time_preview_pipe_merge(self):
+        """合并页单轨管道预览实现（_live_preview_pipe 分派器的兜底；原独立菜单入口已删，
+        2026-09-20 与「实时预览（简易时间引擎）」合并为一个自动分派入口）。对【主视频轨】的
+        合成（滤镜/水印/画布/裁剪/旋转，以及画中画多视频合成）开管道合成预览。
+
+        单个视频轨（Phase 1，2026-09-20）：走 `_preview_with_settings(pipe_engine=True)`
+        ——图内除图片水印（movie= 静态图）外无别的子输入，双 -ss 语义完全正确。
+
+        多视频轨（Phase 2，2026-09-20 用户拍板开放）：委托 `merge_preview_pip_live(
+        pipe_engine=True)`，复用同一张 PiP 合成图、只把渲染目标换成内置时间预览窗口。
+        子视频时间轴口径与 mpv / ffplay 实时预览、以及正式导出**完全一致**。
+        需要先勾选「启用画中画」，否则这些轨并不参与合成，预览会与成片不符。
+
+        串行合并（concat，2026-09-20 开放）：勾选了「串行合并（首尾拼接）」时改走
+        `merge_preview_concat_lavfi(pipe_engine=True)` —— 多段 + xfade 转场 + 逐轨滤镜 +
+        文字水印，时间轴是**输出时间轴**（打开定位在 0，拖动走输出侧 trim）。
+        """
+        enabled_tracks = [t for t in self.merge_tracks if t.enabled]
+        video_tracks = [t for t in enabled_tracks if t.type == "video"]
+        if not video_tracks:
+            self._append_info_ui(_("[时间预览] 没有启用的视频轨道"))
+            return
+        # 先做「多轨但未勾画中画」的守卫（提示必须早于分派，否则用户会看到与成片不符的图）。
+        if len(video_tracks) > 1 and not self.pip_enabled.get() and not self.concat_enabled.get():
+            self._append_info_ui(
+                _('[时间预览] 检测到 {0} 个视频轨——多轨合成需先勾选「启用画中画」（否则这些轨不参与合成，预览与成片不符）；或只启用单个视频轨，走单轨管道预览').format(len(video_tracks)))
+            return
+        # 分派（串行合并优先：它的图是多段 + xfade 的「输出时间轴」，与画中画的叠加图完全
+        # 不同，必须走 concat 专用图；多轨且勾画中画 → 画中画图）。单轨即便勾了「启用画中画」
+        # 也无可叠加子视频，应走单轨实现（旧行为）——故 pip 路由以多轨为前提（pip_enabled_gate），
+        # 与两入口分派器默认「画中画优先」的口径不同：本条是单轨兜底，单轨+画中画=单轨预览。
+        if self._dispatch_merge_preview(pipe_engine=True,
+                                        on_single=lambda: self._time_preview_single_track(video_tracks),
+                                        pip_enabled_gate=(len(video_tracks) > 1)):
+            return
+
+
+
+    def _time_preview_single_track(self, video_tracks):
+        """单轨管道预览实现（_time_preview_pipe_merge 分派器的单轨兜底；原方法体下半段抽出）。
+
+        仅 1 个视频轨（或单轨兜底被触发）时，把该轨当单文件走 `_preview_with_settings` 开管道
+        合成预览——图内除图片水印（movie= 静态图）外无别的子输入，双 -ss 语义完全正确。
+        """
+        _main = video_tracks[0]
+        path = normalize_path(_main.file_path)
+        if not path or not os.path.exists(path):
+            self._append_info_ui(_("[时间预览] 主视频轨文件不存在"))
+            return
+        if not self.ffmpeg_cmd:
+            messagebox.showwarning(_("提示"), _("未找到 ffmpeg，无法预览"))
+            return
+        # 与画中画实时预览同款：先把合并页的文字水印设置落到该轨 enc_settings，再当单文件预览
+        try:
+            self._apply_merge_text_watermark([_main])
+        except Exception:
+            pass
+        # 末端处理接入（2026-09-20 用户实测：封装页普通模式管道预览看不到末端处理效果）：
+        # 正式命令由 _apply_merge_end_handling 在构建后注入 self._merge_end_handling，
+        # 轨道 enc_settings 里没有这个键 → 预览图里 split 网格/边框全丢。这里补注入
+        # （_preview_with_settings 读 settings["end_handling"] 建末端段，与转换页同一条路径）。
+        _s = dict(_main.enc_settings or {})
+        try:
+            _s["end_handling"] = copy.deepcopy(self._merge_end_handling)
+        except Exception:
+            pass
+        try:
+            self._preview_with_settings(path, _s, pipe_engine=True)
+        except Exception as e:
+            self._append_info_ui(_('[时间预览] 打开失败: {0}').format(e))
+            messagebox.showwarning(_("提示"), _('时间预览引擎启动失败：{0}').format(e))
+
+    def _live_preview_pipe(self):
+        """右键「实时预览（简易时间引擎）」：按当前合并模式选合成图，喂给内置时间预览窗口。
+
+        本条的兄弟入口 `_live_preview_player`（右键「实时预览（复杂滤镜）」）走外部
+        播放器（mpv / ffplay），性能通常更好，仅子视频过多时才相对吃力；本条是它的**内置引擎版**：
+        ffmpeg -filter_complex → rawvideo 管道，由 SimplePreviewer 渲染 → 保留标记 / 波形 /
+        逐帧步进 / A-V 仲裁，且不依赖 mpv。注意：内置引擎画面小、性能有限。按模式分派：
+          · 串行合并 → merge_preview_concat_lavfi(pipe_engine=True)（多段 + xfade 图）；
+          · 画中画   → merge_preview_pip_live(pipe_engine=True)（主 + movie 子视频图）；
+          · 普通单轨 → _time_preview_pipe_merge()（该轨自身滤镜/水印/画布合成）。
+        判定逻辑已收进 `_dispatch_merge_preview`（三入口共用），本方法只传引擎与单轨兜底。
+        """
+        self._dispatch_merge_preview(pipe_engine=True,
+                                     on_single=self._time_preview_pipe_merge)
+
+    def _live_preview_player(self):
+        """右键「实时预览（复杂滤镜）」：按当前合并模式选合成图，交外部播放器渲染。
+
+        **入口收敛（2026-09-21 用户拍板）**：原为两条独立入口 ——「实时预览（画中画，可能卡顿）」
+        → merge_preview_pip_live、「串行合并预览 (支持滤镜 lavfi)」→ merge_preview_concat_lavfi。
+        两者本就走同一套外壳（模式守卫 / 取轨 / 轨数上限 / 文字水印注入 / seek_point 注入 /
+        播放器启动与回收），差的只是**图构建内核**：
+          · 画中画   = 主 `[vid1]` + 每子视频 `movie=` → `overlay` 叠加（overlay 栈）；
+          · 串行合并 = `_build_concat_video_graph`（多段 + xfade 转场，与正式命令单一来源）。
+        且末端处理、音频链、ffplay/mpv 命令行三处也各不相同（串行走 `-f lavfi -i 图`、**不给**
+        `-ss`/`-t`、要 `--length`；画中画走 `-i 文件 -vf 图`、要 `-ss`/`-af`/`-t`）——要真并成
+        一个函数体，得抽「图构建器」策略并把上述三轴一并参数化，属架构重写。故本轮**只收敛
+        入口，实现体保留两个**（用户确认的方案）。
+
+        与 `_live_preview_pipe` 的差别只在**渲染引擎**：本条走 mpv / ffplay 外部窗口（可能卡顿、
+        窗口内无标记/波形/步进）；那条走内置时间预览窗口（ffmpeg 管道，不依赖 mpv）。
+        单轨模式（画中画与串行都没勾）无复杂合成图可言 → 只给指引，不误开播放器。
+        """
+        if self._dispatch_merge_preview():
+            return
+        # 与旧「实时预览（画中画）」在非画中画模式下的提示同口径（只进日志、不弹窗），
+        # 只是把可用的替代入口一并列出，别让用户卡在死路上。
+        self._append_info_ui(
+            _("[预览] 当前是单轨模式（未勾选「启用画中画」/「串行合并」）——"
+            "「实时预览（复杂滤镜）」用于多轨合成图；单轨请用「预览轨道」查看该轨滤镜。"))
+
     def _merge_preview_right_menu(self):
         """合并页预览按钮右键：快照 / 缩略图 / 实时预览 选择菜单"""
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label=_("快照（画中画合成）"), command=lambda: self.merge_preview_selected(with_snapshot=True))
         menu.add_command(label=_("缩略图"), command=self._contact_sheet_selected_track)
+        # 「时间预览引擎（主视频轨合成）」入口已删除（2026-09-20 用户确认）：它与下面的
+        # 「实时预览（简易时间引擎）」功能重复——后者按模式自动分派（串行合并图 / 画中画图 /
+        # 单轨合成图），前者在被覆盖后只剩冗余。_time_preview_pipe_merge 方法保留：
+        # 仍是 _live_preview_pipe 的单轨兜底实现（40901 行分派器调用）。
         menu.add_separator()
-        menu.add_command(label=_("实时预览（画中画，可能卡顿）"), command=self.merge_preview_pip_live)
+        # 实时预览（复杂滤镜）：入口收敛（2026-09-21 用户拍板）——原「实时预览（画中画，可能卡顿）」
+        # 与「串行合并预览 (支持滤镜 lavfi)」合成一条，由 _live_preview_player 按当前模式自动分派。
+        # 置灰口径跟随将要走的分支：串行合并模式需 mpv 或 ffplay；画中画模式恒可点。
+        menu.add_command(label=_("实时预览（复杂滤镜）"),
+                         command=self._live_preview_player,
+                         state=("normal" if (not self.concat_enabled.get()
+                                             or self.use_mpv.get() or self.ffplay_cmd)
+                                else "disabled"))
+        # 实时预览（简易时间引擎）：同一张合成图改走内置时间预览窗口（ffmpeg 管道，不依赖 mpv，
+        # 但画面小、性能有限，子视频多 / 滤镜重时同样可能卡顿；外部播放器（mpv/ffplay）性能通常更好）
+        # —— 按当前模式自动选图：串行合并图 / 画中画图 / 单轨合成图。
+        menu.add_command(label=_("实时预览（简易时间引擎，画面小）"), command=self._live_preview_pipe)
+        if self.concat_enabled.get():
+            # 串行合并模式下追加「整段拼接」预览入口（EDL 轻量无滤镜）。
+            # EDL 走 mpv 的 edl:// → 仍按 use_mpv 置灰。
+            # （滤镜版入口已由上方统一按钮覆盖 → 该项删除，2026-09-21。）
+            menu.add_command(label=_("串行合并预览 (无滤镜 mpv EDL)"), command=self.merge_preview_concat_edl,
+                             state=("normal" if self.use_mpv.get() else "disabled"))
         x = self.root.winfo_pointerx()
         y = self.root.winfo_pointery()
         menu.post(x, y)
 
     def _transcode_preview_right_menu(self):
-        """转码页预览按钮右键：快照 / 缩略图 选择菜单"""
+        """转码页预览按钮右键：快照 / 缩略图 / 时间预览引擎 选择菜单"""
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label=_("快照（水印合成）"), command=lambda: self.preview_current_file(with_snapshot=True))
         menu.add_command(label=_("缩略图"), command=self._contact_sheet_current_file)
+        # 时间预览引擎（2026-09-20 Phase 1）：同一张合成图改走 ffmpeg -filter_complex → rawvideo
+        # 管道，由内置 SimplePreviewer 渲染 —— 保留标记/波形/步进，且无需 mpv/ffplay。
+        menu.add_command(label=_("实时预览（简易时间引擎，画面小）"), command=self._time_preview_pipe_current)
         x = self.root.winfo_pointerx()
         y = self.root.winfo_pointery()
         menu.post(x, y)
@@ -39426,6 +46989,7 @@ class FFmpegBatchGUI:
             removed = self.merge_tracks.pop(idx)
             self._append_info_ui(_("[封装] 已删除轨道: {0} - {1}").format(removed.type, os.path.basename(removed.file_path)))
         self.merge_update_track_list()
+        self.merge_auto_recommend_container()
         self.merge_update_command_preview()
     
     def merge_clear_tracks(self):
@@ -39459,27 +47023,8 @@ class FFmpegBatchGUI:
 
 
 
-    def merge_move_track_up(self, idx):
-        if idx <= 0:
-            return
-        self.merge_tracks[idx], self.merge_tracks[idx-1] = self.merge_tracks[idx-1], self.merge_tracks[idx]
-        self.merge_update_track_list()
-        self.merge_update_command_preview()
 
-    def merge_move_track_down(self, idx):
-        if idx >= len(self.merge_tracks)-1:
-            return
-        self.merge_tracks[idx], self.merge_tracks[idx+1] = self.merge_tracks[idx+1], self.merge_tracks[idx]
-        self.merge_update_track_list()
-        self.merge_update_command_preview()
 
-    def merge_remove_track(self, track_idx):
-        if 0 <= track_idx < len(self.merge_tracks):
-            removed = self.merge_tracks.pop(track_idx)
-            self._append_info_ui(_("[封装] 已删除轨道: {0} - {1}").format(removed.type, os.path.basename(removed.file_path)))
-            self.merge_update_track_list()
-            self.merge_auto_recommend_container()
-            self.merge_update_command_preview()
 
     def evaluate_expression(self, expr, main_w, main_h, box_w, box_h):
         return safe_eval_expr(expr, {"W": main_w, "H": main_h, "w": box_w, "h": box_h})
@@ -39496,7 +47041,7 @@ class FFmpegBatchGUI:
         播放器层，mpv 独有）同类型互斥；滤镜倒放 reverse 预览已取消（强制不含 reverse）。"""
         track = self.merge_tracks[track_idx]
         if not os.path.exists(track.file_path):
-            self._append_info_ui(_("[预览] 文件不存在: {0}").format(track.file_path))
+            self._append_info_ui(_('[预览] 文件不存在: {0}').format(track.file_path))
             return
     
         if track.type == "video":
@@ -39555,7 +47100,12 @@ class FFmpegBatchGUI:
                 include_trim=False,
                 enhance_settings=enhance,
                 reverse=False,
-                clip_duration=self._get_media_duration(track.file_path)
+                # 静态图片的「输出时长」= 显示时长（如 16s），不是源探测时长（~0.04s）。
+                # 淡出起点 st = clip_duration - fade_out；若用源时长 → st≈0 → 3s 就淡出变黑
+                # （用户 2026-09-19 实测）。故图片强制用显示时长定位淡出。
+                clip_duration=(_eff_image_display_duration(temp_settings)
+                               if self._is_static_image(track.file_path)
+                               else self._get_media_duration(track.file_path))
             )
     
             # ---- 画中画模式：为主视频绘制子视频虚拟框 ----
@@ -39578,7 +47128,7 @@ class FFmpegBatchGUI:
                             box_w, box_h = rendered
                         else:
                             box_w, box_h = 200, 150
-                            self._append_info_ui(_("[预览] 无法获取从视频渲染尺寸，使用默认 {0}x{1}").format(box_w, box_h))
+                            self._append_info_ui(_('[预览] 无法获取从视频渲染尺寸，使用默认 {0}x{1}').format(box_w, box_h))
                         # 静态角度旋转(rotate_angle) / 持续旋转(spin)：实际输出为 hypot 包围盒正方形
                         # 定位语义（2026-08-26 统一）：overlay_x/y 的 w/h 恒为内容盒（box_w/box_h）。
                         # 旋转时实际叠加区域是中心对齐的 d×d 正方形 → 占位正方形位置
@@ -39591,7 +47141,7 @@ class FFmpegBatchGUI:
                         if overlay_rotation_active(sub.enc_settings):
                             d = int(round(((box_w * box_w + box_h * box_h) ** 0.5)))
                             self._append_info_ui(
-                                _("[预览] 从视频 {0} 启用了旋转，占位框显示为正方形包围盒 {1}x{1}（旋转后实际叠加尺寸）").format(os.path.basename(sub.file_path), d, d))
+                                _('[预览] 从视频 {0} 启用了旋转，占位框显示为正方形包围盒 {1}x{2}（旋转后实际叠加尺寸）').format(os.path.basename(sub.file_path), d, d))
                         x_expr = sub.enc_settings.get('overlay_x', '0')
                         y_expr = sub.enc_settings.get('overlay_y', '0')
                         x_val = self.evaluate_expression(x_expr, main_w, main_h, box_w, box_h)
@@ -39609,13 +47159,13 @@ class FFmpegBatchGUI:
                                     cx - box_w / 2.0, cy - box_h / 2.0, box_w, box_h, _ra,
                                     color="red@0.5", t=2, n=5))
                                 self._append_info_ui(
-                                    f"[预览] 从视频 {os.path.basename(sub.file_path)} 同时显示蓝色正方形占位与红色旋转原始矩形")
+                                    _('[预览] 从视频 {0} 同时显示蓝色正方形占位与红色旋转原始矩形').format(os.path.basename(sub.file_path)))
                             else:
                                 # 仅持续旋转（角度动态）：红色轴对齐原始矩形
                                 drawboxes.append(f"drawbox=x={cx - box_w / 2.0:.1f}:y={cy - box_h / 2.0:.1f}:w={box_w}:h={box_h}:color=red@0.5:t=2")
                         else:
                             drawboxes.append(f"drawbox=x={x_val}:y={y_val}:w={box_w}:h={box_h}:color=red@0.5:t=2")
-                        self._append_info_ui(_("[预览] 从视频 {0} 实际渲染尺寸: {1}x{2}, 位置: ({3}, {4})").format(os.path.basename(sub.file_path), box_w, box_h, x_val, y_val))
+                        self._append_info_ui(_('[预览] 从视频 {0} 实际渲染尺寸: {1}x{2}, 位置: ({3}, {4})').format(os.path.basename(sub.file_path), box_w, box_h, x_val, y_val))
                     if drawboxes:
                         drawbox_chain = ",".join(drawboxes)
                         if filters and filters != "null":
@@ -39623,20 +47173,21 @@ class FFmpegBatchGUI:
                         else:
                             filters = drawbox_chain
 
-            # ---- 文字水印 drawtext（仅主视频；封装页自有文字水印先注入该轨道，
-            #      多条非旋转项逗号串联；旋转项在单轨 -vf 预览跳过） ----
+            # ---- 文字水印：准备两套，供静态图片（lavfi-complex）与非图片（-vf）两路径分别使用 ----
+            # tw_vf：非旋转项逗号串联（-vf 用）；tw_complex：含倒计时/旋转子图的完整复杂图
+            # （lavfi-complex 用，与转换页对等）。原「旋转项在单轨 -vf 预览跳过」改为：
+            # 静态图片走复杂图后，倒计时/旋转/轨迹全部可预览（2026-09-19 合并页动画修复）。
+            tw_vf = ""
+            tw_complex = ""
             if is_main_video:
                 self._apply_merge_text_watermark([track])
                 _tw_trk = track.enc_settings.get("text_watermark", {})
                 _tw_trk_items = track.enc_settings.get("text_watermark_items") or []
                 _ts0, _sp0 = _trim_speed_from_settings(track.enc_settings)
-                dt = build_drawtext_chain_vf(_tw_trk, _tw_trk_items,
+                tw_vf = build_drawtext_chain_vf(_tw_trk, _tw_trk_items,
                                              trim_start=_ts0, speed_factor=_sp0)
-                if dt:
-                    if filters and filters != "null":
-                        filters = f"{filters},{dt}"
-                    else:
-                        filters = dt
+                tw_complex = build_text_watermark_chain(track.enc_settings,
+                                                       main_label="[v0]", out_label="[v_tw]")
 
             # ---- 自适应缩放（固定边距） ----
             orig_w, orig_h = self._cached_video_rotated_dimensions(track.file_path, track.enc_settings)
@@ -39663,10 +47214,69 @@ class FFmpegBatchGUI:
                     filters = f"{filters},{scale_filter}"
                 else:
                     filters = scale_filter
-                self._append_info_ui(_("[预览] 缩放到 {0}x{1}").format(target_w, target_h))
+                self._append_info_ui(_('[预览] 缩放到 {0}x{1}').format(target_w, target_h))
             else:
-                self._append_info_ui(_("[预览] 保持原始尺寸 {0}x{1}").format(final_w, final_h))
+                self._append_info_ui(_('[预览] 保持原始尺寸 {0}x{1}').format(final_w, final_h))
     
+            # ---- 静态图片动画修复（2026-09-19）：复用转换页已验证的 wrap_image_static_timed_complex ----
+            # 根因：静态图片在 mpv 只解码单帧，以图片([VIN])为最终输出主输入时，滤镜图只求值一次、
+            # 时间变量 t 卡死 → 倒计时/旋转/轨迹不动画，且 loop 循环单帧也推不动 t（实测 motion=False，卡顿）。
+            # 修复 = 前置连续 color 基源(r=30:d=N)作主时间轴、图片作被保持次输入(overlay
+            # eof_action=repeat 常驻) → [v0] 变连续流（30fps 丝滑，与转换页一致）。
+            # 关键：淡入淡出/倒计时/旋转等「时间相关滤镜」必须作用在连续 [v0] 上，绝不能作用在单帧
+            # 图片 [VIN]（会冻结）——故 [VIN] 只做格式转换(_bf)，完整视频链 filters(含 fade/scale)
+            # 全部作用在 [v0]；tw_complex(倒计时/旋转) 续接 [vt]。淡出起点已用显示时长 N 定位
+            # （见上方 clip_duration 修正），故 st = N - fade_out = 13s（16s 图、淡出 3s）。
+            if self._is_static_image(track.file_path):
+                _N = _eff_image_display_duration(temp_settings)
+                _md = self._get_video_dimensions_cached(track.file_path)
+                _iw = int(_md[0]) if _md and _md[0] else 0
+                _ih = int(_md[1]) if _md and _md[1] else 0
+                if _iw <= 0 or _ih <= 0:
+                    _iw, _ih = 1280, 720
+                extra_args = []
+                if self.use_mpv.get():
+                    _bf = "format=yuv420p"   # [VIN] 仅格式转换；时间滤镜全部作用在连续 [v0]
+                    _body = filters         # 完整视频链（含 fade/scale），作用在连续输出
+                    _nodes = [f"[VIN]{_bf}[v0]"]
+                    _cur = "[v0]"
+                    if _body and _body != "null":
+                        _nodes.append(f"{_cur}{_body}[vt]")
+                        _cur = "[vt]"
+                    if tw_complex:
+                        # 时间滤镜（倒计时/旋转/轨迹）：main_label 从 [vt] 续接；eof_action=pass 防末段卡死
+                        _tc = (tw_complex.replace("[v0]", "[vt]", 1)
+                                          .replace(":format=auto", ":format=auto:eof_action=pass"))
+                        _nodes.append(_tc)
+                        _cur = "[v_tw]"
+                    _nodes.append(f"{_cur}trim=0:{_ffsec(_N)},setpts=PTS-STARTPTS[VOUT]")
+                    # 首节点 [VIN]{_bf}[v0] 必须与 wrap 的 _old 逐字一致 → 触发 color 基源改写
+                    _lc = wrap_image_static_timed_complex(";".join(_nodes), _bf, _iw, _ih, _N)
+                    # [cd_base] 命中 → preview_with_player 的 edit 3 自动注入 --length=N（与转换页一致）
+                    self.preview_with_player(track.file_path, lavfi_complex=_lc,
+                                             image_duration=_N,
+                                             extra_args=extra_args, mpv_only_args=mpv_only_args)
+                    self._append_info_ui(
+                        _('[预览] 静态图片（合并页）lavfi-complex 动画预览（连续 color 基源 r=30 d={0:g} 驱动 t；淡出起点按显示时长 {1:g}s 定位）').format(_N, _N))
+                else:
+                    # ffplay 无 -filter_complex：回退 -vf 时间滤镜，连续流由 preview_with_player
+                    # 的 ffplay 分支注入【图内 loop 前缀 + 末端 trim=0:N】（ffplay 的 -loop 1 对
+                    # image2 实测无效=1 帧即退窗，见 ffplay_image_main_vf docstring）。
+                    _ff = filters
+                    if tw_vf:
+                        _ff = (_ff + "," + tw_vf) if _ff and _ff != "null" else tw_vf
+                    self.preview_with_player(track.file_path, filters=_ff or "",
+                                             extra_args=extra_args, image_duration=_N, mpv_only_args=mpv_only_args)
+                    self._append_info_ui(
+                        _('[预览] 静态图片（合并页）ffplay 预览（图内 loop 单帧 + trim 收尾，时长 {0:g}s）').format(_N))
+                return
+            # ---- 非图片：保持原 -vf 行为（文字水印非旋转项串入 filters） ----
+            if tw_vf:
+                if filters and filters != "null":
+                    filters = f"{filters},{tw_vf}"
+                else:
+                    filters = tw_vf
+
             # ---- 音频变速（仅 ffplay） ----
             extra_args = []
             af_filters = []
@@ -39704,14 +47314,14 @@ class FFmpegBatchGUI:
                 self._append_info_ui(_("[预览] 实时倒放预览：整段从末尾向前播放（忽略截取起点跳转）。"))
 
             # ---- 调用播放器 ----
-            self.preview_with_player(track.file_path, filters or "", volume=10, extra_args=extra_args,
+            self.preview_with_player(track.file_path, filters or "", extra_args=extra_args,
                                      start_time=start_sec, duration=duration,
                                      mpv_only_args=mpv_only_args)
             if pip_enabled and is_main_video and sub_videos:
                 self._append_info_ui(_("[预览] 占位框尺寸为从视频实际渲染大小"))
     
         elif track.type == "audio":
-            self.preview_with_player(track.file_path, audio_only=True, volume=10)
+            self.preview_with_player(track.file_path, audio_only=True)
         else:
             self._append_info_ui(_("[预览] 不支持预览字幕轨"))
 
@@ -39761,10 +47371,10 @@ class FFmpegBatchGUI:
                                     stderr=subprocess.DEVNULL, creationflags=flags)
             # 审计 M4：同上——read() 不受后面的 wait(timeout) 约束，改 communicate(timeout)。
             try:
-                data, _ = proc.communicate(timeout=30)
+                data, _unused = proc.communicate(timeout=30)
             except subprocess.TimeoutExpired:
                 proc.kill()
-                data, _ = proc.communicate()
+                data, _unused = proc.communicate()
             if proc.returncode != 0 or not data:
                 return None
             return data
@@ -39806,27 +47416,34 @@ class FFmpegBatchGUI:
                 ttk.Button(btn_row, text=_("一键保存"), command=lambda: self._save_sheet_to_dir(ui)).pack(side=tk.LEFT, padx=4)
                 ui["_btn_row"] = btn_row
 
-        def _show_win():
+        def _show_win(center=False):
             w = ui["win"]
-            if w.winfo_exists():
+            if not w.winfo_exists():
+                return
+            if center:
+                # 失败路径：没有图，按请求尺寸居中显示（hide→center→show，避免左上角闪）
+                w.update_idletasks()
+                center_window(w, w.winfo_reqwidth(), w.winfo_reqheight())
+            else:
                 w.deiconify()
                 w.lift()
 
         def worker():
             data = self._ffmpeg_ppm_to_bytes(cmd, out_png)
             if data:
-                def _ok(d=data):
-                    _show_win()
-                    display_cb(d)
-                self.root.after(0, _ok)
+                # 成功路径：窗口保持 withdraw，交给 display_cb → center_window 在居中位置
+                # 才 deiconify（项目 hide→center→show 铁律，杜绝「先左上角闪一下再跳中间」）。
+                # ⚠️ 这里**绝不**先 _show_win()：那会在默认左上角 deiconify，下一帧才被
+                # center_window 移到中间 —— 用户实测就是这一闪。
+                self.root.after(0, lambda d=data: display_cb(d))
             else:
-                self.root.after(0, lambda: (_show_win(),
+                self.root.after(0, lambda: (_show_win(center=True),
                                              ui["status"].config(text=_("快照生成失败"))))
         threading.Thread(target=worker, daemon=True).start()
 
     def _save_sheet_as(self, ui):
         """缩略图「保存到…」：弹出文件对话框，从内存 PhotoImage 导出 PNG 写盘（仅保存时落盘）。"""
-        img = ui.get("img")
+        img = ui.get("img_full") or ui.get("img")   # 优先原始分辨率拼图，避免存成显示缩放后的小图
         if img is None:
             messagebox.showwarning(_("提示"), _("缩略图尚未生成"))
             return
@@ -39845,7 +47462,7 @@ class FFmpegBatchGUI:
 
     def _save_sheet_to_dir(self, ui):
         """缩略图「一键保存」：直接保存到输出目录（从内存 PhotoImage 导出 PNG），文件名为 save_name + '_缩略图.png'。"""
-        img = ui.get("img")
+        img = ui.get("img_full") or ui.get("img")   # 优先原始分辨率拼图
         if img is None:
             messagebox.showwarning(_("提示"), _("缩略图尚未生成"))
             return
@@ -39860,55 +47477,240 @@ class FFmpegBatchGUI:
         except Exception as e:
             messagebox.showerror(_("保存失败"), str(e))
 
+    def _snapshot_display_box(self, reserve_w=None, reserve_h=None):
+        """快照/拼图窗口「图片可用区域」——口径与 mpv 预览（_ffplay_fit_scale）一致：
+        screen 减去 preview_margin（默认 80，覆盖标题栏 + 任务栏 + 边框）后，再扣掉
+        「除了图片以外的窗口占位」，剩下的才是给图片的：
+            reserve_w = WM 左右边框(WIN_SHELL_W) + 图片 Label 左右边距 12
+            reserve_h = WM 标题栏/边框(WIN_SHELL_H) + 客户区非图片开销(WIN_CLIENT_OVERHEAD_H)
+        ⚠️ 只扣「0.9 大 reserve」或只扣「标题栏 36」都不够：前者比 mpv 预览小一圈（用户
+        实测「缩放还是小了点」）；后者漏掉状态栏 ⇒ 窗口比可用区还高，底边掉进任务栏
+        （用户实测「下面文字看不到」）。所以 reserve 必须**分开算外壳与客户区开销**。
+        """
+        try:
+            _scr_w = int(self.root.winfo_screenwidth())
+            _scr_h = int(self.root.winfo_screenheight())
+        except Exception:
+            _scr_w, _scr_h = 1920, 1080
+        try:
+            _margin = int(self.preview_margin.get())
+        except Exception:
+            _margin = 80
+        if reserve_w is None:
+            reserve_w = WIN_SHELL_W + 12
+        if reserve_h is None:
+            reserve_h = WIN_SHELL_H + WIN_CLIENT_OVERHEAD_H
+        _avail_w = max(320, _scr_w - _margin)
+        _avail_h = max(240, _scr_h - _margin)
+        return (max(_avail_w - reserve_w, 200), max(_avail_h - reserve_h, 200))
+
+    def _place_image_window(self, win):
+        """把「内容已装好」的快照/拼图窗口居中显示，并保证底边不被任务栏吃掉（2026-09-26）。
+
+        ⚠️ 为什么不能再用「img.width()+12 / img.height()+36」当窗口尺寸（用户实测
+        「下面文字显示不全、窗口出现时下面的文字完全看不到」）：
+          那两个手写值只算了「图片 + 标题栏」，**漏掉底部的状态栏 Label（约 24px）
+          + 上下 padding + 保存按钮行**。而 Tk 给窗口设的最小尺寸是内容的**真实需求尺寸**，
+          手写值比它小 ⇒ WM 会把窗口从给定 y 起**往下撑高**（顶边不动、底边往下长）
+          ⇒ 顶部余量看着很宽、底部状态文字正好掉进任务栏。
+        ⇒ 改用 winfo_req* 取真实需求尺寸（宽度也要取：长文案会把窗口撑宽、偏离居中）。
+
+        ⚠️ 必须在 config(image=...) / config(text=...) **之后**调用，否则量到的是旧尺寸。
+
+        底边钳制：按「客户区 + WIN_SHELL_H」算屏幕占位，居中后再限制顶边使
+        「底边 ≤ 屏幕底 − preview_margin」，等价于把窗口关在扣掉任务栏的可用区里。
+        窗口矮时该补偿为 0（干净居中）；窗口高到会压任务栏时才顶上去，绝不下移。
+        图片高度本身已由 _snapshot_display_box 预留外壳 + 状态栏，所以正常不会无解；
+        万一窗口仍比屏幕高，则 y 钳到 0（顶边贴屏幕顶，绝不推出屏幕外）。
+        """
+        try:
+            win.update_idletasks()
+            _w = win.winfo_reqwidth()
+            _h = win.winfo_reqheight()
+            _scr_h = win.winfo_screenheight()
+            try:
+                _margin = int(self.preview_margin.get())
+            except Exception:
+                _margin = 80
+            _onscreen_h = _h + WIN_SHELL_H          # 屏幕实际占位 = 客户区 + 标题栏/边框
+            _y_desired = max(0, (_scr_h - _onscreen_h) // 2)      # 整窗居中
+            _y_max = _scr_h - _margin - _onscreen_h               # 底边不越界的最大顶边
+            _y_final = max(0, min(_y_desired, _y_max))
+            # center_window 自己会算 (scr_h - h)//2，这里只补「上移量」
+            _lift = max(0, (_scr_h - _h) // 2 - _y_final)
+            center_window(win, _w, _h, offset_y=_lift)
+        except Exception:
+            pass
+    def _resample_ppm(self, data, tw, th):
+        """把内存里的单帧 PPM 缩到 tw×th，返回新 PPM bytes；失败返回 None。
+
+        只是一次「单图解码 + swscale」，**不重跑滤镜图**（输入已经是解好的那一帧）。
+        """
+        tw = max(2, int(tw) // 2 * 2)  # 取偶数：部分像素格式对奇数宽高会报 not divisible by 2
+        th = max(2, int(th) // 2 * 2)
+        if not getattr(self, "ffmpeg_cmd", None):
+            return None
+        cmd = [self.ffmpeg_cmd, "-y", "-hide_banner", "-loglevel", "error",
+               "-f", "image2pipe", "-c:v", "ppm", "-i", "pipe:0",
+               "-vf", "scale=%d:%d" % (tw, th),
+               "-frames:v", "1", "-f", "image2pipe", "-c:v", "ppm", "pipe:1"]
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL,
+                                    creationflags=_ffmpeg_spawn_flags())
+            try:
+                out, _e = proc.communicate(input=data, timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                out, _e = proc.communicate()
+            if proc.returncode != 0 or not out:
+                return None
+            return out
+        except Exception:
+            return None
+
+    def _fit_display_image(self, img_bytes, img_full, max_w, max_h):
+        """把 img_full 缩到不超过 max_w×max_h 用于**显示**；返回 (img, 说明文字)。
+
+        首选 ffmpeg swscale 做**连续比例**缩放。为什么需要这一趟：纯 Tk 的 PhotoImage
+        只能整数分之一 subsample，1080p 素材在 1080p 屏上会被砍到 960x540——可用区域明明
+        还有 1700×800 的空间（2026-09-26 用户实测反馈「缩放太小」）。项目禁 PIL，不存在
+        更精细的纯 Tk 方案，故借 ffmpeg 的 swscale。
+        ⚠️ 仍绝不用 PhotoImage.zoom 把任意比例补回来：zoom(p) 内存是 O(w·h·p²)，
+        大图上「先放后缩」直接撑爆。resample 失败 → 退回整数 subsample（功能不降级，
+        只是颗粒粗）。
+        """
+        _iw, _ih = img_full.width(), img_full.height()
+        if not _iw or not _ih:
+            return img_full, ""
+        _s = min(1.0, max_w / float(_iw), max_h / float(_ih))
+        if _s >= 0.995:
+            return img_full, ""
+        _data = self._resample_ppm(img_bytes, int(round(_iw * _s)), int(round(_ih * _s)))
+        if _data:
+            try:
+                return (tk.PhotoImage(data=_data),
+                        "（显示按 %d%% 缩放，保存仍是原尺寸）" % int(round(_s * 100)))
+            except Exception:
+                pass
+        _f = 1
+        while (_iw // _f > max_w) or (_ih // _f > max_h):
+            _f += 1
+        return img_full.subsample(_f, _f), _('（显示已缩到 1/%d，保存仍是原尺寸）') % _f
+
     def _display_snapshot(self, img_bytes, win_key):
         """把生成的图像（内存 PPM bytes）显示到指定密钥的快照窗口（主线程执行）。"""
         ui = getattr(self, "_snap_ui", {}).get(win_key)
         if ui is None or not ui["win"].winfo_exists():
             return
         try:
-            img = tk.PhotoImage(data=img_bytes)
+            img_full = tk.PhotoImage(data=img_bytes)   # 原始分辨率（保存时用，不损失）
+            ui["img_full"] = img_full
+            # ---- 显示缩放（2026-09-26）：4K 之类的大图会让窗口比屏幕还高，只见上半 ----
+            # 可用框按 mpv 预览同款 screen−preview_margin 钳制（见 _snapshot_display_box），连续比例缩放见 _fit_display_image。
+            _max_w, _max_h = self._snapshot_display_box()
+            img, _note = self._fit_display_image(img_bytes, img_full, _max_w, _max_h)
             ui["img"] = img  # 保活，防止被 GC（引用挂在窗口 ui 上）
             ui["label"].config(image=img, text="")
-            ui["status"].config(text=_("快照已生成"))
-            # 居中窗口，确保整张图（含状态栏）完整可见，不溢出屏幕下方
-            try:
-                center_window(ui["win"], img.width() + 12, img.height() + 36)
-            except Exception:
-                pass
+            ui["status"].config(text=_("快照已生成") + _note)
+            # 定位显示：按内容真实需求尺寸居中 + 底边留出任务栏（见 _place_image_window）；
+            # ⚠️ 不再手写 img+12 / img+36 —— 那只算了图片和标题栏，会把窗口撑到底部
+            # 状态栏掉进任务栏（用户实测「下面文字显示不全 / 看不到」）。
+            self._place_image_window(ui["win"])
         except Exception as e:
-            ui["status"].config(text=_("快照显示失败: {0}").format(e))
+            ui["status"].config(text=_('快照显示失败: {0}').format(e))
 
     # ---------- 画中画合成快照（方案1：静态单帧真实合成，独立窗口） ----------
-    def _build_pip_snapshot_cmd(self, track, sub_videos):
+    def _build_pip_snapshot_cmd(self, track, sub_videos, tap_label=None, out_png=None,
+                                tap_seek=None, node_fx_override=None):
         """
         复用 _build_overlay_filter_complex 生成与最终成片完全一致的 filter_complex，
         输出 1 帧 PNG 作为合成快照。子视频集合与 _build_pip_cmd 一致：
         画中画 = 全部子视频；水印模式（转码页）只有 1 个叠加元素。
-        """
-        # ---- 输入文件与索引（复用 _prepare_tracks_and_inputs 做路径去重） ----
-        # 主视频排在最前（索引 0），子视频按路径去重后续递增；与正式合并 _build_pip_cmd
-        # 的索引分配规则保持一致（单一来源，避免两处去重逻辑漂移导致快照与成片不一致）。
-        # 注：该函数会顺带 ffprobe 计算各文件流索引并写入 _type_index，快照虽用不到，
-        # 但传入的正是 Track 对象，无副作用风险。
-        input_files, file_index = self._prepare_tracks_and_inputs([track] + list(sub_videos))
 
-        # ---- 构造 sub_infos（与 _build_pip_cmd 一致：copy 临时改 libx265） ----
+        seek（2026-09-21）：只取 1 帧，截取起点不再由图内精确 trim 硬扛，改由输入级 `-ss`
+        定位（见下方长注释）——大文件 + 远起点（用户实测 143s/221s 的 4K）不再从 0 解码。
+
+        tap_label（2026-09-25，「节点标签」功能）：给出标签名时**改取该中间节点**的那一帧
+        （截断到它 + 补 nullsink），而不是最终成片。None = 旧行为，逐字节不变。
+        out_png：输出路径，None = 旧的 thumb_pip_snapshot.png。
+        tap_seek（2026-09-26）：**产物（即该节点输出）时间轴**上的秒数；None = 取第 0 帧。
+        """
+        # ---- 输入文件与索引 ----
+        # 该函数必须调用：它顺带 ffprobe 计算并写入各轨道的 _type_index（子链取流要用）；
+        # 但其返回的 file_index 是**按路径去重**的索引，本函数刻意不用（见下方 seek 说明）。
+        self._prepare_tracks_and_inputs([track] + list(sub_videos))
+
+        # ---- 截取点交给输入级 -ss，图内精确 trim 让位（2026-09-21）----
+        # 病根：主/子都以图内 `trim=start=S` 定位 ⇒ 必须从 0 解码到 S 才有首帧。
+        # 为什么不能「只加 -ss」：实测输入级 -ss 会把滤镜图时间戳**归零**（showinfo 复核：
+        # -ss 250 后首帧 pts=250；同图内 trim=start=250 反而取不到 → 黑帧），
+        # `-copyts` / `-itsoffset` 均补不回来；所以凡加了 -ss 的那条链**必须让位精确 trim**：
+        #   · 主视频：precise_trim=False —— 只关图内 trim；trim_enabled 保留 ⇒
+        #     _trim_speed_from_settings 仍以 trim_start 为换算基准，水印/轨迹/显示时段时间轴不变；
+        #   · 子视频：trim_start / trim_end 同减 S（段长不变 ⇒ loop 帧数、显示窗口时长不变）。
+        # 保真性实测（300s 素材、主 250s / 子 280s）：老写法（单输入 + 绝对 trim）与新写法
+        # 输出**逐字节一致**（同一 md5），耗时 1.50s → 0.20s。
+        # ⚠️ 主/子常是同一个文件（克隆主视频当子视频）⇒ 去重后共用一个输入就只能有一个 -ss，
+        # 而两者截取起点不同、无法各自快进（慢的那个决定快照耗时）⇒ 本函数**刻意不去重**，
+        # 主占 0 号、每个子各占一个输入、各自 -ss。路径不重复时索引与去重版完全一致（零回归）。
+        def _seek_sec(_s, _path):
+            """本轨「截取起点」秒数；静态图片（无时间轴，-ss 会取到空帧）或未启用截取 → None。"""
+            if not _path or self._is_static_image(_path):
+                return None
+            if not _s.get("trim_enabled", False):
+                return None
+            _ts = str(_s.get("trim_start", "") or "").strip()
+            if not _ts:
+                return None
+            try:
+                _v = time_to_seconds(_ts)
+            except Exception:
+                return None
+            return _v if (_v and _v > 0) else None
+
+        _main_settings = dict(track.enc_settings)
+        _main_ss = _seek_sec(_main_settings, track.file_path)
+        if _main_ss is not None:
+            _main_settings["precise_trim"] = False
+
+        input_files = [track.file_path]
+        _input_seek = [_main_ss]
         sub_infos = []
         for sv in sub_videos:
             sv_settings = sv.enc_settings.copy()
             if sv_settings.get("encoder") == "copy":
                 sv_settings["encoder"] = "libx265"
-            sub_infos.append((file_index[sv.file_path], sv.file_path, sv_settings))
+            _sv_ss = _seek_sec(sv_settings, sv.file_path)
+            if _sv_ss is not None:
+                try:
+                    _sv_ts = time_to_seconds(str(sv_settings.get("trim_start", "") or "")) or 0.0
+                except Exception:
+                    _sv_ts = 0.0
+                sv_settings["trim_start"] = f"{max(0.0, _sv_ts - _sv_ss):g}"
+                _sv_te = str(sv_settings.get("trim_end", "") or "").strip()
+                if _sv_te:
+                    try:
+                        _sv_te_v = time_to_seconds(_sv_te)
+                    except Exception:
+                        _sv_te_v = None
+                    if _sv_te_v is not None:
+                        sv_settings["trim_end"] = f"{max(0.0, _sv_te_v - _sv_ss):g}"
+            input_files.append(sv.file_path)
+            _input_seek.append(_sv_ss)
+            sub_infos.append((len(input_files) - 1, sv.file_path, sv_settings))
 
         complex_filter, final_v_label = self._build_overlay_filter_complex(
-            0, track.enc_settings, sub_infos,
+            0, _main_settings, sub_infos,
             include_subtitle_main=False,
             enhance_settings=track.enc_settings.get("enhance", {}),
             reverse=False,
-            main_file_path=track.file_path
+            include_fade=False,
+            main_file_path=track.file_path,
+            node_fx_override=node_fx_override
         )
-        # 注入到封装页的文字水印（普通/复杂，与正式命令 _build_pip_cmd 一致）：
-        # 快照不经过 merge_build_cmd_list 的注入，这里按同一开关逻辑补一次
+        # 封装页独立文字水印（self._merge_tw，与正式命令 _build_pip_cmd 一致）：
+        # 快照不经过 merge_build_cmd_list，这里补写一次主轨 enc_settings 再取片段
         self._apply_merge_text_watermark([track])
         _tw_settings = track.enc_settings.get("text_watermark", {})
         _tw_frag = build_text_watermark_chain(track.enc_settings, main_label=final_v_label, out_label="[v_dtext]")
@@ -39916,27 +47718,134 @@ class FFmpegBatchGUI:
             complex_filter = f"{complex_filter};{_tw_frag}"
             final_v_label = "[v_dtext]"
 
-        # ---- 缩放：镜像播放器预览的自适应缩放逻辑（和红框同一个规则） ----
-        # 主视频启用 pad 时，最终输出画布为 pad 画布尺寸（含偏移），
-        # 不再用主视频自身的渲染尺寸，否则快照窗口尺寸与画布不符。
-        final_w, final_h = self._compute_output_canvas(track.enc_settings, track.file_path)
-        complex_filter, map_label = self._append_fit_scale(complex_filter, final_v_label, final_w, final_h)
+        if tap_label:
+            # ---- tap 模式：截断到该中间节点 → 给悬空支补 nullsink → 直取该标签 ----
+            # 两条硬约束已由 tests/_verify_node_tools.py 的 E2/E4 锁死：
+            #   ① 标签被下游消费后不能再 -map（所以必须先截断）；
+            #   ② 截断/删段后悬空的命名输出必须有去处（所以要补 nullsink）。
+            _tr = truncate_at(complex_filter, tap_label)
+            if _tr is None:
+                raise ValueError(f"图里找不到节点 [{tap_label}]")
+            complex_filter = add_nullsinks(_tr, keep=tap_label)
+            map_label = f"[{tap_label}]"
+        else:
+            # ---- 缩放：镜像播放器预览的自适应缩放逻辑（和红框同一个规则） ----
+            # 主视频启用 pad 时，最终输出画布为 pad 画布尺寸（含偏移），
+            # 不再用主视频自身的渲染尺寸，否则快照窗口尺寸与画布不符。
+            final_w, final_h = self._compute_output_canvas(track.enc_settings, track.file_path)
+            complex_filter, map_label = self._append_fit_scale(complex_filter, final_v_label, final_w, final_h)
+
+        # ---- tap_seek 快路径（2026-09-26「节点按时间取帧」，用户 23 反馈太慢）----
+        # 复用缩略图抽帧口径（_seek_frame_ppm）：输入级 -ss + setpts=PTS+T/TB 恢复时间戳。
+        #   · 旧写法走「输出级 -ss T」——得从 0 解码整条链到 T，大文件 + 远时间点巨慢；
+        #     用户实测「缩略图 8 张都秒出、节点取 1 张反而慢」即此坑。
+        #   · 新写法：把 tap_seek 叠加到（已有的 trim 起点）之上做**输入级 -ss**，直接跳到
+        #     目标秒附近的关键帧，不再从 0 解码；但输入级 -ss 会把图内 PTS 归零，故在
+        #     [0:v]/[{idx}:v] 入口注入 setpts=PTS+T/TB 把首帧时间戳还原到真实位置，否则
+        #     rotate/overlay enable/色键等基于 t 的滤镜会全部按 t≈0 计算 → 叠加物错位。
+        #   · 取首帧（vframes 1）即目标时刻那一帧（现代 ffmpeg 输入级 -ss 帧级精确，落点即 T；
+        #     setpts 只修正时间戳、不改帧内容）。tests/_verify_tap_seek.py 的 S8/S9/S12/S13/S14
+        #     已证：此快路径与「输出级 -ss 真值」逐字节一致。
+        #   · 输入 seek 叠加到 trim 起点之上：_input_seek[k] = (原截取起点 or 0) + T，使「trim
+        #     起点 S + 节点时间 T」整体跳到 S+T；setpts 注入值用 T（图内时间轴是截取后的相对时间，
+        #     还原到产物时间轴第 T 秒）。静态图无时间轴，-ss 无意义，跳过（setpts 仍注入恒定帧）。
+        #   仅在 tap_seek>0 时启用；None/0 = 第 0 帧，保持旧输入级 -ss（trim 起点）口径，零回归。
+        if tap_seek is not None:
+            try:
+                _tsec = float(tap_seek)
+            except (TypeError, ValueError):
+                _tsec = 0.0
+            if _tsec > 0:
+                _ff_t = _ffsec(_tsec)
+                for _k in range(len(_input_seek)):
+                    if self._is_static_image(input_files[_k]):
+                        # 静态图：无时间轴，-ss 无意义，跳过；setpts 仍注入（恒定帧时间戳标到 T）
+                        continue
+                    _input_seek[_k] = (_input_seek[_k] or 0.0) + _tsec
+                complex_filter = complex_filter.replace(
+                    "[0:v]", f"[0:v]setpts=PTS+{_ff_t}/TB,", 1)
+                for _idx in range(1, len(input_files)):
+                    complex_filter = complex_filter.replace(
+                        f"[{_idx}:v]", f"[{_idx}:v]setpts=PTS+{_ff_t}/TB,", 1)
 
         # ---- 组装 ffmpeg 命令 ----
-        out_png = os.path.join(tempfile.gettempdir(), "thumb_pip_snapshot.png")
+        out_png = out_png or os.path.join(tempfile.gettempdir(), "thumb_pip_snapshot.png")
         cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
         for idx, p in enumerate(input_files):
+            # 输入级 -ss：本轨截取起点（图内 trim 已让位，见上方长注释）；tap_seek>0 时已被
+            # 上面叠加到 trim 起点之上 → 跳到目标秒附近关键帧，不再从 0 解码到该时刻。
+            if idx < len(_input_seek) and _input_seek[idx] is not None:
+                cmd.extend(["-ss", f"{_input_seek[idx]:g}"])
             # 子视频加无限循环，保证首帧可用（与 _build_pip_cmd 的 -stream_loop 一致）
             if idx != 0:
                 cmd.extend(["-stream_loop", "-1"])
             cmd.extend(["-i", p])
         cmd.extend(["-filter_complex", complex_filter])
         cmd.extend(["-map", map_label])
+        # 注：取帧时间已由上面的**输入级 -ss**（tap_seek 叠加到 trim 起点之上）实现，
+        # 不再走输出级 -ss（输出级 -ss 会从头解码到 T，慢——这正是用户反馈的坑）。
         # -update 1 让 image2 复用器把单帧直接写入 .png（避免 "does not contain an
         # image sequence pattern" 警告导致部分 ffmpeg 版本不写文件、快照窗口报"生成失败"）
         cmd.extend(["-vframes", "1", "-update", "1", out_png])
         return cmd, out_png
 
+    def _make_node_frame_extractor(self, track, sub_videos, node_key, tap_label,
+                                   orig_size, sub_file=None,
+                                   exclude_keys=("crop", "delogo", "rotate", "vflip", "hflip")):
+        """返回一个「节点时间轴取帧器」，供节点效果窗口内的可视化编辑器（裁剪/delogo/遮罩）
+        当背景帧源使用 —— 与「看它这一帧」同源（_build_pip_snapshot_cmd + tap_seek 快路径）。
+
+        关键：编辑器内部「重新获取画面 / 重新获取帧」按用户填的时间 T 取【该节点输出时间轴】
+        第 T 秒的一帧（含节点效果），而不是外部一次性生成的静止 PNG。这样在编辑器里跳转时间
+        才有意义（外部那张 PNG 对编辑器没用，用户 2026-09-26 反馈）。
+
+        exclude_keys：背景帧刻意排除「几何类」效果（裁剪/去水印/旋转/翻转），否则背景已被裁过、
+        矩形坐标空间与正式输出（裁剪→旋转→翻转 顺序）对不上。其余像素类效果（增强/降噪/色彩/
+        抠像等）保留，方便看实际观感。传入 node_fx_override（仅本次构图用，不写 self）→ 后台线程
+        安全，不会与界面命令预览抢 self.node_fx。
+        orig_size：(节点输出宽, 高) —— 编辑器坐标空间基准（取节点 PNG 真实尺寸）。
+        sub_file：真实视频路径，仅给「重新获取画面」的时间框做总时长上限钳制（避免跳太远）。
+        """
+        app = self
+        _ow, _oh = orig_size
+
+        def _excl_settings():
+            _fx = dict(getattr(app, "node_fx", {}) or {})
+            _base = dict(_fx.get(node_key, {}))
+            for _k in exclude_keys:
+                if _k == "crop":
+                    _base["crop_enabled"] = False
+                elif _k == "delogo":
+                    _base["delogo_enabled"] = False
+                elif _k == "rotate":
+                    _base["rotate"] = 0
+                elif _k == "vflip":
+                    _base["vflip"] = False
+                elif _k == "hflip":
+                    _base["hflip"] = False
+            _ov = dict(_fx)
+            _ov[node_key] = _base
+            return _ov
+
+        def _extractor(input_file, frame_sec, target_width, target_height, pre_vf=None):
+            # 注意：本函数在编辑器后台线程跑，绝不碰 Tk（cursor/after），只跑 ffmpeg。
+            _ov = _excl_settings()
+            _out = os.path.join(tempfile.gettempdir(), "node_%s_bg.png" % node_key)
+            _cmd, _png = app._build_pip_snapshot_cmd(
+                track, sub_videos, tap_label=tap_label, out_png=_out,
+                tap_seek=frame_sec, node_fx_override=_ov)
+            _p = subprocess.run(_cmd, creationflags=_ffmpeg_spawn_flags(),
+                                capture_output=True)
+            if _p.returncode != 0 or not os.path.exists(_png):
+                raise RuntimeError(
+                    "节点背景帧生成失败：\n" +
+                    (_p.stderr or b"").decode("utf-8", "replace")[-500:])
+            _w, _h, _data = _extract_frame_scaled(
+                app.ffmpeg_cmd, _png, frame_sec=0.0,
+                target_width=target_width, target_height=target_height)
+            return _w, _h, _data
+
+        return _extractor
     def _show_pip_snapshot_async(self, track, sub_videos):
         """画中画合成快照入口（方案1）：构造命令后交给通用快照流程。"""
         try:
@@ -39945,49 +47854,13 @@ class FFmpegBatchGUI:
             self._append_info_ui(_("[预览] 合成快照命令构建失败: {0}").format(e))
             return
         modes = [sv.enc_settings.get("blend_mode", "normal") for sv in sub_videos]
-        title = f"画中画合成快照 · 子视频{len(sub_videos)}个 · 模式: {'/'.join(modes)}"
+        title = _('画中画合成快照 · 子视频{0}个 · 模式: {1}').format(len(sub_videos), '/'.join(modes))
         self._show_snapshot_async(cmd, out_png, "pip", title, _("正在生成合成快照…"), self._display_pip_snapshot)
 
     def _display_pip_snapshot(self, img_bytes):
         self._display_snapshot(img_bytes, "pip")
 
     # ---------- 画中画 / 串行 主视频的「模拟生成后文件」缩略图 ----------
-    def _build_pip_contact_sheet_cmd(self, track, sub_videos):
-        """画中画主视频缩略图：复用 _build_overlay_filter_complex 生成与成片一致的合成画面，
-        再抽帧拼 4x4 网格单图（模拟叠加后的最终输出）。"""
-        input_files, file_index = self._prepare_tracks_and_inputs([track] + list(sub_videos))
-        sub_infos = []
-        for sv in sub_videos:
-            sv_settings = sv.enc_settings.copy()
-            if sv_settings.get("encoder") == "copy":
-                sv_settings["encoder"] = "libx265"
-            sub_infos.append((file_index[sv.file_path], sv.file_path, sv_settings))
-
-        complex_filter, final_v_label = self._build_overlay_filter_complex(
-            0, track.enc_settings, sub_infos,
-            include_subtitle_main=False,
-            enhance_settings=track.enc_settings.get("enhance", {}),
-            reverse=False,
-            main_file_path=track.file_path
-        )
-
-        # 按时长均分抽约 8 帧（4x2 网格）
-        dur = self._get_media_duration(track.file_path) or 0.0
-        interval = max(dur / 8.0, 0.5) if dur > 0 else 10.0
-
-        out_png = os.path.join(tempfile.gettempdir(), "thumb_contact_sheet.png")
-        cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
-        for idx, p in enumerate(input_files):
-            if idx != 0:
-                cmd.extend(["-stream_loop", "-1"])
-            cmd.extend(["-i", p])
-        # 在合成结果末尾追加 fps 抽帧 + tile 拼网格
-        sheet_filter = f"{complex_filter};{final_v_label}fps=1/{interval:.4f},scale=320:-1,tile=4x2[sheet]"
-        cmd.extend(["-filter_complex", sheet_filter])
-        cmd.extend(["-map", "[sheet]"])
-        cmd.extend(["-frames:v", "1", "-update", "1", out_png])
-        return cmd, out_png
-
     def _show_pip_contact_sheet_async(self, track, sub_videos):
         """画中画主视频缩略图：seek 分段抽帧（只解码 8 帧，8K 秒出）+ 子视频合成（与成片一致）。"""
         try:
@@ -40010,29 +47883,9 @@ class FFmpegBatchGUI:
             # 注入两次命中主链（PTS 变 2t）、子链一次都没注入。异路径时两者数值巧合相等，
             # 故长期未暴露（2026-09-10 定位，实测 ffmpeg 仍 rc=0，属「静默画错」不是报错）。
             sub_infos.append((i + 1, sv.file_path, sv_settings))
-        title = f"缩略图（画中画合成） · {os.path.basename(track.file_path)}"
+        title = _('缩略图（画中画合成） · {0}').format(os.path.basename(track.file_path))
         self._show_seek_sheet_async(track.file_path, track.enc_settings, sub_infos,
                                     title, _("正在生成缩略图…"))
-
-    def _build_concat_contact_sheet_cmd(self, video_tracks):
-        """串行合并主视频缩略图：复用 _build_concat_video_graph 生成视频 filter_complex
-        （与正式成片完全一致），再抽帧拼 4x2 网格单图。
-        只做视频、忽略音频/BGM，用于预览「拼接+转场后」的最终画面。"""
-        filter_parts, v_labels, seg_durations, trans_effective, total_dur = self._build_concat_video_graph(
-            video_tracks, global_norm=self._concat_norm_global_on())
-
-        # 总时长（用于抽帧间隔）
-        interval = max(total_dur / 8.0, 0.5) if total_dur > 0 else 10.0
-
-        out_png = os.path.join(tempfile.gettempdir(), "thumb_contact_sheet.png")
-        cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts"]
-        for t in video_tracks:
-            cmd.extend(["-i", t.file_path])
-        sheet_filter = ";".join(filter_parts) + f";[vout]fps=1/{interval:.4f},scale=320:-1,tile=4x2[sheet]"
-        cmd.extend(["-filter_complex", sheet_filter])
-        cmd.extend(["-map", "[sheet]"])
-        cmd.extend(["-frames:v", "1", "-update", "1", out_png])
-        return cmd, out_png
 
     def _show_concat_contact_sheet_async(self, video_tracks):
         """串行缩略图：按段抽帧——对每段文件单独 -ss seek（绕开 concat 输出 seek 无效）。
@@ -40045,6 +47898,7 @@ class FFmpegBatchGUI:
         ui = self._snap_ui.get("sheet")
         if ui is None or not ui["win"].winfo_exists():
             win = tk.Toplevel(self.root)
+            win.withdraw()  # 立即隐藏，避免先以默认位置(左上角)闪现再 withdraw 的一闪
             ui = {"win": win, "label": ttk.Label(win), "status": ttk.Label(win, text="")}
             ui["label"].pack(padx=6, pady=6)
             ui["status"].pack(padx=6, pady=(0, 6))
@@ -40093,8 +47947,13 @@ class FFmpegBatchGUI:
         def _show_win():
             w = ui["win"]
             if w.winfo_exists():
-                w.deiconify()
-                w.lift()
+                # 先按当前内容尺寸居中定位再显示：杜绝 deiconify 后停在默认位置(左上角)、
+                # 再被 center_window 移走的闪现。center_window 内部设好几何后才 deiconify。
+                try:
+                    center_window(w, w.winfo_reqwidth(), w.winfo_reqheight())
+                except Exception:
+                    w.deiconify()
+                    w.lift()
 
         def worker():
             frames = []
@@ -40106,7 +47965,8 @@ class FFmpegBatchGUI:
                 sheet = self._tile_ppm_4x2(frames)
                 if sheet:
                     def _ok(s=sheet):
-                        _show_win()
+                        # 窗口仍隐藏时由 _display_contact_sheet→center_window 设好几何并居中显示，
+                        # 避免「先 deiconify 在左上角闪一下、再被移到中央」的一闪。
                         self._display_contact_sheet(s)
                     self.root.after(0, _ok)
                     return
@@ -40183,7 +48043,7 @@ class FFmpegBatchGUI:
         # 同 _build_pip_snapshot_cmd：加 -update 1 确保单帧 PNG 稳定写出
         cmd.extend(["-vframes", "1", "-update", "1", out_png])
         mode = adapted_wm.get("blend_mode", "normal") or "normal"
-        title = f"水印合成快照 · 模式: {mode}"
+        title = _('水印合成快照 · 模式: {0}').format(mode)
         return cmd, out_png, title
 
     def _show_wm_snapshot_async(self, file_path, settings, builder, prefix, busy):
@@ -40195,7 +48055,7 @@ class FFmpegBatchGUI:
         try:
             cmd, out_png, title = builder(file_path, settings)
         except Exception as e:
-            self._append_info_ui(f"[预览] {prefix}快照命令构建失败: {e}")
+            self._append_info_ui(_('[预览] {0}快照命令构建失败: {1}').format(prefix, e))
             return
         self._show_snapshot_async(cmd, out_png, "wm", title, busy, self._display_watermark_snapshot)
 
@@ -40273,7 +48133,13 @@ class FFmpegBatchGUI:
         修法：在主/子视频的入口前注入 setpts=PTS+{t}/TB，把第一帧的时间戳恢复到真实 seek 点。"""
         cmd = [self.ffmpeg_cmd, "-y", "-fflags", "+genpts", "-ss", _ffsec(t), "-i", main_file]
         for _idx, sub_file, _s in sub_infos:
-            cmd += ["-stream_loop", "-1", "-i", sub_file]
+            # 子视频跟随主视频 seek 点 t：缺 -ss 会永远抽子视频开头帧（setpts 只改时间戳、
+            # 不改帧内容）→ 主显示源 t 帧、子显示开头帧 → 合成错位（chromakey 抠像叠加时
+            # 前景与底层运动主体对不上，表现为上下错位）。静态图片无时间轴，-ss 会取空帧故跳过。
+            if self._is_static_image(sub_file):
+                cmd += ["-stream_loop", "-1", "-i", sub_file]
+            else:
+                cmd += ["-stream_loop", "-1", "-ss", _ffsec(t), "-i", sub_file]
         if complex_filter:
             cf = complex_filter
             # 注入 setpts 恢复时间戳（仅替换每个标签首次出现，避开后续引用）
@@ -40363,6 +48229,7 @@ class FFmpegBatchGUI:
         ui = self._snap_ui.get("sheet")
         if ui is None or not ui["win"].winfo_exists():
             win = tk.Toplevel(self.root)
+            win.withdraw()  # 立即隐藏，避免先以默认位置(左上角)闪现再 withdraw 的一闪
             ui = {"win": win, "label": ttk.Label(win), "status": ttk.Label(win, text="")}
             ui["label"].pack(padx=6, pady=6)
             ui["status"].pack(padx=6, pady=(0, 6))
@@ -40412,8 +48279,13 @@ class FFmpegBatchGUI:
         def _show_win():
             w = ui["win"]
             if w.winfo_exists():
-                w.deiconify()
-                w.lift()
+                # 先按当前内容尺寸居中定位再显示：杜绝 deiconify 后停在默认位置(左上角)、
+                # 再被 center_window 移走的闪现。center_window 内部设好几何后才 deiconify。
+                try:
+                    center_window(w, w.winfo_reqwidth(), w.winfo_reqheight())
+                except Exception:
+                    w.deiconify()
+                    w.lift()
 
         def worker():
             frames = []
@@ -40433,7 +48305,8 @@ class FFmpegBatchGUI:
                         self.root.after(0, lambda n=len(frames): self._append_info_ui(
                             _("[缩略图] 仅成功抽取 {0}/8 帧，缺失格已补灰").format(n)))
                     def _ok(s=sheet):
-                        _show_win()
+                        # 窗口仍隐藏时由 _display_contact_sheet→center_window 设好几何并居中显示，
+                        # 避免「先 deiconify 在左上角闪一下、再被移到中央」的一闪。
                         self._display_contact_sheet(s)
                     self.root.after(0, _ok)
                     return
@@ -40477,7 +48350,7 @@ class FFmpegBatchGUI:
         main_settings = copy.deepcopy(main_settings)
         for k in ("crop_enabled", "scale_enabled", "rotate_enabled", "trim_enabled"):
             main_settings[k] = False
-        title = f"缩略图 · {os.path.basename(file_path)}"
+        title = _('缩略图 · {0}').format(os.path.basename(file_path))
         self._show_seek_sheet_async(file_path, main_settings, sub_infos, title, _("正在生成缩略图…"))
 
     def _display_contact_sheet(self, img_bytes):
@@ -40487,28 +48360,19 @@ class FFmpegBatchGUI:
         if ui is None or not ui["win"].winfo_exists():
             return
         try:
-            img = tk.PhotoImage(data=img_bytes)
-            screen_w = self.root.winfo_screenwidth()
-            screen_h = self.root.winfo_screenheight()
-            # 预留垂直空间给标题栏 + 状态栏 + 保存按钮行 + 外边距（多留余量）
-            reserve_h = 200
-            reserve_w = 40
-            max_w = max(screen_w - reserve_w, 200)
-            max_h = max(screen_h - reserve_h, 200)
-            factor = 1
-            while (img.width() // factor > max_w) or (img.height() // factor > max_h):
-                factor += 1
-            if factor > 1:
-                img = img.subsample(factor, factor)
+            img_full = tk.PhotoImage(data=img_bytes)   # 原始分辨率拼图（保存时用，不损失）
+            ui["img_full"] = img_full
+            # 与快照窗口同源：mpv 预览同款 screen−preview_margin 钳制 + 连续比例缩放（_fit_display_image）。
+            # 垂直余量比快照窗多给一点：拼图窗口还多一行保存按钮。
+            _max_w, _max_h = self._snapshot_display_box(reserve_w=24, reserve_h=140)
+            img, _note = self._fit_display_image(img_bytes, img_full, _max_w, _max_h)
             ui["img"] = img
             ui["label"].config(image=img, text="")
-            ui["status"].config(text=_("缩略图已生成"))
-            try:
-                center_window(ui["win"], img.width() + 12, img.height() + 130)
-            except Exception:
-                pass
+            ui["status"].config(text=_("缩略图已生成") + _note)
+            # 同快照窗：真实需求尺寸居中 + 底边留出任务栏（否则保存按钮行/状态栏被任务栏挡）
+            self._place_image_window(ui["win"])
         except Exception as e:
-            ui["status"].config(text=_("缩略图显示失败: {0}").format(e))
+            ui["status"].config(text=_('缩略图显示失败: {0}').format(e))
 
 
     def merge_edit_track_settings(self, track_idx):
@@ -40525,7 +48389,14 @@ class FFmpegBatchGUI:
                             is_watermark=False, track_idx=None, pip_enabled_var=None,
                             overlay_mode='sub', parent=None, show_loop_chroma=True,
                             track_obj=None, is_concat_mode=False, canvas_file=None,
-                            main_video_size=None, main_settings_ctx=None):
+                            main_video_size=None, main_settings_ctx=None,
+                            page_scope=None, pip_subctrl=False,
+                            frame_extractor=None, frame_orig_size=None):
+        # 2026-09-23：本编辑器被三处共用（封装页轨道设置 / 转换页水印编辑器 /
+        # 队列任务水印编辑）→ 主视频作用域由调用方声明：'merge'=封装页（默认，
+        # 与既有行为一致）、'convert'=转换页；队列语境经 canvas_file/main_settings_ctx
+        # 显式透传给 OverlayPositionFrame.ctx_main_*，任务输入优先于任何页面兜底。
+        page_scope = page_scope or "merge"
         if parent is None:
             parent = self.root
         with self.SafeToplevel(parent) as win:
@@ -40547,6 +48418,13 @@ class FFmpegBatchGUI:
             filt_frame = VideoFilterFrame(page_filt, app=self, refresh_cb=self.merge_update_command_preview, context="merge")
             if file_path:
                 filt_frame.current_file = file_path
+            # 2026-09-26「节点效果编辑器按时间取帧」：节点语境下把「节点时间轴取帧器」挂到
+            # filt_frame，供裁剪/delogo 可视化编辑器的「重新获取画面」按节点时间轴取背景帧
+            # （与「看它这一帧」同源）；frame_orig_size 把编辑器坐标空间对齐到节点输出真实尺寸。
+            if frame_extractor is not None:
+                filt_frame.node_frame_extractor = frame_extractor
+            if frame_orig_size is not None:
+                filt_frame.node_frame_orig_size = frame_orig_size
             # 上下文主视频透传（子视频显示时段/叠加层时间线基准；None=回退 app.input_file）
             filt_frame.canvas_file = canvas_file
             # 设置轨道或覆盖设置
@@ -40593,6 +48471,28 @@ class FFmpegBatchGUI:
             trim_frame.pack(fill=tk.X, padx=5, pady=5)
             trim_frame.set_settings(initial_settings)
 
+            # 图片素材：与「一键淡入淡出(all)/一键转场(all)」同款的批量时长入口。
+            # 图片没有时间轴，显示几秒完全由「显示时长」决定；多图串行（相册/幻灯片）
+            # 时逐张改很慢 → 一键把本行「时长(秒)」框的数值套用到所有图片轨道。
+            if file_path and self._is_static_image(file_path):
+                _img_dur_row = ttk.Frame(page_trim)
+                _img_dur_row.pack(fill=tk.X, padx=5, pady=(0, 5))
+                _ocd_btn = ttk.Button(
+                    _img_dur_row, text=_("一键统一时长(all)"),
+                    command=lambda: self._apply_image_duration_all_tracks(
+                        current_track_obj=track_obj,
+                        current_img_var=trim_frame.img_duration))
+                _ocd_btn.pack(side=tk.LEFT)
+                ttk.Label(_img_dur_row, text=_("时长(秒):")).pack(side=tk.LEFT, padx=(6, 0))
+                ttk.Entry(_img_dur_row, textvariable=self.oneclick_image_duration,
+                          width=6).pack(side=tk.LEFT, padx=(2, 0))
+                ToolTip(_ocd_btn,
+                        _("一键统一时长（All）：\n"
+                        "把所有已启用图片轨道的「显示时长」统一为本行「时长(秒)」框的数值（默认 10s）。\n"
+                        "图片本身没有时间长度，显示几秒由这里决定；多图串行时不必逐张改。\n"
+                        "不会改动视频轨道（视频时长由素材本身 + 截取决定）。"),
+                        wraplength=440)
+
             # 是否为主视频 / 末段视频（串行模式）—— 主视频显示「一键淡入淡出/一键转场」批量按钮；
             # 末段视频的转场行灰显（转场挂本段，末段无下一段故无效）
             # 2026-09-17：画中画模式主视频也需识别 is_main_video（开放 BGM 全局叠加 UI），
@@ -40624,6 +48524,7 @@ class FFmpegBatchGUI:
                 lambda *_a: transition_type_zh_var.set(
                     xfade_display_name(transition_type_var.get().strip() or "fade")))
             transition_duration_var = tk.StringVar(value=str(initial_settings.get("transition_duration", "1.0") or "1.0"))
+            pip_aft_var = None   # 音频跟随转场（合成级开关，主视频 enc_settings；save 落盘）
             if not is_watermark and (track_obj is None or (hasattr(track_obj, 'type') and track_obj.type == "video")):
                 page_fade = ttk.Frame(notebook)
                 notebook.add(page_fade, text=_("淡入淡出"))
@@ -40637,12 +48538,21 @@ class FFmpegBatchGUI:
                 ttk.Entry(fade_frame, textvariable=fade_out_var, width=7).grid(row=1, column=3, padx=5, pady=5, sticky="w")
                 ttk.Label(fade_frame, text=_("留空=不应用该项。建议 0.5~2 秒。"),
                           foreground="gray").grid(row=2, column=0, columnspan=3, sticky="w", padx=5, pady=2)
-                # 串行转场（逐轨常驻：串行模式下每条视频轨都有，末段灰显）
-                if is_concat_mode:
+                # 转场（逐轨常驻：串行模式每条视频轨都有；画中画模式每条视频轨都有，末段灰显）
+                # 画中画：首尾相接时按这里的类型/时长做 xfade（与串行共用同一组字段）。
+                #   主视频勾上 → 主视频作为链首，与「显示时段起点 ≈ 主视频时长」的子视频转场；
+                #   子视频勾上 → 与紧接其后的下一段子视频转场。
+                _tr_pip_sub = is_pip and track_obj is not None and \
+                    getattr(track_obj, 'type', None) == 'video'
+                if is_concat_mode or _tr_pip_sub:
                     tr_row = ttk.Frame(fade_frame)
                     tr_row.grid(row=3, column=0, columnspan=3, sticky="w", padx=5, pady=5)
-                    tr_cb = ttk.Checkbutton(tr_row, text=_("启用串行转场"),
-                                            variable=transition_enabled_var)
+                    tr_cb = ttk.Checkbutton(
+                        tr_row,
+                        text=(_("启用串行转场") if is_concat_mode else
+                              (_("与下一段转场（主视频→子视频）") if is_main_video
+                               else _("与下一段转场（首尾相接时）"))),
+                        variable=transition_enabled_var)
                     tr_cb.pack(side=tk.LEFT)
                     tr_combo = ttk.Combobox(tr_row, textvariable=transition_type_zh_var,
                                             values=xfade_display_choices(), state="readonly", width=12)
@@ -40658,7 +48568,8 @@ class FFmpegBatchGUI:
                     if is_last_video:
                         tr_cb.config(state='disabled')
                         tr_combo.config(state='disabled')
-                    ToolTip(tr_cb,
+                    if is_concat_mode:
+                        ToolTip(tr_cb,
                             _("串行转场（片段间交叉溶解，xfade）：\n"
                             "在本段与下一段之间做转场（而非硬切）。挂本段，末段无下一段自动无效。\n\n"
                             "• 勾选后从下拉选择转场类型（fade=交叉溶解、wipeleft=向左擦除等）；\n"
@@ -40667,6 +48578,99 @@ class FFmpegBatchGUI:
                             "  首段淡入 / 末段淡出仍保留为整段起止淡黑；\n"
                             "• 未开转场的相邻片段之间仍为硬切（互不影响，逐轨独立）。"),
                             wraplength=480)
+                    elif is_main_video:
+                        ToolTip(tr_cb,
+                            _("与下一段转场（主视频 → 子视频）：\n"
+                            "主视频放完后，与「显示时段」起点紧接主视频末尾的子视频做转场（而非硬切）。\n\n"
+                            "• 判定：某子视频的显示时段起点 ≈ 主视频时长（容差半帧）才成链；\n"
+                            "• 链内统一到输出画布尺寸与主视频帧率 → 该子视频会被铺满画面；\n"
+                            "  它自身的叠加位置 / 轨迹 / 旋转偏移在链内不生效；\n"
+                            "• 转场时长自动钳制为相邻两段中较短者的一半；\n"
+                            "• xfade 会吞掉转场时长：后段比摆放位置提前「转场时长」出现（与串行一致）；\n"
+                            "• 音频会跟着一起提前，不会与画面错开。"),
+                            wraplength=480)
+                    else:
+                        ToolTip(tr_cb,
+                            _("与下一段转场（子视频之间）：\n"
+                            "本子视频与「显示时段」紧接其后的下一段子视频之间做转场（而非硬切）。\n\n"
+                            "• 前置（必须满足，否则勾了也不生效）：本段与下一段都要有「有限显示窗口」——\n"
+                            "  填显示起始+结束，或「启用循环控制」设有限循环次数；窗口无限(无结束+无限循环)\n"
+                            "  则探不到长度，不成链，转场静默不生效（命令看起来没变化，需先开循环控制/填结束）。\n"
+                            "• 判定：两段首尾相接（前段结束 ≈ 后段起始，容差半帧）才成链；\n"
+                            "  有间隙 / 重叠 → 不成链，两段各自独立叠加（互不干涉）；\n"
+                            "• 链内统一到链首的尺寸与帧率（ffmpeg 的 xfade 要求，不同则直接报错）；\n"
+                            "• 转场时长自动钳制为相邻两段中较短者的一半；\n"
+                            "• xfade 会吞掉转场时长：后段比摆放位置提前「转场时长」出现（与串行一致）；\n"
+                            "• 开启「音频跟随转场」后，音频会按转场链真实时间轴同步提前，声画逐帧对齐。"),
+                            wraplength=480)
+                # 画中画：转场对齐（作用于当前视频，按「前一段起点 + 前一段时长 - 转场时长」算）
+                if is_pip and track_obj is not None and \
+                        getattr(track_obj, 'type', None) == 'video' and not is_main_video:
+                    align_row = ttk.Frame(fade_frame)
+                    align_row.grid(row=4, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+                    align_btn = ttk.Button(
+                        align_row, text=_("转场对齐"),
+                        command=lambda: self._pip_align_transition_starts(
+                            only_track=track_obj,
+                            current_start_var=(loop_chroma_frame.show_start_var
+                                               if loop_chroma_frame is not None else None),
+                            current_end_var=(loop_chroma_frame.show_end_var
+                                             if loop_chroma_frame is not None else None),
+                        ))
+                    align_btn.pack(side=tk.LEFT)
+                    ttk.Label(align_row,
+                              text=_("（起点 = 前一段起点 + 前一段时长 - 转场时长）"),
+                              foreground="gray").pack(side=tk.LEFT, padx=(6, 0))
+                    ToolTip(align_btn,
+                            _("转场对齐（作用于当前视频）：\n"
+                            "把本段的「显示 起始」按前一段算：\n"
+                            "  本段起点 = 前一段起点 + 前一段时长 - 前一段转场时长\n"
+                            "xfade 会吞掉转场时长 d（后段在链内提前 d 秒出现），界面上摆在前段末尾时\n"
+                            "画面其实提前 d 秒切换；对齐后数字即真实切换时刻，手动微调 / 简易时间预览\n"
+                            "粘贴不再差一个转场时长。\n\n"
+                            "• 只在画中画显示，不影响 concat；\n"
+                            "• 前一段需有可探到的显示长度（填「显示 起始+结束」或有限循环次数）；\n"
+                            "• 有「结束」时连同结束一起平移，段长不变。"),
+                            wraplength=440)
+                # 画中画：音频跟随转场（每个子视频独立开关，默认取消）
+                pip_aft_var = None
+                if is_pip and track_obj is not None and \
+                        getattr(track_obj, 'type', None) == 'video' and not is_main_video:
+                    pip_aft_var = tk.BooleanVar(
+                        value=bool(initial_settings.get("pip_audio_follow_transition", False)))
+                    _aft_row = ttk.Frame(fade_frame)
+                    _aft_row.grid(row=5, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+                    _aft_cb = ttk.Checkbutton(_aft_row, text=_("音频跟随转场"), variable=pip_aft_var)
+                    _aft_cb.pack(side=tk.LEFT)
+                    ttk.Label(_aft_row, text=_("（按转场链真实时间轴自动定位音频，声画逐帧对齐）"),
+                              foreground="gray").pack(side=tk.LEFT, padx=(6, 0))
+                    ToolTip(_aft_cb,
+                            _("音频跟随转场（作用于本视频）：\n"
+                            "勾选后，本视频的音频直接落在它进入画面那一刻的转场链真实时间轴上\n"
+                            "（与 xfade 的交叉位置逐帧对齐，类似 concat 的音频跟随），并自动处理三件事：\n"
+                            "• 音频截取：自动按本视频的「显示窗口」(显示起始+结束，或有限循环次数) 裁切；\n"
+                            "• 开始时间：自动定位到转场交叉点（不再用「显示起点 + 手动偏移」）；\n"
+                            "• 混音：自动并入主声/其他子声，无需单独开启混音。\n\n"
+                            "前置（视频侧，必须）：先设好本视频的显示窗口——\n"
+                            "  显示起始+结束，或「启用循环控制」设有限循环次数（窗口无限=无结束+无限循环则不成链，\n"
+                            "  本开关无效，音频留在原显示位置）。视频按此截取，音频也同步按此窗口截取并定位。\n"
+                            "前一段需已开转场且本段与之首尾相接（或用「转场对齐」按钮摆成紧接），才成链生效。\n\n"
+                            "• 仅画中画子视频的淡入淡出页可见，默认不勾选；\n"
+                            "• 想要音频相对窗口单独偏移的自由度（类似 Shotcut 音视频分离）属另一项功能，可后续加；\n"
+                            "  当前音频与显示窗口绑定——调显示窗口即调音频窗口，无需手动截音频；\n"
+                            "• 与「转场对齐」按钮配合最佳：先对齐起点、再勾此开关，声画完全同步。"),
+                            wraplength=460)
+                    # 勾选「音频跟随转场」即自动把音频模式切到「混音」（循环/绿幕页那个下拉），
+                    # 无需再手动勾混音——开启即单音轨输出（与 concat 音频跟随一致）。
+                    # 取消勾选不回退 audio_mode（保留既有混音/替换意图），仅关闭跟随定位。
+                    # ⚠️ audio_mode 挂在 loop_chroma_frame（LoopChromaFrame）上，
+                    # 不在本类（FFmpegBatchGUI）——2026-09-25 修复引用错宿主导致联动静默失效。
+                    def _aft_to_mix(*_a):
+                        _lcf = loop_chroma_frame
+                        if _lcf is not None and hasattr(_lcf, "audio_mode") \
+                                and pip_aft_var.get() and _lcf.audio_mode.get() != "mix":
+                            _lcf.audio_mode.set("mix")   # 自带 trace 会同步下拉显示为「混音」
+                    pip_aft_var.trace_add("write", _aft_to_mix)
                 # 一键淡入淡出 / 一键转场（批量操作，仅主视频 + 串行模式显示）
                 if is_main_video and self.concat_enabled.get():
                     oneclick_row = ttk.Frame(fade_frame)
@@ -40698,6 +48702,24 @@ class FFmpegBatchGUI:
                             "时长取本行「时长(秒)」框，默认 1.0s（自动钳制为相邻两段较短者的一半）。\n"
                             "末段无下一段，自动跳过；已开启淡入淡出的连接处会被转场替代。"),
                             wraplength=440)
+                    # 一键重置：与上面两个「一键…」配对（本页新一行，避免挤爆第一行）
+                    reset_row = ttk.Frame(fade_frame)
+                    reset_row.grid(row=5, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+                    ocr_btn = ttk.Button(reset_row, text=_("一键重置(all)"),
+                                         command=lambda: self._clear_fade_transition_all_tracks(
+                                             current_track_obj=track_obj,
+                                             current_fade_vars=(fade_enabled_var, fade_in_var, fade_out_var),
+                                             current_transition_vars=(transition_enabled_var,
+                                                                      transition_type_var,
+                                                                      transition_duration_var),
+                                         ))
+                    ocr_btn.pack(side=tk.LEFT)
+                    ToolTip(ocr_btn,
+                            _("一键重置（All）：关掉所有轨道的淡入淡出与串行转场，\n"
+                            "只关开关、不清数值 —— 重新点「一键淡入淡出 / 一键转场」时\n"
+                            "还是你上次选的时长与转场类型，不用重填。\n"
+                            "显示时段（每段什么时候出现）不受影响。"),
+                            wraplength=440)
 
             # 水印或画中画模式下，强制启用精准截取
             if is_watermark or (pip_enabled_var is not None and pip_enabled_var.get()):
@@ -40718,9 +48740,17 @@ class FFmpegBatchGUI:
             if show_loop_chroma:
                 page_loop = ttk.Frame(notebook)
                 notebook.add(page_loop, text=_("循环/绿幕控制"))
-                loop_chroma_frame = LoopChromaFrame(page_loop, filt_frame=filt_frame)
+                loop_chroma_frame = LoopChromaFrame(page_loop, filt_frame=filt_frame,
+                                                    page_scope=page_scope)
                 loop_chroma_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
                 loop_chroma_frame.set_settings(initial_settings)
+                # 打开时若「音频跟随转场」已勾选 → audio_mode 同步为混音
+                # （须在 set_settings 之后：它会按存档重置 audio_mode；勾选框块在循环页之前创建，
+                #   创建时 loop_chroma_frame 尚不存在，无法在那时同步）
+                if pip_aft_var is not None and pip_aft_var.get() and \
+                        hasattr(loop_chroma_frame, "audio_mode") and \
+                        loop_chroma_frame.audio_mode.get() != "mix":
+                    loop_chroma_frame.audio_mode.set("mix")
                 if file_path and os.path.exists(file_path):
                     raw_duration = self._get_media_duration(file_path)
                     effective_duration = self._get_effective_duration(initial_settings, raw_duration)
@@ -40748,7 +48778,59 @@ class FFmpegBatchGUI:
             trim_frame.trim_enabled.trace_add('write', update_duration_on_trim_change)
             trim_frame.trim_start.trace_add('write', update_duration_on_trim_change)
             trim_frame.trim_end.trace_add('write', update_duration_on_trim_change)
+            # 图片素材的「显示时长」也算时长来源（图片没有可截的时间轴）→ 一并刷新时长信息
+            trim_frame.img_duration.trace_add('write', update_duration_on_trim_change)
 
+
+            # ---- 页面4b：子视频控制（仅画中画主视频编辑窗显示；不改「循环/绿幕控制」页） ----
+            # 作用对象 = 全部子视频（不含主视频）：批量有限循环 + 硬切接龙摆位。
+            if pip_subctrl:
+                page_subctrl = ttk.Frame(notebook)
+                notebook.add(page_subctrl, text=_("子视频控制"))
+                _sc_box = ttk.LabelFrame(page_subctrl, text=_("子视频批量控制（作用于全部子视频，不含主视频）"))
+                _sc_box.pack(fill=tk.X, padx=8, pady=(10, 4))
+                _sc_row1 = ttk.Frame(_sc_box)
+                _sc_row1.pack(fill=tk.X, padx=6, pady=(6, 2))
+                ttk.Label(_sc_row1, text=_("循环次数:")).pack(side=tk.LEFT)
+                ttk.Entry(_sc_row1, textvariable=self.oneclick_loop_count, width=6).pack(side=tk.LEFT, padx=(2, 8))
+                _sc_btn_loop = ttk.Button(
+                    _sc_row1, text=_("一键有限循环(all)"),
+                    command=lambda: self._pip_finite_loop_all(self.oneclick_loop_count.get()))
+                _sc_btn_loop.pack(side=tk.LEFT)
+                _sc_row2 = ttk.Frame(_sc_box)
+                _sc_row2.pack(fill=tk.X, padx=6, pady=(2, 4))
+                _sc_btn_chain = ttk.Button(
+                    _sc_row2, text=_("一键设置开始"),
+                    command=self._pip_chain_show_starts)
+                _sc_btn_chain.pack(side=tk.LEFT)
+                _sc_btn_mix = ttk.Button(
+                    _sc_row2, text=_("一键混音(all)"),
+                    command=self._pip_mix_all)
+                _sc_btn_mix.pack(side=tk.LEFT, padx=(8, 0))
+                _sc_hint = ttk.Label(
+                    _sc_box,
+                    text=_("接龙规则：第 1 个子视频接在主视频之后，之后每段起点 = 前一段起点 + 前一段时长 − 前一段转场时长。\n"
+                           "声音（混音/替换/跟随）按显示起点自动跟上，无需再单独调音频。"),
+                    wraplength=520, justify=tk.LEFT, foreground="#666666")
+                _sc_hint.pack(fill=tk.X, padx=6, pady=(0, 6))
+                ToolTip(_sc_btn_loop,
+                        _("一键有限循环（All）：\n"
+                          "为所有子视频启用循环控制并设次数（次数取本行「循环次数」框，1 = 只播一遍）。\n"
+                          "子视频窗口有界（有限次数/显示结束）才能被转场链收录、总时长才算得准。"),
+                        wraplength=420)
+                ToolTip(_sc_btn_chain,
+                        _("一键设置开始（接龙）：\n"
+                          "按列表顺序把子视频依次接上前一段：第 1 个接在主视频之后（起点 = 主视频时长），\n"
+                          "之后每段起点 = 前一段起点 + 前一段时长 − 前一段转场时长（前段挂了转场时画面会\n"
+                          "提前切换，摆位同步让位；硬切项目转场时长为 0，即首尾相接）。\n"
+                          "前一段时长探不到（无限循环没设次数）则该段原地不动。"),
+                        wraplength=440)
+                ToolTip(_sc_btn_mix,
+                        _("一键混音（All）：\n"
+                          "为所有子视频（不含主视频）把「音频模式」设为「混音」——子声并入主声、不再单独出一条轨。\n"
+                          "与「音频跟随转场」勾选框自动切混音同源（都写循环/绿幕控制页那条「音频:」下拉）；\n"
+                          "子视频本身无音轨时自动降级为忽略，零副作用。"),
+                        wraplength=440)
 
             # ---- 页面5：叠加/偏移（仅在画中画或水印模式下显示） ----
             overlay_frame = None
@@ -40795,6 +48877,9 @@ class FFmpegBatchGUI:
                                 main_settings = None
                         if not main_settings:
                             # 兜底：filt_frame（仅尺寸语义，旋转可能不准）
+                            # vflip/hflip（2026-09-20 健壮性审计补）：该 dict 同时喂
+                            # bg_pre_filter=_main_bg_pre_filter(...)（42709），缺键=兜底
+                            # 分支下背景帧丢翻转（尺寸不受影响，但画面不镜像）。
                             main_settings = {
                                 "crop_enabled": filt_frame.crop_enabled.get(),
                                 "crop_width": filt_frame.crop_width.get(),
@@ -40805,7 +48890,9 @@ class FFmpegBatchGUI:
                                 "scale_method": filt_frame.scale_method.get(),
                                 "scale_width": filt_frame.scale_width.get(),
                                 "scale_height": filt_frame.scale_height.get(),
-                                "rotate": filt_frame.rotate.get()
+                                "rotate": filt_frame.rotate.get(),
+                                "vflip": filt_frame.vflip.get() if hasattr(filt_frame, "vflip") else False,
+                                "hflip": filt_frame.hflip.get() if hasattr(filt_frame, "hflip") else False
                             }
                         # 获取主视频尺寸（优先使用传入的 main_video_size）
                         if main_video_size is not None:
@@ -40873,7 +48960,13 @@ class FFmpegBatchGUI:
                         track_idx=None,
                         track_obj=None,
                         filt_frame=filt_frame,
-                        visual_callback=watermark_visual_callback
+                        visual_callback=watermark_visual_callback,
+                        # 2026-09-23：主视频作用域——转换页水印编辑器传 'convert'；
+                        # 队列任务水印经 canvas_file/main_settings_ctx 显式给语境主视频
+                        # （ctx 优先于 page_scope，轨迹坐标编辑器按此取本语境背景帧）。
+                        page_scope=page_scope,
+                        ctx_main_file=canvas_file,
+                        ctx_main_settings=main_settings_ctx
                     )
                 else:
                     # 画中画模式（或主视频偏移）
@@ -40884,7 +48977,8 @@ class FFmpegBatchGUI:
                         track_idx=track_idx,
                         track_obj=track_obj,   # 透传：供轨迹坐标编辑器取子视频真实渲染尺寸
                         filt_frame=filt_frame,
-                        visual_callback=None
+                        visual_callback=None,
+                        page_scope=page_scope   # 2026-09-23：封装页='merge'（主视频画布偏移仅在封装页出现）
                     )
                 overlay_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
                 overlay_frame.set_settings(initial_settings)
@@ -41058,9 +49152,48 @@ class FFmpegBatchGUI:
                     _bgm_scale = ttk.Scale(_bgm_r1, from_=0.0, to=1.0, orient=tk.HORIZONTAL,
                                            variable=bgm_volume_var, length=160)
                     _bgm_scale.pack(side=tk.LEFT, padx=2)
-                    _bgm_vollbl = ttk.Label(_bgm_r1, text=f"{_bv:.2f}")
-                    _bgm_vollbl.pack(side=tk.LEFT, padx=(2, 8))
-                    _bgm_scale.config(command=lambda v: _bgm_vollbl.config(text=f"{float(v):.2f}"))
+                    # 滑块右侧编辑框：可直接键入音量（0.0~1.0），与滑块双向同步（2026-09-26）
+                    # ⚠️ 本方法会被反复调用，闭包里的变量必须用默认参数就地绑定，
+                    #    否则上一次窗口的回调会抓到本帧新建的变量（late binding 陷阱）。
+                    _bgm_voltxt = tk.StringVar(value=f"{_bv:.2f}")
+                    _bgm_volsync = [False]
+                    _bgm_vollen = ttk.Entry(_bgm_r1, textvariable=_bgm_voltxt, width=5,
+                                             justify=tk.CENTER)
+                    _bgm_vollen.pack(side=tk.LEFT, padx=(2, 8))
+
+                    def _bgm_vol_from_entry(*_a, _txt=_bgm_voltxt, _var=bgm_volume_var,
+                                            _lock=_bgm_volsync):
+                        if _lock[0]:
+                            return
+                        try:
+                            v = float(_txt.get())
+                        except (ValueError, TypeError):
+                            _lock[0] = True
+                            _txt.set(f"{_var.get():.2f}")
+                            _lock[0] = False
+                            return
+                        if v < 0.0:
+                            v = 0.0
+                        elif v > 1.0:
+                            v = 1.0
+                        _lock[0] = True
+                        _var.set(v)
+                        _txt.set(f"{v:.2f}")
+                        _lock[0] = False
+
+                    def _bgm_vol_from_slider(v, _txt=_bgm_voltxt, _lock=_bgm_volsync):
+                        if _lock[0]:
+                            return
+                        # ⚠️ 置锁必须在写文本**之前**：写文本会触发 trace →
+                        #    _bgm_vol_from_entry，不置锁会反向写回 bgm_volume_var。
+                        _lock[0] = True
+                        _txt.set(f"{float(v):.2f}")
+                        _lock[0] = False
+
+                    _bgm_voltxt.trace_add("write", _bgm_vol_from_entry)
+                    _bgm_vollen.bind("<Return>",
+                                     lambda e, _e=_bgm_vollen: _e.selectrange(0, tk.END))
+                    _bgm_scale.config(command=_bgm_vol_from_slider)
                     ttk.Label(_bgm_r1, text=_("音频文件:")).pack(side=tk.LEFT, padx=(0, 2))
                     _bgm_entry = ttk.Entry(_bgm_r1, textvariable=bgm_path_var, width=34)
                     _bgm_entry.pack(side=tk.LEFT, padx=2)
@@ -41172,6 +49305,8 @@ class FFmpegBatchGUI:
                                 new_settings["bgm_volume"] = bgm_volume_var.get()
                                 new_settings["bgm_trim_start"] = bgm_trim_start_var.get().strip()
                                 new_settings["bgm_trim_end"] = bgm_trim_end_var.get().strip()
+                            if pip_aft_var is not None:
+                                new_settings["pip_audio_follow_transition"] = pip_aft_var.get()
                             if is_concat_mode and is_main_video:
                                 # 音频独立截取（不分段）：仅主视频 concat 模式
                                 new_settings["audio_trim_enabled"] = audio_trim_enabled_var.get()
@@ -41246,7 +49381,7 @@ class FFmpegBatchGUI:
             }
 
         self.edit_video_settings(
-            title=f"视频轨道设置 - {track.codec}",
+            title=_('视频轨道设置 - {0}').format(track.codec),
             initial_settings=initial_settings,
             on_save=lambda new: self._update_track_enc(track_idx, new),
             file_path=track.file_path,
@@ -41258,7 +49393,8 @@ class FFmpegBatchGUI:
             show_loop_chroma=show_loop,
             track_obj=track,   # 传递轨道对象
             is_concat_mode=self.concat_enabled.get(),
-            canvas_file=self._merge_context_main_video()   # 子视频显示时段预览=封装页主视频
+            canvas_file=self._merge_context_main_video(),   # 子视频显示时段预览=封装页主视频
+            pip_subctrl=(self.pip_enabled.get() and is_main)   # 画中画主视频 → 「子视频控制」页
         )
     
     
@@ -41275,9 +49411,11 @@ class FFmpegBatchGUI:
             track.enc_settings["enhance"] = new_settings["enhance"]
         # 同步属性（兼容旧代码）
 
-        track.overlay_enabled = new_settings.get("overlay_enabled", False)
-        track.overlay_x = new_settings.get("overlay_x", "W-w-10")
-        track.overlay_y = new_settings.get("overlay_y", "H-h-10")
+        # 缺键时按 True（与 Track 默认一致）：编辑器没产出该键（如 overlay_frame 为 None）
+        # 不该把轨道悄悄变成「不叠加」（2026-09-24 修正，原为 False）。
+        track.overlay_enabled = new_settings.get("overlay_enabled", True)
+        track.overlay_x = new_settings.get("overlay_x", DEFAULT_OVERLAY_X)
+        track.overlay_y = new_settings.get("overlay_y", DEFAULT_OVERLAY_Y)
         track.pad_enabled = new_settings.get("pad_enabled", False)
         track.pad_width = new_settings.get("pad_width", "")
         track.pad_height = new_settings.get("pad_height", "")
@@ -41292,10 +49430,26 @@ class FFmpegBatchGUI:
         self.merge_update_track_list()
         self.merge_update_command_preview()
 
-    def merge_edit_audio_track(self, track_idx):
-        track = self.merge_tracks[track_idx]
+    def merge_edit_audio_track(self, track_idx=None, node_key=None,
+                              initial_settings=None, on_save=None):
+        is_node = node_key is not None
+        if is_node:
+            # 节点模式：没有真实轨道，用一个轻量代理承载音频效果设置，
+            # 复用整个「音频轨道设置」UI（仅把保存落点改成 on_save，不写回轨道）。
+            class _NodeAudioProxy:
+                def __init__(self, es):
+                    self.enc_settings = dict(es or {})
+                    self.language = self.enc_settings.get("language", "")
+                    self.title = self.enc_settings.get("title", "")
+                    self.codec = _("节点")
+                    self.file_path = None
+            track = _NodeAudioProxy(initial_settings)
+            win_title = _('音频节点效果 [{0}]').format(node_key)
+        else:
+            track = self.merge_tracks[track_idx]
+            win_title = _('音频轨道设置 - {0}').format(track.codec)
         with self.SafeToplevel(self.root) as win:
-            win.title(_('音频轨道设置 - {0}').format(track.codec))
+            win.title(win_title)
             center_window(win, 880, 570)
             win.transient(self.root)
     
@@ -41458,20 +49612,59 @@ class FFmpegBatchGUI:
 
             ttk.Label(vol_control_frame, text=_("倍数:")).pack(side=tk.LEFT)
             vol_slider = ttk.Scale(vol_control_frame, from_=0.1, to=3.0, variable=vol_value_var,
-                                   orient=tk.HORIZONTAL, length=150, state=tk.DISABLED)
+                                   orient=tk.HORIZONTAL, length=120, state=tk.DISABLED)
             vol_slider.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-            vol_label = ttk.Label(vol_control_frame, text="1.0", width=5)
-            vol_label.pack(side=tk.LEFT)
-            vol_slider.configure(command=lambda v: vol_label.config(text=f"{float(v):.2f}"))
+            # 滑块右侧编辑框：可直接键入倍数（0.1~3.0），与滑块双向同步（2026-09-26）
+            # ⚠️ 本方法会被反复调用（每个音频轨一次），闭包变量必须用默认参数就地绑定，
+            #    否则旧窗口的回调会抓到新帧的变量（late binding 陷阱）。
+            vol_txt = tk.StringVar(value=f"{vol_value_var.get():.2f}")
+            vol_sync = [False]
+            vol_entry = ttk.Entry(vol_control_frame, textvariable=vol_txt, width=5,
+                                  justify=tk.CENTER)
+            vol_entry.pack(side=tk.LEFT)
+
+            def _vol_from_entry(*_a, _txt=vol_txt, _var=vol_value_var, _lock=vol_sync):
+                if _lock[0]:
+                    return
+                try:
+                    v = float(_txt.get())
+                except (ValueError, TypeError):
+                    _lock[0] = True
+                    _txt.set(f"{_var.get():.2f}")
+                    _lock[0] = False
+                    return
+                if v < 0.1:
+                    v = 0.1
+                elif v > 3.0:
+                    v = 3.0
+                _lock[0] = True
+                _var.set(v)
+                _txt.set(f"{v:.2f}")
+                _lock[0] = False
+
+            def _vol_from_slider(v, _txt=vol_txt, _lock=vol_sync):
+                if _lock[0]:
+                    return
+                # ⚠️ 置锁必须在写文本**之前**：写文本会触发 trace →
+                #    _vol_from_entry，不置锁会反向写回 vol_value_var。
+                _lock[0] = True
+                _txt.set(f"{float(v):.2f}")
+                _lock[0] = False
+
+            vol_txt.trace_add("write", _vol_from_entry)
+            vol_entry.bind("<Return>", lambda e, _e=vol_entry: _e.selectrange(0, tk.END))
+            vol_slider.configure(command=_vol_from_slider)
 
             def on_vol_enabled(*args):
                 state = tk.NORMAL if vol_enabled_var.get() else tk.DISABLED
                 vol_slider.config(state=state)
+                # 编辑框跟随滑块一起禁用/启用，否则「未勾选启用」还能键入（口径不一致）
+                vol_entry.config(state=state)
             vol_enabled_var.trace_add("write", on_vol_enabled)
             on_vol_enabled()
 
             # ---- 套用同源视频轨（V→A）：同源音频轨一键套用对应视频轨截取/变速/倒放（独立一行，不嵌套音量块） ----
-            src_video = self._find_src_video_track(track)
+            src_video = None if is_node else self._find_src_video_track(track)
             apply_row = ttk.Frame(left_col)
             apply_row.pack(fill=tk.X, pady=(8,2))
             if src_video is not None:
@@ -41605,7 +49798,9 @@ class FFmpegBatchGUI:
             chk_loud.pack(side=tk.LEFT)
             ToolTip(chk_loud, _("将音频响度标准化到广播级标准（EBU R128），适合统一多段音频的音量"), wraplength=400)
             ttk.Label(ln_row, text=_("标准:")).pack(side=tk.LEFT, padx=(15, 2))
-            ttk.Combobox(ln_row, textvariable=loudnorm_i_var, values=["-23", "-16", "-14"], state="readonly", width=9).pack(side=tk.LEFT)
+            _cbo_ln = ttk.Combobox(ln_row, textvariable=loudnorm_i_var, values=["-23", "-16", "-14"], width=9)
+            _cbo_ln.pack(side=tk.LEFT)
+            ToolTip(_cbo_ln, _("可输入任意值：16 与 -16 等价（自动取负），合法范围 -70~-5，越界自动钳制"), wraplength=400)
 
             # ---- 降噪 ----
             dn_row = ttk.Frame(adv_frame); dn_row.pack(fill=tk.X, pady=2)
@@ -41759,7 +49954,7 @@ class FFmpegBatchGUI:
             # 且该模式无可靠手段确认音频时间（用户定版：超级边缘场景，直接无视）。
             # 已设置的分段数据保留在 enc_settings 里，仅在非 concat 模式下生效。
             segs_box = [copy.deepcopy(track.enc_settings.get("audio_segments") or [])]
-            if not is_concat:
+            if (not is_concat) and (not is_node):
                 seg_frame = ttk.Frame(right_column)
                 seg_frame.pack(side=tk.TOP, fill=tk.X, expand=False)
 
@@ -41809,7 +50004,13 @@ class FFmpegBatchGUI:
                     enc = "aac"
                     self._append_info_ui(_("音频混合启用，编码器已从 copy 改为 aac"))
     
-                track.enc_settings.update({
+                # 响度标准值防呆归一（正数取负 / 钳到 -70~-5 / 非法按默认）
+                _ln_ok, _ln_v = loudnorm_i_norm(loudnorm_i_var.get())
+                if not _ln_ok and loudnorm_i_var.get().strip():
+                    self._append_info_ui(_('[响度] 标准值「{0}」无法解析，已按默认 -23').format(loudnorm_i_var.get().strip()))
+                loudnorm_i_var.set(str(_ln_v))   # 归一回显
+
+                new_settings = {
                     "encoder": enc,
                     "bitrate": bitrate_var.get(),
                     "samplerate": samplerate_var.get(),
@@ -41829,7 +50030,7 @@ class FFmpegBatchGUI:
                     "audio_offset": offset_var.get().strip() or "0",
                     "disposition": disp_var.get(),
                     "loudnorm_enabled": loudnorm_enabled_var.get(),
-                    "loudnorm_i": int(float(loudnorm_i_var.get() or -23)),
+                    "loudnorm_i": loudnorm_i_norm(loudnorm_i_var.get())[1],
                     "denoise_enabled": denoise_enabled_var.get(),
                     "denoise_method": denoise_method_var.get(),
                     "channel_mode": channel_mode_var.get(),
@@ -41844,7 +50045,16 @@ class FFmpegBatchGUI:
                     "soxr_enabled": soxr_enabled_var.get(),
                     # 音频分段效果：列表项 {enabled,start,end,type,p1,p2,soft}
                     "audio_segments": [dict(s) for s in segs_box[0] if isinstance(s, dict)],
-                })
+                }
+
+                if is_node:
+                    # 节点模式：不写回轨道，交给调用方（_save_node_audio_fx）落库。
+                    # on_save 内部会自行刷新命令预览，这里不再重复。
+                    if on_save is not None:
+                        on_save(new_settings)
+                    win.destroy()
+                    return
+                track.enc_settings.update(new_settings)
 
                 # 获取语言：优先手动输入，其次下拉框
                 lang_code = custom_lang_entry.get().strip()
@@ -41972,10 +50182,6 @@ class FFmpegBatchGUI:
             ttk.Button(win, text=_("保存"), command=save).grid(row=4, column=0, columnspan=2, pady=10)
             win.wait_window()
 
-    def merge_set_track_enabled(self, idx, enabled):
-        self.merge_tracks[idx].enabled = enabled
-        self.merge_auto_recommend_container()
-        self.merge_update_command_preview()
 
     def merge_auto_recommend_container(self):
         main_video = self.merge_video.get()
@@ -42048,7 +50254,7 @@ class FFmpegBatchGUI:
         dir_path = self.merge_output_dir.get().strip() or os.path.dirname(video)
         dir_path = normalize_path(dir_path)
         base_name = os.path.basename(video)
-        name, _ = os.path.splitext(base_name)
+        name, _unused = os.path.splitext(base_name)
         container = self.merge_container.get() or "mkv"
         custom_name = self.merge_custom_name.get().strip()
         if custom_name:
@@ -42077,9 +50283,7 @@ class FFmpegBatchGUI:
 
     def merge_select_video(self):
         path = filedialog.askopenfilename(title=_("选择视频或图片"),
-                                          filetypes=[(_("媒体文件"), "*.mp4 *.mkv *.avi *.mov *.flv *.ts *.webm *.png *.jpg *.jpeg *.bmp *.gif *.webp"),
-                                                     (_("视频文件"), "*.mp4 *.mkv *.avi *.mov *.flv *.ts *.webm"),
-                                                     (_("图片文件"), "*.png *.jpg *.jpeg *.bmp *.gif *.webp")])
+                                          filetypes=media_filetypes())
         if path:
             self.merge_video.set(normalize_path(path))
 
@@ -42133,6 +50337,16 @@ class FFmpegBatchGUI:
             return
         if not self._check_pip_video_encoders():
             return
+        # 图片主视频 + 输出尺寸非偶数 → 拦下（不自动偶数化，理由见 _check_image_main_even_size）
+        # 主视频参数一律取【主视频轨道】enc_settings（与 merge_build_cmd_list 同款取法）。
+        _mv_main = self.merge_video.get().strip()
+        if _mv_main:
+            _mv_track = next((t for t in self.merge_tracks
+                              if getattr(t, "enabled", True)
+                              and getattr(t, "type", "video") == "video"), None)
+            if not self._check_image_main_even_size(
+                    _mv_main, getattr(_mv_track, "enc_settings", None) if _mv_track else None):
+                return
     
         output = self.merge_output.get().strip()
         final_output = self._resolve_path_conflict(output, show_dialog=True)
@@ -42182,8 +50396,21 @@ class FFmpegBatchGUI:
                         eff = self._get_effective_duration(t.enc_settings, dur)
                         if eff is not None and eff > 0:
                             total_duration += eff
+        elif pip_mode:
+            # 画中画：与转换端 -t 同口径（`_pip_timeline_extent`）——子视频接龙/循环把
+            # 时间轴延长到主视频之外时，进度必须用延长后的总长（否则 100% 后还在转）。
+            # 探不到（全 0/None）时回退主视频有效时长。
+            video_tracks = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
+            if video_tracks:
+                _pip_main = self._pip_main_effective_duration(video_tracks[0])
+                total_duration = self._pip_timeline_extent(
+                    _pip_main, [(t.file_path, t.enc_settings) for t in video_tracks[1:]])
+                if not total_duration or total_duration <= 0:
+                    total_duration = _pip_main
+            else:
+                total_duration = 0
         else:
-            # 普通封装 / 画中画：取主视频轨道的有效时长
+            # 普通封装：取主视频轨道的有效时长
             video_tracks = [t for t in self.merge_tracks if t.enabled and t.type == "video"]
             if video_tracks:
                 main_track = video_tracks[0]
@@ -42231,11 +50458,11 @@ class FFmpegBatchGUI:
                     else:
                         self._append_info_ui(_("[封装] 未勾选删除源文件，保留原文件"))
                 else:
-                    self._append_info_ui(_("[封装] 警告：输出文件 {0} 可能无效（不存在或大小为0），源文件未被删除").format(output_file))
+                    self._append_info_ui(_('[封装] 警告：输出文件 {0} 可能无效（不存在或大小为0），源文件未被删除').format(output_file))
             else:
-                self._append_info_ui(_("[封装] 处理失败，返回码 {0}，源文件未被删除").format(ret))
+                self._append_info_ui(_('[封装] 处理失败，返回码 {0}，源文件未被删除').format(ret))
         except Exception as e:
-            self._append_info_ui(_("[封装] 异常: {0}").format(e))
+            self._append_info_ui(_('[封装] 异常: {0}').format(e))
         finally:
             with self._proc_lock:
                 if proc in self.running_procs:
@@ -42308,7 +50535,7 @@ class FFmpegBatchGUI:
     def on_files_dropped(self, event):
         """根窗口拖放：仅处理添加到队列（输入/输出框由独立回调处理）"""
         files = [normalize_path(f) for f in self.root.tk.splitlist(event.data)]
-        self._append_info_ui(f"拖拽了 {len(files)} 个文件/文件夹")
+        self._append_info_ui(_('拖拽了 {0} 个文件/文件夹').format(len(files)))
         current_tab = self.notebook.index(self.notebook.select())
     
         if current_tab == 0:
@@ -42321,18 +50548,18 @@ class FFmpegBatchGUI:
                     if os.path.splitext(item)[1].lower() in video_exts:
                         self.add_task(item, auto_crop=True)
                     else:
-                        self._append_info_ui(f"忽略非视频文件: {os.path.basename(item)}")
+                        self._append_info_ui(_('忽略非视频文件: {0}').format(os.path.basename(item)))
                 elif os.path.isdir(item):
                     # 如果是目录，递归扫描所有视频文件
-                    self._append_info_ui(f"扫描目录: {item}")
-                    for root_dir, _, filenames in os.walk(item):
+                    self._append_info_ui(_('扫描目录: {0}').format(item))
+                    for root_dir, _unused, filenames in os.walk(item):
                         for filename in filenames:
                             file_path = normalize_path(os.path.join(root_dir, filename))
                             if os.path.splitext(file_path)[1].lower() in video_exts:
                                 self.add_task(file_path, auto_crop=True)
-                    self._append_info_ui(f"目录扫描完成: {item}")
+                    self._append_info_ui(_('目录扫描完成: {0}').format(item))
                 else:
-                    self._append_info_ui(f"忽略无效路径: {item}")
+                    self._append_info_ui(_('忽略无效路径: {0}').format(item))
         else:
             # 封装/合并标签页的处理保持不变
             if self.pip_enabled.get():
@@ -42357,10 +50584,10 @@ class FFmpegBatchGUI:
             self.input_file.set(first_file)
             if not self.output_dir.get():
                 self.output_dir.set(os.path.dirname(first_file))
-            self._append_info_ui(f"已设置输入文件: {os.path.basename(first_file)}")
+            self._append_info_ui(_('已设置输入文件: {0}').format(os.path.basename(first_file)))
             self.update_command_preview()
         else:
-            self._append_info_ui(f"文件不存在: {first_file}")
+            self._append_info_ui(_('文件不存在: {0}').format(first_file))
         return "break"  # 阻止事件冒泡到根窗口
     
     def on_output_drop(self, event):
@@ -42371,10 +50598,10 @@ class FFmpegBatchGUI:
         path = normalize_path(files[0])
         if os.path.isdir(path):
             self.output_dir.set(path)
-            self._append_info_ui(f"已设置输出目录: {path}")
+            self._append_info_ui(_('已设置输出目录: {0}').format(path))
         else:
             self.output_dir.set(os.path.dirname(path))
-            self._append_info_ui(f"已提取输出目录: {os.path.dirname(path)}")
+            self._append_info_ui(_('已提取输出目录: {0}').format(os.path.dirname(path)))
         self._push_output_history("convert", self.output_dir.get())
         self.update_command_preview()
         return "break"
@@ -42838,7 +51065,7 @@ class FFmpegBatchGUI:
             )
         _lbltt_lang = ttk.Label(stop_frame, text=_("选择界面显示语言："))
         _lbltt_lang.pack(side=tk.LEFT, padx=(40, 2))
-        self.language_display_var.set("中文" if self.language_var.get() == "zh" else "English")
+        self.language_display_var.set(_('中文') if self.language_var.get() == "zh" else "English")
         lang_combo = ttk.Combobox(stop_frame, textvariable=self.language_display_var,
                                   values=["中文", "English"], state="readonly", width=12)
         lang_combo.pack(side=tk.LEFT, padx=5)
@@ -43076,7 +51303,7 @@ class FFmpegBatchGUI:
             if not items:
                 return None
 
-            total = sum(d for _, d in items)
+            total = sum(d for _unused, d in items)
             # 转场重叠：相邻两项之间，前项 transition_enabled 才减（钳制为相邻两段较短者一半）
             for i in range(len(items) - 1):
                 es = getattr(items[i][0], "enc_settings", {}) or {}
@@ -43412,7 +51639,8 @@ class FFmpegBatchGUI:
 
     # ---------- 基本界面输入方法 ----------
     def select_input(self):
-        path = filedialog.askopenfilename(title=_("选择视频文件"))
+        path = filedialog.askopenfilename(title=_("选择视频或图片文件"),
+                                         filetypes=media_filetypes())
         if path:
             path = normalize_path(path)
             self.input_file.set(path)
@@ -43990,7 +52218,7 @@ class FFmpegBatchGUI:
         if not cmd_list_lines:
             self.extract_preview_text.insert(tk.END, f"文件 {os.path.basename(file_path)} 不包含用户勾选的任何流")
         else:
-            preview_text = f"--- 预览文件: {os.path.basename(file_path)} ---\n\n"
+            preview_text = _('--- 预览文件: {0} ---\n\n').format(os.path.basename(file_path))
             preview_text += "\n\n".join(cmd_list_lines)
             self.extract_preview_text.insert(tk.END, preview_text)
 
@@ -44286,7 +52514,9 @@ class FFmpegBatchGUI:
     # ---------- 流提取标签页方法 ----------
     def extract_add_file(self, path=None):
         if path is None:
-            paths = filedialog.askopenfilenames(title=_("选择文件"), filetypes=[(_("所有文件"), "*.*")])
+            paths = filedialog.askopenfilenames(
+                title=_("选择文件"),
+                filetypes=media_filetypes(include_audio=True, include_subtitle=True))
             if not paths:
                 return
         else:
@@ -44515,7 +52745,7 @@ class FFmpegBatchGUI:
         for path in file_list:
             stream_indices = self.extract_get_stream_indices(path)
             if not any(stream_indices.values()):
-                self._append_info_ui("[流提取] 警告: {0} 未检测到任何流，跳过".format(os.path.basename(path)))
+                self._append_info_ui(_('[流提取] 警告: {0} 未检测到任何流，跳过').format(os.path.basename(path)))
                 continue
     
             base = os.path.splitext(os.path.basename(path))[0]
@@ -44673,15 +52903,15 @@ class FFmpegBatchGUI:
 
         if task_count == 0:
             if single_mode:
-                self._append_info_ui("[流提取] 文件 {0} 不包含用户勾选的任何流".format(os.path.basename(file_list[0])))
+                self._append_info_ui(_('[流提取] 文件 {0} 不包含用户勾选的任何流').format(os.path.basename(file_list[0])))
             else:
                 self._append_info_ui(_("[流提取] 未添加任何任务，请检查文件是否包含所勾选的流类型"))
         else:
             mode = _("分流") if self.extract_split_mode.get() else _("合并")
             if single_mode:
-                self._append_info_ui("[流提取] 已为 {0} 添加 {1} 个{2}提取任务到队列".format(os.path.basename(file_list[0]), task_count, mode))
+                self._append_info_ui(_('[流提取] 已为 {0} 添加 {1} 个{2}提取任务到队列').format(os.path.basename(file_list[0]), task_count, mode))
             else:
-                self._append_info_ui("[流提取] 共添加 {0} 个{1}提取任务到队列".format(task_count, mode))
+                self._append_info_ui(_('[流提取] 共添加 {0} 个{1}提取任务到队列').format(task_count, mode))
         self.update_task_list()
     def extract_add_to_queue(self):
         if not self.extract_file_list:
@@ -44944,9 +53174,8 @@ class FFmpegBatchGUI:
             io_frame, textvariable=self.output_dir,
             values=tuple(_load_output_history().get("convert", [])))
         self.output_dir_combo.grid(row=1, column=1, padx=5, sticky="ew")
-        ToolTip(_lbltt42,
-                _("输出目录：可直接输入，也可下拉选择历史目录。\n"
-                "历史单独存于 output_dir_history.json，不污染全局设置。"))
+        ToolTip(_lbltt42, _("输出目录：可直接输入，也可下拉选择历史目录。\n"
+                                       "历史单独存于 output_dir_history.json，不污染全局设置。"))
         if DND_AVAILABLE:
             self.output_dir_combo.drop_target_register(DND_FILES)
             self.output_dir_combo.dnd_bind('<<Drop>>', self.on_output_drop)
@@ -45072,7 +53301,7 @@ class FFmpegBatchGUI:
             preview_label_text = _("当前命令模板")
         preview_frame = ttk.LabelFrame(settings_frame, text=preview_label_text, padding="1")
         preview_frame.pack(fill=tk.X, pady=0)
-        self.cmd_preview = scrolledtext.ScrolledText(preview_frame, height=4, wrap=tk.WORD, font=self._pick_ui_font(9))
+        self.cmd_preview = scrolledtext.ScrolledText(preview_frame, height=4, wrap=tk.WORD, font=("Microsoft YaHei",9))
         self.cmd_preview.pack(fill=tk.BOTH, expand=True, padx=(4,0))
         self.cmd_preview.insert(tk.END, _("请选择输入文件，或调整参数..."))
     
@@ -45126,8 +53355,8 @@ class FFmpegBatchGUI:
         list_container.pack(fill=tk.BOTH, expand=True, padx=(5,0), pady=(0, 0))
     
         Batch_style = ttk.Style()
-        Batch_style.configure("Batch.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0", rowheight=self.tree_rowheight, font=self._pick_ui_font(9))
-        Batch_style.configure("Batch.Treeview.Heading", background="#d9d9d9", font=self._pick_ui_font(9))
+        Batch_style.configure("Batch.Treeview", background="#f0f0f0", fieldbackground="#f0f0f0", rowheight=self.tree_rowheight)
+        Batch_style.configure("Batch.Treeview.Heading", background="#d9d9d9")
 
         Batch_style.map("Batch.Treeview",
                         background=[('selected', '#3475b5')],
@@ -45250,7 +53479,7 @@ class FFmpegBatchGUI:
         ttk.Button(info_top, text=_("保存日志"), command=lambda: self.save_log(self.info_text)).pack(side=tk.RIGHT, padx=2)
         self.info_text = scrolledtext.ScrolledText(info_frame, bg='#EAF4FC', fg='black',
                                                    selectbackground='#CCF09C', selectforeground='black',
-                                                   font=self._pick_ui_font(9), wrap=tk.WORD)
+                                                   font=("Microsoft YaHei",9,"normal"), wrap=tk.WORD)
         self.info_text.pack(fill=tk.BOTH, expand=True)
     
         # 转换进程信息日志区
@@ -45262,7 +53491,7 @@ class FFmpegBatchGUI:
         ttk.Button(detail_top, text=_("保存日志"), command=lambda: self.save_log(self.detail_text)).pack(side=tk.RIGHT, padx=2)
         self.detail_text = scrolledtext.ScrolledText(detail_frame, bg='#EAF4FC', fg='black',
                                                      selectbackground='#CCF09C', selectforeground='black',
-                                                     font=self._pick_ui_font(8), wrap=tk.WORD)
+                                                     font=("Microsoft YaHei",8,"normal"), wrap=tk.WORD)
         self.detail_text.pack(fill=tk.BOTH, expand=True)
     
         # 绑定各种控件刷新命令预览
@@ -45322,6 +53551,9 @@ class FFmpegBatchGUI:
         self.trim_frame.trim_start.trace_add("write", lambda *a: self.update_command_preview())
         self.trim_frame.trim_end.trace_add("write", lambda *a: self.update_command_preview())
         self.trim_frame.precise_trim.trace_add("write", lambda *a: self.update_command_preview())
+        # 图片素材的「显示时长」同样是命令输入（图片主视频的 -t / 文字水印画布时长都取它），
+        # 改了必须重算命令预览——否则要手动点「刷新命令」才生效。
+        self.trim_frame.img_duration.trace_add("write", lambda *a: self.update_command_preview())
         self.adv_frame.hwaccel_enabled.trace_add("write", lambda *a: self.update_command_preview())
         self.adv_frame.hwaccel_decoder.trace_add("write", lambda *a: self.update_command_preview())
         self.adv_frame.custom_args.trace_add("write", lambda *a: self.update_command_preview())
@@ -45419,6 +53651,16 @@ class SegmentEditor:
         # 避免合并命令因重复输入路径而爆栈；代价是队列多出 N 条任务。
         self.quick_split_queue_var = tk.BooleanVar(value=False)
 
+        # 随机抽段（2026-09-24）：从已检测出的分段里抽 N 段保留、其余删除。
+        # 最短默认 0.5 与检测回填的最小段长一致，避免「列表里看得见却抽不到」。
+        self.rnd_min_var = tk.StringVar(value="0.5")
+        self.rnd_max_var = tk.StringVar(value="")      # 留空 = 不限
+        self.rnd_count_var = tk.StringVar(value="5")
+        self.rnd_mode_var = tk.StringVar(value="随机")  # 随机 / 均匀（分层抽样，覆盖全片）
+        self.rnd_overlong_var = tk.StringVar(value="丢弃")  # 超长段：丢弃 / 段内随机截取
+        self.rnd_seed_var = tk.StringVar(value="")      # 留空 = 每次自动生成一个并回填（可复现）
+        self._rnd_backup = None                         # 抽取前的列表快照，供「撤销」恢复
+
         self.window = tk.Toplevel(parent)
         self.window.withdraw()  # 先隐藏，构建完成后再由 center_window 居中显示
         self.window.title(_("分段拼接设置"))
@@ -45513,6 +53755,8 @@ class SegmentEditor:
         self.tree.bind("<Double-1>", self.on_tree_double_click)
         # 单击表头/空白区 → 取消选择（未选中时「简易时间预览」会载入全部片段的标记）
         self.tree.bind("<Button-1>", self.on_tree_click_clear_selection)
+        # 右键 → mpv 顺序预览（EDL，不重编码、不带滤镜）：选中若干行就播这几行，未选中播全部
+        self.tree.bind("<Button-3>", self._popup_segment_menu)
 
         op_frame = ttk.Frame(left_frame)
         op_frame.pack(fill=tk.X, pady=2)
@@ -45541,12 +53785,20 @@ class SegmentEditor:
 
         # 右栏「外部命令输入」已收进「外部命令」按钮弹窗（2026-08-28），见 open_external_cmd_dialog
 
-        # ---- 音频独立截取（不分段）+ 自动检测分段（左右并排） ----
-        bottom_row = ttk.Frame(main)
-        bottom_row.pack(fill=tk.X, pady=5)
+        # ---- 左右两列：左=音频独立截取 + 分段切割；右=自动检测分段 + 确定/取消 ----
+        # 2026-09-24 改版：原先是「音频独立截取 | 自动检测分段」一行、下一行「分段切割 | 取消/确定」；
+        # 改成两列堆叠后，右列「自动检测分段」下方多出约两行高度，用于放「随机抽段」参数。
+        cols = ttk.Frame(main)
+        cols.pack(fill=tk.X, pady=5)
 
-        audio_trim_frame = ttk.LabelFrame(bottom_row, text=_("音频独立截取（不分段）"), padding="8")
-        audio_trim_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        left_col = ttk.Frame(cols)
+        left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+
+        right_col = ttk.Frame(cols)
+        right_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
+
+        audio_trim_frame = ttk.LabelFrame(left_col, text=_("音频独立截取（不分段）"), padding="8")
+        audio_trim_frame.pack(fill=tk.X)
 
         # 启用复选框 + 总时长参考
         at_row0 = ttk.Frame(audio_trim_frame)
@@ -45583,8 +53835,8 @@ class SegmentEditor:
         self._on_audio_trim_toggle()
 
         # ---- 自动检测分段（场景变化 / 黑屏 / 静音） ----
-        detect_frame = ttk.LabelFrame(bottom_row, text=_("自动检测分段"), padding="8")
-        detect_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
+        detect_frame = ttk.LabelFrame(right_col, text=_("自动检测分段"), padding="8")
+        detect_frame.pack(side=tk.TOP, fill=tk.X)
 
         # 第 1 行：三个检测按钮
         det_row0 = ttk.Frame(detect_frame)
@@ -45611,17 +53863,64 @@ class SegmentEditor:
         self.detect_status_label = ttk.Label(det_row1, text=_("检测结果会替换当前分段列表"), foreground="gray")
         self.detect_status_label.pack(side=tk.LEFT)
 
-        # ---- 底部按钮 ----
-        btn_frame = ttk.Frame(main)
-        btn_frame.pack(fill=tk.X, pady=10)
-        
-        # 第 1 行：分段切割标签（左） + 精确方式单选（右）
-        row1 = ttk.Frame(btn_frame)
-        row1.pack(fill=tk.X, pady=(0, 6))
+        # 第 3 行：随机抽段 —— 最短 / 最长 秒数 + 超长处理（2026-09-24）
+        det_row2 = ttk.Frame(detect_frame)
+        det_row2.pack(fill=tk.X, pady=(8, 0))
+        b_rand = ttk.Button(det_row2, text=_("随机抽段"), command=self._random_pick_segments, width=10)
+        b_rand.pack(side=tk.LEFT, padx=(0, 8))
+        ToolTip(b_rand,
+                _("从当前列表的分段里抽几段保留、其余删除（纯本地筛选，不重跑检测）。\n"
+                "先按时长筛出合格候选，再按「段数」抽，抽到的段按时间顺序留在列表里。"),
+                wraplength=360)
+        _lbl_rnd1 = ttk.Label(det_row2, text=_("最短"))
+        _lbl_rnd1.pack(side=tk.LEFT)
+        ttk.Entry(det_row2, textvariable=self.rnd_min_var, width=5).pack(side=tk.LEFT, padx=2)
+        ttk.Label(det_row2, text=_("秒")).pack(side=tk.LEFT)
+        _lbl_rnd2 = ttk.Label(det_row2, text=_("最长"))
+        _lbl_rnd2.pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Entry(det_row2, textvariable=self.rnd_max_var, width=5).pack(side=tk.LEFT, padx=2)
+        ttk.Label(det_row2, text=_("秒")).pack(side=tk.LEFT)
+        cmb_overlong = ttk.Combobox(det_row2, textvariable=self.rnd_overlong_var, width=4,
+                                    values=["丢弃", "截取"], state="readonly")
+        cmb_overlong.pack(side=tk.LEFT, padx=(4, 0))
+        ToolTip(cmb_overlong,
+                _("超过「最长秒数」的分段怎么处理：\n"
+                "• 丢弃：不参与抽取（保留完整场景，切点不变）。\n"
+                "• 截取：仍参与抽取，但只在该段内部随机取「最长秒数」那么长。\n"
+                "最长留空 = 不限，此时本项不起作用。"), wraplength=360)
 
-        label = tk.Label(row1, text=_("分段切割:"), fg="blue", font=("", 10, "bold"))
-        label.pack(side=tk.LEFT, padx=(0, 5))
-        ToolTip(label,
+        # 第 4 行：随机抽段 —— 段数 / 模式 / 种子 / 撤销
+        det_row3 = ttk.Frame(detect_frame)
+        det_row3.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(det_row3, text=_("段数")).pack(side=tk.LEFT)
+        ttk.Spinbox(det_row3, from_=1, to=9999, width=4,
+                    textvariable=self.rnd_count_var).pack(side=tk.LEFT, padx=2)
+        ttk.Label(det_row3, text=_("模式")).pack(side=tk.LEFT, padx=(12, 0))
+        cmb_mode = ttk.Combobox(det_row3, textvariable=self.rnd_mode_var, width=4,
+                                values=["随机", "均匀"], state="readonly")
+        cmb_mode.pack(side=tk.LEFT, padx=2)
+        ToolTip(cmb_mode,
+                _("• 随机：在合格候选里等概率抽（简单，但可能都挤在同一段时间）。\n"
+                "• 均匀：按时间顺序把候选分成 N 桶、每桶抽 1 段，保证覆盖全片。"),
+                wraplength=360)
+        _lbl_rnd3 = ttk.Label(det_row3, text=_("种子"))
+        _lbl_rnd3.pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Entry(det_row3, textvariable=self.rnd_seed_var, width=8).pack(side=tk.LEFT, padx=2)
+        ToolTip(_lbl_rnd3,
+                _("随机数种子：同一个种子 + 同一份列表 = 抽出完全相同的结果（可复现）。\n"
+                "留空时会自动生成一个并回填，于是再点一次「随机抽段」就是同样的结果；\n"
+                "想换一组就改这个数字。"), wraplength=360)
+        self.rnd_undo_btn = ttk.Button(det_row3, text=_("撤销"), command=self._undo_random_pick,
+                                       width=6, state="disabled")
+        self.rnd_undo_btn.pack(side=tk.LEFT, padx=(8, 0))
+        ToolTip(self.rnd_undo_btn, _("撤销上一次随机抽段，恢复抽取前的完整列表（检测回填后不可撤销）。"),
+                wraplength=300)
+
+        # ---- 分段切割（左列下方） ----
+        # 2026-09-24：从原先整行的「分段切割:」蓝标签改为左列内的 LabelFrame，与上方两个框对齐
+        split_frame = ttk.LabelFrame(left_col, text=_("分段切割"), padding="8")
+        split_frame.pack(fill=tk.X, pady=(5, 0))
+        ToolTip(split_frame,
                 _("额外功能：生成可执行的 FFmpeg 分段切割脚本，或直接发送到任务队列。\n"
                 "• 快速 (copy)：流复制截取，不重新编码，速度极快。\n"
                 "      流复制截取的片段不准确，适合作为预处理片段，或者无所谓精确的存档。\n"
@@ -45634,9 +53933,14 @@ class SegmentEditor:
                 "勾选「分开队列」则改为每段一条独立任务。\n"
                 "  · 双 -ss（组合跳转）：逐段发送，无法合并（此时「分开队列」自动勾选并置灰）。\n"
                 "输出文件自动命名为：原文件名_seg序号.mp4。"),
-                wraplength=800
+                wraplength=560
         )
-        ttk.Label(row1, text=_("精确方式:")).pack(side=tk.LEFT, padx=(12, 2))
+
+        # 第 1 行：精确方式 + 分开队列
+        row1 = ttk.Frame(split_frame)
+        row1.pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Label(row1, text=_("精确方式:")).pack(side=tk.LEFT)
         # 2026-09-08：精确方式切换需联动「分开队列」（双-ss 恒逐段 → 锁定勾选并置灰）
         ttk.Radiobutton(row1, text=_("trim 滤镜"), variable=self.precise_mode_var,
                         value="trim", command=self._on_precise_mode_change).pack(side=tk.LEFT)
@@ -45656,29 +53960,33 @@ class SegmentEditor:
                 "常规片段数保持不勾选即可（合并更干净）。"),
                 wraplength=680)
 
-        # 第 2 行：发送到队列 / 导出为脚本 + 取消/确定
-        row2 = ttk.Frame(btn_frame)
+        # 第 2 行：发送到队列 + 导出为脚本（2026-09-24：两组合并进同一行，竖直分隔线分组）
+        row2 = ttk.Frame(split_frame)
         row2.pack(fill=tk.X)
 
-        ttk.Label(row2, text=_("发送到队列")).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(row2, text=_("快速"), command=self.send_quick_to_queue, width=6).pack(side=tk.LEFT, padx=5)
-        ttk.Button(row2, text=_("精确"), command=self.send_precise_to_queue, width=6).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row2, text=_("发送到队列")).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(row2, text=_("快速"), command=self.send_quick_to_queue, width=5).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row2, text=_("精确"), command=self.send_precise_to_queue, width=5).pack(side=tk.LEFT, padx=2)
 
-        lbl_export = ttk.Label(row2, text=_(" 导出为脚本"))
-        lbl_export.pack(side=tk.LEFT, padx=(10, 5))
+        ttk.Separator(row2, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6, pady=2)
+
+        lbl_export = ttk.Label(row2, text=_("导出为脚本"))
+        lbl_export.pack(side=tk.LEFT, padx=(0, 4))
         ToolTip(lbl_export,
                 _("导出为脚本时**恒为分开**：脚本就是一行一条命令顺序执行，"
                 "合并成单命令反而更难排查和复用。\n"
                 "所以「分开队列」勾选与否都不影响导出的脚本内容，它只作用于「发送到队列」。\n"
                 "• 快速：每段一条 `ffmpeg -ss 开始 -to 结束 -i 输入 -c copy 输出`。\n"
                 "• 精确：每段一条按右侧「精确方式」生成的完整编码命令（trim 滤镜 / 双 -ss）。"),
-                wraplength=680)
-        ttk.Button(row2, text=_("快速"), command=self.export_quick_script, width=6).pack(side=tk.LEFT, padx=5)
-        ttk.Button(row2, text=_("精确"), command=self.export_precise_script, width=6).pack(side=tk.LEFT, padx=5)
+                wraplength=560)
+        ttk.Button(row2, text=_("快速"), command=self.export_quick_script, width=5).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row2, text=_("精确"), command=self.export_precise_script, width=5).pack(side=tk.LEFT, padx=2)
 
-        ttk.Frame(row2).pack(side=tk.LEFT, expand=True, fill=tk.X)  # 弹簧：把取消/确定推到右侧
-        ttk.Button(row2, text=_("取消"), command=self.on_cancel).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(row2, text=_("确定"), command=self.on_ok).pack(side=tk.RIGHT, padx=5)
+        # ---- 确定 / 取消（右列底部，右对齐；2026-09-24 从整行按钮移入右列） ----
+        okcancel_row = ttk.Frame(right_col)
+        okcancel_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 0))
+        ttk.Button(okcancel_row, text=_("取消"), command=self.on_cancel).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(okcancel_row, text=_("确定"), command=self.on_ok).pack(side=tk.RIGHT, padx=5)
 
 
         # 双-ss 初始为默认模式时，同步一次「分开队列」的锁定态（默认 trim → 无需置灰）
@@ -45956,7 +54264,7 @@ class SegmentEditor:
             cmds = [self.app.generate_ffmpeg_command(input_path, out_paths[i], settings_list[i], preview=False)
                     for i in range(len(out_paths))]
         except Exception as e:
-            self.app._append_info_ui(f"[精确合并] 生成命令失败: {e}")
+            self.app._append_info_ui(_('[精确合并] 生成命令失败: {0}').format(e))
             return None
         # 组合跳转 / 无限源时长限制等无法在单命令优雅合并，回退
         for c in cmds:
@@ -46138,7 +54446,7 @@ class SegmentEditor:
                 cmd_list = self.app.generate_ffmpeg_command(input_file, out_path, settings, preview=True)
                 cmd_str = format_cmd_for_display(cmd_list)
             except Exception as e:
-                cmd_str = f"# 错误：{e}"
+                cmd_str = _('# 错误：{0}').format(e)
             lines.append(cmd_str)
     
         with open(save_path, 'w', encoding='utf-8') as f:
@@ -46375,7 +54683,7 @@ class SegmentEditor:
                 return
         if dur > 0:
             self.segment_total_label.config(
-                text=f"分段视频总时长: {dur:.1f}秒 ({seconds_to_time(dur)})")
+                text=_('分段视频总时长: {0}:.1f秒 ({1})').format(dur, seconds_to_time(dur)))
         else:
             self.segment_total_label.config(text=_("分段视频总时长: 0秒（请添加片段）"))
 
@@ -46541,14 +54849,14 @@ class SegmentEditor:
             ss_match = re.search(r'-ss\s+([\d:.]+)', line, re.IGNORECASE)
             if not ss_match:
                 skipped_count += 1
-                errors.append(f"未找到 -ss: {line[:80]}...")
+                errors.append(_('未找到 -ss: {0}...').format(line[:80]))
                 continue
     
             start_str = ss_match.group(1)
             start_sec = time_to_seconds(start_str)
             if start_sec is None:
                 skipped_count += 1
-                errors.append(f"无效的开始时间: {start_str}，跳过")
+                errors.append(_('无效的开始时间: {0}，跳过').format(start_str))
                 continue
     
             # 匹配 -t 或 -to
@@ -46560,7 +54868,7 @@ class SegmentEditor:
                 duration_sec = time_to_seconds(duration_str)
                 if duration_sec is None:
                     skipped_count += 1
-                    errors.append(f"无效的持续时间: {duration_str}，跳过")
+                    errors.append(_('无效的持续时间: {0}，跳过').format(duration_str))
                     continue
                 end_sec = start_sec + duration_sec
             elif to_match:
@@ -46568,16 +54876,16 @@ class SegmentEditor:
                 end_sec = time_to_seconds(end_str)
                 if end_sec is None:
                     skipped_count += 1
-                    errors.append(f"无效的结束时间: {end_str}，跳过")
+                    errors.append(_('无效的结束时间: {0}，跳过').format(end_str))
                     continue
             else:
                 skipped_count += 1
-                errors.append(f"未找到 -t 或 -to: {line[:80]}...")
+                errors.append(_('未找到 -t 或 -to: {0}...').format(line[:80]))
                 continue
     
             if end_sec <= start_sec:
                 skipped_count += 1
-                errors.append(f"结束时间必须大于开始时间: {start_str}->{end_str}，跳过")
+                errors.append(_('结束时间必须大于开始时间: {0}->{1}，跳过').format(start_str, end_str))
                 continue
     
             # 检查是否重复
@@ -46585,7 +54893,7 @@ class SegmentEditor:
             end_display = seconds_to_time(end_sec)
             if any(seg["start"] == start_display and seg["end"] == end_display for seg in self.segments):
                 skipped_count += 1
-                errors.append(f"重复片段: {start_display}->{end_display}，已跳过")
+                errors.append(_('重复片段: {0}->{1}，已跳过').format(start_display, end_display))
                 continue
     
             # 尝试添加片段（可能会检查总时长等）
@@ -46593,16 +54901,16 @@ class SegmentEditor:
                 parsed_count += 1
             else:
                 skipped_count += 1
-                errors.append(f"添加失败（可能超出总时长）: {start_display}->{end_display}")
+                errors.append(_('添加失败（可能超出总时长）: {0}->{1}').format(start_display, end_display))
     
-        msg = f"成功导入 {parsed_count} 个片段"
+        msg = _('成功导入 {0} 个片段').format(parsed_count)
         if skipped_count > 0:
-            msg += f"，{skipped_count} 行被跳过"
+            msg += _('，{0} 行被跳过').format(skipped_count)
             if errors:
                 # 只显示前10条错误
                 error_preview = "\n".join(errors[:10])
                 if len(errors) > 10:
-                    error_preview += f"\n... 还有 {len(errors)-10} 条错误"
+                    error_preview += _('\n... 还有 {0} 条错误').format(len(errors)-10)
                 messagebox.showwarning(_("导入警告"), msg + _("\n\n错误详情：\n") + error_preview)
             else:
                 messagebox.showinfo(_("导入完成"), msg)
@@ -46673,7 +54981,7 @@ class SegmentEditor:
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                         text=True, errors="replace",
                                         creationflags=_ffmpeg_spawn_flags())
-                self._detect_procs.append(proc)
+                self.app._detect_procs.append(proc)
             except Exception as e:
                 self.window.after(0, lambda: self._set_detect_done(_("检测失败")))
                 self.window.after(0, lambda: messagebox.showerror(_("检测失败"), str(e)))
@@ -46722,7 +55030,7 @@ class SegmentEditor:
             except Exception:
                 pass
             try:
-                self._detect_procs.remove(proc)
+                self.app._detect_procs.remove(proc)
             except Exception:
                 pass
             if timed_out:
@@ -46783,8 +55091,8 @@ class SegmentEditor:
             # 黑屏/静音区间作为「要删除的段」：分段 = 区间之间的内容段
             ranges = [(a, b) for a, b in cuts if b > a]
             if not ranges:
-                self._set_detect_done(_("分析完成（未检测到{0}段）").format(kind_name))
-                messagebox.showinfo(_("提示"), _("未检测到{0}段").format(kind_name))
+                self._set_detect_done(_('分析完成（未检测到{0}段）').format(kind_name))
+                messagebox.showinfo(_("提示"), _('未检测到{0}段').format(kind_name))
                 return
             # 合并重叠区间
             ranges.sort()
@@ -46805,20 +55113,190 @@ class SegmentEditor:
 
         if not new_segments:
             self._set_detect_done(_("分析完成（无有效片段）"))
-            messagebox.showinfo(_("提示"), _("未从{0}检测中切出有效片段").format(kind_name))
+            messagebox.showinfo(_("提示"), _('未从{0}检测中切出有效片段').format(kind_name))
             return
 
-        # 替换列表
+        # 替换列表（检测回填整体覆盖 → 上一次随机抽段的快照随之失效，「撤销」按钮归位）
         self.segments.clear()
+        self._rnd_reset_undo()
         for a, b in new_segments:
             self.segments.append({
                 "start": seconds_to_time(a), "end": seconds_to_time(b),
                 "flip": _("无"), "speed": "1.0", "reverse": False,
             })
         self.refresh_tree()
-        self._set_detect_done(_("分析完成，切出 {0} 段").format(len(new_segments)))
-        self.app._append_info_ui(_("[检测] {0}检测完成，切出 {1} 个片段").format(kind_name, len(new_segments)))
-        messagebox.showinfo(_("检测完成"), _("{0}检测完成，已回填 {1} 个片段").format(kind_name, len(new_segments)))
+        self._set_detect_done(_('分析完成，切出 {0} 段').format(len(new_segments)))
+        self.app._append_info_ui(_('[检测] {0}检测完成，切出 {1} 个片段').format(kind_name, len(new_segments)))
+        messagebox.showinfo(_("检测完成"), _('{0}检测完成，已回填 {1} 个片段').format(kind_name, len(new_segments)))
+
+    # ---------- 随机抽段（2026-09-24） ----------
+    def _rnd_log(self, msg):
+        """写主窗口日志（app 引用可能为空，静默兜底）。"""
+        try:
+            if self.app:
+                self.app._append_info_ui(msg)
+        except Exception:
+            pass
+
+    def _rnd_reset_undo(self):
+        """清空随机抽段快照并禁用「撤销」（列表被整体覆盖时调用）。"""
+        self._rnd_backup = None
+        try:
+            self.rnd_undo_btn.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _rnd_read_params(self):
+        """读取「随机抽段」参数；非法/越界值一律静默钳制并写日志（不弹窗、不归零）。"""
+        def _num(raw, default, name):
+            s = str(raw).strip() if raw is not None else ""
+            if not s:
+                return default
+            try:
+                x = float(s)
+            except (TypeError, ValueError):
+                self._rnd_log(_('[随机] {0}「{1}」不是数字，按 {2} 处理').format(name, s, default))
+                return default
+            if x < 0:
+                self._rnd_log(_('[随机] {0} {1} 为负，按 {2} 处理').format(name, x, default))
+                return default
+            return x
+
+        min_sec = _num(self.rnd_min_var.get(), 0.5, _("最短"))
+        max_raw = str(self.rnd_max_var.get()).strip()
+        max_sec = _num(max_raw, None, _("最长")) if max_raw else None   # 留空 = 不限
+        if max_sec is not None and max_sec < min_sec:
+            self._rnd_log(_('[随机] 最长 {0} 小于最短 {1}，最长视为不限').format(max_sec, min_sec))
+            max_sec = None
+
+        try:
+            count = int(float(str(self.rnd_count_var.get()).strip()))
+        except (TypeError, ValueError):
+            count = 5
+            self._rnd_log(_("[随机] 段数不是数字，按 5 处理"))
+        if count < 1:
+            count = 1
+
+        mode = str(self.rnd_mode_var.get()).strip()
+        if mode not in ("随机", "均匀"):
+            mode = "随机"
+        overlong = str(self.rnd_overlong_var.get()).strip()
+        if overlong not in ("丢弃", "截取"):
+            overlong = "丢弃"
+        return {"min": min_sec, "max": max_sec, "count": count,
+                "mode": mode, "overlong": overlong,
+                "seed": str(self.rnd_seed_var.get()).strip()}
+
+    def _random_pick_segments(self):
+        """从当前列表里抽 N 段保留、其余删除。
+
+        纯 Python 端筛选 + 抽样，不跑 ffmpeg。流程：
+        ①按最短/最长秒数筛出合格候选 → ②抽 N 段（随机 / 均匀分层）
+        → ③超长段按「丢弃 / 段内随机截取」处理 → ④回填列表（其余删除）。
+        """
+        if not self.segments:
+            messagebox.showinfo(_("提示"), _("分段列表为空，请先检测或添加片段"))
+            return
+        p = self._rnd_read_params()
+
+        # ①候选池：按时长筛选
+        pool = []          # [(start, end, dur, seg, need_cut)]
+        n_short = n_long = 0
+        for seg in self.segments:
+            s = time_to_seconds(seg.get("start", ""))
+            e = time_to_seconds(seg.get("end", ""))
+            if s is None or e is None or e <= s:
+                continue
+            dur = e - s
+            if dur < p["min"]:
+                n_short += 1
+                continue
+            need_cut = False
+            if p["max"] is not None and dur > p["max"]:
+                if p["overlong"] == "丢弃":
+                    n_long += 1
+                    continue
+                need_cut = True
+            pool.append((s, e, dur, seg, need_cut))
+
+        if not pool:
+            self.detect_status_label.config(
+                text=_('无合格候选段（过短{0}段 / 超长{1}段）').format(n_short, n_long), foreground="gray")
+            self._rnd_log(_('[随机] 无合格候选段（过短{0}段 / 超长{1}段）').format(n_short, n_long))
+            messagebox.showinfo(_("提示"), _("没有符合时长条件的分段，请放宽「最短/最长」秒数"))
+            return
+        pool.sort(key=lambda it: it[0])   # 按时间序：既是「均匀」分桶的前提，也让输出顺序稳定
+
+        # ②随机种子：留空则自动生成一个并回填 → 再点一次就是同样的结果（可复现）
+        seed_raw = p["seed"]
+        if seed_raw:
+            try:
+                seed = int(seed_raw)
+            except ValueError:
+                # 非数字种子：用与解释器无关的稳定换算，保证同一串字符每次跑出同一结果
+                seed = sum((i + 1) * ord(c) for i, c in enumerate(seed_raw)) % (10 ** 9)
+        else:
+            seed = random.randrange(1, 10 ** 9)
+            self.rnd_seed_var.set(str(seed))
+        rng = random.Random(seed)   # ⚠️ 局部实例：绝不 random.seed() 污染全局
+
+        # ③抽样
+        k = min(p["count"], len(pool))
+        if p["mode"] == "均匀":
+            # 分层抽样：候选按时间序分 k 桶，每桶随机取 1 段 → 覆盖全片，不会都挤在同一段时间
+            picks = []
+            n = len(pool)
+            for i in range(k):
+                a = i * n // k
+                b = min(n, max(a + 1, (i + 1) * n // k))
+                picks.append(pool[rng.randrange(a, b)])
+        else:
+            picks = rng.sample(pool, k)
+        picks.sort(key=lambda it: it[0])
+
+        # ④生成结果段（超长段：在该段内部随机取「最长秒数」那么长）
+        result = []
+        for s, e, dur, seg, need_cut in picks:
+            ns, ne = s, e
+            if need_cut:
+                ns = s + rng.random() * (dur - p["max"])
+                ne = ns + p["max"]
+            new_seg = dict(seg)
+            new_seg["start"] = seconds_to_time(round(ns, 3))
+            new_seg["end"] = seconds_to_time(round(ne, 3))
+            result.append(new_seg)
+
+        # ⑤回填（其余删除），留快照供「撤销」
+        self._rnd_backup = copy.deepcopy(self.segments)
+        self.segments = result
+        self.refresh_tree()
+        for i in range(len(result)):
+            self.tree.selection_add(str(i))
+        self.rnd_undo_btn.configure(state="normal")
+
+        total = 0.0
+        for x in result:
+            a = time_to_seconds(x["start"])
+            b = time_to_seconds(x["end"])
+            if a is not None and b is not None:
+                total += b - a
+        note = _('抽中 {0}/{1} 段，共 {2:.1f} 秒').format(len(result), len(pool), total)
+        if k < p["count"]:
+            note += _('（候选不足，要{0}段）').format(p['count'])
+        self.detect_status_label.config(text=note, foreground="gray")
+        self._rnd_log(_('[随机] 原 {0} 段 → 合格 {1} 段（过短{2} / 超长{3}）→ {4}，模式{5}，种子 {6}').format(len(self._rnd_backup), len(pool), n_short, n_long, note, p['mode'], seed))
+
+    def _undo_random_pick(self):
+        """撤销上一次随机抽段，恢复抽取前的完整列表。"""
+        bak = getattr(self, "_rnd_backup", None)
+        if not bak:
+            return
+        self.segments = copy.deepcopy(bak)
+        self.refresh_tree()
+        self._rnd_reset_undo()
+        self.detect_status_label.config(text=_('已撤销随机抽段，恢复 {0} 段').format(len(self.segments)),
+                                        foreground="gray")
+        self._rnd_log(_('[随机] 已撤销随机抽段，恢复 {0} 段').format(len(self.segments)))
 
     def preview_selected_segment(self):
         """预览选中的片段（用播放器跳转到片段起止）。"""
@@ -46841,6 +55319,102 @@ class SegmentEditor:
             duration = end_sec - start_sec
         # 片段内部翻转/变速/倒放用播放器原生能力无法完整表达，这里只做时间跳转预览
         self.app.preview_with_player(input_file, start_time=start_sec, duration=duration)
+
+    # ---------- 列表右键 · mpv 顺序预览（EDL，不重编码、不带滤镜） ----------
+    def _popup_segment_menu(self, event):
+        """分段列表右键菜单：按列表顺序把若干段交给 mpv 一次性顺序播放。"""
+        row = self.tree.identify_row(event.y)
+        # 右键落在行上：自动选中该行（与封装页轨道列表右键同款体验）
+        if row and row not in self.tree.selection():
+            self.tree.selection_set(row)
+        sel = self.tree.selection()
+        idxs = sorted(int(s) for s in sel if str(s).isdigit()) if sel \
+            else list(range(len(self.segments)))
+        menu = tk.Menu(self.tree, tearoff=0)
+        mpv_on = bool(self.app and getattr(self.app, "use_mpv", None)
+                      and self.app.use_mpv.get())
+        state = "normal" if (mpv_on and idxs) else "disabled"
+        menu.add_command(
+            label=(_('预览选中 {0} 段（mpv 顺序播放）').format(len(idxs)) if sel
+                   else _('预览全部 {0} 段（mpv 顺序播放）').format(len(idxs))),
+            command=lambda: self._preview_segments_edl(idxs), state=state)
+        if not mpv_on:
+            menu.add_command(label=_("（需先在「信息与播放器」启用 mpv）"), state="disabled")
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _preview_segments_edl(self, idxs):
+        """按列表顺序用 mpv EDL 播放若干段：轻量「整体/单段」复核，不重编码、不带滤镜。
+
+        之所以不用 lavfi 合成图：本入口的定位就是「列表时间点对不对」的快速复核，
+        纯 mpv 跳读、秒开；要看滤镜/转场效果时仍走「发送到封装页面」。
+
+        EDL v0 内联格式 `edl://file,start,dur;file,start,dur;...`（写法与封装页
+        `merge_preview_concat_edl` 同款）。已知限制：
+          · 依赖 mpv（ffplay 不支持 edl://）；
+          · 路径含 `=` 会被内联 URL 解析截断 → 只能跳过（封装页 2026-09-17 实测同款坑）；
+          · EDL 是「跳读」不是拼接，换段处短暂停顿/闪烁属正常，也没有 xfade 转场；
+          · 不带逐段翻转/变速/倒放，也不带主界面滤镜。
+        """
+        app = self.app
+        if not (app and getattr(app, "use_mpv", None) and app.use_mpv.get()):
+            messagebox.showwarning(_("提示"), _("本预览依赖 mpv（请在「信息与播放器」页启用 mpv 播放器）"))
+            return
+        if not app._mpv_ready(log=True):
+            return
+        src = normalize_path(self._get_input_path())
+        if not src or not os.path.exists(src):
+            messagebox.showerror(_("错误"), _("源文件不存在，无法预览"))
+            return
+        if "=" in src:
+            messagebox.showwarning(_("提示"),
+                                   _('源文件路径含「=」，mpv 内联 EDL 无法处理：\n{0}\n请改名后重试（去掉或替换 = 即可）。').format(src))
+            return
+
+        entries, bad = [], 0
+        for i in idxs:
+            if not (0 <= i < len(self.segments)):
+                continue
+            seg = self.segments[i]
+            s = time_to_seconds(seg.get("start", ""))
+            e = time_to_seconds(seg.get("end", ""))
+            if s is None or e is None or e <= s:
+                bad += 1
+                continue
+            p = src.replace(",", "\\,").replace(";", "\\;")   # EDL 字段分隔符转义
+            # ⚠ 秒值一律 .6f 定点微秒：禁 %g（只有 6 位有效数字，长素材会抹精度，
+            # 违反「忠实传导用户给的时间值」——与封装页 EDL 同口径）
+            entries.append(f"{p},{s:.6f},{e - s:.6f}")
+        if not entries:
+            messagebox.showinfo(_("提示"), _("没有可预览的有效时间段"))
+            return
+
+        edl_uri = "edl://" + ";".join(entries)
+        # Windows 命令行上限 32767 字符：段数多/路径长时宁可少播，也别让命令被截断后静默失败
+        if len(edl_uri) > 30000:
+            keep = max(1, len(entries) * 29000 // len(edl_uri))
+            entries = entries[:keep]
+            edl_uri = "edl://" + ";".join(entries)
+            app._append_info_ui(_('[分段预览] 命令行过长，只预览前 {0} 段').format(keep))
+        if bad:
+            app._append_info_ui(_('[分段预览] 跳过 {0} 个时间无效的分段').format(bad))
+
+        # ⚠ --hr-seek=yes 必须保持：EDL 没有滤镜图、也没有图内 trim 兜底，
+        # 关掉会直接落到关键帧（最多偏一个 GOP）。不要去和 lavfi 那两处「统一」。
+        cmd = [app.mpv_path.get().strip() or "mpv",
+               "--hr-seek=yes", "--hr-seek-framedrop=no", "--keep-open=no", edl_uri]
+        app._append_info_ui(
+            _('[分段预览] mpv 顺序播放 {0} 段（不重编码、不带滤镜；换段处短暂停顿属正常）').format(len(entries)))
+        app._append_info_ui(_("执行命令: ") + format_cmd_for_display(cmd))
+        try:
+            # 紧贴现存的回收：防止多次预览同时出声（重音）
+            app._reap_prev_preview_player()
+            app._preview_player_proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=_ffmpeg_spawn_flags())
+            _register_preview_proc(app._preview_player_proc)
+        except Exception as e:
+            app._append_info_ui(_('[分段预览] mpv 启动失败: {0}').format(e))
+            messagebox.showerror(_("预览失败"), _('mpv 启动失败:\n{0}').format(e))
 
     # ---------- 确定/取消 ----------
     def on_ok(self):
@@ -47062,19 +55636,13 @@ def parse_edl_tc(tc, fps=25.0):
 
 def format_ffmetadata_time(seconds):
     """秒 -> HH:MM:SS.mmm（FFmetadata 格式）"""
-    seconds = max(0.0, float(seconds))
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = seconds % 60
+    h, m, s = _hms_split(seconds)
     return "%02d:%02d:%09.6f" % (h, m, s)
 
 
 def format_seconds_short(seconds):
     """秒 -> 简洁时间字符串（用于显示/CSV）：优先 HH:MM:SS，不足则 MM:SS"""
-    seconds = max(0.0, float(seconds))
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = seconds % 60
+    h, m, s = _hms_split(seconds)
     if h > 0:
         return "%02d:%02d:%05.2f" % (h, m, s)
     return "%02d:%05.2f" % (m, s)
@@ -47332,9 +55900,9 @@ def parse_ffmetadata(text):
             chapters.append(cur)
         elif cur is not None:
             if line.upper().startswith("START="):
-                cur["_raw_start"] = _parse_ffmeta_num(line.split("=", 1)[1])
+                cur["_raw_start"] = _opt_float(line.split("=", 1)[1])
             elif line.upper().startswith("END="):
-                cur["_raw_end"] = _parse_ffmeta_num(line.split("=", 1)[1])
+                cur["_raw_end"] = _opt_float(line.split("=", 1)[1])
             elif line.upper().startswith("TITLE="):
                 cur["title"] = line.split("=", 1)[1]
     result = []
@@ -47350,14 +55918,6 @@ def parse_ffmetadata(text):
             "end": end,
         })
     return result
-
-
-def _parse_ffmeta_num(s):
-    """解析 FFmetadata 数值字段（可能带浮点）"""
-    try:
-        return float(s)
-    except ValueError:
-        return None
 
 
 def parse_cue(text):
@@ -48019,10 +56579,10 @@ class ChapterEditor:
             return
         path = ""
         try:
-            if hasattr(self.app, "input_file"):
-                path = self.app.input_file.get().strip()
-            if not path and getattr(self.app, "merge_video", None):
-                path = self.app.merge_video.get().strip()
+            # 2026-09-23：章节编辑器只在封装页使用 → 预览取封装页主视频，
+            # 不再兜底到转换页 input_file（会预览另一页的视频）。
+            _pf, _unused = _page_main_video(self.app, "merge")
+            path = _pf or ""
         except Exception:
             path = ""
         if not path or not os.path.exists(path):
@@ -48211,7 +56771,7 @@ def _sync_parse_fps(stream):
     """从 ffprobe stream dict 解析帧率（'25/1' → 25.0），无法解析返回 None。"""
     for key in ("avg_frame_rate", "r_frame_rate"):
         raw = (stream or {}).get(key) or ""
-        num, _, den = str(raw).partition("/")
+        num, _unused, den = str(raw).partition("/")
         try:
             num = float(num)
             den = float(den) if den else 1.0
@@ -48220,14 +56780,6 @@ def _sync_parse_fps(stream):
         if num > 0 and den > 0:
             return num / den
     return None
-
-
-def _sync_format_time(sec):
-    """秒 → '12.500000'（固定 6 位小数，便于复制粘贴；⚠️ 非法输入回退 '0.000' 是 3 位）。"""
-    try:
-        return f"{float(sec):.6f}"
-    except (TypeError, ValueError):
-        return "0.000"
 
 
 def _sync_normalize_offset(off, fps):
@@ -48309,6 +56861,13 @@ _SYNC_MATCH_TPL = 0.30         # 模板时长（秒）
 _SYNC_MATCH_WIN = 5.0          # 搜索窗口首级（±秒，以当前偏移为猜测中心）
 _SYNC_WIN_LEVELS = (5.0, 15.0, 45.0)   # 逐级扩窗档位（默认跑到 ±45s）
 _SYNC_WIN_MAX_LEVEL = 120.0    # 界面上可选的最大窗口（±秒）
+# 「帧级精修」档（2026-09-23）：窗口 = 帧数 ÷ 有效帧率（25fps 下 ±5 帧 = ±0.2s）。
+# 设计前提与 _SYNC_WIN_LEVELS **相反**——后者假设「偏移完全不可信、要从很远找
+# 回来」；帧档假设「粗对齐已做完、只想把光标落到同一帧上」，此时扩窗只会把搜索
+# 送进音乐/环境音的重复段（用户实测：±5s 档常错开 5~6 秒，正是撞上了更亮的假峰）。
+_SYNC_WIN_FRAME = _("帧")             # 下拉里这一档的取值（其余档是秒数的字符串）
+_SYNC_WIN_FRAME_DEFAULT = 5        # 「帧」档默认 ±5 帧
+_SYNC_WIN_FRAME_MAX = 3000         # 「帧」档帧数上限（防手滑填几万帧把搜索拖死）
 _SYNC_MATCH_MIN_GAP = 0.12     # 「最佳−次佳」相关系数差下限，低于此值提示匹配不唯一
 _SYNC_MATCH_STRONG = 0.75      # 「够好就不必再扩窗」的相关系数下限（包络相关度）
 _SYNC_MATCH_WEAK = 0.35        # 包络相关度低于此值 → 标「匹配不唯一，请核对」
@@ -48475,14 +57034,59 @@ def _sync_ncc_search(tpl, hay, lo, hi, min_rms_ratio=0.0, excl=0):
     return _sync_pick(_sync_ncc_curve(tpl, hay, lo, hi, min_rms_ratio), lo, excl)
 
 
-def _sync_match_point(tpl, hay, sr=_SYNC_MATCH_SR):
+def _sync_sub_sample_peak(rs, k):
+    """把整数样本的 ZNCC 峰细化到**亚样本**：(delta, half_width)。
+
+    相关峰本身是连续的，只是被「采样」成了离散 lag——峰顶落在两个样本之间时，
+    取到的最好整数也只是 ±0.5 样本（8kHz = ±62.5μs）。用峰及左右三点拟合抛物线
+    即可反解真峰位（2026-09-23 加）：
+
+        δ = 0.5 · (r[k-1] − r[k+1]) / (r[k-1] − 2·r[k] + r[k+1])
+
+    返回：
+      delta      —— 亚样本偏移（样本单位，∈[-0.5, 0.5]）；不可信时 0.0
+      half_width —— 峰的半高宽（≥ r[k]/2 的曲线点数，样本单位），峰越窄越可信
+
+    ⚠️ 三个退化情形必须原样退回整数，否则会「插值出」一个比不插更糟的值：
+      ① 分母 ≥ 0（不是凸起，是凹陷或平顶）；② 三点里有被门控剔除的 -2.0；
+      ③ |δ| > 0.5（峰根本不在 k 附近，曲线多半是多峰/噪声）。
+    """
+    if not rs or k <= 0 or k >= len(rs) - 1:
+        return 0.0, 0.0
+    a, b, c = rs[k - 1], rs[k], rs[k + 1]
+    if min(a, b, c) <= -1.5:            # 含被门控剔除的点 → 曲线不连续，不插值
+        return 0.0, 0.0
+    den = a - 2.0 * b + c
+    delta = 0.0
+    if den < -1e-9:                     # 只有凸起的峰（二阶导 < 0）才谈得上峰位
+        delta = 0.5 * (a - c) / den
+        if not (-0.5 <= delta <= 0.5):
+            delta = 0.0
+    half = 0.0
+    if b > 0.0:                         # 半高宽：从峰顶向两侧走到 r < r[k]/2
+        thr = 0.5 * b
+        i, j = k, k
+        while i > 0 and rs[i - 1] > -1.5 and rs[i - 1] >= thr:
+            i -= 1
+        while j < len(rs) - 1 and rs[j + 1] > -1.5 and rs[j + 1] >= thr:
+            j += 1
+        half = float(j - i + 1)
+    return delta, half
+
+
+def _sync_match_point(tpl, hay, sr=_SYNC_MATCH_SR, diag=None):
     """在 hay 里找 tpl 的最佳起点：**包络筛候选 + 波形定夺**（2026-09-14 重写）。
 
     返回 (lag_samples, score, gap)：
       lag_samples —— 以 sr 为单位的样本偏移（hay 起点 = 0）；失败 → None
+                     **末级做了亚样本插值 → 可能是小数**，调用方按 sr 除即可
       score       —— 最终 8kHz 全速率的波形 ZNCC（置信度，越接近 1 越可信）
       gap         —— 包络层的「最佳 − 次佳」（次佳取半个模板长以外），
                      越小越可能是周期音造成的假峰
+
+    diag —— 可选的 dict，写回诊断量（不影响返回值，旧调用方不传即无开销）：
+      peak_width_ms —— 末级相关峰的半高宽（毫秒），峰越窄这次命中越可信
+      sub_sample    —— 亚样本偏移量（样本单位），0 = 退化成整数样本
 
     ⚠️ 包络只用来**筛候选、不定夺**（真机实测结论，见下）：
       同一对素材（20s、真值延迟 2.37s、电平 0.7×）实测：
@@ -48517,7 +57121,7 @@ def _sync_match_point(tpl, hay, sr=_SYNC_MATCH_SR):
     scored = []                                   # [(250Hz分, 候选帧号, lag)]
     for i in (keep or ()):
         c = (i * frame) // f0
-        la, sc, _ = _sync_ncc_search(T, H, max(0, c - span),
+        la, sc, _unused = _sync_ncc_search(T, H, max(0, c - span),
                                      min(len(H) - len(T), c + span))
         if la is None:
             continue
@@ -48529,7 +57133,7 @@ def _sync_match_point(tpl, hay, sr=_SYNC_MATCH_SR):
         # 一样（实测 perfect 命中时 gap 只有 0.04），只有隔开一个模板长才算
         # 真正的「另一个候选」，gap 才能当唯一性判据用。
         second = -2.0
-        for sc, i, _ in scored:
+        for sc, i, _unused in scored:
             if abs(i - best_i) <= len(te):
                 continue
             if sc > second:
@@ -48537,7 +57141,7 @@ def _sync_match_point(tpl, hay, sr=_SYNC_MATCH_SR):
         gap = max(0.0, best_sc - second) if second > -1.5 else 1.0
     if best_lag is None or best_sc < _SYNC_MATCH_WEAK:
         # 候选被筛没了 / 分数太低 → 全窗兜底（旧行为，慢但不会漏）
-        la, sc, _ = _sync_ncc_search(T, H, 0, len(H) - len(T))
+        la, sc, _unused = _sync_ncc_search(T, H, 0, len(H) - len(T))
         if la is not None and sc > best_sc:
             best_lag, best_sc = la, sc
     if best_lag is None:
@@ -48545,17 +57149,24 @@ def _sync_match_point(tpl, hay, sr=_SYNC_MATCH_SR):
     # 级2：1kHz 在 ±6 格内细化
     t1, h1 = _sync_downsample(tpl, f1), _sync_downsample(hay, f1)
     c1 = best_lag * (f0 // f1)
-    lag1, _, _ = _sync_ncc_search(t1, h1, max(0, c1 - 6),
+    lag1, _unused, _unused = _sync_ncc_search(t1, h1, max(0, c1 - 6),
                                   min(len(h1) - len(t1), c1 + 6))
     if lag1 is None:
         lag1 = c1
-    # 级3：8kHz 全速率在 ±8 样本内精搜 → 0.125ms
+    # 级3：8kHz 全速率在 ±8 样本内精搜；整数样本只到 0.125ms，
+    #      再叠一层抛物线插值把峰顶算到亚样本（2026-09-23）。
     c2 = lag1 * f1
-    lag2, sc2, _ = _sync_ncc_search(tpl, hay, max(0, c2 - 8),
-                                    min(len(hay) - L, c2 + 8))
+    lo2 = max(0, c2 - 8)
+    hi2 = min(len(hay) - L, c2 + 8)
+    rs2 = _sync_ncc_curve(tpl, hay, lo2, hi2)
+    lag2, sc2, _unused = _sync_pick(rs2, lo2)
     if lag2 is None:
         return None, -2.0, gap
-    return lag2, sc2, gap
+    delta, width = _sync_sub_sample_peak(rs2, lag2 - lo2)
+    if diag is not None:
+        diag["peak_width_ms"] = width * 1000.0 / float(sr)
+        diag["sub_sample"] = delta
+    return lag2 + delta, sc2, gap
 
 
 def _sync_overlap_span(offsets, durs):
@@ -48997,7 +57608,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             head.pack(fill=tk.X)
             idx = getattr(tr, "index", i + 1)
             base = os.path.basename(getattr(tr, "file_path", "") or "")
-            ttk.Label(head, text=f"轨道 {idx} · {base}").pack(side=tk.LEFT)
+            ttk.Label(head, text=_('轨道 {0} · {1}').format(idx, base)).pack(side=tk.LEFT)
             badge = ttk.Label(head, text=_("参考") if i == self.ref_i else _("待对齐"),
                               foreground="#185FA5" if i == self.ref_i else "#854F0B")
             badge.pack(side=tk.LEFT, padx=(8, 0))
@@ -49114,23 +57725,39 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         self.auto_btn.pack(side=tk.LEFT)
         # 搜索范围（2026-09-14）：原来写死「±5 秒」且偷偷分三级扩到 45 秒，
         # 界面上完全看不出来，用户以为只能搜 5 秒。现在显式可选。
+        # 2026-09-23 加「帧」档：粗对齐已经做完时，秒级窗口里必然有音乐/环境音的
+        # 重复段（实测 ±5 秒档常错开 5~6 秒，就是撞上了更亮的假峰）→ 帧档把窗口
+        # 压到几帧（±5 帧 @25fps = ±0.2s），窗内几乎不可能有第二个独立峰。
         ttk.Label(ctl1b, text="±").pack(side=tk.LEFT, padx=(6, 1))
         self.win_var = tk.StringVar(value="5")
         self.win_box = ttk.Combobox(ctl1b, textvariable=self.win_var, width=4,
-                                    state="readonly", values=("5", "15", "45", "120"))
+                                    state="readonly",
+                                    values=(_SYNC_WIN_FRAME, "5", "15", "45", "120"))
         self.win_box.pack(side=tk.LEFT)
-        ttk.Label(ctl1b, text=_("秒")).pack(side=tk.LEFT, padx=(1, 0))
+        self.frame_var = tk.StringVar(value=str(_SYNC_WIN_FRAME_DEFAULT))
+        self.frame_box = ttk.Entry(ctl1b, textvariable=self.frame_var, width=3,
+                                   justify=tk.RIGHT)
+        self.win_unit = ttk.Label(ctl1b, text=_("秒"))
+        self.win_unit.pack(side=tk.LEFT, padx=(1, 0))
+        self._sync_win_ui_refresh()          # 默认在「秒」档 → 帧数框先收起来
+        self.win_var.trace_add("write", lambda *_: self._sync_win_ui_refresh())
         ToolTip(self.win_box,
-                _("自动找点的搜索范围上限（以当前偏移为中心，向两边各搜这么多秒）。\n"
-                "实际是逐级往外扩：±5 秒 → ±15 → ±45 → ±120，\n"
+                _("自动找点的搜索范围上限（以当前偏移为中心，向两边各搜这么多）。\n"
+                "「帧」档 = 帧级精修：窗口 = 帧数 ÷ 帧率（25fps 下 5 帧 = ±0.2 秒），\n"
+                "  只跑一级、不往外扩。粗对齐已做完、只想把光标落到同一帧上时用这一档，\n"
+                "  窗内几乎不可能有第二个峰，又快又准。帧数填在右边的框里（默认 5）。\n"
+                "其余档是秒数：实际逐级往外扩 ±5 → ±15 → ±45 → ±120，\n"
                 "小窗口里找到「足够像」的就停，不够像才继续往外扩。\n"
-                "偏差很小（目视已粗对齐）→ 选 5，最快最准；\n"
                 "偏差几十秒、不知道差在哪 → 选 45 或 120（越慢，越要核对）。"))
+        ToolTip(self.frame_box,
+                _("「帧」档的窗口大小（帧）。默认 {0} 帧"
+                "（25fps ≈ ±0.2 秒）；\n"
+                "越大容错越高，但窗内重新出现第二个相似段落的风险也越高。").format(_SYNC_WIN_FRAME_DEFAULT))
         ToolTip(self.auto_btn,
                 _("以「当前轨」光标处的音频为模板，在其余轨道上自动找出同一个事件\n"
-                "（能量包络预筛 + 波形零均值互相关，精度约 0.1ms）。\n"
-                "搜索范围 = 右边的下拉（默认 ±45 秒）。命中后状态栏会写明\n"
-                "「在 ± 多少秒内命中、相似度多少」，相似度低于 0.35 或存在另一个\n"
+                "（能量包络预筛 + 波形零均值互相关 + 亚样本插值，精度优于 0.1ms）。\n"
+                "搜索范围 = 右边的下拉（默认 ±5 秒；选「帧」= 帧级精修，窗口只有几帧）。\n"
+                "「在 ± 多少内命中、相似度多少」，相似度低于 0.35 或存在另一个\n"
                 "同样像的候选区时，会单独标「匹配不唯一」让你核对。\n"
                 "⚠️ 光标若落在静音上会直接报错（静音只能跟静音对上，结果必错）——\n"
                 "   请把光标挪到有声音的地方再点本按钮。\n"
@@ -49226,11 +57853,11 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         return max(1e-6, t1 - t0)
 
     def _x_of(self, w, t_ref):
-        t0, _ = self._view
+        t0, _unused = self._view
         return (t_ref - t0) / self._span() * w
 
     def _t_of(self, w, x):
-        t0, _ = self._view
+        t0, _unused = self._view
         return t0 + x / max(1.0, float(w)) * self._span()
 
     def _full_span(self):
@@ -49379,7 +58006,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
 
     def _refresh_readouts(self):
         for i in range(self.n):
-            self.readout_vars[i].set(_sync_format_time(self.cursors[i]) + " s")
+            self.readout_vars[i].set(_fmt_sec6(self.cursors[i]) + " s")
 
     # ---------- 探测与解码（后台线程，绝不碰 Tk） ----------
     def _start_probe(self):
@@ -49544,7 +58171,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             if d > 0:
                 pos = max(0.0, min(pos, d))
             self.cursors[i] = pos
-            self.readout_vars[i].set(_sync_format_time(pos) + " s")
+            self.readout_vars[i].set(_fmt_sec6(pos) + " s")
             self._redraw_wave(i)
         if len(playing) == 1:
             self._pan_to_cursor(playing[0])
@@ -49554,7 +58181,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         if not self._view:
             return
         t = self.cursors[i] + self.offsets[i]
-        _, t1 = self._view
+        _unused, t1 = self._view
         span = self._span()
         if t < t1 - span * 0.02:
             return
@@ -49585,7 +58212,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             self.active_combo.current(i)
         except Exception:
             pass
-        self.offset_var.set(_sync_format_time(self.offsets[i]))
+        self.offset_var.set(_fmt_sec6(self.offsets[i]))
         self._redraw_wave(old)
         self._redraw_wave(i)
 
@@ -49610,7 +58237,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             b.config(text=_("参考") if i == j else _("待对齐"),
                      foreground="#185FA5" if i == j else "#854F0B")
         self._sync_fps_label()
-        self.offset_var.set(_sync_format_time(self.offsets[self.active_i]))
+        self.offset_var.set(_fmt_sec6(self.offsets[self.active_i]))
         self._redraw_all()
         self._refresh_table()
 
@@ -49628,7 +58255,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             self._stop_play(i)      # 播放中点波形 = 定位并停下，否则光标立刻被拉走
         self.cursors[i] = max(0.0, t_ref - self.offsets[i])
         self._redraw_wave(i)
-        self.readout_vars[i].set(_sync_format_time(self.cursors[i]) + " s")
+        self.readout_vars[i].set(_fmt_sec6(self.cursors[i]) + " s")
 
     def _on_drag(self, i, ev):
         """左键拖动 = 光标 scrub（只移动本轨光标，绝不改偏移）。
@@ -49643,7 +58270,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         t_ref = self._t_of(self._canvas_w(i), ev.x)
         self.cursors[i] = max(0.0, t_ref - self.offsets[i])
         self._redraw_wave(i)
-        self.readout_vars[i].set(_sync_format_time(self.cursors[i]) + " s")
+        self.readout_vars[i].set(_fmt_sec6(self.cursors[i]) + " s")
 
     def _on_release(self, i, _ev):
         """左键拖动已改为纯光标 scrub（不改偏移），这里只清拖拽状态。
@@ -49694,6 +58321,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             messagebox.showwarning(_("提示"), _("无法启动播放器"), parent=self)
             return
         self._procs[i] = p
+        _register_preview_proc(p)
         self._play_pos[i] = at
         self._play_gen[i] += 1
         gen = self._play_gen[i]
@@ -49810,11 +58438,10 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         if not (0 <= i < self.n):
             return
         self.cursors[i] = max(0.0, t)
-        self.readout_vars[i].set(_sync_format_time(self.cursors[i]) + " s")
+        self.readout_vars[i].set(_fmt_sec6(self.cursors[i]) + " s")
         self._redraw_wave(i)
         self.hint_var.set(
-            _("时间预览：已把「{0}」的光标移到 {1} s（未打点、未改偏移）。").format(
-                self._track_disp(i), _sync_format_time(self.cursors[i])))
+            _('时间预览：已把「{0}」的光标移到 {1} s（未打点、未改偏移）。').format(self._track_disp(i), _fmt_sec6(self.cursors[i])))
 
     def _set_anchor_from_cursor(self, i, k):
         """把第 i 轨光标所在时刻写入「起始 / 结尾」格（用户 2026-09-13 要求：
@@ -49860,8 +58487,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         self._refresh_table()
         idx = self._track_disp(i)
         self.hint_var.set(
-            _("{0}已为「{1}」设定{2} = {3} s；只挪了本轨光标，偏移未动（要按锚点重算偏移：用「按光标对齐」或轨头「打起始(all)」）。").format(
-                src, idx, label, _sync_format_time(v)))
+            _('{0}已为「{1}」设定{2} = {3} s；只挪了本轨光标，偏移未动（要按锚点重算偏移：用「按光标对齐」或轨头「打起始(all)」）。').format(src, idx, label, _fmt_sec6(v)))
 
     # ---------- 微调 / 归零 / 手输 ----------
     def _eff_fps(self):
@@ -49883,7 +58509,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             return
         self.offsets[self.active_i] = _sync_normalize_offset(
             self.offsets[self.active_i] + frames * self._frame_step(), self._eff_fps())
-        self.offset_var.set(_sync_format_time(self.offsets[self.active_i]))
+        self.offset_var.set(_fmt_sec6(self.offsets[self.active_i]))
         self._redraw_wave(self.active_i)
         self._refresh_table()
 
@@ -49897,26 +58523,26 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         """
         i = self.active_i
         self.cursors[i] = max(0.0, self.cursors[i] + frames * self._frame_step())
-        self.readout_vars[i].set(_sync_format_time(self.cursors[i]) + " s")
+        self.readout_vars[i].set(_fmt_sec6(self.cursors[i]) + " s")
         self._redraw_wave(i)
 
     def _goto_cursor_start(self):
         """把【当前轨】光标移到本轨起点（自身时间轴 0.0 s）；只挪光标，不动偏移/锚点。"""
         i = self.active_i
         self.cursors[i] = 0.0
-        self.readout_vars[i].set(_sync_format_time(0.0) + " s")
+        self.readout_vars[i].set(_fmt_sec6(0.0) + " s")
         self._redraw_wave(i)
-        self.hint_var.set(_("已把「{0}」的光标移到起点（0.000 s）。").format(self._track_disp(i)))
+        self.hint_var.set(_('已把「{0}」的光标移到起点（0.000 s）。').format(self._track_disp(i)))
 
     def _goto_cursor_end(self):
         """把【当前轨】光标移到本轨末尾（自身时间轴 dur s）；只挪光标，不动偏移/锚点。"""
         i = self.active_i
         d = self.durs[i] or 0.0
         self.cursors[i] = max(0.0, d)
-        self.readout_vars[i].set(_sync_format_time(self.cursors[i]) + " s")
+        self.readout_vars[i].set(_fmt_sec6(self.cursors[i]) + " s")
         self._redraw_wave(i)
         self.hint_var.set(
-            _("已把「{0}」的光标移到末尾（{1} s）。").format(self._track_disp(i), _sync_format_time(self.cursors[i])))
+            _('已把「{0}」的光标移到末尾（{1} s）。').format(self._track_disp(i), _fmt_sec6(self.cursors[i])))
 
     def _zero_offset(self):
         if self._guard_ref():
@@ -49933,10 +58559,10 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         try:
             v = float(self.offset_var.get())
         except (TypeError, ValueError):
-            self.offset_var.set(_sync_format_time(self.offsets[self.active_i]))
+            self.offset_var.set(_fmt_sec6(self.offsets[self.active_i]))
             return
         self.offsets[self.active_i] = v      # 手输尊重原值，不吸附帧网格
-        self.offset_var.set(_sync_format_time(v))
+        self.offset_var.set(_fmt_sec6(v))
         self._redraw_wave(self.active_i)
         self._refresh_table()
 
@@ -50060,7 +58686,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
                             d = di / dref - 1.0
                             # 极小值归零，避免浮点噪声显示成「-0.000%」
                             self.drift[i] = 0.0 if abs(d) < 1e-9 else d
-        self.offset_var.set(_sync_format_time(self.offsets[self.active_i]))
+        self.offset_var.set(_fmt_sec6(self.offsets[self.active_i]))
 
     def _clear_anchors(self):
         self.anchors = []
@@ -50118,7 +58744,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         for i in range(self.n):
             self.offsets[i] = ref - self.cursors[i]
         self.offsets[self.ref_i] = 0.0
-        self.offset_var.set(_sync_format_time(self.offsets[self.active_i]))
+        self.offset_var.set(_fmt_sec6(self.offsets[self.active_i]))
         self._redraw_all()
         self._refresh_table()
         self.hint_var.set(
@@ -50141,8 +58767,8 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         self._refresh_table()
         idx = self._track_disp(i0)
         self.hint_var.set(
-            f"已把其余 {self.n - 1} 条轨的光标同步到「{idx}」的当前位置"
-            f"（按偏移反算同一时刻）；未打点、未改偏移——确认无误再按「打起始(all)」。")
+            _('已把其余 {0} 条轨的光标同步到「{1}」的当前位置（按偏移反算同一时刻）；未打点、未改偏移——确认无误再按「打起始(all)」。').format(self.n-1, idx)
+)
 
     def _write_anchor_all(self, k, i0=None):
         """把基点轨光标处的这个事件写成**全部轨道**的「起始(k=0)/结尾(k=1)」。
@@ -50187,10 +58813,17 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         if not p0 or not self.ff:
             return None, [], [], _("当前轨没有可用源文件，或未找到 ffmpeg")
         t0 = self.cursors[i0]
-        tpl = _sync_decode_pcm(self.ff, p0, t0, t0 + _SYNC_MATCH_TPL)
-        shift = 0.0
+        # 模板以光标**居中**（2026-09-23）：原实现取 [t0, t0+0.3]，事件压在模板开头
+        # ——ZNCC 对「峰在边缘」的模板最不敏感（归一化分母小、背景占比大），大窗口
+        # 里容易被别的响段抢走。居中后事件相位一致、峰更尖更对称。
+        half = _SYNC_MATCH_TPL / 2.0
+        t_start = max(0.0, t0 - half)
+        tpl = _sync_decode_pcm(self.ff, p0, t_start, t_start + _SYNC_MATCH_TPL)
+        shift = t0 - t_start          # 模板起点 → 事件点的距离（命中时刻要加回去）
+        # ⚠️ 起点贴着文件开头（t0 < half）时整段后移、仍取满 0.3s：否则模板只剩
+        # 0.15s，事件又变回「压在模板边缘」，居中的好处就没了。
         if len(tpl) < 256:
-            # 打结尾时光标常贴文件尾，向后取不满 0.3s → 改向前取
+            # 打结尾时光标常贴文件尾，向后取不满 0.3s → 整段改向前取
             # [t0-TPL, t0]（模板终点=光标=事件点）；命中时刻按 shift 换算回事件。
             # 用户 2026-09-13 实机反馈「打起始是一键了，打结尾还是自己点」即此根因。
             t_start = max(0.0, t0 - _SYNC_MATCH_TPL)
@@ -50204,10 +58837,13 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         tpl_rms = _sync_rms(tpl)
         if tpl_rms < _SYNC_TPL_MIN_RMS:
             return None, [], [], (
-                _("当前轨光标处几乎是静音（电平 {0:.0f}/32768），拿它对去只会跟别的静音段对上——请把光标挪到有声音的位置再自动找点").format(tpl_rms))
+                _('当前轨光标处几乎是静音（电平 {0:.0f}/32768），拿它对去只会跟别的静音段对上——请把光标挪到有声音的位置再自动找点').format(tpl_rms))
         T = t0 + self.offsets[i0]           # 该事件在参考轴上的位置
         t_hits, unsure, no_hit = {i0: t0}, [], []
         self._last_match_info = {}          # {轨索引: (相似度, 次优差, 实际窗口)}
+        self._last_match_diag = {}          # {轨索引: {诊断量}}（峰宽等，见 _sync_match_point）
+        self._last_match_frames = self._match_frame_sel()   # 「帧」档的帧数，其余档 None
+        tpl_sec = len(tpl) / float(_SYNC_MATCH_SR)          # 模板实际时长（尾不足时会短）
         levels = tuple(wins) if wins else _SYNC_WIN_LEVELS
         for i in range(self.n):
             if i == i0:
@@ -50227,17 +58863,25 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             # ⚠️ 早停阈值用 _SYNC_MATCH_STRONG（0.75），旧值 0.5 会让「小窗内
             # 一个凑合的假峰」提前结束搜索，后面几级白给（2026-09-14 修）。
             t_hit, t_sc, t_gap, t_win = None, -2.0, 0.0, 0.0
+            t_diag = {}
             for w in levels:
-                lo = max(0.0, guess - w)
-                hay = _sync_decode_pcm(self.ff, pi, lo, guess + w)
+                # 解码区间要给**模板本身**留位置：起点左移 shift、终点右移
+                # (模板时长 − shift)，于是 lag 的整个取值域正好对应「事件落在
+                # [guess−w, guess+w]」。不给这段余量的话，帧档（w 只有几十毫秒）
+                # 解出来的 hay 比模板还短，lag 无处可滑 → 恒「未命中」（2026-09-23）。
+                lo = max(0.0, guess - w - shift)
+                hi = guess + w + max(0.0, tpl_sec - shift)
+                hay = _sync_decode_pcm(self.ff, pi, lo, hi)
                 if len(hay) <= len(tpl):
                     continue
-                lag, sc, gap = _sync_match_point(tpl, hay)
+                diag = {}
+                lag, sc, gap = _sync_match_point(tpl, hay, diag=diag)
                 if lag is None:
                     continue
                 cand = lo + lag / float(_SYNC_MATCH_SR) + shift   # 模板起点 → 事件点
                 if sc > t_sc:
                     t_hit, t_sc, t_gap, t_win = cand, sc, gap, w
+                    t_diag = dict(diag)
                 if gap >= _SYNC_MATCH_MIN_GAP and sc >= _SYNC_MATCH_STRONG:
                     break
             if t_hit is None:
@@ -50245,10 +58889,11 @@ class MultiSyncReferenceDialog(tk.Toplevel):
                 continue
             t_hits[i] = t_hit
             self._last_match_info[i] = (t_sc, t_gap, t_win)
+            self._last_match_diag[i] = t_diag
             # gap 现在算的是「另一个候选区」与最佳的分差（不再取相邻 lag），
             # 是真判据：分差小 = 周期音/重复段落，命中位置不可信 → 必须提示核对。
             if t_gap < _SYNC_MATCH_MIN_GAP or t_sc < _SYNC_MATCH_WEAK:
-                unsure.append((i, _('{0}（匹配不唯一，请核对）→ {1}').format(idx, _sync_format_time(t_hit))))
+                unsure.append((i, _('{0}（匹配不唯一，请核对）→ {1}').format(idx, _fmt_sec6(t_hit))))
         return t_hits, unsure, no_hit, None
 
     def _auto_find_all(self):
@@ -50263,7 +58908,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             # 状态栏上报不弹窗（无头测试红线 + 用户偏好 log/status bar 上报）
             self.hint_var.set(_("自动找点失败：") + err)
             return
-        unsure_i = {i for i, _ in unsure}
+        unsure_i = {i for i, _unused in unsure}
         hits, got_ref, wide = [], (self.ref_i in t_hits), False
         for i, t in t_hits.items():
             self.cursors[i] = t
@@ -50272,13 +58917,20 @@ class MultiSyncReferenceDialog(tk.Toplevel):
                 info = getattr(self, "_last_match_info", {}).get(i)
                 if info:
                     sc, _gap, win = info
-                    hits.append(_("{0} → {1}（±{2:g}s 内，相似度 {3:.2f}）").format(
-                        self._track_disp(i), _sync_format_time(t), win, sc))
+                    if getattr(self, "_last_match_frames", None):
+                        scope = _("±{0}帧 内").format(self._last_match_frames)
+                    else:
+                        scope = _("±{0:g}s 内").format(win)
+                    dg = getattr(self, "_last_match_diag", {}).get(i) or {}
+                    pw = dg.get("peak_width_ms")
+                    extra = _("，峰宽 {0:.2f}ms").format(pw) if pw else ""
+                    hits.append(_("{0} → {1}（{2}，相似度 {3:.2f}{4}）").format(
+                        self._track_disp(i), _fmt_sec6(t), scope, sc, extra))
                     if win >= 45.0:
                         wide = True
                 else:
-                    hits.append(f"{self._track_disp(i)} → {_sync_format_time(t)}")
-        low = [m for _, m in unsure] + no_hit
+                    hits.append(f"{self._track_disp(i)} → {_fmt_sec6(t)}")
+        low = [m for _unused, m in unsure] + no_hit
         if not got_ref:
             low.append(_("参考轨未命中，偏移仍按上一次的锚点体系"))
         else:
@@ -50287,7 +58939,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             for i in range(self.n):
                 self.offsets[i] = ref_t - self.cursors[i]
             self.offsets[self.ref_i] = 0.0
-        self.offset_var.set(_sync_format_time(self.offsets[self.active_i]))
+        self.offset_var.set(_fmt_sec6(self.offsets[self.active_i]))
         self._redraw_all()
         self._refresh_table()
         msg = _("自动找点：") + ("；".join(hits) if hits else _("无命中"))
@@ -50297,12 +58949,57 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             msg += _("　（有轨道要扩到最大窗口才命中，请用「取当前帧对比」核对一下画面）")
         self.hint_var.set(msg)
 
+    def _sync_win_ui_refresh(self):
+        """「帧」档 → 显示帧数输入框、单位改「帧」；其余档 → 收起输入框、单位「秒」。
+
+        只收起（pack_forget）不用 disable：ttk 的 disabled 态在部分主题下会变成
+        灰底灰字、看不出框里写的数字，收起来反而更干净。
+        该方法只读 win_var、不回写 → 绑 trace 不会自激。
+        """
+        try:
+            sel = (self.win_var.get() or "").strip()
+        except Exception:
+            sel = ""
+        is_frame = sel.startswith(_SYNC_WIN_FRAME)
+        try:
+            if is_frame:
+                self.frame_box.pack(side=tk.LEFT, after=self.win_box, padx=(1, 0))
+            else:
+                self.frame_box.pack_forget()
+            self.win_unit.configure(text=_("帧") if is_frame else _("秒"))
+        except Exception:
+            pass
+
+    def _match_frames(self, default=_SYNC_WIN_FRAME_DEFAULT):
+        """帧数输入框 → 整数（非法/空 → default）。兜底到 [1, _SYNC_WIN_FRAME_MAX]。"""
+        try:
+            n = int(float((self.frame_var.get() or "").strip()))
+        except Exception:
+            return default
+        return max(1, min(_SYNC_WIN_FRAME_MAX, n))
+
+    def _match_frame_sel(self):
+        """当前是不是「帧」档：是 → 帧数（int），否 → None。"""
+        try:
+            sel = (self.win_var.get() or "").strip()
+        except Exception:
+            return None
+        if not sel.startswith(_SYNC_WIN_FRAME):
+            return None
+        return self._match_frames()
+
     def _match_wins(self):
-        """界面上选的搜索范围上限 → 逐级扩窗档位序列。
+        """界面上选的搜索范围上限 → 逐级扩窗档位序列（秒）。
 
         选 45 → (5, 15, 45)；选 120 → (5, 15, 45, 120)；选 5 → (5,)。
+        **选「帧」→ 只有一级**：窗口 = 帧数 ÷ 有效帧率（25fps 下 5 帧 = ±0.2s），
+        不往外扩——帧档的前提就是「粗对齐已做完」，扩窗只会把搜索送进重复段落，
+        这正是「±5 秒档结果错开 5~6 秒」的成因（2026-09-23）。
         下拉还没建好（无头/早期调用）时退回默认档。
         """
+        n = self._match_frame_sel()
+        if n is not None:
+            return (n * self._frame_step(),)
         try:
             mx = float(self.win_var.get())
         except Exception:
@@ -50334,7 +59031,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
 
     @staticmethod
     def _fmt_t(v):
-        return "—" if v is None else _sync_format_time(v)
+        return "—" if v is None else _fmt_sec6(v)
 
     @staticmethod
     def _fmt_d(v):
@@ -50366,7 +59063,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
                   else f"{self.drift[i] * 100:+.3f}")
             rows.append([
                 name, self._fmt_t(a), self._fmt_t(b),
-                "—" if (a is None or b is None) else _sync_format_time(b - a),
+                "—" if (a is None or b is None) else _fmt_sec6(b - a),
                 self._fmt_d(da), self._fmt_d(db), dv])
         return rows
 
@@ -50414,12 +59111,12 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         a, b = self._anchor_pair(i)
         if a is None or b is None:
             self.hint_var.set(
-                f"「{self._track_disp(i)}」还没有完整的起始/结尾（先打点或"
-                f"「从截取读回」），没有可复制的时间。")
+                _('「{0}」还没有完整的起始/结尾（先打点或「从截取读回」），没有可复制的时间。').format(self._track_disp(i))
+)
             return
-        txt = f"-ss {_sync_format_time(a)} -to {_sync_format_time(b)}"
+        txt = f"-ss {_fmt_sec6(a)} -to {_fmt_sec6(b)}"
         self._copy_text(txt)
-        self.hint_var.set(f"已复制「{self._track_disp(i)}」的时间：{txt}{note}")
+        self.hint_var.set(_('已复制「{0}」的时间：{1}{2}').format(self._track_disp(i), txt, note))
 
     def _read_back_from_tracks(self):
         """从各轨已设的截取数值（trim_start / trim_end）反向生成打点。
@@ -50428,12 +59125,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         等价于「按光标对齐」的自动版——上次的结果只要还在轨道上，就能一键接着调。
         只读轨道，不写回任何东西。
         """
-        def _num(v):
-            try:
-                s = str(v).strip()
-                return float(s) if s else None
-            except (TypeError, ValueError):
-                return None
+        _num = _opt_float  # 空串/None/非法 → None（2026-09-22 抽公共）
 
         s_slot = self._slot(_("起始"))
         e_slot = self._slot(_("结尾"))
@@ -50463,7 +59155,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         self._apply_anchors()
         self._redraw_all()
         self._refresh_table()
-        msg = f"已从轨道截取读回：起始 {got_s} 条 / 结尾 {got_e} 条，偏移与漂移已重算。"
+        msg = _('已从轨道截取读回：起始 {0} 条 / 结尾 {1} 条，偏移与漂移已重算。').format(got_s, got_e)
         if missing:
             msg += _("　未设截取：") + "、".join(missing)
         self.hint_var.set(msg)
@@ -50521,7 +59213,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
                 skipped.append(self._track_disp(i))
                 continue
             tr = self.tracks[i]
-            ts, te = _sync_format_time(a), _sync_format_time(b)
+            ts, te = _fmt_sec6(a), _fmt_sec6(b)
             # 视频轨（窗口里的轨道本体）
             es = tr.enc_settings
             es["trim_enabled"] = True
@@ -50612,11 +59304,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             if p:
                 window_groups.setdefault(p, []).append(i)
 
-        def _f(v, default=None):
-            try:
-                return float(v)
-            except (TypeError, ValueError):
-                return default
+        _f = _opt_float  # 宽容转 float（2026-09-22 抽公共）
 
         hit = 0
         for p, saved_list in saved_groups.items():
@@ -50670,7 +59358,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
                            foreground="#185FA5" if i == new_ref else "#854F0B")
         self.offsets[self.ref_i] = 0.0
         try:
-            self.offset_var.set(_sync_format_time(self.offsets[self.active_i]))
+            self.offset_var.set(_fmt_sec6(self.offsets[self.active_i]))
         except Exception:
             pass
         self._reset_view()
@@ -50691,7 +59379,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
                 json.dump(self._state_dict(), f, ensure_ascii=False, indent=2)
             return True
         except Exception as e:
-            self.hint_var.set(f"保存失败：{e}")
+            self.hint_var.set(_('保存失败：{0}').format(e))
             return False
 
     def _save_state_as(self):
@@ -50703,7 +59391,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         if not path:
             return
         if self._save_state_to(path):
-            self.hint_var.set(f"已保存对齐结果：{path}")
+            self.hint_var.set(_('已保存对齐结果：{0}').format(path))
 
     def _load_state_from(self):
         path = filedialog.askopenfilename(
@@ -50715,19 +59403,19 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except Exception as e:
-            self.hint_var.set(f"读取失败：{e}")
+            self.hint_var.set(_('读取失败：{0}').format(e))
             return
         hit, total, msg = self._apply_state(data)
         if hit == 0:
             self.hint_var.set(_("未载入：") + msg)
             return
         when = str(data.get("saved_at", "") or "")
-        tail = f"（存档时间 {when}）" if when else ""
+        tail = _('（存档时间 {0}）').format(when) if when else ""
         if hit < total:
             self.hint_var.set(
-                f"已载入 {hit}/{total} 条轨道{tail}；其余对不上，需重新对齐。")
+                _('已载入 {0}/{1} 条轨道{2}；其余对不上，需重新对齐。').format(hit, total, tail))
         else:
-            self.hint_var.set(f"已载入对齐结果（{hit} 条轨道）{tail}")
+            self.hint_var.set(_('已载入对齐结果（{0} 条轨道）{1}').format(hit, tail))
 
     def _autosave_state(self):
         p = self._autosave_path()
@@ -50756,10 +59444,10 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         tail = f"（{when}）" if when else ""
         if hit < total:
             self.hint_var.set(
-                f"已恢复上次的对齐结果：{hit}/{total} 条轨道对得上{tail}，"
-                f"其余需重新对齐。")
+                _('已恢复上次的对齐结果：{0}/{1} 条轨道对得上{2}，其余需重新对齐。').format(hit, total, tail)
+)
         else:
-            self.hint_var.set(f"已恢复上次的对齐结果{tail}（不想要就点「清除标记」）。")
+            self.hint_var.set(_('已恢复上次的对齐结果{0}（不想要就点「清除标记」）。').format(tail))
 
     def _apply_topmost(self):
         """顶部「总在最前」勾选（默认关，见 __init__ 里去掉 transient 的注释）。"""
@@ -50802,7 +59490,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
                 name = _("比对%d · %s") % (k, disp)
             out.append({"path": getattr(self.tracks[i], "file_path", "") or "",
                         "t": t,
-                        "caption": "%s　%s s" % (name, _sync_format_time(t))})
+                        "caption": _("%s　%s s") % (name, _fmt_sec6(t))})
         return out
 
     def _open_frame_compare(self):
@@ -51053,6 +59741,1209 @@ class SyncFrameCompareDialog(tk.Toplevel):
             pass
 
 
+
+
+class TimelineOverviewDialog(tk.Toplevel):
+    """时间分配总览（画中画）：一条时间轴看全部片段 + 拖拽粗调 + 数值微调。
+
+    数据全部来自各视频轨 enc_settings 的「显示时段」(show_start / show_end)，口径与
+    `_resolve_display_window` / `_pip_timeline_extent` / `_pip_transition_chains`
+    同源（真时间轴模型，见 research/concat-overlay-alt §13–14b）。
+    ⚠️ 本窗口**只读写 enc_settings**，绝不改 `_build_pip_cmd` 的构建逻辑。
+
+    边界（与已否决清单的界线）：这里拖的是**时间**——数值编辑的友好手势（粗调），
+    不是「在帧画布里拖 overlay 小图做空间定位」（那是位置编辑器的地盘，永久否决）。
+    """
+
+    _LBL_W = 210      # 左侧轨道名列宽（像素）
+    _ROW_H = 32       # 每条轨道行高
+    _HDR_H = 26       # 顶部时间刻度高
+    _PAD_R = 16       # 右侧留白
+    _HIT = 5          # 端点热区半宽（像素）
+    _CV_W = 760       # 画布初始 / 最小宽
+    _CV_H = 300
+    _SNAP_PX = 6      # 吸附热区半宽（像素）→ 换算成秒
+    _C_SNAP = "#d97706"
+    _C_MAIN = "#a9c8ee"
+    _C_SUB = "#a9dcb6"
+    _C_OFF = "#d9d9d9"
+    _C_SEL = "#1f6fb2"
+    _C_GRID = "#dcdcdc"
+    _CHAIN = ("#d97757", "#2f855a", "#805ad5", "#b7791f", "#2b6cb0")
+
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.withdraw()
+        self.app = app
+        self.title(_("时间分配总览（画中画）"))
+        self.transient(parent)
+        self.resizable(True, True)
+        self.rows = []
+        self.sel = None          # 主项（右侧数值框编辑它）
+        self.multi = set()       # 多选集合（整体平移的作用范围；恒含 sel，除非清空）
+        self._drag = None
+        self.T = 1.0
+        self.main_dur = 0.0
+        self.manual = None
+        self._x0 = self._LBL_W
+        self._x1 = self._CV_W - self._PAD_R
+        self.name_var = tk.StringVar(value="")
+        self.start_var = tk.StringVar(value="")
+        self.end_var = tk.StringVar(value="")
+        self.info_var = tk.StringVar(value="")
+        self.hint_var = tk.StringVar(value="")
+        self.shift_var = tk.StringVar(value="0.5")   # 整体平移 Δ（秒）
+        self.sel_var = tk.StringVar(value="")        # 底部「已选 N 段」
+        self.snap_enabled = tk.BooleanVar(value=True)   # 自动吸附（默认开）
+        self._snap_t = None                             # 当前吸附到的时刻（画高亮用）
+        # 循环次数 / 淡入淡出时长 / 转场时长：优先共用封装页同名变量（同一个数，两边同步）
+        _lv = getattr(app, "oneclick_loop_count", None)
+        self.loop_var = _lv if hasattr(_lv, "get") else tk.StringVar(value="1")
+        _fv = getattr(app, "oneclick_fade_duration", None)
+        self.fade_var = _fv if hasattr(_fv, "get") else tk.StringVar(value="1.0")
+        _tv = getattr(app, "oneclick_transition_duration", None)
+        self.trans_var = _tv if hasattr(_tv, "get") else tk.StringVar(value="1.0")
+        self._build_ui()
+        self._reload()
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.update_idletasks()
+        _w = max(1040, self.winfo_reqwidth())
+        _h = min(self.winfo_reqheight() + 60,
+                 max(320, int(self.winfo_screenheight() * 0.86)))
+        _x = max(0, (self.winfo_screenwidth() - _w) // 2)
+        _y = max(0, (self.winfo_screenheight() - _h) // 2 - 24)
+        self.geometry(f"{_w}x{_h}+{_x}+{_y}")
+        self.deiconify()
+
+    # ---------- 界面构建 ----------
+    def _build_ui(self):
+        main = ttk.Frame(self, padding="10")
+        main.pack(fill=tk.BOTH, expand=True)
+
+        top = ttk.Frame(main)
+        top.pack(fill=tk.X)
+        ttk.Label(top, textvariable=self.hint_var, foreground="#555555",
+                  wraplength=740, justify=tk.LEFT).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        _rb = ttk.Button(top, text=_("重新读取"), width=10, command=self._reload)
+        _rb.pack(side=tk.RIGHT)
+        ToolTip(_rb, _("按当前轨道设置重新读一遍时间轴（改动了别处的显示时段后点它刷新）。"))
+
+        body = ttk.Frame(main)
+        body.pack(fill=tk.BOTH, expand=True, pady=(8, 6))
+
+        left = ttk.Frame(body)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        _cvw = ttk.Frame(left)
+        _cvw.pack(fill=tk.BOTH, expand=True)
+        self.cv = tk.Canvas(_cvw, width=self._CV_W, height=self._CV_H,
+                            background="#ffffff", highlightthickness=1,
+                            highlightbackground="#cccccc")
+        self.cv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        _vsb = ttk.Scrollbar(_cvw, orient=tk.VERTICAL, command=self.cv.yview)
+        _vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.cv.configure(yscrollcommand=_vsb.set)
+        # ⚠️ 时间轴类 canvas 必须绑 <Configure> 重绘：绘制与命中都按 winfo_width() 换算，
+        # 宽度变了不重绘 → 色块停在旧宽度、点击落点错位。
+        self.cv.bind("<Configure>", lambda _e: self._redraw())
+        self.cv.bind("<ButtonPress-1>", self._on_press)
+        self.cv.bind("<B1-Motion>", self._on_motion)
+        self.cv.bind("<ButtonRelease-1>", self._on_release)
+        self.cv.bind("<Motion>", self._on_hover)
+        self.cv.bind("<MouseWheel>", self._on_wheel)
+
+        right = ttk.LabelFrame(body, text=_("选中片段"), width=250)
+        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(8, 0))
+        ttk.Label(right, textvariable=self.name_var, wraplength=230, justify=tk.LEFT,
+                  font=("TkDefaultFont", 9, "bold")).pack(anchor=tk.W, padx=6, pady=(6, 4))
+        _form = ttk.Frame(right)
+        _form.pack(fill=tk.X, padx=6)
+        ttk.Label(_form, text=_("起始:")).grid(row=0, column=0, sticky="w")
+        _es = ttk.Entry(_form, textvariable=self.start_var, width=12)
+        _es.grid(row=0, column=1, sticky="w", padx=(4, 0))
+        ttk.Label(_form, text=_("秒")).grid(row=0, column=2, sticky="w")
+        ttk.Label(_form, text=_("结束:")).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        _ee = ttk.Entry(_form, textvariable=self.end_var, width=12)
+        _ee.grid(row=1, column=1, sticky="w", padx=(4, 0), pady=(6, 0))
+        ttk.Label(_form, text=_("秒")).grid(row=1, column=2, sticky="w", pady=(6, 0))
+        # 数值框只绑 <Return> / <FocusOut>（On_type 级 trace 会把半截输入写回）
+        _es.bind("<Return>", lambda _e: self._apply_form())
+        _ee.bind("<Return>", lambda _e: self._apply_form())
+        _es.bind("<FocusOut>", lambda _e: self._apply_form())
+        _ee.bind("<FocusOut>", lambda _e: self._apply_form())
+        self.start_entry = _es
+        self.end_entry = _ee
+        ttk.Label(right, textvariable=self.info_var, wraplength=232, justify=tk.LEFT,
+                  foreground="#444444").pack(anchor=tk.W, padx=6, pady=(8, 4))
+        # 「预览素材」（2026-09-27 用户需求）：时间轴上只看到文件名 / 序号，光看名字认不出
+        # 是哪一个素材 → 点一下直接播该片段的**素材原文件**。放右侧信息栏（下方留给批量操作）。
+        _b_pv = ttk.Button(right, text=_("预览素材"), width=12, command=self._preview_sel)
+        _b_pv.pack(anchor=tk.W, padx=6, pady=(0, 4))
+        ToolTip(_b_pv,
+                _("播放当前选中片段对应的【素材原文件】，用来确认「这个文件名到底是哪个素材」。\n"
+                  "• 视频素材：从该段的显示起点开始播（填了「结束」就只播这一段，没填则播到素材末尾）；\n"
+                  "• 静态图片：按「图片显示时长」停留几秒。\n"
+                  "⚠️ 播的是素材本身，不含叠加 / 裁剪 / 转场等段级处理 ——\n"
+                  "   要看「合成后长什么样」请用封装页的画中画实时预览。"),
+                wraplength=430)
+        self.preview_btn = _b_pv
+        ttk.Separator(right).pack(fill=tk.X, padx=6, pady=4)
+        ttk.Label(right, text=_(
+            "• 点条选中；Ctrl / Shift + 点 = 多选\n"
+            "• 拖条中间 = 整体平移；拖左右边缘 = 改开始 / 结束（粗调）\n"
+            "• 拖动时自动吸到别的素材的起点 / 终点（橙线提示；Shift = 强制吸附）\n"
+            "• 多选时拖任一条 = 选中的一起平移（间距不变）\n"
+            "• 上面两个框 = 微调（秒，也认 分:秒），回车生效；多选时置灰\n"
+            "• 结束留空 = 无限显示（一直显示到输出结束）\n"
+            "• 主视频是时间轴基准，不可拖动"),
+            wraplength=232, justify=tk.LEFT,
+            foreground="#666666").pack(anchor=tk.W, padx=6, pady=(0, 6))
+
+        bottom = ttk.Frame(main)
+        bottom.pack(fill=tk.X)
+        _sh = ttk.Frame(bottom)
+        _sh.pack(side=tk.LEFT)
+        _b_all = ttk.Button(_sh, text=_("全选子视频"), width=11, command=self._sel_all)
+        _b_all.pack(side=tk.LEFT)
+        ToolTip(_b_all, _("选中所有子视频（主视频是基准，不参与平移）。"))
+        _b_none = ttk.Button(_sh, text=_("清空选择"), width=9, command=self._sel_none)
+        _b_none.pack(side=tk.LEFT, padx=(4, 10))
+        ToolTip(_b_none, _("取消全部选中。"))
+        ttk.Label(_sh, text=_("整体平移：")).pack(side=tk.LEFT)
+        # ⚠️ 宽度 9：Δ 允许填到 6 位小数（0.266333），8 位会被截断看不全
+        _ed = ttk.Entry(_sh, textvariable=self.shift_var, width=9)
+        _ed.pack(side=tk.LEFT)
+        _ed.bind("<Return>", lambda _e: self._apply_shift(1))
+        ttk.Label(_sh, text=_("秒")).pack(side=tk.LEFT, padx=(2, 0))
+        _b_back = ttk.Button(_sh, text=_("前移 −"), width=8,
+                             command=lambda: self._apply_shift(-1))
+        _b_back.pack(side=tk.LEFT, padx=(8, 2))
+        ToolTip(_b_back,
+                _("选中片段统一往前挪 Δ 秒（相对间距不变）。\n"
+                "场景：主视频剪短了，后面几段悬空 → 一起前移。\n"
+                "最前面那段贴到 0 时会一起停住，不会变负。"))
+        _b_fwd = ttk.Button(_sh, text=_("后移 +"), width=8,
+                            command=lambda: self._apply_shift(1))
+        _b_fwd.pack(side=tk.LEFT)
+        ToolTip(_b_fwd, _("选中片段统一往后挪 Δ 秒（相对间距不变）。"))
+        ttk.Separator(_sh, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=(12, 8))
+        _snap_chk = ttk.Checkbutton(_sh, text=_("自动吸附"), variable=self.snap_enabled)
+        _snap_chk.pack(side=tk.LEFT)
+        ToolTip(_snap_chk,
+                _("拖动时自动吸到别的素材的起点 / 终点（含主视频的头尾、时间轴末端）。\n"
+                "• 靠近了才吸（约 6 像素内），吸中时画布上会出现一条橙色竖线；\n"
+                "• 拖的时候按住 Shift = 强制吸到最近那个端点（不管多远）；\n"
+                "• 想自由摆放就把这个勾去掉。\n"
+                "（标记点 / 章节点的吸附暂未支持，后续再加。）"))
+        _b_attach = ttk.Button(_sh, text=_("首尾吸附"), width=9, command=self._attach_ends)
+        _b_attach.pack(side=tk.LEFT, padx=(8, 0))
+        ToolTip(_b_attach,
+                _("选中的片段按时间先后依次首尾相接：后一段的起点 = 前一段的结束\n"
+                "（段长不变，只整体平移；第 1 段原地不动）。\n"
+                "没多选时 = 所有子视频都参与。"))
+        ttk.Label(bottom, textvariable=self.sel_var,
+                  foreground="#555555").pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Button(bottom, text=_("关闭"), width=10, command=self._close).pack(side=tk.RIGHT)
+
+        # ----- 批量按钮行：与「子视频控制」页 / 转场对齐同源（点完自动重新读取时间轴）-----
+        ttk.Separator(main).pack(fill=tk.X, pady=(8, 4))
+        oc = ttk.Frame(main)
+        oc.pack(fill=tk.X)
+        ttk.Label(oc, text=_("批量：")).pack(side=tk.LEFT)
+        _b_fade = ttk.Button(oc, text=_("一键淡入淡出(all)"), width=17,
+                             command=lambda: self._run_batch(
+                                 "一键淡入淡出",
+                                 lambda: self.app._apply_fade_all_tracks()))
+        _b_fade.pack(side=tk.LEFT, padx=(0, 6))
+        ToolTip(_b_fade,
+                _("一键淡入淡出（All）：所有已启用的视频 / 音频轨道批量开片段首尾淡入淡出\n"
+                "（短片段自动钳制到 40%）。时长取左边「淡入s」框，与编辑窗同名框同一个值。\n"
+                "淡入淡出只改首尾透明度、不改变画面出现时刻，所以时间轴上的位置不变。"),
+                wraplength=430)
+        ttk.Label(oc, text=_("淡入s:")).pack(side=tk.LEFT)
+        ttk.Entry(oc, textvariable=self.fade_var, width=6).pack(side=tk.LEFT, padx=(2, 6))
+        _b_trans = ttk.Button(oc, text=_("一键转场(all)"), width=17,
+                              command=lambda: self._run_batch(
+                                  "一键转场",
+                                  lambda: self.app._apply_transition_all_tracks()))
+        _b_trans.pack(side=tk.LEFT, padx=(6, 6))
+        ToolTip(_b_trans,
+                _("一键转场（All）：除末段外每个连接处批量开串行转场（xfade），\n"
+                "类型取封装页当前下拉框，时长取左边「转场s」框（自动钳制为相邻两段较短者的一半）；\n"
+                "已开淡入淡出的连接处会被转场替代。\n"
+                "⚠️ 本按钮只改转场开关 / 类型 / 时长，不动各段的显示时段起点。\n"
+                "转场会吞时长、让位后面段的起点，所以要按转场重排起点时点「转场对齐」，\n"
+                "时间轴上的数字才等于画面真正切换的时刻。"),
+                wraplength=440)
+        ttk.Label(oc, text=_("转场s:")).pack(side=tk.LEFT)
+        ttk.Entry(oc, textvariable=self.trans_var, width=6).pack(side=tk.LEFT, padx=(2, 6))
+        _b_rst = ttk.Button(oc, text=_("一键重置"), width=10,
+                            command=lambda: self._run_batch(
+                                "一键重置",
+                                lambda: self.app._clear_fade_transition_all_tracks()))
+        _b_rst.pack(side=tk.LEFT, padx=(6, 0))
+        ToolTip(_b_rst,
+                _("一键重置（All）：关掉所有轨道的淡入淡出与串行转场，\n"
+                "只关开关、不清数值 —— 重新点「一键淡入淡出 / 一键转场」时还是原值。\n"
+                "显示时段（每段什么时候出现）不受影响；本按钮与封装页「淡入淡出」页\n"
+                "的「一键重置(all)」是同一个动作。"),
+                wraplength=440)
+
+
+        # ----- 第二行：接龙 / 循环 / 混音 / 对齐 -----
+        oc2 = ttk.Frame(main)
+        oc2.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(oc2, text=_("批量：")).pack(side=tk.LEFT)
+        _b_chain = ttk.Button(oc2, text=_("一键设置开始"), width=13,
+                              command=lambda: self._run_batch(
+                                  "一键设置开始", lambda: self.app._pip_chain_show_starts()))
+        _b_chain.pack(side=tk.LEFT, padx=(0, 6))
+        ToolTip(_b_chain,
+                _("一键设置开始（接龙，与「子视频控制」页同名按钮同一个动作）：\n"
+                "第 1 个子视频接在主视频之后，之后每段起点 = 前一段起点 + 前一段时长 − 前一段转场时长。\n"
+                "点完本窗口会按新摆位重新画一遍时间轴。"))
+        _b_align = ttk.Button(oc2, text=_("转场对齐"), width=10,
+                              command=self._align_transition_sel)
+        _b_align.pack(side=tk.LEFT, padx=6)
+        ToolTip(_b_align,
+                _("转场对齐（作用于选中的子片段，与编辑窗同名按钮同一套公式）：\n"
+                "本段起点 = 前一段起点 + 前一段时长 − 前一段转场时长（段长不变）。\n"
+                "选中 1 个 = 只对齐它；Ctrl / Shift 多选 = 逐个对齐选中的；未选中不动作。\n"
+                "要全部重排：先点「全选子视频」再点本按钮。\n"
+                "xfade 会吞掉转场时长，对齐后界面上的数字才等于画面真正切换的时刻。"))
+
+
+        _b_loop = ttk.Button(oc2, text=_("一键有限循环(all)"), width=16,
+                             command=lambda: self._run_batch(
+                                 "一键有限循环",
+                                 lambda: self.app._pip_finite_loop_all(self.loop_var.get())))
+        _b_loop.pack(side=tk.LEFT, padx=(6, 6))
+        ToolTip(_b_loop,
+                _("一键有限循环（All）：给所有子视频开启「循环控制」并设次数（左边那个框）。\n"
+                "子视频窗口有界（有限次数 / 有结束时间）才能被转场链收录、总时长才算得准。\n"
+                "次数框与「子视频控制」页共用同一个值。"))
+        ttk.Label(oc2, text=_("次数:")).pack(side=tk.LEFT)
+        ttk.Entry(oc2, textvariable=self.loop_var, width=5).pack(side=tk.LEFT, padx=(2, 6))
+        _b_mix = ttk.Button(oc2, text=_("一键混音(all)"), width=13,
+                            command=lambda: self._run_batch(
+                                "一键混音", lambda: self.app._pip_mix_all()))
+        _b_mix.pack(side=tk.LEFT, padx=(6, 0))
+        ToolTip(_b_mix,
+                _("一键混音（All）：所有子视频的「音频模式」设为「混音」——子声并入主声，\n"
+                "不再单独出一条轨；子视频本身没音轨时自动跳过。"))
+
+
+    # ---------- 数据收集（只读） ----------
+    def _collect(self):
+        """按当前 merge_tracks 重建行数据；同时算出时间尺 self.T。
+
+        口径全部复用命令端已有的函数，避免「总览看到的」和「命令跑出来的」漂移。
+        """
+        app = self.app
+        rows = []
+        vids = [t for t in (getattr(app, "merge_tracks", []) or [])
+                if getattr(t, "type", None) == "video" and getattr(t, "enabled", True)]
+        if not vids:
+            self.T = 1.0
+            self.main_dur = 0.0
+            self.manual = None
+            self.hint_var.set(_("封装页还没有已启用的视频轨道。"))
+            return rows
+        main = vids[0]
+        subs = vids[1:]
+        try:
+            main_dur = float(app._pip_main_effective_duration(main) or 0.0)
+        except Exception:
+            main_dur = 0.0
+        sub_infos = [(i, sv.file_path, sv.enc_settings) for i, sv in enumerate(subs)]
+        try:
+            extent = float(app._pip_timeline_extent(
+                main_dur, [(_p, _s) for (_i, _p, _s) in sub_infos]) or 0.0)
+        except Exception:
+            extent = main_dur
+        try:
+            _res = app._pip_transition_chains(
+                sub_infos, main.enc_settings, main.file_path, main_dur)
+            chains, chain_of = _res[0], _res[1]
+        except Exception:
+            chains, chain_of = [], {}
+        try:
+            shift = app._pip_audio_follow_shift(subs, chains, sub_infos, main) or {}
+        except Exception:
+            shift = {}
+        manual = None
+        try:
+            if app.merge_manual_duration_enabled.get():
+                manual = time_to_seconds((app.merge_manual_duration.get() or "").strip())
+        except Exception:
+            manual = None
+
+        def _short(s, n=26):
+            s = str(s)
+            return s if len(s) <= n else s[:n - 1] + "…"
+
+        _mb = _short(os.path.basename(main.file_path or "") or "（未设文件）", 22)
+        rows.append({
+            "kind": "main", "track": main, "name": _mb,
+            "label": "主 · " + _mb, "full": "主视频 · " + _mb,
+            "ws": 0.0, "we": main_dur, "enabled": True, "editable": False,
+            "chain": None, "trans": 0.0, "audio": 0.0, "dur": main_dur,
+        })
+        for i, sv in enumerate(subs):
+            es = sv.enc_settings if isinstance(sv.enc_settings, dict) else {}
+            try:
+                if app._is_static_image(sv.file_path):
+                    _eff = _eff_image_display_duration(es)
+                else:
+                    _raw = app._get_media_duration(
+                        sv.file_path,
+                        frame_align_fps=app._get_video_framerate(sv.file_path))
+                    _eff = app._get_effective_duration(es, raw_duration=_raw)
+                _ws, _we, _bd = app._resolve_display_window(
+                    es, _eff, input_path=sv.file_path)
+            except Exception:
+                _ws, _we, _bd, _eff = 0.0, None, False, None
+            _ws = float(_ws or 0.0)
+            _we = float(_we) if (_bd and _we is not None and _we > _ws) else None
+            try:
+                _tr = float(app._pip_trans_duration(sv) or 0.0)
+            except Exception:
+                _tr = 0.0
+            try:
+                _sh = float(shift.get(normalize_path(sv.file_path), 0.0) or 0.0)
+            except (TypeError, ValueError):
+                _sh = 0.0
+            _on = bool(es.get("overlay_enabled", True))
+            _ci = chain_of.get(i)
+            _fl = ""
+            if not _on:
+                _fl += " ·未叠加"
+            if _ci is not None:
+                _fl += f" ·链{int(_ci) + 1}"
+            if _tr > 0:
+                _fl += f" ·转场{_tr:g}s"
+            _b = _short(os.path.basename(sv.file_path or "") or "（未设文件）", 22)
+            rows.append({
+                "kind": "sub", "track": sv, "name": _b,
+                "label": f"{i + 1}. {_b}{_fl}", "full": f"子视频 {i + 1} · {_b}",
+                "ws": _ws, "we": _we, "enabled": _on, "editable": True,
+                "chain": _ci, "trans": _tr, "audio": max(0.0, _ws + _sh),
+                "dur": float(_eff) if _eff else None,
+            })
+        _cand = [extent, main_dur] + [r["we"] for r in rows if r["we"] is not None] \
+            + [r["ws"] for r in rows]
+        if manual:
+            _cand.append(manual)
+        self.T = max(_cand) or 1.0
+        if self.T <= 0.001:
+            self.T = 1.0
+        self.main_dur = main_dur
+        self.manual = manual
+        _ext = self.T - main_dur
+        # ⚠️ 时间一律走 _ffsec（默认 9 位小数，与命令端同口径）；别再写 .3f
+        _hint = f"时间轴总长 {_ffsec(self.T)}s"
+        if _ext > 1e-6:
+            _hint += f"（主视频 {_ffsec(main_dur)}s + 延长 {_ffsec(_ext)}s 补黑帧）"
+        _hint += f"；共 {len(rows)} 个片段（1 主 + {len(subs)} 子）。"
+        if manual:
+            _hint += f"　⚠ 手动时长已启用，输出会被 -t 截到 {_ffsec(manual)}s。"
+        self.hint_var.set(_hint)
+        return rows
+
+    def _reload(self):
+        self.rows = self._collect()
+        _n = len(self.rows)
+        # 轨道可能增删 → 旧选区按行号收缩（行号是索引，不能跨重载沿用）
+        _m = set(i for i in (self.multi or set()) if 0 <= i < _n)
+        if _m:
+            self.multi = _m
+            if self.sel not in _m:
+                self.sel = min(_m)
+        else:
+            self.multi = set()
+            if self.sel is None:
+                self.sel = 1 if _n > 1 else (0 if _n else None)
+                if self.sel is not None:
+                    self.multi = {self.sel}
+            elif self.sel >= _n:
+                self.sel = None
+        self._redraw()
+        self._sync_form()
+
+    # ---------- 选择（单选 / 多选） ----------
+    def _sel_rows(self):
+        """当前选区里**可编辑**的行号（主视频不算：它是时间轴基准）。"""
+        return sorted(i for i in (self.multi or set())
+                      if 0 <= i < len(self.rows) and self.rows[i]["editable"])
+
+    def _set_sel(self, idxs, primary=None):
+        self.multi = set(idxs)
+        if primary is not None:
+            self.sel = primary
+        else:
+            self.sel = min(self.multi) if self.multi else None
+        self._redraw()
+        self._sync_form()
+
+    def _select(self, i):
+        """单选（拖拽 / 数值框的作用对象）。"""
+        if i is None:
+            self._set_sel([])
+            return
+        self._set_sel({i}, i)
+
+    def _toggle_sel(self, i):
+        """Ctrl + 点：加 / 减一个。"""
+        m = set(self.multi or set())
+        if i in m:
+            m.discard(i)
+        else:
+            m.add(i)
+        self.multi = m
+        self.sel = (i if i in m else (min(m) if m else None))
+        self._redraw()
+        self._sync_form()
+
+    def _range_sel(self, i):
+        """Shift + 点：从主项到当前行整段选。"""
+        _a = self.sel if self.sel is not None else i
+        _lo, _hi = min(_a, i), max(_a, i)
+        self._set_sel(range(_lo, _hi + 1), i)
+
+    def _sel_all(self):
+        self._set_sel([i for i, r in enumerate(self.rows) if r["editable"]],
+                      (1 if len(self.rows) > 1 else None))
+
+    def _sel_none(self):
+        self._set_sel([])
+
+    # ---------- 绘制 ----------
+    def _tx(self, t):
+        """秒 → 画布 x（钳进 [0, T]）"""
+        try:
+            v = float(t)
+        except (TypeError, ValueError):
+            v = 0.0
+        v = max(0.0, min(v, self.T))
+        return self._x0 + (self._x1 - self._x0) * (v / self.T)
+
+    @staticmethod
+    def _tick_step(span):
+        for s in (0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800):
+            if span / s <= 10:
+                return s
+        return 3600
+
+    @staticmethod
+    def _tick_label(t):
+        h, m, s = _hms_split(t)
+        if h > 0:
+            return f"{h}:{m:02d}:{s:04.1f}"
+        return f"{m:02d}:{s:04.1f}"
+
+    def _redraw(self):
+        cv = self.cv
+        try:
+            if not cv.winfo_exists():
+                return
+        except Exception:
+            return
+        cv.delete("all")
+        _w = max(self._CV_W, cv.winfo_width())
+        self._x0 = self._LBL_W
+        self._x1 = max(self._x0 + 40, _w - self._PAD_R)
+        _n = len(self.rows)
+        _bh = self._HDR_H + _n * self._ROW_H + 8
+        cv.configure(scrollregion=(0, 0, _w, _bh))
+        _step = self._tick_step(self.T)
+        _t = 0.0
+        _guard = 0
+        while _t <= self.T + 1e-9 and _guard < 400:
+            _X = self._tx(_t)
+            cv.create_line(_X, self._HDR_H, _X, _bh, fill=self._C_GRID)
+            cv.create_text(_X + 2, 3, anchor="nw", text=self._tick_label(_t),
+                           fill="#777777", font=("TkDefaultFont", 7))
+            _t += _step
+            _guard += 1
+        cv.create_line(self._x0, self._HDR_H, self._x1, self._HDR_H, fill="#999999")
+        for i, r in enumerate(self.rows):
+            _y = self._HDR_H + i * self._ROW_H
+            _yb, _yt = _y + 3, _y + self._ROW_H - 3
+            _in_sel = i in (self.multi or set())
+            cv.create_rectangle(self._x0, _yb, self._x1, _yt,
+                                fill=("#e8f2fc" if _in_sel else "#f5f5f5"),
+                                outline=("#9dc6e8" if _in_sel else "#e3e3e3"))
+            # 主视频之后被延长出来的部分（tpad 补黑帧）
+            if r["kind"] == "main" and r["we"] is not None and self.T > r["we"] + 1e-6:
+                _cx = self._tx(r["we"])
+                cv.create_rectangle(_cx, _yb, self._x1, _yt, fill="#ececec", outline="")
+                if self._x1 - _cx > 64:
+                    cv.create_text((_cx + self._x1) / 2, (_yb + _yt) / 2,
+                                   text=_("延长（补黑帧）"), fill="#999999",
+                                   font=("TkDefaultFont", 7))
+            cv.create_text(6, (_yb + _yt) / 2, anchor="w", text=r["label"],
+                           fill=("#a0a0a0" if not r["enabled"] else "#222222"),
+                           font=("TkDefaultFont", 8))
+            _bx0 = self._tx(r["ws"])
+            _bx1 = self._tx(self.T if r["we"] is None else r["we"])
+            if _bx1 - _bx0 < 3:
+                _bx1 = _bx0 + 3
+            _fill = self._C_MAIN if r["kind"] == "main" else (
+                self._C_SUB if r["enabled"] else self._C_OFF)
+            if r["chain"] is not None:
+                _ol = self._CHAIN[int(r["chain"]) % len(self._CHAIN)]
+            else:
+                _ol = "#8a8a8a"
+            if _in_sel:
+                _ol = self._C_SEL
+            cv.create_rectangle(_bx0, _yb + 2, _bx1, _yt - 2, fill=_fill,
+                                outline=_ol,
+                                width=(3 if i == self.sel and _in_sel
+                                       else (2 if _in_sel else 1)),
+                                dash=((3, 2) if r["we"] is None else None))
+            if _bx1 - _bx0 > 56:
+                _tt = "%s – %s" % (_ffsec(r["ws"]),
+                                   (_ffsec(r["we"]) if r["we"] is not None else "∞"))
+                cv.create_text((_bx0 + _bx1) / 2, (_yb + _yt) / 2, text=_tt,
+                               fill="#333333", font=("TkDefaultFont", 7))
+            if r["editable"]:
+                # 两端的热区把手（提示可拖边缘改起止）
+                cv.create_rectangle(_bx0, _yb + 2, _bx0 + 3, _yt - 2,
+                                    fill="#ffffff", outline=_ol)
+                cv.create_rectangle(_bx1 - 3, _yb + 2, _bx1, _yt - 2,
+                                    fill="#ffffff", outline=_ol)
+        if self._snap_t is not None:
+            _sx = self._tx(self._snap_t)
+            cv.create_line(_sx, 2, _sx, _bh, fill=self._C_SNAP, width=2, dash=(5, 3))
+            cv.create_text(min(_sx + 4, self._x1 - 60), self._HDR_H + 4, anchor="nw",
+                           text=_("吸附 %s") % _ffsec(self._snap_t), fill=self._C_SNAP,
+                           font=("TkDefaultFont", 7, "bold"))
+        if self.manual and self.manual > 0:
+            _mx = self._tx(self.manual)
+            cv.create_line(_mx, 2, _mx, _bh, fill="#c0392b", dash=(4, 3))
+            cv.create_text(_mx + 3, _bh - 3, anchor="sw", text=_("手动 -t"),
+                           fill="#c0392b", font=("TkDefaultFont", 7))
+
+    # ---------- 交互 ----------
+    def _row_at(self, ev_x, ev_y):
+        try:
+            _y = self.cv.canvasy(ev_y)
+        except Exception:
+            _y = ev_y
+        i = int((_y - self._HDR_H) // self._ROW_H)
+        return i if 0 <= i < len(self.rows) else None
+
+    def _zone_at(self, i, ev_x):
+        r = self.rows[i]
+        _bx0 = self._tx(r["ws"])
+        _bx1 = self._tx(self.T if r["we"] is None else r["we"])
+        if abs(ev_x - _bx0) <= self._HIT:
+            return "start"
+        if abs(ev_x - _bx1) <= self._HIT:
+            return "end"
+        if _bx0 <= ev_x <= _bx1:
+            return "move"
+        return None
+
+    def _select(self, i):
+        self.sel = i
+        self._redraw()
+        self._sync_form()
+
+    def _on_press(self, ev):
+        i = self._row_at(ev.x, ev.y)
+        if i is None:
+            return
+        # 修饰键：Ctrl = 加减一个，Shift = 从主项到此处整段，都不按 = 单选
+        # （ev.state 位掩码：0x1 Shift / 0x4 Ctrl；测试用的假事件没有 state → getattr 兜底）
+        _st = int(getattr(ev, "state", 0) or 0)
+        if _st & 0x0004:
+            self._toggle_sel(i)
+            if i not in self.multi:      # 刚取消选中 → 不进入拖拽
+                return
+        elif _st & 0x0001:
+            self._range_sel(i)
+        elif i not in self.multi:
+            self._set_sel({i}, i)
+        else:
+            self.sel = i                 # 已在选区里：只把主项挪过去，选区保留（方便接着整组拖）
+            self._redraw()
+            self._sync_form()
+        r = self.rows[i]
+        if not r["editable"]:
+            return
+        _z = self._zone_at(i, ev.x)
+        if _z is None:
+            return
+        _idxs = self._sel_rows()
+        if len(_idxs) > 1:
+            _z = "move"                  # 多选只做整体平移（改单端点没有统一语义）
+        elif not _idxs:
+            _idxs = [i]
+        # 拖拽基线：整组各段的原始窗口（Δ 从主项算，其余按同一 Δ 走）
+        self._drag = {
+            "i": i, "zone": _z, "x": ev.x, "ws": r["ws"], "we": r["we"],
+            # 冻结按下时刻的像素/秒：拖右端会把 T 撑大，若拖动中每帧用新 T 重算 _pps，
+            # dt=Δx/pps 跟着膨胀 → T 更大 → 正反馈，拖出画布右缘瞬间冲到天文数字
+            "pps": max(1e-6, (self._x1 - self._x0) / self.T),
+            "base": dict((j, (self.rows[j]["ws"], self.rows[j]["we"]))
+                         for j in _idxs),
+        }
+
+    def _on_motion(self, ev):
+        d = self._drag
+        if not d:
+            return
+        i = d["i"]
+        if i >= len(self.rows):
+            return
+        # 只钳下界（拖左出画布按 0 算）；上界放开，拖出右缘可继续延长——
+        # 防爆炸靠按下时刻冻结的 pps（见 _on_press）：比例不随 T 重算，dt 对 Δx 只有线性响应，无正反馈
+        _mx = max(0, ev.x)
+        _pps = d.get("pps") or max(1e-6, (self._x1 - self._x0) / self.T)     # 像素 / 秒
+        _dt = (_mx - d["x"]) / _pps
+        _base = d.get("base") or {i: (d["ws"], d["we"])}
+        if d["zone"] == "move":
+            # 整体平移：Δ 对整组统一 —— 谁先顶到 0 就一起停（相对间距不变）
+            _dt = max(_dt, -min(_b[0] for _b in _base.values()))
+            _dt2, _sp = self._snap_move(ev, _base, _dt)
+            if _sp is not None:
+                _dt2 = max(_dt2, -min(_b[0] for _b in _base.values()))
+                _dt = _dt2
+            self._snap_t = _sp
+            for j, (_ws0, _we0) in _base.items():
+                _ws = max(0.0, _ws0 + _dt)
+                _we = None if _we0 is None else max(_ws + 0.01, _we0 + _dt)
+                self._set_row(j, _ws, _we)
+        else:
+            _ws0, _we0 = d["ws"], d["we"]
+            if d["zone"] == "start":
+                _ws = max(0.0, _ws0 + _dt)
+                if _we0 is not None:
+                    _ws = min(_ws, _we0 - 0.05)
+                _ws, _sp = self._snap_value(_ws, ev, (i,))
+                if _sp is not None and _we0 is not None and _ws > _we0 - 0.05:
+                    _ws, _sp = max(0.0, _ws0 + _dt), None   # 吸过去就贴死结束点 → 放弃吸附
+                _we = _we0
+            else:
+                # 无界行的右边缘就画在时间轴末端 → 从 T 起算，不然会「一拖就跳」
+                _b = _we0 if _we0 is not None else self.T
+                _we = max(_ws0 + 0.05, _b + _dt)
+                _we, _sp = self._snap_value(_we, ev, (i,))
+                if _sp is not None and _we <= _ws0 + 0.05:
+                    _we, _sp = max(_ws0 + 0.05, _b + _dt), None
+                _ws = _ws0
+            self._snap_t = _sp
+            self._set_row(i, _ws, _we)
+        self._redraw()
+        self._sync_form()
+
+    # ---------- 吸附（阶段 4：先把素材自己的起点 / 终点吸上） ----------
+    def _snap_points(self, exclude=()):
+        """可吸附的时刻：**其他**素材的起点 / 终点（含主视频头尾、时间轴末端、手动 -t）。
+
+        标记点 / 章节点的吸附暂不支持（用户口径：先把素材端点做扎实，再谈标记点）。
+        """
+        ex = set(exclude or ())
+        pts = set()
+        for i, r in enumerate(self.rows):
+            if i in ex:
+                continue
+            pts.add(max(0.0, float(r["ws"])))
+            if r["we"] is not None:
+                pts.add(max(0.0, float(r["we"])))
+        if self.main_dur > 0:
+            pts.add(float(self.main_dur))
+        pts.add(0.0)
+        pts.add(float(self.T))
+        if self.manual:
+            pts.add(float(self.manual))
+        return sorted(pts)
+
+    def _snap_force(self, ev):
+        """拖的时候按住 Shift = 强制吸附（忽略热区距离）。"""
+        return bool(int(getattr(ev, "state", 0) or 0) & 0x0001)
+
+    def _snap_tol(self):
+        """热区（像素）→ 秒。"""
+        _pps = max(1e-6, (self._x1 - self._x0) / self.T)
+        return self._SNAP_PX / _pps
+
+    def _snap_value(self, v, ev, exclude=()):
+        """单个值吸附（改起点 / 改终点用）→ (值, 吸附点或 None)。"""
+        _force = self._snap_force(ev)
+        if not self.snap_enabled.get() and not _force:
+            return v, None
+        _pts = self._snap_points(exclude)
+        if not _pts:
+            return v, None
+        _tol = self._snap_tol()
+        _bp, _bd = None, None
+        for _p in _pts:
+            _d = abs(_p - v)
+            if _bd is None or _d < _bd:
+                _bp, _bd = _p, _d
+        if _bd is None:
+            return v, None
+        if _force or _bd <= _tol:
+            return _bp, _bp
+        return v, None
+
+    def _snap_move(self, ev, base, dt):
+        """整组平移的吸附：找出「被拖的端点里离某个吸附点最近的那一个」，把 Δ 调过去。
+
+        base = {行号: (ws0, we0)}；返回 (dt2, 吸附点或 None)。整组一起调 → 间距不变。
+        """
+        _force = self._snap_force(ev)
+        if not self.snap_enabled.get() and not _force:
+            return dt, None
+        _pts = self._snap_points(base.keys())
+        if not _pts:
+            return dt, None
+        _tol = self._snap_tol()
+        _bd, _bdt, _bp = None, dt, None
+        for _ws0, _we0 in base.values():
+            for _v0 in ((_ws0,) if _we0 is None else (_ws0, _we0)):
+                for _p in _pts:
+                    _d = abs(_p - (_v0 + dt))
+                    if _bd is None or _d < _bd:
+                        _bd, _bdt, _bp = _d, _p - _v0, _p
+        if _bd is None:
+            return dt, None
+        if not _force and _bd > _tol:
+            return dt, None
+        return _bdt, _bp
+
+    def _set_row(self, j, ws, we):
+        """写一行（只改内存里的行数据；落库在 _commit*）。"""
+        if j >= len(self.rows):
+            return
+        r = self.rows[j]
+        # ⚠️ 这里**不要** round：整体平移 / 首尾吸附 / 拖拽都落到这里，
+        #    round(,3) 会把 27.033333333 写成 27.033（用户看到「点一下平移，小数被吃掉」），
+        #    round(,6) 同样会吃掉 27.033333333 的最后三位。
+        #    显示走 _ffsec、写回也走 _ffsec，两边都会自己收敛小数位，
+        #    内存里留全精度才不会丢真值；钳位只防越界（负 / 超出时间尺）。
+        _ws = max(0.0, min(float(ws), self.T))
+        r["ws"] = _ws
+        r["we"] = None if we is None else max(float(we), _ws + 0.01)
+        # 拖到时间轴右端之外 → 时间轴跟着长（与「补在后面」同语义：有界窗口结束 = 时间轴跨度）
+        if r["we"] is not None and r["we"] > self.T:
+            self.T = r["we"]
+
+    def _on_release(self, ev):
+        d = self._drag
+        self._drag = None
+        if not d:
+            return
+        self._snap_t = None
+        _idxs = sorted((d.get("base") or {}).keys()) or [d["i"]]
+        if self._commit_many(_idxs):
+            self._reload()
+
+    def _on_hover(self, ev):
+        if self._drag:
+            return
+        i = self._row_at(ev.x, ev.y)
+        _cur = ""
+        if i is not None:
+            r = self.rows[i]
+            if r["editable"]:
+                _z = self._zone_at(i, ev.x)
+                if _z in ("start", "end"):
+                    _cur = "sb_h_double_arrow"
+                elif _z == "move":
+                    _cur = "fleur"
+        try:
+            self.cv.configure(cursor=_cur)
+        except Exception:
+            pass
+
+    def _on_wheel(self, ev):
+        try:
+            _d = int(ev.delta)
+        except Exception:
+            return
+        if not _d:
+            return
+        try:
+            self.cv.yview_scroll(-1 if _d > 0 else 1, "units")
+        except Exception:
+            pass
+
+    # ---------- 右侧数值编辑 ----------
+    def _sync_form(self):
+        i = self.sel
+        _idxs = self._sel_rows()
+        _st = "normal"
+        if i is None or i >= len(self.rows):
+            self.name_var.set(_("（未选中）"))
+            self.start_var.set("")
+            self.end_var.set("")
+            self.info_var.set("")
+            self.sel_var.set(_("未选片段"))
+            _st = "disabled"
+        else:
+            r = self.rows[i]
+            self.name_var.set(r["full"])
+            self.start_var.set(_ffsec(r["ws"]))
+            self.end_var.set(_ffsec(r["we"]) if r["we"] is not None else "")
+            if len(_idxs) > 1:
+                self.sel_var.set(_("已选 %d 段") % len(_idxs))
+                _st = "disabled"      # 数值微调只对单选有意义（多选请用「整体平移」）
+            elif not r["editable"]:
+                self.sel_var.set(_("已选 1 段（主视频 = 基准，不可平移）"))
+                _st = "disabled"
+            else:
+                self.sel_var.set(_("已选 1 段"))
+        # ⚠️ ttk 用 config(state=)（.state(["disabled"]) 在本项目的 ttk 上不稳）
+        try:
+            self.start_entry.config(state=_st)
+            self.end_entry.config(state=_st)
+        except Exception:
+            pass
+        # 「预览素材」按钮：未选中 / 多选时置灰（预览单个才有意义；主视频也允许预览）
+        try:
+            _pv_st = "normal" if (i is not None and i < len(self.rows)
+                                  and len(self.multi or ()) <= 1) else "disabled"
+            self.preview_btn.config(state=_pv_st)
+        except Exception:
+            pass
+        if i is None or i >= len(self.rows):
+            return
+        if len(_idxs) > 1:
+            _ws = min(self.rows[j]["ws"] for j in _idxs)
+            _we = [self.rows[j]["we"] for j in _idxs]
+            _lines = [_("已选 %d 段（数值微调已置灰，用底部「整体平移」）") % len(_idxs)]
+            _lines.append(_("最早起点：%s") % _ffsec(_ws))
+            if all(_w is not None for _w in _we):
+                _lines.append(_("最晚结束：%s（跨度 %s 秒）")
+                              % (_ffsec(max(_we)), _ffsec(max(_we) - _ws)))
+            else:
+                _lines.append(_("结束：含无限显示段（一直显示到输出结束）"))
+            _lines.append("—")
+            for j in _idxs:
+                _r = self.rows[j]
+                _lines.append(_("%s：%s ~ %s") % (
+                    _r["name"], _ffsec(_r["ws"]),
+                    (_ffsec(_r["we"]) if _r["we"] is not None else _("无限"))))
+            self.info_var.set("\n".join(_lines))
+            return
+        r = self.rows[i]
+        _lines = [_("素材时长：") + (f"{_ffsec(r['dur'])}s" if r.get("dur") else _("探不到"))]
+        if r["we"] is None:
+            _lines.append(f"显示窗口：{_ffsec(r['ws'])} 起，一直显示（无限）")
+        else:
+            _lines.append(_("显示窗口：%s ~ %s（%s 秒）") % (
+                _ffsec(r["ws"]), _ffsec(r["we"]), _ffsec(r["we"] - r["ws"])))
+        if r["kind"] == "sub":
+            _sh = r["audio"] - r["ws"]
+            if abs(_sh) > 1e-6:
+                _lines.append("音频起点：%s（跟随转场偏移 %s 秒）"
+                              % (_ffsec(r["audio"]), _ffsec(_sh)))
+            else:
+                _lines.append(f"音频起点：{_ffsec(r['audio'])}")
+        if r.get("trans"):
+            _lines.append(f"转场：与下一段 {r['trans']:g}s")
+        if r.get("chain") is not None:
+            _lines.append(f"转场链：链{int(r['chain']) + 1}")
+        if not r["enabled"]:
+            _lines.append(_("⚠ 未启用叠加（不会出现在画面里）"))
+        if r["kind"] == "main":
+            _lines.append(_("主视频 = 时间轴基准，长度来自素材 / 截取"))
+        self.info_var.set("\n".join(_lines))
+
+    def _preview_sel(self):
+        """预览当前选中片段的**素材原文件**（视频从显示起点起播 / 图片按时长停留）。
+
+        用途：时间轴上只看到文件名 / 序号，光看名字认不出是哪一个素材 → 点一下直接看 / 听。
+        ⚠️ 播的是素材本身，**不做**段级处理（叠加 / 裁剪 / 变速 / 转场）——
+           要看「合成后长什么样」请用封装页的画中画实时预览（两条路各司其职，不合并）。
+        静态图片必须分流：ffplay/mpv 对图片没有时间轴可言，不给时长则 1 帧就退窗
+        （项目铁律：取素材时长的代码一律先 `_is_static_image` 分流）。
+        """
+        i = self.sel
+        if i is None or i >= len(self.rows):
+            self.app._append_info_ui(_("[时间分配] 先在时间轴上选中一个片段，再点「预览素材」。"))
+            return
+        r = self.rows[i]
+        _t = r.get("track")
+        _fp = normalize_path(getattr(_t, "file_path", "") or "")
+        if not _fp or not os.path.exists(_fp):
+            self.app._append_info_ui(_("[时间分配] 该片段没有可预览的素材文件（未加载 / 路径已失效）。"))
+            return
+        _kind = _("主视频") if r.get("kind") == "main" else _("子视频")
+        _base = os.path.basename(_fp)
+        _ws = float(r.get("ws") or 0.0)
+        _we = r.get("we")
+        _es = getattr(_t, "enc_settings", None)
+        if not isinstance(_es, dict):
+            _es = {}
+        # ---- 静态图片：按「图片显示时长」停留 ----
+        try:
+            _img = bool(self.app._is_static_image(_fp))
+        except Exception:
+            _img = False
+        if _img:
+            # 时长口径与成片完全一致（同一函数、不加 default 覆盖）：用户看到停几秒
+            # 就是图片在正片里显示几秒。该函数契约上**恒正**（无设置 / 非法值一律回退
+            # default=10），故无需再判 0 —— 多一层兜底只会掩盖真值来源。
+            _n = float(_eff_image_display_duration(_es) or 0.0)
+            self.app._append_info_ui(
+                _("[时间分配] 预览{0}素材（静态图片，停留 {1}s）：{2}").format(
+                    _kind, _ffsec(_n), _base))
+            try:
+                self.app.preview_with_player(_fp, image_duration=_n)
+            except Exception as e:
+                self.app._append_info_ui(_("[时间分配] 预览失败: {0}").format(e))
+            return
+        # ---- 视频 / 音频素材：从显示起点起播，有界窗口则只播这一段 ----
+        _dur = None
+        if _we is not None and float(_we) > _ws + 1e-6:
+            _dur = float(_we) - _ws
+        _msg = _("[时间分配] 预览{0}素材：{1}").format(_kind, _base)
+        if _ws > 1e-6 or _dur is not None:
+            _msg += _("（从 %s 起%s）") % (
+                _ffsec(_ws),
+                (_("，播 %s 秒") % _ffsec(_dur)) if _dur is not None else _("，播到素材结束"))
+        self.app._append_info_ui(_msg)
+        try:
+            self.app.preview_with_player(
+                _fp,
+                start_time=(_ws if _ws > 1e-6 else None),
+                duration=_dur)
+        except Exception as e:
+            self.app._append_info_ui(_("[时间分配] 预览失败: {0}").format(e))
+
+    def _apply_form(self):
+        i = self.sel
+        if i is None or i >= len(self.rows):
+            return
+        if len(self._sel_rows()) > 1:
+            return                    # 多选：数值微调只对单选生效
+        r = self.rows[i]
+        if not r["editable"]:
+            return
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+        _s = (self.start_var.get() or "").strip()
+        _e = (self.end_var.get() or "").strip()
+        _ws = time_to_seconds(_s) if _s else 0.0
+        if _ws is None or _ws < 0:
+            self.app._append_info_ui(
+                _("[时间分配] 起始时间无法识别（填秒数或 分:秒），已忽略本次输入。"))
+            self._sync_form()
+            return
+        _we = None
+        if _e:
+            _we = time_to_seconds(_e)
+            if _we is None:
+                self.app._append_info_ui(
+                    _("[时间分配] 结束时间无法识别（填秒数或 分:秒），已忽略本次输入。"))
+                self._sync_form()
+                return
+            if _we <= _ws + 0.01:
+                self.app._append_info_ui(
+                    _("[时间分配] 结束必须晚于起始（至少 0.01 秒），已忽略本次输入。"))
+                self._sync_form()
+                return
+        r["ws"] = round(max(0.0, _ws), 6)
+        r["we"] = None if _we is None else round(_we, 6)
+        self._redraw()
+        if self._commit_many([i]):
+            self._reload()
+
+    # ---------- 写回（enc_settings 是本窗口唯一的写入口） ----------
+    def _commit(self, i):
+        """单行写回（保留旧签名；内部走 _commit_many）。"""
+        return self._commit_many([i] if i is not None else [])
+
+    def _commit_many(self, idxs):
+        """把若干行的时段写回 enc_settings，只刷新一次界面、只写一条日志。"""
+        _done = []
+        for i in idxs:
+            if i is None or i >= len(self.rows):
+                continue
+            r = self.rows[i]
+            if not r["editable"]:
+                continue
+            es = r["track"].enc_settings
+            if not isinstance(es, dict):
+                continue
+            es["show_start"] = _ffsec(r["ws"])
+            es["show_end"] = _ffsec(r["we"]) if r["we"] is not None else ""
+            _done.append(r)
+        if not _done:
+            return False
+        try:
+            self.app.merge_update_track_list()
+        except Exception:
+            pass
+        try:
+            self.app.merge_update_command_preview()
+        except Exception:
+            pass
+        try:
+            self.app._refresh_at_total_ref()
+        except Exception:
+            pass
+        if len(_done) == 1:
+            r = _done[0]
+            self.app._append_info_ui(
+                _("[时间分配] %s 显示时段 → %s ~ %s 秒")
+                % (r["name"], _ffsec(r["ws"]),
+                   (_ffsec(r["we"]) if r["we"] is not None else "无限")))
+        else:
+            self.app._append_info_ui(
+                _("[时间分配] 已更新 %d 个片段的显示时段（%s）")
+                % (len(_done), "、".join(_r["name"] for _r in _done)))
+        return True
+
+    # ---------- 整体平移（阶段 3） ----------
+    def _apply_shift(self, sign):
+        """底部按钮 / 回车：按 Δ 整组平移（sign = −1 前移 / +1 后移）。"""
+        _raw = (self.shift_var.get() or "").strip()
+        _d = time_to_seconds(_raw) if _raw else None
+        if _d is None or _d <= 0:
+            self.app._append_info_ui(
+                _("[时间分配] 平移量无法识别（填正数秒数或 分:秒），已忽略。"))
+            return
+        self._shift_selected(sign * _d)
+
+    def _shift_selected(self, delta):
+        """选中的段统一 ±Δ（相对间距不变；顶到 0 就一起停，不会变负）。"""
+        _idxs = self._sel_rows()
+        if not _idxs:
+            self.app._append_info_ui(
+                _("[时间分配] 先选一段再平移（点条选中；Ctrl / Shift + 点多选；"
+                "主视频是时间轴基准，不能平移）。"))
+            return False
+        _d = delta
+        _min_ws = min(self.rows[j]["ws"] for j in _idxs)
+        if _min_ws + _d < 0:
+            _d = -_min_ws
+        if abs(_d) < 1e-9:
+            self.app._append_info_ui(_("[时间分配] 已经在最前端，无法再往前平移。"))
+            return False
+        # 先算新值再统一放宽时间尺：否则「后移」跨越当前末端时起点会被 T 钳住
+        _new = []
+        _T = self.T
+        for j in _idxs:
+            _ws0, _we0 = self.rows[j]["ws"], self.rows[j]["we"]
+            _ws = max(0.0, _ws0 + _d)
+            _we = None if _we0 is None else max(_ws + 0.01, _we0 + _d)
+            _new.append((j, _ws, _we))
+            _T = max(_T, _ws, _we if _we is not None else 0.0)
+        self.T = _T
+        for _j, _ws, _we in _new:
+            self._set_row(_j, _ws, _we)
+        self._redraw()
+        self._sync_form()
+        if self._commit_many(_idxs):
+            self.app._append_info_ui(
+                _("[时间分配] 整体平移 %s 秒（%d 个片段，相对间距不变）")
+                % (_ffsec(_d), len(_idxs)))
+            self._reload()
+        return True
+
+    # ---------- 首尾吸附按钮（批量版：选中的依次相接） ----------
+    def _attach_ends(self):
+        """选中的片段按时间先后首尾相接：后一段起点 = 前一段结束（段长不变）。
+
+        与「一键设置开始」的差别：那个按 track 顺序接在主视频之后、且带转场让位；
+        这个是纯端点对接、第 1 段原地不动，用于把已经摆得差不多的几段抹平缝隙 / 重叠。
+        """
+        _idxs = self._sel_rows()
+        if not _idxs:
+            _idxs = [i for i, r in enumerate(self.rows) if r["editable"]]
+        if len(_idxs) < 2:
+            self.app._append_info_ui(_("[时间分配] 首尾吸附需要至少 2 个片段。"))
+            return
+        _order = sorted(_idxs, key=lambda j: self.rows[j]["ws"])
+        _new_vals = []
+        _prev_we = None
+        _first = True
+        for j in _order:
+            r = self.rows[j]
+            if _first:
+                _first = False
+                _prev_we = r["we"]
+                continue
+            if _prev_we is None:
+                break                       # 前一段无限显示 → 后面没得接
+            _ln = None if r["we"] is None else (r["we"] - r["ws"])
+            _ws2 = max(0.0, float(_prev_we))
+            _we2 = None if _ln is None else _ws2 + _ln
+            _new_vals.append((j, _ws2, _we2))
+            _prev_we = _we2
+        if not _new_vals:
+            self.app._append_info_ui(_("[时间分配] 没有可吸附的片段（前一段是无限显示）。"))
+            return
+        # 先放宽时间尺再落位：否则接到当前末端之外时起点会被旧 T 钳住
+        _T = self.T
+        for _j, _ws2, _we2 in _new_vals:
+            _T = max(_T, _ws2, _we2 if _we2 is not None else 0.0)
+        self.T = _T
+        for _j, _ws2, _we2 in _new_vals:
+            self._set_row(_j, _ws2, _we2)
+        self._redraw()
+        self._sync_form()
+        if self._commit_many([_j for _j, _a, _b in _new_vals]):
+            self.app._append_info_ui(
+                _("[时间分配] 首尾吸附：%d 个片段依次相接（段长不变）") % len(_new_vals))
+            self._reload()
+
+    # ---------- 批量按钮（复用封装页 / 编辑窗的同名动作） ----------
+    def _align_transition_sel(self):
+        """总览「转场对齐」：只对齐**选中的子片段**（编辑窗同款单段公式）。
+
+        选中 1 个 = 单段对齐；Ctrl / Shift 多选 = 按 track 顺序逐个对齐；
+        未选中 / 只选了主视频 = 不动作只写日志（防止本想对单个却把全部重排）。
+        要全部重排：先「全选子视频」再点本按钮。
+        """
+        _subs = [self.rows[i]["track"] for i in sorted(self.multi)
+                 if 0 <= i < len(self.rows) and self.rows[i]["kind"] == "sub"]
+        if not _subs:
+            self.app._append_info_ui(_(
+                "[时间分配] 「转场对齐」作用于选中的子片段：请先在时间轴上点选（未选中不动作）。"))
+            return
+        try:
+            for _t in _subs:
+                self.app._pip_align_transition_starts(only_track=_t)
+        except Exception as _e:
+            self.app._append_info_ui(_("[时间分配] 「转场对齐」执行失败：{0}").format(_e))
+            return
+        self.app._append_info_ui(
+            _("[时间分配] 已对齐选中的 {0} 个片段，时间轴已重新读取。").format(len(_subs)))
+        self._reload()
+
+    def _run_batch(self, name, fn):
+        """执行 app 上的批量动作，然后按新数据重画时间轴。
+
+        这里**不复制任何逻辑**——按钮直接调 `_pip_chain_show_starts` /
+        `_pip_finite_loop_all` / `_pip_mix_all` /
+        `_apply_fade_all_tracks` / `_apply_transition_all_tracks`，
+        保证总览窗口里的「一键…」和别处点的是同一份实现。
+        （「转场对齐」走 _align_transition_sel：只对齐选中片段，内部仍调同一份
+        `_pip_align_transition_starts(only_track=…)`。）
+        """
+        try:
+            fn()
+        except Exception as _e:
+            self.app._append_info_ui(_("[时间分配] 「{0}」执行失败：{1}".format(name, _e)))
+            return
+        self.app._append_info_ui(_("[时间分配] 已在总览窗口执行「{0}」，时间轴已重新读取。".format(name)))
+        self._reload()
+
+    def _close(self):
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+
 # ================== 主入口 ==================
 if __name__ == "__main__":
     if sys.platform == "win32":
@@ -51098,10 +60989,20 @@ if __name__ == "__main__":
                         _p.kill()
                 except Exception:
                     pass
-            try:
-                app._detect_procs = []
-            except Exception:
-                pass
+        try:
+            app._detect_procs = []
+        except Exception:
+            pass
+        # 关闭前杀掉全部登记的预览播放器（mpv/ffplay，含音频引擎/轨列表/分段预览），
+        # 否则最后的预览窗口会变孤儿进程常驻（用户报「关闭程序 ffplay 预览进程残留一堆」）。
+        try:
+            app._reap_prev_preview_player()
+        except Exception:
+            pass
+        try:
+            _kill_all_preview_procs()
+        except Exception:
+            pass
         try:
             root.destroy()
         except Exception:

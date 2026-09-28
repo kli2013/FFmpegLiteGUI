@@ -197,6 +197,15 @@ split=2[rb…bg][rb…fg];[rb…fg]crop=<expand>,<filter>,<crop-back>[rb…bl];[
   > -ss 55 -i file1.mp4 -ss 30 -i file2.mp4 rest…
   > ```
 
+#### Still images (new 2026-09)
+
+Images (`png` / `jpg` / `jpeg` / `bmp` / `webp`) can be used as source material directly — no need to convert them to video first.
+
+- **The duration is controlled right in the Trim panel**: when the source is an image, that panel switches to a **"Display duration (seconds)"** box (10 s by default) — the value you enter is how long the image lasts. The regular start/end, frame-accurate and combined-seek controls don't apply to images and are hidden.
+- **Once the duration is set, the image is just a normal video clip with a length of its own**: filters, crop, watermark, PiP, segment join, transitions and text watermark (countdown included) all work as usual.
+- In **segment join**, each image carries its own display duration and the total is the sum of them (minus any transition overlap).
+- Images have no audio track of their own: configure audio separately if you need sound — segment join fills a silent track matching each image's duration.
+
 ### 3.5 Segment join (tab "Segment join") — hidden segment-cut tool at bottom-left
 
 Cuts and rejoins one video by multiple time ranges (e.g. remove mid-roll ads). Checking it ignores the Trim tab and uses the segment list.

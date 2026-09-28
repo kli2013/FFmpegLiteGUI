@@ -771,3 +771,229 @@ If you also enabled "Background music (BGM)" on the main video:
 ### 5. One-sentence summary
 
 **The "Audio" dropdown picks, for this sub-video: while it is on screen, is its sound gone for good (Ignore), its own separate track (Default), blended into the main audio (Mix), or taking over the main audio (Replace)?** For Mix / Replace the range follows the picture — nothing extra to set up.
+
+---
+
+## 18. PiP transitions (cross-dissolve between clips) & audio alignment (2026-09-25)
+
+> This chapter covers the three things added recently: **transition (cross-dissolve)**, **transition alignment**, and **audio follows transition**.
+> The preconditions are spelled out in as much detail as possible, because **none of them takes effect on its own** — miss even one and it silently does nothing (the command line shows no transition, so it looks like the feature is broken).
+
+### 0. Start with the model: this is a "real timeline"
+
+To make sense of every rule below, fix the mental model first. **The PiP capability is, at heart, a real timeline (the Shotcut kind)** — not the old PiP where a small window floats on top of the main video:
+
+- **Every clip sits on one shared timeline**, and each one's own "Display start / end" (or the window derived from a finite loop count) decides **which stretch of the timeline it occupies** — that is that material's in / out point.
+- **The main video is the first clip**: the timeline is measured from it; when later materials are placed beyond it, the tool automatically pads the bottom with black frames (the timeline extends to the latest clip's end).
+- **The picture hands off according to the windows**: previous clip's end ≈ next clip's start ⇒ the picture switches over naturally; overlapping windows mean two clips on screen at once (small window or full screen, whichever you placed — overlap is a legitimate state of a real timeline, not an error).
+- **A transition is not part of the model itself; it is an optional effect added at the seam.** If the clips butt head-to-tail and both durations are detectable, a fade / wipe etc. is inserted at the cut; if they do not, it falls back to a hard cut. That is where all those preconditions come from — the tool has to be able to **lay out the timeline** (how long each clip is, where it starts and ends) before a transition can be attached at the seam.
+- The three features each cover one thing in the model: **transition** = the effect at the seam; **transition alignment** = placing the in-point exactly at the seam (the start number = the real switch moment); **audio follows transition** = making this clip's sound follow the seam (picture and sound cut at the same instant).
+
+> Implementation note (does not affect usage): underneath it all this is overlay compositing plus black-frame padding at the end of the main video, **not a concat filter chain** — so it is more expressive than serial concat (clips may overlap, may be small windows, position is preserved per clip). **Serial concat / Concat mode** is the real concatenation; keep the two apart. For our purposes, just remember the name **"real timeline"**.
+
+In one sentence: **use it as a real timeline first (arrange the clips, butt them together), and only think about a dissolve once you want one.** The triggers, the alignment formula and the audio follow below are all details of that model.
+
+### 1. What the three are, and where you see them
+
+| Feature | What it is | Where (PiP only; serial concat has its own) |
+|---|---|---|
+| **Transition (cross-dissolve)** | A fade / wipe / slide etc. between the previous clip's picture and the next one, instead of a hard cut | The "Enable transition" checkbox on each video track's **Fade in/out** tab (greyed out on the last clip) |
+| **Transition alignment** | A button that computes a clip's "display start" as the exact moment the picture really switches to it | **Sub-video only** (not the main video), on the **Fade in/out** tab; the main video tab also has "One-click transition (all)", which aligns every clip while it goes |
+| **Audio follows transition** | A checkbox that makes this clip's sound follow the transition, frame-accurate against the picture, and still gives only one audio track | **Sub-video only** (not the main video), on the **Fade in/out** tab — **off by default** |
+
+> Note: all three only appear / take effect **in PiP mode**. Serial concat mode has its own transitions (ch. 8 §2, similar mechanism, but the concatenation rules differ) and is not affected by the alignment / audio-follow rules of this chapter.
+
+---
+
+### 2. ⚠️ When a transition really takes effect (chaining) — all four conditions
+
+Tick a checkbox and the effect is not guaranteed. **All** of the following must hold, otherwise the tool silently skips it (no transition in the command line — it looks like nothing happened):
+
+1. **It must be PiP mode.** (Blunt, but let's state it.)
+2. **The previous clip must have "Transition" ticked** — the transition hangs on the *previous* clip and controls the "previous → this" dissolve.
+   - Example: for clip1 → clip2 to dissolve, tick **clip1**'s transition box (clip2's box controls clip2 → clip3).
+   - Ticking transition on the main video makes it the head of the chain, and it dissolves with the sub-video whose display start ≈ the main video's duration.
+3. **The two clips must butt head-to-tail on screen**: the previous clip's "display end" ≈ this clip's "display start" (differences of no more than half a frame).
+   - A gap in the middle, or two overlapping clips ⇒ no chaining; each clip displays on its own, independent of the other (hard cut).
+4. **Both the previous and this clip need a finite display duration.** Any one of these:
+   - ① A "Display end" time filled in on the **Loop/Chroma control** tab (both start and end filled ⇒ the window is bounded);
+   - ② or "Enable loop control" ticked with a **finite** loop count (not "loop forever").
+   - If a clip has "no end filled in + loop forever", the tool cannot detect its length ⇒ no chaining ⇒ the transition silently does nothing.
+
+Additional automatic rules:
+
+- The transition duration is automatically clamped to **half the duration of the shorter** of the two neighbouring clips (so it is never so short that it errors).
+- The transition "eats" its own duration: the next clip appears **earlier** by that many seconds than where you placed it on screen (the picture has already cut over). That is what transition alignment exists to fix (see §3).
+- **Position / trajectory / rotation are preserved across the transition**: each sub-video taking part first bakes its picture (with your overlay position, trajectory motion, rotation offset, scaling) into a transparent canvas the same size as the main video, and only then transitions —
+  - you place both sub-videos in the bottom-right ⇒ the transition happens in the bottom-right, and the main video shows through the transparent area outside the small window;
+  - no stretching either: the sub-video keeps the size you set, and the surplus is transparent;
+  - the same holds when the main video has a transition ticked (the main video joins the chain): the main picture dissolves into "the sub-video in the bottom-right corner", and the position is not lost;
+  - exception: a sub-video in **blend mode does not take part in transitions** (it needs to be computed pixel by pixel against the main video, and a transition chain is an independent picture that cannot do that). Everything else (rotation / trajectory / sub-canvas) can join the chain.
+
+> **In one sentence:** for clip A → clip B to have a transition, tick transition on clip A, make A and B butt head-to-tail, and give both a finite display window.
+
+---
+
+### 3. Transition alignment — how to use it, and when it applies
+
+- **It is a manual button; it never runs by itself.** The command generator does not call it — it only applies when you click. "Don't click anything" = exactly as before, with no effect on any existing project.
+- **The formula (at a glance)**:
+  ```
+  this clip's start = previous clip's start + previous clip's length − previous clip's transition duration
+  ```
+  - Example: main video 12 s, transition 2 s ⇒ the first sub-video starts at 12 − 2 = **10 s** (the picture cuts over at 10 s, not 12 s).
+  - For the next one: keep accumulating from the "new start" computed for the previous clip.
+- **Which clip it refers to**: always the **clip immediately before it in the track list** (in the order you added the files) — **not** the order the clips sit on screen. Otherwise, when you drag some clip later, the tool would take the clip *after* it to be the "previous" one (a bug we hit before: aligning #2 used #3's timing).
+- **Precondition**: the previous clip must have a detectable display length (start and end filled, or a finite loop count). If it cannot be detected, a message pops up asking you to set it first.
+- **The "end" moves along with it; the clip length does not change**: shifting only the start would stretch the clip, so the end moves by the same amount.
+- **One-click transition (all)**: clicked on the main video's **Fade in/out** tab, it turns on transitions for every clip at once and performs the alignment as it goes (no dialog, log lines only).
+
+---
+
+### 4. Audio follows transition — how to use it, and when it applies
+
+- It is a checkbox on the sub-video's **Fade in/out** tab — **off by default**.
+- Once ticked, it **automatically switches the "Audio:" dropdown on the Loop/Chroma control tab to "Mix"** — so you don't need to tick Mix yourself; from then on everything is mixed into a single audio track on output (same rule as audio-follow in serial concat mode).
+- It drops this clip's sound **exactly at the moment the picture really cuts to it** (the cross point of the transition), so picture and sound are frame-aligned — no more "the picture cut early while the sound is still sitting where it was".
+- **Preconditions (on the video side; all must hold, or this checkbox does nothing)**:
+  1. The previous clip has a transition on and butts head-to-tail with this one (i.e. "chained", as in §2);
+  2. This clip has a finite display window (same as §2 condition 4: display end, or a finite loop count).
+  - If it is not chained, ticking it changes nothing; the sound stays at its original display position (identical to not ticking it).
+- **You do not trim the audio yourself**: it is cut and positioned automatically from this clip's display window (start + end, or the finite loop count); adjusting the display window is adjusting the audio window.
+  - If you want that "picture and sound separate, audio offset independently" kind of freedom (like Shotcut), that is a different feature and is not implemented yet; for now audio is bound to the display window.
+
+---
+
+### 5. How this differs from before the upgrade (when PiP had no transitions at all) (key point)
+
+> "Before the upgrade" here means **versions in which PiP had no transition capability at all** — back then clips could only hard-cut: no dissolve, no alignment, no audio follow. It is not a comparison against some intermediate version.
+
+| Scenario | Before (PiP had no transitions) | After (now) |
+|---|---|---|
+| How clips switch | **Hard cut only**: the instant the previous picture ends, the next frame is immediately the next clip — no effect whatsoever | A "Transition" checkbox (hangs on the previous clip); once ticked, a fade etc. plays **between** the two (preconditions: butt head-to-tail + both have a finite display window) |
+| Where the start goes | No transitions, so the "off by one transition duration" problem did not exist; the clip started wherever you placed it | With transitions the start is easy to mis-place ⇒ a "Transition alignment" button, plus one-click transition aligning everything as it goes; the start number = the real switch moment |
+| Sub-video audio | The "Audio:" dropdown existed (Default / Ignore / Mix / Replace), but you had to **select Mix by hand** for it to join the main sound | The dropdown is still there and its default behaviour is **unchanged**; additionally "Audio follows transition": ticking it **automatically** switches audio to Mix **and** aligns it to the transition cross point — no more manual Mix |
+| Sound once a transition is on | Not applicable (there were no transitions then) | With a transition on but **"Audio follows transition" left unticked**, the sound stays at its original display position and drifts from the picture across the dissolve; only with it ticked are picture and sound frame-aligned |
+| Sub-video position / trajectory / rotation | Always worked (no transition ever touched them) | Still **all work** (participating clips bake into a unified canvas before transitioning, position kept per clip); the only exception is a blend-mode sub-video, which does not take part in transitions |
+| Configuring nothing | Auto-loop and end at the main video's duration | **Exactly the same** (every new feature needs a click / tick; the defaults change nothing for existing projects) |
+
+> The key point: **all the new capabilities are "only after you click / tick", and the defaults keep the old behaviour.** Carrying on as before with auto-loop and ending at the main video's duration is perfectly fine; the output only changes once you actually use transitions / alignment / audio follow.
+
+#### One level deeper: what the real-timeline model itself brings (before the model → after)
+
+The table above compares "transition capability or not". Here we go one level further and compare with **the old PiP, before the real-timeline model existed** (main video as the bottom layer, output duration always equal to the main video's duration). Back then, placing a sub-video's start beyond the main video's duration meant the tool **would not extend the output duration by itself, nor auto-fill the related parameters**; the concrete differences:
+
+| What you want | Before the model (old PiP) | After the model (now) |
+|---|---|---|
+| Place a sub-video's start beyond the main video's duration | **The output duration does not extend**: the total is still computed from the main video; and because "the main input ends = the whole output ends" for overlay, `-t` can be as large as you like and you still get no frames ⇒ **the sub-material disappears completely**, with not a word of warning | It scans every clip's window end and takes the largest ⇒ the main video's tail is **automatically padded with black frames** (`tpad=stop_mode=add`, exact to zero error), the total duration uses the new value and the sub-material appears in full |
+| A dissolve between two clips | PiP had no transitions; even if you hand-craft `xfade` into the command, clips with **different size / frame rate / SAR fail outright** (`size ... do not match` / `timebase ... do not match`), so you had to add the `scale` + `setsar` + `fps` trio yourself, compute `offset` by hand and clamp the transition duration to half the shorter clip — miss one step and it errors or degrades | Just tick a transition: participating clips are **normalized automatically** (with the unified canvas you don't even need resizing), `offset` is computed for you and the duration clamped for you; clips without a transition get zero normalization |
+| Warnings for clipped / infinite windows | **Total silence**: clips with an infinite window cannot be measured, get cut wholesale, and cannot chain with their neighbours — not a word in the log | The log calls them out: when a clip's start lies beyond the output duration but its window is infinite, it warns "Did you forget to give this material a finite duration?" (see ch. 18 §7, first FAQ) |
+
+> One sentence: before the model, "placing it outside the main video = placing it for nothing", and a dissolve meant hand-crafting filters and filling in every parameter; after the model the timeline extends by itself and every transition parameter is filled in for you — your remaining job is "give each clip a finite window + tick transitions".
+
+---
+
+### 6. Recommended order of operations (to avoid pitfalls)
+
+1. Switch to PiP mode, add the main video and the sub-videos.
+2. For each clip: on the **Loop/Chroma control** tab, give it a **finite display window** (fill "Display end", or tick "Enable loop control" with a finite count).
+   → If you are unsure whether the timeline has gaps / overlaps, open 【ch. 20, Timeline overview】 and see it all at once (right-click menu → "Timeline overview").
+3. Tick "Transition" clip by clip (main video → sub 1 → sub 2 …); pick the type and duration as you like.
+4. On each sub-video's **Fade in/out** tab: first click "Transition alignment" (start computed from the previous clip), then tick "Audio follows transition" (auto-mix + positioned).
+   - Or take the lazy route: click "One-click transition (all)" on the main video tab to turn everything on and align in one go, then tick "Audio follows transition" per sub-video.
+5. Preview / export.
+
+### 7. FAQ (why nothing happened when I clicked)
+
+- **Q: I ticked the transition but the command did not change?**
+  → Most likely: an infinite window (no end filled + loop forever), or the previous clip has no transition, or the two clips do not butt head-to-tail. Go back to §2's four conditions and check them one by one.
+  → Since 2026-09-25 the log calls it out: when a clip's start lies beyond the output duration but its window is infinite, it warns "Did you forget to give this material a finite duration?" — seeing that line means condition 4 (finite display window) is not met.
+- **Q: I ticked audio follow but still get several audio tracks / the sound is still off?**
+  → It has to be "chained" first (previous clip transitions + head-to-tail) for the tick to do anything; not chained it is a no-op, and the sound stays at its original display position (same as not ticking). When you tick it you should see the "Audio:" field on the **Loop/Chroma control** tab flip to "Mix" automatically; if it did not, it is not chained.
+- **Q: The sound is still earlier / later than the picture?**
+  → That means it is not chained and the audio is at its original display position. First confirm that a transition really appears in the command (chaining succeeded), then tick audio follow.
+- **Q: Aligning clip 2 used clip 3's timing / clip 3 treated itself as clip 2?**
+  → An old bug that has been fixed: alignment always takes the clip immediately before it in the **track list order**, and no longer sorts by the times you placed on screen. If it still misbehaves, make sure you have not messed up the clip order.
+- **Q: I set an overlay position / trajectory / rotation on a sub-video, and after enabling transitions all of that is gone?**
+  → Not since 2026-09-25 (the unified-canvas approach): every sub-video taking part bakes its picture (position / trajectory / rotation) into the unified transparent canvas before transitioning, so position is kept per clip, size is not stretched, and the main video shows through the transparent parts. If a position still gets lost, check that you have not put that sub-video in blend mode (blend does not take part in transitions).
+
+---
+
+## 19. Nodes: Video node / Audio node (2026-09-25 / 2026-09-26)
+
+> This chapter covers two entries: **Video node** and **Audio node**, both in the right-click menu.
+> One-line purpose: **treat some position in the middle of the processing chain as an independent piece of material, and give it its own set of effects.**
+
+### 1. First, what a "node" is
+
+A PiP / serial concat command is internally one processing chain, with several intermediate outputs on it (for example, a new branch created after `[1:v]` has been scaled and cropped). **A "node" is the position of one of those intermediate outputs.**
+
+- Select a node → a set of effects is applied to **everything after** it (picture / audio); nothing in front of it is affected.
+- The effects are keyed by a "position fingerprint" in `node_fx`, and **every time the command is regenerated they are automatically re-inserted after that node** — no manual command edits, no intermediate files.
+
+### 2. The two entries and their scope
+
+| Entry | Available in | Editing window it opens |
+|------|---------|-------------|
+| **Video node** | **PiP only** (greyed out outside PiP) | "Video track settings", treated like an ordinary video track: crop / rotate / trajectory / the region-effect family… |
+| **Audio node** | **PiP + serial concat** (greyed out in plain mux) | "Audio track settings": volume / loudness normalization / channels… |
+
+The two **do not overlap**: the video-node list only shows picture segments, the audio-node list only audio segments.
+
+### 3. Video node: how to pick and configure
+
+1. **Right-click** → "Video node" → the command preview refreshes once automatically to pull out the current processing chain.
+2. A "Video node" window pops up: a two-level tree on the left (level 1 = processing stage: main chain / sub chain / overlay / transition / final; level 2 = nodes), each row showing index, last filter, size and **mounted effects**.
+3. Select a node → the right pane shows, **inside the window**, that node's real picture at the "frame-grab time" and its real size (including effects already mounted in front of it). Frame grabbing goes through an in-memory pipe, **nothing is written to disk**, and the list stays clickable while grabbing.
+4. Confirm → the "Video track settings" window opens, and you configure it just like an ordinary video track.
+5. Save → "N node effects recorded"; the command preview refreshes along with it.
+
+**Typical scenario (de-logo / watermark removal)**:
+
+1. **The problem**: the logo occupies a whole corner, so applying `delogo` directly is still harsh — two edges have no suitable reference pixels.
+2. **Overlay a layer to supply reference pixels**: overlay one layer on the video — **crop a suitable background and stretch it into that corner**, to give those two edges some reference pixels; alternatively overlay a pre-prepared PNG.
+3. **At this point the main video and this overlay layer are separate** (the overlay is its own branch; it does not modify the main video's original pixels there).
+4. **Before, this program could only do it in two passes**: export once, reload the output file, then apply `delogo` to that.
+5. **Now**: apply `delogo` once more directly on the **right node** — **one pass**, small picture loss.
+
+### 4. Audio node
+
+Same flow as the video node, except you pick an audio intermediate node and the "Audio track settings" window opens.
+Common use: **add one loudness normalization at the last node** (`loudnorm` and friends), so a single pass brings every clip to the same loudness. Middle audio nodes have very few usable filters anyway.
+
+### 5. Positioning mechanism, and re-picking when a node is missed (important)
+
+- Nodes are **not located by label name**; they are located by the fingerprint "**clip index + last filter name**".
+- The upside: with cascaded PiP, every `amix` output may be named the same, and by name you would grab the wrong one; the fingerprint hits the exact spot.
+- The cost: **if the processing chain changes** (a stage added / removed / toggled), the position may no longer be found → the tool **skips it and warns**; it will never quietly apply it in the wrong place. Go back to "Video node / Audio node" and pick the node again.
+- Labels sharing a name get a "n/m same name" suffix to tell them apart; after selecting one, the panel below shows "Original label: [real name]".
+
+### 6. Known limits
+
+- **Branches are not offered**: only nodes with a "single output label" appear in the list (a node fanning out to several streams has unclear semantics; out of scope this round).
+- Node effects only work in the **PiP / serial concat** chains; plain mux mode has no intermediate nodes.
+- Several effects can be mounted on one node; the "Mounted effects" column shows a summary.
+
+---
+
+## 20. Timeline overview (PiP only, 2026-09-27)
+
+> This chapter is the **visual counterpart** of the "real timeline" in **ch. 18**: one timeline shows every clip at a glance, and you can drag them.
+> Details are not repeated here — every button / gesture also exists as a same-named control on the mux page's **"Loop/Chroma control"**, **"Fade in/out"** and **"Sub-video control"** tabs, and hovering the mouse over them gives the full description. **This chapter only lists what is different from those other places.**
+
+**What it is**: every PiP video track has a "display period (display start / display end)", which is easy to miss when you edit them one by one; this window draws all the clips on one timeline so you can drag them directly, and redraws automatically after each change.
+
+- It only reads / writes each video track's "display period", from the same source as the command side's `_resolve_display_window` / `_pip_timeline_extent` — what you see is what the command will produce.
+- To open: PiP mode + at least 2 video tracks; entry point is the right-click menu → "Timeline overview".
+- Different thing from the position editor: **what you drag here is "time"**; where the small window sits is not changed here.
+
+**Four things that are different from other places**:
+
+| Elsewhere | What this adds |
+|---|---|
+| You can only edit numbers one at a time | Dragging to coarsely adjust + **auto-snapping** (to another material's edge / the main video's start and end / the end of the timeline / a manual `-t`; hold **Shift** while dragging = force snap) |
+| One clip at a time | **Multi-select** (Ctrl / Shift + click) + **moving a whole group** (relative gaps unchanged, stops together when it hits 0) + "Ends snap" (the selected clips are butted head-to-tail in turn) |
+| Batch buttons must be hunted for track by track | The **same batch of buttons** along the bottom — the only difference being that the timeline is **redrawn automatically** once they have run (same implementation as everywhere else): one-click fade in/out (all) / one-click transition (all) / one-click reset / one-click set start / transition alignment / one-click finite loop (all) / one-click mix (all) |
+| The filename alone doesn't tell you which source it is | The **"Preview source"** button on the right (new in 2026-09-27): select any clip and click it to play that clip's **original source file** — video plays from the clip's display start (with "End" filled, only this segment; otherwise to the end of the source), images stay for the "image display duration"; the button greys out automatically when nothing / several clips are selected. ⚠️ Plays the raw source only — **no** overlay / crop / speed / transition or other per-segment processing — to see the composited result use the PiP live preview |
+
+> One sentence: **this is the "arranging time" gesture tool (coarse adjustment)**; precise numbers are still edited on the **Loop/Chroma control** tab. Its main uses are checking at a glance whether the timeline has gaps / overlaps, and re-aligning the starts after a batch of transitions has swallowed them.
