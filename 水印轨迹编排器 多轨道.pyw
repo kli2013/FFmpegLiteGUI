@@ -319,6 +319,12 @@ class TrackFrame(ttk.LabelFrame):
         self.segment_durations = []
         # blend 混合模式（parse 时从命令识别，normal=普通叠加；非 normal 时生成区域化 blend 子图）
         self.blend_mode = "normal"
+        # 多实例支持：同一源 [K:v] 可放多个子视频实例（主程序 PiP 常见）。
+        # src_index = 来自哪个 -i 输入（track.index 仍用于显示/标题）；instance_id = 本实例唯一序号
+        # （用于生成时各滤镜标签不撞名）。rotate_angle = 静态旋转角度（度，None 表示无）。
+        self.src_index = 1
+        self.instance_id = 0
+        self.rotate_angle = None
 
         # 特效（旋转 / delogo / 遮罩）—— 与主程序新近加的子视频能力保持对齐
         self.spin_enabled_var = tk.BooleanVar(value=False)
@@ -820,6 +826,32 @@ def split_filters_aware(text):
     return [p.strip() for p in parts if p.strip()]
 
 
+def _stmt_io(stmt):
+    """Return (input_labels, output_labels) for one filtergraph statement.
+
+    input_labels  : leading 1~2 ``[..]`` groups (single- or two-input filters).
+    output_labels : trailing ``[..]`` group(s) (a split can emit two).
+    Labels only ever sit at the head/tail of a statement, so this is safe for
+    ffmpeg filtergraph syntax (no ``[..]`` appears inside ordinary filter args).
+    """
+    inputs = []
+    m = re.match(r'\s*\[([^\]]+)\]', stmt)
+    if m:
+        inputs.append('[' + m.group(1) + ']')
+        m2 = re.match(r'\s*\[[^\]]+\]\[([^\]]+)\]', stmt)
+        if m2:
+            inputs.append('[' + m2.group(1) + ']')
+    outputs = []
+    s = stmt.rstrip()
+    while True:
+        m = re.search(r'\[([^\]]+)\]\s*$', s)
+        if not m:
+            break
+        outputs.insert(0, '[' + m.group(1) + ']')
+        s = s[:m.start()].rstrip()
+    return inputs, outputs
+
+
 # ================== 主程序 ==================
 class MultiTrackWatermarkGUI:
     def __init__(self, root):
@@ -1125,6 +1157,175 @@ class MultiTrackWatermarkGUI:
             out.append(s)
         return out
 
+    def _extract_main_chain(self, filter_complex):
+        """提取主视频（[0:v]）的完整滤镜语句，保真保留主程序落在主视频上的全部滤镜
+        （增强/look/校色/画质/去水印/delogo/绿幕/画布/pad 等），返回 (stmts, final_label)。
+
+        主程序的 PiP 命令里，主视频增强链形如
+            [0:v]setpts=PTS-STARTPTS,<增强链>[v_main_proc]; [1:v]...; [v_main_proc][sub]overlay...
+        旧版 generate_command 写死 ``[0:v]format=yuv420p[v_main]``，等于把整条主视频增强链
+        丢掉 → 解析后再导出，画质/风格滤镜全部丢失。本函数从 [0:v] 起做图遍历：凡是输入标签
+        是 [0:v] 或已被主链产出的语句都收入，直到遇到第一个「把主链和一个子视频流混合」的
+        overlay/blend 为止（该 overlay 的输入里含一个未由主链产出的子视频标签 → 边界）。
+        这样主链整段（含局部模糊/画布的子图 split/overlay）都被完整保留，而（会被重建的）
+        子视频链与 overlay 不收入。
+
+        返回 final_label = 该 overlay 实际消费的主链最终标签（overlay 首输入即主干），
+        调用方据此把它的定义重命名为 [v_main]，与下方 generate_command 的 current_base 接上。
+        无主视频链时返回 (None, None)。
+        """
+        if not filter_complex:
+            return None, None
+        stmts = [s.strip() for s in filter_complex.split(';') if s.strip()]
+        out = []
+        started = False
+        produced = set()
+        final_label = None
+        last_out = None  # 上一条保留语句的输出标签（隐式续接用）
+        for s in stmts:
+            if not started:
+                if s.startswith('[0:v]'):
+                    started = True
+                    out.append(s)
+                    _, os_ = _stmt_io(s)
+                    for o in os_:
+                        produced.add(o)
+                    if os_:
+                        last_out = os_[-1]
+                continue
+            ins, _ = _stmt_io(s)
+            if not ins:
+                # 无前导标签 = ffmpeg 隐式续接上一条语句的输出（如 color=...[canvas] 这类
+                # 源滤镜、或链尾裸滤镜）。只要该输出仍属主链产出就续接，否则视为断开。
+                if last_out is not None and last_out in produced:
+                    ins = [last_out]
+                else:
+                    break
+            # 边界：任一输入是 [N:v]（N>=1，子视频输入）或未被主链产出的标签
+            # → 说明这条语句把主链与子视频混合了，主链到此结束
+            boundary = False
+            for lbl in ins:
+                m = re.match(r'\[(\d+):v\]$', lbl)
+                if m and int(m.group(1)) >= 1:
+                    boundary = True
+                    break
+                if lbl not in produced and lbl != '[0:v]':
+                    boundary = True
+                    break
+            if boundary:
+                for lbl in ins:
+                    if lbl in produced:
+                        final_label = lbl.strip('[]')
+                        break
+                if final_label is None:
+                    # 边界由 [N:v] 子视频输入触发（未捕获到真实 overlay 来定位）；
+                    # 主链最后产出的标签即 overlay 主干消费的最终标签
+                    final_label = (last_out.strip('[]') if last_out else 'v_main_proc')
+                break
+            out.append(s)
+            _, os_ = _stmt_io(s)
+            for o in os_:
+                produced.add(o)
+            if os_:
+                last_out = os_[-1]
+        if not out:
+            return None, None
+        if final_label is None:
+            final_label = (last_out.strip('[]') if last_out else 'v_main_proc')
+        return out, final_label
+
+    def _trace_chain(self, out_to_stmt, target_label):
+        """从 target_label 回溯到其源输入 [K:v]，返回有序语句列表（源语句在前）。"""
+        ordered = []
+        visited = set()
+        cur = target_label
+        while cur:
+            key = '[' + cur + ']'
+            stmt = out_to_stmt.get(key)
+            if not stmt or stmt in visited:
+                break
+            visited.add(stmt)
+            ordered.append(stmt)
+            ins, _ = _stmt_io(stmt)
+            nxt = None
+            for lbl in ins:
+                if re.match(r'\[\d+:v\]$', lbl) or lbl == '[0:v]':
+                    nxt = lbl.strip('[]')
+                    break
+                nxt = lbl.strip('[]')
+                break
+            cur = nxt
+        ordered.reverse()
+        return ordered
+
+    def _detect_sub_instances(self, filter_complex):
+        """检测子视频实例：每个 overlay 消费一个子层 [v_spin_i]，回溯其完整链即一个实例。
+
+        主程序允许同一源 [K:v] 放多个子视频实例（如 5 个 PiP 窗口都来自 [1:v] 带 stream_loop -1）。
+        旧版按「每 -i 输入一个轨道」建轨会把多个实例去重成 1 个 → 解析后再导出只剩 1 个子视频、
+        滤镜全丢。这里改为按 overlay 检测实例：每个 overlay 的第二输入即子层标签，回溯其完整链。
+        返回 list of dict：{sub_label, chain_stmts, src_index, x, y, enable}。
+        """
+        if not filter_complex:
+            return []
+        stmts = [s.strip() for s in filter_complex.split(';') if s.strip()]
+        out_to_stmt = {}
+        for s in stmts:
+            _, outs = _stmt_io(s)
+            for o in outs:
+                out_to_stmt.setdefault(o, s)
+        instances = []
+        seen = set()
+        for s in stmts:
+            if 'overlay=' not in s:
+                continue
+            m = re.match(r'^\s*(\[[^\]]+\])?(\[[^\]]+\])?overlay=', s)
+            if not m or not m.group(2):
+                continue
+            sub_label = m.group(2).strip('[]')
+            if sub_label in seen:
+                continue
+            seen.add(sub_label)
+            chain_stmts = self._trace_chain(out_to_stmt, sub_label)
+            x, y, enable = self._parse_overlay_xy(s)
+            src_index = None
+            if chain_stmts:
+                sm = re.match(r'\[(\d+):v\]', chain_stmts[0])
+                if sm:
+                    src_index = int(sm.group(1))
+            instances.append({
+                'sub_label': sub_label,
+                'chain_stmts': chain_stmts,
+                'src_index': src_index,
+                'x': x, 'y': y, 'enable': enable,
+            })
+        return instances
+
+    def _parse_overlay_xy(self, stmt):
+        """从一条 overlay 语句里抽取 x / y / enable（兼容引号与无引号两种写法）。"""
+        m = re.search(r'overlay=(.*?)(?:\[[^\]]+\])?$', stmt)
+        opts = m.group(1) if m else stmt
+        x = y = None
+        me = re.search(r"x='([^']*)'", opts)
+        if me:
+            x = me.group(1)
+        else:
+            me2 = re.search(r"x=([^:]*?)(?=:y=|:enable=|:shortest=|:eof_action=|$)", opts)
+            if me2:
+                x = me2.group(1)
+        my = re.search(r"y='([^']*)'", opts)
+        if my:
+            y = my.group(1)
+        else:
+            my2 = re.search(r"y=([^:]*?)(?=:enable=|:shortest=|:eof_action=|$)", opts)
+            if my2:
+                y = my2.group(1)
+        en = re.search(r"enable='([^']*)'", opts)
+        if not en:
+            en = re.search(r"enable=([^:]+?)(?=:shortest=|:eof_action=|$)", opts)
+        enable = en.group(1) if en else "1"
+        return x, y, enable
+
     def _apply_scale_dims(self, w, h, scale_str):
         """把缩放滤镜 `scale=W:H` 应用到 (w,h) 上，返回新尺寸。
         仅支持常见写法：纯数字、一侧 -1 / -2（保持比例）；其余表达式无法求值则返回原值。
@@ -1198,6 +1399,14 @@ class MultiTrackWatermarkGUI:
             else:
                 i += 1
 
+        # 去掉 -filter_complex 参数最外层可能携带的引号（主程序导出的命令常整体加引号，
+        # 如 "... -filter_complex "[0:v]..."）。仅剥离首尾一对匹配引号，内部 enable='...'
+        # 之类的引号不受影响。剥掉后 raw_filters_map / _extract_sub_chain / 主链抽取 才能
+        # 正确命中 [0:v] / [N:v] 前缀。
+        if filter_complex and len(filter_complex) >= 2 and filter_complex[0] in '"\'' \
+                and filter_complex[-1] == filter_complex[0]:
+            filter_complex = filter_complex[1:-1]
+
         if len(inputs) < 2:
             messagebox.showerror("错误", "命令中至少需要包含 2 个 -i 输入文件")
             return
@@ -1218,6 +1427,18 @@ class MultiTrackWatermarkGUI:
             matches = re.findall(pattern, filter_complex)
             for idx, filters in matches:
                 raw_filters_map[int(idx)] = filters.strip(',')
+
+        # ---- 主视频增强链保真（与主程序对齐的关键）----
+        # 主程序把增强/look/校色/画质/去水印/delogo/画布/pad 全部叠在 [0:v] 上，
+        # 旧版 generate_command 写死 ``[0:v]format=yuv420p[v_main]`` 把这些全丢了。
+        # 这里把 [0:v] 完整子图抽出来，并把最终标签重命名为 [v_main]，generate 时原样回放。
+        self.main_chain_replay = None
+        if filter_complex:
+            _mc_stmts, _mc_final = self._extract_main_chain(filter_complex)
+            if _mc_stmts and _mc_final:
+                _mc_frag = ';'.join(_mc_stmts)
+                _mc_frag = _mc_frag.replace('[' + _mc_final + ']', '[v_main]')
+                self.main_chain_replay = _mc_frag
 
         # blend 混合模式识别：主程序区域化 blend 子图形如
         #   [mcr0][rgx0b]blend=all_mode=multiply[blx0r]
@@ -1251,111 +1472,212 @@ class MultiTrackWatermarkGUI:
                             continue
                         static_coords.append((x, y))
 
-        for idx, file_path in enumerate(inputs[1:], start=1):
-            file_name = file_path.split("/")[-1].split("\\")[-1]
-            track = TrackFrame(self.scrollable_frame, idx, file_name, self)
-            track.pack(fill="x", padx=5, pady=5)
+        # ---- 子视频实例检测（修复「同一源放多个实例被去重成 1 个」）----
+        # 主程序允许同一源 [K:v] 放多个子视频实例（如 5 个 PiP 窗口都来自 [1:v] 带 stream_loop -1）。
+        # 旧版按「每 -i 输入一个轨道」建轨会把多个实例去重成 1 个 → 解析后再导出只剩 1 个子视频、
+        # 滤镜全丢。现改为按 overlay 检测实例：每个 overlay 消费一个子层 [v_spin_i]，回溯其完整链
+        # 即一个实例，独立成轨，保留各自 scale/旋转/速度/滤镜/位置，可单独编辑（每实例独立轨道）。
+        sub_instances = self._detect_sub_instances(filter_complex) if filter_complex else []
 
-            # 用 chain 提取拿到整条子链（包含 ';' 子图），从中识别 spin/delogo/mask/alpha/scale
-            chain_stmts = self._extract_sub_chain(filter_complex or "", idx)
-            chain_str = ";".join(chain_stmts)
+        if sub_instances:
+            for inst_seq, inst in enumerate(sub_instances):
+                src_index = inst['src_index']
+                if src_index is None or src_index >= len(inputs):
+                    src_index = (len(inputs) - 1) if len(inputs) > 1 else 0
+                file_path = inputs[src_index]
+                file_name = file_path.split("/")[-1].split("\\")[-1]
+                # track.index 仍取源序号（用于显示/标题），src_index/instance_id 供生成区分
+                track = TrackFrame(self.scrollable_frame, src_index, file_name, self)
+                track.src_index = src_index
+                track.instance_id = inst_seq
+                track.pack(fill="x", padx=5, pady=5)
 
-            # spin 持续旋转：匹配 `rotate=angle='N*PI/180*t'`
-            spin_m = re.search(r"rotate=angle='([0-9.\-]+)\*PI/180\*t'", chain_str)
-            if spin_m:
-                try:
-                    track.set_spin(True, float(spin_m.group(1)))
-                except ValueError:
-                    track.set_spin(True, spin_m.group(1))
+                chain_stmts = inst['chain_stmts']
+                chain_str = ";".join(chain_stmts)
 
-            # delogo：匹配 `delogo=x=..:y=..:w=..:h=..`
-            delogo_m = re.search(r"delogo=x=([^:]+):y=([^:]+):w=([^:]+):h=([^:]+)", chain_str)
-            if delogo_m:
-                track.set_delogo(True, delogo_m.group(1), delogo_m.group(2),
-                                  delogo_m.group(3), delogo_m.group(4))
+                # spin 持续旋转：匹配 `rotate=angle='N*PI/180*t'`
+                spin_m = re.search(r"rotate=angle='([0-9.\-]+)\*PI/180\*t'", chain_str)
+                if spin_m:
+                    try:
+                        track.set_spin(True, float(spin_m.group(1)))
+                    except ValueError:
+                        track.set_spin(True, spin_m.group(1))
 
-            # 遮罩：匹配 `format=gray,drawbox=0:0:iw:ih:color=WHITE_OR_BLACK:t=fill,
-            #  drawbox=x=X:y=Y:w=W:h=H:color=WHITE_OR_BLACK:t=fill`
-            # 第二个 drawbox 的 color 决定 mode（black=inside 矩形透明 / white=outside 只露矩形）
-            mask_m = re.search(
-                r"format=gray,drawbox=x=0:y=0:w=iw:h=ih:color=(\w+):t=fill,"
-                r"drawbox=x=([^:]+):y=([^:]+):w=([^:]+):h=([^:]+):color=(\w+):t=fill",
-                chain_str
-            )
-            if mask_m:
-                rect_color = mask_m.group(6)
-                mode = "inside" if rect_color == "black" else "outside"
-                track.set_mask(True, mask_m.group(2), mask_m.group(3),
-                                mask_m.group(4), mask_m.group(5), mode)
+                # 静态旋转（固定角度，非 *t 持续旋转）：抽取角度存 track.rotate_angle，
+                # 不进 filter_parts（生成时按标准 hypot 画布重建）。
+                rot_m = re.search(r"rotate=angle='?(-?[0-9.]+)\*PI/180'?(?::|$)", chain_str)
+                if rot_m and '*PI/180*t' not in rot_m.group(0):
+                    try:
+                        track.rotate_angle = float(rot_m.group(1))
+                    except ValueError:
+                        track.rotate_angle = None
 
-            # alpha：在整条子链里搜 `colorchannelmixer=aa=N`
-            alpha_m = re.search(r"colorchannelmixer=aa=([0-9.]+)", chain_str)
-            if alpha_m:
-                try:
-                    track.set_alpha(float(alpha_m.group(1)))
-                except ValueError:
-                    pass
+                # delogo：匹配 `delogo=x=..:y=..:w=..:h=..`（可带时间段 enable）
+                delogo_m = re.search(r"delogo=x=([^:]+):y=([^:]+):w=([^:]+):h=([^:]+)(?::enable=([^,\[\]]+))?", chain_str)
+                if delogo_m:
+                    if delogo_m.group(5):
+                        # 带时间段 enable：不识别成 track.delogo（UI 重建不带 enable），
+                        # 下方 filter_parts 循环会原样保留该 delogo（含 enable）
+                        pass
+                    else:
+                        track.set_delogo(True, delogo_m.group(1), delogo_m.group(2),
+                                        delogo_m.group(3), delogo_m.group(4))
 
-            # blend 混合模式：mcr 后数字 = 子视频序号（0 起，= idx-1）。识别后：
-            # ① filter_parts 摊平时跳过 blend 残留（采样 crop/alphaextract，子图生成时重建）；
-            # ② generate_command 走区域化 blend 子图（不再普通叠加）。
-            track.blend_mode = str(blend_map.get(idx - 1, "normal") or "normal").strip().lower()
+                # 遮罩：匹配 `format=gray,drawbox=0:0:iw:ih:color=WHITE_OR_BLACK:t=fill,
+                #  drawbox=x=X:y=Y:w=W:h=H:color=WHITE_OR_BLACK:t=fill`
+                # 第二个 drawbox 的 color 决定 mode（black=inside 矩形透明 / white=outside 只露矩形）
+                mask_m = re.search(
+                    r"format=gray,drawbox=x=0:y=0:w=iw:h=ih:color=(\w+):t=fill,"
+                    r"drawbox=x=([^:]+):y=([^:]+):w=([^:]+):h=([^:]+):color=(\w+):t=fill",
+                    chain_str
+                )
+                if mask_m:
+                    rect_color = mask_m.group(6)
+                    mode = "inside" if rect_color == "black" else "outside"
+                    track.set_mask(True, mask_m.group(2), mask_m.group(3),
+                                    mask_m.group(4), mask_m.group(5), mode)
 
-            # scale 和其它 filter_parts：跨语句摊平扫描。
-            # 注意：scale 不一定在第一条 statement —— 主程序带遮罩时形如
-            #   [1:v]split=2[mks1a][mks1m];[mks1m]format=gray,drawbox=...[mks1msk];
-            #   [mks1a][mks1msk]alphamerge,scale=360:642,format=rgba[v_temp_0];...
-            # scale 落在 alphamerge 同句里，只扫第一条会丢 → 这里遍历整条链的每条
-            # statement，剥掉输入标签前缀（单/双输入）和尾部输出标签后按 ',' 拆，
-            # 跳过已识别的特效，把剩余部分按顺序摊平为 filter_parts。
-            filter_parts = []
-            scale_w = scale_h = None
-            for stmt in (chain_stmts or [raw_filters_map.get(idx, "")]):
-                body = stmt
-                # 剥输入标签前缀：[x] 单输入 或 [x][y] 双输入（alphamerge 子图）
-                body = re.sub(r'^(\[[^\]]+\])(\[[^\]]+\])?', '', body)
-                # 剥尾部输出标签
-                body = re.sub(r'(\[[^\]]+\])+$', '', body)
-                for part in split_filters_aware(body):
-                    if part.startswith('format=') or part.startswith('colorchannelmixer='):
-                        continue
-                    if part == 'null' or part.startswith('split=') or part.startswith('alphamerge'):
-                        continue  # 占位/遮罩子图已识别
-                    if part.startswith('drawbox='):
-                        continue
-                    if part.startswith('rotate=') and '*PI/180*t' in part:
-                        continue  # 持续旋转已识别
-                    if part.startswith('delogo='):
-                        continue
-                    if part.startswith('scale='):
-                        m = re.match(r'^scale=([^:]+):([^:,]+)', part)
-                        if m:
-                            scale_w, scale_h = m.group(1), m.group(2)
-                        continue
-                    if part.startswith('alphaextract'):
-                        continue  # blend 子图残留（子图在生成时重建）
-                    if track.blend_mode != "normal" and part.startswith('crop='):
-                        # blend 子视频的采样 crop（主区域+子区域两处，含静态数字与动态表达式两种）；
-                        # 区域 blend 子图在 generate 时重建，残留只会造成错位双裁剪。
-                        # 已知限制：blend 模式下用户自带的裁剪 crop 一并忽略（如需裁剪请用 scale）。
-                        continue
-                    filter_parts.append(part)
+                # alpha：在整条子链里搜 `colorchannelmixer=aa=N`
+                alpha_m = re.search(r"colorchannelmixer=aa=([0-9.]+)", chain_str)
+                if alpha_m:
+                    try:
+                        track.set_alpha(float(alpha_m.group(1)))
+                    except ValueError:
+                        pass
 
-            track.set_filter_parts(filter_parts)
+                # blend 混合模式：按实例序号映射（mcr 后数字 = 子视频序号，0 起）
+                track.blend_mode = str(blend_map.get(inst_seq, "normal") or "normal").strip().lower()
 
-            if scale_w is not None and scale_h is not None:
-                track.set_scale(scale_w, scale_h)
+                # scale 和其它 filter_parts：跨语句摊平扫描（同旧逻辑）
+                filter_parts = []
+                scale_w = scale_h = None
+                for stmt in (chain_stmts or [raw_filters_map.get(src_index, "")]):
+                    body = stmt
+                    body = re.sub(r'^(\[[^\]]+\])(\[[^\]]+\])?', '', body)
+                    body = re.sub(r'(\[[^\]]+\])+$', '', body)
+                    for part in split_filters_aware(body):
+                        if part.startswith('format=') or part.startswith('colorchannelmixer='):
+                            continue
+                        if part == 'null' or part.startswith('split=') or part.startswith('alphamerge'):
+                            continue
+                        if part.startswith('drawbox='):
+                            continue
+                        if part.startswith('rotate='):
+                            continue  # 持续旋转 / 静态旋转均已识别，生成时重建
+                        if part.startswith('delogo='):
+                            if ':enable=' in part:
+                                filter_parts.append(part)
+                            continue
+                        if part.startswith('scale='):
+                            m = re.match(r'^scale=([^:]+):([^:,]+)', part)
+                            if m:
+                                scale_w, scale_h = m.group(1), m.group(2)
+                            continue
+                        if part.startswith('alphaextract'):
+                            continue
+                        if track.blend_mode != "normal" and part.startswith('crop='):
+                            continue
+                        filter_parts.append(part)
 
-            if idx-1 < len(static_coords):
-                x, y = static_coords[idx-1]
-                track.set_static_position(x, y)
+                track.set_filter_parts(filter_parts)
 
-            self.tracks.append(track)
+                if scale_w is not None and scale_h is not None:
+                    track.set_scale(scale_w, scale_h)
+
+                if inst['x'] is not None and inst['y'] is not None:
+                    track.set_static_position(inst['x'], inst['y'])
+
+                self.tracks.append(track)
+        else:
+            # 退化：filter_complex 无 overlay（极少见）→ 退回旧版每输入一轨，保持旧行为
+            for idx, file_path in enumerate(inputs[1:], start=1):
+                file_name = file_path.split("/")[-1].split("\\")[-1]
+                track = TrackFrame(self.scrollable_frame, idx, file_name, self)
+                track.pack(fill="x", padx=5, pady=5)
+
+                chain_stmts = self._extract_sub_chain(filter_complex or "", idx)
+                chain_str = ";".join(chain_stmts)
+
+                spin_m = re.search(r"rotate=angle='([0-9.\-]+)\*PI/180\*t'", chain_str)
+                if spin_m:
+                    try:
+                        track.set_spin(True, float(spin_m.group(1)))
+                    except ValueError:
+                        track.set_spin(True, spin_m.group(1))
+
+                delogo_m = re.search(r"delogo=x=([^:]+):y=([^:]+):w=([^:]+):h=([^:]+)(?::enable=([^,\[\]]+))?", chain_str)
+                if delogo_m:
+                    if delogo_m.group(5):
+                        pass
+                    else:
+                        track.set_delogo(True, delogo_m.group(1), delogo_m.group(2),
+                                        delogo_m.group(3), delogo_m.group(4))
+
+                mask_m = re.search(
+                    r"format=gray,drawbox=x=0:y=0:w=iw:h=ih:color=(\w+):t=fill,"
+                    r"drawbox=x=([^:]+):y=([^:]+):w=([^:]+):h=([^:]+):color=(\w+):t=fill",
+                    chain_str
+                )
+                if mask_m:
+                    rect_color = mask_m.group(6)
+                    mode = "inside" if rect_color == "black" else "outside"
+                    track.set_mask(True, mask_m.group(2), mask_m.group(3),
+                                    mask_m.group(4), mask_m.group(5), mode)
+
+                alpha_m = re.search(r"colorchannelmixer=aa=([0-9.]+)", chain_str)
+                if alpha_m:
+                    try:
+                        track.set_alpha(float(alpha_m.group(1)))
+                    except ValueError:
+                        pass
+
+                track.blend_mode = str(blend_map.get(idx - 1, "normal") or "normal").strip().lower()
+
+                filter_parts = []
+                scale_w = scale_h = None
+                for stmt in (chain_stmts or [raw_filters_map.get(idx, "")]):
+                    body = stmt
+                    body = re.sub(r'^(\[[^\]]+\])(\[[^\]]+\])?', '', body)
+                    body = re.sub(r'(\[[^\]]+\])+$', '', body)
+                    for part in split_filters_aware(body):
+                        if part.startswith('format=') or part.startswith('colorchannelmixer='):
+                            continue
+                        if part == 'null' or part.startswith('split=') or part.startswith('alphamerge'):
+                            continue
+                        if part.startswith('drawbox='):
+                            continue
+                        if part.startswith('rotate=') and '*PI/180*t' in part:
+                            continue
+                        if part.startswith('delogo='):
+                            if ':enable=' in part:
+                                filter_parts.append(part)
+                            continue
+                        if part.startswith('scale='):
+                            m = re.match(r'^scale=([^:]+):([^:,]+)', part)
+                            if m:
+                                scale_w, scale_h = m.group(1), m.group(2)
+                            continue
+                        if part.startswith('alphaextract'):
+                            continue
+                        if track.blend_mode != "normal" and part.startswith('crop='):
+                            continue
+                        filter_parts.append(part)
+
+                track.set_filter_parts(filter_parts)
+
+                if scale_w is not None and scale_h is not None:
+                    track.set_scale(scale_w, scale_h)
+
+                if idx-1 < len(static_coords):
+                    x, y = static_coords[idx-1]
+                    track.set_static_position(x, y)
+
+                self.tracks.append(track)
 
         # 轨道全部生成后递归绑定滚轮，保证鼠标在轨道内任意控件上都能上下滚动
         self._bind_track_wheel(self.scrollable_frame)
 
-        messagebox.showinfo("解析成功", f"成功识别到 {len(inputs)-1} 个子视频轨道！")
+        messagebox.showinfo("解析成功", f"成功识别到 {len(self.tracks)} 个子视频轨道！")
 
     # ---------- 核心表达式构建 ----------
     def get_max_keyframes(self):
@@ -1722,7 +2044,13 @@ class MultiTrackWatermarkGUI:
         end_behavior = self.end_behavior_var.get() if not loop else "停留在结束点"
 
         filter_chain = []
-        filter_chain.append("[0:v]format=yuv420p[v_main]")
+        # 主视频链：优先回放解析时保真抽出的 [0:v] 完整子图（含增强/look/校色/画质/
+        # 去水印/delogo/画布/pad 等），避免「解析后再导出把主视频滤镜全丢」。
+        # 解析时未抽到（无 filter_complex / 解析失败）才退回旧版写死的 format=yuv420p。
+        if getattr(self, 'main_chain_replay', None):
+            filter_chain.append(self.main_chain_replay)
+        else:
+            filter_chain.append("[0:v]format=yuv420p[v_main]")
         current_base = "[v_main]"
         output_counter = 0
 
@@ -1775,6 +2103,9 @@ class MultiTrackWatermarkGUI:
             dwell = track.dwell_var.get() if jump_mode else 0.0
             cycle = track.cycle_entry.get().strip() if not advanced and not jump_mode else None
             idx = track.index
+            # 多实例支持：src_index = 来自哪个 -i 输入；iid = 实例唯一序号（滤镜标签不撞名）
+            src_index = getattr(track, 'src_index', idx)
+            iid = getattr(track, 'instance_id', idx)
 
             if has_trajectory:
                 if advanced:
@@ -1795,13 +2126,13 @@ class MultiTrackWatermarkGUI:
                 x_expr = track.static_x
                 y_expr = track.static_y
 
-            sub_stream = f"[{idx}:v]"
-            sub_temp_label = f"v_sub_{idx}"
+            sub_stream = f"[{src_index}:v]"
+            sub_temp_label = f"v_sub_{iid}"
             out_stream = f"[v_out_{output_counter}]"
-            ov_alias = f"ov{idx}"  # 给 overlay 起别名，多轨道时让 sendcmd 按名定向
+            ov_alias = f"ov{iid}"  # 给 overlay 起别名，多轨道时让 sendcmd 按名定向
 
             # ---- 收集子视频真实尺寸（送 sendcmd 数值求值用）----
-            sub_path = input_entries[idx][1]
+            sub_path = input_entries[src_index][1]
             sub_native_w, sub_native_h = None, None
             try:
                 _probe = self.get_video_resolution(sub_path)
@@ -1861,11 +2192,13 @@ class MultiTrackWatermarkGUI:
             except (ValueError, TypeError):
                 _sp_val = 60.0
             spin_on = bool(track.spin_enabled_var.get()) and _sp_val != 0
-            # 静态旋转（filter_parts 里的 rotate= 非持续旋转）同样输出 hypot 正方形画布
-            # （rotate=..:ow=hypot(iw,ih):oh=hypot(iw,ih):c=black@0），blend 区域必须用对角线
-            has_static_rotate = any(
-                p.startswith('rotate=') and '*PI/180*t' not in p for p in filter_parts)
-            if (spin_on or has_static_rotate) and sub_w and sub_h:
+            # 静态旋转（track.rotate_angle 已抽取，filter_parts 里不再含 rotate=）：同样输出
+            # hypot 正方形画布（rotate=..:ow=hypot(iw,ih):oh=hypot(iw,ih):c=black@0）。
+            static_rotate_on = track.rotate_angle is not None
+            # chromakey 输出 alpha（绿幕透明），必须走 rgba 才能被 overlay 正确合成
+            chromakey_present = any(p.startswith('chromakey') for p in filter_parts)
+            rotate_on = spin_on or static_rotate_on
+            if rotate_on and sub_w and sub_h:
                 _d = int(round((sub_w * sub_w + sub_h * sub_h) ** 0.5))
                 sub_w = sub_h = _d
 
@@ -1885,7 +2218,7 @@ class MultiTrackWatermarkGUI:
                 else:
                     _draw = (f"drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill,"
                              f"drawbox=x={_mx}:y={_my}:w={_mw}:h={_mh}:color=white:t=fill")
-                _mka, _mkm, _mkmsk, _mkout = f"mk{idx}a", f"mk{idx}m", f"mk{idx}msk", f"mk{idx}out"
+                _mka, _mkm, _mkmsk, _mkout = f"mk{iid}a", f"mk{iid}m", f"mk{iid}msk", f"mk{iid}out"
                 filter_chain.append(f"{cur_input}split=2[{_mka}][{_mkm}]")
                 filter_chain.append(f"[{_mkm}]format=gray,{_draw}[{_mkmsk}]")
                 filter_chain.append(f"[{_mka}][{_mkmsk}]alphamerge[{_mkout}]")
@@ -1937,6 +2270,8 @@ class MultiTrackWatermarkGUI:
                 (track.use_alpha_var.get() and 0.0 <= _av < 1.0)
                 or track.mask_enabled_var.get()
                 or spin_on
+                or static_rotate_on
+                or chromakey_present
             )
             if need_rgba:
                 filter_chain.append(f"{cur_input}format=rgba[{sub_temp_label}_rgba]")
@@ -1944,18 +2279,25 @@ class MultiTrackWatermarkGUI:
 
             # ---- alpha 透明度（在遮罩之后 / 旋转之前，与主程序顺序一致）----
             if track.use_alpha_var.get() and 0.0 <= _av < 1.0:
-                _alpha_label = f"v_alpha_{idx}"
+                _alpha_label = f"v_alpha_{iid}"
                 filter_chain.append(f"{cur_input}colorchannelmixer=aa={_av:.2f}[{_alpha_label}]")
                 cur_input = f"[{_alpha_label}]"
 
-            # ---- 持续旋转（需要 rgba；用对角线正方形画布）----
+            # ---- 旋转（持续旋转 / 静态角度，二者互斥；需 rgba + 对角线正方形画布）----
             if spin_on:
-                _spin_label = f"v_spin_{idx}"
+                _spin_label = f"v_spin_{iid}"
                 filter_chain.append(
                     f"{cur_input}rotate=angle='{_sp_val}*PI/180*t':"
                     f"ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=black@0[{_spin_label}]"
                 )
                 cur_input = f"[{_spin_label}]"
+            elif static_rotate_on:
+                _rot_label = f"v_spin_{iid}"
+                filter_chain.append(
+                    f"{cur_input}rotate=angle='{track.rotate_angle:g}*PI/180':"
+                    f"ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=black@0[{_rot_label}]"
+                )
+                cur_input = f"[{_rot_label}]"
 
             # ---- 构建 overlay（sendcmd 模式：位置由命令文件驱动）----
             blend_mode = str(getattr(track, "blend_mode", "normal") or "normal").strip().lower()
@@ -1977,8 +2319,8 @@ class MultiTrackWatermarkGUI:
                     _bh -= 1
                 _bw = max(2, _bw); _bh = max(2, _bh)
                 # 唯一 label / 别名（多轨道不撞名）
-                _cr = f"cr{idx}"
-                _mc, _ap, _rg, _ae, _br, _bx = (f"b{idx}{x}" for x in ("mc", "ap", "rg", "ae", "br", "bx"))
+                _cr = f"cr{iid}"
+                _mc, _ap, _rg, _ae, _br, _bx = (f"b{iid}{x}" for x in ("mc", "ap", "rg", "ae", "br", "bx"))
                 # 主区域来源：区域隔离时用 bl_base{_blend_seq}（原始帧副本，重叠区互不干涉），
                 # 否则用当前合成主干（单 blend 直接与当前画面混合）
                 if use_regional:
@@ -1996,14 +2338,19 @@ class MultiTrackWatermarkGUI:
                         horizon = delay_val + total_period
                     if horizon <= 0:
                         horizon = max(global_duration, 0.001)
-                    cmdfile = self._write_sendcmd_file(track, x_expr, y_expr, horizon, idx, base_dir,
+                    cmdfile = self._write_sendcmd_file(track, x_expr, y_expr, horizon, iid, base_dir,
                                                         main_w, main_h, _bw, _bh,
                                                         overlay_name=f"overlay@{ov_alias}",
                                                         crop_name=f"crop@{_cr}")
                     sendcmd_files.append(cmdfile)
                     sc_label = f"{sub_temp_label}_sc"
-                    filter_chain.append(f"{cur_input}sendcmd=f='{cmdfile}'[{sc_label}]")
-                    cur_input = f"[{sc_label}]"
+                    # sendcmd 挂主视频流（输出时间轴）而非子视频流：子视频带 setpts 会压缩自身
+                    # 时间轴，挂子视频流会让 crop 窗口与 overlay 位置按各自压缩时钟走而相互失同步
+                    # （同源于多实例表现为「轨迹点互相串/乱飞」）。挂主视频流后所有实例共用输出时钟。
+                    filter_chain.append(f"{_src}sendcmd=f='{cmdfile}'[{sc_label}]")
+                    _src = f"[{sc_label}]"
+                    if not use_regional:
+                        current_base = f"[{sc_label}]"
                     # crop 初始占位 0:0（sendcmd 首命令 t=0 即覆盖；crop 的 x/y 由命令文件按 iw/ih 驱动）
                     filter_chain.append(f"{_src}crop@{_cr}={_bw}:{_bh}:0:0,format=rgb24[{_mc}]")
                     overlay_opts = "x=-1:y=-1"
@@ -2052,13 +2399,16 @@ class MultiTrackWatermarkGUI:
                     horizon = delay_val + total_period
                 if horizon <= 0:
                     horizon = max(global_duration, 0.001)
-                cmdfile = self._write_sendcmd_file(track, x_expr, y_expr, horizon, idx, base_dir,
+                cmdfile = self._write_sendcmd_file(track, x_expr, y_expr, horizon, iid, base_dir,
                                                     main_w, main_h, sub_w or 0, sub_h or 0,
                                                     overlay_name=f"overlay@{ov_alias}")
                 sendcmd_files.append(cmdfile)
                 sc_label = f"{sub_temp_label}_sc"
-                filter_chain.append(f"{cur_input}sendcmd=f='{cmdfile}'[{sc_label}]")
-                cur_input = f"[{sc_label}]"
+                # sendcmd 挂主视频流（输出时间轴）而非子视频流：子视频带 setpts 会压缩自身
+                # 时间轴，挂子视频流会让轨迹按各自压缩时钟播放而相互失同步（同源于多实例乱飞）。
+                # 挂主视频流后所有实例共用输出时钟，与表达式模式（x='expr'）完全一致。
+                filter_chain.append(f"{current_base}sendcmd=f='{cmdfile}'[{sc_label}]")
+                current_base = f"[{sc_label}]"
                 overlay_opts = f"x=-1:y=-1"
             else:
                 overlay_opts = f"x='{x_expr}':y='{y_expr}'"
