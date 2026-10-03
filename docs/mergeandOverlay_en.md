@@ -952,7 +952,7 @@ The two **do not overlap**: the video-node list only shows picture segments, the
 
 1. **The problem**: the logo occupies a whole corner, so applying `delogo` directly is still harsh — two edges have no suitable reference pixels.
 2. **Overlay a layer to supply reference pixels**: overlay one layer on the video — **crop a suitable background and stretch it into that corner**, to give those two edges some reference pixels; alternatively overlay a pre-prepared PNG.
-3. **At this point the main video and this overlay layer are separate** (the overlay is its own branch; it does not modify the main video's original pixels there).
+3. **At this point the main video and this overlay layer are still separate** (the overlay is its own branch; it does not modify the main video's original pixels there).
 4. **Before, this program could only do it in two passes**: export once, reload the output file, then apply `delogo` to that.
 5. **Now**: apply `delogo` once more directly on the **right node** — **one pass**, small picture loss.
 
