@@ -51,6 +51,8 @@ Presets save and reuse common parameter sets so you don't reconfigure every time
 
 **Encoder** — stream copy (`copy`), software (`libx264`, `libx265`, `libvpx-vp9`, `libsvtav1`, `mpeg4`, `libxvid`, `libtheora`), hardware (`NVIDIA NVENC`, `Intel QSV`, `AMD AMF`, `VAAPI`, `VideoToolbox`), pro formats (`ProRes`, `DNxHD`, `FFV1`), and image/animated (`GIF`, `WebP`). The rate-control and preset options switch automatically with the encoder.
 
+- **Hardware encoding advanced button (new 2026-10-07)**: when a hardware encoder (NVENC / QSV / AMF / VAAPI / VideoToolbox) is selected, the encoder-selection area shows a set of "hardware encoding advanced" buttons that expand to hardware-specific advanced params (e.g. lookahead / adaptive quantization / reference-frame limit / rate-control mode); the options differ per hardware. These are written into the encoder's private params (the hardware counterparts of `-x264-params` / `-x265-params`), so you don't type the full param string by hand.
+
 **Preset** — speed vs. compression (`ultrafast`…`veryslow`; hardware uses `p1`…`p7`). The available list adapts to the encoder.
 
 **Rate control**
@@ -79,6 +81,8 @@ Presets save and reuse common parameter sets so you don't reconfigure every time
 - Re-encode only; ignored with `copy`.
 
 **Scale** — three modes: width (height auto), height (width auto), exact W×H (may stretch). A swap (⇄) button exchanges the two values.
+
+- **Scale algorithm selection (new 2026-10-07)**: **right-click** the ⇄ swap button to open a scale-algorithm menu; choose a different `scale` algorithm (`bicubic` / `bilinear` / `lanczos` / `spline` …, mapping to ffmpeg `sws_flags` / `scale=flags=`). The algorithms trade off sharpness / aliasing / blur. The choice is written into the command; the default still uses ffmpeg's general default.
 
 **Crop**
 - Enable then set width / height / left / top.
@@ -110,6 +114,10 @@ Presets save and reuse common parameter sets so you don't reconfigure every time
   - Marks only — **no pixel conversion** (use the "Color matrix" filter above for that).
   - Measured pitfall (local ffmpeg n9.0.1): `-color_primaries` / `-color_trc` are **silently dropped** by the libx264 / libx265 / libsvtav1 wrappers (same with a side-data-free y4m input, so it isn't frame side-data overwriting), while `-colorspace` / `-color_range` work. Those three encoders therefore go through private params: `-x264-params colorprim=:transfer=`, `-x265-params`, `-svtav1-params color-primaries=:transfer-characteristics=`; other encoders still use the generic options (whether they land depends on the ffmpeg build).
   - Illegal values (old presets / hand-edited config) are ignored with a log line instead of breaking the whole command.
+
+- **Static HDR metadata (master-display / max-cll, new 2026-10-07)**: the Advanced-enhancement window adds a "static HDR metadata" input where you can fill `master-display` (e.g. `G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)`) and `max-cll` (e.g. `1000,400`). When enabled, these are written to the output (through the encoder's private params `-x264-params` / `-x265-params` / `-svtav1-params` …) so HDR10 players can do luminance mapping. **Prerequisite**: the output must use an HDR10-capable container / encoder (e.g. mp4 + x265 / svtav1), and the source must carry an HDR10 tag or have HDR already preserved.
+- **Advanced-enhancement style looks (new 2026-10-03)**: the Advanced-enhancement window adds a set of "style look" presets (cinematic / retro / clean …) — essentially packaged `eq` / `colormatrix` / `tonemap` param combos you can apply in one click and keep tuning afterward; applying a look writes those filter params at once, but is not locked and can be changed later.
+- **Advanced-enhancement live preview frame (new 2026-10-03)**: the Advanced-enhancement window has a built-in **live preview frame** that reflects denoise / sharpen / color / style-look (especially color-class) changes instantly, grabbing frames in memory and refreshing with the sliders.
 
 **Remove logo / blur** (separate window)
 - **`delogo`** — smart-interpolation logo/watermark removal. Frame the region with the visual crop tool, then "Copy coordinates from crop" fills `x:y:w:h` in one click.
@@ -154,6 +162,8 @@ split=2[rb…bg][rb…fg];[rb…fg]crop=<expand>,<filter>,<crop-back>[rb…bl];[
 **Deinterlace** — `none`, `bwdif`, `yadif`, `kerndeint`, `pp=lb`, `fieldorder`.
 
 **Pixel format** — optional `yuv420p` (default, for compatibility), `yuv422p`, `yuv444p`, various 10-bit. You can disable the default.
+
+- **Checkbox state persisted (changed 2026-10-07)**: the "specify pixel format" checkbox has been moved into "Info & Player → More settings" and is now **persisted** (written to config, remembered after restart); earlier it was a semi-persistent "last checkbox" logic that was lost on exit. When unchecked it still falls back to the default `yuv420p`, same behaviour as before.
 
 **Speed** — custom multiplier (any positive, e.g. `0.5` slow, `2.0` fast). Audio gets an automatic `atempo` chain (works beyond 2× / below 0.5×).
 

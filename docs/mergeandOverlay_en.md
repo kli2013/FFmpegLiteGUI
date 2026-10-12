@@ -23,6 +23,54 @@ The Merge page (Mux / Merge / PiP) is one of the core modules. It combines multi
 - **External subtitle** — `srt`, `ass`, `ssa`, `vtt`, `idx`, `sup`…
 - **External video** — in PiP or Concat mode, as a sub-video or concat segment.
 
+### 1.2.1 Generate color background (virtual track, 2026-10-09)
+
+Generate a solid-color / transparency video track without loading any video file (underlying FFmpeg `lavfi` color source `color=c=0xRRGGBBAA,s=WxH:r=30:d=DUR,format=rgba`, expressed via the sentinel `color:RRGGBBAA:WxH:DUR`; no real file is written on disk). It can serve as the main-video background, an overlay layer, a PiP sub-video source, or a transparent carrier.
+
+- **Entry**: On the Merge page, "More ▸ Generate ▸ Color background…" opens a dialog; confirming adds a new video track. With an existing color track selected, "More" shows "Edit color source…" to change color / transparency / size / duration in place (no new track is created).
+- **Parameters**:
+  - Color: 6-digit hex `#RRGGBB`, with a live swatch preview and the system color picker;
+  - Transparency: 0–100% dropdown steps (opaque 100% / half 50% / fully transparent 0% / custom) + slider, two-way synced; the UI is entirely in percentages, internally mapped back to 0–255 alpha (50% → 128);
+  - Width / Height: integers, with a "⇄" button to swap them (portrait ⇄ landscape);
+  - Duration: seconds, accepts decimals.
+- **Typical uses**: a solid-color canvas background; a semi-transparent block pressed over the main video as a mask / color grade; a PiP sub-frame sourced directly from a color block (the sub-video source swaps `movie=<path>` for `color=…,format=rgba[label]`, downstream chain unchanged); a transparent carrier for text watermark / rotating watermark / countdown.
+- **Note (transparent export)**: H.264 / H.265 carry no alpha channel, so exporting silently turns transparency into solid color. When the main video is detected as a color source with `alpha<255` (or chroma-key / mask / alpha-bearing input), the program automatically: forces pixel format `yuva420p` → disables stream-copy and forces re-encode → upgrades the container to `.mov` + encoder `prores_ks` 4444 to keep transparency. To output H.264/H.265, keep transparency at 100%.
+- **Preview**: wired into all preview paths on the same footing as "chroma key" and "main-video transparency" (transcode page / single clip / pipe, PiP live, single track, text-watermark snapshot); in preview the `fmt` checkbox's `format=yuv420p` is automatically ignored in favor of `format=rgba`, so transparency is preserved.
+- The color source does not support stream-copy (`-c:v copy` fails); export always re-encodes.
+
+### 1.2.2 Generate pattern background / countdown (virtual track, 2026-10-10)
+
+Also a **file-less** generative track built on FFmpeg `lavfi` generators, expressed via the sentinel `gen:<type>:WxH:DUR`. Two entries:
+
+- **Pattern background** ("More ▸ Generate ▸ Pattern background…"): pick a generator type from the dropdown; usable as a main-video background or an overlay layer.
+
+  | Type | Look | Shotcut equivalent |
+  |---|---|---|
+  | `bars` | SMPTE SD color bars | SMPTE bars |
+  | `hdbars` | SMPTE HD color bars | — |
+  | `pal100` | PAL 100% color bars | 100% PAL bars |
+  | `pal75` | PAL 75% color bars | 75% EBU bars |
+  | `testsrc` | bars + circle + **ticking timecode at bottom-center** | — |
+  | `testsrc2` | bars + zoneplate + **ticking timecode at top** | closest to a TV test card |
+  | `rgbtest` | RGB tri-band + **horizontal alpha gradient** (fully transparent at left → near-opaque at right) | — |
+  | `yuvtest` | full-frame pure YUV gradient (opaque, for calibration) | — |
+  | `null` | transparent base (RGBA all zero, usable as an overlay layer) | — |
+
+  Note: Shotcut's "Philips PM5544" (the classic test card with a ball in the middle) and FuBK are test **images** bundled with MLT; FFmpeg has no matching filter. For a "test-card look", use `testsrc2`.
+
+- **Countdown / count-up** ("More ▸ Generate ▸ Countdown…"): three dimensions combine freely — all **2 × 4 × 2 = 16** choices are selectable and usable.
+
+  - **Direction**: Countdown (counts down to zero at "Duration") / Count-up (accumulates from 0);
+  - **Style**: `s` (total seconds) / `frames` (total frames, at 30fps) / `Timecode xx:xx:xx:xx` (h:m:s:f, last field frames 00–29) / `Clock xx:xx:xx` (h:m:s);
+  - **Background**: `None` (transparent bg, white text — usable as an overlay layer; export must pick an alpha-capable format) / `Dial` (gray face, black text — gray-white dial + double white rings + crosshair, same look as Shotcut).
+
+  The dial is not an image asset — it is drawn pixel by pixel by `nullsrc + geq`: the gray-white sector sweeps one full turn over time, so **any duration automatically completes exactly one revolution**, with no external assets needed.
+
+- Parameters match the color background: width / height (with a "⇄" swap button), duration (seconds).
+- Edit: with the track selected, "More" shows "Edit pattern source…" or "Edit countdown…" to change parameters in place, without adding a track.
+- Generative sources have no audio; export container / encoder rules match the color source.
+- **Transparency rule**: `rgbtest` (carries an alpha gradient) and `null` (fully transparent base) count as transparent — when used as the **main video**, export is auto-upgraded to `.mov` + `prores_ks 4444` to keep alpha. The other pattern sources (bars / `testsrc` / `testsrc2` / `yuvtest`) are opaque and export with H.264 as usual.
+
 ### 1.3 Mode selection & params
 
 **Mux mode**
@@ -53,6 +101,7 @@ The Merge page (Mux / Merge / PiP) is one of the core modules. It combines multi
   - **Audio**: trim, reverse, speed, silence generation (auto-fill).
   - **Forced uniform at each segment's end**: resolution, pixel format, fps, SAR (from the main video) — so concat never errors.
   - **Global stage (after join) keeps only**: subtitle burn-in (main video), text watermark (drawtext, main video). To drop a segment's audio in Concat mode, don't uncheck enable — choose **generate silent stream** in that video's audio-binding tab. (2026-08-28 restored: the mux page's burn-in UI is fully back — all three modes support burn-in + charenc.)
+  - **"Disable parsing" button (new 2026-10-07)**: the serial-concat list toolbar gains a "Disable parsing" toggle. When checked, materials known to be **same-spec** (resolution / fps / pixel format / codec all match) **skip ffprobe parsing** and are joined directly via the `concat` text list, **greatly speeding up enqueueing / command generation for large batches of same-spec materials** (no per-file probe). Use it only for confirmed same-spec materials; mismatched specs should still use the default parsing, otherwise the join may error.
 
 When the main video encoder is non-`copy`, every video track (main + all subs) is double-click editable with these independent filters:
 
@@ -81,7 +130,7 @@ The **"End handling"** button on the mux page toolbar (the Transcode page's Adva
 
 1. **Multi-view split grid** — split the output into 2–5 cells: rows×cols (e.g. 1×3 horizontal, 2×2 grid). ffmpeg `split` + `hstack`/`vstack`.
 2. **End concat (append image/video)** — append an image (QR code / end card, display seconds) or a video. Images auto-scale with black bars; video should be pre-matched. **Forces re-encode.**
-3. **Border (pad canvas expand)** — top/bottom/left/right margins (px) + color (`#RRGGBB` or name). **Border position** dropdown: `after split (grid outer frame, default)` / `before split (border per cell)` — the latter borders each cell before stitching (cell borders back-to-back, visually a 2× margin line); identical when split is off. ffmpeg `pad` (HandBrake Pad); odd sizes round up to even; pure-copy auto-switches to re-encode.
+3. **Border (pad canvas expand)** — top/bottom/left/right margins (px) + color (`#RRGGBB` or name). **Border position** dropdown: `after split (grid outer frame, default)` / `before split (border per cell)` — the latter borders each cell before stitching (cell borders back-to-back, visually a 2× margin line); identical when split is off. ffmpeg `pad` (HandBrake Pad); odd sizes round up to even; pure-copy auto-switches to re-encode. **Border width unified (2026-10-06)**: in `before split (border per cell)` mode the **inner margin between cells is now the same width as the outer border** (older versions made the inner margin 2× the outer, making the inter-cell gap visibly thicker than the outer frame). Now inner and outer are consistent for a more even look.
 
 **Preview support**: text command preview always reflects it; the mux page live preview (mpv lavfi) supports the full grid + border (incl. multi-row grids); the Transcode play preview supports border and single-row/column grids (multi-row grids hint to use complex/live preview).
 
@@ -268,6 +317,12 @@ Double-click any audio or subtitle track in the list to open its detailed settin
 - If the file does not exist or equals the current source → a single log line, no change.
 - Why the layout survives: sub-video positions default to relative expressions and crop sizes default relative to the source, so they adapt to the new size automatically.
 
+**⑥ Update settings (subdivided 2026-10-03)**
+- The track-list right-click menu gains a group of "Update settings" sub-items that split the old catch-all "apply current settings" so you don't overwrite by mistake:
+  - **Global settings**: refresh the selected tracks wholesale with the main UI's current global encode / filter / output settings (overwrite).
+  - **Watermark (separate)**: only stamp the current watermark (image/video watermark + text watermark) onto the selected tracks, **without touching their other encode/filter settings** — for "batch-add watermark while keeping each track's own filters".
+  - Splitting the two means batch-updating a group's watermark won't wipe each track's already-tuned filters/trim.
+
 > Note: "One-click fade in/out (all) / One-click transition (all)" is no longer a right-click item — it lives as buttons inside the main video's "Fade in/out" tab (see §7.3).
 
 ### 7.5 Appendix — the 24 transition types in detail (xfade transition)
@@ -377,7 +432,7 @@ Besides static positioning, a watermark / PiP sub-video can also **move along a 
 ### 11.3 Relation to other features
 
 - **No conflict with loop control (show window / cycle show / loop count)**: trajectory controls *position* (overlay `x/y` expressions), loop control governs *visibility* (`enable` expression) — they are **orthogonal dimensions** and can be freely combined. E.g. corner hopping + show window 5–10s = hopping only during seconds 5–10.
-- **Blend modes don't support dynamic trajectories**: when using overlay/screen/multiply etc. blend modes, the trajectory setting is ignored (falls back to the base position) and the program informs you.
+- **Blend modes also support dynamic trajectories**: since 2026-10-07, blend modes (overlay / screen / multiply etc.) **also** support the four preset trajectories and list waypoints (the dynamic crop window follows) — earlier versions supported only the 4 preset dynamic trajectories under blend, while list waypoints silently failed; this is now connected. Note that a blend sub-video **still does not take part in transitions** (see ch. 18) — that's a separate, independent limitation.
 - **Stackable with continuous rotation**: spin + movement are independent.
 - **Implementation**: x/y use `t`-based ffmpeg eval expressions (triangle wave / piecewise linear interpolation / st-ld variable slots) — no external trajectory editor needed; the base coordinates `overlay_x/overlay_y` are preserved, so you can switch back to static at any time.
 
@@ -391,9 +446,10 @@ Besides the four presets, the trajectory dialog has an **"Enable list waypoints"
 - **Self-rotation** — spin while moving (overrides the global rotation); each segment can set its own speed.
 - **End action** — e.g. freeze at segment end (position stops, sub-video/self-rotation keeps going).
 - Row coords can be set by dragging in the visual editor via the "start/end" buttons; the panel shows total duration with a red vertical line marking the end row.
-- **Max 15 rows** (far below ffmpeg's long-expression crash threshold of ~95–100 segments); over-limit is warned.
+- **Max 99 rows** (relaxed since 2026-10-03: in practice FFmpeg 4–9 all handle 25 segments without error, so the old 15-row cap was over-conservative). Over 99 rows is warned.
 
 **Implementation**: `build_waypoint_expr` compiles the whole table into overlay x/y eval expressions (per-frame `t` evaluation, `lt`/`mod` segmentation, `st`/`ld` variable slots) — no temp files; blend mode also supports it (dynamic crop window follows). **Orthogonal to loop control (show window / cycle show)**: the table governs "where/when-hidden", loop control governs "when-visible" — combinable.
+- **sendcmd mode (fully wired since 2026-10-03)**: when the waypoint segment count reaches the **sendcmd row threshold** (default 15, adjustable in "Info & Player → More settings"), it automatically switches to `sendcmd=f=...`, writing each segment's time expressions into a **temp txt file** instead of one giant expression — avoiding ffmpeg's long-expression crash. The command looks like `sendcmd=f='.../Temp/ff_wp_sendcmd/ff_wp_sendcmd_wps0_xxxxx.txt'`. **FFmpeg 4.3 compatibility**: text-watermark doesn't support sendcmd's `x/y`, so it auto-switches to `reinit=x=..:y=..` (verified working). **Canvas mode + list waypoints + scale conflict fixed (2026-10-07)**: earlier, having "canvas offset mode" + "list waypoints" on at the same time, with the sub-video also scaled, caused coordinate misalignment or errors / scale failing; this is now fixed — all three can be on together and work normally.
 
 ---
 
@@ -577,6 +633,8 @@ Editing works on a **local copy**: opening / cancelling doesn't touch stored dat
 - The "external shape image" field **blank** → plain rectangle (`color=` solid block).
 - With a path → external shape image (`movie=` loads the image).
 - The list's "type" column is display-only; there's no dropdown.
+- **Built-in geometry shapes (new 2026-10-06)**: besides the rectangle, **circle / triangle / diamond** are now built in as geometry blocks (no external image needed). Selecting "circle/triangle/diamond" generates the shape with ffmpeg geometry filters on the fly (circle = circular mask, triangle/diamond = polygon path); the "rectangle coords (x/y/w/h)" become that shape's bounding box and the shape fills it. Direction (only/transparent) and edge feather share the same logic as the rectangle.
+- **Mask rotation (new 2026-10-06)**: a selected shape can set a "rotation angle" (degrees, around the shape's own centre). A circle shows no visual change when rotated; a triangle/diamond/rectangle changes orientation. Rotation happens in the canvas coordinate system and is orthogonal to "coords / trajectory" — combinable.
 
 ### 15.2 Direction: per row
 
@@ -620,6 +678,12 @@ How overlaps composite → decided by **direction + list order** (**later row ov
 
 - ⚠️ **An external shape image leaks `alpha=16` (≈6% tint, a faint sub-video layer over the whole frame) outside the shape**: as soon as a `movie=` (rgb source) appears in the graph, ffmpeg's format negotiation routes the trailing `format=gray` through limited-range RGB→Y, turning black into 16. Fix: after drawing the base colour add **`extractplanes=g`** (byte-exact copy of the G plane; black = 0 exactly), the same fix as the old single-shape PNG path (reproduced and fixed via probe on 2026-09-11).
 - The base is still **one matte**: `format=rgba,split=3` → base matte (base colour from the first shape's direction) + main alpha + shape sources; shapes `overlay` onto the same matte in list order (later over earlier) → one `format=gray` + `blend=all_mode=multiply` + `alphamerge`. The filter segment is generated by `_build_mask_multi_shape_filters`; an empty list falls back to the old single-shape logic (old projects keep working).
+
+### 15.7 Stroke (edge stroke, new 2026-10-03)
+
+- The mask dialog gains a "Stroke" button on the left (near the direction / coords area): it draws an outline around the current shape's edge, for emphasising the block outline or making a "stroke mask" effect.
+- The stroke acts on the shape's edge ring (the shape's interior still fills by its direction); colour / width are adjustable in the stroke settings. It is orthogonal to "edge feather" (feather softens the edge, stroke hardens it — both can be on).
+- Applies to: rectangle / circle / triangle / diamond / external shape image all support stroke; once on, it participates in trajectory movement, time window and rotation along with the shape.
 
 ---
 
@@ -970,7 +1034,8 @@ Common use: **add one loudness normalization at the last node** (`loudnorm` and 
 
 ### 6. Known limits
 
-- **Branches are not offered**: only nodes with a "single output label" appear in the list (a node fanning out to several streams has unclear semantics; out of scope this round).
+- **Branches are now offered (relaxed 2026-10-03)**: earlier only nodes with a "single output label" appeared in the list (a node fanning out to several streams had unclear semantics, so the old version didn't offer it); now this is relaxed — as long as you use the "custom command" form (e.g. `delogo…[uc1];[uc1]unsharp…`, see the wording at the end of §7) you can mount multi-branch effects on a branching node (typical: `split` → two branches each processed → `blend`). A plain comma chain still acts on a single label and won't auto-branch.
+- **Adjust insert-filter order (new 2026-10-03)**: the node-effect window gains an "insert order" control that reorders multiple effects mounted on the same node (e.g. `unsharp` then `delogo`, or the reverse) instead of always appending to the end; order changes reflect in the command preview immediately.
 - Node effects only work in the **PiP / serial concat** chains; plain mux mode has no intermediate nodes.
 - Several effects can be mounted on one node; the "Mounted effects" column shows a summary.
 
@@ -997,3 +1062,23 @@ Common use: **add one loudness normalization at the last node** (`loudnorm` and 
 | The filename alone doesn't tell you which source it is | The **"Preview source"** button on the right (new in 2026-09-27): select any clip and click it to play that clip's **original source file** — video plays from the clip's display start (with "End" filled, only this segment; otherwise to the end of the source), images stay for the "image display duration"; the button greys out automatically when nothing / several clips are selected. ⚠️ Plays the raw source only — **no** overlay / crop / speed / transition or other per-segment processing — to see the composited result use the PiP live preview |
 
 > One sentence: **this is the "arranging time" gesture tool (coarse adjustment)**; precise numbers are still edited on the **Loop/Chroma control** tab. Its main uses are checking at a glance whether the timeline has gaps / overlaps, and re-aligning the starts after a batch of transitions has swallowed them.
+
+## 21. Editor generalized preview (real frame / effect preview, 2026-10-06)
+
+Since 2026-10-06, the editors and preview windows were **generalized** so more features show their real effect directly while you edit — no longer relying solely on the top-level ffplay / mpv preview window to take a look. (You could preview before too, but only through that separate top-level player, which meant a save-and-check cycle each time; the in-editor preview removes that repeated step.)
+
+### 1. Effect preview window (right-side live preview, 2026-10-06)
+
+- In the overlay / chroma-key / blend / delogo etc. editors, a (or an enhanced) **live effect preview** panel was added on the right that refreshes instantly with parameter changes, covering features that previously had no live preview:
+  - **Opacity** (sub-video / text-watermark alpha);
+  - **Chroma-key** (green/blue screen keying result);
+  - **Blend** (overlay/screen/multiply composite result);
+  - **Delogo / mask / end-handling** right-side preview.
+- Frames are grabbed through an in-memory pipe, **no disk writes**; move one slider / toggle one checkbox and the right-side picture follows immediately — tune while you watch.
+- This is a different system from the "live preview (complex filters) / simple time engine" — those preview the **whole command**'s composite; here it's a small in-editor window for the **current single effect**.
+
+### 2. Position editor wired to real frames (2026-10-06)
+
+- The **position editors** for text watermark and sub-video (the drag-to-position windows) are now **wired to real frames**: the editor background shows the source video's **real picture** (grabbed at the current time frame), so dragging text / sub-video lands directly on the real picture for more accurate placement.
+- **Global toggle (More settings)**: in "Info & Player → More settings" you can **globally turn off** real frames (falling back to a solid-colour / placeholder background) — useful on old machines or with huge sources where frame grabbing is slow.
+- **Text rendered to disk**: the text watermark inside the position editor is **rendered to a temp image on disk then composited back** (rather than pure in-memory drawing) to match the final ffmpeg `drawtext` glyphs/position; temp files are cleaned up uniformly on program exit.
