@@ -1082,3 +1082,246 @@ Since 2026-10-06, the editors and preview windows were **generalized** so more f
 - The **position editors** for text watermark and sub-video (the drag-to-position windows) are now **wired to real frames**: the editor background shows the source video's **real picture** (grabbed at the current time frame), so dragging text / sub-video lands directly on the real picture for more accurate placement.
 - **Global toggle (More settings)**: in "Info & Player → More settings" you can **globally turn off** real frames (falling back to a solid-colour / placeholder background) — useful on old machines or with huge sources where frame grabbing is slow.
 - **Text rendered to disk**: the text watermark inside the position editor is **rendered to a temp image on disk then composited back** (rather than pure in-memory drawing) to match the final ffmpeg `drawtext` glyphs/position; temp files are cleaned up uniformly on program exit.
+
+## 22. Nested composite (groups / group nodes, 2026-10-15 ~ 2026-10-17)
+
+> This chapter is about **grouping**: first composite several sub-videos into one intermediate picture, then place that intermediate picture onto the main video as **one independent material**.
+> It solves "several sub-videos have to move / rotate / take filters as **one whole**" — configuring the same trajectory or filter one by one is both tedious and easy to get out of sync.
+
+### 0. The model in one sentence
+
+**A group = one transparent picture the size of a "shipping box"**, with the sub-videos sitting inside it at their own original positions;
+the box is then treated as an ordinary sub-video and placed onto the main video as a whole, getting its trajectory / scale / rotation / filters as a whole.
+
+That analogy is enough — **for rendering a group is just one material**, not a new concept.
+
+### 1. What problem it solves
+
+| Scenario | Without a group | With a group |
+|---|---|---|
+| 3 sub-videos slide left→right together | 3 trajectories configured one by one; start / end / easing must match exactly | 1 trajectory on the **group parent row**; the whole group moves |
+| A set of small windows scaled up / rotated together | scale and rotation configured separately, each with its own rotation center | set once on the parent row: scales by **the whole box**, rotates around the box center |
+| One color grade / key / outline / mask for the whole set | configured once per clip | attached once on the parent row, applied to the composited picture |
+| Command length | the same trajectory expression is written N times | the trajectory expression is written once (see below) |
+
+**A side benefit: a shorter command.** One 6-segment move trajectory (x+y) measures about **514 characters**; without a group every member carries its own copy, while with a group only the group node's single `overlay` carries it ⇒ a group of N members saves roughly `(N-1)×514` characters. The more segments (e.g. 40 segments, 2400 characters each), the more you save — and the less likely you are to hit ffmpeg's expression-length limit.
+
+**One more: the parent row's frame grab / preview is cached.** The composited picture is cached by "group state signature" (`_material_ctx_frame_sig`), so reopening the parent-row editor or refreshing the right-side preview repeatedly does not re-render the whole group; only settings that affect the picture trigger a recompute.
+
+### 2. The three roles
+
+| Role | What it is | How it looks in the list |
+|---|---|---|
+| **Group member** | a sub-video pulled into the group (2 or more) | type column `Video(Group)g1-1`, `Video(Group)g1-2`… |
+| **Group main** | the member "at the bottom" of the group; decides the group's base placement / base size / where the group-level fields live | type column suffixed ` [Main]` |
+| **Group parent row** | host of the group's final output label, **not a track**; the group's overall position / size / rotation / effects are recorded on it | an extra row `▾ g1` above the group's members |
+
+A few rules:
+
+- **The group main defaults to the topmost member in list order** and can be changed at any time (right-click "Set as Group Base Video").
+- **Changing the main keeps the group settings**: the group's placement delta, absolute placement and whole-group angle all move to the new main.
+- **The parent row is not a track**: move up / move down / delete / enable — none of these "per-track" commands touch it (clicking them cannot damage it by accident).
+
+### 3. The shipping box: the group's canvas
+
+The group's canvas is **not** the group main's own size, but **the union of all member rectangles on the canvas** (= the shipping box):
+
+```
+box size   = union width × union height (each rounded up to an even number, for yuv420p chroma alignment)
+box origin = top-left corner of the union (in main-canvas coordinates)
+```
+
+- **Only transparent padding is added**: the one or two pixels added by the even-number rounding are always transparent — they **never move a member and never crop one**.
+- The parent row's "spec" column shows `Box 384x528 · Placement(9,1201)` — that is the box size and box origin.
+- A member's "spec" column shows **both** coordinate systems: `· In-box(384,0)  Canvas(393,1201)`. The first is the in-box coordinate actually used for rendering; the second is the member's own overlay coordinate (same reference as the position editor and the timeline overview).
+
+Why the union instead of the group main's size: early versions used the main's `384x528` as the canvas, and members sitting outside it got **cropped**. With the union the box always fits every member.
+
+### 4. How to use it
+
+All entries live in the mux page list's **right-click menu** (in PiP mode). Five items:
+
+| Menu item | Precondition | Behaviour |
+|---|---|---|
+| **Group (New Group)** | PiP mode + **2 or more sub-videos** selected | creates `g1` (smallest free number); the topmost member in list order automatically becomes the group main |
+| **Add to Group ▸ Add to gN** | at least 1 video track selected + an existing group | adds the selected tracks to an existing group |
+| **Remove from Group** | the selected track is already in some group | removes it; **a group with fewer than 2 members dissolves automatically**, and that group's output state (group-level fields + parent-row effects) is cleared along with it |
+| **Dissolve Group** | same as above | splits the whole group; members go back to plain sub-videos |
+| **Set as Group Base Video** | exactly **one** grouped track selected | changes the group main; group-level fields migrate as a whole |
+
+⚠️ **The main video does not take part in grouping**: the main video is "the base being overlaid", not an overlay layer. To give a group a custom size / background, first add a **virtual source** ("Generate ▸ Color background") and use it as the main-video placeholder.
+
+⚠️ **A group cannot be moved to the first row to become the main video** (hard block): a group has no fixed size (its size comes from the shipping box, and the box depends on the main canvas), which would be circular. To make a group fill the frame, again "add a virtual source as the main video — its size is the output resolution".
+
+### 4.1 A typical flow (3 small windows scrolling together)
+
+1. In PiP mode, place the 3 sub-videos at their own positions (**do this step as if there were no group**; those positions are the final relative layout);
+2. select the 3 → right-click "Group (New Group)" → a `▾ g1` row appears, the 3 become `Video(Group)g1-1..3`;
+3. double-click `▾ g1` → in "Video track settings" do the **whole-group** work: position / size, scale, rotation, opacity;
+   to make it move, configure one list-waypoint trajectory on the trajectory page (the whole group travels together);
+4. use the **position editor** (the parent row's) to drag the whole box where you want it on screen;
+5. preview to confirm. Later, to adjust one member's own picture (crop, key, grade), double-click **that member** as usual.
+
+> Suggested order: **place relative positions first, group second, whole-group motion last**. In the opposite order, later changes to a member's position recompute the shipping box's size / origin, and the group's scale and placement are all "computed from the box" ⇒ visually the group shifts a bit (not a bug — the box was recomputed).
+
+### 5. How to recognise it in the list
+
+- **Parent row**: `▾ g1` / state `Enable|Disable|Half` / type `Group(3)` / spec `Box 384x528 · Placement(9,1201)` / source `→ [v_grp_g1_2]`.
+  - `Enable` = the whole group is overlaying; `Disable` = every member has "Enable overlay" unchecked; `Half` = some are off.
+  - The label in the "source" column is the group's **final output label** — the parent row is "the host of that overlay edge", and that edge decides where the whole group sits and when it appears.
+- **Member rows**: the row number is prefixed with `└ ` (fake indentation, meaning "belongs to the group above"); the whole row is tinted by **group colour** (g1, g2… each has its own background, cycling through 8 colours).
+- A group's members **need not be contiguous** — other tracks may sit between them; the parent/child relation is recognised purely from the `grp` field.
+
+### 6. The group parent row = one independent material
+
+**Double-clicking the parent row** opens the **"Video track settings" window** (the very same one used for sub-videos), not the position editor.
+Mental model: *"this final label is one material"* — it is a picture the size of the shipping box, and it is treated as a sub-video in the sub-video ordering.
+
+#### 6.1 What can be set (all of it really takes effect)
+
+| Page / item | Effect |
+|---|---|
+| Overlay position / size | places and sizes the whole group |
+| **Scale** | scales by the whole box (the scale + rotation center is computed from the scaled box, so it does not drift upward) |
+| **Rotation** | rotates the whole group around the box center |
+| **Opacity** / fade in-out | the whole group (the group canvas base is black with alpha; the fade uses the group's own stream time) |
+| **Keying (chromakey / colorkey)** | samples the **composited whole-group picture** |
+| **Mask / crop / delogo / region effects / colour grade / style presets** | all apply to the composited picture (⚠️ with "Canvas mode" ticked, the canvas takes over position / size / rotation and the crop box steps aside automatically) |
+| **Canvas mode** | supported (same generator as the main video / sub-videos, transparent base) |
+| **List waypoints (waypoint table)** | supported — this is the correct way to "move the whole group" |
+| Custom filter string | supported |
+
+> **This does not contradict ch. 19 · 7 "filters blocked on nodes"**: that section is about **intermediate nodes** (`node_effect_chain`, all 7 switches off, because downstream still relies on the label for size / time assumptions); the parent row goes through the **material path** (`node_material_chain`), which additionally opens scale / fade / opacity / mask / keying.
+> The criterion is "is this label used as an **intermediate node** or as **a material**", not "is it a node". A parent row is the latter (only one overlay remains after it).
+
+#### 6.2 Items that do not take effect (not omissions — the semantics do not hold)
+
+| Item | Why it does not take effect |
+|---|---|
+| **Trim / speed** | both rewrite timestamps. The group canvas length is decided by the "group window" and its visible span is carried by `enable=`; inserting another time transform makes the two semantics fight (audio and other node positioning go wrong) |
+| **Pixel format** | changing format mid-chain breaks the downstream label's format assumptions |
+| **Subtitles** | subtitles must be burned onto the final canvas size; inserted at the group node they would be covered by later overlay layers |
+| **Blend mode (set on the parent row)** | blending means "blend with the main-video pixels", and the group node is not yet on the main video ⇒ this item produces no filter |
+| **Blend mode (set on the group main)** | not "ignored" but **the whole group degrades**: it falls back to independent overlays (the output still uses the blend you set, only without a group). Never silently dropped |
+
+#### 6.3 "Projection" semantics: parent-row edits **never write back to members**
+
+Every parent-row setting is stored as one record in `node_fx[group output key]` and **never touches any member's enc_settings**.
+Therefore:
+
+- editing the parent row only changes "how this composited picture is placed / processed"; each member's own parameters stay byte-identical;
+- conversely, the parent row's "first record" is overwritten repeatedly (not appended) ⇒ toggling the settings window **never stacks**, and never "comes back empty";
+- the only thing written into the group main's `enc_settings` is the **group-level fields** (`grp_dx/grp_dy`, `grp_abs_x/grp_abs_y`, `grp_rot_angle`) — they belong to "the group", not to a member.
+
+### 7. Position: three coordinate layers and the position editor
+
+| Name | Meaning | Stored in |
+|---|---|---|
+| **Member overlay coordinate** `overlay_x/y` | the member's position on the **main canvas** (which decides its relative position inside the box) | the member |
+| **Group-level delta** `grp_dx/grp_dy` | how far the whole group is shifted from the "box origin" (default 0) | the group main |
+| **Group-level absolute placement** `grp_abs_x/grp_abs_y` | the parent row's X/Y boxes directly give "where the box's top-left lands"; once given, the delta is not added | the group main |
+
+- **The box you drag in the position editor is the whole shipping box**, not a member. Dragging only writes group-level values (delta or absolute placement); members' `overlay_x/y` never change ⇒ you never get "after dragging the group, reopening the node shows a brand-new box".
+- The parent row's X/Y boxes are **pre-filled with the group's real placement**; editing them means absolute placement. Dragging in the position editor afterwards automatically converts absolute placement back into a delta (the two entries are mutually exclusive and cannot overwrite each other).
+- To move **a single member**: go to that member's own position editor (its coordinates are still in the main-canvas domain; changing them recomputes the box, so the group resizes).
+
+### 8. Time: the group window = the union of member windows
+
+When the group appears is decided by the **union of the members' own "display start / end"**:
+
+```
+group window start = min(start of explicitly bounded members, group main start)
+group window end   = max(end of each member's window)
+group canvas length = group window end
+```
+
+> The group canvas is a stream starting at `0` (its length = the **absolute end** of the window); the part before the window start is empty transparency — so "the group only starts at 1s" is achieved by `enable=` controlling when it is pasted onto the main video, not by shifting the canvas forward out of nowhere.
+
+Example: the group main shows `1s~4s`, another member shows `0s~6s` ⇒ group window = `0s~6s`, where:
+
+- `0~1s` only that member is in the box;
+- `1~4s` both are in;
+- `4~6s` only that member remains (at 6s the whole group disappears).
+
+A few rules (all learned the hard way):
+
+- **The group main's window no longer truncates the group** (old behaviour: the group lived only until the main ended, and members after it were cut off).
+- **A member starting before the group main**: the group also appears earlier (otherwise the member's leading part would be blocked entirely).
+- **Unbounded members follow the group window**: a member with no end / infinite loop shows until the end of the main video; it **cannot pull the group's start backwards** (otherwise "group main starting at 1s + two default infinite-loop members" would make the whole group pop up at 0s).
+- **Members with "Enable overlay" unchecked do not join the union** (they never appear), otherwise you would get a tail where "the group is still there but the picture is fully transparent".
+- When the group window exceeds the main video, the main video's tail is padded with black frames automatically (the same rule as an ordinary sub-video that overshoots — existing behaviour of the real-timeline model).
+
+### 9. Who moves / rotates / scales: geometry ownership
+
+This is the easiest thing to trip over. One sentence: **the parent row owns "the whole group", a member owns "itself"**.
+
+| What you want | Configure on | Why |
+|---|---|---|
+| Move the whole group (incl. trajectory) | parent row | the group node has a single overlay, so the trajectory is written once |
+| Scale the whole group | parent row | scales by the box |
+| Rotate the whole group | parent row | rotates around the box center |
+| Move / scale / rotate just one member | that member | each member leg expresses it itself, acting on that member inside the box |
+
+Rotation has two sources with a priority:
+
+- **The group main's `rotate_angle` means the whole-group angle in the group context** (the main is the "bottom" of the box, so rotating it equals rotating the whole box);
+- if the parent row has a group-level angle (`grp_rot_angle`, non-zero), **the parent row wins**.
+- No double rotation: the group main's content leg **skips** the rotation segment inside a group, so rotation appears exactly once, at the group node.
+
+### 10. What "Enable overlay" means inside a group
+
+Exactly the **same meaning** as on the non-group path: *should this layer appear in the picture*.
+
+| What you switch off | Result |
+|---|---|
+| a **regular member** | only that member disappears; the other members and the whole group are unaffected |
+| the **group main** | only the group main itself disappears; the members are unaffected; **the group does not vanish with it**, and the position does not jump |
+| **every member of the group** | the group does not hold ⇒ it falls back to "independent overlays (which all happen to be invisible)"; the picture is clean and nothing errors |
+
+Switching off a member **does not change the shipping-box geometry** (the box stays stable); it only affects "whether to overlay" and "the union of the group window".
+
+### 11. Audio
+
+**A group composites video only.** Each member's audio follows its own settings (ignore / mix / replace / follow transition); it never takes part in the in-group composite and is not affected by the parent row.
+
+### 12. Relationship to other features
+
+| Feature | Relationship |
+|---|---|
+| **PiP transitions (xfade chain)** | when a group exists the **transition chain steps aside** (the two are orthogonal: a transition is "between two pictures", a group is "composite several pictures into one first"). To transition between members, do not put them in the same group |
+| **Blend mode** | see 6.2: a blend on the group main ⇒ the whole group degrades; a member's own blend does not take effect inside the group (blending is against the main video, and there is no main video inside a group) |
+| **Virtual sources (color / gen)** | can serve as the main-video base (the group's size / resolution come from the main video) |
+| **Serial concat mode** | not available: grouping only makes sense in **PiP mode** |
+| **Video node / command editor** | the in-group composite is one single chain with labels like `v_gbase_g1` → `v_grp_g1_0` → … → `v_grp_g1_2`; the last label is the parent row (pick it with "Video node" to attach further effects — the same window as double-clicking the parent row) |
+| **Copy filters / paste filters** | group identity fields **do not take part in copying**: pasting a member's filters onto a normal track does not quietly pull that track into the group; pasting onto a member does not kick the member out of the group |
+| **Save / load project** | group identity and group-level fields are saved together with the track settings (`grp` / `is_grp_base` plus the 5 group-level keys are all in the save list); changing any parameter never loses the group (`_GROUP_KEYS` is written back) |
+
+### 13. Cases that "degrade" (the group looks like it did nothing?)
+
+A group is not "always a group once created". In the following cases it **falls back to independent overlays** (the picture is still correct, there just is no "group" layer):
+
+| Trigger | Explanation |
+|---|---|
+| the group main has a **non-normal blend mode** | see 6.2; blending needs main-video pixels |
+| **the group main's size cannot be probed** (parsing disabled / file problem) | without a size the shipping box cannot be computed |
+| **the shipping-box geometry cannot be computed** (member position / size abnormal, parse failed) | same as above |
+| every member has "Enable overlay" unchecked | the group does not hold (they would not appear anyway) |
+| fewer than 2 members | a single clip is not a group (removing members until 1 is left dissolves it automatically) |
+
+How to check: generate the command and look for `v_grp_g1_*` labels — present = the group formed; absent = it degraded (the log then contains a line "[Group] Grouping condition not met… treated as independent overlay").
+
+### 14. Implementation anchors (for maintenance / troubleshooting)
+
+> This section is for locating code when changing it; it does not affect usage.
+
+- **Data**: every member has `enc_settings["grp"]="g1"`; the group main additionally has `is_grp_base=True`. The group-level fields form `_GROUP_KEYS`:
+  `grp / is_grp_base / grp_dx / grp_dy / grp_abs_x / grp_abs_y / grp_rot_angle`
+  (a new group-level field **must** be added to this list, otherwise `_update_track_enc` silently loses it when it replaces the settings block).
+- **Single geometry source**: `_group_box_geometry` (`size` box size / `origin` box origin / `rel` in-box relative coordinates / `rects` member rectangles on the main canvas), shared by rendering and the UI.
+- **Three rendering stages**:
+  - stage A3: `color=c=black@0:s=box:d=group window` as the base, then the member legs `overlay` in `rel` order with `enable='between(t,member start,member end)'`;
+  - stage B: the group node is overlaid only once, in the **group main**'s round (`overlay x/y = main placement + box-origin correction + group-level delta`);
+  - group-node transform: `_group_node_transform_parts` (opacity → rotation → trajectory scale), mirroring the same-named segments of sub-videos.
+- **Labels**: `v_gbase_<g>` (group canvas) → `v_grp_<g>_<k>` (member legs) → the last link is the group's final output (the parent row); `k` in `v_grp_<g>_<k>` always equals the member's list order (legs of invisible members are kept too, only with `enable='0'`).
+- **Parent-row material chain**: `node_material_chain` (independent-material convention); **the chain is chosen by the landing label** being in `_last_group_final_labels`, regardless of which window it was opened from.
+- **Preview**: `merge_preview_pip_live` mirrors the export logic item by item (group planning / A3 / group-node enable / `move_mode` injection); the right-side live preview shows the **node-context** picture (box size + composited frame).
