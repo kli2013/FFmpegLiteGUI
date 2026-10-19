@@ -1063,6 +1063,14 @@ def fgmodel_build_node_complex(model, target_nid):
             _tgt = _n
             break
     _out_pad = (_tgt.out_pads[0].name if _tgt and _tgt.out_pads else None)
+    # 🩹 2026-10-19（用户报「新建的空行 [v_out_01][v_out_0] 做可视化裁剪提示无法提取初始帧」）：
+    # 目标节点**内容为空** = 纯直通 / 标签别名（用户新建一行、先填两个标签、再往里填滤镜）。
+    # 它的 out_pad 没有任何子链产出 ⇒ `-map [v_out_0]` 必然报 "Output pad does not exist"
+    # ⇒ 取帧 / 量尺寸一起失败。直通的输出就是第一路输入 ⇒ 用 in_pad 当末端
+    # （它在子图里确实有上游产出）。注意必须在 `_chains` 非空之后判，否则纯外部输入
+    # （`[0:v]` → 空）会走进这里返回一个子图里不存在的 pad。
+    if _tgt and not _tgt.filters and _tgt.in_pads:
+        _out_pad = _tgt.in_pads[0].name
     if not _out_pad:
         return None, None
     # 🩹 2026-10-14：子图被截断后，某些输出 pad 在子图内部**没有消费者**
@@ -1073,6 +1081,12 @@ def fgmodel_build_node_complex(model, target_nid):
     # 不做任何事、不产出，图就合法了。只补**子图内部**的悬空 pad，目标自身不补。
     _pad_by_name = {}
     for _n in _nodes:
+        # 🩹 2026-10-19：**内容为空**的节点（纯别名 / 用户新建还没填滤镜的行）
+        # 一条链都没产出 ⇒ 它的 out_pad 是「名义 pad」，既不该当悬空补 sink
+        # （`[v_out_0]nullsink` 引用一个没人产出的标签 ⇒ 整图非法），也不该参与
+        # 悬空判定。只有真有滤镜的节点才产出 pad。
+        if not _n.filters:
+            continue
         for _p in _n.out_pads:
             _pad_by_name.setdefault(_p.name, _p)
     _consumed = set()
@@ -2197,6 +2211,7 @@ def _is_expanded_virtual_spec(path):
 
     - 颜色源：`color=c=0x3fff08ff:s=1080x1920:r=30:d=10.000,format=rgba`
     - 生成源：`smptebars=s=...:r=30:d=...,format=rgba` 等（`_GEN_FILTERS` 的各值前缀）
+    - 倒计时转盘：`nullsrc=s=...:r=30:d=...,format=gray,geq=lum='...'`
 
     这类串不是磁盘文件（`os.path.exists` 为 False），但已是合法的 `-f lavfi -i`
     参数值，直接透传给 ffmpeg 即可。命令编辑器解析真实命令时会拿到这种形态（主命令
@@ -2210,7 +2225,14 @@ def _is_expanded_virtual_spec(path):
         return True
     # 生成源展开式的滤镜名前缀（与 _GEN_FILTERS 各值一致；null 类型展开为
     # `color=c=0x00000000` 已被上方 color=c= 覆盖）。
-    if _s.startswith(tuple(_GEN_FILTERS.values())):
+    # 🔴 额外登记 `nullsrc=`：倒计时 `bg=dial` 的转盘刻意用
+    # `nullsrc + format=gray + geq` 画（见 `_countdown_lavfi_spec`；§5.1 说的
+    # 「透明底不要用 nullsrc」是另一件事，指 bg=none），它不属于 `_GEN_FILTERS`
+    # 的任何值 ⇒ 2026-10-18 用户实测「命令编辑器认不出倒计时主输入」就是漏这一条
+    # （bg=none 因展开成 `color=c=0x00000000` 反而没事）。
+    # ⚠️ 新增虚拟源若首滤镜不在此名单，命令编辑器会把主输入当「不可喂输入」剔除
+    # （`_cmd_collect_virtual_aware_inputs` 的 `_feedable`）⇒ 出图报「找不到主输入」。
+    if _s.startswith(tuple(_GEN_FILTERS.values()) + ("nullsrc=",)):
         return True
     return False
 
@@ -2403,6 +2425,10 @@ _COUNTDOWN_MODES = ("up", "down")
 _COUNTDOWN_STYLES = ("s", "f", "tc", "clk")
 _COUNTDOWN_BGS = ("none", "dial")
 _COUNTDOWN_FPS = 30
+# 转盘渲染比例（生成高度 / 声明高度，纯内存偏好，由倒计时对话框滑块写入）：
+# 1.0 = 全分辨率（旧清晰版，慢但锐利）；越低越快但边缘略虚（发虚）。默认 0.5：
+# 1080p 下 gen=960x540、环厚恰与旧版一致（3px 放大 2x=6px），约 3x 实时、几乎不发虚。
+_COUNTDOWN_DIAL_RATIO = 0.5
 _COUNTDOWN_FONT_NAMES = ("Arial", "微软雅黑", "Consolas")
 # UI 显示名（顺序即下拉顺序；code 与哨兵字段一一对应）
 # ⚠️ 用**函数**而非模块级常量：模块级 _() 在 import 时求值（TRANS 尚空）⇒ 英文界面下
@@ -2504,8 +2530,12 @@ def _cd_dial_geq(w, h, mode):
     ⚠️ 成本铁律（2026-10-10 实测）：geq 开销 ≈ **表达式节点数 × 像素数**（`lum='128'`
     1080p/10s 仅 1.4s，本式同条件 19.7s）。全分辨率 1080p 只有 ~0.5x 实时 ⇒
     实时预览必然周期性等缓冲（导出文件本身时间戳正常、播放流畅，只是生成慢）。
-    低分辨率生成再放大救不了：环只有 h/180（1080p 下 6px / 直径 980px），
-    放大后必然断续。要预览流畅只能换掉细环设计（直边元素放大才干净）。
+
+    ✅ 2026-10-19 已解决「低分辨率救不了」的旧判断：`_countdown_lavfi_spec` 的 dial
+    分支按 `_COUNTDOWN_DIAL_RATIO`（默认 0.5，用户经对话框滑块可调；33%→640×360）
+    低分辨率跑本式、再 `scale` 放大回 WxH。1080p 下 50% 时 gen=960×540、ring_w=3
+    放大 2x 恰为 6px（=全分辨率版），约 3x 实时且几乎不发虚；33%→640×360 约 2.6x、
+    环放大 3x 才明显发虚。放大只让环/扇区边缘轻微柔化，观感更顺。
     """
     cx, cy = w // 2, h // 2
     r_out = int(min(w, h) * 0.455)
@@ -2527,8 +2557,18 @@ def _countdown_lavfi_spec(mode, style, bg, w, h, dur):
     _fs = {"s": int(h * 0.45), "f": int(h * 0.36),
            "clk": int(h * 0.30), "tc": int(h * 0.235)}[style]
     if bg == "dial":
-        _base = "nullsrc=s=%dx%d:r=%d:d=%.3f,format=gray,geq=lum='%s'" % (
-            w, h, _COUNTDOWN_FPS, dur, _cd_dial_geq(w, h, mode))
+        # 转盘渲染比例（_COUNTDOWN_DIAL_RATIO）：1.0 = 全分辨率（旧清晰版，逐像素慢但锐利）；
+        # <1 = 该比例低分辨率生成再 scale 放大（快，边缘略虚）。详见 §5.1 / research §6.1。
+        _ratio = _COUNTDOWN_DIAL_RATIO
+        if _ratio < 1.0 - 1e-6:
+            _gh = max(2, round(h * _ratio)) & ~1
+            _gw = max(2, (round(w * _gh / h)) & ~1)
+            _base = ("nullsrc=s=%dx%d:r=%d:d=%.3f,format=gray,geq=lum='%s',"
+                     "scale=%d:%d" % (_gw, _gh, _COUNTDOWN_FPS, dur,
+                                      _cd_dial_geq(_gw, _gh, mode), w, h))
+        else:
+            _base = "nullsrc=s=%dx%d:r=%d:d=%.3f,format=gray,geq=lum='%s'" % (
+                w, h, _COUNTDOWN_FPS, dur, _cd_dial_geq(w, h, mode))
         _fc = "black"
     else:
         # ⚠️ 透明底**不能**写成 color=c=black@0 —— _ensure_tw_duration_limit 用子串
@@ -2936,16 +2976,21 @@ DEFAULT_OVERLAY_Y = "H-h-10"
 #    （allow_negative_offset and rect_color=='deepskyblue' = 主视频画布偏移模式，见
 #    _generic_overlay_editor 内 reset_position），幽灵色与之同值会误导后续阅读。
 RK_SE_GHOST_COLOR = '#00d0ff'
-# 2026-10-16：**组身份与组落位**的持久化字段（存在组成员各自的 enc_settings 里）。
+# 2026-10-16：**编组身份**的持久化字段（存在组成员各自的 enc_settings 里）。
 # 它们**没有任何 UI 输入**（不在轨道设置窗的任何一页上），而轨道编辑器保存时是
 # `enc_settings = new_settings` **整块替换** ⇒ 不在此名单里的键会被静默抹掉，成员被踢出
 # 组（用户实测「组内编辑任意修改后都丢失组信息，每次改完都要重新编组」）。
 # ⇒ 唯一出口：`_update_track_enc` 按本集合回填。加 Group 字段必须同时改这里。
-# `grp_dx/grp_dy`（组整体平移增量）、`grp_abs_x/grp_abs_y`（父行 X/Y 绝对落位）、
-# `grp_rot_angle`（父行静态角度 —— **渲染侧唯一读取口径**，Stage B 组节点 rotate 用它）
-# 三者都是**组级属性**，语义上不属于成员自己（成员的 rotate_angle/overlay_x/y 一字不动）。
-_GROUP_KEYS = ("grp", "is_grp_base", "grp_dx", "grp_dy", "grp_abs_x", "grp_abs_y",
-               "grp_rot_angle")
+#
+# 它属于**轨道身份**而非滤镜：从组员「复制滤镜」粘到普通轨会把目标轨静默拉进同一组
+# （导出结构突变、无任何提示），从普通轨粘到组员则会把它踢出组。
+# 名单唯一出处 = `_GROUP_KEYS`（模块级，勿在此另抄一份）。
+#
+# 🔴 2026-10-18（解耦）：组级几何（`grp_dx/dy` 增量落位、`grp_abs_x/y` 绝对落位、
+#   `grp_rot_angle` 整组角度）已**搬进父行**素材项 `node_fx["grp:<gid>"][0]`
+#   （`_group_level_item` 唯一出处）⇒ 不再是成员 `enc_settings` 的键，从本名单移除。
+#   留着也无害（回填/跳过都只是查不命中），但会误导后来人以为它们还在成员身上。
+_GROUP_KEYS = ("grp", "is_grp_base")
 
 
 def rk_clamp_inside(x, y, w, h, W, H):
@@ -3235,6 +3280,69 @@ def _cmd_collect_virtual_aware_inputs(main, ins):
     return None
 
 
+def _lavfi_shift_pts(spec, t):
+    """把 lavfi spec 的**起始时间**顶到 t 秒（在源滤镜后插 `setpts=PTS+t/TB`）。
+
+    为什么需要（2026-10-18 用户报「命令编辑器出图一直显示渲染中」）：
+      lavfi 源没有 seek 能力，`-ss 20` 由 demuxer 实现为「逐帧解码再丢弃」——
+      转盘的 geq 每帧都要按 1080p 全像素求值，等于把前 20 秒白算一遍。
+      实测 1920x1080 转盘：t=5 → 9.5s，t=10 → 18.9s，t=20 → **37.3s**
+      （超过出图 worker 的 25s 超时 ⇒ 界面永远停在「渲染中…」）。
+      改为把时间平移进图里：第一帧的 PTS 直接就是 t，`-frames:v 1` 只算一帧。
+
+    等价性实测（1920x1080 转盘 t=10，同一台机器）：
+      A `-ss 10`      19.27s  md5=6a6e6999d130
+      B `setpts` 平移  0.20s  md5=6a6e6999d130   ← 逐字节相同
+    （说明 `-ss` 在 lavfi 上并不重置 PTS，两种写法进滤镜图的 t 一致，只是 B 不白算。）
+
+    只对**时间相关**的 spec 有价值（含 geq / drawtext）；纯颜色/图案源本来就瞬时，
+    调用方按需判断。插入点取「第一个顶层逗号」之前 —— 源滤镜（nullsrc/color/…）
+    的参数不含顶层逗号，逗号只在 geq/drawtext 的表达式里（单引号内，不算顶层）。
+    找不到顶层逗号（单滤镜 spec）⇒ 返回 None，调用方退回输入级 `-ss`。
+    """
+    _s = str(spec or "")
+    _t = float(t or 0.0)
+    if not _s or _t <= 0:
+        return None
+    _depth = 0
+    _q = ""
+    _i = 0
+    while _i < len(_s):
+        _ch = _s[_i]
+        if _q:
+            if _ch == "\\":
+                _i += 2
+                continue
+            if _ch == _q:
+                _q = ""
+        elif _ch in "'\"":
+            _q = _ch
+        elif _ch == "(":
+            _depth += 1
+        elif _ch == ")":
+            if _depth > 0:
+                _depth -= 1
+        elif _ch == "," and _depth == 0:
+            return "%s,setpts=PTS+%.3f/TB%s" % (_s[:_i], _t, _s[_i:])
+        _i += 1
+    return None
+
+
+def _lavfi_input_args(spec, seek, is_first):
+    """虚拟源 spec → `-i` 参数（首个输入带时间定位）。
+
+    首输入且 spec 时间相关（geq/drawtext）⇒ 用 `_lavfi_shift_pts` 平移起点，
+    **不加 `-ss`**（省掉前面所有帧的 geq 计算）；其余情况维持原样。
+    """
+    if is_first and float(seek or 0.0) > 0 and ("geq=" in spec or "drawtext=" in spec):
+        _sh = _lavfi_shift_pts(spec, seek)
+        if _sh:
+            return ["-f", "lavfi", "-i", _sh]
+    if is_first:
+        return ["-ss", "%.3f" % float(seek or 0.0), "-f", "lavfi", "-i", spec]
+    return ["-f", "lavfi", "-i", spec]
+
+
 def _cmd_editor_in_args(inputs, seek_t=0.0):
     """构造命令编辑器节点取帧 / 出图预览的 `-i` 输入参数。
 
@@ -3246,7 +3354,9 @@ def _cmd_editor_in_args(inputs, seek_t=0.0):
 
     - 虚拟/生成源（color:/gen:）：`-f lavfi -i <_virtual_lavfi_spec>`（非磁盘文件，
       原样 `-i` 会 `Protocol not found`，与 `_build_pip_snapshot_cmd` 同口径）；
-      spec 解析失败才回退原样 `-i`。主输入（_i==0）仍带 `-ss` 以跳到预览时刻帧。
+      spec 解析失败才回退原样 `-i`。主输入（_i==0）**时间相关 spec**（含 geq/drawtext）
+      改用 `setpts=PTS+seek/TB` 平移起点（等价但只算一帧，见 `_lavfi_shift_pts`），
+      其余情况仍带 `-ss`。
     - 静态图（`_is_static_image_file`）：`-loop 1 -framerate 30 -t <dur> -i`（不 -ss，
       单帧无限循环；dur 取 max(10s, seek_t+2s) 兜住长视频 seek 后子图仍要引用该图）。
     - 首个输入（主输入）为视频：`-ss <seek_t> -i`（与 preview.md 输入 seek 口径一致）。
@@ -3256,14 +3366,25 @@ def _cmd_editor_in_args(inputs, seek_t=0.0):
     _seek = float(seek_t or 0.0)
     _img_dur = "%.3f" % max(10.0, _seek + 2.0)
     for _i, _f in enumerate(inputs):
-        _nf = normalize_path(_f)
+        # 🔴 虚拟源 / 已展开 spec **绝不能**过 `normalize_path`（2026-10-18 用户报
+        #    「倒计时在命令编辑器里出图失败、面板显示一大串报错」的根因）：
+        #    normalize_path 把 `\` 全换成 `/`，而 lavfi spec 里的反斜杠是 ffmpeg 的
+        #    **转义**，不是路径分隔符 ——
+        #      fontfile=C\:/Windows/Fonts/arial.ttf  → C//:/Windows/... （盘符被拆坏）
+        #      text='%{eif\:trunc(...)\:d}'         → %{eif/:trunc(...)/:d}（转义全废）
+        #    两者都让 ffmpeg 报 `Error parsing filter description` ⇒ 出图失败。
+        #    颜色源 spec 没有反斜杠，所以「颜色素材前些天适配过」时看不出这个问题；
+        #    只有带 drawtext 的倒计时（且无论 bg=dial / bg=none）才必然踩中。
+        #    判据用**原串**（归一化前）判，虚拟源才涉及这里的转义语义。
+        _raw = "" if _f is None else str(_f)
+        _nf = (_raw if (_is_virtual_source(_raw)
+                        or _is_expanded_virtual_spec(_raw))
+               else normalize_path(_raw))
         if _is_virtual_source(_nf):
             _spec = _virtual_lavfi_spec(_nf)
             if _spec:
-                if _i == 0:
-                    _args += ["-ss", "%.3f" % _seek, "-f", "lavfi", "-i", _spec]
-                else:
-                    _args += ["-f", "lavfi", "-i", _spec]
+                # 首个输入：时间相关 spec（geq/drawtext）走 setpts 平移，不白算前面的帧。
+                _args += _lavfi_input_args(_spec, _seek, _i == 0)
             elif _i == 0:
                 _args += ["-ss", "%.3f" % _seek, "-i", _nf]
             else:
@@ -3271,10 +3392,7 @@ def _cmd_editor_in_args(inputs, seek_t=0.0):
         elif _is_expanded_virtual_spec(_nf):
             # 命令编辑器解析出的展开式（color=c=0x... / smptebars=...）：本身已是合法
             # `-f lavfi -i` 值，直接透传，不要再用 _virtual_lavfi_spec 二次展开（会失败）。
-            if _i == 0:
-                _args += ["-ss", "%.3f" % _seek, "-f", "lavfi", "-i", _nf]
-            else:
-                _args += ["-f", "lavfi", "-i", _nf]
+            _args += _lavfi_input_args(_nf, _seek, _i == 0)
         elif _is_static_image_file(_nf):
             _args += ["-loop", "1", "-framerate", "30", "-t", _img_dur, "-i", _nf]
         elif _i == 0:
@@ -4284,10 +4402,15 @@ def build_move_xy_expr(mode, x0, y0, move_settings=None, sw="w", sh="h"):
         T = 4.0
 
     def _clamp_x(expr):
-        return f"min(max(({expr}),0),W-{sw}-5)"
+        # 🔴 上界必须再套 max(0,…)（2026-10-18）：运动对象 ≥ 画布宽时 W-sw-5 < 0，
+        #    旧的 `min(max(x,0),负数)` 会恒等于那个负数 ⇒ 整只运动对象**贴左上偏 5px
+        #    且完全不动**（静默错位，比「不动」更难查）。触发者正是新的组包装盒：
+        #    组内子开预制轨迹 ⇒ 盒 = 整幅主画布 ⇒ 组节点按盒宽算幅度。
+        #    sw < W 时 max(0, 正数) 数值与旧串完全一致（仅表达式长一点）。
+        return f"min(max(({expr}),0),max(0,W-{sw}-5))"
 
     def _clamp_y(expr):
-        return f"min(max(({expr}),0),H-{sh}-5)"
+        return f"min(max(({expr}),0),max(0,H-{sh}-5))"
 
     def _amp(v, default):
         s = str(v if v is not None else "").strip()
@@ -14161,7 +14284,19 @@ def _merge_output_total_duration(app, enabled_tracks):
 
 # ================== 视频尺寸计算 ==================
 def get_video_dimensions(ffprobe_cmd: str, file_path: str) -> Tuple[Optional[int], Optional[int]]:
-    """获取视频原始宽高（不考虑旋转）"""
+    """获取视频原始宽高（不考虑旋转）
+
+    🔴 2026-10-18（用户报「虚拟素材为主视频时串行合并拿不到分辨率，用 1280x720 兜底」
+      ＋「竖屏虚拟素材设宽 1080，高度算成 608」——**同一个根**）：
+      虚拟源（`color:` / `gen:` 哨兵，以及命令编辑器里的展开式 spec）**不是磁盘文件**，
+      `os.path.exists` 恒 False ⇒ 旧实现直接返回 (None, None)，17 个调用方各自兜
+      1280x720。而 1280x720 是 16:9：`1080 * 720/1280 = 607.5 → 608` 正是那个 608。
+      ⇒ 在这里**统一短路**：虚拟源尺寸只在 `_virtual_source_dimensions` 一处解析，
+      下方 ffprobe 只服务真实文件。新增虚拟源类型只需改那一个函数。
+    """
+    _vd = _virtual_source_dimensions(file_path)
+    if _vd is not None:
+        return _vd
     if not ffprobe_cmd or not os.path.exists(file_path):
         return None, None
     cmd = [ffprobe_cmd, "-v", "error", "-select_streams", "v:0",
@@ -14733,6 +14868,25 @@ def overlay_rotation_active(settings, wp_rot=None):
         except Exception:
             return False
     return False
+
+
+def _overlay_rotation_active_raw(spin_on, spin_speed, rotate_angle, wp_rot):
+    """旋转谓词**唯一真相源**（2026-10-18 抽取）：判断叠加层是否真的产出 rotate 包装盒。
+
+    只覆盖三项**非 waypoints** 判定：自旋 / 静态角 / 航点旋转标志。waypoints 表达式角度
+    的解析由 `overlay_rotation_active` 的 move_mode 分支单独处理（本函数三处调用方都已把
+    wp_rot 当布尔预传入，不在此重算）。
+
+    口径（与 `overlay_rotation_active` 逐字一致）：
+      · 自旋 = spin_enabled **且** spin_speed != 0（项目铁律）；
+      · 静态角 = rotate_angle != 0；
+      · 航点旋转 = wp_rot 为真。
+    ⚠️ spin_speed 的"取值失败→60"用 `_opt_float(..., 60.0)` 完成，**绝不写 `x or 60.0`**
+    （会把显式 spin_speed=0 误判成 60 —— 2026-09-17 同类偏移 bug 的根源）。
+    """
+    _sp = _opt_float(spin_speed, 60.0)
+    _ra = _opt_float(rotate_angle, 0.0)
+    return (bool(spin_on) and _sp != 0) or (_ra != 0) or bool(wp_rot)
 
 
 def _pipe_scale_abs_coord(expr, factor):
@@ -25566,6 +25720,18 @@ class BlurFilterDialog(tk.Toplevel):
                 self.y_var.set(str(int(_y)))
                 self.w_var.set(str(int(_w)))
                 self.h_var.set(str(int(_h)))
+                # 🔴 2026-10-19（用户报「画的框保存后没生效，出来的是默认 delogo=1:1:100:100」）：
+                # 画完区域 = 明确「这块要处理」⇒ **当前项标记启用 + 打开总开关**。
+                # 不这样做：本窗口 `load_settings` 会把旧单键迁移出一个 `enabled=False`
+                # 的默认项（x/y/w/h=1/1/100/100）⇒ 生成阶段整条被跳过 ⇒ 用户画的坐标
+                # 白填，再被「模板串」顶成 1:1:100:100（=用户看到的假象）。
+                self.enabled_var.set(True)
+                with suppress(Exception):
+                    _idx = self._current_item_idx()
+                    if _idx is not None and 0 <= _idx < len(self.items):
+                        self.items[_idx].update(self._form_to_item_dict())
+                        self.items[_idx]["enabled"] = True
+                        self._refresh_blur_tree()
             _pre = None
             try:
                 _px = int(float(str(self.x_var.get()).strip() or 0))
@@ -35192,6 +35358,9 @@ class OverlayPositionFrame(ttk.LabelFrame):
         self.tile_inside_callback = tile_inside_callback
         self._controls = []
         self.blend_mode = tk.StringVar(value="normal")
+        # 「轨迹来源」下拉是否已 pack 出来（`enable_group_traj_src` 置真）——
+        # `get_settings` 据此决定要不要产 `grp_traj_src` 键（非组窗口绝不能产）。
+        self._grp_traj_src_shown = False
         self._create_controls()
 
     def _create_controls(self):
@@ -35391,6 +35560,68 @@ class OverlayPositionFrame(ttk.LabelFrame):
                 "注意：旋转包围盒为对角线尺寸，水印不宜过大，否则会被主画面边缘裁切。"),
                 wraplength=420)
 
+        # ---- 「轨迹来源」下拉（**仅父行语境**，2026-10-18 用户定案 G）----
+        # 默认**隐藏**：只有宿主把 `group_box_edit` 置真（列表里的组父行 / 组节点窗）
+        # 才 pack 出来。值 = canonical `""`（无＝用父行自己的）/ `"main"` / `"sub-N"`
+        # ⇒ 绝不包 `_()`（`_group_traj_src_track` 直接按它反查成员，包了英文界面必失效）。
+        self.group_traj_src = tk.StringVar(value="")
+        # 显示名 ↔ canonical 值的映射（下拉显示中文、存库存 ASCII）
+        self._grp_traj_src_disp = {"": _("无")}
+        self._grp_traj_src_val = {_("无"): ""}
+        _lblts = ttk.Label(spin_frame, text=_("轨迹来源:"))
+        _cbts = ttk.Combobox(spin_frame, textvariable=self.group_traj_src,
+                             values=[_("无")], state="readonly", width=8)
+        # 先建不 pack：`enable_group_traj_src()` 才显示
+        self._grp_traj_src_lbl = _lblts
+        self._grp_traj_src_cb = _cbts
+        self._controls.append(_cbts)
+        ToolTip(_lblts,
+                _("整组位移轨迹（列表轨迹 / 预制轨迹）从谁那里借。\n"
+                "无（用父行自己的）＝只认本窗「轨迹控制…」里配的轨迹；\n"
+                "gG-N（编号同列表「类型」列）＝借那条成员自己的轨迹来带动整只包装盒，\n"
+                "成员自身画面不动（它自己的轨迹仍只作用它自己）。\n"
+                "选中那条没配轨迹 ⇒ 自动回退「无」，列表规格列会标「(无轨迹)」。\n"
+                "⚠️ 只管位移：角度与持续旋转各自独立（角度＝整组，成员角度＝它自己）。"),
+                wraplength=420)
+
+    def enable_group_traj_src(self, gid):
+        """显示「轨迹来源」下拉并填好选项（仅父行语境调用，2026-10-18 G）。
+
+        `gid` = 本窗代表的组；选项由 `_group_traj_src_tracks` 按**列表序**编号
+        （`gG-N`，编号口径同列表「类型」列），下拉**没有组员可借**（组只剩 1 条）⇒ 不显示。
+        """
+        if not hasattr(self, "_grp_traj_src_cb"):
+            return False        # mode='main' 的窗没有这一行（只有 sub 语境建）
+        _subs, _base = [], None
+        with suppress(Exception):
+            _subs, _base = self.app._group_traj_src_tracks(gid)
+        if _base is None:
+            return False
+        _disp = {"": _("无")}
+        _vals = {_("无"): ""}
+        _d = self.app._group_member_label(gid, _base)
+        _disp["main"] = _d
+        _vals[_d] = "main"
+        for _k, _t in enumerate(_subs):
+            _d = self.app._group_member_label(gid, _t)
+            _canon = self.app._GROUP_TRAJ_SUB_PREFIX + str(_k + 1)
+            _disp[_canon] = _d
+            _vals[_d] = _canon
+        self._grp_traj_src_disp = _disp
+        self._grp_traj_src_val = _vals
+        self._grp_traj_src_cb.configure(values=list(_vals.keys()))
+        # 当前值 → 显示名。`set_settings` 存进来的是 **canonical 值**（此时下拉还没填
+        # 选项）；用户手选后变量里是**显示名** ⇒ 两个都要认（`_vals` 反查表兜住后者）。
+        _cur = str(self.group_traj_src.get() or "").strip()
+        if _cur not in _disp:
+            _cur = _vals.get(_cur, "")
+        if _cur not in _disp:
+            _cur = ""
+        self.group_traj_src.set(_disp[_cur])
+        self._grp_traj_src_shown = True          # `get_settings` 据此决定要不要产键
+        self._grp_traj_src_lbl.pack(side=tk.LEFT, padx=(16, 2))
+        self._grp_traj_src_cb.pack(side=tk.LEFT)
+        return True
 
     def _edit_wp_point(self, row_idx, which, cur_x, cur_y, cur_angle, apply_xy, apply_angle, t0=0.0,
                        active_flag=None, w=None):
@@ -35640,8 +35871,8 @@ class OverlayPositionFrame(ttk.LabelFrame):
                             _rf()
             with suppress(Exception):
                 self.app._append_info_ui(
-                    _('[轨迹] 该端尺寸已更新: {0}x{1}').format(nw, nh)
-                    + (_('（缩放倍率 {0:.4g}）').format(_ns) if _ns else ""))
+                    f"[轨迹] 该端尺寸已更新: {nw}x{nh}"
+                    + (f"（缩放倍率 {_ns:.4g}）" if _ns else ""))
         # 起始/结尾双端（条件调用）：仅当调用方传入 w + active_flag 时启用
         # （active_flag 由 _open_editor 的 _active 可变列表提供，翻转即切写回目标端）
         start_end = None
@@ -35755,12 +35986,17 @@ class OverlayPositionFrame(ttk.LabelFrame):
             wm_w, wm_h = int(_base_sz[0]), int(_base_sz[1])
             # 静态角度：**优先读组级字段**（位置编辑器刚写进去、可能还没保存），
             # 没有才回落到素材项（上次保存的 rotate_angle）—— 两处本来就是同时写的。
+            # 🔴 2026-10-18（组级字段搬进父行）：组级字段宿主 = **父行**素材项
+            #   `node_fx["grp:<gid>"][0]`（`_group_level_item` 唯一出处），**不再**从组内主
+            #   `enc_settings` 读（那是搬家前的旧落点，留着 = 解耦后又出现"成员带动整组"）。
+            #   gid 取自本窗的 `group_label_edit`（`v_grp_<gid>_<n>`，与
+            #   `_merge_edit_group_row` / `_open_node_effect_editor` 同一口径）。
             _ang0 = None
             try:
-                _gbt = app._merge_group_base_track(
-                    getattr(self, "track_obj", None), app._get_enabled_video_tracks())
-                if _gbt is not None:
-                    _ang0 = (getattr(_gbt, "enc_settings", None) or {}).get("grp_rot_angle")
+                _gm = re.match(r"^v_grp_(.+)_\d+$",
+                               str(getattr(ff, "group_label_edit", None) or ""))
+                if _gm:
+                    _ang0 = app._group_level_item(_gm.group(1)).get("grp_rot_angle")
             except Exception:
                 _ang0 = None
             if _ang0 is None:
@@ -35774,6 +36010,35 @@ class OverlayPositionFrame(ttk.LabelFrame):
                 _mat_ang = float(_ang0 or 0.0)
             except (TypeError, ValueError):
                 _mat_ang = 0.0
+        # 🔴 2026-10-18（用户要求）：**落位参考框** —— 起点/结尾坐标编辑器里要能看见
+        #   「主视频内容框（恒画）+ 其他子视频框 + 组包装盒橙框」，否则组内主当内容盒时
+        #   摆轨迹完全是盲摆（看不到组内子在哪、也看不到盒边界）。
+        #   几何与外部「🎨 可视化编辑坐标」**同一套**（`_draw_background` 唯一出处，
+        #   组内成员走 `_editor_ref_rects` 的「盒原点 + rel」）⇒ 两处必然一致。
+        #   2026-10-18（用户「按现在实现无需开关」）：参考框**恒显示**，不再设开关。
+        _ref_draw = None
+        try:
+            if _bg_file:
+                _subs_r = app._get_enabled_video_tracks() or []
+                _mt_r = _subs_r[0] if _subs_r else None
+                _job = getattr(self, "track_obj", None)
+                if _mt_r is not None:
+                    _grp_r = (app._editor_ref_rects(_job, _subs_r)
+                              if _job is not None else {})
+                    _box_r = (app._group_composite_box(_job, _subs_r)
+                              if _job is not None else None)
+
+                    def _ref_draw(canvas, scale_x, scale_y=None, _mt=_mt_r, _subs=_subs_r,
+                                  _grp=_grp_r, _box=_box_r, _job=_job,
+                                  _off=_bg_offset, _rs=_bg_render_size):
+                        app._draw_background(
+                            canvas, mw, mh, scale_x, _mt, _subs[1:],
+                            _off[0], _off[1], _rs or (mw, mh),
+                            current_edit_track=_job, tag="bg_ref", scale_y=scale_y,
+                            group_box=(_box[:4] if _box is not None else None),
+                            grp_rects=_grp)
+        except Exception:
+            _ref_draw = None
         app.open_watermark_overlay_editor(
             mw, mh, max(int(round(wm_w * _init_s)), 10), max(int(round(wm_h * _init_s)), 10), vx, vy,
             # 2026-09-14：内容源=全局基准尺寸 → 启用「缩放 (倍率)」滑块（100%=当前基准尺寸，
@@ -35818,6 +36083,8 @@ class OverlayPositionFrame(ttk.LabelFrame):
             # 只留红/蓝边框 ⇒ 位置由画面本身反映，不必再开第二个预览窗。
             draw_diagonal=False,
             coord_box=True,
+            # 2026-10-18：落位参考框（开关关闭 / 无主视频 ⇒ None ⇒ 旧行为）。
+            bg_ref_draw=_ref_draw,
             start_end=start_end)
         try:
             apply_xy(float(vx.get()), float(vy.get()))
@@ -36401,7 +36668,7 @@ class OverlayPositionFrame(ttk.LabelFrame):
 
     def get_settings(self):
         if self.mode == 'sub':
-            return {
+            _d = {
                 "overlay_enabled": self.overlay_enabled.get(),
                 "overlay_x": self.overlay_x.get().strip(),
                 "overlay_y": self.overlay_y.get().strip(),
@@ -36417,6 +36684,14 @@ class OverlayPositionFrame(ttk.LabelFrame):
                 "move_margin": self.move_margin.get().strip() if hasattr(self, "move_margin") else "W*0.03",
                 "move_waypoints": [dict(w) for w in getattr(self, "move_waypoints", [])],
             }
+            # 🔴 2026-10-18（G）：「轨迹来源」只在**父行语境**存在（`enable_group_traj_src`
+            #   才 pack 出来）⇒ 非组窗口**绝不产这个键**，否则每个普通子视频的
+            #   enc_settings 都会多一个无意义的 `grp_traj_src: ""`（项目存档会变脏、
+            #   还会被「复制滤镜」带去别的轨）。显示名 → canonical 值。
+            if getattr(self, "_grp_traj_src_shown", False):
+                _d["grp_traj_src"] = self._grp_traj_src_val.get(
+                    self.group_traj_src.get(), "")
+            return _d
         else:
             return {
                 "pad_enabled": self.pad_enabled.get(),
@@ -36464,6 +36739,12 @@ class OverlayPositionFrame(ttk.LabelFrame):
             if hasattr(self, "move_waypoints"):
                 _wp = settings.get("move_waypoints")
                 self.move_waypoints = [dict(w) for w in _wp] if isinstance(_wp, list) else []
+            if hasattr(self, "group_traj_src"):
+                # ⚠️ 此时下拉可能还没填选项（`enable_group_traj_src` 在 set_settings
+                #   **之后**才调用，见 edit_video_settings）⇒ 先存 canonical 值，
+                #   由 `enable_group_traj_src` 负责翻译成显示名。
+                self.group_traj_src.set(
+                    str(settings.get("grp_traj_src", "") or "").strip())
         else:
             self.pad_enabled.set(settings.get("pad_enabled", False))
             self.pad_width.set(settings.get("pad_width", ""))
@@ -37357,9 +37638,10 @@ _COPY_FILTER_EXCLUDE_KEYS = frozenset({
     "base_width", "base_height",
     # —— 外部音轨源（与具体文件绑定）——
     "external_audio_path", "external_audio_stream",
-    # —— 编组身份 / 组级几何（2026-10-17 P2-1）——
+    # —— 编组身份（2026-10-17 P2-1；2026-10-18 解耦后只剩 `grp`/`is_grp_base`）——
     #    这些键属于**轨道身份**而非滤镜：从组员「复制滤镜」粘到普通轨会把目标轨静默
     #    拉进同一组（导出结构突变、无任何提示），从普通轨粘到组员则会把它踢出组。
+    #    组级几何已搬进父行 node_fx，不再走 enc_settings（见 `_GROUP_KEYS` 注释）。
     #    名单唯一出处 = `_GROUP_KEYS`（模块级，勿在此另抄一份）。
     *_GROUP_KEYS,
 })
@@ -37991,7 +38273,6 @@ def _win32_restore_hidden_owned(hwnd, _depth=0):
     except Exception:
         pass
     return _n
-
 
 
 def _win32_force_foreground_hard(hwnd):
@@ -40295,13 +40576,13 @@ class FFmpegBatchGUI:
     
     def _get_video_dimensions_cached(self, file_path):
         """获取视频原始宽高（不考虑旋转），带缓存"""
-        # 虚拟颜色源：宽高直接由哨兵给出（不出 real 文件）—— 与 _cached_video_dimensions 同口径。
+        # 虚拟源：宽高直接由哨兵 / 展开式给出（不出 real 文件）—— 与 _cached_video_dimensions 同口径。
         # 2026-10-09：此前只 _cached_video_dimensions 处理了颜色源，本函数漏了 ⇒ 画中画预览
         # 的主视频尺寸回退 1280x720，颜色 1080x1920 被当 1280x720 布局（缩放/子视频虚拟框全错位）。
-        if _is_virtual_source(file_path):
-            # color: 返回 (hex8, w, h, dur)；gen: 返回 (type, w, h, dur) —— 索引同构
-            _pc = _parse_color_source(file_path) or _parse_gen_source(file_path)
-            return (_pc[1], _pc[2]) if _pc else (None, None)
+        # 2026-10-18：收敛到 `_virtual_source_dimensions`（唯一解析器，含 gen: / 展开式）。
+        _vd = _virtual_source_dimensions(file_path)
+        if _vd is not None:
+            return _vd
         if not file_path or not os.path.exists(file_path):
             return None, None
         try:
@@ -41371,8 +41652,8 @@ class FFmpegBatchGUI:
         x = sub_settings.get('overlay_x', '0').strip() or '0'
         y = sub_settings.get('overlay_y', '0').strip() or '0'
         _content_w, _content_h = self._overlay_content_size(sub_file, sub_settings)
-        _spv = _opt_float(sub_settings.get("spin_speed", 60.0) or 60.0, 60.0)
-        _rot_ov = (spin_on and _spv != 0) or (ra != 0) or wp_rot
+        _spv = _opt_float(sub_settings.get("spin_speed", 60.0), 60.0)
+        _rot_ov = _overlay_rotation_active_raw(spin_on, _spv, ra, wp_rot)
         _mv = (sub_settings.get('move_mode', '') or '').strip()
         if _mv == "waypoints":
             # 列表轨迹：x/y 为画布绝对像素（数字），直接使用；无效时回退基准位置
@@ -41862,9 +42143,11 @@ class FFmpegBatchGUI:
         alpha_enabled = sub_settings.get("alpha_enabled", False)
         alpha_val = sub_settings.get("alpha_value", 1.0)
         # 静态透明度：轨迹透明度存在时跳过——由下方 geq 一并折入（避免两道滤镜重复设 alpha）。
-        # 🔴 组内主（group_base，C1）：透明度也**不在此层表达** —— 它作用于**整组**（组员一起
-        #    变透明），故整段跳过，由组节点承担（_group_node_transform_parts）。
-        if alpha_enabled and 0.0 <= alpha_val <= 1.0 and not group_base \
+        # 🔴 2026-10-18（解耦）：`group_base` **不再跳过**任何变换 —— 组内主的透明度 /
+        #    旋转 / 自旋 / 轨迹缩放全部**只作用它自己**（旧模型 B/C1 让它们作用于整组，
+        #    导致「组内主一改，全组跟着动」，也无法与其他成员各配各的）。
+        #    整组姿态改由**父行**（组虚拟行）承担 —— 它本来就是一条独立素材。
+        if alpha_enabled and 0.0 <= alpha_val <= 1.0 \
                 and not (_wp_res is not None and _wp_res[4] is not None):
             filter_parts.append(f"[{current_sub}]colorchannelmixer=aa={alpha_val:.2f}[v_alpha_{i}]")
             current_sub = f"v_alpha_{i}"
@@ -41872,8 +42155,7 @@ class FFmpegBatchGUI:
         # 列表轨迹透明度（oa→ob 段内线性插值）：与静态 alpha_value 串联合成（相乘）；
         # 全 1.0 时 _wp_res[4] 为 None → 跳过（与无任何透明度的老工程行为一致）。
         # 置于静态透明度之后：两道 colorchannelmixer=aa 串联 = alpha_val × 轨迹表达式。
-        if _wp_res is not None and _wp_res[4] is not None and not group_base:
-            # 🔴 组内主（C1）：轨迹透明度同上，搬到组节点作用于整组。
+        if _wp_res is not None and _wp_res[4] is not None:
             # ⚠️ colorchannelmixer=aa 在本 ffmpeg 构建为 init 模式，拒绝求值时变表达式
             #   （含 t 或 max() 会被拒，且逗号会被 filtergraph 当成滤镜分隔符 → "No such filter: 'lt(t'"）。
             #   改用 geq（per-frame 求值）承载时变 alpha：
@@ -41905,10 +42187,11 @@ class FFmpegBatchGUI:
         _spin_on = bool(sub_settings.get("spin_enabled", False))
         # ⚠️ _wp_res / _wp_rot 已在上方「列表轨迹提前解析」段算好（必须早于 need_alpha，
         # 否则航点旋转不补 format=rgba → 不透明黑方块）。此处只复用，禁止再算一遍。
-        # 🔴 组内主（group_base，模型 B / C1）：旋转**不在此层表达** —— 它必须作用于**整组**
-        #    （组员随之一起转），故整段跳过，改由阶段 B 的组节点承担
-        #    （`_group_node_transform_parts`）。真机 A/B 实证：留在内容腿 ⇒ 组员不跟随旋转。
-        if not group_base and (_spin_on or _ra != 0 or _wp_rot):
+        # 🔴 2026-10-18（解耦）：`group_base` **不再跳过**旋转 —— 组内主的静态角度 / 自旋 /
+        #    航点角度只作用**它自己**（组画布内它就是一个普通成员，与组内子同权）。
+        #    整组旋转改由**父行**（组虚拟行 = 一条独立素材）的 `grp_rot_angle` + 自旋承担，
+        #    由阶段 B 的组节点表达（`_group_node_transform_parts`）。
+        if _spin_on or _ra != 0 or _wp_rot:
             _sp = sub_settings.get("spin_speed", 60.0)
             _sp = _opt_float(_sp, 60.0)
             # 判定必须走唯一真相源（与 _overlay_sub_size 的中心补偿同一口径）：
@@ -41975,8 +42258,8 @@ class FFmpegBatchGUI:
                          or 'normal').strip().lower() != 'normal':
             filter_parts.append(f"[{current_sub}]format=rgba[v_zrgba_{i}]")
             current_sub = f"v_zrgba_{i}"
-        # 🔴 组内主同理（C1）：轨迹缩放必须作用于**整组**（组节点），不在内容腿表达。
-        if _wp_zoom and not group_base:
+        # 🔴 2026-10-18（解耦）：轨迹缩放也**不再**因 `group_base` 跳过 —— 只作用组内主自己。
+        if _wp_zoom:
             if _wp_scale_sc is not None:
                 # sendcmd 驱动 scale@slr{i}：首帧占位=首区间倍率（避免首帧 glitch）。
                 # ⚠️ 值含逗号（max(2,...)）必须整体单引号包裹，否则 filtergraph 把逗号当
@@ -42156,28 +42439,36 @@ class FFmpegBatchGUI:
 
         🔴 旋转判据用 `overlay_rotation_active(_ss_xy, wp_rot=meta["wp_rot"])`（不是只看
         `geo["rot"]`）：父行自旋转 / 父行航点角度都会让组节点产出 d×d 包装盒，此时
-        `geo["rot"]` 仍可能是 None（几何只读组内主自己的设置）⇒ 不补 d×d 会让整盒偏
-        (d−PW)/2。组内主自身有旋转时两判据同真 ⇒ 与旧结果**逐字符一致**。
+        `geo["rot"]` 仍可能是 None（几何只看**父行**旋转，见 `_group_box_geometry`）⇒
+        不补 d×d 会让整盒偏 (d−PW)/2。
+
+        🔴 2026-10-18（解耦）：`sub_settings` = **组内主**的 enc_settings，而组内主的
+        旋转/自旋/轨迹**只作用它自己**了 ⇒ 它的 `move_mode`（预制四模式）与 `rotate_angle`
+        绝不能参与**整盒**的落位/旋转判据，否则组内主一动整组跟着动。处理：
+          · `meta` 五键（wp_res/wp_rot/spin_on/ra/wp_zoom）调用方已按「只认父行」清零；
+          · `_ss_xy` 这份副本里**抹掉**组内主的 `move_mode`（预制）与 `rotate_angle` /
+            `spin_enabled`，只留 overlay_x/y（组的基准落位）与父行 row_settings 的投影。
+          · `overlay_x/y` **保留**：它是组的基准落位（`_group_place_xy` 的 x/y 由此而来），
+            与「组内主自己的变换」无关 —— 这是刻意保留的唯一一个组内主字段。
         """
-        _ss_xy = dict(sub_settings or {})
+        # 组内主自己的姿态不参与整盒（解耦）—— **白名单**只保留基准落位 overlay_x/y，
+        # 其余成员姿态键一律不进 `_ss_xy`（新增姿态键天然不漏，不必维护剥除黑名单）。
+        _ss_xy = {_k: (sub_settings or {}).get(_k)
+                  for _k in ("overlay_x", "overlay_y")
+                  if _k in (sub_settings or {})}
         if wp_move:
             _ss_xy["move_mode"] = "waypoints"
         if row_settings:
             for _rk in self._GROUP_ROW_FX_KEYS:
                 if _rk in row_settings:
                     _ss_xy[_rk] = row_settings[_rk]
-        # 🔴 旋转判据必须与 `_pip_overlay_xy` 内的 `_rot_ov` **逐字同口径**（那才是真正
-        #   决定插不插 rotate 的地方）：`(spin_on and spv≠0) or (ra≠0) or wp_rot`。
-        #   不能用 `overlay_rotation_active(_ss_xy)` 单独判：
-        #     · 组级角度走 `meta["ra"]`（`grp_rot_angle` 注入进 `_gs`，**不在** `_ss_xy`）
-        #       ⇒ 只看 settings 会漏（D7 实测：geo.rot=None + ra=30 时补偿按 PW×PH 算，
-        #          整盒偏 (d−PW)/2 —— 正是用户说的「开角度就撑开/偏移」同类问题）；
-        #     · 父行自旋转是 `spin_on`（meta）+ spin_speed（row_settings）两处拼起来的。
-        #   `_spv` 与 `_pip_overlay_xy` 同款 `or 60.0`（显式 0 视为未填 → 60）。
-        _spv_now = _opt_float(_ss_xy.get("spin_speed", 60.0) or 60.0, 60.0)
-        _rot_now = (bool(meta.get("spin_on")) and _spv_now != 0) \
-            or (_opt_float(meta.get("ra", 0) or 0, 0.0) != 0) \
-            or bool(meta.get("wp_rot"))
+        # 旋转判据统一走模块级 `_overlay_rotation_active_raw`（与 `_pip_overlay_xy` 的
+        # `_rot_ov` / `overlay_rotation_active` 同一真相源，删掉"逐字同口径"的双份维护）。
+        # 仍不能调 `overlay_rotation_active(_ss_xy)`：组级角度在 `meta["ra"]`、父行自旋在
+        # `meta["spin_on"]`（**不在** `_ss_xy`），只看 settings 会漏判（D7 实测同类偏移）。
+        _spv_now = _opt_float(_ss_xy.get("spin_speed", 60.0), 60.0)
+        _rot_now = _overlay_rotation_active_raw(meta.get("spin_on"), _spv_now,
+                                                meta.get("ra"), meta.get("wp_rot"))
         if grp_scaled_size is not None:
             _sw, _sh = float(grp_scaled_size[0]), float(grp_scaled_size[1])
             _sc = (_sw, _sh)
@@ -42210,6 +42501,46 @@ class FFmpegBatchGUI:
         if _dy:
             _y = "(%s) - %g" % (_y, _dy)
         return _x, _y
+
+    def _group_member_pos_expr(self, sub_file, sub_settings, meta, canvas, origin):
+        """**组内子**在组画布内的 x/y 表达式（主画布域定位 − 包装盒原点）。
+
+        2026-10-18 用户拍板「A+a / 主画布域」：组内子的位移轨迹按**整幅主画布**求值
+        （与未编组时同一套坐标），再由包装盒原点平移到盒内。这样：
+          · 轨迹幅度 / 边界与「不编组」逐值一致（用户直觉：开不编组都一样飞）；
+          · 包装盒只需 `_group_member_rect` 的全时段包络装下它，**零循环依赖**
+            （盒尺寸不吃表达式，表达式也不吃盒尺寸）。
+        组内定位走静态 `rel` 的旧口径会被**盒尺寸**污染：`W` = 盒宽、`H` = 盒高 —— 而
+        轨迹表达式是按主画布生成的 ⇒ 盒一旦不等于主画布，整条轨迹幅度就走形。故这里把
+        表达式里的 `W`/`H` 显式换成**主画布常量**（`\bW\b`/`\bH\b`，不碰 `w`/`h`：
+        那两个是 overlay 副输入尺寸，组内与非组同域，必须保持变量）。
+
+        canvas：**该侧**的主画布尺寸 —— 导出 = `geo["canvas"]`（真画布，含 pad）；
+                管道预览 = 同一真画布 × `_pwf`（因为传进来的 `meta`/`sub_settings` 已由
+                `_pipe_scale_pos_settings` 换算到预览帧空间，两者必须配套，否则整组偏右下）。
+        origin：包装盒原点（**与 canvas 同域**）= 组画布左上角在主画布上的位置。
+        返回 (x_expr, y_expr) 字符串（overlay 参数，含逗号的函数已由 `_pip_overlay_xy` 括号化）。
+        """
+        _x, _y = self._pip_overlay_xy(
+            sub_file, sub_settings,
+            (meta or {}).get("wp_res"), (meta or {}).get("wp_rot"),
+            (meta or {}).get("spin_on"), (meta or {}).get("ra"), (meta or {}).get("wp_zoom"))
+        _cw = "%g" % float(canvas[0])
+        _ch = "%g" % float(canvas[1])
+        _x = re.sub(r"\bW\b", _cw, str(_x))
+        _y = re.sub(r"\bH\b", _ch, str(_y))
+        _ox, _oy = float(origin[0]), float(origin[1])
+        # 组画布内坐标 = 主画布坐标 − 盒原点。原点为 0 时不拼接（老工程逐字符不变）。
+        if _ox:
+            _x = "(%s) - %g" % (_x, _ox)
+        if _oy:
+            _y = "(%s) - %g" % (_y, _oy)
+        return _x, _y
+
+    def _group_gid_of_key(self, key):
+        """`grp:<gid>` 语义 key → gid（逆 `_group_final_label_key`）。非 grp key ⇒ ''。"""
+        _k = str(key or "")
+        return _k[4:] if _k.startswith("grp:") else ""
 
     def _group_final_label_key(self, gid, mem_count):
         """组最终输出标签 → 节点指纹 key（**不触发** `_ensure_node_graphs_current`）。
@@ -42261,52 +42592,90 @@ class FFmpegBatchGUI:
         except Exception:
             return None
 
-    def _group_place_delta(self, base_settings):
-        """组的整体落位增量 (dx, dy)（主画布像素）；缺省 / 非法 → (0.0, 0.0)。"""
-        _ss = base_settings if isinstance(base_settings, dict) else {}
+    # ---------- 组的**整体落位**（2026-10-16 用户定案：从「寄生组内主」解耦） ----------
+    # 病根（用户两轮实测）：组落位此前只由组内主 overlay_x/y 表达 ⇒ 「拖组盒 → 只改组内主
+    # → 成员并集原点重算 → 重开节点变成一只新盒子」；且组内其他成员"没跟着动"。
+    # 修法 = 组级增量字段 **grp_dx / grp_dy**（存在组内主的 enc_settings）：
+    #   · 成员坐标语义**一字不动**（仍是主画布绝对）⇒ 老工程缺省 delta=0 逐字节不变（E1 硬门）；
+    #   · 拖组盒只改 delta ⇒ 全部成员视觉上一起走，且**没有任何成员数据被改写**
+    #     （用户原话：节点里插入 overlay 天然不会错位）；
+    #   · 组设置/项目保存天然跟随 enc_settings，无需另立注册表。
+    def _group_level_item(self, gid):
+        """**组级字段**的宿主 = 父行（组虚拟行）的素材项 `node_fx["grp:<gid>"][0]`。
+
+        🔴 2026-10-18（用户定案「组级字段搬进父行」）：`grp_dx/grp_dy/grp_abs_x/grp_abs_y/
+        grp_rot_angle` 语义上**全部属于父行**（父行 = 一条独立素材 = 组的化身），此前却
+        物理寄居在**组内主**的 `enc_settings` 上 —— 于是「换组内主」必须搬家（老代码里
+        一整段 `_move_keys` 补丁），且组内主自己开自旋会被组节点读去转**整盒**。
+        搬进父行后：换组内主与本组字段彻底无关（那段搬家逻辑已删）；成员的
+        `enc_settings` 只归成员自己 ⇒ 组内变换解耦。
+
+        返回 dict（**只读副本**，改它不会落库）；gid 为空 / 没有素材项 → `{}`
+        ⇒ 所有组级字段回落缺省（增量 0 / 无绝对落位 / 无角度），逐字符等于旧行为。
+        """
+        if not gid:
+            return {}
+        return self._group_material_item(self._group_final_label_key(gid, 0))
+
+    def _group_place_delta(self, gid, pwf=1.0):
+        """组的整体落位增量 (dx, dy)（主画布像素）；缺省 / 非法 → (0.0, 0.0)。
+
+        数据源 = **父行**素材项（`_group_level_item` 唯一出处），不再读组内主。
+        `pwf`：管道预览工作分辨率缩放因子（<1 时把绝对像素换算到缩小后的空间，
+        与 `overlay_x/y` 同一把尺子；>=1 原样返回，零行为变化）。
+        """
+        _ss = self._group_level_item(gid)
         _out = []
         for _k in ("grp_dx", "grp_dy"):
+            _v = _ss.get(_k, "") or 0
+            if pwf < 1.0:
+                with suppress(Exception):
+                    _v = _pipe_scale_abs_coord(_v, pwf)
             try:
-                _out.append(float(str(_ss.get(_k, "") or 0) or 0))
+                _out.append(float(str(_v) or 0))
             except (TypeError, ValueError):
                 _out.append(0.0)
         return _out[0], _out[1]
 
-    def _group_place_xy(self, base_settings, x_expr, y_expr):
+    def _group_place_xy(self, gid, x_expr, y_expr, pwf=1.0):
         """组节点落位的**唯一读取口径**：`_group_node_xy` 结果 + 组级增量。
 
         ⚠️ 表达式可能含逗号函数（mod/min/max）⇒ 加 delta 前必须整体括号包裹
         （同 `_group_node_xy` 内既有写法，否则 filtergraph 把逗号当滤镜分隔符）。
         delta 为 0（缺省）时**返回原串**，与改动前逐字符一致。
         """
-        _dx, _dy = self._group_place_delta(base_settings)
+        _dx, _dy = self._group_place_delta(gid, pwf=pwf)
         if _dx:
             x_expr = ("(%s) + %g" % (x_expr, _dx)) if _dx > 0 else ("(%s) - %g" % (x_expr, -_dx))
         if _dy:
             y_expr = ("(%s) + %g" % (y_expr, _dy)) if _dy > 0 else ("(%s) - %g" % (y_expr, -_dy))
         return x_expr, y_expr
 
-    def _group_place_abs(self, base_settings):
+    def _group_place_abs(self, gid, pwf=1.0):
         """组的**绝对落位** (x, y)（主画布像素）；没设过 → (None, None)。
 
-        与 `_group_place_delta` 是同一族的**组级字段**（存在组内主的 enc_settings，
-        语义上是"组"的属性，不是成员的属性）。来源 = 列表虚拟父行设置窗里的
-        「叠加位置 X/Y」数字框（2026-10-16）：父行是**投影**，不能去改成员的
-        overlay_x/y，只能把"整组该落在哪"记成组自己的绝对坐标。
+        与 `_group_place_delta` 是同一族的**组级字段**（现居**父行**素材项，语义上是
+        "组"的属性）。来源 = 列表虚拟父行设置窗里的「叠加位置 X/Y」数字框
+        （2026-10-16）：父行是**投影**，不能去改成员的 overlay_x/y，只能把"整组该落在哪"
+        记成组自己的绝对坐标。
 
         ⚠️ 与增量互斥：给了绝对值就**不再叠加** delta（否则两套落位相加必漂移）。
         可视化编辑器拖动组合盒时会把这两个键删掉、改回增量。
         ⚠️ 值可以是表达式（与主画布 overlay_x/y 同域：`W`/`H` = 主画布，`w`/`h` =
         包装盒）—— 所以这里**不求值**，原样交给 filtergraph。纯数字会顺手转成 float
         （UI 画框要用），表达式则保留字符串（画框时回退到增量位置）。
+        `pwf` 同 `_group_place_delta`（管道预览坐标换算）。
         """
-        _ss = base_settings if isinstance(base_settings, dict) else {}
+        _ss = self._group_level_item(gid)
         _out = []
         for _k in ("grp_abs_x", "grp_abs_y"):
             _v = str(_ss.get(_k, "") or "").strip()
             if not _v:
                 _out.append(None)
                 continue
+            if pwf < 1.0:
+                with suppress(Exception):
+                    _v = _pipe_scale_abs_coord(_v, pwf)
             try:
                 _out.append(float(_v))
             except (TypeError, ValueError):
@@ -42597,7 +42966,7 @@ class FFmpegBatchGUI:
             self._append_info_ui(
                 _("[分组] 分组条件不成立（无界窗口/尺寸未知），已按独立叠加处理"))
         if _grp_ok:
-            _who = _("；").join(_("%s=%d 条") % (_g, len(_d["mems"])) for _g, _d in _grp_ok.items())
+            _who = "；".join(_("%s=%d 条") % (_g, len(_d["mems"])) for _g, _d in _grp_ok.items())
             self._append_info_ui(_("[分组] 已启用嵌套合成：%s（组内 overlay，音频不分组）") % _who)
 
         # ---- 画中画：转场链规划（未开转场 → 空链，逐字节走原路径）----
@@ -42696,7 +43065,10 @@ class FFmpegBatchGUI:
                 include_fade=include_fade,
                 # 组内主强制走**表达式路**：它的定位/旋转/轨迹要整体搬到组节点上表达，
                 # 而 sendcmd 是「图层内 overlay」专用的位置驱动，组节点不消费它。
-                wp_sendcmd=(wp_sendcmd and not _gb),
+                # 🔴 组员（含组内主）一律关：组成员 canvas=None ⇒ 图层内压根没有 overlay
+                #    消费 sendcmd，定位全部由阶段 A3 承担（`_group_member_pos_expr`）。
+                #    开着只会多写一个临时命令文件 + 多一条日志，位置毫无影响。
+                wp_sendcmd=(wp_sendcmd and i not in _grp_of),
                 # 组员画布不带 shortest=1 ⇒ 画布（首输入）自己定长，内容较早 EOF 时与
                 # 「未编组」一致按 repeat 冻末帧，而不会被裁断（转场链仍用 True，见 docstring）。
                 canvas_shortest=(i not in _grp_of),
@@ -42795,10 +43167,27 @@ class FFmpegBatchGUI:
                 #    两元解包必炸 `too many values to unpack (expected 2, got 4)`。
                 _rr = _d["rel_of"][_i]
                 _rx, _ry = float(_rr[0]), float(_rr[1])
+                # 🔴 组内子的**位移轨迹**（2026-10-18 用户拍板「A+a / 主画布域」）：定位改走
+                #    **时间表达式**（`_group_member_pos_expr` = 主画布域 `_pip_overlay_xy`
+                #    − 盒原点），包装盒已按**全时段包络**放大（`_group_member_rect`）⇒ 轨迹
+                #    任何时刻都在组画布内，不会被裁。此前用静态 `rel` 数字 ⇒ 组员的位移轨迹
+                #    在组内完全不生效（用户报告「组内子开轨迹没用」）。
+                # 🔴 2026-10-18（解耦）：判据对**所有成员**一视同仁（含组内主）——
+                #    组内主的位移轨迹同样只作用它自己，包装盒也已按它的全时段包络放大
+                #    （`_group_member_rect` 解耦后不再对 base 特判）⇒ 它也必须走表达式，
+                #    否则「组内主开轨迹」在组内不生效。
+                #    静态成员（无生效轨迹）仍走 `%g` 数字（逐字符不变）。
+                _dyn_i = bool(self._group_traj_kind(sub_infos[_i][2]))
+                if _dyn_i:
+                    _rx, _ry = self._group_member_pos_expr(
+                        sub_infos[_i][1], sub_infos[_i][2], _layers[_i][1],
+                        _d["geo"]["canvas"], _d["geo"]["origin"])
+                else:
+                    _rx, _ry = ("%g" % _rx), ("%g" % _ry)
                 _ln = float(_d["lens"][_i])
                 _w0 = min(float((_d.get("wsa") or {}).get(_i, 0.0) or 0.0), _ln)
                 filter_parts.append(
-                    "[%s][%s]overlay=x='%g':y='%g'"
+                    "[%s][%s]overlay=x='%s':y='%s'"
                     ":enable='between(t,%.6g,%.6g)'[%s]"
                     % (_acc, _layers[_i][0], _rx, _ry, _w0, _ln, _nl))
                 _acc = _nl
@@ -42819,83 +43208,78 @@ class FFmpegBatchGUI:
                 if i != _grp_ok[_grp_of[i]]["base"]:
                     continue
                 _gid = _grp_of[i]
-                # 🔴 模型 B / C1：组内主的 旋转 / 轨迹缩放 / 定位 在**组节点**上表达
-                #    ⇒ 作用于整组（组员一起转 / 一起缩 / 一起移位）。这些段已在内容腿跳过
-                #    （阶段 A 传 group_base=True）。_pip_overlay_xy 的旋转中心补偿按组内主
-                #    内容盒算 —— 与组画布尺寸同源，故落位与「未编组时组内主」完全一致。
-                _bmeta = _layers[_grp_ok[_gid]["base"]][1]
-                # 🔴 2026-10-16：父行的**静态角度**是**组级字段** `grp_rot_angle`（存在组内主，
-                #    与 grp_dx/grp_dy 同族）—— 父行 = 独立素材 ⇒ 它的旋转必须作用于**整组**，
-                #    且**不写成员自己的 rotate_angle**（否则成员各自再转一次 = 双重旋转）。
-                #    有点角度时用一份**副本**接管：`_group_node_transform_parts` 判据走
-                #    `overlay_rotation_active(sub_settings)`、中心补偿走 `meta["ra"]`，
-                #    两处都要看到组级角度；缺省（无此键）逐字符不变（老工程零回归）。
-                _gra = _opt_float((sub_settings or {}).get("grp_rot_angle", 0) or 0, 0.0)
-                _gs = sub_settings
+                # 🔴 模型 B/C1 → **解耦**（2026-10-18）：组内主的旋转 / 自旋 / 轨迹缩放 /
+                #    透明度全部**只作用它自己**（内容腿不再按 `group_base` 跳过，见
+                #    `_build_sub_layer_node`）。组节点（整只包装盒）的姿态**只认父行** ——
+                #    父行 = 组虚拟行 = 一条独立素材 = 组的化身。
+                #    ⚠️ 下面 `_bmeta` / `_gs` **不再**取组内主内容腿的 meta / enc_settings
+                #    （那正是「组内主开自旋 → 整组跟着转、中心还是按盒子算」的根源）。
+                #    组内主的 overlay_x/y 仍作为**组的基准落位**使用（`_group_node_xy`
+                #    需要它算盒原点修正），但姿态四键全部归零。
+                _bmeta = dict(_layers[_grp_ok[_gid]["base"]][1] or {})
+                # 父行**静态角度** = 组级字段 `grp_rot_angle`（存父行素材项，与
+                # grp_dx/grp_dy 同族）⇒ 作用于**整组**，且**不写成员自己的 rotate_angle**
+                #（否则成员各自再转一次 = 双重旋转）。
+                _lvl = self._group_level_item(_gid)
+                _gra = _opt_float(_lvl.get("grp_rot_angle", 0) or 0, 0.0)
+                # 🔴 组内主继承来的姿态**清零**（解耦核心）：`spin_on`/`ra`/`wp_res`/
+                #    `wp_rot`/`wp_zoom` 五键归零 —— 组内主开自己的自旋/角度/轨迹缩放，
+                #    现在只在它自己那条腿生效，**不再带动整组**。
+                _bmeta["spin_on"] = False
+                _bmeta["ra"] = _gra
+                _bmeta["wp_res"] = None
+                _bmeta["wp_rot"] = False
+                _bmeta["wp_zoom"] = False
+                # `_gs` 同理：它只喂 `_group_node_transform_parts` 的判据
+                # （`overlay_rotation_active` / spin_speed）。**不能**用组内主的
+                # enc_settings —— 那会让组内主的 rotate_angle/spin_enabled 再次生效。
+                # 改为「空白 + 父行投影」，与解耦后的语义一致。
+                _gs = {"move_mode": "", "spin_enabled": False, "rotate_angle": 0.0}
                 if _gra:
-                    _gs = dict(sub_settings or {})
                     _gs["rotate_angle"] = _gra
-                    _bmeta = dict(_bmeta or {})
-                    _bmeta["ra"] = _gra
                 # 🔴 2026-10-16 第七轮②：**父行素材项的列表轨迹** → 组节点 overlay 的 x/y
                 #    时间表达式（唯一出处 `_group_material_wp_res`）。父行是**独立素材** ⇒
                 #    它的静态落位走 `grp_abs_x/y`、列表轨迹走时间表达式，与非组子视频
-                #    **同一条投影路线**。航点的旋转/缩放/透明度一并接进 meta —— 消费端
-                #    `_group_node_transform_parts` / `_pip_overlay_xy` 本就吃这几个键
-                #    （组内主自己的列表也走同一处），接上即作用于**整组**，无需新机制。
-                #    无列表（move_mode≠waypoints / 空）⇒ _mwp=None ⇒ 逐字符走老口径。
+                #    **同一条投影路线**。航点的旋转/缩放一并接进 meta —— 消费端
+                #    `_group_node_transform_parts` / `_pip_overlay_xy` 本就吃这几个键。
+                #    无列表（move_mode≠waypoints / 空）⇒ _mwp=None。
                 _gkey = self._group_final_label_key(_gid, len(_grp_ok[_gid]["mems"]))
                 _ts0_m, _sp0_m = _trim_speed_from_settings(main_settings)
                 _mwp = self._group_material_wp_res(
                     _gkey, _grp_ok[_gid]["geo"]["size"][0], _grp_ok[_gid]["geo"]["size"][1],
-                    trim_start=_ts0_m, speed_factor=_sp0_m)
+                    trim_start=_ts0_m, speed_factor=_sp0_m, gid=_gid)
                 if _mwp is not None:
-                    _bmeta = dict(_bmeta or {})
                     _bmeta["wp_res"] = _mwp
                     _bmeta["wp_rot"] = _mwp[2] is not None
                     _bmeta["wp_zoom"] = _mwp[3] is not None
                     # 🔴 2026-10-17（用户实测「父行轨迹里重绘的矩形和角度都无效」，角度部分）：
                     #   `overlay_rotation_active`（旋转判据唯一真相源）的「列表轨迹」分支被
                     #   `settings["move_mode"] == "waypoints"` 门禁 —— 而父行的轨迹住在
-                    #   **父行素材项**（`node_fx[key]`，投影），**不在** `sub_settings`
-                    #   （组内主的 enc_settings）里 ⇒ 那个门对父行恒 False ⇒ 即使
-                    #   `wp_rot=True` 传进去了也照样不插 rotate ⇒ 航点 ra/rb 画了也不生效
-                    #   （位移/缩放不受影响，它们不吃这个门）。
-                    #   修法：与上面 `grp_rot_angle → rotate_angle` **同款投影注入** —— 有
-                    #   父行轨迹时把 `move_mode` 补进 `_gs`（只给判据看的副本）。
-                    #   ⚠️ 只补进 `_gs`：它只喂 `_group_node_transform_parts`；
-                    #      `_group_node_xy` / `_pip_overlay_xy` 仍吃未改的 `sub_settings`
-                    #      ⇒ 不会让组内主自己被当成"有轨迹"而二次算一遍。
-                    _gs = dict(_gs or {})
+                    #   **父行素材项**（`node_fx[key]`，投影）⇒ 那个门对父行恒 False ⇒
+                    #   即使 `wp_rot=True` 传进去了也照样不插 rotate（用户实测航点 ra/rb
+                    #   画了不生效；位移/缩放不吃这个门，故不受影响）。
+                    #   修法：把 `move_mode` 补进 `_gs`（只给判据看的副本）。
                     _gs["move_mode"] = "waypoints"
-                # 🔴 2026-10-18（用户第 3 条：「父行不支持自己的自旋转和那几个预制轨迹，
-                #    开了无效」）：父行 = **独立素材**，它「叠加/偏移」页里的**自旋转**与
-                #    **预制轨迹**（h/v/diamond/corners）此前根本没有消费端 —— 存进
-                #    `node_fx[key][0]` 却没人读。这里与列表轨迹同一条「父行优先」投影：
-                #      · 预制轨迹 ⇒ 注入 `_gs["move_mode"]`（喂 `_group_node_transform_parts`
-                #        的旋转判据）+ `_group_node_xy(row_settings=_row_fx)`（喂 overlay
-                #        表达式；运动幅度按**包装盒**算）；组内主的列表轨迹整体让位
-                #        （否则 wp_res 的位移会与预制位移混在一起）；
-                #      · 自旋转   ⇒ `meta["spin_on"]=True` + `_gs` 里的 spin_speed；
+                # 🔴 2026-10-18（用户第 3 条）：父行 = **独立素材**，它「叠加/偏移」页里的
+                #    **自旋转**与**预制轨迹**（h/v/diamond/corners）⇒ 与列表轨迹同一条
+                #    父行投影路线：
+                #      · 预制轨迹 ⇒ 注入 `_gs["move_mode"]`（喂旋转判据）+
+                #        `_group_node_xy(row_settings=_row_fx)`（喂 overlay 表达式；运动
+                #        幅度按**包装盒**算）；父行的列表轨迹整体让位（否则 wp_res 的位移
+                #        会与预制位移混在一起）；
+                #      · 自旋转   ⇒ `_bmeta["spin_on"]=True` + `_gs` 里的 spin_speed；
                 #        角度由 spin 驱动 ⇒ 清 `wp_rot`（航点角度让位）。
                 #    只投影这 6 个键，成员 enc_settings 一字不动。
-                _row_fx = self._group_material_row_proj(_gkey)
+                _row_fx = self._group_material_row_proj(_gkey, gid=_gid)
                 if _row_fx:
-                    _gs = dict(_gs or {})
                     _gs.update(_row_fx)
-                    _bmeta = dict(_bmeta or {})
                     if _row_fx.get("spin_enabled"):
                         _bmeta["spin_on"] = True
                         _bmeta["wp_rot"] = False
                     if _row_fx.get("move_mode"):
-                        # 🔴 2026-10-18（审计发现）：父行**预制轨迹**是整组位移的唯一来源 ⇒
-                        #   组内主自己的列表轨迹必须**整体让位**（位移/航点角度/航点缩放/
-                        #   航点透明度全清）。旧判据 `and _mwp is None` 只在「组内主没有列表」
-                        #   时清 ⇒ 组内主与父行都配过时：位移虽被 `_pip_overlay_xy` 的
-                        #   预制分支自然忽略，但 `wp_rot/wp_zoom` 仍生效（角度/缩放叠到预制
-                        #   位移上）；更糟的是传给 `_group_node_xy` 的 wp_move 仍为 True ⇒
-                        #   `_group_node_xy` 跳过**盒原点修正 base** ⇒ 整组偏移 (base_dx,base_dy)。
-                        #   清 `_mwp` 同时修掉这两处（wp_move 随之为 False）。
+                        # 父行**预制轨迹**是整组位移的来源 ⇒ 列表轨迹整体让位（位移/航点
+                        # 角度/航点缩放全清）。清 `_mwp` 同时让 `wp_move` 回落 False
+                        # （恢复 `_group_node_xy` 的盒原点 base 修正，否则整组偏移 base_dx/dy）。
                         _mwp = None
                         _bmeta["wp_res"] = None
                         _bmeta["wp_rot"] = False
@@ -42912,14 +43296,14 @@ class FFmpegBatchGUI:
                 _gscaled = self._group_material_scaled_size(
                     _grp_ok[_gid]["geo"]["size"], _gkey)
                 _gx, _gy = self._group_place_xy(
-                    sub_settings,
+                    _gid,
                     *self._group_node_xy(
                         sub_file, sub_settings, _bmeta, _grp_ok[_gid]["geo"],
                         grp_scaled_size=_gscaled, wp_move=(_mwp is not None),
                         row_settings=_row_fx))
                 # 组级**绝对落位**（父行 X/Y 数字框）：有就覆盖，且与增量互斥
                 # （唯一出处 `_group_place_abs`；缺省 None ⇒ 老工程逐字符不变）
-                _absx, _absy = self._group_place_abs(sub_settings)
+                _absx, _absy = self._group_place_abs(_gid)
                 if _mwp is not None:
                     # 列表轨迹 = **逐帧**落位 ⇒ 静态绝对落位（X/Y 数字框）不参与
                     # （与 `_pip_overlay_xy` 里「航点取代 overlay_x/y」同一语义；两套相加必漂移）
@@ -43708,9 +44092,16 @@ class FFmpegBatchGUI:
         偏了 (d−w)/2。组节点那边 `rotate ow/oh=hypot(iw,ih)` 仍会把整盒（= 紧凑盒 PW×PH）
         旋转成 d×d（`_group_node_xy` 的中心对齐按 PW×PH→d 补偿），语义完全一致。
 
-        ⚠️ 只算**静态**几何：列表轨迹 / 轨迹位移的成员按「起点位置」计（全时段极值见
-        research/pip-group-nest/README.md §13-5「组画布包围盒必须含旋转包装盒与轨迹全时段
-        极值」，未做——需要时在这里补采样求并集）。
+        🔴 **动态成员取全时段包络**（2026-10-18 用户拍板「A+a / 主画布域」）：组内子带
+        生效的位移轨迹（列表航点 / 预制四模式）时，它的位置是 t 的函数 —— 只按起点算会让
+        包装盒装不下它的运动范围，轨迹一飞出去就被组画布裁掉（视觉上「飞一半消失」）。
+        这里用**端点采样**求外接矩形（`_blend_wp_place_rects` / `_blend_move_envelope`，
+        与 blend 静态包围盒同一批纯函数，O(段数) 不逐帧）：
+          · 列表轨迹：航点端点的并集（含 z(t) 缩放）—— 紧凑而精确；
+          · 预制四模式：`build_move_xy_expr` 把它们夹在画布内 ⇒ 包络≈整幅主画布。
+        用户已确认「包装盒变成整个原始主画布问题不大」（真实帧 + 放开边界仍可自由摆）。
+        🔴 2026-10-18（解耦）：全时段包络现在对**所有成员**（含组内主）一视同仁 ——
+           组内主的位移轨迹同样只作用它自己，包装盒必须装得下它的运动范围。
         """
         _cw, _ch = self._overlay_content_size(sub_file, sub_settings)
         _W, _H = canvas
@@ -43721,12 +44112,55 @@ class FFmpegBatchGUI:
             _content_box_expr(sub_settings.get('overlay_y', '0') or '0', _cw, _ch), _ctx)
         if _x is None or _y is None:
             return None
-        if (sub_settings or {}).get("is_grp_base"):
-            # 组内主：姿态（旋转/轨迹缩放）在组节点上表达 ⇒ 盒内它占内容盒（无中心偏移）
-            return (float(_x), float(_y), float(_cw), float(_ch))
+        # 🔴 2026-10-18（解耦）：**组内主不再有特例** —— 它的旋转/自旋/轨迹缩放回到
+        #    自己那条腿（内容腿不再按 `group_base` 跳过）⇒ 它在组画布内的占位与其他
+        #    成员完全同构：`_overlay_sub_size`（旋转时 d×d）+ `_content_box_shift` 中心
+        #    对齐 + 位移轨迹的全时段包络。
+        #    旧特例（返回内容盒、跳过后两段）的前提是「组内主在盒内恒为静态内容盒」，
+        #    解耦后该前提不成立 ⇒ 继续走老路会让旋转后的组内主被组画布裁掉一角。
         _sw, _sh = self._overlay_sub_size(sub_file, sub_settings)
         _offx, _offy = _content_box_shift(_cw, _ch, _sw, _sh)
-        return (float(_x) - _offx, float(_y) - _offy, float(_sw), float(_sh))
+        _rect = (float(_x) - _offx, float(_y) - _offy, float(_sw), float(_sh))
+        _env = self._group_member_motion_rect(
+            sub_settings, canvas, (_sw, _sh), (_offx, _offy), _x, _y)
+        if _env is None:
+            return _rect
+        _u = _blend_rect_union([(_rect[0], _rect[1], _rect[0] + _rect[2], _rect[1] + _rect[3]),
+                                (_env[0], _env[1], _env[0] + _env[2], _env[1] + _env[3])])
+        if _u is None:
+            return _rect
+        return (_u[0], _u[1], _u[2] - _u[0], _u[3] - _u[1])
+
+    def _group_member_motion_rect(self, settings, canvas, box_wh, off_xy, base_x, base_y):
+        """组内子**位移轨迹的全时段占位外接矩形** (x, y, w, h)（真主画布坐标）；无轨迹 → None。
+
+        唯一出处，只被 `_group_member_rect` 调用（几何 → 组画布尺寸 → 组节点落位全链路）。
+        · box_wh：**叠加盒**尺寸（旋转时 d×d，=`_overlay_sub_size`）；
+        · off_xy：叠加盒相对内容盒的中心对齐偏移（=`_content_box_shift`）；
+        · base_x/base_y：内容盒左上角（`overlay_x/y` 主画布域求值结果）。
+        三者与 `_pip_overlay_xy` 严格同口径 —— 否则包络与实际落位差半个旋转盒。
+
+        ⚠️ 航点表达式**不做全局 clamp**（`build_waypoint_expr` 注释：插值天然在段内两端点
+           之间），所以列表轨迹的包络可能超出画布 —— 这正是要取真实并集而非「整幅画布」的
+           原因（超界航点若按画布算会被裁）。
+        """
+        if not isinstance(settings, dict):
+            return None
+        if self._group_has_list_traj(settings):
+            _rects = _blend_wp_place_rects(settings.get("move_waypoints"),
+                                           box_wh[0], box_wh[1], off_xy[0], off_xy[1])
+        else:
+            _mv = str(settings.get("move_mode") or "").strip()
+            if _mv not in self._GROUP_MOVE_PRESETS:
+                return None
+            # base 是内容盒左上 ⇒ 换成叠加盒左上（减中心偏移）再求包络
+            _rects = _blend_move_envelope(
+                _mv, canvas[0], canvas[1], box_wh[0], box_wh[1],
+                float(base_x) - float(off_xy[0]), float(base_y) - float(off_xy[1]))
+        _u = _blend_rect_union(_rects)
+        if _u is None:
+            return None
+        return (_u[0], _u[1], _u[2] - _u[0], _u[3] - _u[1])
 
     def _group_box_geometry(self, members, main_settings=None, main_file_path=None,
                             canvas=None):
@@ -43771,14 +44205,18 @@ class FFmpegBatchGUI:
         _pw = max(2, int(_pw + 0.5)) + (max(2, int(_pw + 0.5)) % 2)
         _ph = max(2, int(_ph + 0.5)) + (max(2, int(_ph + 0.5)) % 2)
         _rot = None
-        # 组级角度 `grp_rot_angle`（存在组内主，与 grp_dx/grp_dy 同族）：父行 = **独立素材**
-        # ⇒ 它的旋转作用于**整组**、且**不写成员自己的 rotate_angle**（否则成员各自再转一次）。
-        # 缺省（老工程）不写这个键 ⇒ 判据与改动前逐字符一致（零回归）。
-        _rs = dict(_ms[_bi][1])
-        _gra = _opt_float(_rs.get("grp_rot_angle", 0) or 0, 0.0)
-        if _gra:
-            _rs["rotate_angle"] = _gra
-        if overlay_rotation_active(_rs):
+        # 🔴 2026-10-18（解耦）：`rot`（组节点旋转后的 d×d 包装盒）只由**父行**的旋转决定。
+        #    旧判据读**组内主**的 `overlay_rotation_active` ⇒ 组内主自己开自旋就把整盒撑成
+        #    1.41 倍正方形（用户实测「组内主开自旋，中心不对、带着整个包装盒旋转」）。
+        #    解耦后组内主的旋转回到它自己那条腿（`_build_sub_layer_node` 内容腿），
+        #    组节点的旋转只来自父行（`grp_rot_angle` + 父行自旋）。
+        #    父行 = 独立素材 ⇒ 它的旋转作用于**整组**、且**不写成员自己的 rotate_angle**。
+        #    缺省（无父行旋转）⇒ `_rot=None`，与改动前逐字符一致。
+        _gid_m = str((_ms[0][1] or {}).get("grp") or "").strip()
+        _lvl_m = self._group_level_item(_gid_m)
+        _gra = _opt_float(_lvl_m.get("grp_rot_angle", 0) or 0, 0.0)
+        _psp = _opt_float(_lvl_m.get("spin_speed", 60.0) or 60.0, 60.0)
+        if _gra or (bool(_lvl_m.get("spin_enabled", False)) and _psp != 0):
             _d = max(2, int(round((_pw * _pw + _ph * _ph) ** 0.5)))
             _rot = (_d, _d)
         return {
@@ -43788,6 +44226,9 @@ class FFmpegBatchGUI:
             "rel": [(r[0] - _ox, r[1] - _oy, r[2], r[3]) for r in _rects],
             "base": (float(_rects[_bi][0] - _ox), float(_rects[_bi][1] - _oy)),
             "rot": _rot,
+            # (W, H) 求值域（真输出画布，含 pad）—— 动态成员的定位表达式要把 `W`/`H`
+            # 换成这两个常量（组画布内 overlay 的 W/H 是**盒**尺寸，不是主画布）。
+            "canvas": (float(canvas[0]), float(canvas[1])),
         }
 
 
@@ -48769,6 +49210,13 @@ class FFmpegBatchGUI:
             _want_group = (bool(getattr(filt_frame, "group_box_edit", False))
                            or bool(_fx_key)
                            or bool(getattr(filt_frame, "group_label_edit", None)))
+            # 🔴 2026-10-18（用户报「组内主/子视频的坐标编辑器也传包装盒」）：
+            #   `_want_group` 只能认**父行标记**（group_box_edit / group_fx_key_edit /
+            #   group_label_edit，由 `edit_video_settings` 对父行入口专挂）。**组内成员**
+            #   走的是普通成员编辑窗，不挂任何组标记，但它的轨道自带 `grp`（`_gid` 非空）
+            #   ⇒ 若把 `_gid` 也算进组语境判据，成员会被误判成 `group_box`，坐标编辑器
+            #   就用包装盒尺寸 + 合成帧，而不是它自己的原始尺寸 + 原始帧（用户要的是后者）。
+            #   ⇒ 组语境判定**只看 `_want_group`**，`_gid` 只用于「已是组语境后」反查组 id。
             # 轨道对象（组指纹载体）：VideoFilterFrame.set_track 灌的是 current_track；
             # OverlayPositionFrame 另有 track_obj。两者取到谁算谁。
             _gt = getattr(filt_frame, "track_obj", None) or getattr(
@@ -48782,7 +49230,7 @@ class FFmpegBatchGUI:
             #      标记 + 标签现查组，不能只依赖 track。这样遮罩 / delogo / 简易位置 / 裁剪
             #      这些「像素域编辑器」无需各自判断是否成组。
             _evs_all = None
-            if _want_group or _gid:
+            if _want_group:
                 with suppress(Exception):
                     _evs_all = self._get_enabled_video_tracks()
             # 🔴 2026-10-16（用户第 3 条）：**组最终标签自带组 id** ⇒ 直接正则解析，
@@ -48815,7 +49263,7 @@ class FFmpegBatchGUI:
                             _gid = _g
                             _gt = self._merge_group_base_track(_t, _evs_all) or _mems_g[0]
                             break
-            if _box is None and _gid and _gt is not None and not force:
+            if _want_group and _box is None and _gid and _gt is not None and not force:
                 with suppress(Exception):
                     _box = self._group_composite_box(_gt, _evs_all or self._get_enabled_video_tracks())
             # 没有 _fx_key 但已知组 ⇒ 现算 label（`_merge_group_row_label` 唯一出处）
@@ -49079,7 +49527,14 @@ class FFmpegBatchGUI:
     
     def _draw_background(self, canvas, canvas_w, canvas_h, scale, main_track, sub_tracks,
                          offset_x, offset_y, main_render_size, current_edit_track=None, tag="bg",
-                         scale_y=None, group_box=None):
+                         scale_y=None, group_box=None, grp_rects=None):
+        """位置编辑器背景层：主视频内容框（蓝）+ 其他子视频框（绿/粉）+ 组包装盒（橙）。
+
+        grp_rects：2026-10-18 新增，`{track: (x, y, w, h)}`（**真主画布**坐标）。
+          命中者按该矩形画（组内成员 = 「包装盒原点 + rel」，唯一出处
+          `_editor_ref_rects`）；未命中者仍走自己的 overlay_x/y 表达式（老口径）。
+          None / {} ⇒ 逐字节等于改动前。
+        """
         canvas.delete(tag)
         if main_render_size:
             main_w, main_h = main_render_size
@@ -49112,35 +49567,57 @@ class FFmpegBatchGUI:
             # 定位语义（2026-08-26 统一）：overlay_x/y 的 w/h 恒为内容盒（sw/sh）；
             # 旋转时 d×d 正方形自动居中（锚点=内容盒左上角），虚线框=内容矩形本身
             _ra_sub = _opt_float(sub.enc_settings.get("rotate_angle", 0) or 0, 0.0)
-            x_expr = sub.enc_settings.get('overlay_x', '0')
-            y_expr = sub.enc_settings.get('overlay_y', '0')
-            x_val = safe_eval_expr(x_expr, {"W": canvas_w, "H": canvas_h, "w": sw, "h": sh})
-            y_val = safe_eval_expr(y_expr, {"W": canvas_w, "H": canvas_h, "w": sw, "h": sh})
-            if x_val is None or y_val is None:
-                continue
-            x_val = max(0, min(x_val, canvas_w - sw))
-            y_val = max(0, min(y_val, canvas_h - sh))
+            # 🔴 2026-10-18：**组内成员**（grp_rects 命中）坐标 = 「包装盒原点 + rel」——
+            #   与导出阶段 A3 的 `xy_override=rel` 同源（`_group_box_geometry` 唯一出处）。
+            #   绝不能拿它自己的 overlay_x/y 在主画布 W/H 域求值：组成员存的是**包装盒内
+            #   相对坐标**，那样会把它画到画布左上角附近（用户报「组内子位置看不到」的真因），
+            #   再经下方 clamp 一压就彻底贴在边上。
+            #   矩形直接取 rel 的 w/h（已是导出占位盒，含旋转包装）⇒ 不再二次旋转。
+            _gr = grp_rects.get(sub) if grp_rects else None
+            if _gr is not None:
+                x_val = float(_gr[0])
+                y_val = float(_gr[1])
+                sw = max(1.0, float(_gr[2]))
+                sh = max(1.0, float(_gr[3]))
+                _ra_sub = 0.0
+                _is_grp_mem = True
+            else:
+                _is_grp_mem = False
+                x_expr = sub.enc_settings.get('overlay_x', '0')
+                y_expr = sub.enc_settings.get('overlay_y', '0')
+                x_val = safe_eval_expr(x_expr, {"W": canvas_w, "H": canvas_h, "w": sw, "h": sh})
+                y_val = safe_eval_expr(y_expr, {"W": canvas_w, "H": canvas_h, "w": sw, "h": sh})
+                if x_val is None or y_val is None:
+                    continue
+                x_val = max(0, min(x_val, canvas_w - sw))
+                y_val = max(0, min(y_val, canvas_h - sh))
+            # 2026-10-18：组内成员用粉紫区分（绿=组外子视频，橙=包装盒）——
+            #   用户要能一眼看出「这个框是同组的兄弟」还是「组外独立子视频」。
+            _ocol = "#FF66CC" if _is_grp_mem else "lightgreen"
+            _mcol = "#FF66CC" if _is_grp_mem else "red"
             if _ra_sub != 0:
                 # 画旋转后的内容多边形（内容矩形以内容中心=旋转正方形中心为中心绕 rotate_angle 旋转）
                 cx, cy = x_val + sw / 2.0, y_val + sh / 2.0
                 pts = rotate_rect_polygon(cx - sw / 2.0, cy - sh / 2.0, sw, sh, _ra_sub)
                 cpts = [tuple(self._to_canvas_coords(px, py, scale, scale_y)) for px, py in pts]
-                canvas.create_polygon(cpts, outline="lightgreen", width=2, dash=(4, 4), fill="", tags=tag)
+                canvas.create_polygon(cpts, outline=_ocol, width=2, dash=(4, 4), fill="", tags=tag)
                 _sx0 = min(p[0] for p in cpts)
                 _sy0 = min(p[1] for p in cpts)
                 _sy1 = max(p[1] for p in cpts)
             else:
                 cx1, cy1 = self._to_canvas_coords(x_val, y_val, scale, scale_y)
                 cx2, cy2 = self._to_canvas_coords(x_val + sw, y_val + sh, scale, scale_y)
-                canvas.create_rectangle(cx1, cy1, cx2, cy2, outline="lightgreen", width=2, dash=(4, 4), fill="", tags=tag)
+                canvas.create_rectangle(cx1, cy1, cx2, cy2, outline=_ocol, width=2, dash=(4, 4), fill="", tags=tag)
                 _sx0, _sy0, _sy1 = cx1, cy1, cy2
             # ⚠️ 2026-10-12：序号由「框内左上角」改挂**框外侧**（上方；贴顶时下方）——
             #   子视频缩放较小时框内那 1~2 位红色编号同样会压住框内容，与活动框的
             #   "当前子视频" label 同一诉求、同一处理（判据与 _generic_overlay_editor 一致）。
             _s_up = _sy0 > 20
             canvas.create_text(max(0, _sx0), (_sy0 - 3) if _s_up else (_sy1 + 2),
-                               anchor="sw" if _s_up else "nw", text=str(sub_order[sub]),
-                               fill="red", font=("Arial", 10, "bold"), tags=tag)
+                               anchor="sw" if _s_up else "nw",
+                               text=((_("%d 组内") % sub_order[sub]) if _is_grp_mem
+                                     else str(sub_order[sub])),
+                               fill=_mcol, font=("Arial", 10, "bold"), tags=tag)
         # 组范围虚线框（2026-10-15，用户要求）：编辑组内成员时把**组的组合包围盒**画出来，
         # 让用户看清"这一组总共占主画布哪一块"。纯显示 —— 位置编辑器仍拖**本轨自己**，
         # 组的整体落位请到「视频节点」拖组合框（该框的坐标已含组内相对偏移）。
@@ -49157,6 +49634,49 @@ class FFmpegBatchGUI:
 
 
     # ---------- 通用公共位置可视化编辑器函数 ----------
+    def _editor_ref_rects(self, track, enabled_videos=None):
+        """组内成员在**真主画布**上的矩形 —— 位置编辑器参考框专用（唯一出处）。
+
+        返回 `{track_obj: (x, y, w, h)}`（float，主画布像素）。`track` 自己不在表里
+        （它由活动框/幽灵框表达）；不成组 / 几何求不出 → `{}`（调用方逐字节走老口径）。
+
+        🔴 为什么必须有它（2026-10-18 用户报「组内子视频的位置看不到」）
+          · 组成员在**导出**时按 `rel`（包装盒内相对坐标）定位 —— 阶段 A3 的
+            `xy_override=rel`，见 `_group_box_geometry` 的 "rel"；
+          · 而 `_draw_background` 旧实现拿成员自己的 `overlay_x/y` 在**主画布** W/H 域
+            求值、再 clamp 进画布 ⇒ 组内子被画到画布左上角附近（越界还被压到边上）。
+          ⇒ 主画布矩形 = 「包装盒原点（已含组级落位，`_group_composite_box` 的 x/y）
+             + rel」。几何一律问 `_group_box_geometry`，此处**不**另行现算。
+        """
+        _out = {}
+        if track is None:
+            return _out
+        evs = (enabled_videos if enabled_videos is not None
+               else self._get_enabled_video_tracks())
+        mems = self._group_members(track, evs)
+        if len(mems) < 2:
+            return _out
+        _main = evs[0] if evs else None
+        _canvas = self._get_canvas_size(_main) if _main is not None else None
+        if not _canvas or _canvas[0] < 2:
+            return _out
+        try:
+            geo = self._group_box_geometry(
+                [(t.file_path, t.enc_settings) for t in mems], canvas=_canvas)
+            box = self._group_composite_box(track, evs)
+        except Exception:
+            return _out
+        if geo is None or box is None:
+            return _out
+        _bx, _by = float(box[0]), float(box[1])     # 盒原点（已含 grp_dx/grp_dy 与绝对落位）
+        for _t, _r in zip(mems, geo["rel"]):
+            if _t is track:
+                continue
+            _out[_t] = (_bx + float(_r[0]), _by + float(_r[1]),
+                        max(1.0, float(_r[2])), max(1.0, float(_r[3])))
+        return _out
+
+
     def _generic_overlay_editor(self, parent, canvas_w, canvas_h,
                                 rect_x, rect_y, rect_w, rect_h,
                                 on_apply, title=None,
@@ -50338,7 +50858,10 @@ class FFmpegBatchGUI:
                 # 内容中心相对画布中心的偏移（= 原始模型 sx/sy；内容盒左上角 current_x/y + 半宽）
                 kx = current_x + current_w / 2.0 - canvas_w / 2.0
                 ky = current_y + current_h / 2.0 - canvas_h / 2.0
-                sc = (current_w / content_src_w) if content_src_w > 0 else 1.0
+                # ⚠️ 2026-10-19：`content_src_w` 允许为 None（调用方只想给「内容帧」、
+                #   不需要「缩放 (倍率)」滑块时会传 None）—— 旧写法 `content_src_w > 0`
+                #   在 None 上直接 TypeError，被外层 `except: pass` 吞掉 ⇒ 框内静默空白。
+                sc = (current_w / content_src_w) if (content_src_w and content_src_w > 0) else 1.0
                 # ---- 合成模式快捷路径：几何**完全没变** → 直接跳过（顺带恢复可见）----
                 # ⚠️ 与上一版不同：内容帧是叠在背景上合成好的**整帧**，位置一变整张图就变，
                 #    所以 x/y 也参与判定 —— 不能再靠「只挪图」省 ffmpeg（那样背景不动、
@@ -51782,10 +52305,14 @@ class FFmpegBatchGUI:
                                                             # 透传 `_generic_overlay_editor`；给了它 ⇒ 内容帧
                                                             # **零磁盘**（不 seek 源文件、不写临时文件）。
                                                             # 与 content_file 二选一，**本参数优先**。
-                                  content_chroma_settings=None):  # 2026-10-11：虚拟框内渲染绿幕——
+                                  content_chroma_settings=None,  # 2026-10-11：虚拟框内渲染绿幕——
                                                             # 子视频轨 enc_settings（含 chroma_enabled 等），
                                                             # 透传 _generic_overlay_editor；None=不接（旧调用零变化）。
-                                                            # ⚠️ 放签名最末（旧的按位置传参不受影响）。
+                                  bg_ref_draw=None):        # 2026-10-18：**落位参考框**绘制器
+                                                            # signature(canvas, scale_x, scale_y=None)。
+                                                            # 与 bg_shape_outlines（遮罩形状轮廓）**并存**：
+                                                            # 两条都调，互不覆盖。None=旧行为。
+                                                            # ⚠️ 必须放签名最末（旧的按位置传参不受影响）。
         """
         水印可视化编辑器，支持回写位置和缩放尺寸，以及更新水印字典和滤镜框架。
         free_layout=True 时放开边界（子视频可拖出画布、可比主视频大）。
@@ -51852,7 +52379,7 @@ class FFmpegBatchGUI:
                 filt_frame.scale_method.set("exact")
                 filt_frame.scale_width.set(str(new_w))
                 filt_frame.scale_height.set(str(new_h))
-            self._append_info_ui(_('[可视化-水] 已保存位置: ({0}, {1}) 尺寸: {2}x{3}').format(new_x, new_y, new_w, new_h))
+            self._append_info_ui(f"[可视化-水] 已保存位置: ({new_x}, {new_y}) 尺寸: {new_w}x{new_h}")
 
         def apply_wm_angle(new_angle):
             # 2026-09-02：轨迹航点编辑——angle_cb 优先（写回航点 ra/rb），否则回退水印静态旋转
@@ -51894,9 +52421,23 @@ class FFmpegBatchGUI:
                                          lambda px, py: (px * scale_x, py * _sy),
                                          tag="mask_outline")
 
+        # 2026-10-18：**落位参考框**（主视频内容框 / 其他子视频 / 组包装盒）与遮罩形状轮廓
+        # **并存** —— 两条绘制器都调一遍，互不覆盖。任一方为 None ⇒ 行为等于改动前。
+        # 背景：`_generic_overlay_editor` 只允许一个 bg_draw_func，故此处合成。
+        if _shape_outline_drawer is not None or bg_ref_draw is not None:
+            def _bg_draw_all(canvas, scale_x, scale_y=None):
+                if bg_ref_draw is not None:
+                    with suppress(Exception):
+                        bg_ref_draw(canvas, scale_x, scale_y)
+                if _shape_outline_drawer is not None:
+                    with suppress(Exception):
+                        _shape_outline_drawer(canvas, scale_x, scale_y)
+        else:
+            _bg_draw_all = None
+
         self._generic_overlay_editor(parent or self.root, canvas_w, canvas_h,
                                      rect_x, rect_y, wm_w, wm_h,
-                                     _cb, title, aspect, bg_draw_func=_shape_outline_drawer,rect_label=_('水印'),
+                                     _cb, title, aspect, bg_draw_func=_bg_draw_all,rect_label=_('水印'),
                                      min_visible_pixels=0,show_scale_tip=True,
                                      allow_negative_offset=free_layout,
                                      free_layout_var=free_layout_var,
@@ -52028,10 +52569,11 @@ class FFmpegBatchGUI:
         _ox, _oy = geo["origin"]
         _pw, _ph = geo["size"]
         # 组级落位增量（唯一出处 _group_place_delta；缺省 0 ⇒ 老工程逐像素不变）
-        _base_t = self._merge_group_base_track(track, evs) or mems[0]
-        _ddx, _ddy = self._group_place_delta(_base_t.enc_settings)
+        # 🔴 2026-10-18：数据源 = **父行**素材项（不再读组内主 enc_settings）。
+        _gid = str((getattr(track, "enc_settings", None) or {}).get("grp") or "").strip()
+        _ddx, _ddy = self._group_place_delta(_gid)
         # 组级**绝对落位**（父行 X/Y 数字框）：有就覆盖，缺省/非法 → 走增量
-        _ax, _ay = self._group_place_abs(_base_t.enc_settings)
+        _ax, _ay = self._group_place_abs(_gid)
         # 绝对落位若是**表达式**（如 `W-w-10`）就求不出数 ⇒ 画框回退到增量位置；
         # 构建器那边仍是原样字符串，成片不受影响（只是虚线框位置不精确）。
         _gx = _ax if isinstance(_ax, float) else float(_ox) + _ddx
@@ -52296,13 +52838,16 @@ class FFmpegBatchGUI:
                 #    反推会算出错误的增量。
                 _ndx = round(float(new_x) - float(_grp_box[6]), 3)
                 _ndy = round(float(new_y) - float(_grp_box[7]), 3)
-                _es = _grp_place_base.enc_settings
-                _es["grp_dx"] = "%g" % _ndx
-                _es["grp_dy"] = "%g" % _ndy
-                # 拖动写的是**增量** ⇒ 若之前用父行 X/Y 定过绝对落位，此处作废
-                # （两者互斥，避免"拖完又跳回旧绝对值"）。
-                _es.pop("grp_abs_x", None)
-                _es.pop("grp_abs_y", None)
+                # 🔴 2026-10-18：组级增量写**父行**素材项（不再写组内主 enc_settings）。
+                # gid 从组落位宿主（组内主）的组身份取 —— 宿主恒在，key 恒可算。
+                _grp_gid = str((getattr(_grp_place_base, "enc_settings", None) or {})
+                                .get("grp") or "").strip()
+                if _grp_gid:
+                    self._group_material_set(self._group_final_label_key(_grp_gid, 0),
+                                             grp_dx="%g" % _ndx, grp_dy="%g" % _ndy)
+                    # 拖动写的是**增量** ⇒ 若之前用父行 X/Y 定过绝对落位，此处作废
+                    # （两者互斥，避免"拖完又跳回旧绝对值"）。
+                    self._group_level_pop(_grp_gid, "grp_abs_x", "grp_abs_y")
                 # 🔴 2026-10-16 二轮：**缩放把手照常生效**（父行 = 独立素材 ⇒ 没有新规则）。
                 #    写进父行的素材设置（node_fx），由 node_material_chain 渲染成 scale=。
                 #    与「包装盒尺寸」不同才写（拖动只挪位置时会带回原尺寸，不必脏化设置）。
@@ -52350,7 +52895,7 @@ class FFmpegBatchGUI:
                 filt_frame.scale_height.set(str(new_h))
             track.overlay_enabled = True
             self.merge_refresh_ui()
-            self._append_info_ui(_('[可视化-从] 已保存位置: ({0}, {1}) 大小: {2}x{3}').format(new_x, new_y, new_w, new_h))
+            self._append_info_ui(f"[可视化-从] 已保存位置: ({new_x}, {new_y}) 大小: {new_w}x{new_h}")
 
         def apply_angle(new_angle):
             """编辑器「应用」时写回旋转角度。
@@ -52366,11 +52911,17 @@ class FFmpegBatchGUI:
             if _grp_place_base is not None and group_fx_key:
                 _ang = float(new_angle or 0.0)
                 self._group_material_set(group_fx_key, rotate_angle=_ang)
-                _es = _grp_place_base.enc_settings
-                if _ang:
-                    _es["grp_rot_angle"] = _ang
-                else:
-                    _es.pop("grp_rot_angle", None)
+                # 🔴 2026-10-18：组级角度与 grp_dx/grp_dy 同族，一并搬进**父行**素材项
+                # （`grp_rot_angle` 与 `rotate_angle` 同住第 0 项 —— 前者是渲染侧读取口径，
+                #  后者是设置窗/重开编辑器的预填源，两者本就同义，见 `_merge_group_apply_row_rot`）。
+                _grp_gid = str((getattr(_grp_place_base, "enc_settings", None) or {})
+                                .get("grp") or "").strip()
+                if _grp_gid:
+                    if _ang:
+                        self._group_material_set(
+                            self._group_final_label_key(_grp_gid, 0), grp_rot_angle=_ang)
+                    else:
+                        self._group_level_pop(_grp_gid, "grp_rot_angle")
             else:
                 track.enc_settings['rotate_angle'] = float(new_angle or 0.0)
             if ov_angle_var is not None:
@@ -52389,7 +52940,7 @@ class FFmpegBatchGUI:
             offset_y = safe_eval_expr(off_y_expr, {"W": canvas_w, "H": canvas_h}) or 0
         else:
             offset_x, offset_y = 0, 0
-        extra_info = _('主视频偏移: X={0}, Y={1}').format(offset_x, offset_y)
+        extra_info = f"主视频偏移: X={offset_x}, Y={offset_y}"
         if _grp_box is not None:
             extra_info += (_("\n组范围: %dx%d @ (%d, %d)（虚线框）；拖动本框 = 整组平移"
                            "（写组级增量，成员坐标不动）")
@@ -52427,12 +52978,23 @@ class FFmpegBatchGUI:
             # 背景底 = 主视频（_resolve_editor_bg 唯一口径）；子视频列表恢复 enabled_videos[1:]
             main_render_size = (self._get_video_render_size(_bg_track)
                                 or (canvas_w, canvas_h))
+            # 2026-10-18：**参考框**恒显示（用户「按现在实现无需开关」）——
+            #   主视频内容框（蓝）+ 其他子视频绿框 + 组包装盒橙框都画。
+            #   只影响显示，不改任何数据、不改导出。
             self._draw_background(canvas, canvas_w, canvas_h, scale_x, _bg_track,
-                                  enabled_videos[1:], offset_x, offset_y, main_render_size,
+                                  enabled_videos[1:],
+                                  offset_x, offset_y, main_render_size,
                                   current_edit_track=track, tag="bg", scale_y=scale_y,
-                                  group_box=(_grp_box[:4] if _grp_box is not None else None))
+                                  group_box=(_grp_box[:4] if _grp_box is not None else None),
+                                  # 2026-10-18：组内成员按「盒原点 + rel」画（唯一出处
+                                  # `_editor_ref_rects`）。非组语境 → {} ⇒ 老口径逐字节不变。
+                                  # 🔴 2026-10-19 修：原先这里还挂着 `if _ref_on else {}`，
+                                  #   但参考框开关早已移除、`_ref_on` 不存在 ⇒ draw_bg 一进来
+                                  #   就 NameError，又被 _invoke_bg_draw 的 except 静默吞掉 ——
+                                  #   主视频/子视频/组盒 辅助框全部消失且无任何报错。
+                                  grp_rects=self._editor_ref_rects(track, enabled_videos))
     
-        title = _('可视化编辑叠加位置 - {0}').format(os.path.basename(track.file_path))
+        title = f"可视化编辑叠加位置 - {os.path.basename(track.file_path)}"
         if _gc_png:
             title = _("可视化编辑组整体位置 - 组 %s（%dx%d）") % (
                 str(track.enc_settings.get("grp") or "").strip() or "?",
@@ -57584,13 +58146,14 @@ class FFmpegBatchGUI:
         与 _open_pattern_generator 平行（不动已上线的颜色 / 图案对话框，零回归）。
         三个维度自由组合：方向 倒计时/正计时 × 样式 秒/帧/时间码/时钟 × 背景 无/转盘。
         转盘 = nullsrc + geq 逐像素生成（灰白扇区随 T 扫掠 + 双白环 + 十字线），数字走 drawtext。
+        2026-10-19：转盘新增「渲染质量」滑块（_COUNTDOWN_DIAL_RATIO），低比例低分辨率生成再放大。
         """
         win = tk.Toplevel(self.root)
         win.title(_("生成倒计时（虚拟轨道）"))
         win.transient(self.root)
         win.grab_set()
         win.resizable(False, False)
-        center_window(win, 430, 390)
+        center_window(win, 430, 430)
 
         is_edit = initial_track is not None
         _init = _parse_gen_source(initial_track.file_path) if is_edit else None
@@ -57656,16 +58219,32 @@ class FFmpegBatchGUI:
         d_var = tk.StringVar(value=f"{init_dur:.3f}")
         ttk.Entry(r4, textvariable=d_var, width=10).grid(row=0, column=1, padx=(0, 6))
 
+        # 转盘渲染质量（仅 bg=转盘 生效）：滑块控制「生成高度占输出高度的比例」。
+        # 100% = 全分辨率（旧清晰版，锐利但 1080p ~0.5x 实时）；越低越快但边缘略虚。
+        r5 = _mk_row()
+        ttk.Label(r5, text=_("转盘质量:")).grid(row=0, column=0, padx=(0, 4))
+        q_var = tk.DoubleVar(value=round(_COUNTDOWN_DIAL_RATIO * 100.0))
+        q_label = ttk.Label(r5, text="%.0f%%" % q_var.get(), width=6)
+        q_scale = ttk.Scale(r5, from_=33, to=100, orient=tk.HORIZONTAL, length=180,
+                            variable=q_var,
+                            command=lambda _v: q_label.config(text="%.0f%%" % q_var.get()))
+        q_scale.grid(row=0, column=1, padx=(0, 4))
+        q_label.grid(row=0, column=2)
+        ToolTip(q_scale, _("转盘表盘生成分辨率占输出高度的比例。\n"
+                "100% = 全分辨率（旧规格，锐利但慢）；越低越快、边缘略虚。\n"
+                "仅「背景 = 转盘」时生效。"), wraplength=370)
+
         tip = ttk.Label(
             frm,
             text=_("倒计时以「时长」为零点，正计时从 0 起；\n"
                  "生成源无音频，导出容器 / 编码器口径与颜色源一致。\n"
-                 "⚠️ 转盘背景在高分辨率（如 1080p）预览时会周期性卡顿：\n"
-                 "逐像素生成赶不上墙钟，属正常；导出文件不受影响。"),
+                 "⚠️ 转盘背景：选「清晰(100%)」在 1080p 约 0.5x 实时（预览可能卡）；\n"
+                 "调低「转盘质量」低分辨率生成再放大，速度快数倍、边缘略虚。"),
             wraplength=380, justify=tk.LEFT)
         tip.pack(fill=tk.X, pady=6)
 
         def _on_ok():
+            global _COUNTDOWN_DIAL_RATIO
             try:
                 w = int(w_var.get().strip())
                 h = int(h_var.get().strip())
@@ -57676,6 +58255,7 @@ class FFmpegBatchGUI:
             if w <= 0 or h <= 0 or d <= 0:
                 messagebox.showerror(_("参数错误"), _("宽度/高度/时长必须为正数。"), parent=win)
                 return
+            _COUNTDOWN_DIAL_RATIO = max(0.33, min(1.0, q_var.get() / 100.0))
             token = _make_countdown_token(
                 _cd_code_for(_countdown_mode_labels(), mode_var.get(), "down"),
                 _cd_code_for(_countdown_style_labels(), style_var.get(), "s"),
@@ -59707,10 +60287,19 @@ class FFmpegBatchGUI:
             f_norm = normalize_path(f)
 
             if _is_virtual_source(f_norm):
-                # 虚拟颜色源：走 lavfi 输入（透明靠 format=rgba 保 alpha 通道）
+                # 虚拟源：走 lavfi 输入（透明靠 format=rgba 保 alpha 通道）
                 _spec = _virtual_lavfi_spec(f_norm)
                 if _spec:
                     cmd.extend(["-f", "lavfi", "-i", _spec])
+                else:
+                    # 🔴 2026-10-18：spec 解析失败（工程里被改坏的哨兵）时**绝不能直接
+                    #    continue** —— `file_index` 是按 input_files 下标建的，少一个 -i
+                    #    会让**后面所有**输入的序号整体前移 ⇒ `[1:v]` 指到别的输入（画面
+                    #    张冠李戴，且不报错）。补一个 1 帧黑底占位，保编号对齐并明确告知。
+                    self._append_info_ui(
+                        _("[输入] 虚拟源解析失败，已用黑底占位保编号对齐：%s") % f_norm[:48])
+                    cmd.extend(["-f", "lavfi", "-i",
+                                "color=c=black:s=1280x720:r=30:d=1.000"])
                 continue
 
             if f_norm == main_video_path:                                   # 主视频截取
@@ -59800,7 +60389,18 @@ class FFmpegBatchGUI:
 
     def _append_pip_single_audio(self, a_maps, a_enc, audio, file_index, map_count):
         """画中画音频：把单条音频轨道的 -map + 编码参数追加进列表（与原多音轨逐轨逻辑一致）。
-        a_maps/a_enc 为列表，调用方在合适位置 cmd.extend 它们。"""
+        a_maps/a_enc 为列表，调用方在合适位置 cmd.extend 它们。
+
+        🔴 2026-10-18：虚拟源（color:/gen:）只有画面没有音轨 —— 若音频轨指向虚拟源
+        （工程里手工/分离音频造出的同路径音频轨），`-map N:a` 会让 ffmpeg 直接失败：
+            Stream map '' matches no streams.
+            Failed to set value '1:a' for option 'map': Invalid argument
+        ⇒ 这里按「无音轨 → 忽略」处理（与 `_pip_sub_audio_node` 的降级口径一致）。
+        """
+        if _is_virtual_source(audio.file_path) or _is_expanded_virtual_spec(audio.file_path):
+            self._append_info_ui(_("[封装-画] 虚拟源没有音轨，已忽略这条音频：%s")
+                                 % str(audio.file_path)[:48])
+            return
         a_idx = file_index[audio.file_path]
         a_maps.append("-map")
         a_maps.append(f"{a_idx}:a:{audio._type_index}")
@@ -59817,12 +60417,12 @@ class FFmpegBatchGUI:
         if af_str:
             if enc == "copy":
                 enc = "aac"
-                self._append_info_ui(_("音频轨 {0} 应用了滤镜，编码器自动改为 aac").format(map_count+1))
+                self._append_info_ui(_('音频轨 {0} 应用了滤镜，编码器自动改为 aac').format(map_count + 1))
             a_enc.append("-filter:a" + sfx)
             a_enc.append(af_str)
         enc, fb = self._opus_copy_fallback(enc, audio)
         if fb:
-            self._append_info_ui(_("音频轨 {0} {1}").format(map_count+1, fb))
+            self._append_info_ui(_('音频轨 {0} {1}').format(map_count + 1, fb))
         if enc == "copy":
             a_enc.extend([f"-c:a:{map_count}", "copy"])
         else:
@@ -59863,6 +60463,15 @@ class FFmpegBatchGUI:
         """
         _idx = file_index.get(sub_audio.file_path)
         if _idx is None:
+            return None
+        # 🔴 2026-10-18：虚拟源（color:/gen:）的输入是 lavfi **视频**流，没有音轨 ——
+        #    下面拼的 `[N:a]` 在 ffmpeg 里是硬错误（`Stream map '' matches no streams` /
+        #    `Invalid argument`，实测见 tests/_dbg_virtual_sub_overlay.py B 段）。
+        #    按注释里既有的「子视频无音轨 → 降级忽略」口径，这里提前返回 None。
+        if _is_virtual_source(sub_audio.file_path) \
+                or _is_expanded_virtual_spec(sub_audio.file_path):
+            self._append_info_ui(_("[封装-画] 虚拟源没有音轨，已忽略其子声：%s")
+                                 % str(sub_audio.file_path)[:48])
             return None
         # PiP 子声的 enc_settings 不自带 _file_path，_audio_effective_duration 取不到源时长
         # → afade=t=out 落到 st=0 兜底（子声只开头 1s 有声）。按转换页惯例注入源路径。
@@ -60088,7 +60697,13 @@ class FFmpegBatchGUI:
             a_maps.append("-map")
             a_maps.append("[afinal]")
             # [afinal] 编码：amix 输出必须重编码；沿用主音频设置（无主音频则 aac）
-            _enc_src = main_audio.enc_settings if main_audio is not None else main_video.enc_settings
+            # 🔴 无主音频（虚拟素材主视频 / 主音频「忽略」）时**不能**退到
+            #    `main_video.enc_settings`：视频轨也有同名 `encoder` 键（= 用户选的
+            #    libx265）⇒ 拼出 `-c:a libx265` ⇒ ffmpeg「Invalid encoder type」
+            #    导出直接失败（2026-10-18 用户实测）。给空 dict 让 `enc` 落到默认
+            #    aac，且不带 -b:a/-ar —— 音频源可能是 48k 的 BGM/子声，硬写
+            #    `-ar 44100` 会白降采样（与串行合并那处 128k/44100 兜底刻意不同）。
+            _enc_src = main_audio.enc_settings if main_audio is not None else {}
             enc = _enc_src.get("encoder", "aac")
             if enc == "copy":
                 enc = "aac"
@@ -60238,7 +60853,9 @@ class FFmpegBatchGUI:
             a_parts.append(f"anullsrc=r=48000:cl=stereo{_anull_trim2}[amain]")
         a_maps.append("-map")
         a_maps.append("[amain]")
-        _enc_src = main_audio.enc_settings if main_audio is not None else main_video.enc_settings
+        # 🔴 同上（BGM 分支）：无主音频时给空 dict，绝不退到视频轨 enc_settings
+        #    —— 否则 `encoder` 键取到 libx265，拼出 `-c:a libx265` 直接导出失败。
+        _enc_src = main_audio.enc_settings if main_audio is not None else {}
         enc = _enc_src.get("encoder", "aac")
         if enc == "copy":
             enc = "aac"
@@ -63201,11 +63818,14 @@ class FFmpegBatchGUI:
         获取视频原始宽高（不考虑旋转），优先读解析缓存（拖入文件时已填充 _stream_info_cache），
         未命中回退懒尺寸缓存，再回退未缓存 ffprobe。供构建命令复用，避免对大量文件重复探帧。
         """
-        # 虚拟颜色源：宽高直接由哨兵给出（不出 real 文件）
-        if _is_virtual_source(file_path):
-            p = _parse_color_source(file_path)
-            if p:
-                return p[1], p[2]
+        # 虚拟源：宽高直接由哨兵 / 展开式给出（不出 real 文件）。
+        # 🔴 2026-10-18：这里此前只 `_parse_color_source`（**只认 color:**），
+        #    图案 / 倒计时（`gen:`）解析为 None ⇒ 继续走 `os.path.exists` 必假
+        #    ⇒ 返回 (None, None) ⇒ 串行合并主视频尺寸兜 1280x720（用户实测）。
+        #    改走唯一解析器 `_virtual_source_dimensions`（color/gen/展开式全覆盖）。
+        _vd = _virtual_source_dimensions(file_path)
+        if _vd is not None:
+            return _vd
         if not file_path or not os.path.exists(file_path):
             return None, None
         # 1) 解析缓存（命中即 0 次 ffprobe）
@@ -63412,9 +64032,7 @@ class FFmpegBatchGUI:
                         canvas=_canvas_ui)
                 if _geo is None:
                     continue
-                _base_i = _grp_base_ui.get(_g, _ms[0])
-                _ddx, _ddy = self._group_place_delta(
-                    self.merge_tracks[_base_i].enc_settings or {})
+                _ddx, _ddy = self._group_place_delta(_g)
                 _grp_ui[_g] = {
                     "size": _geo["size"],
                     # 落位 = 盒原点 + 组级增量（与渲染 `_group_place_xy` 同口径）
@@ -63456,31 +64074,30 @@ class FFmpegBatchGUI:
                     _gm = _grp_members_ui.get(_g_of, [])
                     _gon = sum(1 for _x in _gm if self.merge_tracks[_x].enabled)
                     # ---- 轨迹来源标记（2026-10-18 用户定案：「父行的规格」也可承载）----
-                    # 整组位移轨迹有两个候选源：父行素材项（**优先**）/ 组内主 enc_settings
-                    # （父行没配时生效）。父行窗只预填自己那份 ⇒ 用户看不到组内主那条，
-                    # 会以为「父行继承了轨迹」。规格列直接标出当前生效来源，判据与渲染
-                    # 同口径（`_group_traj_kind`：列表 **+ 预制四模式**）；都没有 ⇒ 不加后缀。
-                    # 🔴 2026-10-18 用户第 1 条：只问列表轨迹（旧 `_group_has_list_traj`）时，
-                    #    **预制轨迹**（左右扫/上下扫/菱形/四角）被判成"没轨迹"，可整组明明在动
-                    #    ⇒ 这里必须按 `_group_traj_kind` 标出类型（`·预制`）。父行自旋转同理
-                    #    单列 `· 自旋:父`（它也是整组姿态，父行才有的东西）。
+                    # 整组位移轨迹的**来源**由父行「轨迹来源」下拉决定（`grp_traj_src`）：
+                    # 无＝父行自己 / `g1-1` / `g1-2`（编号同「类型」列）。标签直接用
+                    # `_group_traj_src_disp_settings` 返回的来源标记（判据与渲染**同源**）——
+                    # 含「回退」态：选中的成员没配轨迹 ⇒ 标 `g1-2(无轨迹)`。
+                    # 类型后缀（`·预制`）按 `_group_traj_kind` 标；父行自旋单列 `· 自旋:父`
+                    # （它也是整组姿态，恒认父行自己）。都没有 ⇒ 不加后缀。
                     _traj_lbl = ""
                     if _gm:
                         _bi2 = _grp_base_ui.get(_g_of, _gm[0])
                         if 0 <= _bi2 < len(self.merge_tracks):
                             _fkey2 = self._group_final_label_key(_g_of, len(_gm))
                             _row_it2 = self._group_material_item(_fkey2)
-                            _k2 = self._group_traj_kind(_row_it2)
-                            if _k2:
-                                _traj_lbl = _(" · 轨迹:父") + (_("·预制") if _k2 == "预制" else "")
-                            else:
-                                _k3 = self._group_traj_kind(
-                                    self.merge_tracks[_bi2].enc_settings or {})
-                                if _k3:
-                                    _traj_lbl = (_(" · 轨迹:主")
-                                                 + (_("·预制") if _k3 == "预制" else ""))
+                            with suppress(Exception):
+                                _src_s, _src_tag, _src_kind = \
+                                    self._group_traj_src_disp_settings(
+                                        _g_of, key=_fkey2, item=_row_it2)
+                                if _src_tag:
+                                    _traj_lbl = _(" · 轨迹:") + _src_tag + (
+                                        # 🔴 `_src_kind` 是 `_group_traj_kind` 的 canonical 值
+                                        #    （`列表`/`预制`/`""`）⇒ **绝不包 `_()`**：包了英文界面
+                                        #    下恒假 ⇒ 类型后缀静默丢失（零报错，只能静态扫出来）。
+                                        _("·预制") if _src_kind == "预制" else "")
                             if self._group_material_row_proj(
-                                    _fkey2, item=_row_it2).get("spin_enabled"):
+                                    _fkey2, item=_row_it2, gid=_g_of).get("spin_enabled"):
                                 _traj_lbl += _(" · 自旋:父")
                             # 2026-10-18 用户定案 A：`grp:<gid>` 这个 key 也会被右键
                             # 「视频节点」追加效果（那个入口是"每次套用 = 再挂一条"）。
@@ -63597,8 +64214,9 @@ class FFmpegBatchGUI:
                 if _is_virtual_source(track.file_path):
                     # 虚拟颜色源：规格直接由哨兵给出（不探文件）
                     _cp = _parse_color_source(track.file_path)
-                    detail = (_('{0}x{1} · {2} (生成源)').format(_cp[1], _cp[2], seconds_to_time(_cp[3]))
-                              if _cp else _("颜色源"))
+                    detail = (_('{0}x{1} · {2} (生成源)').format(
+                        _cp[1], _cp[2], seconds_to_time(_cp[3]))
+                        if _cp else _("颜色源"))
                 # 2026-10-08：复选框「禁用解析」(_merge_probe_skipped) 为准 —— 事后勾选时
                 # 轨道未必带 _no_probe 标记，仍应跳过尺寸/时长探测，避免 UI 线程被几百行
                 # 同步 ffprobe 卡死。
@@ -63856,16 +64474,17 @@ class FFmpegBatchGUI:
         self._append_info_ui(
             _("[分组] 已新建组 %s（%d 条；组内最上=组内主，可用右键「设为组内主视频」改）")
             % (_g, len(_idx)))
-        # 组员的**位移**轨迹编组后不生效（整组位移由组节点统一承载，来源 = 父行 / 组内主）；
-        # 但成员的旋转 / 缩放 / 透明度航点仍在自己的内容腿里照常生效 —— 只提示，不改数据。
-        # ⚠️ 判据用 `_group_traj_kind`（列表 **+ 预制**）：组员的预制轨迹位移同样被 A3 的
-        #    静态 rel 取代（`xy_override`），只问列表轨迹会漏报（2026-10-18 用户第 1 条）。
+        # 组员的**位移**轨迹自 2026-10-18 起**在组内生效**（用户拍板 A+a / 主画布域）：
+        # 成员在自己的内容腿里按主画布域跑轨迹，阶段 A3 用时间表达式定位，包装盒由
+        # `_group_member_rect` 自动扩到**全时段包络**（飞不出裁切区）。整组位移仍可叠加
+        # 在组节点 / 父行上（两者正交，互不取代）。只提示，不改数据。
+        # ⚠️ 判据用 `_group_traj_kind`（列表 **+ 预制**）：两条路都走同一个表达式定位。
         _wp_mem = [self.merge_tracks[_i] for _i in _idx[1:]
                    if self._group_traj_kind(self.merge_tracks[_i].enc_settings)]
         if _wp_mem:
             self._append_info_ui(
-                _("[分组] 有 %d 条组员带轨迹（列表/预制）：它们的**位移**在组内不生效"
-                "（整组位移由组节点承载），旋转 / 缩放 / 透明度仍按各自生效。")
+                _("[分组] 有 %d 条组员带轨迹（列表/预制）：位移在**组内**按各自轨迹生效，"
+                "包装盒已扩到轨迹全时段范围；整组位移仍可由组节点/父行叠加。")
                 % len(_wp_mem))
 
     def _merge_group_add_selected(self, gid):
@@ -63884,14 +64503,13 @@ class FFmpegBatchGUI:
             self.merge_tracks[_i].enc_settings.setdefault("is_grp_base", False)
         self.merge_refresh_ui()
         self._append_info_ui(_("[分组] 已加入组 %s（%d 条）") % (gid, len(_idx)))
-        # 加入的成员一律是**组员**（组内主不变）⇒ 它们的位移轨迹在组内不生效，仅提示。
+        # 加入的成员一律是**组员**（组内主不变）⇒ 位移轨迹在组内同样生效（2026-10-18 起）。
         _wp_mem2 = [self.merge_tracks[_i] for _i in _idx
                     if self._group_traj_kind(self.merge_tracks[_i].enc_settings)]
         if _wp_mem2:
             self._append_info_ui(
-                _("[分组] 有 %d 条加入的组员带轨迹（列表/预制）：它们的**位移**在组内不生效"
-                "（整组位移由组节点承载），旋转 / 缩放 / 透明度仍按各自生效。")
-                % len(_wp_mem2))
+                _("[分组] 有 %d 条加入的组员带轨迹（列表/预制）：位移在**组内**生效，"
+                "包装盒已扩到轨迹全时段范围。") % len(_wp_mem2))
 
     def _merge_group_remove_selected(self):
         """右键「移出组」：把选中轨道移出各自所在的组（组内主标记一并清除）。"""
@@ -63908,8 +64526,6 @@ class FFmpegBatchGUI:
             _g = str((self.merge_tracks[_i].enc_settings or {}).get("grp") or "").strip()
             if _g and _g not in _touched:
                 _touched.append(_g)
-        # ⚠️ 一切「按组标签/指纹」的计算都必须在 **pop grp 之前** ——
-        #    `_node_key_of_label` 要构图，组没了就查不到该节点 ⇒ key 落 None。
         _before = {}
         for _g in _touched:
             _before[_g] = [t for t in self.merge_tracks
@@ -63917,7 +64533,7 @@ class FFmpegBatchGUI:
         _going = [self.merge_tracks[_i] for _i in _sel]
         _cleared = 0
         for _g, _mems in _before.items():
-            # 移出后仍 ≥2 条的组 = **还活着** ⇒ 父行效果与组级字段必须原样保留；
+            # 移出后仍 ≥2 条的组 = **还活着** ⇒ 父行素材项（含组级字段）必须原样保留；
             # 名存实亡（剩 <2 条）⇒ 连着输出态一起清。
             _left = [t for t in _mems if not any(t is _x for _x in _going)]
             if len(_left) >= 2:
@@ -63935,7 +64551,7 @@ class FFmpegBatchGUI:
             self._append_info_ui(_("[分组] 已移出组 %d 条") % _n)
             if _cleared:
                 self._append_info_ui(
-                    _("[分组] 该组已不复存在 ⇒ 一并清除组落位/角度与组输出效果（共 %d 项）") % _cleared)
+                    _("[分组] 该组已不复存在 ⇒ 一并清除父行落位/角度与效果（共 %d 项）") % _cleared)
 
     def _merge_group_dissolve_selected(self):
         """右键「解散整组」：解散选中轨所属的整个组（所有成员一起移出）。"""
@@ -63946,8 +64562,7 @@ class FFmpegBatchGUI:
                 _gids.add(_g)
         if not _gids:
             return
-        # 同上：整组消失 ⇒ 连着清掉「输出态」（组级字段 + 父行素材项）。
-        # ⚠️ 必须**先**算 label/key（要原始成员表 + 组还在图里），再 pop grp。
+        # 同上：整组消失 ⇒ 连着清掉「输出态」（父行素材项，组级字段已住在里面）。
         _before = {_g: [t for t in self.merge_tracks
                         if str((t.enc_settings or {}).get("grp") or "").strip() == _g]
                    for _g in _gids}
@@ -63965,29 +64580,30 @@ class FFmpegBatchGUI:
         self._append_info_ui(_("[分组] 已解散 %d 个组（共 %d 条）") % (len(_gids), _n))
         if _cleared:
             self._append_info_ui(
-                _("[分组] 同时清除组落位/角度与组输出效果（共 %d 项）") % _cleared)
+                _("[分组] 同时清除父行落位/角度与效果（共 %d 项）") % _cleared)
 
     def _merge_group_clear_output_state(self, gid, mems):
         """组**彻底消失**时清空它的「输出态」（2026-10-16 用户拍板：**清空**，不保留）。
 
-        清两样东西：
-          ① **组级字段**（`grp_dx/dy`、`grp_abs_x/y`、`grp_rot_angle`，存在成员身上）——
-             它们是**纯组状态**，解组后没有任何归属地；留着 = 成员身上带一把看不见的锁，
-             而且重建出同 gid 的组时会**原地复活**（`_next_merge_group_id` 取最小可用号
-             ⇒ 全解散后再编组又从 `g1` 开始）。
-          ② **父行素材项** `node_fx[组最终输出标签的 key]` —— 父行效果（缩放 / 淡入淡出 /
-             透明度 / 抠像 / 角度）寄居在这里。它的 key 是 `node_fingerprint(段序号, 末滤镜名)`，
-             **结构相同的组重建后 key 相同** ⇒ 不清就会「凭空复活」，而父行此时已从列表
-             消失 ⇒ 用户**看不见、也无处删除**（违反「所见即所得」）。
-             ⇒ 清掉，并在调用方信息栏报数（可追溯）。
+        清两样东西（🔴 2026-10-18 解耦后**合而为一**，都住在父行素材项里）：
+          ① **组级字段**（`grp_dx/dy` 增量落位、`grp_abs_x/y` 绝对落位、`grp_rot_angle`
+             整组角度）—— 已从成员 `enc_settings` **搬进父行素材项**（`_group_level_item`
+             唯一出处）⇒ 与 ② 同一条记录，一起清即可。它们是**纯组状态**，解组后没有任何
+             归属地；留着 = 用户看不见、也无处删除（违反「所见即所得」），而且重建出同 gid
+             的组时会**原地复活**（`_next_merge_group_id` 取最小可用号 ⇒ 全解散后再编组又从
+             `g1` 开始）。
+          ② **父行的其它素材效果**（缩放 / 淡入淡出 / 透明度 / 抠像 / 角度 / 列表轨迹 …）寄居在
+             `node_fx["grp:<gid>"]`。key 是**稳定语义 key**（只依赖 gid，永不因成员增减位移
+             而漂）⇒ 不清就会「凭空复活」。
 
-        ⚠️ 判据用 `_merge_group_row_label` + `_node_key_of_label`（与
-           `_merge_edit_group_row` / `_open_node_effect_editor` **同一口径**），
-           不另行推断 ⇒ 不会误伤普通节点的同名 key。
-        ⚠️ 必须在 **pop `grp` 之前**调用（要通过 label 查图里的节点指纹）。
-        返回：被清掉的项数（组级字段个数 + 父行效果项，供日志报数）。
+        ⚠️ key 直接用 `_group_final_label_key(gid, 0)`（= `grp:<gid>`，纯函数，**不必构图**）
+           —— 与 `node_fx_key_of_node` / `_node_key_of_label` / 存储 / key2seg / 孤儿检测
+           全部同口径（2026-10-17 Point 4 方案A）。故这里**不再**经 `_merge_group_row_label`
+           + `_node_key_of_label` 绕一圈（旧实现依赖图完整，图不完整就漏清）。
+        返回：被清掉的项数（父行素材项条数，供日志报数）。
         """
         _n = 0
+        # 成员身上残留的组级字段（解耦前的落点）：容错清掉，正常工程里已不存在。
         for _t in mems or []:
             _es = _t.enc_settings if isinstance(_t.enc_settings, dict) else None
             if not _es:
@@ -63996,19 +64612,11 @@ class FFmpegBatchGUI:
                 if _k in _es:
                     _es.pop(_k, None)
                     _n += 1
-        try:
-            _mems_ok = [t for t in (mems or [])
-                        if isinstance(getattr(t, "enc_settings", None), dict)]
-            if _mems_ok:
-                _label = self._merge_group_row_label(gid, _mems_ok)
-                _key = self._node_key_of_label(_label) if _label else None
-                _fx = getattr(self, "node_fx", None)
-                if _key and isinstance(_fx, dict) and _key in _fx:
-                    _fx.pop(_key, None)
-                    _n += 1
-        except Exception:
-            # 取不到 key（图不完整等）⇒ 宁可不删，也不误删别人的效果
-            pass
+        _fx = getattr(self, "node_fx", None)
+        _key = self._group_final_label_key(gid, 0)
+        if _key and isinstance(_fx, dict) and _fx.get(_key):
+            _fx.pop(_key, None)
+            _n += 1
         return _n
 
 
@@ -64023,26 +64631,17 @@ class FFmpegBatchGUI:
         if not _g:
             return
         _target = id(self.merge_tracks[_i])
-        # 🔴 **全部组级字段**都挂在组内主轨道上（`grp_dx/grp_dy` 增量落位、`grp_abs_x/y`
-        #    绝对落位、`grp_rot_angle` 整组静态角度），换组内主时必须一起搬家 ——
-        #    2026-10-16 只搬了 dx/dy，导致换主后「父行 X/Y 绝对落位」和「组角度」
-        #    突然归零（用户视角：组跳回原位、角度凭空消失）。名单取自 `_GROUP_KEYS`
-        #    （唯一出处，以后新增组级字段自动跟随；`grp` / `is_grp_base` 是组身份本身，不搬）。
-        _move_keys = tuple(_k for _k in _GROUP_KEYS if _k not in ("grp", "is_grp_base"))
-        _moved = {}
-        for _t in self.merge_tracks:
-            _es = _t.enc_settings if isinstance(_t.enc_settings, dict) else {}
-            if (str(_es.get("grp") or "").strip() == _g
-                    and _es.get("is_grp_base") and id(_t) != _target):
-                for _k in _move_keys:
-                    if _k in _es:
-                        _moved[_k] = _es.pop(_k)
+        # 🔴 2026-10-18（解耦）：**不再需要搬家**。组级字段（`grp_dx/grp_dy` 增量落位、
+        #    `grp_abs_x/y` 绝对落位、`grp_rot_angle` 整组角度）已全部搬进**父行**素材项
+        #    `node_fx["grp:<gid>"][0]`（`_group_level_item` 唯一出处）⇒ 它们与"谁是组内主"
+        #    彻底无关，换主时组的位置/角度原样保留。
+        #    （2026-10-16 曾为此加过整段 `_move_keys` 搬家补丁，并踩过一次"只搬 dx/dy
+        #      导致换主后绝对落位与组角度归零"的坑；搬家前提已消失，整段删除。）
+        #    仍要处理的只有组身份本身：`is_grp_base` 标记要改到新主身上。
         for _t in self.merge_tracks:
             _es = _t.enc_settings if isinstance(_t.enc_settings, dict) else {}
             if str(_es.get("grp") or "").strip() == _g:
                 _es["is_grp_base"] = (id(_t) == _target)
-                if id(_t) == _target and _moved:
-                    _es.update(_moved)
         self.merge_refresh_ui()
         self._append_info_ui(
             _("[分组] 组 %s 的组内主已设为：%s")
@@ -64250,12 +64849,34 @@ class FFmpegBatchGUI:
                                 if re.match(r"^v_grp_(.+)_\d+$", tap_label or "") else None),
         )
 
+    # ---------- 组父行 = 独立素材：设置的**投影读写**（2026-10-16）----------
+    # 父行不是一条真实轨道，它的「设置」寄居在 node_fx[key] 的第 0 项（key = 组最终输出
+    # 标签的节点指纹）。所有对父行的改动（缩放 / 旋转 / 淡入淡出 / 抠像 / 落位…）都必须
+    # 落在这里 —— **绝不写回任何成员轨道的 enc_settings**，否则就是"用投影改原件"。
+    def _group_material_items(self, key):
+        """父行素材项的**可变** items 列表（node_fx[key]）；缺失则建 [{}] 返回并落库。
+
+        读/写/删三件套（`_group_material_item` / `_group_material_set` / `_group_level_pop`）
+        共用，避免各写一遍 `node_fx_items(_fx.get(key))` + `[0]` 骨架（#6）。
+        ⚠️ `node_fx_items` 返回新列表、但元素是**原 dict 引用**（不深拷贝），故调用方改
+        `_items[0]` 会直接反映进 `_fx[key]`；缺失时本函数已把新建的 [{}] 写入 `_fx`。
+        """
+        if not key:
+            return None
+        _fx = getattr(self, "node_fx", None)
+        if not isinstance(_fx, dict):
+            self.node_fx = {}
+            _fx = self.node_fx
+        _items = node_fx_items(_fx.get(key))
+        if not _items:
+            _items = [{}]
+            _fx[key] = _items
+        return _items
+
     def _group_material_item(self, key):
         """父行（独立素材）的那一份设置 dict；没有 → {}（只读，改它不会落库）。"""
-        if not key:
-            return {}
-        _it = node_fx_items((getattr(self, "node_fx", None) or {}).get(key))
-        return dict(_it[0]) if _it else {}
+        _items = self._group_material_items(key)
+        return dict(_items[0]) if _items else {}
 
     def _group_material_extra(self, key):
         """父行素材项**之外**的效果条数 + 其中「几何类」的清单（2026-10-18 用户定案 A）。
@@ -64282,12 +64903,15 @@ class FFmpegBatchGUI:
         for _it in _items[1:]:
             if not isinstance(_it, dict):
                 continue
-            _mv = str(_it.get("move_mode") or "").strip()
-            if _mv == "waypoints":
-                if [w for w in (_it.get("move_waypoints") or []) if isinstance(w, dict)]:
-                    if _("列表轨迹") not in _geo:
-                        _geo.append(_("列表轨迹"))
-            elif _mv in self._GROUP_MOVE_PRESETS:
+            # 复用 `_group_traj_kind` 的"列表/预制"分类（与渲染、来源标记同一口径），
+            # 不再手写 waypoints+非空 / 预设 两段判据（#7 收敛重复）。
+            _kd = self._group_traj_kind(_it)
+            # 🔴 `_kd` 是 canonical 值（`列表`/`预制`/`""`）⇒ **绝不包 `_()`**（坑 103）：
+            #    包了英文界面下 `==` 恒假 ⇒ 几何清单恒空，规格列"另有 N 条"丢类型后缀。
+            if _kd == "列表":
+                if _("列表轨迹") not in _geo:
+                    _geo.append(_("列表轨迹"))
+            elif _kd == "预制":
                 if _("预制轨迹") not in _geo:
                     _geo.append(_("预制轨迹"))
             if _it.get("spin_enabled") and _("自旋转") not in _geo:
@@ -64321,6 +64945,9 @@ class FFmpegBatchGUI:
     # 预制轨迹（「叠加/偏移」页轨迹弹窗里除列表之外的四个预设）：消费端是
     # `_pip_overlay_xy` 的 `elif _mv:` → `build_move_xy_expr`。
     _GROUP_MOVE_PRESETS = ("h", "v", "diamond", "corners")
+    # 「轨迹来源」下拉的 canonical 值前缀（🔴 绝不包 `_()`；显示名见下拉构造与
+    # `_group_traj_sub_label`）。解析 / 构造 / 标记 / 显示四处共用，改前缀只动这一常量。
+    _GROUP_TRAJ_SUB_PREFIX = "sub-"
     # 父行素材项里**能被组节点消费**的变换字段（自旋转 + 预制轨迹），见
     # `_group_material_row_proj` / `_group_node_xy(row_settings=…)`。
     _GROUP_ROW_FX_KEYS = ("move_mode", "move_cycle", "move_dwell", "move_margin",
@@ -64362,7 +64989,142 @@ class FFmpegBatchGUI:
         _mv = str(settings.get("move_mode") or "").strip()
         return "预制" if _mv in self._GROUP_MOVE_PRESETS else ""
 
-    def _group_material_row_proj(self, key, item=None):
+    def _group_traj_sub_label(self, n):
+        """成员序号 n(1-based) → 紧凑显示名 `子-N`（旧口径，2026-10-19 起不再参与 tag）。
+
+        规格列 / 标题的来源标记改用统一编号 `gG-N`（`_group_member_label`），本方法仅
+        保留旧口径（旧测试 / 将来需要紧凑写法时用）。
+        """
+        return _("子-%d") % n
+
+    def _group_traj_src_parse(self, src):
+        """canonical 值 → (kind, idx)：''/'未知'→('none',0) / 'main'→('main',0) /
+        'sub-N'→('sub',N)。判据与渲染**逐字同口径**（见 `_group_traj_src_track`）。
+        ⚠️ 返回 'none' 即"无＝用父行自己的"，与下拉首项、列表规格列回退态一致。
+        """
+        _s = str(src or "").strip()
+        if not _s or _s == "main":
+            return (_s if _s == "main" else "none"), 0
+        _m = re.match("^" + re.escape(self._GROUP_TRAJ_SUB_PREFIX) + r"(\d+)$", _s)
+        if _m:
+            return "sub", int(_m.group(1))
+        return "none", 0
+
+    def _group_traj_src_tracks(self, gid):
+        """组 gid 的（组内主, 组内子列表) —— 「轨迹来源」下拉的**编号唯一出处**。
+
+        编号口径（2026-10-18 用户定案 2「编号按你的来」）：
+          · `组内主`  = 带 `is_grp_base` 标记的那条（缺标记取**列表序第一条**，与
+            `_grp_base_ui` 的 `next(..., _ms[0])` 同款兜底）；
+          · `组内子-N` = **其余**成员按**列表序**递增（`_get_enabled_video_tracks` 保序）。
+        ⚠️ 编号只认**列表序**，不认 id/文件名 —— 用户在列表里看到的行顺序就是编号顺序。
+        返回 `([], None)` = 不成组 / 组已被解散。
+        """
+        _g = str(gid or "").strip()
+        if not _g:
+            return [], None
+        _mems = [t for t in self._get_enabled_video_tracks()
+                 if str((getattr(t, "enc_settings", None) or {}).get("grp")
+                        or "").strip() == _g]
+        if not _mems:
+            return [], None
+        _base = next((t for t in _mems
+                      if (t.enc_settings or {}).get("is_grp_base")), _mems[0])
+        return [t for t in _mems if t is not _base], _base
+
+    def _group_traj_src_track(self, gid, src):
+        """「轨迹来源」取值 → 那条成员轨；`""` / 未知 / 组已变 → None。
+
+        `src` 是 **canonical 值**：`""`（无＝用父行自己的）/ `"main"` / `"sub-N"`。
+        绝不包 `_()`（multi 侧同 `_group_traj_kind` 的理由）。
+        """
+        _kind, _k = self._group_traj_src_parse(src)
+        if _kind == "none":
+            return None
+        _subs, _base = self._group_traj_src_tracks(gid)
+        if _kind == "main":
+            return _base
+        return _subs[_k - 1] if 0 < _k <= len(_subs) else None
+
+    def _group_member_label(self, gid, track):
+        """成员轨 → 下拉编号 `gG-N`（与列表类型列 `视频(组)gG-N` 同套组号/序号口径：
+        组号＝grp 在视频轨里首次出现顺序；组内序号＝该成员在列表序里的位置）。
+        「轨迹来源」下拉复用此编号，便于用户把下拉选项和列表行一一对照。
+        canonical 值（`main`/`sub-N`）绝不在此拼 —— 那是 `_group_traj_src_parse` 的判据，
+        包了英文界面必失效；本方法只产 ASCII 编号，两版逐字相同。"""
+        _g = str(gid or "").strip()
+        if not _g or track is None:
+            return ""
+        _grp_members_ui = {}
+        for _i, _t in enumerate(self.merge_tracks):
+            if getattr(_t, "type", "") != "video":
+                continue
+            _gg = str((_t.enc_settings or {}).get("grp") or "").strip()
+            if _gg:
+                _grp_members_ui.setdefault(_gg, []).append(_i)
+        if _g not in _grp_members_ui:
+            return ""
+        _grp_num = {_gg: (_k + 1) for _k, _gg in enumerate(_grp_members_ui)}
+        _members = _grp_members_ui[_g]
+        _ti = next((_i for _i, _t in enumerate(self.merge_tracks) if _t is track), -1)
+        if _ti not in _members:
+            return "g%d" % _grp_num[_g]     # 兜底：绝不返回空串（否则下拉出现空白项）
+        return "g%d-%d" % (_grp_num[_g], _members.index(_ti) + 1)
+
+    def _group_traj_kind_disp(self, kind):
+        """canonical 轨迹类型 → 展示名（与 `_group_traj_kind` 同口径；canonical 本身绝不包 `_()`，
+        这里只翻成展示用的「列表轨迹 / 预制轨迹」，与 `_group_material_extra` 的规格列口径一致）。"""
+        return {"列表": _("列表轨迹"), "预制": _("预制轨迹")}.get(kind, kind)
+
+    def _group_traj_src_disp_settings(self, gid, key=None, item=None, pwf=1.0):
+        """「轨迹来源」解析 → **位移轨迹**实际宿主的设置 dict（唯一消费出处）。
+
+        2026-10-18（用户定案 G/H）：父行「叠加/偏移」页的角度右侧新增「轨迹来源」下拉
+        （`无` / `g1-1` / `g1-2`…，编号同列表「类型」列），把旧「组内主兜底」变成**显式选择**。
+        🔴 下拉**只管位移**（列表轨迹 + 预制轨迹）：角度（`grp_rot_angle`）与自旋
+           （父行素材项 `spin_*`）解耦后天然独立，**不参与**来源选择（用户撤回过
+           「统一来源」方案 —— 那是多余的一层耦合）。
+        🔴 **回退规则（用户第 1 条）**：选中的成员自己没配生效轨迹 ⇒ **回退「无」**
+           （用父行自己的），并在列表规格列标 `轨迹:g1-2(无轨迹)` 告知"你选的那条没轨迹"。
+
+        返回 `(settings, tag, kind)`：
+          · `settings` = 提供整组位移的设置 dict（**已按 pwf 换算到预览帧空间**），
+            无生效轨迹 ⇒ `{}`；
+          · `tag` = 来源标记 `父` / `gG-N` / `gG-N(无轨迹)`（2026-10-19 起统一编号），`""` = 无轨迹；
+          · `kind` = 该来源里的轨迹类型 `列表` / `预制` / `""`（`_group_traj_kind` canonical 值）。
+
+        `item`：调用方**已换算过**的父行素材项（预览侧 `_group_material_wp_res` 的老参数
+        口径）—— 父行路径**原样透传、绝不二次缩放**（老行为逐字节不变）；成员路径由本函数
+        按 `pwf` 用 `_pipe_scale_pos_settings` 换算（成员的航点同样是真画布绝对像素）。
+        """
+        _key = key or (self._group_final_label_key(gid, 0) if gid else None)
+        _parent = (item if item is not None
+                   else (self._group_material_item(_key) if _key else {}))
+        _pk = self._group_traj_kind(_parent)
+        _src = str((_parent or {}).get("grp_traj_src", "") or "").strip()
+        if not _src:
+            # 「无」= 父行自己（父行压根没配 `grp_traj_src` 键时也走这里 ⇒ 零回归）
+            return (_parent or {}), (_("父") if _pk else ""), _pk
+        _t = self._group_traj_src_track(gid, _src)
+        if _t is None:
+            # 成员被移出组 / 组解散 ⇒ 同「没轨迹」处理：回退父行自己
+            return (_parent or {}), (_("父") if _pk else ""), _pk
+        # 🔴 来源标记统一用编号 `gG-N`（`_group_member_label`，与下拉 /「类型」列同源）；拿不到 ⇒ 退回 canonical。
+        _tag = self._group_member_label(gid, _t) or str(_src)
+        _ms = getattr(_t, "enc_settings", None) or {}
+        if pwf < 1.0:
+            with suppress(Exception):
+                _ms = _pipe_scale_pos_settings(dict(_ms), pwf)
+        _mk = self._group_traj_kind(_ms)
+        if not _mk:
+            # 用户第 1 条：成员没配生效轨迹 ⇒ 回退「无」（父行自己的）
+            # 🔴 `(无轨迹)` 是 **canonical tag 后缀**：下游 `endswith` + 切片都按它判
+            #    （`_group_level_pop` 提示分支）⇒ **绝不包 `_()`**（坑 103）：
+            #    包了英文界面下 `endswith` 恒假且切片长度错位 ⇒ 提示整条静默失效。
+            return (_parent or {}), (_tag + "(无轨迹)" if _pk else ""), _pk
+        return _ms, _tag, _mk
+
+    def _group_material_row_proj(self, key, item=None, gid=None, pwf=1.0):
         """父行素材项 → 组节点要消费的**变换投影**（自旋转 / 预制轨迹）；无 → {}。
 
         2026-10-18（用户第 3 条「父行不支持自己的自旋转和那几个预制轨迹，开了无效」）：
@@ -64372,22 +65134,30 @@ class FFmpegBatchGUI:
           · **自旋转**（`spin_enabled` + `spin_speed`）：组节点 rotate 的角度项；
           · **预制轨迹**（`move_mode` ∈ `_GROUP_MOVE_PRESETS`）：组节点 overlay 的 x/y
             时间表达式（与组内主自己的预制轨迹同一条 `build_move_xy_expr` 路线）。
-        优先级与列表轨迹同一条「**父行优先**」：父行列表 > 父行预制 > 组内主。
-        只返回那 6 个键，**绝不反写成员**（父行 = 纯投影，成员 enc_settings 一字不动）。
-        `item`：调用方已换算过的素材项（预览侧走 `_pipe_scale_pos_settings`）；None =
-        现读 `node_fx[key]` 第 0 项。
+        🔴 2026-10-18（G/H）：两条来源**不同** ——
+          · **预制轨迹**走「轨迹来源」下拉（`_group_traj_src_disp_settings`，可借用成员）；
+          · **自旋**恒认**父行自己**（解耦后天然独立，成员的 `spin_*` 只作用它自己那条腿）。
+        优先级与列表轨迹同一条「**同源优先**」：来源的预制 > 来源的列表；都不存在才落父行。
+        只返回那 6 个键，**绝不反写成员**（成员 enc_settings 只被读取）。
+        `item`：调用方已换算过的**父行**素材项（预览侧走 `_pipe_scale_pos_settings`）；
+        None = 现读 `node_fx[key]` 第 0 项。`gid`/`pwf`：成员来源的编号与预览帧空间换算。
         """
         _it = item if item is not None else (self._group_material_item(key) if key else {})
         if not _it:
             return {}
+        _g = gid or self._group_gid_of_key(key)
+        _disp, _tag, _kind = self._group_traj_src_disp_settings(
+            _g, key=key, item=_it, pwf=pwf)
         _out = {}
-        _mv = str(_it.get("move_mode") or "").strip()
+        # 位移（预制轨迹）来自「轨迹来源」选中的那一份设置
+        _mv = str((_disp or {}).get("move_mode") or "").strip()
         if _mv in self._GROUP_MOVE_PRESETS:
             # 四个预设参数原样带上；缺省键交给 build_move_xy_expr 自己的默认值
             _out["move_mode"] = _mv
             for _k in ("move_cycle", "move_dwell", "move_margin"):
-                if _k in _it:
-                    _out[_k] = _it[_k]
+                if _k in _disp:
+                    _out[_k] = _disp[_k]
+        # 自旋恒认父行自己（成员的自旋只作用它自己那条腿 —— 解耦铁律）
         _sp = _opt_float(_it.get("spin_speed", 60.0), 60.0)
         if bool(_it.get("spin_enabled", False)) and _sp != 0:
             # 与 `overlay_rotation_active` 同一条判据：spin = enabled **且** speed≠0
@@ -64396,8 +65166,9 @@ class FFmpegBatchGUI:
         return _out
 
     def _group_material_wp_res(self, key, sw, sh, trim_start=0.0, speed_factor=1.0,
-                               item=None):
-        """父行素材项里的**列表轨迹** → `build_waypoint_expr` 结果；没有 → None。
+                               item=None, gid=None, pwf=1.0):
+        """父行（或「轨迹来源」选中的成员）里的**列表轨迹** → `build_waypoint_expr`；
+        没有 → None。
 
         🔴 2026-10-16 第七轮②（用户：「只有简易位置和遮罩的轨迹列表支持了，画布模式 和
         **叠加/偏移页的轨迹**没接入，不支持」）：父行 = 独立素材，它在「叠加/偏移」页里
@@ -64413,14 +65184,25 @@ class FFmpegBatchGUI:
           · `grp_dx/dy`（拖组合盒的**增量**）仍然叠加 —— 它是"整组平移"，对轨迹整体平移是合理的。
         仅当 `move_mode == "waypoints"` **且列表非空**时成立；否则 None（老工程逐字节不变）。
 
+        🔴 2026-10-18（G/H）：位移轨迹的**宿主**由「轨迹来源」下拉决定（`grp_traj_src`，
+           存在父行素材项里）—— `""` 用父行自己 / `"main"` 组内主 / `"sub-N"` 该成员；
+           选中的成员没配生效轨迹 ⇒ 自动回退父行自己（用户第 1 条），**永不吃不到轨迹**。
+           `_group_traj_src_disp_settings` 是那个解析的**唯一出处**。
+
         sw/sh：包装盒尺寸（给轨迹预设 / `move_margin` 之类表达式的 w/h 用；与素材自己同源）。
         trim_start / speed_factor：与组内主轨道同口径（航点时间存在**原始时间轴**上，
         `build_waypoint_expr` 内部换算到输出时间线；预览侧 settings 已禁用 trim ⇒ 不换算）。
-        item：调用方**已换算过**的素材项（预览侧走 `_pipe_scale_pos_settings(..., _pwf)`
+        item：调用方**已换算过**的**父行**素材项（预览侧走 `_pipe_scale_pos_settings(..., _pwf)`
         把航点绝对坐标缩到预览帧空间）。None = 现读 `node_fx[key]` 第 0 项（导出侧）。
         判据（move_mode / 非空列表）与产表达式**只在这里写一次**，两处共用。
         """
         _it = item if item is not None else (self._group_material_item(key) if key else {})
+        if not _it:
+            return None
+        _g = gid or self._group_gid_of_key(key)
+        # 位移轨迹宿主：父行自己 / 「轨迹来源」选中的成员（可能已按 pwf 换算）
+        _it, _tag, _kind = self._group_traj_src_disp_settings(
+            _g, key=key, item=_it, pwf=pwf)
         if not _it or str(_it.get("move_mode") or "").strip() != "waypoints":
             return None
         _wps = [w for w in (_it.get("move_waypoints") or []) if isinstance(w, dict)]
@@ -64443,53 +65225,72 @@ class FFmpegBatchGUI:
         该 key 还没有效果项时**新建第 0 项**（父行本来就是一条素材 ⇒ 第一次拧角度 /
         拖把手时它就该存在）。返回 True = 写入成功。
         """
-        if not key:
+        _items = self._group_material_items(key)
+        if not _items:
             return False
-        _fx = getattr(self, "node_fx", None)
-        if not isinstance(_fx, dict):
-            self.node_fx = {}
-            _fx = self.node_fx
-        _items = node_fx_items(_fx.get(key))
-        _items = _items or [{}]
         _items[0].update(fields)
-        _fx[key] = _items
         return True
 
-    def _merge_group_apply_row_rot(self, base_track, new):
-        """父行窗口里的「角度」→ 组级旋转字段 `grp_rot_angle`（存在组内主）。
+    def _group_level_pop(self, gid, *names):
+        """从**父行**素材项里删掉若干组级字段（`_group_level_item` 的写侧对偶）。
+
+        「清掉」不能靠 `_group_material_set(key, k=None)` —— 那只会写一个 `None` 值，
+        读取端 `str(None or "")` 虽然也得空，但 `_group_level_item` 的
+        `"grp_rot_angle" in item` 之类**存在性判据**会误判成"配过"。
+        返回 True = 确实删掉了至少一个键。
+        """
+        _key = self._group_final_label_key(gid, 0) if gid else None
+        _items = self._group_material_items(_key)
+        if not _items:
+            return False
+        _hit = False
+        for _n in names:
+            if _n in _items[0]:
+                _items[0].pop(_n, None)
+                _hit = True
+        return _hit
+
+    def _merge_group_apply_row_rot(self, gid, new):
+        """父行窗口里的「角度」→ 组级旋转字段 `grp_rot_angle`（存**父行**素材项）。
 
         父行是**投影** ⇒ 角度绝不能写成员的 `rotate_angle`（那是成员自己的角度，写了会
         双重旋转：成员自己转一次 + 组再转一次）。
         `grp_rot_angle` 是**渲染侧唯一读取口径**：Stage B 的组节点 `rotate=` 与
         `_group_box_geometry` 的 `rot`（中心对齐补偿）都读它。
         角度为 0 ⇒ 清掉该键（回到"没转过"，与用户把角度拧回 0 的直觉一致）。
+
+        🔴 2026-10-18：宿主从**组内主 enc_settings** 改为**父行** `node_fx["grp:<gid>"][0]`
+        （`_group_level_item` 同一去处）—— 组级字段本就是父行的属性，且解耦后
+        换组内主不再需要"搬家"。
         """
-        _es = getattr(base_track, "enc_settings", None)
-        if not isinstance(_es, dict):
+        _key = self._group_final_label_key(gid, 0) if gid else None
+        if not _key:
             return False
         _va = _opt_float((new or {}).get("rotate_angle", 0) or 0, 0.0)
         if _va:
-            _es["grp_rot_angle"] = _va
+            self._group_material_set(_key, grp_rot_angle=_va)
             self._append_info_ui(_("[组] 父行角度已保存：%g°（作用于**整组**，成员角度未改动）") % _va)
             return True
-        if "grp_rot_angle" in _es:
-            _es.pop("grp_rot_angle", None)
+        if "grp_rot_angle" in self._group_level_item(gid):
+            self._group_level_pop(gid, "grp_rot_angle")
             self._append_info_ui(_("[组] 父行角度已清零（整组不再旋转）"))
         return False
 
-    def _merge_group_apply_row_place(self, base_track, initial, new):
+    def _merge_group_apply_row_place(self, gid, initial, new):
         """父行窗口里的「叠加位置 X/Y」→ 组级**绝对落位** `grp_abs_x/grp_abs_y`。
 
         父行是**投影** ⇒ 落位绝不能写成员的 `overlay_x/y`（那是"用投影改原件"）。
-        `grp_abs_x/y` 与 `grp_dx/grp_dy` 同族（存在组内主、语义上是**组**的属性），
+        `grp_abs_x/y` 与 `grp_dx/grp_dy` 同族（现居**父行**素材项，语义上是**组**的属性），
         构建器 Stage B 与 `_group_composite_box` 都优先读它。
 
         只有用户**真的改过** X/Y（与打开时的值不同）才写；没动就不写 ⇒ 保持增量模型
         （可视化编辑器拖动写增量，两个入口互斥、不会互相覆盖）。
         值原样存（可以是 `W-w` 这类表达式，与 overlay_x/y 同域）。
+
+        🔴 2026-10-18：宿主同 `_merge_group_apply_row_rot`（组内主 → 父行素材项）。
         """
-        _es = getattr(base_track, "enc_settings", None)
-        if not isinstance(_es, dict):
+        _key = self._group_final_label_key(gid, 0) if gid else None
+        if not _key:
             return False
         _ox = str((initial or {}).get("overlay_x", "") or "").strip()
         _oy = str((initial or {}).get("overlay_y", "") or "").strip()
@@ -64497,15 +65298,16 @@ class FFmpegBatchGUI:
         _ny = str((new or {}).get("overlay_y", "") or "").strip()
         _hit = False
         if _nx and _nx != _ox:
-            _es["grp_abs_x"] = _nx
+            self._group_material_set(_key, grp_abs_x=_nx)
             _hit = True
         if _ny and _ny != _oy:
-            _es["grp_abs_y"] = _ny
+            self._group_material_set(_key, grp_abs_y=_ny)
             _hit = True
         if _hit:
+            _lvl = self._group_level_item(gid)
             self._append_info_ui(
                 _("[组] 父行落位已保存：X=%s / Y=%s（成员坐标未改动，属组级绝对落位）")
-                % (_es.get("grp_abs_x", _("（沿用）")), _es.get("grp_abs_y", _("（沿用）"))))
+                % (_lvl.get("grp_abs_x", _("（沿用）")), _lvl.get("grp_abs_y", _("（沿用）"))))
         return _hit
 
     def _merge_edit_group_row(self, gid):
@@ -64575,40 +65377,49 @@ class FFmpegBatchGUI:
         #      可能是表达式，那种情况 `_group_place_abs` 返回字符串，仍原样显示，语义不变）。
         _items = node_fx_items(self.node_fx.get(_key))
         _cur = dict(_items[0]) if _items else {}
-        _ax, _ay = self._group_place_abs(_base.enc_settings)
+        _ax, _ay = self._group_place_abs(_gid)
         _seed_x = _ax if _ax is not None else ("%g" % float(_box[0]))
         _seed_y = _ay if _ay is not None else ("%g" % float(_box[1]))
         _initial = dict(_cur)
         _initial["overlay_x"] = _seed_x
         _initial["overlay_y"] = _seed_y
-        # ---- 轨迹来源提示（2026-10-18 用户定案：「只加提示，知道来源就行」）----
-        # 组节点只有**一个**落位点 ⇒ 整组的位移轨迹有两个候选源：
-        #   ① 父行素材项 `node_fx[key][0]` —— **优先**（列表轨迹 / 预制轨迹 / 自旋转）；
-        #   ② 组内主 `enc_settings` —— 编组前就配好的，父行没配时生效。
-        # 覆盖关系在导出/预览的组分支里（`_group_material_wp_res` / `_group_material_row_proj`
-        # 的结果写进 `_bmeta` 与 `_gs`）—— 本窗口只预填 ① ⇒ 用户看不到 ②，
-        # 会以为「父行继承了轨迹」（实测困惑点）。这里只**告知**：不改数据、不迁移、
-        # 不改渲染（想在父行接管就直接在轨迹列表 / 预设里配，配了就覆盖）。
-        # 🔴 2026-10-18 用户第 1 条：判据必须用 `_group_traj_kind`（列表 **+ 预制**）——
-        #    只看列表轨迹时，组内主配的是「左右扫/上下扫/菱形/四角」会被判成没轨迹。
-        _kind_row = self._group_traj_kind(_cur)
-        _kind_base = self._group_traj_kind(_base.enc_settings)
-        _traj_owner = _("父行") if _kind_row else (_("组内主") if _kind_base else "")
-        if _kind_base and not _kind_row:
-            self._append_info_ui(
-                _("[组] 组 %s 的轨迹当前来自 **组内主**（编组前在它身上配的%s轨迹，"
-                "组节点按它整体摆位）。本窗口里再配轨迹会**覆盖**它；"
-                "想换来源就右键「设为组内主视频」换一条主视频。本窗口的轨迹页"
-                "显示的是**父行自己**的轨迹（当前为空），不是继承来的。")
-                % (_gid, _kind_base))
-        elif _kind_row:
-            self._append_info_ui(
-                _("[组] 组 %s 的轨迹来自 **父行**（%s轨迹，已覆盖组内主自己的轨迹）。")
-                % (_gid, _kind_row))
+        # ---- 轨迹来源提示（2026-10-18 用户定案 G：「只加提示，知道来源就行」）----
+        # 整组位移轨迹的来源由**「轨迹来源」下拉**显式决定（本窗「叠加/偏移」页角度右侧，
+        # 仅父行显示）：`无`＝父行自己 / `组内主` / `组内子-N`。
+        # 🔴 旧的「父行没配就悄悄用组内主」兜底已在同一轮**删掉** —— 兜底不是默认，
+        #    是"看不见的耦合"（用户原话：「组内的所有都该是独立的，和父行不在有关系」）。
+        #    现在缺省是 `无`：父行没配轨迹 ⇒ 整组不位移，与成员各自的轨迹互不影响。
+        # 消费链在导出/预览的组分支（`_group_material_wp_res` / `_group_material_row_proj`
+        # → `_bmeta` / `_gs`）；解析与回退的**唯一出处** = `_group_traj_src_disp_settings`。
+        # 这里只**告知**：不迁移数据、不改用户已有的选择。
+        _ds_tag = ""
+        with suppress(Exception):
+            _ds, _ds_tag, _ds_kind = self._group_traj_src_disp_settings(
+                _gid, key=_key, item=_cur)
+            if _ds_tag:
+                # 🔴 同上：`(无轨迹)` 是 canonical 后缀，判据/切片两侧都**不包 `_()`**。
+                if _ds_tag.endswith("(无轨迹)"):
+                    self._append_info_ui(
+                        _("[组] 组 %s 的轨迹来源选了 **%s**，但那条成员**没有配生效轨迹** ⇒ "
+                        "已自动回退到「无」（用父行自己的，当前%s）。"
+                        "要让整组跟着它走，请先在那条成员的「叠加/偏移」页配好轨迹。")
+                        % (_gid, _ds_tag[:-len("(无轨迹)")],
+                           (_("父行是") + self._group_traj_kind_disp(_ds_kind)) if _ds_kind else _("父行也没配轨迹")))
+                else:
+                    self._append_info_ui(
+                        _("[组] 组 %s 的整组位移轨迹来自 **%s**（%s）。"
+                        "本窗口「轨迹控制…」里配的轨迹属于**父行自己**，"
+                        "只有来源选「无」时它才生效。")
+                        % (_gid, _ds_tag, self._group_traj_kind_disp(_ds_kind)))
+            else:
+                self._append_info_ui(
+                    _("[组] 组 %s 当前**没有整组位移轨迹**（轨迹来源＝无，且父行自己也没配）。"
+                    "成员的轨迹只作用它自己那条腿。") % _gid)
         # 父行的**自旋转**（2026-10-18 用户第 3 条）：它和轨迹一样是整组姿态，且父行
         # 才配得到；有它时航点角度让位（角度由自旋转驱动）—— 明确打一条，避免又出现
-        # 「开了不知道生不生效」。
-        if self._group_material_row_proj(_key, item=_cur).get("spin_enabled"):
+        # 「开了不知道生不生效」。🔴 自旋**恒认父行自己**（成员的只作用它自己 —— 解耦铁律），
+        #    所以这里判据不含「轨迹来源」。
+        if self._group_material_row_proj(_key, item=_cur, gid=_gid).get("spin_enabled"):
             self._append_info_ui(
                 _("[组] 组 %s 的**自旋转**来自父行（作用于整组；此时列表轨迹里的航点角度"
                 "不再叠加）") % _gid)
@@ -64626,7 +65437,7 @@ class FFmpegBatchGUI:
                     "滤镜类（裁剪/遮罩/抠像/缩放…）会**照常叠加生效**；"
                     "但其中的 %s **不生效** —— 父行的几何只认本窗口这一条（第 1 条）。"
                     "要把几何搬到父行，就在本窗口里重配一遍。")
-                    % (_gid, _n_extra, _("、").join(_geo_extra)))
+                    % (_gid, _n_extra, "、".join(_geo_extra)))
             else:
                 self._append_info_ui(
                     _("[组] 组 %s 的这个组节点上还有 **%d 条**效果（在右键「视频节点」里加的），"
@@ -64656,12 +65467,15 @@ class FFmpegBatchGUI:
             self._append_info_ui(
                 _("[组] 父行里的 %s **不会生效**：父行是合成画面，时间轴类（循环/倒放/截取/"
                 "变速）由成员各自的窗口承载，混合模式只支持普通叠加。"
-                "（本次不改你的设置，仅告知。）") % _("、").join(_unsup))
+                "（本次不改你的设置，仅告知。）") % "、".join(_unsup))
         # ⚠️ 必须**先落库**：edit_index=0 只在"第 0 项已存在"时才是替换（越界会变追加
         # ⇒ 重开又是一条新的，正是用户实测的"其它重开就丢"）。补了默认值也一样要写回，
         # 否则窗口预填的还是缺 X/Y 的旧项。
         self._group_material_set(_key, **_initial)
         _role = "main" if (_evs and _base is _evs[0]) else "sub"
+        # 标题尾巴里的「轨迹:N」用 `_group_traj_src_disp_settings` 的来源标记
+        # （`父` / `g1-2` / `g1-2(无轨迹)`）—— 与列表规格列同一个出处。
+        _tag_title = _ds_tag
         try:
             self._open_node_effect_editor(
                 _key, _lab, (_bw, _bh), _base.file_path, _evs[0], _evs[1:],
@@ -64669,15 +65483,15 @@ class FFmpegBatchGUI:
                 #   此处 = 「列表父行」入口 ⇒ 身份 = 组 + 包装盒尺寸；尾巴 = 轨迹来源 + 另有N条。
                 title=material_win_title(
                     _("组 %s（%dx%d）") % (_gid, _bw, _bh),
-                    (_(" · 轨迹:%s") % _traj_owner if _traj_owner else "")
+                    (_(" · 轨迹:%s") % _tag_title if _tag_title else "")
                     + (_(" · 另有%d条") % _n_extra if _n_extra else "")),
                 # ⭐ 父行是「一条素材」⇒ 同一份设置只此一条：预填 + 替换（不追加堆叠）
                 edit_index=0,
                 material=True,
                 role=_role,
                 post_save=lambda new: (
-                    self._merge_group_apply_row_rot(_base, new),
-                    self._merge_group_apply_row_place(_base, _initial, new)))
+                    self._merge_group_apply_row_rot(_gid, new),
+                    self._merge_group_apply_row_place(_gid, _initial, new)))
         except Exception as _exc:
             self._append_info_ui(_("[组] 打开组轨道设置失败：%s") % _exc)
         return True
@@ -64899,7 +65713,7 @@ class FFmpegBatchGUI:
         _sv_max = max(1, min(30, self.sub_video_preview_max.get()))
         if len(sub_videos) > _sv_max:
             self._append_info_ui(
-                _('[预览] 子视频数量 {0} 超过 {1} 个，实时预览仅支持前 {2} 个').format(len(sub_videos), _sv_max, _sv_max))
+                f"[预览] 子视频数量 {len(sub_videos)} 超过 {_sv_max} 个，实时预览仅支持前 {_sv_max} 个")
             sub_videos = sub_videos[:_sv_max]
         main_file = normalize_path(main_video.file_path)
         # 2026-10-09：主视频是否为「颜色虚拟源」。颜色源不是真实文件 → 不能把哨兵串当位置输入
@@ -65102,7 +65916,7 @@ class FFmpegBatchGUI:
                                 "us": _us2, "wsa": _wsa2, "geo": _geo}
         _grp_of = {_ii: _gg for _gg, _d in _grp_ok.items() for _ii in _d["mems"]}
         if _grp_ok:
-            self._append_info_ui(_("[预览] 已启用嵌套合成：%s") % _("；").join(
+            self._append_info_ui(_("[预览] 已启用嵌套合成：%s") % "；".join(
                 _("%s=%d 条") % (_gg, len(_d["mems"])) for _gg, _d in _grp_ok.items()))
         try:
             # 有生效分组时链让位（[] ⇒ 空链），避免「组员又是链成员」的语义冲突 —— 与导出
@@ -65277,7 +66091,8 @@ class FFmpegBatchGUI:
                     cur = "[v_main_canvas_s]"
                 _main_w, _main_h = _mbbw, _mbbh
                 self._append_info_ui(
-                    _('[预览] 主视频画布模式已启用：内容基准 {0}x{1}，画布 {2}x{3}').format(_mdim[0] or 1280, _mdim[1] or 720, _main_w, _main_h))
+                    f"[预览] 主视频画布模式已启用：内容基准 {_mdim[0] or 1280}x{_mdim[1] or 720}，"
+                    f"画布 {_main_w}x{_main_h}")
             else:
                 self._append_info_ui(_("[预览] 主视频画布模式生成失败，已按普通主视频处理"))
         # 主视频有效结束时长（结尾强制收尾 trim 用）：截取后时长优先，图片给默认 10s
@@ -65336,7 +66151,7 @@ class FFmpegBatchGUI:
             # 必须同步为 pad 尺寸——轨迹 clamp / 基准位置求值 ctx / _blend_static_geometry
             # 全用它，否则轨迹被锁死主视频源尺寸、普通叠加基准位置也错位。
             _main_w, _main_h = _pwc, _phc
-            self._append_info_ui(_('[预览] 主视频画布偏移：{0}x{1} @ ({2},{3})').format(_pwc, _phc, _ox, _oy))
+            self._append_info_ui(f"[预览] 主视频画布偏移：{_pwc}x{_phc} @ ({_ox},{_oy})")
 
         # ---- 转场链：主视频进链 split + 真时间轴延长（与正式命令
         # _build_overlay_filter_complex 的「链规划 → 主进链 split → 底 tpad」同序）----
@@ -65366,7 +66181,8 @@ class FFmpegBatchGUI:
                 f"{cur}tpad=stop_mode=add:stop_duration={_pv_total - _pv_main_eff:.6f}{_pv_pad_col}[v_main_ext_pv]")
             cur = "[v_main_ext_pv]"
             self._append_info_ui(
-                _('[预览] 子素材显示时段超出主视频时长（{0:.3f}s），已延长预览时间轴到 {1:.3f}s（尾部补黑帧）').format(_pv_main_eff, _pv_total))
+                f"[预览] 子素材显示时段超出主视频时长（{_pv_main_eff:.3f}s），"
+                f"已延长预览时间轴到 {_pv_total:.3f}s（尾部补黑帧）")
 
         # ---- 多 blend 子视频区域隔离（需求3）：主视频 split 出原始帧副本 ----
         # 非 normal blend 子视频 ≥2 个时，blend 主区域从主视频【原始帧】副本取
@@ -65410,7 +66226,8 @@ class FFmpegBatchGUI:
             # 用户无从判断到底是设置问题还是渲染问题。
             if not force_overlay and not _s.get('overlay_enabled', True):
                 self._append_info_ui(
-                    _('[预览] 子视频 {0} 未勾选「启用叠加」：预览与成片都不显示它（如需显示，请到该轨道的「视频轨道设置」里勾选「启用叠加」）').format(_k + 1))
+                    f"[预览] 子视频 {_k + 1} 未勾选「启用叠加」：预览与成片都不显示它"
+                    f"（如需显示，请到该轨道的「视频轨道设置」里勾选「启用叠加」）")
                 return None
             try:
                 _ow, _oh = get_video_rotated_dimensions(self.ffprobe_cmd, _sfile, _s)
@@ -65508,10 +66325,12 @@ class FFmpegBatchGUI:
                                            sw=str(_rw), sh=str(_rh), spin_speed=_spd,
                                            trim_start=_ts0, speed_factor=_sp0)
                 _wp_rotP = (_wpP is not None and _wpP[2] is not None)
-            if not group_base and (_alpha or (_spin and _spd != 0) or _rad != 0 or _wp_rotP or
-                                   (_wpP is not None and _wpP[4] is not None)):
+            # 🔴 2026-10-18（解耦）：`group_base` **不再跳过**透明度/旋转/轨迹缩放 ——
+            #    组内主的这些变换只作用它自己（与导出 `_build_sub_layer_node` 同口径）。
+            if (_alpha or (_spin and _spd != 0) or _rad != 0 or _wp_rotP or
+                    (_wpP is not None and _wpP[4] is not None)):
                 _sp.append("format=rgba")
-            if _alpha and not group_base:
+            if _alpha:
                 _av = _opt_float(_s.get("alpha_value", 1.0), 1.0)
                 # 静态透明度：轨迹透明度存在时跳过——由下方 geq 一并折入。
                 if 0.0 <= _av <= 1.0 and not (_wpP is not None and _wpP[4] is not None):
@@ -65522,7 +66341,7 @@ class FFmpegBatchGUI:
             #    时间戳变量为 T（独立 t 用 re.sub 换 T），上游已挂 format=rgba，静态 _av 折入 a='(_av*255)*(traj_T)'。
             #    geq 表达式取 0~255 平面值（非 0~1），alpha 须 ×255 缩放（见子视频处说明）。
             #    已知限制：geq 读不到输入 alpha，不乘源素材自带 alpha（见子视频处说明）。
-            if not group_base and _wpP is not None and _wpP[4] is not None:
+            if _wpP is not None and _wpP[4] is not None:
                 _traj_TP = re.sub(r'\bt\b', 'T', _wpP[4])
                 _saP = _av if (_alpha and 0.0 <= _av <= 1.0) else 1.0
                 _sp.append(f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{_saP*255:.0f}*({_traj_TP})'")
@@ -65538,7 +66357,7 @@ class FFmpegBatchGUI:
             #     角度改回 0（不挂 rotate）即恢复正常 —— 正是本条漏延后。仅画布模式受影响
             #     （非画布模式 rotate 本来就在叠加前，与正式命令同序）。
             _rot_segP = None
-            if not group_base and overlay_rotation_active(_s, wp_rot=_wp_rotP):
+            if overlay_rotation_active(_s, wp_rot=_wp_rotP):
                 _angle_exprd = ""
                 if _rad != 0:
                     _angle_exprd = f"{_rad}*PI/180"
@@ -65574,9 +66393,9 @@ class FFmpegBatchGUI:
                                                   or 'normal')).strip().lower() != 'normal':
                 _sp.append("format=rgba")
             # 画布模式下把列表缩放段**攒起来**，稍后在画布合成之后追加（见下方 _sub_cv_on 块）。
-            # group_base：轨迹缩放搬去组节点（见 `_group_node_transform_parts`）⇒ 内容腿不加。
+            # 🔴 2026-10-18（解耦）：group_base 也**照常**加轨迹缩放（只作用它自己）。
             _wp_scale_segP = None
-            if _wp_zoomP and not group_base:
+            if _wp_zoomP:
                 # 列表轨迹缩放 sendcmd 化（2026-10-07，与正式命令 _build_sub_layer_node
                 # 33273 同款）：航点行数 > 阈值时把 zoom scale 改名 scale@slr{_k} 并挂
                 # sendcmd 命令文件（值 = max(2,2*round(iw*(s)/2))，s 为倍率因子区间表，
@@ -65830,7 +66649,9 @@ class FFmpegBatchGUI:
                     _ch["penable"] = f"between(t,{_ch['start']:.6g},{_ch['start'] + _acc_len:.6g})"
                     with suppress(Exception):
                         self._append_info_ui(
-                            _('[预览] 子视频 {0}…{1} 已合成转场链：{2:.2f}s~{3:.2f}s（{4} 段，链内统一 {5}x{6}）').format(_mem[0] + 1, _mem[-1] + 1, _ch['start'], _ch['start'] + _acc_len, len(_mem), _ch['size'][0], _ch['size'][1]))
+                            f"[预览] 子视频 {_mem[0] + 1}…{_mem[-1] + 1} 已合成转场链："
+                            f"{_ch['start']:.2f}s~{_ch['start'] + _acc_len:.2f}s"
+                            f"（{len(_mem)} 段，链内统一 {_ch['size'][0]}x{_ch['size'][1]}）")
 
         # ---- 阶段 A3：分组节点合成（成员层 → overlay 成组节点 [v_grp_<g>_<k>]）----
         # 单画布方案（2026-10-17，与导出 `_build_overlay_filter_complex` 阶段 A3 逐项
@@ -65883,38 +66704,60 @@ class FFmpegBatchGUI:
                            % (_acc, _grp_layer[_i]["label"], _g, _kk))
                     _acc = "v_grp_%s_%d" % (_g, _kk)
                     continue
-                _rx, _ry = _pv_grp_off(_geo["rel"][_d["mems"].index(_i)])
+                _Lm = _grp_layer[_i]
+                # 🔴 2026-10-18（解耦）：判据对**所有成员**一视同仁（含组内主），
+                #    与导出阶段 A3 逐项同口径 —— 组内主的位移轨迹只作用它自己。
+                if self._group_traj_kind(_Lm["s"]):
+                    # 🔴 组内子**位移轨迹**（2026-10-18 用户拍板 A+a / 主画布域，与导出阶段
+                    #    A3 逐项同口径）：定位走时间表达式。表达式按**预览帧空间**求
+                    #    （`s_pos`/`wpP` 已由 `_pipe_scale_pos_settings` 换算）⇒ W/H 常量
+                    #    必须是「真画布 × `_pwf`」，与 rel 的 `_pv_grp_off` 同一把尺子。
+                    #    盒几何（`_geo`）永远在**真画布域** → 此处两处换算缺一不可。
+                    _rx, _ry = self._group_member_pos_expr(
+                        _Lm["sfile"], _Lm["s_pos"],
+                        {"wp_res": _Lm["wpP"], "wp_rot": _Lm["wp_rotP"],
+                         "spin_on": _Lm["spin"], "ra": _Lm["rad"],
+                         "wp_zoom": _Lm["wp_zoomP"]},
+                        _pv_grp_scale(_geo["canvas"]), _pv_grp_off(_geo["origin"]))
+                else:
+                    _rx, _ry = _pv_grp_off(_geo["rel"][_d["mems"].index(_i)])
+                    # 静态成员：保持 `%g` 数字形态（与改动前逐字符一致）
+                    _rx, _ry = ("%g" % _rx), ("%g" % _ry)
                 # 🔴 成员可见时段必须钉 enable（与导出阶段 A3 逐字符同口径）：单画布方案下
                 # 内容腿没有「成员画布 EOF」兜底 ⇒ 不钉就会越过自己的窗口一直显示
                 # （此前预览整段缺这条，与导出不一致）。起点取成员自己的窗口起点（`wsa`）。
                 _ln = float(_d["lens"][_i])
                 _w0 = min(float((_d.get("wsa") or {}).get(_i, 0.0) or 0.0), _ln)
-                fg.raw("[%s][%s]overlay=x='%g':y='%g':enable='between(t,%.6g,%.6g)'"
+                fg.raw("[%s][%s]overlay=x='%s':y='%s':enable='between(t,%.6g,%.6g)'"
                        "[v_grp_%s_%d]"
                        % (_acc, _grp_layer[_i]["label"], _rx, _ry, _w0, _ln, _g, _kk))
                 _acc = "v_grp_%s_%d" % (_g, _kk)
             _d["node"] = _acc
             # ---- 组节点的变换 + 落位（与导出阶段 B 的组分支逐项同口径）----
-            # 组内主的旋转 / 轨迹缩放 / 透明度在**组节点**上表达 ⇒ 作用于整组（阶段 A3 的
-            # 内容腿已按 group_base=True 跳过这些段）。
+            # 🔴 2026-10-18（解耦）：组内主的旋转 / 自旋 / 轨迹缩放 / 透明度**只作用它
+            #    自己**（`_pv_build_layer` 内容腿不再按 `group_base` 跳过）⇒ 组节点的姿态
+            #    **只认父行**（`_bmeta` 五键清零 + `_gs` 只带父行投影），与导出同口径。
             _bsv = sub_videos[_d["base"]]
             _Lb = _grp_layer[_d["base"]]
-            _bmeta = {"wp_res": _Lb["wpP"], "wp_rot": _Lb["wp_rotP"], "spin_on": _Lb["spin"],
-                      "ra": _Lb["rad"], "wp_zoom": _Lb["wp_zoomP"]}
+            # 🔴 解耦核心：组内主继承来的姿态**清零**（组内主开自旋/角度不再带动整组）。
+            _bmeta = {"wp_res": None, "wp_rot": False, "spin_on": False,
+                      "ra": 0.0, "wp_zoom": False}
             _sess = _bsv.enc_settings or {}
-            # 组级静态角度 `grp_rot_angle`（存在组内主，与 grp_dx/grp_dy 同族）：父行 = 独立素材
-            # ⇒ 旋转作用于**整组**、且**不写成员自己的 rotate_angle**（否则成员各自再转一次）。
-            _gra = _opt_float(_sess.get("grp_rot_angle", 0) or 0, 0.0)
-            _gs = _sess
+            # 组级静态角度 `grp_rot_angle` 现居**父行**素材项（`_group_level_item`）。
+            # 父行 = 独立素材 ⇒ 它的角度作用于**整组**、且**不写成员自己的 rotate_angle**
+            #（否则成员各自再转一次 = 双重旋转）。
+            _gkey = self._group_final_label_key(_g, len(_d["mems"]))
+            _lvl = self._group_level_item(_g)
+            _gra = _opt_float(_lvl.get("grp_rot_angle", 0) or 0, 0.0)
+            _gs = {"move_mode": "", "spin_enabled": False, "rotate_angle": 0.0}
             if _gra:
-                _gs = dict(_sess)
                 _gs["rotate_angle"] = _gra
-                _bmeta = dict(_bmeta)
                 _bmeta["ra"] = _gra
-            # 组级落位数值（grp_dx/grp_dy 增量 / grp_abs_x/y 绝对）与**组内主 overlay_x/y
-            # （= 组的基准落位）都是**真画布像素** ⇒ `_pwf<1`（管道工作分辨率上限）时换算到
-            # 预览帧空间（含画布/子尺寸变量的表达式由 ffmpeg 在图内按当前帧求值 → 原样保留）。
-            # 漏缩 overlay_x/y 会令整组在缩小后的画布里偏右下（用户实测「管道模式无角度也下偏」）。
+            # 组内主 overlay_x/y（= 组的基准落位）是**真画布像素** ⇒ `_pwf<1`（管道工作分辨率
+            # 上限）时换算到预览帧空间（含画布/子尺寸变量的表达式由 ffmpeg 在图内按当前帧求值
+            # → 原样保留）。漏缩 overlay_x/y 会令整组在缩小后的画布里偏右下（用户实测「管道模式
+            # 无角度也下偏」）。⚠️ 组级落位（grp_dx/dy、grp_abs_x/y）已改由
+            # `_group_place_delta/_group_place_abs(pwf=…)` 内部换算（数据源是父行素材项）。
             # ⚠️ 传给 `_group_node_xy` 的必须是**未注入 rotate_angle** 的 base 设置（`_sess_pv`），
             # 与导出 `_build_overlay_filter_complex` 同口径（导出传 `sub_settings` 原样、旋转只走
             # `meta["ra"]`）—— 注入 rotate_angle 会让 `_overlay_content_size` 误按成员内容盒算，
@@ -65922,8 +66765,7 @@ class FFmpegBatchGUI:
             _sess_pv = _sess
             if _pwf < 1.0:
                 _sess_pv = dict(_sess)
-                for _gk in ("grp_dx", "grp_dy", "grp_abs_x", "grp_abs_y",
-                            "overlay_x", "overlay_y"):
+                for _gk in ("overlay_x", "overlay_y"):
                     _gv2 = _sess.get(_gk)
                     if _gv2 not in (None, ""):
                         with suppress(Exception):
@@ -65931,7 +66773,6 @@ class FFmpegBatchGUI:
             # 组父行缩放（独立素材 scale）⇒ 旋转中心对齐两端须用缩放后尺寸（否则「缩放 +
             # 旋转」整组上偏，用户实测）。先按**未缩放** geo 求用户缩放尺寸，再套 `_pwf` 换算
             # 到预览帧空间（与 _geo_pv 同域）。未缩放 → None 走旧口径。
-            _gkey = self._group_final_label_key(_g, len(_d["mems"]))
             # 🔴 2026-10-16 第七轮②：**父行素材项的列表轨迹** —— 与导出同口径（唯一出处
             #    `_group_material_wp_res`；预览必须与转换一致，否则「预览对、导出错」）。
             #    ⚠️ 航点坐标要按 `_pwf` 换算到**预览帧空间**（与 `_sess_pv` 的 overlay_x/y
@@ -65944,10 +66785,10 @@ class FFmpegBatchGUI:
                     _mwp = self._group_material_wp_res(
                         _gkey, _geo_pv["size"][0], _geo_pv["size"][1],
                         trim_start=_ts0_m, speed_factor=_sp0_m,
+                        gid=_g, pwf=_pwf,
                         item=_pipe_scale_pos_settings(
                             self._group_material_item(_gkey), _pwf))
             if _mwp is not None:
-                _bmeta = dict(_bmeta)
                 _bmeta["wp_res"] = _mwp
                 _bmeta["wp_rot"] = _mwp[2] is not None
                 _bmeta["wp_zoom"] = _mwp[3] is not None
@@ -65959,25 +66800,24 @@ class FFmpegBatchGUI:
                 #   仍吃 `_sess_pv`，不会让组内主自己被当成"有轨迹"二次算一遍。
                 _gs = dict(_gs or {})
                 _gs["move_mode"] = "waypoints"
-            # 🔴 2026-10-18（用户第 3 条，与导出阶段 B **逐项同口径**）：父行的**自旋转 /
-            #    预制轨迹** —— 此前没有任何消费端（存进 node_fx[key][0] 但渲染不认）。
+            # 🔴 2026-10-18（用户第 3 条，与导出阶段 B **逐项同口径**）：父行的**自旋转**与
+            #    **来源的预制轨迹**（位移可借成员，见「轨迹来源」下拉）。
             #    · 预制轨迹 ⇒ 注入 `_gs` + `_group_node_xy(row_settings=…)`（幅度按包装盒）；
-            #      组内主的列表轨迹整体让位；
-            #    · 自旋转   ⇒ `_bmeta["spin_on"]=True` + `_gs` 的 spin_speed，航点角度让位。
-            #    预览必须与成片同口径，否则「预览动、导出不动」或反向。
+            #      来源的列表轨迹整体让位（wp_res 的位移会与预制位移混在一起）；
+            #    · 自旋   ⇒ `_bmeta["spin_on"]=True` + `_gs` 的 spin_speed，航点角度让位；
+            #      **恒认父行自己**（成员的自旋只作用它自己那条腿 —— 解耦铁律）。
             #    ⚠️ 预览帧空间：move_cycle/dwell 是秒、spin_speed 是角度、move_margin 默认
             #      是 `W*0.03` 表达式 ⇒ 都不含绝对像素，无需 `_pwf` 换算。
-            _row_fx = self._group_material_row_proj(_gkey)
+            #      （借成员的**列表轨迹**已在 `_group_material_wp_res(pwf=…)` 内部换算。）
+            _row_fx = self._group_material_row_proj(_gkey, gid=_g, pwf=_pwf)
             if _row_fx:
-                _gs = dict(_gs or {})
                 _gs.update(_row_fx)
-                _bmeta = dict(_bmeta)
                 if _row_fx.get("spin_enabled"):
                     _bmeta["spin_on"] = True
                     _bmeta["wp_rot"] = False
                 if _row_fx.get("move_mode"):
-                    # 与导出阶段 B **同一条**让位语义（见那边注释）：父行预制轨迹存在 ⇒
-                    # 组内主列表轨迹整体让位（含 wp_rot/wp_zoom），且 `_mwp` 清空让
+                    # 与导出阶段 B **同一条**让位语义（见那边注释）：**来源的**预制轨迹存在 ⇒
+                    # **来源的**列表轨迹整体让位（含 wp_rot/wp_zoom），且 `_mwp` 清空让
                     # `wp_move` 回落 False（恢复盒原点 base 修正）。预览/成片必须一致。
                     _mwp = None
                     _bmeta["wp_res"] = None
@@ -65986,12 +66826,13 @@ class FFmpegBatchGUI:
             _user_scaled = self._group_material_scaled_size(_geo["size"], _gkey)
             _pv_scaled = (_pv_grp_scale(_user_scaled) if _user_scaled is not None else None)
             _gx, _gy = self._group_place_xy(
-                _sess_pv,
+                _g,
                 *self._group_node_xy(_bsv.file_path, _sess_pv, _bmeta, _geo_pv,
                                      grp_scaled_size=_pv_scaled,
                                      wp_move=(_mwp is not None),
-                                     row_settings=_row_fx))
-            _ax, _ay = self._group_place_abs(_sess_pv)
+                                     row_settings=_row_fx),
+                pwf=_pwf)
+            _ax, _ay = self._group_place_abs(_g, pwf=_pwf)
             if _mwp is not None:
                 # 列表轨迹 = 逐帧落位 ⇒ 静态绝对落位不参与（与导出同一条判据；两套相加必漂移）
                 _ax = _ay = None
@@ -66138,7 +66979,8 @@ class FFmpegBatchGUI:
                 _dgp = self._blend_downgrade_pad(_ms, main_file)
                 if _dgp:
                     self._append_info_ui(
-                        _('[混合模式] pad 画布 {0}x{1} 大于主视频渲染尺寸，blend({2}) 已降级为普通叠加（脱离主视频像素的混合无意义）').format(_dgp[0], _dgp[1], _blend_mode))
+                        f"[混合模式] pad 画布 {_dgp[0]}x{_dgp[1]} 大于主视频渲染尺寸，"
+                        f"blend({_blend_mode}) 已降级为普通叠加（脱离主视频像素的混合无意义）")
                     _blend_mode = 'normal'
             if _blend_mode != 'normal':
                 # 自旋转/静态角度时子视频链输出为 hypot 正方形画布 → blend 区域必须用对角线
@@ -66276,7 +67118,7 @@ class FFmpegBatchGUI:
                     else:
                         # mode 未知（理论不发生）→ 兜底静态基准位置 blend
                         self._append_info_ui(
-                            _('[预览] 子视频 {0} 混合模式+轨迹控制：轨迹模式不支持，已按基准位置 blend').format(_k + 1))
+                            f"[预览] 子视频 {_k+1} 混合模式+轨迹控制：轨迹模式不支持，已按基准位置 blend")
                         _bbx, _bby, _bbw, _bbh, _bsx, _bsy = self._blend_static_geometry(
                             int(_bxv - _offPx), int(_byv - _offPy), _bw_src, _bh_src, _main_w, _main_h)
                         if _bbw >= 2 and _bbh >= 2:
@@ -66409,13 +67251,13 @@ class FFmpegBatchGUI:
             cur = "[v_bp]"
             fg.extend(_pip_split_parts(cur, "[v_po2]", build_split_border_cfg(_pip_eh)))
             cur = "[v_po2]"
-            self._append_info_ui(_('[预览] 实时预览：多画面拼接 {0}x{1}（等宽边框）').format(_pip_rows, _pip_cols))
+            self._append_info_ui(f"[预览] 实时预览：多画面拼接 {_pip_rows}x{_pip_cols}（等宽边框）")
             fg.raw(f"{cur}null[vo]")
         else:
             if _pip_split_ok:
                 fg.extend(_pip_split_parts(cur, "[v_split]"))
                 cur = "[v_split]"
-                self._append_info_ui(_('[预览] 实时预览：多画面拼接 {0}x{1}').format(_pip_rows, _pip_cols))
+                self._append_info_ui(f"[预览] 实时预览：多画面拼接 {_pip_rows}x{_pip_cols}")
             if _bp_pip:
                 _bp_tail = "," + _bp_pip
                 self._append_info_ui(_("[预览] 实时预览：已叠加末端边框"))
@@ -66664,7 +67506,7 @@ class FFmpegBatchGUI:
             fg.raw("[amain_pv]anull[ao]")
             if _pv_mixed:
                 self._append_info_ui(
-                    _('[预览] 已混入 {0} 条音频（子视频混音/替换 + 独立音频混音，与导出一致）').format(_pv_mixed))
+                    f"[预览] 已混入 {_pv_mixed} 条音频（子视频混音/替换 + 独立音频混音，与导出一致）")
         graph = fg.build()
 
         # ---- 「节点标签」同步到预览（2026-09-26）----
@@ -66709,14 +67551,14 @@ class FFmpegBatchGUI:
                     anchor_nodes=graph_nodes(_pv_anchor),
                     anchor_graph=_pv_anchor)
             except Exception as _e:
-                self._append_info_ui(_('[节点] 预览叠加节点效果失败（按原图继续）: {0}').format(_e))
+                self._append_info_ui(f"[节点] 预览叠加节点效果失败（按原图继续）: {_e}")
             if getattr(self, "node_audio_fx", None):
                 try:
                     graph, _pv_node_lbl = self._apply_node_audio_fx(
                         graph, ("ao" if "[ao]" in graph else "out"),
                         anchor_nodes=graph_nodes(getattr(self, "_last_graph", "") or ""))
                 except Exception as _e:
-                    self._append_info_ui(_('[音频节点] 预览叠加失败（按原图继续）: {0}').format(_e))
+                    self._append_info_ui(f"[音频节点] 预览叠加失败（按原图继续）: {_e}")
 
         # ---- 【时间预览引擎】管道合成模式（2026-09-20 Phase 2，用户拍板开放封装页）----
         # 同一张 PiP 合成图改喂内置时间预览窗口：ffmpeg -filter_complex → rawvideo 管道，
@@ -66748,7 +67590,8 @@ class FFmpegBatchGUI:
                 _pipe_h = _main_h * _pip_rows
             _pipe_ar = (float(_pipe_w) / _pipe_h) if _pipe_h > 0 else None
             self._append_info_ui(
-                _('[时间预览] 画中画管道合成预览：{0} 个子视频 movie 合成（ffmpeg -filter_complex → rawvideo；子视频跟随进度条同步 seek）').format(len(sub_videos)))
+                f"[时间预览] 画中画管道合成预览：{len(sub_videos)} 个子视频 movie 合成"
+                f"（ffmpeg -filter_complex → rawvideo；子视频跟随进度条同步 seek）")
             if _pv_out_mode:
                 # 路线A（research/pipe-pip-chain）：链图 = 输出时间轴——xfade offset / adelay /
                 # enable / cbase d 全是 0 基绝对值，管道的 pts 平移桥接会让整链错位（拖动后
@@ -66758,7 +67601,8 @@ class FFmpegBatchGUI:
                 _pv_out = _pv_total if (_pv_total and _pv_total > 0) else (
                     _pv_main_eff if (_pv_main_eff and _pv_main_eff > 0) else _main_limit)
                 self._append_info_ui(
-                    _('[时间预览] 含转场链 → 输出时间轴模式（总长 {0:.2f}s；拖动从 0 解码后输出侧裁剪，seek 较慢但与导出逐帧一致）').format(_pv_out))
+                    f"[时间预览] 含转场链 → 输出时间轴模式（总长 {_pv_out:.2f}s；"
+                    f"拖动从 0 解码后输出侧裁剪，seek 较慢但与导出逐帧一致）")
                 # 合成音频图下传（串行合并同款）：out_mode 的输出时间轴与主文件音轨时间轴
                 # 不对齐（图内主声床 atrim=_ssec 后 0 基 + 子声 adelay 落位），引擎直读主文件
                 # 只会放出「第一个视频的完整音频」（用户实测）→ 抽混音段成独立 lavfi 图，
@@ -66806,7 +67650,7 @@ class FFmpegBatchGUI:
                 # 【秒开】关掉 hr-seek（同 preview_with_player 的说明）：图内 trim=start=_ssec
                 # 已精确裁切，mpv 不必再消耗 _ssec 秒滤镜输出才出首帧；画面仍逐帧准确。
                 cmd.append("--hr-seek=no")
-            self._append_info_ui(_('[预览] 画中画实时预览：mpv lavfi-complex（{0} 个子视频 movie 合成，可能卡顿）').format(len(sub_videos)))
+            self._append_info_ui(f"[预览] 画中画实时预览：mpv lavfi-complex（{len(sub_videos)} 个子视频 movie 合成，可能卡顿）")
             self._append_info_ui(_("执行命令: ") + format_cmd_for_display(cmd))
             try:
                 flags = _ffmpeg_spawn_flags()
@@ -66820,7 +67664,7 @@ class FFmpegBatchGUI:
                 # 兜底：Popen 抛 OSError=mpv 进程起不来（不可用），标记标志供后续预览直接回退/提示
                 self._mpv_usable = False
                 self._mpv_verified = True   # 已实测失败，后续预览直接回退不再重试子进程
-                self._append_info_ui(_('[预览] mpv 启动失败: {0}（已标记 mpv 不可用，请检查路径或用快照预览）').format(e))
+                self._append_info_ui(f"[预览] mpv 启动失败: {e}（已标记 mpv 不可用，请检查路径或用快照预览）")
         else:
             # ffplay 回退：图内 [vid1]→[in]、[vo]→[out]，主音频 passthrough 段([aid1]anull[ao])删除
             # （ffplay 主音轨随 -i 自动播放）。图片主视频的循环由图内 `loop=loop=-1` 滤镜承担
@@ -66857,9 +67701,10 @@ class FFmpegBatchGUI:
                     #    音频已在图内 amovie 自供（含混音段），无需 -af 直挂。
                     _lav_cmd.extend(["-f", "lavfi", "-i", _ff_graph])
                     _lav_cmd.extend(self._ffplay_fit_scale(_out_w, _out_h))
-                    _lav_cmd.extend(["-window_title", _('预览(PiP): {0}').format(os.path.basename(main_file))])
+                    _lav_cmd.extend(["-window_title", f"预览(PiP): {os.path.basename(main_file)}"])
                     self._append_info_ui(
-                        _('[预览] 画中画实时预览：ffplay -f lavfi 整图（尾垫 {0:.2f}s → {1:.2f}s，autoexit 盯图 EOF 全片播完自动关窗；窗口内不支持 seek）').format(_main_limit, _pv_total))
+                        f"[预览] 画中画实时预览：ffplay -f lavfi 整图（尾垫 {_main_limit:.2f}s → "
+                        f"{_pv_total:.2f}s，autoexit 盯图 EOF 全片播完自动关窗；窗口内不支持 seek）")
                     self._append_info_ui(_("执行命令: ") + format_cmd_for_display(_lav_cmd))
                     self._spawn_player_stderr_scan(_lav_cmd, scan_ffplay=True)
                     return
@@ -66910,7 +67755,7 @@ class FFmpegBatchGUI:
                 _n_mix = sum(1 for s in _ff_af.split(";") if s.strip().startswith("[asub"))
                 _n_mix += sum(1 for s in _ff_af.split(";") if s.strip().startswith("[afsub"))
                 self._append_info_ui(
-                    _('[预览] ffplay -af 已混入 {0} 条音频（与 mpv 同口径）').format(_n_mix))
+                    f"[预览] ffplay -af 已混入 {_n_mix} 条音频（与 mpv 同口径）")
                 cmd.extend(["-af", _ff_af])
             elif _main_trim_prefix and _ssec is not None and _has_audio:
                 cmd.extend(["-af", f"atrim=start={_ssec},asetpts=PTS-STARTPTS"])
@@ -66925,9 +67770,9 @@ class FFmpegBatchGUI:
             if _ff_t and _ff_t > 0:
                 cmd.extend(["-t", f"{_ff_t:g}"])
             if "-window_title" not in cmd:
-                cmd.extend(["-window_title", _('预览(PiP): {0}').format(os.path.basename(main_file))])
+                cmd.extend(["-window_title", f"预览(PiP): {os.path.basename(main_file)}"])
             self._append_info_ui(
-                _('[预览] 画中画实时预览：ffplay -vf（{0} 个子视频 movie 合成）').format(len(sub_videos)))
+                f"[预览] 画中画实时预览：ffplay -vf（{len(sub_videos)} 个子视频 movie 合成）")
             self._append_info_ui(_("执行命令: ") + format_cmd_for_display(cmd))
             self._spawn_player_stderr_scan(cmd, scan_ffplay=True)
 
@@ -70696,6 +71541,15 @@ class FFmpegBatchGUI:
                         overlay_group_fx_key if overlay_group_box else None)
                 overlay_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
                 overlay_frame.set_settings(initial_settings)
+                # 🔴 2026-10-18（G）：父行「叠加/偏移」页的**轨迹来源**下拉 ——
+                #   必须在 `set_settings` **之后**调（它要把存好的 canonical 值翻成显示名）。
+                #   gid 从 `overlay_group_label`（`v_grp_<gid>_<n>`）取 —— 与
+                #   `resolve_material_ctx` / `_group_output_label_for_tap` 同一口径。
+                if overlay_group_box and overlay_group_label:
+                    _m_gid = re.match(r"^v_grp_(.+)_\d+$", overlay_group_label or "")
+                    if _m_gid:
+                        with suppress(Exception):
+                            overlay_frame.enable_group_traj_src(_m_gid.group(1))
 
             # ---- 页面6：轨道元数据（仅视频轨道非水印） ----
             if track_obj is not None and not is_watermark:
@@ -71176,6 +72030,37 @@ class FFmpegBatchGUI:
                         return {}
 
                     def _pv_build_cmd(src, t, static, bw, bh, mode):
+                        # 🔴 2026-10-19（用户报「命令编辑器每个节点的效果预览都是：原始画面 +
+                        #   默认 W-w-10/H-h-10 位置的 overlay + 最后一条链的 delogo」）：
+                        #   命令编辑器的节点语境必须走 `node_preview_cb`（= **该选中节点子图**
+                        #   出帧）。旧路径会拿 `_sub_file`（= 本行文件）+ 封装页主轨/子轨设置
+                        #   去拼一张别处的画：overlay 用默认落位、效果用最后一链的——
+                        #   与「我点的这个节点」毫无关系，且每个节点看起来都一样。
+                        #   tail 只补**本窗口正在编的效果**（滤镜链 + 装框）；overlay 已在
+                        #   节点子图里，绝不在这里再叠一次。
+                        _ncb = getattr(filt_frame, "node_preview_cb", None)
+                        if _ncb is not None:
+                            _tail = []
+                            if mode == "proc":
+                                with suppress(Exception):
+                                    _blur = build_video_filter_chain(
+                                        dict(_pv_sub_settings()),
+                                        include_subtitle=False, include_speed=False,
+                                        include_trim=False, include_format=False,
+                                        include_scale=False, include_fade=False,
+                                        chroma_settings=None)
+                                    if _blur and _blur != "null":
+                                        _tail.append(_blur)
+                            _tail.append(_pv_fit_scale(bw, bh))
+                            _ncmd = None
+                            with suppress(Exception):
+                                _ncmd = _ncb(t, ",".join(_tail))
+                            if not _ncmd:
+                                # 同 delogo/遮罩预览的稳健兜底：t>0 失败回落 t=0 节点帧
+                                with suppress(Exception):
+                                    _ncmd = _ncb(0.0, ",".join(_tail))
+                            if _ncmd:
+                                return _ncmd
                         # 🔴 2026-10-16（用户第 2 条）：**组父行语境**整条预览改走
                         #   `_build_pip_snapshot_cmd` tap 到 `v_out_<组内主序号>`。
                         #   病根（用户实测两句）：
@@ -84560,6 +85445,51 @@ class CommandTreeEditor:
 
         return _extractor
 
+    def _make_cmd_node_preview_cb(self, chain_ref):
+        """命令编辑器节点语境「右侧实时预览 / 效果预览」的取帧**命令**构建器。
+
+        与 `_make_cmd_node_frame_extractor` **同源同参**（同一 `_cmd_node_input_graph`
+        子图 = 该节点 + 祖先），区别只在输出形态：那边返回解码好的帧，这边返回一条
+        ffmpeg 命令（预览栏本来就要命令）。签名与 `_make_node_preview_cmd_cb` 一致：
+        `(t, tail_vf) -> cmd`，`tail_vf` 追加在节点输出之后（本窗口效果链 + 装框）。
+
+        🔴 2026-10-19（用户报「命令编辑器里每个节点的效果预览都是原始画面 + 默认落位的
+        overlay + 最后一条链的 delogo」）：不挂本回调时，设置窗的预览走
+        `_sub_file` + 封装页主/子轨设置那条**与本窗口无关**的旧路径 ⇒ overlay 用默认
+        落位、效果取最后一链，且每个节点看起来完全一样。
+        """
+        app = self
+
+        def _cb(t, tail_vf, *_a):
+            try:
+                _ff = getattr(app.app, "ffmpeg_cmd", None)
+                if not _ff:
+                    return None
+                _inputs = _cmd_collect_virtual_aware_inputs(
+                    app._cur_main_input(), app._cmd_input_files())
+                if not _inputs:
+                    return None
+                _in_args = _cmd_editor_in_args(_inputs, float(t or 0.0))
+                _tail = (tail_vf or "").strip().strip(",")
+                _complex, _out_pad = app._cmd_node_input_graph(chain_ref)
+                if _complex and _out_pad:
+                    _fc, _map = _complex, _out_pad
+                    if _tail:
+                        _fc = "%s;%s%s[__pv]" % (_complex, _out_pad, _tail)
+                        _map = "[__pv]"
+                    return [_ff] + _in_args + [
+                        "-filter_complex", _fc, "-map", _map, "-an",
+                        "-frames:v", "1", "-f", "image2pipe", "-vcodec", "ppm", "-"]
+                _cmd = [_ff] + _in_args
+                if _tail:
+                    _cmd += ["-vf", _tail]
+                return _cmd + ["-frames:v", "1", "-f", "image2pipe",
+                               "-vcodec", "ppm", "-"]
+            except Exception:
+                return None
+
+        return _cb
+
     def _cmd_node_orig_size(self, chain_ref):
         """节点输入帧的真实尺寸 (w,h) → 编辑器坐标空间基准；失败回退 None。
 
@@ -84978,7 +85908,12 @@ class CommandTreeEditor:
             self.sync_fgmodel()
             _nid = None
             for _n in (self._fgmodel.nodes or []):
-                if any(getattr(_p, "name", "") == _name for _p in (_n.out_pads or [])):
+                # 🔴 2026-10-19（用户报「overlay 前景那一路单独点有帧，这里却说取不到尺寸」）：
+                # fgmodel 的 pad 名**带方括号**（`[v_temp_0]`），这里 `_name` 已 strip 过
+                # ⇒ 裸 `==` 永远比不中**中间标签**（只有 `[1:v]` 这种外部输入走前面
+                # `_pad_to_input_file` 才碰巧能用）。两边都归一化再比。
+                if any((getattr(_p, "name", "") or "").strip("[]") == _name
+                       for _p in (_n.out_pads or [])):
                     _nid = _n.nid
                     break
             if _nid is None:
@@ -85006,15 +85941,42 @@ class CommandTreeEditor:
         self._on_tree_select(None)
         return True
 
-    def _cmd_open_overlay_position_editor(self, chain_ref):
-        """命令编辑器版「🎨 可视化编辑坐标」（**无轨道对象**）。
+    def _cmd_pad_chain_ref(self, pad):
+        """pad 名（`[v_main_proc]`）→ 产出它的子链 chain_ref `(rowid, i, k)`。
 
-        用户口径（同上）：这一行既是一条完整素材，那它叠到画布上的落位就该能拖。
-        · **画布 + 背景帧** = 该节点自己的输出帧（取帧器与右侧出图预览 / 成片**同源**）；
-        · **可拖矩形的大小** = overlay 的**第二个输入**（叠上去那一路）的真实尺寸
-          —— 外部输入查 `-i` 文件尺寸、中间标签跑一次它的子图量尺寸，纯内存不落盘；
+        外部输入（`[0:v]`）/ 悬空标签 / 找不到 → None（调用方据此退回「裸主输入」）。
+        与 `_cmd_pad_frame_size` 的节点查找**同一判据**（fgmodel pad 名带方括号）。
+        """
+        _name = (pad or "").strip().strip("[]")
+        if not _name:
+            return None
+        try:
+            self.sync_fgmodel()
+            for _n in (self._fgmodel.nodes or []):
+                if any((getattr(_p, "name", "") or "").strip("[]") == _name
+                       for _p in (_n.out_pads or [])):
+                    _rr = getattr(_n, "row_ref", None)
+                    if not _rr:
+                        return None
+                    return ("r%dc%d" % (int(_rr[0]), int(_rr[1])),
+                            int(_rr[0]), int(_rr[1]))
+        except Exception:
+            return None
+        return None
+
+    def _cmd_open_overlay_position_editor(self, chain_ref):
+        """命令编辑器版「🎨 可视化编辑坐标」（**无轨道对象**）= 真·位置编辑器。
+
+        🔴 2026-10-19（用户报「你怎么传递的是可视化裁剪窗口呢? 他是位置编辑器啊」）：
+        此前借 `RectSelectEditor`（可视化裁剪 / delogo 选区那套矩形**选区**窗口）来拖
+        overlay 的 x/y —— 那是像素域选区窗，语义是「框一块区域」，不是「把这一层摆到
+        画布的哪个位置」。改为与「子视频/画中画」同一个位置编辑器
+        `_generic_overlay_editor`（拖矩形 = 落位、箭头微调、可选框内真实帧）：
+        · **画布** = overlay **第一路输入（底图）**的真实帧尺寸；
+        · **背景帧** = 底图那一路的输出帧（该子链的取帧器，纯内存）；
+        · **可拖矩形** = overlay **第二路输入（前景）**的真实尺寸（框内叠前景真实帧）；
         · **应用** = 就地写回该链 `overlay=` 的 x/y（`cmd_set_overlay_xy`）。
-        实现复用**无轨富选区编辑器** `RectSelectEditor`（同一套拖拽/数值联动 UI）。
+        尺寸不可在这里改：前景大小由它上游（crop/scale）决定，只写 x/y。
 
         三条**诚实拒绝**（不静默假装能用）：
           ① 这条链没有 overlay；② overlay 只接了一路（定不出前景尺寸）；
@@ -85056,29 +86018,94 @@ class CommandTreeEditor:
                 "常见原因：那一路的上游是虚拟源 / 表达式输入，取不到真实帧尺寸。")
                 % _pads[1], parent=self.win)
             return
-        _fx = self._make_cmd_node_frame_extractor(chain_ref)
-        _f = self._resolve_video_object(chain_ref)
-        _xv = tk.StringVar(value=(_x0 or "0"))
-        _yv = tk.StringVar(value=(_y0 or "0"))
-        _wv = tk.StringVar(value=str(_sz[0]))
-        _hv = tk.StringVar(value=str(_sz[1]))
+        # 画布 = 底图（第一路）真实尺寸；定不了就退到该节点输出尺寸，再退 1920x1080。
+        _base_sz = self._cmd_pad_frame_size(_pads[0]) or self._cmd_node_orig_size(chain_ref) \
+            or (1920, 1080)
+        _base_sz = (int(_base_sz[0]), int(_base_sz[1]))
+        # 背景取帧器：底图那一路的子链；外部输入（[0:v]）→ None ⇒ 取帧器退回裸主输入。
+        try:
+            _bg_ex = self._make_cmd_node_frame_extractor(
+                self._cmd_pad_chain_ref(_pads[0]))
+        except Exception:
+            _bg_ex = None
+        # 框内前景真实帧（两条来源，都不落盘）：
+        #   · 内部标签（`[v_temp_0]`）→ 跑产出它的那条子链，直接拿 PPM 字节（零临时文件）；
+        #   · 外部输入（`[1:v]`）→ 那个 `-i` 文件本身；由 `_fetch_raw_frame` 用
+        #     `content_file` 走 `-ss` 取帧。⚠️ 不能拿主输入顶替 —— 那会画成主视频画面。
+        _fg_ppm = None
+        _fg_file = ""
+        try:
+            _fg_ref = self._cmd_pad_chain_ref(_pads[1])
+            if _fg_ref is not None:
+                _r = self._make_cmd_node_frame_extractor(_fg_ref)("", 0.0, None, None)
+                if _r and _r[2]:
+                    _fg_ppm = _r[2]
+            else:
+                _fg_file = self._pad_to_input_file(_pads[1]) or ""
+        except Exception:
+            _fg_ppm = None
+            _fg_file = ""
+        try:
+            _ix = int(float((_x0 or "0").strip() or 0))
+        except (TypeError, ValueError):
+            _ix = 0
+        try:
+            _iy = int(float((_y0 or "0").strip() or 0))
+        except (TypeError, ValueError):
+            _iy = 0
+        _rowid = "r%dc%d" % (int(chain_ref[1]), int(chain_ref[2]))
+        _main_file = self._cur_main_input() or self._resolve_video_object(chain_ref)
 
-        def _apply():
-            if self._cmd_write_back_overlay_xy(chain_ref, _xv.get(), _yv.get()):
+        def _apply(nx, ny, nw, nh, cw, ch):
+            # ⚠️ 尺寸不写回：前景宽高由它上游 crop/scale 决定（这里只负责落位）。
+            if self._cmd_write_back_overlay_xy(chain_ref, nx, ny):
+                _note = ""
+                if (int(nw), int(nh)) != (int(_sz[0]), int(_sz[1])):
+                    _note = _("（宽高由上游 %s 决定，本次未改：%dx%d）") % (
+                        _pads[1], _sz[0], _sz[1])
                 self.app._append_info_ui(
-                    _("[命令编辑器] overlay 落位已写回：x=%s:y=%s")
-                    % (_xv.get().strip(), _yv.get().strip()))
+                    _("[命令编辑器] overlay 落位已写回：x=%s:y=%s%s") % (nx, ny, _note))
 
         try:
-            RectSelectEditor(
-                self.app, _f, _xv, _yv, _wv, _hv,
-                frame_extractor=_fx,
-                title=_("可视化编辑坐标 — 命令编辑器（%s）") % "r%dc%d" % (
-                    int(chain_ref[1]), int(chain_ref[2])),
-                on_apply=_apply, apply_label=_("写入 x/y"), clear_label=_("取消"),
-                show_simple_pos=False, show_black_border=False, safe_border=True,
-                info_extra=_("拖拽 = 改这条链 overlay 的 x/y；画布 = 该节点自己的输出帧"),
-                modal=False)
+            self.app._generic_overlay_editor(
+                self.win,
+                _base_sz[0], _base_sz[1],
+                _ix, _iy, int(_sz[0]), int(_sz[1]),
+                _apply,
+                _("可视化编辑坐标 — 命令编辑器（%s）") % _rowid,
+                (float(_sz[0]) / float(_sz[1]) if _sz[1] else None),
+                allow_resize=False,          # 尺寸由上游决定：只拖不改大小
+                allow_negative_offset=True,  # overlay x/y 允许负值（手写表达式也常为负）
+                rect_color='red',
+                rect_label=_("叠加层 %s") % _pads[1],
+                extra_info=_("拖拽 = 改这条链 overlay 的 x/y\n"
+                             "画布 = 第 1 路（%s）的真实帧 %dx%d\n"
+                             "框 = 第 2 路（%s）的真实尺寸 %dx%d（大小由上游决定）")
+                           % (_pads[0], _base_sz[0], _base_sz[1],
+                              _pads[1], int(_sz[0]), int(_sz[1])),
+                show_nudge=False,
+                coord_box=True,
+                draw_diagonal=False,
+                main_video_file=_main_file,
+                main_offset=(0, 0),
+                main_render_size=(_base_sz[0], _base_sz[1]),
+                frame_extractor=_bg_ex,
+                content_file=(_fg_file or None),
+                content_ppm=_fg_ppm,
+                # ⚠️ 刻意传 None：`content_src_w/h` 非空会挂出「缩放 (倍率)」滑块，而本窗口
+                # `allow_resize=False`、应用只写 x/y ⇒ 拖滑块盒子会变、保存却什么都不写
+                # （用户最恨的「点了没生效」）。尺寸由上游 crop/scale 决定，已在 extra_info 写明。
+                content_src_w=None,
+                content_src_h=None,
+                # 🔴 2026-10-19（用户报「位置编辑器里框内没有真实帧，是个透明的」）：
+                # `content_alpha=False` 走的是**不透明合成**分支（`color=black` 整张黑画布 +
+                # `-ss fc -i content_file`）——本窗口没有 content_file（前景是内存 PPM）⇒
+                # ffmpeg 拿 `-i None` 必然失败、静默 return，框里就只剩一个空描边。
+                # 位置编辑器的语义是「把这一层摆到底图的哪个位置」：底图已经有真实背景帧
+                # （`bg_frame`），框内要的是**前景自己那张图** ⇒ 必须走 content_alpha=True 的
+                # 轻量路径（角度≈0 时把前景小图缩到框尺寸贴上去，零 ffmpeg 跟随）。
+                content_alpha=True,
+            )
         except Exception as _e:
             messagebox.showerror(_("打开可视化编辑器失败"), str(_e), parent=self.win)
 
@@ -85182,6 +86209,10 @@ class CommandTreeEditor:
                     main_video_size=None,
                     frame_extractor=_fex,
                     frame_orig_size=_forig,
+                    # 🔴 2026-10-19：节点语境的**右侧实时预览 / 效果预览**也走「该节点子图」
+                    #   —— 不挂它时预览会拿本行文件 + 封装页轨道设置拼一张无关的画
+                    #   （overlay 默认落位 + 最后一链的 delogo，每个节点都一样）。
+                    node_preview_cb=self._make_cmd_node_preview_cb(_ref),
                     main_video_mode=False,
                     pip_subctrl=False,
                     # 🔴 2026-10-16（用户第 2 条）：**这一行的素材身份** —— 左列那个
@@ -85207,16 +86238,21 @@ class CommandTreeEditor:
         """build_video_filter_chain 返回 null/空时，按窗口里勾选的意图给一个可手改模板。
 
         仅当能确认用户『试图』做某项才给模板（避免无中生有）：
-        - 视频 + 去水印(delogo) 项存在 → delogo=x=1:y=1:w=100:h=100
+        - 视频 + 去水印(delogo) **有启用项** → delogo=x=1:y=1:w=100:h=100
         - 视频 + 裁剪已启用 → crop=100:100:0:0
-        返回 '' 表示无明确意图（调用方改为弹提示、不写入，避免生成非法串）。
+        返回 '' 表示无明确意图（调用方只记日志、不写入，避免生成非法串）。
+        ⚠️ 判据是「**有 enabled 项**」而不是「列表非空」—— 见下方注释。
         """
         if kind == "v":
             _raw_items = settings.get("blur_items")
-            if isinstance(_raw_items, list) and _raw_items:
-                for _it in _raw_items:
-                    if str(_it.get("type", "delogo")) == "delogo":
-                        return "delogo=x=1:y=1:w=100:h=100"
+            # 🔴 2026-10-19（用户报「打开应用视频滤镜什么都不动、直接保存也写出
+            # delogo=x=1:y=1:w=100:h=100」）：本窗口 load_settings 会把旧单键迁移出
+            # **一个 enabled=False 的默认项**（1/1/100/100）⇒ 「列表非空」根本不能当
+            # 「用户想做去水印」的证据。模板串只在**真有启用项**时才给。
+            _on_items = ([it for it in _raw_items
+                          if isinstance(it, dict) and it.get("enabled", True)]
+                         if isinstance(_raw_items, list) else [])
+            if _on_items:
                 return "delogo=x=1:y=1:w=100:h=100"
             if settings.get("crop_enabled", False):
                 return "crop=100:100:0:0"
@@ -85234,9 +86270,15 @@ class CommandTreeEditor:
                 # 安全网：用户在「去水印」子窗添加了 delogo 项却没勾主开关
                 # （blur_enabled=False）→ build_video_filter_chain 会返回 "null"（L11233）。
                 # 这里强制启用，让添加的项真正生效，避免节点变成 null。
+                # 🔴 2026-10-19：判据从「列表非空」收紧为「**至少一项 enabled**」——
+                #   本窗口 load_settings 永远会迁移出一个 enabled=False 的默认项
+                #   （1/1/100/100）⇒ 旧的「非空即强制启用」会让「什么都不动、直接保存」
+                #   也写出 `delogo=x=1:y=1:w=100:h=100`（用户实测报障）。
                 _raw_items = _settings.get("blur_items")
-                if (not _settings.get("blur_enabled", False)
-                        and isinstance(_raw_items, list) and _raw_items):
+                _has_on = (isinstance(_raw_items, list)
+                           and any(isinstance(_it, dict) and _it.get("enabled", True)
+                                   for _it in _raw_items))
+                if not _settings.get("blur_enabled", False) and _has_on:
                     _settings = dict(_settings)
                     _settings["blur_enabled"] = True
                 _frag = build_video_filter_chain(
@@ -85262,12 +86304,11 @@ class CommandTreeEditor:
                 self.app._append_info_ui(
                     _("[命令编辑器] 该设置未生成有效滤镜，已填入模板串供手改：%s") % _tpl)
             else:
-                messagebox.showinfo(
-                    _("提示"),
-                    _("该设置未产生任何滤镜串（窗口里需先勾选并启用一项滤镜，\n"
-                    "例如 delogo 要在「去水印」页勾选启用并框选/填坐标）。\n"
-                    "未写入列表，避免生成非法串。"),
-                    parent=self.win)
+                # 🔴 2026-10-19：这里是**纯 no-op**（窗口里没启用任何滤镜项）—— 不弹模态
+                # （用户口径：能 log 就别打断），也绝不写任何字符串进列表。
+                self.app._append_info_ui(
+                    _("[命令编辑器] 视频设置未生成滤镜串（窗口里没有启用任何滤镜项），"
+                      "列表未改动。要加滤镜请先在该页勾选并启用一项（如 delogo 勾启用 + 框选区域）。"))
                 return
         try:
             self._set_cell_value(rowid, "mid", _frag)
