@@ -1149,6 +1149,8 @@ All entries live in the mux page list's **right-click menu** (in PiP mode). Five
 | **Dissolve Group** | same as above | splits the whole group; members go back to plain sub-videos |
 | **Set as Group Base Video** | exactly **one** grouped track selected | changes the group main; group-level fields migrate as a whole |
 
+> **A dissolved / emptied group ⇒ the parent-row settings are gone too (added 2026-10-20)**: the parent-row settings live in `node_fx["grp:<gid>"]`; the key depends only on the gid, and gid is taken as the **smallest free number** ⇒ after clearing / deleting everything, a fresh group starts again from `g1`. So "clear → re-drag files → group" would resurrect the **old group's parent-row settings** (blend mode / scale / placement / trajectory …) onto a completely unrelated new group. Now all three paths clear them: remove-from-group / dissolve-group (see table above), **delete track** (when the group drops below 2 members), and the **"Clear" button** (tracks emptied ⇒ node effects all cleared). If you clear by mistake, press ↶ undo — the undo snapshot is taken before clearing and includes these effects.
+
 ⚠️ **The main video does not take part in grouping**: the main video is "the base being overlaid", not an overlay layer. To give a group a custom size / background, first add a **virtual source** ("Generate ▸ Color background") and use it as the main-video placeholder.
 
 ⚠️ **A group cannot be moved to the first row to become the main video** (hard block): a group has no fixed size (its size comes from the shipping box, and the box depends on the main canvas), which would be circular. To make a group fill the frame, again "add a virtual source as the main video — its size is the output resolution".
@@ -1190,6 +1192,7 @@ Mental model: *"this final label is one material"* — it is a picture the size 
 | **Canvas mode** | supported (same generator as the main video / sub-videos, transparent base) |
 | **List waypoints (waypoint table)** | supported — this is the correct way to "move the whole group" |
 | Custom filter string | supported |
+| **Blend mode** | **supported since 2026-10-20** — the whole group blends with the main video; see 6.2.1 |
 
 > **This does not contradict ch. 19 · 7 "filters blocked on nodes"**: that section is about **intermediate nodes** (`node_effect_chain`, all 7 switches off, because downstream still relies on the label for size / time assumptions); the parent row goes through the **material path** (`node_material_chain`), which additionally opens scale / fade / opacity / mask / keying.
 > The criterion is "is this label used as an **intermediate node** or as **a material**", not "is it a node". A parent row is the latter (only one overlay remains after it).
@@ -1201,8 +1204,40 @@ Mental model: *"this final label is one material"* — it is a picture the size 
 | **Trim / speed** | both rewrite timestamps. The group canvas length is decided by the "group window" and its visible span is carried by `enable=`; inserting another time transform makes the two semantics fight (audio and other node positioning go wrong) |
 | **Pixel format** | changing format mid-chain breaks the downstream label's format assumptions |
 | **Subtitles** | subtitles must be burned onto the final canvas size; inserted at the group node they would be covered by later overlay layers |
-| **Blend mode (set on the parent row)** | blending means "blend with the main-video pixels", and the group node is not yet on the main video ⇒ this item produces no filter |
-| **Blend mode (set on the group main)** | not "ignored" but **the whole group degrades**: it falls back to independent overlays (the output still uses the blend you set, only without a group). Never silently dropped |
+| **Loop / reverse** | same as trim/speed: the timeline-class ones are carried by each member's own window |
+
+#### 6.2.1 Blend mode (blend): only the parent row counts (2026-10-20)
+
+A group node = the group's final output label = **one independent layer with its own α** (the group canvas is `color=black@0`; wherever a member does not cover, α=0). So, for "blending with the main video", it is **no different from an ordinary sub-video layer** ⇒ a blend set on the parent row simply takes the same region-based blend path as a sub-video (`_group_blend_plan` computes the bounding box + `_make_blend_region` emits the graph):
+
+- it blends **only inside the group's bounding box**; the transparent gaps inside the group and everything outside the box stay the main video as-is (α isolation is locked automatically);
+- the whole-group position / scale / rotation / trajectory still work (the bounding box takes the *static* upper bound of the "trajectory sweep"; what moves is the in-box placement); when the parent row carries a trajectory, this upper bound tightens by the **same rule as a sub-video**: list waypoints take the union of endpoint ranges, the four preset modes take the motion envelope (`_group_blend_sweep`); only if it cannot be computed does it fall back to the whole canvas (conservative — never drops any picture).
+  ⚠️ Only a trajectory on the **parent row** (incl. one "borrowed" via "trajectory source") turns the group-node placement into a `t`-bearing expression — a member's own trajectory is already swallowed by the box's "all-time envelope", so the group placement stays static.
+- multiple blends (group + ordinary sub-video, group + group) keep their regional isolation,互不干涉;
+- parent row "Enable overlay" off ⇒ no blend (that path has no `enable` end; leaving a plain overlay is what actually hides it).
+
+**A blend set *inside* the group is always ignored** (decided 2026-10-20):
+
+| Set on | Behaviour |
+|--------|-----------|
+| **Group parent row** | ✅ takes effect — the whole group blends with the main video |
+| **Group main / any group member** | ❌ ignored, with a log line "the blend mode set on a group member … is invalid inside the group …" |
+
+Reason: inside a group there is only a transparent canvas, **no main-video pixels to blend with**, so the semantics do not hold. Earlier versions handled this as "**whole-group degrade**" (fall back to independent overlays) — that would blow the whole group apart and change the picture drastically, which is scarier than "ignore" ⇒ now it groups normally + tells you explicitly. To blend the whole group, set it on the **parent row**.
+
+**Set it but see no effect? Check the info panel.** Every composition prints one line (de-duplicated by "mode + conclusion", so it won't spam):
+
+| Log | Meaning / what to do |
+|-----|----------------------|
+| `parent-row blend(multiply) **took effect**: blend region 110x40 @(100,60)` | ✅ normal |
+| `**degraded to plain overlay**: pad canvas 640x480 larger than main-video render size` | main video has pad on and the canvas is larger than the video ⇒ the black border has no pixels to blend. Shrink the pad canvas (or turn pad off) |
+| `**not effective**: the whole group is placed outside the canvas` | the group is outside the visible area; drag it in |
+| `parent row has a blend set, but the parent row's "Enable overlay" is **off**` | tick "Enable overlay" back on the parent row |
+| `the blend mode set on a group member … is invalid inside the group … ignored` | you set it **inside** the group — set it on the parent row |
+
+> Seeing `nullsink` in the command is **almost always normal**: inside `_make_blend_region` the same main-video stream is `split` into "region source / transparent canvas / paste-back target" three ways, and the extra copy must be consumed by `nullsink`, otherwise ffmpeg reports unconnected. Only `[v_crop_N]nullsink` / `[cur_baseN]nullsink` are the "a pre-counted blend copy is unused" fallbacks (2026-10-20 fixed a counting bug that wrongly triggered this).
+
+**The parent row's "effect preview" mini-window shows the *whole picture*** (= main video + group overlay, same as other sub-videos), **not** just the parent row's small shipping-box picture — otherwise effects like blend / opacity / keying that "must interact with the main video" would be invisible in the preview. And it follows the window's **unsaved** changes live (change the blend dropdown and you see it immediately) — no need to save first.
 
 #### 6.3 "Projection" semantics: parent-row edits **never write back to members**
 
@@ -1289,7 +1324,7 @@ Switching off a member **does not change the shipping-box geometry** (the box st
 | Feature | Relationship |
 |---|---|
 | **PiP transitions (xfade chain)** | when a group exists the **transition chain steps aside** (the two are orthogonal: a transition is "between two pictures", a group is "composite several pictures into one first"). To transition between members, do not put them in the same group |
-| **Blend mode** | see 6.2: a blend on the group main ⇒ the whole group degrades; a member's own blend does not take effect inside the group (blending is against the main video, and there is no main video inside a group) |
+| **Blend mode** | see 6.2.1: set on the **parent row** ⇒ the whole group blends with the main video (supports position / scale / rotation / trajectory); set **inside the group** (incl. the group main) ⇒ ignored, with a log line |
 | **Virtual sources (color / gen)** | can serve as the main-video base (the group's size / resolution come from the main video) |
 | **Serial concat mode** | not available: grouping only makes sense in **PiP mode** |
 | **Video node / command editor** | the in-group composite is one single chain with labels like `v_gbase_g1` → `v_grp_g1_0` → … → `v_grp_g1_2`; the last label is the parent row (pick it with "Video node" to attach further effects — the same window as double-clicking the parent row) |
@@ -1302,7 +1337,6 @@ A group is not "always a group once created". In the following cases it **falls 
 
 | Trigger | Explanation |
 |---|---|
-| the group main has a **non-normal blend mode** | see 6.2; blending needs main-video pixels |
 | **the group main's size cannot be probed** (parsing disabled / file problem) | without a size the shipping box cannot be computed |
 | **the shipping-box geometry cannot be computed** (member position / size abnormal, parse failed) | same as above |
 | every member has "Enable overlay" unchecked | the group does not hold (they would not appear anyway) |
@@ -1321,6 +1355,7 @@ How to check: generate the command and look for `v_grp_g1_*` labels — present 
 - **Three rendering stages**:
   - stage A3: `color=c=black@0:s=box:d=group window` as the base, then the member legs `overlay` in `rel` order with `enable='between(t,member start,member end)'`;
   - stage B: the group node is overlaid only once, in the **group main**'s round (`overlay x/y = main placement + box-origin correction + group-level delta`);
+    ⚠️ when the parent row has a blend set, this becomes `_make_blend_region` (`_group_blend_plan` computes the bounding box); **export and preview share the same helper** — change geometry in only one place, `_group_blend_plan`.
   - group-node transform: `_group_node_transform_parts` (opacity → rotation → trajectory scale), mirroring the same-named segments of sub-videos.
 - **Labels**: `v_gbase_<g>` (group canvas) → `v_grp_<g>_<k>` (member legs) → the last link is the group's final output (the parent row); `k` in `v_grp_<g>_<k>` always equals the member's list order (legs of invisible members are kept too, only with `enable='0'`).
 - **Parent-row material chain**: `node_material_chain` (independent-material convention); **the chain is chosen by the landing label** being in `_last_group_final_labels`, regardless of which window it was opened from.
