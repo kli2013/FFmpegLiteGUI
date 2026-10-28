@@ -3670,13 +3670,18 @@ def _cmd_editor_in_args(inputs, seek_t=0.0, dur_of=None, sub_seek=True,
     return _args
 
 
-# ----- 媒体类浏览窗口文件类型统一口径（2026-09-22）-----
+# ----- 媒体扩展名统一口径（2026-09-22 建；2026-10-23 收敛为单一来源）-----
 # 媒体 = 视频 + 图片，之下细分 视频 / 图片（用户诉求：全包括的媒体下再分视频、图片，
 # 选起来更快）。此前各浏览窗口各自手写，出现过两类问题：①串联「添加外部视频」只列
 # 视频、图片选不到；②「替换素材」把图片塞进「视频文件」项（分类错）。
-# 视频集合 = 程序实际支持的容器（与拖拽分类 video_exts 一致）；
-# 图片集合 = 程序实际按图片轨处理的集合（与拖拽分类 img_exts 一致，不含 tif/tiff）。
-_MEDIA_VIDEO_PATTERN = "*.mp4 *.mkv *.avi *.mov *.flv *.webm *.ts"
+# 🔴 2026-10-23：五处拖拽分类各自手写 video_exts / img_exts / audio_exts（清单各差几项，
+#    .m4v/.mts/.rmvb 在某些落点被当「非视频」忽略，同一个文件换个落点结论就不同）→ 全部收敛到
+#    下面四组 EXTS，所有 glob 串由它们派生。**加新格式只改这里，别在调用点另抄一份清单。**
+_MEDIA_VIDEO_EXTS = (
+    ".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".ts",
+    ".m2ts", ".mts", ".mpg", ".mpeg", ".m4v", ".wmv", ".3gp", ".3g2",
+    ".ogv", ".rmvb", ".rm", ".asf", ".f4v", ".vob", ".mxf", ".divx", ".m2v", ".y4m", ".ivf",
+)
 # 「素材分类用」图片集合：添加轨道 / 浏览窗口 filter 的判定，含 gif。
 # ⚠️ 与上面的 _STATIC_IMAGE_EXTS 不是一回事，两者不能混用：
 #   _STATIC_IMAGE_EXTS = 可视化抽帧判定（刻意排除动画 gif：gif 多帧可 seek，抽帧不该跳过 seek）
@@ -3686,9 +3691,25 @@ _MEDIA_VIDEO_PATTERN = "*.mp4 *.mkv *.avi *.mov *.flv *.webm *.ts"
 #   → 同一文件两种添加方式的轨道标记与回执不一致。现统一走本常量。
 #   ⚠️ 命令构建层（40+ 处）仍统一走 _is_static_image：gif 有自身时长、按视频处理，此处不改。
 _MEDIA_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
+_MEDIA_AUDIO_EXTS = (".mp3", ".aac", ".m4a", ".wav", ".flac", ".ogg", ".opus", ".ac3", ".dts", ".mka")
+_MEDIA_SUBTITLE_EXTS = (".srt", ".ass", ".ssa", ".vtt", ".idx", ".sup")
+
+# 浏览窗口 filetypes 用的 glob 串（一律由上面 EXTS 派生，别手写）
+_MEDIA_VIDEO_PATTERN = " ".join("*" + e for e in _MEDIA_VIDEO_EXTS)
 _MEDIA_IMAGE_PATTERN = " ".join("*" + e for e in _MEDIA_IMAGE_EXTS)
-_MEDIA_AUDIO_PATTERN = "*.mp3 *.aac *.m4a *.wav *.flac *.ogg *.opus *.ac3 *.dts *.mka"
-_MEDIA_SUBTITLE_PATTERN = "*.srt *.ass *.ssa *.vtt *.idx *.sup"
+_MEDIA_AUDIO_PATTERN = " ".join("*" + e for e in _MEDIA_AUDIO_EXTS)
+_MEDIA_SUBTITLE_PATTERN = " ".join("*" + e for e in _MEDIA_SUBTITLE_EXTS)
+
+# 拖拽分桶用的「可视媒体」＝ 视频 + 图片。
+# 转码页把图片当主视频转；合并页图片必须落 video 桶 —— 落 else 分支会被当字幕加轨，
+# 正是 2026-09-22 修过的同类问题（见上面 _MEDIA_IMAGE_EXTS 注释）。
+_MEDIA_DROP_EXTS = _MEDIA_VIDEO_EXTS + _MEDIA_IMAGE_EXTS
+
+# 「这个文件像不像媒体」判定集（2026-10-23）：只用于转码前的**软提示**，不做硬拦截。
+# ⚠️ 刻意宽松：ffmpeg 能读的容器远多于任何清单，宁可放行也不误伤；
+#   集合外只会「问一句」，用户确认后照常转换。
+_INPUT_MEDIA_EXTS = (frozenset(_MEDIA_VIDEO_EXTS) | frozenset(_MEDIA_IMAGE_EXTS)
+                     | frozenset(_MEDIA_AUDIO_EXTS))
 
 
 def media_filetypes(include_audio=False, include_subtitle=False, all_files=True):
@@ -4339,8 +4360,9 @@ class FrameCapture(object):
     """一次取帧执行的**结果**（不含任何 ffmpeg 语义解释）。
 
     status：
-      ok       rc=0 且有字节
+      ok       rc=0（stdout 模式还要有字节；落盘模式只看 rc，产物由调用方查文件）
       empty    rc=0 但零字节 —— 取帧时刻越过 EOF 的典型形态（默认取帧 3 秒、素材更短）
+               ⚠️ 只可能出现在 **stdout 模式**；落盘模式见 `expect_stdout=False`
       fail     rc!=0（滤镜/参数/解码错误，`err` 里是原始 stderr）
       timeout  communicate 超时（已 kill，`data` 恒为 None：半截帧不该被当成画面显示）
       spawn    子进程都没起来（ffmpeg 路径不存在等）
@@ -4364,7 +4386,8 @@ class FrameCapture(object):
             self.status, self.rc, len(self.data or b""), len(self.err))
 
 
-def run_frame_capture(argv, timeout=None, stderr_mode="pipe", stdin_data=None):
+def run_frame_capture(argv, timeout=None, stderr_mode="pipe", stdin_data=None,
+                      expect_stdout=True):
     """取帧唯一执行口：跑 argv 取一帧，返回 FrameCapture。
 
     timeout     默认 `_FRAME_CAPTURE_TIMEOUT`(30s)；超时一律 kill 并判 timeout。
@@ -4372,12 +4395,18 @@ def run_frame_capture(argv, timeout=None, stderr_mode="pipe", stdin_data=None):
                 "devnull" 丢弃（纯尺寸探测这类不在乎原因的场合，省一次管道泵）。
     stdin_data  非 None 时把 bytes 从 stdin 喂给 ffmpeg（`-i pipe:0` 的二级管道：
                 已有 PPM 再套一层滤镜，如 `_resample_ppm`）。
+    expect_stdout True（默认）＝帧从 **stdout** 吐回内存，零字节 ⇒ status="empty"。
+                False＝**落盘**模式（`-f image2 out.png`）⇒ stdout 本来就恒空，
+                零字节是**正常形态**、不是失败 ⇒ rc=0 一律 "ok"，产物由调用方查文件。
+                🔴 2026-10-24：这两个模式以前共用一条「输出 0 字节」诊断，
+                于是每个新文字水印开位置编辑器都刷一条（`color=…:d=1` + 落盘 = 13 项，
+                必然命中）——成功路径零输出的铁律被这条误报破坏，故拆出本形参。
     ⚠️ 必须 communicate 而不是 stdout.read() + wait()：stderr 是 PIPE 时只读 stdout 会
     死锁（ffmpeg 写满 stderr 管道阻塞在写、我们阻塞在读）。
     """
     argv = [str(x) for x in (argv or [])]
     if not argv:
-        return FrameCapture("spawn", err="空命令", argv=argv)
+        return FrameCapture("spawn", err=_("空命令"), argv=argv)
     _to = _FRAME_CAPTURE_TIMEOUT if timeout is None else float(timeout)
     _sink = subprocess.PIPE if stderr_mode == "pipe" else subprocess.DEVNULL
     _stdin = subprocess.PIPE if stdin_data is not None else None
@@ -4385,7 +4414,7 @@ def run_frame_capture(argv, timeout=None, stderr_mode="pipe", stdin_data=None):
         proc = subprocess.Popen(argv, stdin=_stdin, stdout=subprocess.PIPE, stderr=_sink,
                                 creationflags=_ffmpeg_spawn_flags())
     except Exception as _e:
-        return FrameCapture("spawn", err=str(_e) or "ffmpeg 启动失败", argv=argv)
+        return FrameCapture("spawn", err=str(_e) or _("ffmpeg 启动失败"), argv=argv)
     try:
         data, err_b = proc.communicate(input=stdin_data, timeout=_to)
     except subprocess.TimeoutExpired:
@@ -4395,25 +4424,28 @@ def run_frame_capture(argv, timeout=None, stderr_mode="pipe", stdin_data=None):
             proc.communicate()
         # 🔴 超时**必须说出来**（见上方 `_FRAME_CAPTURE_LOG` 的注释）：用户看到的
         #   「点一下就卡死」很可能就是这里静默等了 30s；不点名命令永远查不到是哪条腿。
-        _frame_capture_note("[取帧] 超时 %.0fs（已终止）：%s" % (_to, _argv_brief(argv)),
+        _frame_capture_note(_("[取帧] 超时 %.0fs（已终止）：%s") % (_to, _argv_brief(argv)),
                             ("timeout", _argv_brief(argv)))
         return FrameCapture("timeout", rc=proc.returncode, argv=argv,
-                            err="ffmpeg 取帧超时(%.0fs)" % _to)
+                            err=_("ffmpeg 取帧超时(%.0fs)") % _to)
     _err = (err_b or b"").decode("utf-8", "replace")
     if proc.returncode != 0:
         # 🔴 失败也要说一次（带 stderr 尾行）：用户报「预览突然变成别的画面 / 发黑」时，
         #   很大一部分就是这里 rc!=0 被各调用方静默回落成「上一次成功帧」。
         _frame_capture_note(
-            "[取帧] 失败 rc=%s：%s\n  %s" % (
+            _("[取帧] 失败 rc=%s：%s\n  %s") % (
                 proc.returncode, _argv_brief(argv),
-                (_err.strip().splitlines() or ["(无 stderr)"])[-1][:200]),
+                (_err.strip().splitlines() or [_("(无 stderr)")])[-1][:200]),
             ("fail", proc.returncode, _argv_key(argv)))
         return FrameCapture("fail", data=data, err=_err, rc=proc.returncode, argv=argv)
     if not data:
+        if not expect_stdout:
+            # 落盘模式：产物在文件里，stdout 恒空 ⇒ 零字节不含任何信息（见形参注释）。
+            return FrameCapture("ok", err=_err, rc=0, argv=argv)
         # rc=0 但零字节＝**取帧时刻越过产物时长**的典型形态（精确取帧等不到该秒）。
         # 调用方普遍会「停在上一次成功帧」，用户看到的是「画面变成别的东西」。
         _frame_capture_note(
-            "[取帧] 输出 0 字节（rc=0，通常是取帧时刻越过产物时长）：%s" % _argv_brief(argv),
+            _("[取帧] 输出 0 字节（rc=0，通常是取帧时刻越过产物时长）：%s") % _argv_brief(argv),
             ("empty", _argv_key(argv)))
         return FrameCapture("empty", err=_err, rc=0, argv=argv)
     return FrameCapture("ok", data=data, err=_err, rc=0, argv=argv)
@@ -4449,6 +4481,13 @@ def _main_bg_pre_filter(settings):
         parts.append("vflip")
     if settings.get("hflip", False):
         parts.append("hflip")
+    # 拼接（2026-10-28）：背景帧必须与成片同画面 —— 不加这一步，位置编辑器里看到的
+    # 永远是「单张原始主视频」，可画布尺寸（_get_canvas_size）已经是 N 倍宽 ⇒ 背景被拉伸。
+    # 复用链内同一个生成器与判据（tile_grid_of），预览=编辑器=成片三处永远同一份。
+    _trc = tile_grid_of(settings)
+    if _trc:
+        parts.append(build_end_split_filters(
+            _trc[0], _trc[1], in_label="", out_label="", max_tiles=TILE_MAX_TILES))
     return ",".join(parts) if parts else None
 
 
@@ -9523,6 +9562,19 @@ _REGION_EFFECT_FILTERS = {
     "eq_bright": {"tpl": "eq=brightness={s}",      "tag": "e", "default": "-0.3"},
     "black":   {"tpl": "lutyuv=y=0:u=128:v=128",   "tag": "e"},
     "white":   {"tpl": "lutyuv=y=255:u=128:v=128", "tag": "e"},
+    # 马赛克打码（2026-10-24）：按块取样（mode 默认 avg），不是卷积运算 —— 块边界
+    # 在区域内部自带硬边，与区域外互不影响 ⇒ **不需要 bleed 外扩**（同点运算）。
+    # 实测 n9.0.1：w/h 允许范围 1~1024，填 0 或负数 ffmpeg 直接硬报错、整条命令失败
+    # ⇒ 必须靠 clamp 夹住（见下方生成分支），不能把用户输入原样透传。
+    # ⚠️ **mode 恒用默认 avg，刻意不暴露设置**（2026-10-24 定案，数据见
+    # research/ffmpeg-feature-mining-2026-10-24/README.md §8）：
+    #   avg/min/max 三者块内像素 100% 相同 ⇒ 都只是「每块挑哪个代表值」，不是强弱之分。
+    #   avg 与不写 mode 的 md5 逐字节相同（亮度守恒，区域不突兀 = 打码最优）；
+    #   min 把区域压暗（块均值 69/152/0）、max 泛白（190/143/60）⇒ 越怪越显眼，
+    #   且 min/max 保留块内极值、理论上泄露更多。min/max 的价值在**全帧像素风**，
+    #   属风格化，真要做得连风格一起做，别塞进打码下拉当「更强」选项。
+    #   另：mode 写错（MAX/med/空）是硬报错整条命令失败，所以更不该开自由文本口。
+    "pixelize": {"tpl": "pixelize=w={s}:h={s}",    "tag": "e", "default": "16", "clamp": (1, 1024)},
     # --- 邻域运算：卷积类，必须外扩 ---
     # （sobel 已删：输出是梯度幅值图，效果强弱完全取决于区域纹理，平滑内容下
     #   近似均匀暗块、肉眼无感（2026-09-07 实测，scale 参数亦无视觉改善），不可靠。）
@@ -12122,6 +12174,10 @@ def node_effect_chain(settings, graph_id=None):
     _custom = (s.get(NODE_FX_CUSTOM_KEY) or "").strip()
     if _custom:
         return _custom
+    # 拼接（2026-10-28）：与 scale / format 同属「**素材出口**层面」的事 —— 挂在中间节点上
+    # 会把流向该节点的画面撑成 N 倍，下游已算好的坐标（overlay / 遮罩 / 画布）全部错位。
+    # 故节点效果里一律不生效（入口也不显示按钮，这里只是兜底：老预设可能带着这个键）。
+    s.pop("tile_enabled", None)
     return build_video_filter_chain(
         s,
         include_subtitle=False, include_speed=False, include_trim=False,
@@ -12917,6 +12973,134 @@ def _preserve_colorbalance_lightness(chain):
     return ",".join(_out)
 
 
+# ======================================================================
+# 网格 / 扫描线（drawgrid）—— 叠加特效，与风格预设(look)正交，可与其共存
+# 参数映射：宽度→w（iw=整幅宽⇒只画横线）、高度→h、粗细→t、间隔→h-t、
+#           颜色+透明度→c（drawgrid 把颜色和 alpha 合在同一个参数里）
+# 研究见 research/drawgrid-grid/README.md
+# ======================================================================
+GRID_DEFAULTS = {
+    "w": "iw",          # 格子宽；iw=整幅宽 ⇒ 只有横线（扫描线）；给更小的值出竖线变网格
+    "gap": 22,          # 间隔 = 线与线之间的空白（1080p 基准像素，见 GRID_REF_H）
+    "t": 12,            # 粗细 = 线本身占的宽度（1080p 基准像素）
+    "color": "#000000",
+    "alpha": 0.25,
+}
+
+# 数字型像素的**基准分辨率**：填 12 = 「1080p 下 12 像素」，拼链时换算成 `ih*12/1080`。
+# 为什么不能写死像素（2026-10-23 用户报「调粗细，右侧预览没按比例缩放，导致很粗」）：
+#   预览帧只有几百像素高，死像素的 12px 在 640 宽的预览里视觉上是成片的三倍粗 ——
+#   用户按预览调，成片必然细得看不见。写成 ih 表达式后，预览 / 720p / 1080p / 4K 全部
+#   等比一致（实测 n9.0.1 的 drawgrid 接受 ih 表达式，与等值整数逐字节相同）。
+#   副作用（正向）：同一套参数在 4K 上不再是 2 倍条数，观感跨分辨率统一。
+GRID_REF_H = 1080
+GRID_REF_W = 1920
+
+
+def _grid_num(v):
+    """参数值 → (float, True)；表达式（iw/2、ih/32）返回 (None, False)。"""
+    try:
+        return float(str(v).strip()), True
+    except (TypeError, ValueError):
+        return None, False
+
+
+def _grid_expr(v, axis, ref):
+    """像素数字 → 相对表达式（`ih*12/1080`）；本来就是表达式（`ih/32`）则原样返回。"""
+    _f, _is_num = _grid_num(v)
+    if not _is_num:
+        return str(v).strip()
+    if _f <= 0:
+        return "0"
+    return "{}*{:g}/{}".format(axis, _f, ref)
+
+
+def _grid_gap_value(enhance_settings):
+    """「间隔」的取值 —— 新键 `grid_gap`；兼容旧键 `grid_h`（= 间隔 + 粗细，2026-10-23 前）。"""
+    _e = enhance_settings or {}
+    _raw = _e.get("grid_gap")
+    if _raw not in (None, ""):
+        return str(_raw).strip()
+    _hf, _h_ok = _grid_num(_e.get("grid_h", ""))
+    _tf, _t_ok = _grid_num(_e.get("grid_t", ""))
+    if _h_ok and _t_ok:
+        return "{:g}".format(max(1.0, _hf - _tf))
+    return GRID_DEFAULTS["gap"]
+
+
+def _grid_color_alpha(color, alpha):
+    """颜色 + 透明度 → drawgrid 的 `c=` 取值。
+
+    ⚠️ drawgrid 把颜色和 alpha 合在同一个 `c=` 里（`c=black@0.25`），本函数负责拼。
+    alpha≥0.9995 时省略 `@`（等价满不透明，且少一段难读的串）。
+    颜色接受 `0xRRGGBB` / `#RRGGBB` / 颜色名 —— 2026-10-23 实测三者都被 drawgrid 接受；
+    UI 存 `#RRGGBB`（tk colorchooser 的原生格式），拼链时统一转 `0xRRGGBB`，
+    避免 `#` 在 filtergraph 里被当注释/转义。
+    """
+    _c = str(color or "").strip() or GRID_DEFAULTS["color"]
+    if _c.startswith("#"):
+        _c = "0x" + _c[1:]
+    try:
+        _a = float(alpha)
+    except (TypeError, ValueError):
+        _a = GRID_DEFAULTS["alpha"]
+    if _a >= 0.9995:
+        return _c
+    return "{}@{:.4f}".format(_c, max(0.0, _a))
+
+
+def _build_grid_filter(enhance_settings):
+    """网格/扫描线 → `drawgrid=w=…:h=…:t=…:c=…`；未启用或无效时返回 ""。
+
+    参数 = 「间隔 + 粗细」两个可感知量（h 恒等于两者之和，故不再暴露「高度」——同一个数
+    给两次必然互相打架）。数字按 GRID_REF_H / GRID_REF_W 等比换算成 ih/iw 表达式。
+
+    2026-10-23 实测（C:\\FFmpeg ffmpeg n9.0.1，探针 tests/_verify_drawgrid_*_1023.py）：
+      • `t >= h` 时不是网格，而是**全帧均匀压暗**（暗化率饱和 = alpha 本身）⇒ 间隔夹到 ≥1
+      • `t=0` 等于完全不画 ⇒ 视为关闭（不拼进链，省一次空转）
+      • `c=…@0` 逐字节等于不挂滤镜 ⇒ alpha 0 同样视为关闭
+      • `w` 固定 `iw` 时只有横线；实测 `w=iw/16` 暗化率 9.4%→13.7%（竖线出现）
+      • `t` 只吃整数（`t=6.5` → 6）；写表达式则按帧尺寸求值后再取整
+      • 死像素跨分辨率漂移（`h=34`：720p 21 条 / 1080p 31 条 / 4K 63 条）⇒ 一律走 ih 表达式
+    """
+    if not enhance_settings or not enhance_settings.get("grid_enabled", False):
+        return ""
+    # ⚠️ 只把 None / 空串当「没填」：`0 or ""` 会把数字 0 吞成默认值（t=0 应该=关闭）
+    def _grid_raw(key, dflt):
+        _v = enhance_settings.get(key)
+        return str(dflt) if _v is None or str(_v).strip() == "" else str(_v).strip()
+
+    _w = _grid_raw("grid_w", GRID_DEFAULTS["w"])
+    _gap = str(_grid_gap_value(enhance_settings)).strip() or str(GRID_DEFAULTS["gap"])
+    _t = _grid_raw("grid_t", GRID_DEFAULTS["t"])
+
+    _gap_f, _gap_is_num = _grid_num(_gap)
+    _tf, _t_is_num = _grid_num(_t)
+    # t=0 / alpha=0 ⇒ 实测等于完全关闭，不拼进链
+    if _t_is_num and _tf <= 0:
+        return ""
+    try:
+        _a = float(enhance_settings.get("grid_alpha", GRID_DEFAULTS["alpha"]))
+    except (TypeError, ValueError):
+        _a = GRID_DEFAULTS["alpha"]
+    if _a <= 0:
+        return ""
+    # 间隔至少 1px：间隔 0 会让 h == t（实测变成整帧均匀压暗，不是扫描线）
+    if _gap_is_num and _gap_f < 1:
+        _gap, _gap_f = "1", 1.0
+    # h = 间隔 + 粗细；两段都是数字就在数字域相加，否则拼成表达式交给 ffmpeg 求值
+    if _gap_is_num and _t_is_num:
+        _h = "{:g}".format(_gap_f + _tf)
+    else:
+        _h = "({})+({})".format(_gap, _t)
+    _c = _grid_color_alpha(enhance_settings.get("grid_color", GRID_DEFAULTS["color"]), _a)
+    return "drawgrid=w={}:h={}:t={}:c={}".format(
+        _grid_expr(_w, "iw", GRID_REF_W),
+        _grid_expr(_h, "ih", GRID_REF_H),
+        _grid_expr(_t, "ih", GRID_REF_H),
+        _c)
+
+
 def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = True, include_speed: bool = True,
                               include_trim: bool = True, include_format: bool = True, include_scale: bool = True,
                               enhance_settings=None, reverse=False, graph_id: str = "",
@@ -13080,6 +13264,16 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
                 _tpl = _spec["tpl"]
                 if "{s}" in _tpl:
                     _sv = str(strength).strip() or str(_spec.get("default", ""))
+                    _cl = _spec.get("clamp")
+                    if _cl:
+                        # 有取值域的滤镜（pixelize 1~1024）必须夹住：0 / 负数 / 非数字
+                        # 都是 **ffmpeg 硬报错**（整条命令失败），不能像无域参数那样透传。
+                        # 空值/乱填一律回落到该类型默认值，再夹一次域。
+                        try:
+                            _iv = int(float(_sv))
+                        except Exception:
+                            _iv = int(float(_spec.get("default", _cl[0])))
+                        _sv = str(max(int(_cl[0]), min(int(_cl[1]), _iv)))
                     _f = _tpl.format(s=_sv)
                 else:
                     _f = _tpl
@@ -13391,6 +13585,20 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
                 if _chain:
                     filters.append(_look_with_enable(_chain, _enh_en))
 
+    # ----- 网格 / 扫描线（drawgrid）-----
+    # 2026-10-23：独立于风格预设的叠加特效（可与任意 look 共存）。
+    # ⚠️ 必须排在 look 之后：实测 `eq…,drawgrid` 与 `drawgrid,eq…` 有差（PSNR 31.5），
+    #   调色在前才会把线压成「半透明灰带」；放链尾线才是干净的 c=黑@a。
+    # 「范围」= all 时无视时间段（全片生效）；= seg 时挂与其余增强同一份 enable（实测
+    #   drawgrid 支持 timeline，恒假时逐字节等于不挂）。
+    if enhance_settings:
+        _gd = _build_grid_filter(enhance_settings)
+        if _gd:
+            if str(enhance_settings.get("grid_scope", "all")) == "seg" and _enh_en:
+                filters.append(_look_with_enable(_gd, _enh_en))
+            else:
+                filters.append(_gd)
+
     # ----- 遮罩 / 透明蒙版（最终渲染帧空间，WYSIWYG）-----
     # 2026-09-10 两迁记录：裁剪前（原始帧）→ 缩放之后 → 链尾（本位置，抠图兼容见下）。
     # 遮罩始终落在 crop/rotate/scale 之后的最终渲染帧上，与画布/显示/转换三同一坐标系；
@@ -13494,6 +13702,34 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
     # ----- 倒放 -----
     if reverse:
         filters.append("reverse")
+
+    # ----- 拼接（本路画面复制成 行×列 网格 = 单视频的「末端处理」；2026-10-28）-----
+    # 位置选在**链尾、淡入淡出之前**，理由是逐项核过的：
+    #   · 裁剪 / 旋转 / 反交错 / 缩放 / 抠像 / 增强 / 遮罩 / 字幕 全在它之前 ⇒
+    #     所有坐标类（遮罩框、简易位置、画布编辑器）的坐标系**一点没变**，改行列数不会让
+    #     已存的坐标错位；字幕也是「先烧进每格，再复制」，不会按整张网格放大。
+    #   · 淡入淡出在它之后 ⇒ 淡入淡出盖住整张网格（符合直觉；反过来每格各自淡入很怪）。
+    #   · 输出尺寸 = 每格尺寸 × (列, 行)，与「末端处理」的网格同语义。下游（overlay 定位、
+    #     串行归一、编码）一律按**真实流尺寸**继续，这里不做任何回缩。
+    # ⛔ 画布模式（位置、尺寸、旋转）开启时**跳过**：画布用**源尺寸**当内容基准
+    #    （`build_canvas_filtergraph` 的 W/H），拼接后内容已是 N 倍宽却仍被缩回源尺寸
+    #    ⇒ 与末端预览那个「压扁」同源。画布模式下改用「缩放」控制每格尺寸。
+    # ⛔ pad 画布（主视频固定输出画布 `pad_enabled`）开启时也跳过：画布尺寸/偏移是定值，
+    #    拼接后的 N 倍画面会被 overlay 进那张定值画布 ⇒ 直接裁掉大半（同样不是"下游按新
+    #    尺寸自适应"）。
+    # 🔴 判据唯一出处 = `tile_grid_of`：尺寸推算（`tiled_frame_size` → 输出画布 / 素材
+    #    渲染尺寸 / 预览帧尺寸）读的是同一个函数，两边永远同源。
+    # ⚠️ **不要**在这里跟 `include_scale` 同门控（2026-10-28 试过、结论相反）：子视频/水印
+    #    预览正是 `include_scale=False` + 外层 `force_scale` 的组合，网格必须留在链尾，外层只
+    #    负责把**每格**缩到目标（`force_scale` 已改走 `untiled_frame_size`）。关掉拼接会让
+    #    预览少一个网格、与成片不一致 —— 比尺寸错更难查。
+    _tile_rc = tile_grid_of(settings)
+    if _tile_rc:
+        # 复用末端网格的生成器（纯逗号链 / xstack 一段，零标签）；上限跟 UI 一致
+        # （TILE_MAX_TILES = 5×5），末端仍受自己 2-5 的既有约束。
+        filters.append(build_end_split_filters(
+            _tile_rc[0], _tile_rc[1], in_label="", out_label="",
+            max_tiles=TILE_MAX_TILES))
 
     # ----- 淡入淡出（片段首尾淡入黑 / 淡出黑，视频） -----
     if include_fade and settings.get("fade_enabled", False):
@@ -14156,6 +14392,33 @@ def _build_drawtext_enable(s: dict, trim_start=0.0, speed_factor=1.0):
     return ""
 
 
+def _tw_visible_at(s, t):
+    """文字水印在**源时间** t 是否处于显示时段（与 _build_drawtext_enable 同语义）。
+
+    2026-10-24：位置编辑器「只看此刻」过滤用（兄弟条按各自时段显隐）。
+    🔴 四分支顺序、开闭区间必须与 _build_drawtext_enable 逐条对应，否则编辑器
+    画出来的共存关系与成片不符。
+    🔴 **不做** trim/speed 换算：传进来的 t 是编辑器背景帧的源片时刻（帧画面就是
+    源片 t 的画面）；换算是导出侧的事，这里再换算等于双重换算
+    （2 倍速下 5s 出现的条目会在 2.5s 就「出现」）。
+    """
+    _f = _opt_float
+    _start = _f(s.get("enable_start"))
+    _end = _f(s.get("enable_end"))
+    _cycle = _f(s.get("enable_cycle"))
+    _show = _f(s.get("enable_show"))
+    _t = float(t or 0.0)
+    if _start is not None and _end is not None and _end > _start:
+        return _start <= _t <= _end
+    if _cycle is not None and _show is not None and _cycle > 0 and _show > 0:
+        return (_t % _cycle) < _show
+    if _start is not None:
+        return _t >= _start
+    if _end is not None:
+        return _t <= _end
+    return True
+
+
 def _build_enh_seg_enable(s, speed_factor=1.0):
     """主增强链统一时间段：用户填「输出时间线」秒数，换算到 speed(setpts) 之前的滤镜入口时间。
 
@@ -14251,6 +14514,189 @@ def _tw_multiline_on(tw_settings) -> bool:
     return bool(v)
 
 
+# ============ 文字水印「单条内局部变色」（方案 A：内联标记 → 切段 → 链式 drawtext）============
+# 标记语法（仅影响其后文字，直到下一个标记或结尾；逐行独立解析）：
+#   {RRGGBB} 或 {#RRGGBB}    → 后续文字用该十六进制颜色（沿用条目透明度）
+#   {} / {default} / {reset} → 复位到条目默认 font_color
+#   {red}/{white}/...        → ffmpeg 支持的预置颜色名
+# 例：`警告{FF0000}请勿靠近` → "警告"用默认色、"请勿靠近"用红色。
+# ⚠️ 以下 helper 均为无 IO 纯函数，multi 侧可逐字 port；ffmpeg 实测见 research/tw-partial-color。
+_TW_COLOR_TAG_RE = re.compile(
+    r'\{(#?)([0-9A-Fa-f]{6}|default|reset|red|green|blue|white|black|'
+    r'yellow|cyan|magenta|orange|gray|grey)?\}')
+
+
+def _tw_strip_color_markup(text):
+    """移除局部变色标记，返回纯文本（供宽度估算 / 编辑器 / drawtext 兜底）。"""
+    if not text:
+        return text
+    return _TW_COLOR_TAG_RE.sub("", text)
+
+
+def _tw_parse_color_segments(line_text):
+    """解析单行的局部变色标记 → [(seg_text, color_or_None), ...]。
+    color_or_None: None=用条目默认 font_color；'#RRGGBB' 或颜色名=该段颜色。
+    无标记 / 标记无效 → 返回 [(line_text, None)]（与整条单色等价）。"""
+    if not line_text:
+        return [("", None)]
+    segs = []
+    cur_text = []
+    cur_color = None
+    pos = 0
+    for m in _TW_COLOR_TAG_RE.finditer(line_text):
+        head = line_text[pos:m.start()]
+        if head:
+            cur_text.append(head)
+        # 先按「旧颜色」flush 当前累积（标记前的文字归属上一颜色），再切到新颜色。
+        if cur_text:
+            segs.append(("".join(cur_text), cur_color))
+            cur_text = []
+        mark = (m.group(2) or "").lower()
+        if mark in ("", "default", "reset"):
+            cur_color = None
+        elif re.fullmatch(r'[0-9a-f]{6}', mark):
+            cur_color = "#" + mark
+        else:
+            cur_color = mark  # 颜色名
+        pos = m.end()
+    tail = line_text[pos:]
+    if tail:
+        cur_text.append(tail)
+    if cur_text:
+        segs.append(("".join(cur_text), cur_color))
+    segs = [(t, c) for t, c in segs if t != ""]
+    return segs if segs else [("", None)]
+
+
+def _tw_flatten_sep(raw):
+    """「换行拼成一行」时的连接符（multiline 关的回退路径唯一出处）。
+
+    含局部变色标记 ⇒ 视为同一行的**分段**（用户只是借换行给每段单独上色），用空串相连。
+    插空格会在段间留出「一个空格宽」的缝：CJK 只占 1/4 字看着还行，Latin 短词旁边
+    （`i` 后接 `love`）空格宽度比 `i` 本身还宽 3 倍 → 用户报「回退回去的接缝非常宽」。
+    无标记 ⇒ 沿用旧行为空格分隔（多行当成一句话的历史口径，改它会影响既有纯文本条目）。
+    """
+    return "" if _TW_COLOR_TAG_RE.search(raw or "") else " "
+
+
+def _tw_parse_text_lines(tw_settings):
+    """按条目设置把文字解析成「逐行段列表」：[[(seg_text,color),...], ...]。
+    与 _tw_effective_text 同口径（multiline 开保留换行、关则拼成一行），但保留标记。"""
+    raw = str((tw_settings or {}).get("text", "") or "")
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    if _tw_multiline_on(tw_settings):
+        body = raw.strip("\n")
+        if not body:
+            return [[("", None)]]
+        return [_tw_parse_color_segments(ln) for ln in body.split("\n")]
+    return [_tw_parse_color_segments(_tw_flatten_sep(raw).join(countdown_lines(raw)))]
+
+
+def _tw_has_color_markup(seg_lines):
+    """段列表里是否确实存在「非默认色」标记（决定是否切段）。"""
+    return any(c is not None for ln in seg_lines for _t, c in ln)
+
+
+def _tw_fontcolor_value(color, opacity):
+    """段颜色 → drawtext fontcolor 值；None → 返回 None（调用方用默认色）。"""
+    if color is None:
+        return None
+    c = color.strip()
+    if c.startswith("#"):
+        c = c[1:]
+    if re.fullmatch(r'[0-9A-Fa-f]{6}', c):
+        return f"0x{c.upper()}@{opacity:.2f}"
+    return f"{color}@{opacity:.2f}"
+
+
+def _tw_drawtext_node(font_path, text, fs_tok, fontcolor_val, x_expr, y_expr,
+                      opacity, border_w=0, border_color="#000000",
+                      enable_expr="", alpha_expr=None):
+    """单段 drawtext 的「内部参数串」（不含 'drawtext=' 前缀与 sendcmd），供链式复用。"""
+    parts = [
+        f"fontfile={escape_drawtext_path(font_path)}",
+        f"text={escape_drawtext_text(text)}",
+        fs_tok,
+        f"fontcolor={fontcolor_val}",
+        f"x='{x_expr.replace(chr(39), chr(92) + chr(39))}'",
+        f"y='{y_expr.replace(chr(39), chr(92) + chr(39))}'",
+    ]
+    _bw = _opt_int(border_w, 0)
+    if _bw > 0:
+        bc = str(border_color).lstrip("#")
+        parts.append(f"borderw={_bw}")
+        parts.append(f"bordercolor=0x{bc}@{opacity:.2f}")
+    if enable_expr:
+        parts.append(f"enable='{enable_expr}'")
+    if alpha_expr is not None:
+        parts.append(f"alpha='{alpha_expr.replace(chr(39), chr(92) + chr(39))}'")
+    return ":".join(parts)
+
+
+_TW_ASCII_EM = (
+    # Helvetica/Arial 标准 AFM 字宽（1/1000 em），ASCII 32..126。
+    # 只服务「段间推进量」：链式 drawtext 必须知道前一段的真实宽度才能接上后一段。
+    # 拉丁各字符宽差极大（'W'=0.944em、'i'=0.222em），用 estimate_text_size 的
+    # 统一 0.6em 会让 WARNING 重叠 30%+、abcdefghij 拉出 70px+ 大缝。
+    278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278,   # 32-47
+    556, 556, 556, 556, 556, 556, 556, 556, 556, 556,                                # 48-57 数字
+    278, 278, 584, 584, 584, 556, 1015,                                              # 58-64
+    667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833,                 # 65-77 A-M
+    722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611,                 # 78-90 N-Z
+    278, 278, 278, 469, 556, 333,                                                    # 91-96
+    556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833,                 # 97-109 a-m
+    556, 556, 556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500,                 # 110-122 n-z
+    334, 260, 334, 584,                                                              # 123-126
+)
+
+
+def _tw_advance_px(text, font_size) -> int:
+    """段内文字推进宽度（像素）——链式 drawtext 接续后一段时的 x 偏移量。
+
+    与 estimate_text_size 分开是有意的：
+    - estimate_text_size 服务「内容盒 / 旋转裁切」，口径偏保守（宁可裁大不裁字），不能动；
+    - 本函数服务「段间拼接」，偏保守只会把后一段推远 → 拉出可见缝隙，必须尽量准。
+    CJK 全角 0.98em（实测 0.979em，@48 误差 ≈0px）；ASCII 走 AFM 表 ×1.03
+    （Arial 实测比理论宽 ~2.5%、微软雅黑拉丁宽 ~6%，取折中）；其余半角扩展 0.9em 兜底。
+    """
+    fs = _opt_int(font_size, 48)
+    if fs <= 0:
+        fs = 48
+    em = 0.0
+    for ch in (text or ""):
+        o = ord(ch)
+        if o >= 0x2E80:                                  # CJK / 全角
+            em += 0.98
+        elif 32 <= o <= 126:                             # ASCII 可打印
+            em += _TW_ASCII_EM[o - 32] * 1.03e-3
+        else:                                            # 其余半角扩展
+            em += 0.9
+    return int(round(em * fs))
+
+
+def _tw_segment_chain(seg_lines, font_path, fs_int, fs_tok, default_fontcolor_val,
+                      opacity, border_w, border_color, x_base_expr, y_base_expr,
+                      enable_expr="", alpha_expr=None, line_h=0.0):
+    """逐行段列表 → 逗号链 drawtext 串（每段一个 drawtext）。
+    返回 'drawtext=A,drawtext=B,...'。x/y 基准为表达式（可含 t），逐段/逐行累加偏移。
+
+    段宽走 _tw_advance_px（AFM 字宽表）：CJK 精确、Latin 误差 <5%（实测见
+    research/tw-partial-color §5）。不要换回 estimate_text_size —— 它统一按
+    0.6em 计 ASCII，宽字母会重叠、窄字母会拉缝。"""
+    nodes = []
+    for li, line in enumerate(seg_lines):
+        cum = 0.0
+        y_expr = (f"(({y_base_expr}) + {li * line_h:g})") if (line_h and li > 0) else y_base_expr
+        for seg_text, seg_color in line:
+            fc_val = _tw_fontcolor_value(seg_color, opacity) or default_fontcolor_val
+            x_expr = (f"(({x_base_expr}) + {cum:g})") if cum > 0 else x_base_expr
+            nodes.append("drawtext=" + _tw_drawtext_node(
+                font_path, seg_text, fs_tok, fc_val, x_expr, y_expr,
+                opacity, border_w, border_color, enable_expr, alpha_expr))
+            cum += _tw_advance_px(seg_text, fs_int)
+    return ",".join(nodes)
+
+
 def _tw_effective_text(tw_settings) -> str:
     """文字水印「有效渲染文本」——编辑器矩形估算与 drawtext 共用的唯一真相源。
 
@@ -14258,16 +14704,19 @@ def _tw_effective_text(tw_settings) -> str:
       真实 0x0A 在 ffmpeg n9 / n71 / 4.3 三版本 drawtext 均渲染多行
       （研究档案 research/vertical-countdown 结论 1）；且**不加引号**的写法同样成立
       （tests/_verify_tw_multiline.py 实测 bands=3）→ 转义链与 mpv 路径无需改动。
-    - `multiline` 关：沿用旧行为，多行拼成一行（空格分隔）。
+    - `multiline` 关：多行拼成一行；**连接符见 `_tw_flatten_sep`** —— 含颜色标记时用空串
+      （换行只是分段上色的手段，插空格会变成可见的缝），无标记时沿用旧的空格分隔。
 
     2026-09-25：编辑器 wm_w/wm_h 与渲染端 crop 盒都取自本函数，二者必须同源，
     否则「编辑器按多行画高框、渲染却压成单行」→ 用户报「设置与显示不符 / 文字没当富文本」。
+    2026-10-24：此处统一剥离「局部变色标记」（方案 A），保证宽度估算 / drawtext 兜底
+    看到的是纯文本。带标记的分段解析走 _tw_parse_text_lines（与本条同口径但保留标记）。
     """
     raw = str((tw_settings or {}).get("text", "") or "")
     raw = raw.replace("\r\n", "\n").replace("\r", "\n")
     if _tw_multiline_on(tw_settings):
-        return raw.strip("\n")
-    return " ".join(countdown_lines(raw))
+        return _tw_strip_color_markup(raw.strip("\n"))
+    return _tw_strip_color_markup(_tw_flatten_sep(raw).join(countdown_lines(raw)))
 
 
 def _tw_waypoint_xy_sendcmd(tw_settings, trim_start, speed_factor, tag, wpr=None):
@@ -14455,6 +14904,19 @@ def build_drawtext_filter(tw_settings: dict, trim_start=0.0, speed_factor=1.0, t
     else:
         _fs_tok = _tw_zoom_fontsize_tok(
             font_size, (_wpr[3] if (_wpr is not None and _wpr[3] is not None) else None))
+    enable_expr = _build_drawtext_enable(tw_settings, trim_start=trim_start,
+                                         speed_factor=speed_factor)
+    # 局部变色（方案 A）：非列表轨迹时，把带标记文本切成多段 drawtext 链。
+    # 列表轨迹（waypoints）下 drawtext 的 x/y 由 sendcmd/别名统一驱动，拆段会破坏命名
+    # 与定位 → 此场景退回整条单色（标记字符在整条单色下已被 _tw_effective_text 剥除，
+    # 不会残留到画面；即「waypoints + 局部变色」= 普通单色文字水印）。
+    _seg_lines = _tw_parse_text_lines(tw_settings)
+    if _tw_has_color_markup(_seg_lines) and _mv != "waypoints":
+        _al = (_wpr[4] if (_wpr is not None and _wpr[4] is not None) else None)
+        return _tw_segment_chain(
+            _seg_lines, font_path, font_size, _fs_tok, fontcolor, opacity,
+            border_w, border_color, x_expr, y_expr, enable_expr, _al,
+            line_h=(font_size * 1.2 if _tw_multiline_on(tw_settings) else 0.0))
     parts = [
         f"fontfile={escape_drawtext_path(font_path)}",
         f"text={escape_drawtext_text(text)}",
@@ -14468,8 +14930,6 @@ def build_drawtext_filter(tw_settings: dict, trim_start=0.0, speed_factor=1.0, t
         parts.append(f"borderw={border_w}")
         parts.append(f"bordercolor=0x{bc}@{opacity:.2f}")
     # 显示时段 / 循环控制 (enable 表达式)
-    enable_expr = _build_drawtext_enable(tw_settings, trim_start=trim_start,
-                                         speed_factor=speed_factor)
     if enable_expr:
         parts.append(f"enable='{enable_expr}'")
     # 列表轨迹透明度（oa→ob 段内线性插值）：与 fontcolor@opacity 相乘（drawtext alpha × 颜色透明度）
@@ -14504,37 +14964,51 @@ def _render_text_watermark_preview_png(ffmpeg_cmd, tw, box_w, box_h):
     fc = color.lstrip("#")
     border_w = _opt_int(tw.get("border_w", 0), 0)
     border_color = tw.get("border_color", "#000000")
-    parts = [
-        f"fontfile={escape_drawtext_path(font_path)}",
-        f"text={escape_drawtext_text(text)}",
-        f"fontsize={fs}",
-        f"fontcolor=0x{fc}@{opacity:.2f}",
-        "x=8", "y=8",
-    ]
-    if border_w > 0:
-        bc = border_color.lstrip("#")
-        parts.append(f"borderw={border_w}")
-        parts.append(f"bordercolor=0x{bc}@{opacity:.2f}")
+    # 局部变色（方案 A）：带标记时把文字切成多段 drawtext 链，按顺序落在同一张透明 PNG 上；
+    # 段内各自颜色、整条共用字号/透明度/描边，落点 (8,8) 与单色一致（与编辑器 8px 内边距同口径）。
+    _seg_lines = _tw_parse_text_lines(tw)
+    if _tw_has_color_markup(_seg_lines):
+        graph = "format=rgba,colorchannelmixer=aa=0," + _tw_segment_chain(
+            _seg_lines, font_path, fs, f"fontsize={fs}", f"0x{fc}@{opacity:.2f}",
+            opacity, border_w, border_color, "8", "8",
+            line_h=(fs * 1.2 if _tw_multiline_on(tw) else 0.0))
+        _seg_sig = repr([(t, c) for ln in _seg_lines for t, c in ln])
+    else:
+        parts = [
+            f"fontfile={escape_drawtext_path(font_path)}",
+            f"text={escape_drawtext_text(text)}",
+            f"fontsize={fs}",
+            f"fontcolor=0x{fc}@{opacity:.2f}",
+            "x=8", "y=8",
+        ]
+        if border_w > 0:
+            bc = border_color.lstrip("#")
+            parts.append(f"borderw={border_w}")
+            parts.append(f"bordercolor=0x{bc}@{opacity:.2f}")
+        graph = "format=rgba,colorchannelmixer=aa=0,drawtext=" + ":".join(parts)
+        _seg_sig = ""
     # 先 format=rgba + colorchannelmixer=aa=0 把底变成「完全透明」，再 drawtext 画文字
     # （color=c=black@0 的 alpha 会被 color 源默认 rgb24 丢掉的坑，详见 research 备注）。
-    graph = "format=rgba,colorchannelmixer=aa=0,drawtext=" + ":".join(parts)
     # 2026-10-05 修「新水印仍显示上一条的文字」：文件名按**内容指纹**命名（原来写死
     # _kli_tw_preview.png，所有水印/所有编辑器共用一个文件）。两个叠加 bug：
     #   ① 固定名 ⇒ 第二条水印渲完还是第一条的图（用户实测：新条目写着"测试文字"却显示 "123"）；
     #   ② **没有 -y** ⇒ 目标已存在时 ffmpeg 打印 "Not overwriting - exiting" 却**仍返回 rc=0**，
     #      下面的 returncode 检查拦不住 → 照样把陈旧文件路径返回给调用方。
     # 指纹入名后，即使偶发同名也必然带 -y 覆盖，两道防线都堵上。
+    # 2026-10-24：指纹加入「局部变色段结构」(_seg_sig)，否则同文本不同配色会命中同一张旧 PNG。
     import hashlib
     _sig = "|".join([text, font_path, str(fs), fc, f"{opacity:.3f}", str(border_w),
-                     border_color.lstrip("#"), str(int(box_w)), str(int(box_h))])
+                     border_color.lstrip("#"), str(int(box_w)), str(int(box_h)), _seg_sig])
     _tag = hashlib.md5(_sig.encode("utf-8")).hexdigest()[:12]
     out = os.path.join(tempfile.gettempdir(), f"_kli_tw_preview_{_tag}.png")
     cmd = [ffmpeg_cmd, "-y", "-f", "lavfi", "-i", f"color=c=black@0:s={int(box_w)}x{int(box_h)}:d=1",
            "-vf", graph, "-frames:v", "1", "-f", "image2", out]
     try:
         # C1-f2（2026-10-20）：执行机器统一到 `run_frame_capture`（timeout=30 不变）。
-        # ⚠️ 落盘模式：stdout 恒空 ⇒ status="empty"，只判 rc + 产物文件。
-        cap = run_frame_capture(cmd, timeout=30, stderr_mode="devnull")
+        # ⚠️ 落盘模式：stdout 恒空 ⇒ 必须 `expect_stdout=False`（否则每次渲 PNG 都被判
+        #    "empty" 并打一条「输出 0 字节」误报——新水印的内容指纹进文件名 ⇒ 去重键每次不同
+        #    ⇒ 每个新文字水印开位置编辑器都刷一条）。判据只有 rc + 产物文件。
+        cap = run_frame_capture(cmd, timeout=30, stderr_mode="devnull", expect_stdout=False)
         if cap.rc != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
             return None
         return out
@@ -14777,16 +15251,57 @@ def build_split_grid_size(rows: int, cols: int, base_w: int, base_h: int,
     return _w, _h
 
 
+def end_split_xstack_layout(rows: int, cols: int) -> str:
+    """rows×cols 网格在 `xstack` 里的 layout 表达式（行优先，第 0 格在左上）。
+
+    以「首格尺寸」w0/h0 为步长 ⇒ 要求每格同宽同高（末端网格本来每格同尺寸：
+    无边框时同一份流 split 出来、有边框时间隙 pad 已把各格补到统一尺寸）。
+
+    例：2×2 → `0_0|w0_0|0_h0|w0_h0`；3×1 → `0_0|w0_0|w0+w0_0`。
+
+    🔴 2026-10-28 实测（4.3 与 n9.0.1 行为一致，两个二进制都复现）：
+    **layout 里的乘法不生效** —— `w0*2` / `2*w0` / `0_2*h0` 都被当成 `w0` / `h0` 本身
+    （320×180 三格横排：`w0*2` 给 640×180 = 只挪了一格；`w0+w0` 才是 960×180）。
+    故只能用**加法链**表达第 N 格偏移。此前一直写 `w0*%d`，因为末端网格 n>5 恒 clamp 成
+    2×2（只需 w0/h0）从未暴露；视频滤镜页放开到 3×3 后立刻命中（3×3 输出只有 2×2 大）。
+    ⛔ 不要图省事换回 `*`，也不要改成 `w0*w0/w0` 之类 —— 乘法这条路是坏的。
+    """
+    _rows = max(1, int(rows or 1))
+    _cols = max(1, int(cols or 1))
+    _xs = ["0" if _c == 0 else "+".join(["w0"] * _c)
+           for _c in range(_cols)]
+    _ys = ["0" if _r == 0 else "+".join(["h0"] * _r)
+           for _r in range(_rows)]
+    return "|".join(f"{_xs[_c]}_{_ys[_r]}" for _r in range(_rows) for _c in range(_cols))
+
 def build_end_split_filters(rows: int, cols: int, in_label: str = "[v_in]", out_label: str = "[v_out]",
-                            border=None) -> str:
+                            border=None, max_tiles: int = 5) -> str:
     """
     末端多画面拼接滤镜：把输入视频流 split 成 rows×cols 份拼接成网格。
-    返回 filter_complex 片段字符串（以 in_label 开头、out_label 结尾），总格数 = rows*cols（限制 2-5）。
+    返回 filter_complex 片段字符串（以 in_label 开头、out_label 结尾），总格数 = rows*cols。
 
-    - 行=1（列>1）→ 横排：split=N + hstack=inputs=N
-    - 列=1（行>1）→ 竖排：split=N + vstack=inputs=N
-    - 行>1 且列>1 → 网格：每行先 hstack，再把各行 vstack
-      例 2×2：split=4[v1][v2][v3][v4];[v1][v2]hstack=inputs=2[top];[v3][v4]hstack=inputs=2[bottom];[top][bottom]vstack=inputs=2[vo]
+    max_tiles（2026-10-28）：格数上限，越界时按「行=1 保持列 / 列=1 保持行 / 否则 2×2」折算。
+      默认 5 = 「末端处理」的既有约束（四档 UI 只开放到这里）；视频滤镜页的「拼接」传
+      `TILE_MAX_TILES`（5×5 = 25，跟 UI 的 1-5 一致）。改默认值会动到末端，勿随手改。
+
+    - 行=1（列>1）→ 横排：`split=N,hstack=inputs=N`（**纯逗号链，零标签**，一段）
+    - 列=1（行>1）→ 竖排：`split=N,vstack=inputs=N`（同上）
+    - 行>1 且列>1 → 网格：`split=N,xstack=inputs=N:layout=…`（一步，零标签）
+      例 2×2：`split=4,xstack=inputs=4:layout=0_0|w0_0|0_h0|w0_h0`
+
+    🔴 2026-10-28（用户：「末端的 split 分裂标签有点繁琐」）：此前一律「split 带 [sp*]
+    标签 + 每行 hstack + 总 vstack」。当时 preview 的普通 -vf 分支还手抄了一份单级形态
+    （`split=N,hstack=inputs=N`）⇒ 两套实现并存；同一天已把 preview 改为复用本函数，
+    现在**只有这一份实现**，改这里即同时改成片 / 预览 / 背景帧 / 取帧预处理。
+    实测（ffmpeg 4.3 / n9、mpv --lavfi-complex 与 --vf=lavfi 四条路径）：
+      · 单级：split 的 N 个输出按序隐式接 hstack/vstack 的 N 个输入 ⇒ 可省全部标签；
+      · 多级：隐式链**不行** —— split 多出的输出会溢出到 hstack 报
+        `Too many inputs specified for the "hstack" filter`，必须走 xstack。
+        （`max_tiles=5` 的末端语境下 n>5 会 clamp 成 2×2；画中画传 `TILE_MAX_TILES=25`，
+         5×5 也是合法输入，不受此限。）
+
+    ⚠️ 边框档（border 非空）**仍必须带标签**：逐格 pad 的 left/right/top/bottom 各不相同，
+    表达不了纯逗号链 ⇒ 保留 `split=N[sp*]` + 逐格 pad，只有末尾拼接收成一段 xstack。
 
     border（可选 dict，键 left/right/top/bottom/color）：启用「间隙模型」边框 ——
     split 之后逐格按所在位置非对称 pad（外围独占、内部缝隙相邻两格各占一半），再拼网格。
@@ -14796,8 +15311,9 @@ def build_end_split_filters(rows: int, cols: int, in_label: str = "[v_in]", out_
     rows = max(1, int(rows or 1))
     cols = max(1, int(cols or 1))
     n = rows * cols
-    if n < 2 or n > 5:
-        n = max(2, min(5, n))
+    _cap = max(2, int(max_tiles or 5))
+    if n < 2 or n > _cap:
+        n = max(2, min(_cap, n))
         # 重新折算：若行=1 保持 n 列；列=1 保持 n 行；否则 2×2
         if rows == 1:
             cols = n
@@ -14806,25 +15322,33 @@ def build_end_split_filters(rows: int, cols: int, in_label: str = "[v_in]", out_
         else:
             rows, cols = 2, 2
             n = 4
+    # ---- 无边框：纯逗号链 / xstack 一步 ⇒ 零标签（2026-10-28，见 docstring 实测）----
+    if not border:
+        if rows == 1:
+            return f"{in_label}split={n},hstack=inputs={n}{out_label}"
+        if cols == 1:
+            return f"{in_label}split={n},vstack=inputs={n}{out_label}"
+        return (f"{in_label}split={n},xstack=inputs={n}"
+                f":layout={end_split_xstack_layout(rows, cols)}{out_label}")
+    # ---- 边框档：逐格 pad 参数各不相同，必须独立段 + 标签；只有末尾拼接收成一段 ----
     # 标签用独特前缀（sp/sr）避免与调用方既有 filtergraph 标签冲突
     labels = [f"[sp{i}]" for i in range(n)]
     parts = [f"{in_label}split={n}{''.join(labels)}"]
     # 间隙模型：split 之后逐格非对称 pad → [sbp{i}]，再按网格拼接（每格内容尺寸不变）
     stack_labels = labels
-    if border:
-        _plan, _gx, _gy = build_split_gap_pad_plan(
-            rows, cols,
-            border.get("left", 0), border.get("right", 0),
-            border.get("top", 0), border.get("bottom", 0))
-        _bc = (border.get("color", "") or "").strip()
-        if re.fullmatch(r"#[0-9a-fA-F]{6}", _bc):
-            _bc = "0x" + _bc[1:].upper()
-        _bc = _bc or "black"
-        stack_labels = []
-        for _i in range(n):
-            _l, _r, _t, _b = _plan[_i]
-            parts.append(f"{labels[_i]}{build_split_gap_pad_frag(_l, _r, _t, _b, _bc)}[sbp{_i}]")
-            stack_labels.append(f"[sbp{_i}]")
+    _plan, _gx, _gy = build_split_gap_pad_plan(
+        rows, cols,
+        border.get("left", 0), border.get("right", 0),
+        border.get("top", 0), border.get("bottom", 0))
+    _bc = (border.get("color", "") or "").strip()
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", _bc):
+        _bc = "0x" + _bc[1:].upper()
+    _bc = _bc or "black"
+    stack_labels = []
+    for _i in range(n):
+        _l, _r, _t, _b = _plan[_i]
+        parts.append(f"{labels[_i]}{build_split_gap_pad_frag(_l, _r, _t, _b, _bc)}[sbp{_i}]")
+        stack_labels.append(f"[sbp{_i}]")
     if rows == 1:
         # 横排
         parts.append(f"{''.join(stack_labels)}hstack=inputs={n}{out_label}")
@@ -14832,15 +15356,155 @@ def build_end_split_filters(rows: int, cols: int, in_label: str = "[v_in]", out_
         # 竖排
         parts.append(f"{''.join(stack_labels)}vstack=inputs={n}{out_label}")
     else:
-        # 网格：每行 hstack 再整体 vstack
-        row_labels = []
-        for r in range(rows):
-            row_lbl = f"[sr{r}]"
-            row_in = "".join(stack_labels[r * cols:(r + 1) * cols])
-            parts.append(f"{row_in}hstack=inputs={cols}{row_lbl}")
-            row_labels.append(row_lbl)
-        parts.append(f"{''.join(row_labels)}vstack=inputs={rows}{out_label}")
+        # 网格：xstack 一步（原先「每行 hstack + 总 vstack」= rows+1 段）
+        parts.append(f"{''.join(stack_labels)}xstack=inputs={n}"
+                     f":layout={end_split_xstack_layout(rows, cols)}{out_label}")
     return ";".join(parts)
+
+
+# 「拼接」（单视频链尾网格）的行列上限与总格数区间 —— 唯一出处。
+# 2026-10-28 用户要求「放宽到 1-5」：行 / 列各 1..5（单侧 1 = 纯横排 / 纯竖排），
+# 总格数 2..25（1×1 等于没拼）。改这里即同时改：判据 `tile_grid_of`、对话框校验、
+# `set_settings` 夹紧、链内 `max_tiles`（见 TILE_MAX_TILES 的调用点）。
+TILE_MAX_SIDE = 5
+TILE_MIN_TILES = 2
+TILE_MAX_TILES = TILE_MAX_SIDE * TILE_MAX_SIDE
+
+
+def _tile_dim(value, default: int = 2) -> int:
+    """把「行 / 列」的原始值解析成 `1..TILE_MAX_SIDE` 的整数（**唯一出处**）。
+
+    三个消费点共用：`tile_grid_of` 判据、`VideoFilterFrame.set_settings` 载入、
+    拼接对话框的 `_ok` 写回。以前每处各写一遍 `max(1, min(TILE_MAX_SIDE, int(v or 2)))`
+    —— 那句有个坑：**`or 2` 只兜空串，兜不住非数字**（`int("abc")` 抛 ValueError）。
+    enc_settings 来自老工程 / 手编预设 / 预设串味时会出现 `"abc"` / `"2.7"`，
+    旧写法 ⇒ 设置窗一打开就崩（判据侧因为外面包了 try 才没崩，于是「判据能过、UI 崩」）。
+
+    非法（空串 / 非数字 / None）⇒ `default`；合法但越界 ⇒ 夹到 1..TILE_MAX_SIDE。
+    注意「总格数 2-25」的校验**不在这里**（那是 `TILE_MIN_TILES/TILE_MAX_TILES` 的事）。
+    """
+    try:
+        _v = int(str(value if value is not None else "").strip())
+    except (ValueError, TypeError):
+        return max(1, min(TILE_MAX_SIDE, int(default or 2)))
+    return max(1, min(TILE_MAX_SIDE, _v))
+
+
+def tile_grid_of(settings) -> Optional[Tuple[int, int]]:
+    """「拼接」是否生效 → (rows, cols)；None = 不拼接。
+
+    🔴 **唯一判据出处**：链内插入（`build_video_filter_chain`）与所有尺寸推算
+    （`tiled_frame_size` 的调用方）共用这一份，禁止各写一遍 —— 判据一分为二，必然出现
+    「画面拼了但画布没拼」/「画布拼了但没拼画面」这类错位（2026-10-28 用户实测的就是这个）。
+
+    不生效的三档（与链路一致）：
+      · `tile_enabled` 未勾；
+      · 画布模式（`canvas_mode` + `canvas_segments`）—— 画布用**素材原始尺寸**当内容基准，
+        先拼再进画布会被缩回源尺寸（横向压扁，与末端预览那个坑同源）；
+      · pad 画布（`pad_enabled` 且几何有效）—— 画布尺寸/偏移是定值，N 倍画面会被裁掉大半。
+    """
+    if not settings or not settings.get("tile_enabled", False):
+        return None
+    if settings.get("canvas_mode") and settings.get("canvas_segments"):
+        return None
+    if _pad_canvas_geometry(settings) is not None:
+        return None
+    try:
+        _r = _tile_dim(settings.get("tile_rows", 2))
+        _c = _tile_dim(settings.get("tile_cols", 2))
+    except (ValueError, TypeError):
+        _r, _c = 2, 2
+    if not (TILE_MIN_TILES <= _r * _c <= TILE_MAX_TILES):
+        return None
+    return _r, _c
+
+
+def tiled_frame_size(w, h, settings) -> Tuple[int, int]:
+    """把「链后尺寸」按拼接网格放大：返回 (w*列, h*行)；不拼接 ⇒ 原样返回。
+
+    给**真实成帧尺寸**用：输出画布 / 素材渲染尺寸 / 预览帧尺寸 / 编辑器画布。
+    ⛔ **不要**用于「链内 scale 的目标尺寸」—— 拼接插在链尾，scale 的目标是**每格**尺寸；
+    拿放大后的值去写 `scale_width` 会让单格再乘一次（成片 4 倍大）。
+    预览侧的管道降采样（`_pwf`）正是这条边界：`_rend_*` 保持每格尺寸、只有帧尺寸放大。
+    """
+    _g = tile_grid_of(settings)
+    if not _g:
+        return w, h
+    _r, _c = _g
+    try:
+        return int(w) * _c, int(h) * _r
+    except (TypeError, ValueError):
+        return w, h
+
+
+def untiled_frame_size(w, h, settings) -> Tuple[int, int]:
+    """`tiled_frame_size` 的**逆运算**：真实成帧尺寸 → 每格尺寸（链内 scale 的目标）。
+
+    🔴 2026-10-28（用户实测「位置编辑器保存一次尺寸就涨一次，无限递增」）：
+    编辑器里拖出来的矩形是**成帧尺寸**（含拼接 N 倍），写回 `scale_width/height` 时若原样写，
+    下一轮渲染 = 该尺寸再拼一次 ⇒ 640→1280→2560… 每保存一次翻倍。
+    凡是「编辑器尺寸 → 链内 scale」的写回口，必须先过本函数折回每格。
+    与 `tiled_frame_size` 同一判据 ⇒ 关掉拼接后两者都是恒等（零回归）。
+    """
+    _g = tile_grid_of(settings)
+    if not _g:
+        try:
+            return int(w), int(h)
+        except (TypeError, ValueError):
+            return w, h
+    _r, _c = _g
+    try:
+        return int(round(float(w) / _c)), int(round(float(h) / _r))
+    except (TypeError, ValueError, ZeroDivisionError):
+        return w, h
+
+
+def material_size_settings(track, filt_frame):
+    """**尺寸推算**用的合成设置 dict（crop / rotate / scale + 画布·pad + 拼接）。
+
+    为什么必须只有一份（2026-10-28 用户实测「位置编辑器保存一次尺寸就涨一次」）：
+      位置编辑器是从**视频滤镜窗内部**打开的，此刻 `track.enc_settings` 还是**上一次保存**
+      的值，窗里的控件（含「拼接」勾选）才是**实时值**。于是
+        · 读（编辑器画布 / 内容盒 / 背景帧）走 `_get_video_render_size(track, filt_frame)` → 实时；
+        · 写（`on_apply` 把矩形折回每格）若照 `enc_settings` → 读到拼接=关 ⇒ 折不动，
+          把**成帧**尺寸原样写成**每格**尺寸 ⇒ 下一轮再乘一次。
+      ⇒ 读写两侧共用本函数，判据只有一个（与 `tile_grid_of` 同一条铁律）。
+
+    优先级：控件实时值 > `enc_settings`（`canvas_mode` / `pad_enabled` 只有轨道里有）。
+    控件没有拼接控件（非画中画模式 / 节点语境）⇒ 落 `enc_settings` ⇒ 与改动前同值。
+    """
+    settings = {
+        "crop_enabled": filt_frame.crop_enabled.get(),
+        "crop_width": filt_frame.crop_width.get(),
+        "crop_height": filt_frame.crop_height.get(),
+        "scale_enabled": filt_frame.scale_enabled.get(),
+        "scale_method": filt_frame.scale_method.get(),
+        "scale_width": filt_frame.scale_width.get(),
+        "scale_height": filt_frame.scale_height.get(),
+        "rotate": filt_frame.rotate.get()
+    }
+    _tes = getattr(track, "enc_settings", None) or {}
+    # 🔴 2026-10-28（判据分裂）：pad 画布这一档必须**连几何键一起**搬过来。
+    # `tile_grid_of` 判「pad 画布 ⇒ 拼接不生效」靠的是 `_pad_canvas_geometry(settings)`，
+    # 而该函数读到 `pad_width/pad_height` 为空就返回 None（= pad 无效）⇒ 只搬 `pad_enabled`
+    # 会出现「链内（完整 enc_settings）判不拼、尺寸推算（本函数）判拼」的分裂：
+    # 位置编辑器尺寸 ×N，写回又被 `untiled_frame_size` 折回 ⇒ **每保存一次缩一半**
+    # （正是「保存一次涨一次」的反向版本）。键名与 `_pad_canvas_geometry` 的读取口径逐字一致。
+    for _k in ("canvas_mode", "canvas_segments", "pad_enabled",
+               "pad_width", "pad_height", "offset_x", "offset_y"):
+        if _k in _tes:
+            settings[_k] = _tes[_k]
+    settings.update({_k: _tes.get(_k) for _k in ("tile_enabled", "tile_rows", "tile_cols")
+                     if _k in _tes})
+    # 只有**带拼接 UI 的窗**（画中画模式的素材设置窗）才有「实时值」可言；其余窗
+    # （转换页 / 队列 / 节点语境，`show_tile=False`）即便控件对象存在也恒为默认值
+    # ⇒ 拿它覆盖轨道保存值会把真·开着的拼接读成关。故按 UI 是否真的显示来分流。
+    if getattr(filt_frame, "_show_tile", False):
+        with suppress(Exception):
+            settings["tile_enabled"] = filt_frame.tile_enabled.get()
+            settings["tile_rows"] = filt_frame.tile_rows.get()
+            settings["tile_cols"] = filt_frame.tile_cols.get()
+    return settings
 
 
 def build_end_concat_filters(tail_path: str, tail_sec: float,
@@ -14930,6 +15594,16 @@ def build_text_watermark_filtergraph(tw_settings: dict, main_label: str = "", ou
     x_expr = (tw_settings.get("overlay_x", "10") or "10").strip() or "10"
     y_expr = (tw_settings.get("overlay_y", "10") or "10").strip() or "10"
 
+    # 局部变色（方案 A）：把带标记文本解析成「逐行段列表」，存在非默认色才切段。
+    # enable_expr / border / default_fc_val 提到外层，供 _dt_parts 与链式切段共用同一口径。
+    seg_lines = _tw_parse_text_lines(tw_settings)
+    has_seg = _tw_has_color_markup(seg_lines)
+    default_fc_val = f"0x{color.lstrip('#')}@{opacity:.2f}"
+    border_w = _opt_int(tw_settings.get("border_w", 0), 0)
+    border_color = tw_settings.get("border_color", "#000000")
+    enable_expr = _build_drawtext_enable(tw_settings, trim_start=trim_start,
+                                         speed_factor=speed_factor)
+
     # 列表轨迹缩放：fontsize 逐帧**矢量重绘**（放大不糊）。两种承载方式：
     #   · 行数 ≤ 阈值 → 逐帧表达式（_tw_zoom_fs，见 _tw_zoom_fontsize_tok）；
     #   · 行数 > 阈值 → 与 x/y 一起切 sendcmd，此处只用初始字面量 _tw_fs_literal
@@ -14938,26 +15612,25 @@ def build_text_watermark_filtergraph(tw_settings: dict, main_label: str = "", ou
     _tw_zoom_fs = None
     _tw_fs_literal = None
 
-    def _dt_parts(xv, yv, alpha_expr=None):
+    def _dt_parts(xv, yv, alpha_expr=None, seg_text=None, seg_color_val=None):
         if _tw_fs_literal is not None:
             _fs = f"fontsize={_tw_fs_literal}"
         else:
             _fs = _tw_zoom_fontsize_tok(font_size, _tw_zoom_fs)
+        _t = seg_text if seg_text is not None else text
+        _fc = seg_color_val if seg_color_val is not None else default_fc_val
         parts = [
             f"fontfile={escape_drawtext_path(font_path)}",
-            f"text={escape_drawtext_text(text)}",
+            f"text={escape_drawtext_text(_t)}",
             _fs,
-            f"fontcolor=0x{color.lstrip('#')}@{opacity:.2f}",
+            f"fontcolor={_fc}",
             f"x='{xv.replace(chr(39), chr(92) + chr(39))}'",
             f"y='{yv.replace(chr(39), chr(92) + chr(39))}'",
         ]
-        bw = _opt_int(tw_settings.get("border_w", 0), 0)
-        if bw > 0:
-            bc = (tw_settings.get("border_color", "#000000") or "#000000").lstrip("#")
-            parts.append(f"borderw={bw}")
+        if border_w > 0:
+            bc = border_color.lstrip("#")
+            parts.append(f"borderw={border_w}")
             parts.append(f"bordercolor=0x{bc}@{opacity:.2f}")
-        enable_expr = _build_drawtext_enable(tw_settings, trim_start=trim_start,
-                                             speed_factor=speed_factor)
         if enable_expr:
             parts.append(f"enable='{enable_expr}'")
         # 列表轨迹透明度（oa→ob 段内线性插值）：与 fontcolor@opacity 相乘（drawtext alpha × 颜色透明度）
@@ -15019,11 +15692,25 @@ def build_text_watermark_filtergraph(tw_settings: dict, main_label: str = "", ou
             if _mx is not None:
                 x_expr = _mx.replace("W", "main_w").replace("H", "main_h")
                 y_expr = _my.replace("W", "main_w").replace("H", "main_h")
+        # 局部变色（方案 A）：非列表轨迹时切成多段 drawtext 链（逐段颜色、整条共用字号/透明度）。
+        # 列表轨迹（waypoints）下 drawtext 由 sendcmd/别名统一驱动，拆段会破坏定位 → 不切。
+        if has_seg and _mv != "waypoints":
+            _fs_tok = (f"fontsize={_tw_fs_literal}" if _tw_fs_literal is not None
+                       else _tw_zoom_fontsize_tok(font_size, _tw_zoom_fs))
+            chain = _tw_segment_chain(
+                seg_lines, font_path, font_size, _fs_tok, default_fc_val, opacity,
+                border_w, border_color, x_expr, y_expr, enable_expr, _tw_alpha_expr_tw,
+                line_h=(font_size * 1.2 if _tw_multiline_on(tw_settings) else 0.0))
+            return f"{main_label}{chain}{out_label}" if main_label else f"{chain}{out_label}"
         dt = "drawtext=" + _dt_parts(x_expr, y_expr, _tw_alpha_expr_tw)
         return f"{main_label}{dt}{out_label}" if main_label else f"{dt}{out_label}"
 
     # ---- 旋转：透明层 + drawtext(居中) + rotate(静态/spin) + overlay ----
     tw, th = estimate_text_size(text, font_path, font_size)
+    # 宽字母兜底（2026-10-24）：`estimate_text_size` 对 ASCII 统一 0.6em，`WWWWWW` 这类真实
+    # 字宽 (0.94em/字) 远超估算 → 透明层偏窄，旋转后末字被 crop 直接切掉（实测 6 个 W 只剩 5 个）。
+    # 取 max 只补「明显低估」，不会缩小任何盒子（CJK 仍走 estimate 的 1.0em 保守值）。
+    tw = max(tw, _tw_advance_px(text, font_size))
     pad = 8
     tw2 = tw + 2 * pad
     th2 = th + 2 * pad
@@ -15067,6 +15754,17 @@ def build_text_watermark_filtergraph(tw_settings: dict, main_label: str = "", ou
         base_node = f"color=c=black@0:s={_lw}x{_lh}:d=999999"
         dt_core = "drawtext=" + _dt_parts("(w-text_w)/2", "(h-text_h)/2")
         crop_node = f"crop={_lw}:{_lh}:0:0"
+    elif has_seg:
+        # 局部变色（方案 A）：整条文字画到同一透明层，逐段各自颜色、按累计宽度左对齐排列，
+        # 再整体 rotate 一次（与单色旋转同一条后续 rotate/overlay 链路）。旋转下「缩放版」
+        # （_wp_zoom_tw）走 fontsize 逐帧表达式不便拆段 → 该场景回落整条单色（见下 else）。
+        base_node = f"color=c=black@0:s={tw2}x{th2}:d=999999"
+        dt_core = _tw_segment_chain(seg_lines, font_path, font_size,
+                                   _tw_zoom_fontsize_tok(font_size, _tw_zoom_fs),
+                                   default_fc_val, opacity, border_w, border_color,
+                                   str(pad), str(pad), enable_expr, _tw_alpha_expr_tw,
+                                   line_h=(font_size * 1.2 if _tw_multiline_on(tw_settings) else 0.0))
+        crop_node = f"crop={tw2}:{th2}:0:0"
     else:
         base_node = f"color=c=black@0:s={tw2}x{th2}:d=999999"
         dt_core = "drawtext=" + _dt_parts(str(pad), str(pad))
@@ -15224,7 +15922,8 @@ def countdown_layout(tw_settings, font_path, font_size):
     """倒计时画布布局（纯计算：无 IO、不碰 ffmpeg）。返回 None 表示无法布局。
 
     返回 dict：
-      lines       参与滚动的文本行
+      lines       参与滚动的文本行（**已剥离**局部变色标记，供测量/定位）
+      segs        与 lines 等长：每行的段列表 [(text, color_or_None), …]（保留标记语义）
       horizontal  横排（左→右/右→左）还是竖排（上→下/下→上）
       canvas_w/h  画布像素尺寸（已含 COUNTDOWN_PAD 内边距）
       pos         每行 drawtext 的左上角 [(x, y)...]
@@ -15238,10 +15937,19 @@ def countdown_layout(tw_settings, font_path, font_size):
     fs = _opt_int(font_size, 48)
     if fs <= 0:
         fs = 48
-    lines = countdown_lines((tw_settings or {}).get("text", ""))
-    if not lines or not font_path or not os.path.exists(font_path):
+    raw_lines = countdown_lines((tw_settings or {}).get("text", ""))
+    if not raw_lines or not font_path or not os.path.exists(font_path):
         return None
+    # 局部变色（方案 A，2026-10-24）：每行解析成段列表；测量/定位一律用**剥标记后的纯文本**，
+    # 否则 `{FF0000}` 既会被当正文画出来、又把行宽撑大（居中与步进全偏）。
+    # `lines` 保持纯文本形态 → 既有消费点（窗口夹紧/步进/时长）零改动。
+    segs = [_tw_parse_color_segments(ln) for ln in raw_lines]
+    lines = [_tw_strip_color_markup(ln) for ln in raw_lines]
     sizes = [estimate_text_size(ln, font_path, fs) for ln in lines]
+    # 宽字母兜底：`estimate_text_size` 对 ASCII 统一 0.6em，`WWWW`/`ABCDEFGHIJ` 这类真实字宽
+    # 反而更宽（宋体大写仅 0.5em、雅黑 0.6em，但 W 达 0.94em）→ 行宽/画布偏窄会把末字裁掉。
+    # 取 max 只会把「明显低估」的盒子补到真实宽度，绝不会让任何盒子变小（CJK 仍走保守的 1.0em）。
+    sizes = [(max(w, _tw_advance_px(ln, fs)), h) for (w, h), ln in zip(sizes, lines)]
     item_w = max(w for w, _h in sizes) or fs
     item_h = max(h for _w, h in sizes) or fs
     raw_gap = (tw_settings or {}).get("countdown_gap")
@@ -15296,7 +16004,7 @@ def countdown_layout(tw_settings, font_path, font_size):
     wx = max(0, min(wx, canvas_w - ww))
     wy = max(0, min(wy, canvas_h - wh))
     return {
-        "lines": lines, "horizontal": horizontal, "reverse": reverse,
+        "lines": lines, "segs": segs, "horizontal": horizontal, "reverse": reverse,
         "canvas_w": canvas_w, "canvas_h": canvas_h, "pos": pos,
         "pitch": pitch, "start": (far if reverse else COUNTDOWN_PAD),
         "t0": _cd_num((tw_settings or {}).get("countdown_t0"), 0.0, lo=0.0, hi=360000),
@@ -15341,10 +16049,20 @@ def build_tw_countdown_subgraph(tw_settings, main_label: str = "", out_label: st
 
     # ---- ① 画布：每行一个 drawtext 显式定位（绝不用 text_h 做多行居中）----
     dt_nodes = []
+    _default_fc = f"0x{_fc}@{opacity:.2f}"
+    _segs_all = lay.get("segs") or []
     for i, ln in enumerate(lay["lines"]):
         px, py = lay["pos"][i]
+        _segs = _segs_all[i] if i < len(_segs_all) else [(ln, None)]
+        if _tw_has_color_markup([_segs]):
+            # 局部变色（方案 A）：该行切成多段 drawtext，逐段颜色、段间按真实字宽接续。
+            # 行内起点 px 是「整行左端」，段偏移由 _tw_segment_chain 逐段累加。
+            dt_nodes.append(_tw_segment_chain(
+                [_segs], font_path, fs, f"fontsize={fs}", _default_fc, opacity,
+                bw, _bc, str(px), str(py)))
+            continue
         p = [f"fontfile={_fp}", f"text={escape_drawtext_text(ln)}",
-             f"fontsize={fs}", f"fontcolor=0x{_fc}@{opacity:.2f}",
+             f"fontsize={fs}", f"fontcolor={_default_fc}",
              f"x={px}", f"y={py}"]
         if bw > 0:
             p += [f"borderw={bw}", f"bordercolor=0x{_bc}@{opacity:.2f}"]
@@ -19674,16 +20392,18 @@ def build_end_overlay_frags(end_settings=None):
     border_frag = build_preview_border_frag(eh)
     _out = []
     if split_on:
-        # 网格后面还要接外框 pad 时，必须先给网格产物打标签（否则 pad 接不到网格输出）
-        _grid_out = "[v_grid]" if (after and border_frag) else ""
-        if after or not border_frag:
-            _out.append(build_end_split_filters(rows, cols, in_label="", out_label=_grid_out))
-        else:
-            # before（间隙模型）：逐格非对称 pad 由网格段内部自带，不再额外加外框
-            _out.append(build_end_split_filters(rows, cols, in_label="", out_label=_grid_out,
-                                                border=build_split_border_cfg(eh)))
-        if after and border_frag:
-            _out.append(f"[v_grid]{border_frag}")
+        # 网格后面还要接外框 pad 时，**不需要**给网格产物打标签（2026-10-28）：
+        # `pad` 直接逗号接在网格那一段尾部即可 —— 网格段（`build_end_split_filters`）末尾
+        # 恒是**单个未命名输出**，逗号追加就是「顺着这条链继续」。
+        # 旧写法是先 `[v_grid]` 打标签、再单独启一段 `[v_grid]pad=…`，而两个调用方
+        # （`build_end_preview_cmd` 的 `_pv_compose_vf`、`_pv_end_composite_cmd` 的
+        #  `",".join`）都是**逗号**拼片段 ⇒ 产出 `…hstack[v_grid],[v_grid]pad=…`，
+        # ffmpeg 把 `[v_grid]` 当成链内输入标签、split 的多路输出直接灌进 pad
+        # ⇒ `Too many inputs specified for the "pad" filter`（末端「split+外框」预览必失败）。
+        _grid = build_end_split_filters(
+            rows, cols, in_label="", out_label="",
+            border=(None if (after or not border_frag) else build_split_border_cfg(eh)))
+        _out.append(f"{_grid},{border_frag}" if (after and border_frag) else _grid)
     elif border_frag:
         _out.append(border_frag)
     return _out
@@ -19708,10 +20428,13 @@ def build_end_preview_cmd(ffmpeg_cmd, src, t, end_settings=None, base_settings=N
     _vf = []
     if base_settings:
         try:
-            # 预览是「已经 seek 到 t 的单帧」⇒ trim / 变速 / 字幕不参与（否则把这一帧又切掉）
+            # 预览是「已经 seek 到 t 的单帧」⇒ trim / 变速 / 字幕不参与（否则把这一帧又切掉）。
+            # ⚠️ enhance_settings 必须显式喂（2026-10-23）：缺它 = 基础链里没有降噪/eq/look/
+            #    网格，末端窗口预览看到的画面与成片不是同一张（用户报「网格在末端预览里没有」）。
             _base = build_video_filter_chain(dict(base_settings),
                                              include_trim=False, include_speed=False,
-                                             include_subtitle=False)
+                                             include_subtitle=False,
+                                             enhance_settings=base_settings.get("enhance", {}))
         except Exception:
             _base = ""
         if _base and _base != "null":
@@ -20818,9 +21541,14 @@ class VideoFilterFrame(ttk.LabelFrame):
 
 
 
-    def __init__(self, parent, app, preview_callback=None, refresh_cb=None, context="convert", **kwargs):
+    def __init__(self, parent, app, preview_callback=None, refresh_cb=None, context="convert",
+                 show_tile=False, **kwargs):
         super().__init__(parent, text=_("视频滤镜 (裁剪/旋转/缩放/反交错/像素格式/变速/倒放)"), padding="5", **kwargs)
         self.app = app
+        # show_tile（2026-10-28）：「拼接」入口是否出现 —— 只在**画中画模式**下给
+        # （封装页 pip_enabled 打开时由 edit_video_settings 传进来）。默认 False ⇒
+        # 转换页 / 队列任务编辑 / 未开画中画的封装页 UI **逐像素不变**。
+        self._show_tile = bool(show_tile)
         # context：宿主页标识。仅 "convert"(转换页主视频滤镜) 显示「入队自动去黑边」勾选框；
         # "merge"(封装页) / "task_edit"(队列任务编辑) 不显示——该功能只作用于转换页队列。
         self._context = context
@@ -20902,6 +21630,14 @@ class VideoFilterFrame(ttk.LabelFrame):
             # 风格预设（look，2026-10-02）：下拉选预设(token) + 强度(0..1)，纯内置滤镜链
             "style_preset": "",
             "style_intensity": 1.0,
+            # 网格/扫描线（drawgrid，2026-10-23）：独立叠加特效，与 look 正交
+            "grid_enabled": False,
+            "grid_w": GRID_DEFAULTS["w"],
+            "grid_gap": GRID_DEFAULTS["gap"],
+            "grid_t": GRID_DEFAULTS["t"],
+            "grid_color": GRID_DEFAULTS["color"],
+            "grid_alpha": GRID_DEFAULTS["alpha"],
+            "grid_scope": "all",          # all=全片 / seg=跟「时间段（统一）」
             # 增强滤镜统一时间段（2026-09-30）：把上方全部增强限制在某个时间段
             "enh_seg_enabled": False,
             "enh_seg_start": "",          # 输出时间线起始秒（空=从头）
@@ -21159,6 +21895,30 @@ class VideoFilterFrame(ttk.LabelFrame):
                 "注意：画布内的旋转与「持续旋转 spin」是两层，同时开会叠加旋转（属预期效果）。\n"
                 "    开启本功能会接管掉裁剪的简易位置的移动效果，避免双重位移。"),
                 wraplength=520)
+
+        # 拼接（2026-10-28）：「单视频的末端处理」—— 把这一路画面复制成 行×列 网格。
+        # 入口按用户要求放在「位置、尺寸、旋转」右边，且**只在画中画模式出现**
+        # （主视频/子视频/水印三处素材设置窗共用本类，由 show_tile 决定是否创建按钮）。
+        # 变量**无条件创建**：get_settings / set_settings 要读写它们，隐藏时不建会 KeyError。
+        self.tile_enabled = tk.BooleanVar(value=False)
+        self.tile_rows = tk.StringVar(value="2")
+        self.tile_cols = tk.StringVar(value="2")
+        if self._show_tile:
+            _tile_btn = ttk.Button(rot_frame, text=_("拼接"), width=8,
+                                   command=self._open_tile_dialog)
+            _tile_btn.pack(side=tk.LEFT, padx=(10, 0))
+            ToolTip(_tile_btn,
+                    _("把这一路画面复制成 行×列 的网格（画中画里做「多画面 / 多个效果」用）。\n"
+                    "滤镜位置在**链尾**：裁剪、旋转、缩放、增强、遮罩、字幕都作用在单格上，\n"
+                    "最后才拼成网格 ⇒ 已存的遮罩框 / 简易位置坐标不会因为行列数变化而错位。\n"
+                    "输出尺寸 = 每格尺寸 × 行列数（与「末端处理」的网格同语义）；\n"
+                    "想让整体尺寸不变，把「缩放」设成目标尺寸 ÷ 列数即可。\n"
+                    "不生效（勾了也不会拼）：开「位置、尺寸、旋转」（画布模式）或主视频 pad 画布 ——\n"
+                    "画布用的是定尺寸基准，先拼再进画布会被压扁 / 裁掉；这两种情况请用「缩放」\n"
+                    "控制每格大小（或者先关掉画布）。\n"
+                    "另外两档里本按钮根本不出现：串行合并、视频节点效果（拼接只在画中画模式下给），\n"
+                    "老工程带过来的 tile 值在渲染时会被剥掉。"),
+                    wraplength=560)
 
         # 去水印/模糊、高级增强按钮已移到 line1（2026-08-28，见烧录字幕前）
 
@@ -21571,6 +22331,139 @@ class VideoFilterFrame(ttk.LabelFrame):
                 "  看着像参数没生效。此时状态行会给出建议秒数，点一下跳过去；\n"
                 "  只想粗暴对比整体效果，就临时取消勾选本项"))
 
+        # ---- 网格 / 扫描线（drawgrid）— 2026-10-23 ----
+        # 独立叠加特效，与「风格预设(look)」正交（「褪色老旧」+ 网格可共存），故不进那个下拉。
+        # 参数语义（2026-10-23 实测，探针 tests/_verify_drawgrid_*_1023.py）：
+        #   宽度=w（iw=整幅宽⇒只画横线；调小才出竖线）、间隔+粗细=h（h 恒 = 间隔 + 粗细，
+        #   故**不**单独给「高度」——它是同一个数，给两次必然互相打架）、粗细=t、
+        #   颜色+透明度=c（drawgrid 把两者合在同一个参数里，UI 拆成两栏）。
+        # 数字一律按 1080p 基准换算成 ih 表达式（GRID_REF_H）：死像素在小尺寸预览里会粗得夸张。
+        grid_frame = ttk.LabelFrame(left_frame, padding="5")
+        # tooltip 只挂在「网格」这两个字上（用 labelwidget）：挂整框的话，鼠标掠过内边距
+        # 与控件之间的缝隙也会弹，调参数时一直在闪。
+        _g_title = ttk.Label(grid_frame, text=_("网格"))
+        grid_frame.configure(labelwidget=_g_title)
+        grid_frame.pack(fill=tk.X, pady=5)
+
+        # 布局（2026-10-23 用户定案，3 行 × 3 组 label+控件）：
+        #   启用网格  范围
+        #   宽度  间隔  粗细
+        #   颜色  透明度
+        # 列 = 每组「标签 + 控件」两列，共 6 列。
+        # 行0：启用 + 范围（两者都是「开关」语义）
+        self.grid_enabled = tk.BooleanVar(value=self.enhance_settings.get("grid_enabled", False))
+        ttk.Checkbutton(grid_frame, text=_("启用网格"),
+                        variable=self.grid_enabled).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(grid_frame, text=_("范围")).grid(row=0, column=2, sticky="e", padx=(0, 4))
+        _g_scope_init = "跟时间段" if str(self.enhance_settings.get("grid_scope", "all")) == "seg" else "全片"
+        self.grid_scope = tk.StringVar(value=_g_scope_init)
+        _g_scope = ttk.Combobox(grid_frame, textvariable=self.grid_scope, state="readonly",
+                                width=9, values=("全片", "跟时间段"))
+        _g_scope.grid(row=0, column=3, columnspan=3, sticky="w", pady=1)
+
+        # 行1：宽度 / 间隔 / 粗细（间隔 + 粗细 = drawgrid 的 h，用户不用再关心「高度」）
+        ttk.Label(grid_frame, text=_("宽度")).grid(row=1, column=0, sticky="w", pady=1)
+        self.grid_w = tk.StringVar(value=str(self.enhance_settings.get("grid_w", GRID_DEFAULTS["w"])))
+        _g_w = ttk.Entry(grid_frame, textvariable=self.grid_w, width=7)
+        _g_w.grid(row=1, column=1, sticky="w", padx=(2, 10), pady=1)
+        ttk.Label(grid_frame, text=_("间隔")).grid(row=1, column=2, sticky="e", padx=(0, 4), pady=1)
+        self.grid_gap = tk.StringVar(value=str(_grid_gap_value(self.enhance_settings)))
+        _g_gap = ttk.Entry(grid_frame, textvariable=self.grid_gap, width=7)
+        _g_gap.grid(row=1, column=3, sticky="w", padx=(2, 10), pady=1)
+        ttk.Label(grid_frame, text=_("粗细")).grid(row=1, column=4, sticky="e", padx=(0, 4), pady=1)
+        self.grid_t = tk.StringVar(value=str(self.enhance_settings.get("grid_t", GRID_DEFAULTS["t"])))
+        _g_t = ttk.Entry(grid_frame, textvariable=self.grid_t, width=7)
+        _g_t.grid(row=1, column=5, sticky="w", padx=(2, 0), pady=1)
+
+        # 行2：颜色 / 透明度（透明度滑块跨 3 列，才有长度）
+        ttk.Label(grid_frame, text=_("颜色")).grid(row=2, column=0, sticky="w", pady=1)
+        self.grid_color = tk.StringVar(value=str(self.enhance_settings.get("grid_color", GRID_DEFAULTS["color"])))
+        _g_color = tk.Button(grid_frame, text="", width=7, bd=1, relief="solid", padx=0, pady=0,
+                             command=lambda: _pick_grid_color())
+        _g_color.grid(row=2, column=1, sticky="w", padx=(2, 10), pady=1)
+        ttk.Label(grid_frame, text=_("透明度")).grid(row=2, column=2, sticky="e", padx=(0, 4), pady=1)
+        _g_a_row = ttk.Frame(grid_frame)
+        _g_a_row.grid(row=2, column=3, columnspan=3, sticky="ew", pady=1)
+        try:
+            _g_a_init = float(self.enhance_settings.get("grid_alpha", GRID_DEFAULTS["alpha"]))
+        except (TypeError, ValueError):
+            _g_a_init = GRID_DEFAULTS["alpha"]
+        self.grid_alpha = tk.DoubleVar(value=_g_a_init)
+        _g_a_lbl = ttk.Label(_g_a_row, width=5)
+        _g_a_lbl.pack(side=tk.RIGHT, padx=(4, 0))
+        _g_alpha = ttk.Scale(_g_a_row, from_=0.0, to=1.0, variable=self.grid_alpha,
+                             orient=tk.HORIZONTAL, length=80)
+        _g_alpha.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        def _pick_grid_color():
+            # ⚠️ 与 open_chroma_color 一致：colorchooser 是**函数内局部导入**（项目风格，
+            # 模块级没有这个 import）→ 漏了会在点按钮时 NameError。
+            from tkinter import colorchooser
+            _cur = str(self.grid_color.get() or "").strip() or GRID_DEFAULTS["color"]
+            _pick = colorchooser.askcolor(title=_("选择网格颜色"), parent=self.winfo_toplevel(),
+                                          initialcolor=_cur)
+            if _pick and _pick[1]:
+                self.grid_color.set(_pick[1])
+
+        def _g_text_color(hex_color):
+            """黑底配白字，避免色块上看不见色值（只服务这个按钮的显示）。"""
+            try:
+                _v = str(hex_color).lstrip("#")
+                _r, _g, _b = int(_v[0:2], 16), int(_v[2:4], 16), int(_v[4:6], 16)
+                return "#ffffff" if (_r * 299 + _g * 587 + _b * 114) / 1000 < 128 else "#000000"
+            except (ValueError, IndexError):
+                return "#000000"
+
+        def _g_paint_color(*_a):
+            _hex = str(self.grid_color.get() or "").strip() or GRID_DEFAULTS["color"]
+            if _hex.startswith("0x"):
+                _hex = "#" + _hex[2:]      # 兼容旧值/手填 0xRRGGBB
+                self.grid_color.set(_hex)
+                return
+            try:
+                _g_color.configure(bg=_hex, activebackground=_hex,
+                                   text=_hex.upper().replace("#", ""),
+                                   fg=_g_text_color(_hex))
+            except tk.TclError:
+                pass      # 非法色值就地忽略，别打断编辑（用户还在输入中）
+
+        def _g_alpha_lbl_sync(*_a):
+            _g_a_lbl.configure(text="{:d}%".format(int(round(self.grid_alpha.get() * 100))))
+
+        _g_inputs = [_g_w, _g_gap, _g_t, _g_color, _g_alpha, _g_scope]
+
+        def _g_apply_state(*_a):
+            """未勾选时整组禁用（不隐藏：隐藏会让窗口高度跳变，居中会飘）。"""
+            _st = "normal" if self.grid_enabled.get() else "disabled"
+            for _wd in _g_inputs:
+                try:
+                    _wd.configure(state=_st)
+                except tk.TclError:
+                    pass
+
+        self.grid_alpha.trace_add("write", _g_alpha_lbl_sync)
+        self.grid_color.trace_add("write", _g_paint_color)
+        self.grid_enabled.trace_add("write", _g_apply_state)
+        _g_alpha_lbl_sync()
+        _g_paint_color()
+        _g_apply_state()
+        ToolTip(_g_title,
+                _("在整个画面上叠加网格 / 扫描线（ffmpeg drawgrid）。\n"
+                "• 宽度：格子宽。填 iw = 整幅宽 ⇒ 只画横线（扫描线效果）；\n"
+                "  填小值（如 640 或 iw/8）⇒ 竖线也出来，变成网格\n"
+                "• 间隔 + 粗细：两者相加就是 drawgrid 的「格子高」，所以没有单独的「高度」可填。\n"
+                "  间隔至少 1：间隔 0 时高 = 粗细，实测不是扫描线，而是整帧均匀压暗\n"
+                "• 粗细就是线宽，必须小于「间隔 + 粗细」（上面的约束已自动兜住）\n"
+                "• 数字的含义 = **1080p 下的像素**，实际按画面高度等比换算：\n"
+                "  所以右侧小预览与成片的粗细比例一致，720p / 1080p / 4K 观感也一致\n"
+                "  （想在 4K 保持绝对 12px，把数字乘 2 即可：24）\n"
+                "  ⚠ 等比缩放有物理下限：粗细填 2~3 时，右侧几百像素高的小预览会把它缩成 0，\n"
+                "    预览就看不到线（成片正常）。要确认效果就临时把粗细调到 8 以上看一眼\n"
+                "• 透明度 0% 或粗细 0 = 不生效（自动不拼进滤镜链）\n"
+                "• 颜色 + 透明度合成 drawgrid 的 c= 参数；颜色是黑线时压暗画面，\n"
+                "  想要白线就选白色，不要靠「反色」绕\n"
+                "• 范围：全片 = 无视「时间段（统一）」；跟时间段 = 只在该区间出现"))
+
         # ---- 右栏：色彩调整 ----
         right_frame = ttk.Frame(paned)
         paned.add(right_frame, weight=1)
@@ -21913,6 +22806,15 @@ class VideoFilterFrame(ttk.LabelFrame):
                 # 显示名→token 走 _style_display_to_token（认不出来返回空串 = 不选预设）
                 "style_preset": _style_display_to_token(self.style_preset_var.get()),
                 "style_intensity": round(self.style_intensity_var.get(), 3),
+                # 网格/扫描线（drawgrid）：独立叠加特效，与 look 正交。
+                # 存「间隔 + 粗细」两个可感知量；h 由 _build_grid_filter 相加得出。
+                "grid_enabled": self.grid_enabled.get(),
+                "grid_w": self.grid_w.get().strip(),
+                "grid_gap": self.grid_gap.get().strip(),
+                "grid_t": self.grid_t.get().strip(),
+                "grid_color": self.grid_color.get().strip(),
+                "grid_alpha": round(self.grid_alpha.get(), 3),
+                "grid_scope": "seg" if self.grid_scope.get() == "跟时间段" else "all",
                 "negate_enabled": self.negate_enabled.get(),
                 "enh_seg_enabled": self.enh_seg_enabled.get(),
                 "enh_seg_start": self.enh_seg_start.get().strip(),
@@ -22004,6 +22906,9 @@ class VideoFilterFrame(ttk.LabelFrame):
             eq_brightness_var, eq_contrast_var, eq_saturation_var, eq_gamma_var,
             hue_angle_var, hue_saturation_var,
             self.style_preset_var, self.style_intensity_var,
+            # 网格：漏一个就是「调参数右侧预览不动，保存重开才看得到」（2026-10-23 用户报）
+            self.grid_enabled, self.grid_w, self.grid_gap, self.grid_t,
+            self.grid_color, self.grid_alpha, self.grid_scope,
             self.enh_seg_enabled, self.enh_seg_start, self.enh_seg_end,
             self.enh_seg_loop, self.enh_seg_cycle, self.enh_seg_once,
             self._enh_pv_time,
@@ -22028,6 +22933,9 @@ class VideoFilterFrame(ttk.LabelFrame):
                     self.mark_range.set("tv")
             # 与实时预览共用同一份采集器：预览看到的就是这里存下来的，杜绝两处漂移
             self.enhance_settings.update(_pv_collect_enh())
+            # 旧键 grid_h（= 间隔 + 粗细）已被 grid_gap 取代，存盘时顺手清掉，
+            # 免得设置文件里留一个永不生效的死键（迁移由 _grid_gap_value 负责）
+            self.enhance_settings.pop("grid_h", None)
             if self.app:
                 self.app.update_command_preview()
             if hasattr(self, '_preview_callback') and self._preview_callback:
@@ -24870,6 +25778,105 @@ class VideoFilterFrame(ttk.LabelFrame):
         _dlg_toggle()
         center_window(win, 400, 160)  # 屏幕居中显示（紧凑尺寸）
 
+    def _open_tile_dialog(self):
+        """「拼接」小窗：行 / 列 → 本路画面复制成网格（= 单视频的「末端处理」）。
+
+        只在 `show_tile=True`（画中画模式）时按钮可见；三处素材设置窗（主视频 / 子视频 /
+        水印）共用本类 ⇒ 同一个入口作用在**当前正在编辑的那一路**上。
+        确定后写回 `tile_enabled / tile_rows / tile_cols`，并触发命令模板 + 右侧预览刷新
+        （与其它控件的 `_preview_callback` 同源，别只刷一处）。
+        """
+        win = tk.Toplevel(self)
+        win.title(_("拼接（多画面）"))
+        with suppress(Exception):
+            win.transient(self.winfo_toplevel())
+        _en = tk.BooleanVar(value=self.tile_enabled.get())
+        _r = tk.StringVar(value=self.tile_rows.get() or "2")
+        _c = tk.StringVar(value=self.tile_cols.get() or "2")
+        body = ttk.Frame(win, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Checkbutton(body, text=_("启用拼接（把这一路画面复制成 行×列 网格）"),
+                        variable=_en).grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(body, text=_("行:")).grid(row=1, column=0, sticky="w", pady=(10, 0))
+        # 2026-10-28：Combobox(readonly, 1-3) → Spinbox(可手输, 1-5)。
+        # 行/列各放到 5（总格 2-25），且允许直接键入数字（readonly 下拉在 4、5 时不够用）。
+        ttk.Spinbox(body, textvariable=_r, from_=1, to=5, width=4,
+                    state="normal").grid(row=1, column=1, sticky="w", padx=(4, 14), pady=(10, 0))
+        ttk.Label(body, text=_("列:")).grid(row=1, column=2, sticky="w", pady=(10, 0))
+        ttk.Spinbox(body, textvariable=_c, from_=1, to=5, width=4,
+                    state="normal").grid(row=1, column=3, sticky="w", padx=(4, 0), pady=(10, 0))
+        _n_lbl = ttk.Label(body, text="", foreground="gray")
+        _n_lbl.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ttk.Label(body,
+                  text=_("滤镜在链尾：裁剪 / 旋转 / 缩放 / 增强 / 遮罩 / 字幕都先作用在单格上，"
+                       "最后才拼成网格 ⇒ 已存坐标不会因行列数变化而错位。\n"
+                       "输出尺寸 = 每格尺寸 × 行列数（与「末端处理」同语义）；想让整体尺寸不变，"
+                       "把「缩放」设成 目标尺寸 ÷ 列数。\n"
+                       "不生效的四种情况（勾了也不会拼，别以为是 bug）：\n"
+                       "  ① 开「位置、尺寸、旋转」（画布模式）；② 主视频 pad 画布\n"
+                       "      —— 画布把定尺寸当内容基准，先拼会被压扁 / 裁掉，请改用「缩放」控每格大小；\n"
+                       "  ③ 串行合并；④ 视频节点效果里的滤镜链\n"
+                       "      —— 这两处根本不出现本按钮（拼接只在画中画模式里给），老工程带过来的\n"
+                       "      tile 值渲染时会被剥掉，不会画成网格。"),
+                  foreground="gray", wraplength=460, justify="left").grid(
+                      row=3, column=0, columnspan=4, sticky="w", pady=(10, 0))
+
+        def _sync_note(*_a):
+            try:
+                _n = int(_r.get()) * int(_c.get())
+            except (ValueError, TypeError):
+                _n = 0
+            _n_lbl.config(text=_("总格数 %d%s") % (
+                _n, "" if TILE_MIN_TILES <= _n <= TILE_MAX_TILES
+                else _("  ← 需在 %d-%d 之间") % (TILE_MIN_TILES, TILE_MAX_TILES)))
+
+        for _v in (_r, _c):
+            _v.trace_add("write", _sync_note)
+        _sync_note()
+
+        def _ok():
+            # 🔴 2026-10-28：Spinbox 是 state="normal"（可手输）⇒ 输入框里可能是 `abc` / `2.7`。
+            # 旧写法只在「算总格数」那一步包了 try，下面两行 `int(_r.get())` 裸露 ⇒
+            # **取消勾选 + 手输 abc + 点确定** 会抛 ValueError（对话框不关、无提示）。
+            # 现改为：先把原始值解析成 int（失败 = None），非法时勾选档提示拦截、
+            # 未勾选档回落 2（此时拼接不生效，没必要拦用户）；写入一律用解析后的整数。
+            def _raw_int(_var):
+                try:
+                    return int(str(_var.get() or "").strip())
+                except (ValueError, TypeError):
+                    return None
+
+            _rv, _cv = _raw_int(_r), _raw_int(_c)
+            if _rv is None or _cv is None:
+                if alert_if(bool(_en.get()), _("提示"),
+                            _("行 / 列要填 1-%d 的整数（当前：%s × %s）。") % (
+                                TILE_MAX_SIDE, _r.get(), _c.get()), parent=win):
+                    return
+                _rv = _rv if _rv is not None else 2
+                _cv = _cv if _cv is not None else 2
+            _n = _rv * _cv
+            if alert_if(_en.get() and not (TILE_MIN_TILES <= _n <= TILE_MAX_TILES), _("提示"),
+                        _("总格数需在 %d-%d 之间（当前 %d）。") % (
+                            TILE_MIN_TILES, TILE_MAX_TILES, _n), parent=win):
+                return
+            self.tile_enabled.set(bool(_en.get()))
+            self.tile_rows.set(str(max(1, min(TILE_MAX_SIDE, _rv))))
+            self.tile_cols.set(str(max(1, min(TILE_MAX_SIDE, _cv))))
+            win.destroy()
+            for _cb in (getattr(self, "refresh_cb", None),
+                        getattr(self, "_preview_callback", None)):
+                with suppress(Exception):
+                    if _cb:
+                        _cb()
+
+        _btns = ttk.Frame(body)
+        _btns.grid(row=4, column=0, columnspan=4, sticky="e", pady=(12, 0))
+        ttk.Button(_btns, text=_("取消"), command=win.destroy, width=8).pack(side=tk.RIGHT)
+        ttk.Button(_btns, text=_("确定"), command=_ok, width=8).pack(side=tk.RIGHT, padx=(0, 6))
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        with suppress(Exception):
+            center_window(win, 520, 360)
+
     def get_settings(self):
         return {
             "frame_rate_type": self.frame_rate_type.get(),
@@ -24897,6 +25904,11 @@ class VideoFilterFrame(ttk.LabelFrame):
             "rotate": self.rotate.get(),
             "vflip": self.vflip.get(),
             "hflip": self.hflip.get(),
+            # 拼接（单视频末端处理，2026-10-28）：行×列 → 链尾 split 成网格。
+            # 变量无条件存在（按钮只在画中画模式可见）⇒ 老工程读不到就是默认 False/2×2。
+            "tile_enabled": self.tile_enabled.get(),
+            "tile_rows": self.tile_rows.get(),
+            "tile_cols": self.tile_cols.get(),
             "speed_enabled": self.speed_enabled.get(),
             "speed_factor": self.speed_factor.get(),
             "deinterlace_filter": self.deinterlace_filter.get(),
@@ -24963,6 +25975,13 @@ class VideoFilterFrame(ttk.LabelFrame):
         self.rotate.set(settings.get("rotate", "none"))
         self.vflip.set(settings.get("vflip", False))
         self.hflip.set(settings.get("hflip", False))
+        # 拼接（2026-10-28）：与 get_settings 对称；行列夹到 1-TILE_MAX_SIDE（生成侧还有总格数校验）
+        # 🔴 2026-10-28 修：`int(...)` 必须包 try —— enc_settings 来自老工程 / 手编预设 / 预设串味，
+        # 值可能是 `"abc"` / `"2.7"`（`or 2` 只兜「空串」，兜不住非数字）⇒ 旧写法会让整个设置窗
+        # 打开就 ValueError。判据侧 `tile_grid_of` 本来就有 try，这里补齐同款兜底（非法 → 回落 2）。
+        self.tile_enabled.set(bool(settings.get("tile_enabled", False)))
+        self.tile_rows.set(str(_tile_dim(settings.get("tile_rows", 2))))
+        self.tile_cols.set(str(_tile_dim(settings.get("tile_cols", 2))))
         self.speed_enabled.set(settings.get("speed_enabled", False))
         self.speed_factor.set(settings.get("speed_factor", "1.0"))
         self.deinterlace_filter.set(normalize_deinterlace_filter(settings.get("deinterlace_filter", "none")))
@@ -25003,10 +26022,122 @@ class VideoFilterFrame(ttk.LabelFrame):
             self._blur_items = []
 
 
+def _collect_tw_siblings(app, tw, parent_widget):
+    """取文字水印「其它启用条目」（排除当前编辑项 tw，按 identity 排除）。
+
+    来源优先级：对话框实例 app.text_wm_dialog.items（转换页/队列） → 传入的
+    parent_widget.items（封装页对话框）→ app.text_watermark_items（兜底）。
+    仅返回 enabled 且文字非空的条目，供位置编辑器作参考叠加。"""
+    items = None
+    _dlg = getattr(app, "text_wm_dialog", None)
+    if _dlg is not None:
+        items = getattr(_dlg, "items", None)
+    if not items:
+        items = getattr(parent_widget, "items", None)
+    if not items:
+        items = getattr(app, "text_watermark_items", None)
+    if not items:
+        return []
+    out = []
+    for _it in items:
+        if _it is tw:
+            continue
+        if not _it.get("enabled", True):
+            continue
+        if not str(_it.get("text", "") or "").strip():
+            continue
+        out.append(_it)
+    return out
+
+
+# 兄弟文字预览图缓存（内容分辨率 PNG → 显示分辨率 PhotoImage）。键 = (png 路径, 显示宽, 显示高)。
+# 复用与当前条完全相同的 drawtext 渲染（_render_text_watermark_preview_png），确保兄弟条与当前条
+# 文字落点（垂直基线/字号/透明度）完全同引擎、零对齐偏差；resize 时同尺寸直接命中缓存。
+_TW_SIB_PHOTO_CACHE = {}
+
+
+# 兄弟条「算不算旋转」的唯一阈值（度）。必须与当前条自己的轻量/合成分界
+# （`_do_render_content` / `_set_rect_live` 的 `abs(current_angle) < 0.5`）同值：
+# 出图旋转与摆位补偿若各用一套阈值，0.4° 这类角度会出现「图没转、位置却按 hypot 补了」的错位。
+_TW_SIB_ROT_EPS = 0.5
+
+def _tw_sibling_photo(ffmpeg_cmd, png_path, dw, dh, angle=0.0):
+    """把内容分辨率的文字水印 PNG 缩放到显示尺寸，返回 Tk PhotoImage（带 LRU 缓存）。
+
+    angle≠0：顺带把图旋转 angle 度再返回，**返回图大于 dw×dh**（rotate ow/oh=hypot(iw,ih)
+    正方形），调用方须按同一中心摆位（见 `_tw_sib_display_origin`）。
+    2026-10-24 用户实测：兄弟条设过旋转角，在别人的位置编辑器里却画成水平 —— 导出侧
+    `build_text_watermark_filtergraph` 是 `rotate=angle=…:ow/oh=hypot:c=black@0` 绕内容盒
+    中心转，这里必须同参，否则「所见非所得」。
+    """
+    global _TW_SIB_PHOTO_CACHE
+    if not png_path or not os.path.exists(png_path) or dw < 1 or dh < 1:
+        return None
+    _ang = round(float(angle or 0.0), 2)
+    _k = (png_path, dw, dh, _ang)
+    _p = _TW_SIB_PHOTO_CACHE.get(_k)
+    if _p is not None:
+        return _p
+    if len(_TW_SIB_PHOTO_CACHE) > 48:
+        _TW_SIB_PHOTO_CACHE.clear()
+    try:
+        # ⚠️ 必须保 alpha：源 PNG 是透明底（colorchannelmixer=aa=0），直接用 PPM 输出会丢
+        # alpha 通道 ⇒ 透明处变黑色底（用户实测「兄弟条有黑色背景」）。改用 RGBA + PNG 管道
+        # 保留透明度；Tk PhotoImage 可直接读 PNG data（含 alpha）。
+        _vf = f"format=rgba,scale={dw}:{dh}:flags=bilinear"
+        if abs(_ang) >= _TW_SIB_ROT_EPS:
+            # c=black@0 = 透明填充（rgba 下即 alpha=0），与导出侧静态 rotate 完全同参。
+            _vf += (f",rotate=angle='{_ang}*PI/180'"
+                    f":ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=black@0")
+        _cmd = [ffmpeg_cmd, "-y", "-i", png_path,
+                "-vf", _vf,
+                "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "pipe:1"]
+        _out = subprocess.run(_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             creationflags=_ffmpeg_spawn_flags(), timeout=20).stdout
+        if not _out:
+            return None
+        _ph = tk.PhotoImage(data=_out)
+        _TW_SIB_PHOTO_CACHE[_k] = _ph
+        return _ph
+    except Exception:
+        return None
+
+
+def _tw_sib_display_origin(x, y, bw, bh, angle):
+    """兄弟条在**内容坐标**里的显示原点（未乘 scale、未加 PAD）。
+
+    - 角度≈0：就是内容盒左上角 (x, y) —— 与当前条 to_canvas 同系。
+    - 角度≠0：`_tw_sibling_photo` 返回的是 hypot 正方形（大图），导出侧
+      （build_text_watermark_filtergraph）同样「绕内容盒中心转、overlay 盒左上角
+      = 内容盒左上角 − (d−盒)/2」（与 `_content_box_shift` 同式）⇒ 这里逐项补偿，
+      否则兄弟条一转就整体往右下跑 (d−w)/2、(d−h)/2。
+    """
+    x, y, bw, bh = float(x), float(y), float(bw), float(bh)
+    if abs(float(angle or 0.0)) < _TW_SIB_ROT_EPS:
+        return x, y
+    _d = rotate_box_size(bw, bh, 1)[0]
+    return x - (_d - bw) / 2.0, y - (_d - bh) / 2.0
+
+
+def _bg_draw_lower_target(below_content, covers_canvas):
+    """bg_draw（兄弟条 / 其他条目）该压到哪个 tag 之下（纯规则，便于单测）。
+
+    below_content=False（子视频幽灵框等旧调用方）→ 恒压到活动矩形之下（旧行为）。
+    below_content=True（文字水印兄弟条）→ 正常压到当前条真实帧之下（当前条最前）；
+    但当内容帧是**铺满整块画布的不透明合成图**（角度≠0 / 绿幕）时，压在其下等于
+    整块被遮 ⇒ 改压到活动矩形之下（浮在合成图之上），代价只是重叠处盖住当前条文字。
+    """
+    if below_content and not covers_canvas:
+        return "content_img"
+    return "rect"
+
+
+
 def _open_tw_position_editor_impl(app, tw, canvas_w, canvas_h, refresh_cb, parent_widget,
                                   ctx_file=None, ctx_settings=None, scope=None,
-                                  main_offset=None, main_render_size=None):
-    """文字水印位置编辑器公共实现（AdvancedFrame 转换页/队列 与 封装页共用）。
+                                  main_offset=None, main_render_size=None,
+                                  collect_siblings=True, sync_dialog_angle=True):
+    """文字水印位置编辑器公共实现（转换页/队列 与 封装页共用）。
 
     - tw：要编辑的文字水印设置 dict（写回 overlay_x/overlay_y/font_size/rotate）
     - canvas_w/h：画布尺寸（调用方各自计算：转换页/队列/封装页主视频渲染尺寸）
@@ -25021,6 +26152,13 @@ def _open_tw_position_editor_impl(app, tw, canvas_w, canvas_h, refresh_cb, paren
       2026-09-23：此前封装页不传 → 画布已是 pad 尺寸、背景帧却被拉伸铺满 → 画面变形；
       与子视频位置编辑器（open_visual_overlay_editor）同款传参后主视频按自身尺寸摆放、
       pad 留黑区保持黑色。None=铺满画布（旧行为，转换页无 pad 功能）。
+    - collect_siblings：是否画「其它启用条目」（兄弟条）。队列任务文字水印是**单条 dict**
+      （不是条目表）⇒ 传 False，否则 _collect_tw_siblings 会去抓主界面对话框的 items（错源）。
+    - sync_dialog_angle：旋转角改动是否顺带回写主界面文字水印对话框的旋转数值框。
+      队列/封装页语境传 False —— 那里改的是任务/封装页自己的条目，不该动主界面那份。
+
+    2026-10-24：队列任务编辑（FFmpegBatchGUI.edit_task）原来内联了一份本函数的构造，
+    差异只有上面两个参数 ⇒ 收敛到这里，以后（兄弟条旋转、时间窗等）只改一处。
     """
     text = tw.get("text", "")
     fs = _opt_int(tw.get("font_size", 48), 48)
@@ -25076,7 +26214,7 @@ def _open_tw_position_editor_impl(app, tw, canvas_w, canvas_h, refresh_cb, paren
     def apply_tw_angle(new_angle):
         tw["rotate"] = float(new_angle or 0.0)
         # 同步回写文字水印对话框内的「旋转角度」数值框（对话框实例存于 app.text_wm_dialog）
-        _dlg = getattr(app, "text_wm_dialog", None)
+        _dlg = getattr(app, "text_wm_dialog", None) if sync_dialog_angle else None
         if _dlg is not None:
             with suppress(Exception):
                 if _dlg.winfo_exists():
@@ -25092,12 +26230,88 @@ def _open_tw_position_editor_impl(app, tw, canvas_w, canvas_h, refresh_cb, paren
     _bg_file, _main_settings = _resolve_editor_bg(app, ctx_file, ctx_settings, scope=scope)
     _bg_filter = _main_bg_pre_filter(_main_settings) if _main_settings else None
 
+    # 2026-10-24：拖拽编辑器里把「其它启用条目」的真实文字也画出来（每条按各自颜色/
+    # 字号/位置），当前条目仍可拖、其它条目作参考，方便对齐 / 避重叠 / 看颜色搭配。
+    # 🔴 渲染口径（2026-10-24 修正「恒定向下偏移」）：兄弟条必须用与当前条**完全相同**的
+    #   drawtext PNG（_render_text_watermark_preview_png）渲染，再缩放摆到 to_canvas(overlay_x,overlay_y)，
+    #   与当前条（同一函数、同一坐标换算）像素级一致。绝不用 Tk create_text 画 —— 两种引擎
+    #   文字垂直基线/字号落点天然差几像素，谁当兄弟谁被画低，导致第二编辑器里对齐后成片错位。
+    _sib_items = _collect_tw_siblings(app, tw, parent_widget) if collect_siblings else []
+    _bg_sib_func = None
+    # 2026-10-24：「只看此刻」过滤开关（默认不勾 = 全画，旧行为）。框架在每次重画叠加层前
+    # 把当前背景帧时刻写进 _bg_time_ref[0]；背景帧就是**源片 t 的画面**，故判据用源时间。
+    _sib_filter_var = tk.BooleanVar(master=parent_widget, value=False)
+    _bg_time_ref = [0.0]
+    if _sib_items:
+        _sib_data = []
+        for _s in _sib_items:
+            _se = _tw_effective_text(_s)
+            if not _se:
+                continue
+            _sf = _opt_int(_s.get("font_size", 48), 48)
+            _sw, _sh = estimate_text_size(_se, "", _sf)
+            _sbw = _sw + 16
+            _sbh = _sh + 16
+            _sx = safe_eval_expr(_s.get("overlay_x", "10"),
+                                 {"W": canvas_w, "H": canvas_h, "w": _sbw, "h": _sbh})
+            _sy = safe_eval_expr(_s.get("overlay_y", "10"),
+                                 {"W": canvas_w, "H": canvas_h, "w": _sbw, "h": _sbh})
+            if _sx is None:
+                _sx = 10
+            if _sy is None:
+                _sy = 10
+            # 兄弟条内容分辨率 PNG（与当前条同源 drawtext，含各自字体/颜色/透明度；
+            # 旋转在 _draw_siblings 里按各自 rotate 用 ffmpeg 现转，不带进这张 PNG）
+            _spng = _render_text_watermark_preview_png(
+                app.ffmpeg_cmd, _s, int(_sbw), int(_sbh))
+            _sib_data.append({
+                "x": float(_sx), "y": float(_sy),
+                "bw": _sbw, "bh": _sbh,
+                "ang": _opt_float(_s.get("rotate", 0) or 0, 0.0),
+                "png": _spng,
+                "s": _s,   # 条目本体：绘制时按它自己的显示时段判「此刻是否可见」
+            })
+
+        def _draw_siblings(canvas, sx, sy):
+            # 重画前清掉上一轮（resize 会再次调用本回调，避免残留堆积）
+            with suppress(Exception):
+                canvas.delete("sib_img")
+            # 2026-10-24「只看此刻」：勾选时按背景帧时刻过滤，取消时全部画出（默认）。
+            # 只影响**画不画**，PNG 不重渲 ⇒ 切换开关是纯 canvas 级操作，零 ffmpeg。
+            _only_now = bool(_sib_filter_var.get())
+            _now_t = float(_bg_time_ref[0] or 0.0)
+            for _d in _sib_data:
+                try:
+                    if _only_now and not _tw_visible_at(_d["s"], _now_t):
+                        continue
+                    _png = _d.get("png")
+                    if not _png or not os.path.exists(_png):
+                        continue
+                    # 显示尺寸 = 内容盒 × scale（与当前条 _disp_cw/_disp_ch 同口径）
+                    _dw = max(1, int(round(_d["bw"] * sx)))
+                    _dh = max(1, int(round(_d["bh"] * sy)))
+                    _sang = float(_d.get("ang") or 0.0)
+                    _ph = _tw_sibling_photo(app.ffmpeg_cmd, _png, _dw, _dh, _sang)
+                    if _ph is None:
+                        continue
+                    # 摆到内容坐标 (x,y)，框架 _invoke_bg_draw 会统一 +PAD（与当前条 to_canvas 同系）
+                    _ox, _oy = _tw_sib_display_origin(_d["x"], _d["y"], _d["bw"], _d["bh"], _sang)
+                    canvas.create_image(_ox * sx, _oy * sy,
+                                        image=_ph, anchor=tk.NW,
+                                        tags=("bg_draw", "sib_img"))
+                except Exception:
+                    pass
+        _bg_sib_func = _draw_siblings
+
     app._generic_overlay_editor(
         parent_widget, canvas_w, canvas_h,
         10 if _init_x is None else _init_x,
         10 if _init_y is None else _init_y,
         wm_w, wm_h, on_apply, title, None,
-        bg_draw_func=None, rect_label=_('文字水印'),
+        bg_draw_func=_bg_sib_func, rect_label=_('文字水印'),
+        bg_draw_below_content=True,  # 兄弟条压在当前条真实帧之下，当前条始终最前
+        bg_time_ref=_bg_time_ref if _sib_items else None,
+        sib_filter_var=_sib_filter_var if _sib_items else None,
         min_visible_pixels=0, show_scale_tip=False,
         rotate_angle=_tw_ra, angle_cb=apply_tw_angle,
         show_nudge=False,   # 文字水印位置编辑器：看不到画布，无微调按钮
@@ -25419,6 +26633,10 @@ class TextWatermarkDialog(tk.Toplevel):
         self.text_var = tk.StringVar(value=s.get("text", ""))
         text_entry = ttk.Entry(_r, textvariable=self.text_var, width=30)
         text_entry.pack(side=tk.LEFT, padx=(0, 5))
+        # 局部变色（方案 A，2026-10-24）：在文字里用 {RRGGBB} 标记切换后续颜色，预览/导出/位置编辑器同步生效。
+        ToolTip(text_entry,
+                _("局部变色：在文字里用 {RRGGBB}（或 {#RRGGBB}）设置其后文字颜色，例如 「警告{FF0000}请勿靠近」→「警告」默认色、「请勿靠近」红色；\n用 {} 复位到条目默认色。也支持 {red}/{white}/{yellow} 等颜色名。\n预览、导出与位置编辑器所见即所得（逐段按累计宽度排列，无需拆条目）。"),
+                wraplength=460)
         # 富文本（2026-09-19）：多行编辑入口。普通模式把多行拼成一行显示；
         # 倒计时模式按行拆分逐行排版（见 countdown_lines / build_tw_countdown_subgraph）。
         ttk.Button(_r, text=_("富文本"), width=6,
@@ -26578,9 +27796,81 @@ class TextWatermarkDialog(tk.Toplevel):
         body = ttk.Frame(dlg, padding=6)
         body.pack(fill=tk.BOTH, expand=True)
         ttk.Label(body, text=_("每行一条（直接回车换行）。倒计时模式按行逐行排版；普通模式会拼成一行显示。")).pack(anchor="w")
+        ttk.Label(body, text=_("局部变色：选中文字点「插入」给这段上色；不选则插标记，其后文字变色。")).pack(anchor="w")
+        # 局部变色工具栏（方案 C，2026-10-24）。只往文本里插入**纯文本标记**，不把 Text
+        # 变成彩色显示——标记即文本，撤销 / 复制 / index 定位全部天然正确。彩色效果去
+        # 位置编辑器或预览看（见 research/tw-partial-color §8）。
+        bar = ttk.Frame(body)
+        bar.pack(fill=tk.X, pady=(3, 0))
         txt = tk.Text(body, width=46, height=12, wrap="none", undo=True)
         txt.pack(fill=tk.BOTH, expand=True, pady=(4, 6))
         txt.insert("1.0", self.text_var.get())
+        # 待插入色：默认取条目当前字色（UI 侧统一存 #RRGGBB；颜色名也照原样透传）
+        _cur = {"hex": (self.settings.get("font_color") or "#FFFFFF").upper()}
+        swatch = tk.Frame(bar, width=16, height=16, bg=_cur["hex"],
+                          relief="sunken", bd=1)
+        hex_lbl = ttk.Label(bar, text=_cur["hex"], width=9)
+
+        def _pick_color():
+            from tkinter import colorchooser     # 项目惯例：colorchooser 函数内局部导入
+            _rgb, _hx = colorchooser.askcolor(
+                color=_cur["hex"], parent=dlg, title=_("选择文字颜色"))
+            if not _hx:
+                return
+            _cur["hex"] = _hx.upper()
+            swatch.configure(bg=_cur["hex"])
+            hex_lbl.configure(text=_cur["hex"])
+            txt.focus_set()
+
+        def _put(markup, wrap_sel=True):
+            """插入标记。有选区且 wrap_sel → `{色}选区{}` 打包；否则只插标记本身。
+
+            光标 = Text 的 `insert` mark（gravity=right），插入内容后自动停在标记**之后**，
+            所以上完色直接接着打字就生效，不需要手动挪光标。"""
+            txt.focus_set()
+            _sel = txt.tag_ranges("sel")
+            if _sel and wrap_sel:
+                _start, _end = txt.index("sel.first"), txt.index("sel.last")
+                # 先补尾部复位、再插首部颜色：{} 会被后者推右，最终顺序 = {色}选区{}
+                txt.mark_set("insert", _end)
+                txt.insert("insert", "{}")
+                txt.insert(_start, markup)
+            elif _sel:
+                txt.mark_set("insert", txt.index("sel.first"))
+                txt.insert("insert", markup)
+            else:
+                txt.insert("insert", markup)
+            txt.see("insert")
+
+        def _insert_color():
+            _put("{" + _cur["hex"].lstrip("#") + "}")
+
+        def _insert_reset():
+            _put("{}", wrap_sel=False)
+
+        def _clear_marks():
+            """剥掉标记。有选区 → 只清选区（与「插入」的选区语义对称）；无选区 → 整段清。"""
+            txt.focus_set()
+            if txt.tag_ranges("sel"):
+                _start = txt.index("sel.first")
+                _clean = _tw_strip_color_markup(txt.get("sel.first", "sel.last"))
+                txt.delete("sel.first", "sel.last")
+                txt.insert(_start, _clean)
+            else:
+                _raw = txt.get("1.0", "end-1c")
+                txt.delete("1.0", "end")
+                txt.insert("1.0", _tw_strip_color_markup(_raw))
+
+        # pack 顺序 = 视觉顺序（控件都在上面统一创建，避免回调对后定义名的前向引用）
+        ttk.Button(bar, text=_("颜色…"), width=7, command=_pick_color).pack(side=tk.LEFT)
+        swatch.pack(side=tk.LEFT, padx=(5, 4))
+        hex_lbl.pack(side=tk.LEFT)
+        ttk.Button(bar, text=_("插入"), width=5,
+                   command=_insert_color).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Button(bar, text=_("还原"), width=5,
+                   command=_insert_reset).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(bar, text=_("清除标记"), width=9,
+                   command=_clear_marks).pack(side=tk.LEFT, padx=(4, 0))
         btns = ttk.Frame(body)
         btns.pack(fill=tk.X)
 
@@ -27205,7 +28495,7 @@ class BlurFilterDialog(tk.Toplevel):
         _lbltt10.grid(row=2, column=0, sticky="w", pady=5)
         self.type_var = tk.StringVar(value=self.filter_frame._blur_type.get())
         type_combo = ttk.Combobox(main, textvariable=self.type_var,
-                                  values=["delogo", "boxblur", "gblur", "negate",
+                                  values=["delogo", "boxblur", "gblur", "pixelize", "negate",
                                           "hflip", "vflip", "swapuv", "desat", "eq_bright",
                                           "unsharp", "avgblur", "median",
                                           "black", "white"],
@@ -27216,6 +28506,8 @@ class BlurFilterDialog(tk.Toplevel):
             _("【滤镜类型说明】\n"
             "• delogo：智能去水印滤镜，需指定区域坐标（用周围像素填充），本身就只作用于选定区域。\n"
             "• boxblur / gblur：模糊滤镜；勾「仅应用到选定区域」=局部模糊，不勾=全帧模糊。\n"
+            "• pixelize：马赛克打码（隐私遮挡，按块取平均色）；勾「仅应用到选定区域」\n"
+            "  =只糊坐标框内，不勾=整幅打码；块尺寸越大越糊，1 等于没有效果。\n"
             "• 其余类型统称「区域效果」：勾「仅应用到选定区域」时恒作用于坐标框内：\n"
             "  negate 局部反色（把坐标框内画面逐通道反相 255-x，无强度参数；\n"
             "  与子视频混合模式里的 negation 公式完全不同）；\n"
@@ -27260,6 +28552,7 @@ class BlurFilterDialog(tk.Toplevel):
                 "gblur：sigma（浮点数，默认2.0）\n"
                 "avgblur / median：半径（整数，默认 5 / 3）\n"
                 "unsharp：锐化强度（浮点数，默认1.5）\n"
+                "pixelize：块尺寸（整数 1~1024，默认 16，越大越糊；1 = 几乎无变化）\n"
                 "eq_bright：亮度（-1.0 ~ 1.0，默认 -0.3，负数压暗、正数提亮）\n"
                 "delogo 与无参数的区域效果（negate / hflip / vflip / swapuv /\n"
                 "desat / black / white）：此参数无效"))
@@ -27498,7 +28791,7 @@ class BlurFilterDialog(tk.Toplevel):
     # 勾=恒局部（旧行为，坐标解锁）；不勾=全帧时间段效果（坐标禁用）。
     # 与生成端 _REGION_EFFECT_FILTERS 一一对应，加类型时两边一起改。
     _REGION_EFFECTS = ("negate", "hflip", "vflip", "swapuv", "desat", "eq_bright",
-                       "unsharp", "avgblur", "median", "black", "white")
+                       "unsharp", "avgblur", "median", "pixelize", "black", "white")
 
     # 有强度参数的类型：type -> (强度框标签, 默认值)。不在此表里的类型强度框禁用。
     # 🔴 类体 dict 同样是 import 期求值（与「默认参数」坑一致）：写成 `_("半径:")` 会被冻成
@@ -27512,6 +28805,7 @@ class BlurFilterDialog(tk.Toplevel):
             "unsharp": (_("强度:"), "1.5"),
             "avgblur": (_("半径:"), "5"),
             "median": (_("半径:"), "3"),
+            "pixelize": (_("块尺寸:"), "16"),
             "eq_bright": (_("亮度:"), "-0.3"),
         }
 
@@ -30551,10 +31845,16 @@ class SimplePreviewer:
         self.copy_marks_btn = ttk.Button(mark_row, text=_("复制时间"), width=8,
                                          command=self._copy_segments_clipboard)
         self.copy_marks_btn.pack(side=tk.LEFT, padx=(4, 0))
+        # 右键 = 只要「当前 seek 光标所在的时间」（不带 -ss/-to）。左键原行为不变。
+        # 2026-10-26 用户：「给简易时间预览这个管道窗口的复制时间右键加个复制当前时间，
+        # 获取的时间格式不需要 -ss 这些，就是当前 seek 光标在的时间就行」。
+        self.copy_marks_btn.bind("<Button-3>", self._popup_copy_time_menu)
         ToolTip(self.copy_marks_btn,
                 _("把所有已标记段落复制成 `-ss 12.345 -to 20.000` 逐行文本到剪贴板。\n"
                 "该格式专供「分段拼接」窗口右栏命令区使用：粘贴后点导入即可逐行解析成片段；"
-                "单个时间点也可随手复制一行当起点/终点回填。"))
+                "单个时间点也可随手复制一行当起点/终点回填。\n\n"
+                "▶ 右键 = 只复制**当前光标所在的时间**（如 `00:02:30.000000`，不带 -ss/-to），\n"
+                "   给「多流同步参考 → 移动光标到」这类只要时间的框用。"))
         self.import_marks_btn = ttk.Button(mark_row, text=_("导入时间"), width=8,
                                            command=self._import_time_dialog)
         self.import_marks_btn.pack(side=tk.LEFT, padx=(4, 0))
@@ -31249,14 +32549,24 @@ class SimplePreviewer:
             pass
 
     def _enable_kf_buttons(self):
+        """关键帧扫描完成 → 启用跳转按钮并把状态行收尾。
+
+        🔴 2026-10-24：旧代码把「写状态行」也放在 `not _audio_mode` 里 ⇒ **音频模式下
+        （含用音频模式打开视频文件）状态行永远停在「正在解析关键帧…」**。按钮在音频
+        模式下本就隐藏，但中间态同样必须收尾；只是文案不再提那两个不可见的按钮。
+        """
         with suppress(Exception):
-            if self._keyframes and not getattr(self, "_audio_mode", False):
-                self.kf_prev_btn.config(state=tk.NORMAL)
-                self.kf_next_btn.config(state=tk.NORMAL)
-                self.status_label.config(
-                    text=_('✓ 已扫描 {0} 个关键帧，可用「上一关键帧/下一关键帧」跳转').format(len(self._keyframes)))
-                self._track_dirty = True   # 波形条关键帧刻度补画（内核波形条）
-                self._draw_track()
+            if not self._keyframes:
+                return
+            if getattr(self, "_audio_mode", False):
+                self.status_label.config(text=_('✓ 已扫描 {0} 个关键帧').format(len(self._keyframes)))
+                return
+            self.kf_prev_btn.config(state=tk.NORMAL)
+            self.kf_next_btn.config(state=tk.NORMAL)
+            self.status_label.config(
+                text=_('✓ 已扫描 {0} 个关键帧，可用「上一关键帧/下一关键帧」跳转').format(len(self._keyframes)))
+            self._track_dirty = True   # 波形条关键帧刻度补画（内核波形条）
+            self._draw_track()
 
     def _goto_prev_keyframe(self):
         self._goto_keyframe(-1)
@@ -31648,6 +32958,50 @@ class SimplePreviewer:
                 text=_('已复制 {0} 段时间到剪贴板（粘到分段拼接右栏导入）').format(len(self._marks)))
         except Exception:
             self.mark_status.config(text=_("复制失败"))
+
+    def _popup_copy_time_menu(self, ev=None):
+        """「复制时间」按钮的右键菜单（2026-10-26）。
+
+        为什么不把左键改掉：左键输出 `-ss/-to` 是「分段拼接」右栏的导入格式，
+        已有调用方依赖；这里只是**多给一个出口**，不动老行为。
+        菜单项把时间值也印在标题里（`复制当前时间（00:02:30.000000）`）——
+        右键即所见即所得，不会复制到「以为是别处」的时间。
+        """
+        txt = _format_preview_time(float(self._current_us) / 1e6)
+        m = tk.Menu(self.win, tearoff=0)
+        m.add_command(label=_('复制当前时间（{0}）').format(txt),
+                      command=self._copy_current_time)
+        try:
+            if ev is not None:
+                m.tk_popup(ev.x_root, ev.y_root)
+            else:
+                m.tk_popup(self.copy_marks_btn.winfo_rootx(),
+                           self.copy_marks_btn.winfo_rooty()
+                           + self.copy_marks_btn.winfo_height())
+        finally:
+            with suppress(Exception):
+                m.grab_release()
+
+    def _copy_current_time(self):
+        """复制当前 seek 光标所在的时间（纯时间，不带 `-ss` / `-to`）。
+
+        2026-10-26 用户：「给简易时间预览这个管道窗口的复制时间右键加个复制当前时间，
+        获取的时间格式不需要 -ss 这些，就是当前 seek 光标在的时间就行」。用途是喂
+        「多流同步参考 → 移动光标到」这类**只要时间**的框 —— 带 `-ss` 前缀还得手删。
+
+        取 `_current_us`（本窗位置真源，与顶部时间标签、播放头、标记全读同一个值），
+        格式也照抄界面读数 `HH:MM:SS.ffffff`：复制出来能和窗口里的数字一一对照，
+        `time_to_seconds` 同样认（`00:02:30.000000` → 150.0）。
+        """
+        sec = float(self._current_us) / 1e6
+        txt = _format_preview_time(sec)
+        try:
+            write_clipboard_safe(self.win, txt)
+            with suppress(Exception):
+                self.status_label.config(text=_('已复制当前时间 {0}').format(txt))
+        except Exception:
+            with suppress(Exception):
+                self.status_label.config(text=_("复制失败"))
 
     def _import_time_dialog(self):
         """「导入时间」弹窗：粘贴 `-ss S -to E` 逐行（「复制时间」/章节「外部时间」同款），
@@ -37779,6 +39133,10 @@ class OverlayPositionFrame(ttk.LabelFrame):
             #   + 包装盒尺寸；合成图里抠像/叠加都已算完 ⇒ chroma 传 None（否则二次抠像）。
             #   生成失败（_gc_png=None）⇒ 逐字节回落旧行为（组内主文件 + 原尺寸 + chroma）。
             content_file=((_gc_png or _sub_f) or None),
+            # 2026-10-28：与普通位置编辑器同口径 —— 子视频自己开了「拼接」⇒ 内容帧也拼，
+            # 否则该航点/该端显示的仍是单张原片（组合成图 `_gc_png/_gc_ppm` 已算完 ⇒ 不预拼）。
+            content_pre_filter=(None if (_gc_png or _gc_ppm or not _chroma_src)
+                                else self.app._tile_pre_filter(_chroma_src)),
             # 🔴 2026-10-17：有内存字节就用字节（**零磁盘**），`content_file` 只作兜底。
             content_ppm=_gc_ppm,
             content_chroma_settings=(None if (_gc_png or _gc_ppm) else _chroma_src),   # 2026-10-11：子视频绿幕接入真实帧（子视频轨 enc_settings）
@@ -42253,7 +43611,6 @@ class FFmpegBatchGUI:
 
     def stop_all_transcodes(self):
         """停止所有转码进程（发送 q 信号，并标记任务为已停止）"""
-        self.stop_flag = True  # 标记全局停止，阻止新任务启动
         with self._proc_lock:
             # 清理已结束的进程和任务映射
             self.running_procs = [p for p in self.running_procs if p.poll() is None]
@@ -42267,6 +43624,12 @@ class FFmpegBatchGUI:
                                    _("将停止 {0} 个正在运行的转码进程，确定吗？").format(
                                        len(self.running_procs))):
             return
+    
+        # ⚠️ 置位必须放在「确实有进程 + 用户已确认」之后（2026-10-27 修）：
+        #    原先写在函数第一行，导致两种假停止 —— ① 没有进程时点一下、② 弹窗点「否」取消，
+        #    都会留下 stop_flag=True 且无人复位，下一次 _submit_next_batch 读到它就不再提交新任务，
+        #    队列静默停掉（日志只打「队列已停止」），与用户操作意图完全相反。
+        self.stop_flag = True  # 标记全局停止，阻止新任务启动
     
         # 标记任务为已停止
         # ⚠️ 循环变量禁用 `_`：本函数内 `_()` 是翻译函数，用 `_` 当循环变量会让
@@ -46562,7 +47925,10 @@ class FFmpegBatchGUI:
             return orig_w, orig_h
         if not w or not h:
             return orig_w, orig_h
-        return max(2, int(w)), max(2, int(h))
+        # 2026-10-28：拼接把成帧放大 列×行 倍（链尾 split 网格）⇒ 主视频「真实帧尺寸」必须含它，
+        # 否则 overlay 定位域、快照适配、位置编辑器画布全部按旧尺寸算（用户实测「拼接了但
+        # 各处仍按原始尺寸」）。画布模式 / pad 画布两档 `tile_grid_of` 自动返回 None。
+        return tiled_frame_size(max(2, int(w)), max(2, int(h)), main_settings)
 
     def _blend_downgrade_pad(self, main_settings, main_file_path) -> Optional[Tuple[int, int]]:
         """blend 降级判定（用户拍板 2026-08-25）：pad 启用且画布任一轴大于主视频
@@ -46603,6 +47969,10 @@ class FFmpegBatchGUI:
                 w, h = 320, 240
         with suppress(Exception):
             w, h = compute_rendered_size(w, h, sub_settings)
+        # 2026-10-28：拼接（链尾 split 网格）是**链的一部分** ⇒ 内容盒 = 每格 × 列行。
+        # 这是 overlay_x/y 的 w/h、blend 区域、spin 对角线的唯一基准；不含它的话成片按
+        # 单格尺寸摆位、画面却是 N 倍宽（位置编辑器里看到的尺寸也和成片对不上）。
+        w, h = tiled_frame_size(w, h, sub_settings)
         return max(2, int(w)), max(2, int(h))
 
     def _overlay_sub_size(self, sub_file, sub_settings):
@@ -48965,6 +50335,11 @@ class FFmpegBatchGUI:
             _frame_w, _frame_h = _pg0[0], _pg0[1]  # pad 画布帧 = pad 尺寸
         else:
             _frame_w, _frame_h = _rend_w, _rend_h
+        # 🔴 2026-10-28（用户实测「管道预览里拼接被当原始尺寸播放 → 上下黑边」）：帧尺寸必须含
+        # 链尾「拼接」。`_rend_*`（链内 scale 的目标）**保持每格尺寸**，只有帧尺寸放大 ——
+        # 下面的 `_pwf` 拿 `_rend_*` 写 `scale_width/height`，若这里连 `_rend_*` 一起乘，
+        # 单格会再乘一次（成片 4 倍大）。画布/pad 两档 `tile_grid_of` 返回 None ⇒ 不动。
+        _frame_w, _frame_h = tiled_frame_size(_frame_w, _frame_h, settings)
         # 工作分辨率上限（_PIPE_WORK_MAX_W，仅 pipe_engine；GPU 路线 mpv/ffplay 全分辨率由硬件跑，
         # 不动）：帧宽 > 上限时把帧整体乘 f，并**改写链内分辨率**为降采样尺寸（精确模式）→ 图里
         # 真实产出即降采样尺寸，下游定位基准同步乘 f → 布局逐像素一致、仅像素变少（图计算量按
@@ -49086,6 +50461,12 @@ class FFmpegBatchGUI:
                 orig_w, orig_h = 1280, 720
         
         final_w, final_h = compute_rendered_size(orig_w, orig_h, settings)
+        # 🔴 2026-10-28（用户实测「管道预览里拼接按原始尺寸播放 → 上下黑边」）：链尾「拼接」
+        # 让链的**真实产出** = 每格 × (列, 行)，而本函数下面所有基准（末端网格/边框的缩放目标、
+        # 屏幕适配 scale、管道预览画面比 `_pipe_base_w/h`）都以 final_w/h 为准 ⇒ 不含拼接时
+        # 预览框按原始比例开，2:1 的图被塞进 16:9 框就是上下黑边。`_eh` 的末端网格仍在其后
+        # 单独乘（两者是叠加关系，不冲突）。
+        final_w, final_h = tiled_frame_size(final_w, final_h, settings)
         
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
@@ -49131,21 +50512,15 @@ class FFmpegBatchGUI:
         _bp_after_split = bool(_eh_p.get("border_after_split", True))
         _split_ok = _sp_on
         _bp_before = bool(_bp) and _split_ok and (not _bp_after_split)
-        # split 仅在实际渲染的路径计入缩放（2026-08-27 实测修正，2026-10-06 随判据恢复分情况）：
-        # - 走复杂图（4b 分支真进：canvas / 文字水印旋转 / 图片水印 / 多级网格 / before 等宽边框）
-        #   → 完整网格渲染，计行列；
-        # - 走普通 -vf 逗号链 → 仅单级网格（rows==1 横排 / cols==1 竖排，split=N,hstack/vstack=inputs=N
-        #   纯逗号链，实测可行）；多级网格需 filter_complex 标签，普通路径放弃；
-        # 不渲染的网格不计入，否则画面被按网格基准过度缩小。
-        # ⚠️ `_eh_need_complex` 与下方 4b 分支的进入条件**必须逐字同口径**，否则
-        #    「以为渲染了却没渲染」/「没渲染却按网格缩小」两类静默错画面。
-        #    2026-10-06 曾把本行简化成 `_sp_on_scale = _sp_on`（配合当时的 `if True:` 恒复杂图），
-        #    判据恢复分情况后必须一起恢复，否则单级网格会按未渲染的基准缩小。
-        _eh_need_complex_scale = _split_ok and ((_psr > 1 and _psc > 1) or _bp_before)
-        _sp_on_scale = _sp_on and (
-            (use_mpv and (wm_active or _tw_rotate)) or _eh_need_complex_scale
-            or _sp_rows == 1 or _sp_cols == 1
-        )
+        # split 是否计入缩放（2026-08-27 实测修正，2026-10-06 随判据恢复分情况，
+        # 2026-10-28 收敛为恒真）：
+        # 🔴 普通 -vf 现在能渲染**全部** 1..5 网格（多行多列 = 单段 xstack，见 5b 段），
+        #    「多级网格必须复杂图」这条限制已不存在 ⇒ 只要 `_split_ok`（= 链里真要拼），
+        #    输出就真是 cols× / rows× ⇒ 缩放必须按行列计。
+        #    旧写法 `_eh_need_complex_scale or (_sp_rows==1 or _sp_cols==1)` 把 2×2 排除在外，
+        #    是「普通链渲染不了多级网格」时代的分支；留着会让 2×2 按 1 倍宽算（该缩不缩，
+        #    超屏时画面被硬挤/被裁，正是「判据分裂」的另一副面孔）。
+        _sp_on_scale = _sp_on
         # before 模式（间隙模型）：外围只加一次 + 格间 (cols-1) 条缝隙，≠ 旧口径的「每格都 +四边距」
         _bp_before_scale = (_sp_on_scale and (_sc_w > 0 or _sc_h > 0)
                             and not bool(_eh_scale.get("border_after_split", True)))
@@ -49232,11 +50607,18 @@ class FFmpegBatchGUI:
         #   「命令形状即索引」：扫一眼 -vf / 复杂图就知道链断在哪一段。恒真等于把索引抹掉。
         # ⚠️ 本判据只用「逗号链能否表达」判，不用「mpv 是否可用」判（ffplay 的 -vf 即完整
         #   filtergraph，ffplay 也能渲染复杂图，见 research/ffplay-preview 实证）。
-        # ⚠️ _sp_on_scale（第 4 步）必须与本判据同口径：只有本判据真走复杂图渲染网格时，
-        #   多级网格才计入缩放基准，否则画面被按网格尺寸过度缩小。
-        # 末端网格的复杂图/逗号链两套实现在下方 5b 段分派（_split_ok or _bp → 内部分支），
-        # 本判据只决定「进入 4b 复杂图段」还是「进入 5 普通路径段」。
-        _eh_need_complex = _split_ok and ((_psr > 1 and _psc > 1) or _bp_before)
+        # ⚠️ _sp_on_scale（第 4 步）现在恒等于 _sp_on（普通链能渲染全部 1..5 网格），
+        #   本判据只管「走哪条渲染路径」，不再影响缩放口径。
+        # 🔴 2026-10-28（用户：单链 + 画中画开放拼接后复验）：判据从「多行多列 or 网格前边框」
+        #   放宽成「网格前边框 or 格数>5」—— 2×2 这类现在就是**单段 xstack 逗号链**，
+        #   普通 -vf 完全能跑，判成「必须复杂图」既白走重的路径，又在普通路径打
+        #   「多行网格不支持」的反向提示（用户实测该提示说反了：2×2 走 --vf=lavfi 正常出网格）。
+        #   末端语境格数上限就是 5（对话框拦 + 生成侧 `split_on=False` 兜底），所以这里
+        #   `> 5` 实际只为「视频滤镜页 / 画中画 25 格」留口径，末端现状恒走普通链。
+        #   仍必须走复杂图的只剩两类：`_bp_before`（间隙模型边框 = split 后逐格非对称 pad，
+        #   逗号链表达不了）与格数 >5（末端约束，视频滤镜页不受此限，那边 max_tiles=25）。
+        #   改这里必须同步改下方 5b 段 `_bp_split_simple = _split_ok and not _eh_need_complex`。
+        _eh_need_complex = _split_ok and (_bp_before or (_psr * _psc) > 5)
         if (bool(settings.get("canvas_mode")) and bool(settings.get("canvas_segments"))) \
                 or _tw_rotate or wm_active or _eh_need_complex:
             # ================= 复杂图（mpv --lavfi-complex / ffplay -vf 共用，[VIN]/[VOUT] 占位） =================
@@ -49358,7 +50740,13 @@ class FFmpegBatchGUI:
                     reverse=False,
                     chroma_settings=adapted_wm2 if adapted_wm2.get("chroma_enabled", False) else None,
                     loop_size=_loop_size,
-                    force_scale=None if _wm_cv_on else (wm_w2, wm_h2),  # 画布模式交给第 2 段缩放
+                    # 🔴 2026-10-28（用户实测「ffplay/mpv、管道预览里 2×2 被算了两次」）：
+                    #   `force_scale` 落在链内**缩放位**，而「拼接」段在**链尾** ⇒ 这里必须是
+                    #   **每格**尺寸。`wm_w2/wm_h2` 是 `_overlay_content_size` 的**成帧**尺寸
+                    #   （已含 N 倍）⇒ 直接给会「先放大到 N 倍、再拼一次」= N² 倍，画面里的
+                    #   水印比成片大一整圈。成片/效果预览不走本参数 ⇒ 只有预览错。
+                    force_scale=(None if _wm_cv_on
+                                 else untiled_frame_size(wm_w2, wm_h2, adapted_wm2)),
                 )
                 if _sub_base and _sub_base != "null":
                     sub_vf_parts = [_sub_base]
@@ -49948,10 +51336,9 @@ class FFmpegBatchGUI:
                 self._append_info_ui(_("[预览] 画布模式段数据无效，已忽略画布预览"))
 
         # ----- 5b. 末端处理预览接入（2026-08-27）：split 网格 + 边框 pad，链尾最外层 ----
-        # ⚠️ 2026-08-27 实测修正：mpv 的 --vf=lavfi=[...] 不认 [0:v] 前缀、不支持分号多段图
-        # （报 "Trailing garbage after a filter" / "not connected to any source"）→ 普通 -vf 路径
-        # 不能用 [0:v] 包装/分号段：边框用逗号链末尾追加；split 仅 ffplay（-vf 分号图可用，
-        # 第一段无前缀自动接输入）与 lavfi 复杂图（--lavfi-complex=[VOUT] 占位）支持。
+        # ⚠️ 2026-08-27 实测修正（**仅对边框档成立**）：mpv 的 --vf=lavfi=[...] 不认 [0:v] 前缀、
+        # 不支持分号多段图（报 "Trailing garbage after a filter" / "not connected to any source"）
+        # → 普通 -vf 路径不能用 [0:v] 包装/分号段。无边框的网格是**单段纯逗号链**，不受此限。
         # （_eh_p / _bp / _psr / _psc / _split_ok / _bp_after_split / _bp_before 已在第 4 步缩放前
         #  统一算好 —— 复杂图进入条件要用，这里直接复用，避免两处口径不一致。2026-10-06）
         if _split_ok or _bp:
@@ -49985,26 +51372,32 @@ class FFmpegBatchGUI:
                         lavfi_complex_str = lavfi_complex_str.replace("[VOUT]", f",{_bp}[VOUT]")
             else:
                 # 普通 -vf（mpv --vf=lavfi=[...] / ffplay -vf）：纯逗号链。
-                # ⚠️ 2026-08-27 用户实测 + 复验：ffmpeg 链式隐式连接——split=N 的 N 个输出按序接
-                # hstack/vstack 的 N 个输入（无需标签），`...,split=N,hstack=inputs=N,pad=...` 在
-                # ffplay -vf 与 mpv --vf=lavfi 均可用（T1/T5 实测）→ 单级网格（rows==1 横排 /
-                # cols==1 竖排，N=2..5）直接逗号链；多级网格（rows>1 且 cols>1）需 filter_complex
-                # 标签，普通路径放弃并提示（复杂预览/实时预览完整支持）。
+                # ⚠️ 2026-08-27 用户实测 + 复验：ffmpeg 链式隐式连接 —— split=N 的 N 个输出按序接
+                # 下游 N 输入滤镜（无需标签），`...,split=N,hstack=inputs=N,pad=...` 在 ffplay -vf
+                # 与 mpv --vf=lavfi 均可用（T1/T5 实测）→ 1 行/1 列直接 hstack/vstack。
                 #
-                # 📌 2026-10-06：本块自判据恢复分情况后**只处理单级网格 + after 边框**。
-                #    下方 `_bp_before` 降级段（「先统一 pad 一圈再切网格」⇒ 格间 = 外围 2 倍）已
-                #    **恒不可达**：新判据 `_eh_need_complex` 把 `_bp_before` 全部导向复杂图，
-                #    与成片间隙模型一致（预览与成片同口径）。保留仅作历史参照，勿改。
-                _bp_split_simple = _split_ok and (_psr == 1 or _psc == 1)
+                # 📌 2026-10-06：`_bp_before` 降级段（「先统一 pad 一圈再切网格」⇒ 格间 = 外围 2 倍）
+                #    已恒不可达：`_eh_need_complex` 把 `_bp_before` 全部导向复杂图，与成片间隙模型
+                #    一致（预览与成片同口径）。保留仅作历史参照，勿改。
+                # 🔴 2026-10-28（②「2×2 也走普通链」）：判据对上方 `_eh_need_complex` **直接取反**
+                #    —— 禁各写一遍，否则「以为走了复杂图 / 其实走了普通链」两类静默错画面。
+                #    普通 -vf 现在能渲染**全部 1..5 网格**（1 行/1 列 = hstack/vstack，多行多列 =
+                #    单段 xstack，都是纯逗号链、零标签，mpv --vf=lavfi 与 ffplay -vf 实测均可）；
+                #    只有「间隙模型边框（split 后逐格非对称 pad ⇒ 必须多段 + 标签）」和
+                #    「格数 >5」才非走复杂图不可。故本分支到达时 `_bp_split_simple` 恒真，
+                #    下面的「不支持」提示只是防漂移的断言式兜底（真触发 = 判据又分裂了）。
+                _bp_split_simple = _split_ok and not _eh_need_complex
                 if _split_ok and not _bp_split_simple:
                     self._append_info_ui(
-                        _("[预览] 多行网格（split 行×列）在普通预览不支持（需 filter_complex），"
-                        "复杂预览/实时预览可用"))
+                        _("[预览] 内部判据不一致：拼接既没走复杂图、也不在普通链支持范围"
+                        "（请报 bug，画面可能不拼）"))
                 _tail_comma = []
                 if _bp_split_simple:
-                    _n = _psr * _psc
-                    _seg_split = (f"split={_n},hstack=inputs={_n}" if _psr == 1
-                                  else f"split={_n},vstack=inputs={_n}")
+                    # ⛔ 禁手写：此前这里逐字手抄生成器的单级分支（`split=N,hstack=inputs=N`），
+                    #   形态碰巧一致，但生成器一改（单级也发 xstack / 加 format / 改 clamp 口径）
+                    #   预览与成片就**静默分裂**，且只在「末端 + 普通预览」这个组合露头。
+                    #   现统一由生成器出，输出逐字相同（`_verify_end_split_compact` 锁）。
+                    _seg_split = build_end_split_filters(_psr, _psc, "", "")
                     if _bp_before:
                         # ⚠️ 旧口径降级：普通 -vf 是纯逗号链，表达不了「split 之后逐格分别 pad」——
                         # split 的 N 个输出在逗号链里无法各自接不同的 pad（实测 ffmpeg 报
@@ -52150,6 +53543,19 @@ class FFmpegBatchGUI:
         except Exception:
             return None
 
+    def _tile_pre_filter(self, settings):
+        """「拼接」的取帧预处理片段（给位置编辑器取**素材真实画面**用）；无拼接 → None。
+
+        与 `_main_bg_pre_filter` 同一手法：编辑器取的是**原始素材帧**，成片的画面却是
+        链尾 split 网格 ⇒ 不加这一段，框内内容永远是单张原始视频（用户 2026-10-28 报障）。
+        判据/生成器与链内完全同一份（`tile_grid_of` + `build_end_split_filters`）。
+        """
+        _g = tile_grid_of(settings or {})
+        if not _g:
+            return None
+        return build_end_split_filters(_g[0], _g[1], in_label="", out_label="",
+                                       max_tiles=TILE_MAX_TILES)
+
     def _get_canvas_size(self, main_track):
         """
         获取主视频最终画布尺寸（考虑 pad 或 裁剪/旋转/缩放后的实际尺寸）。
@@ -52172,7 +53578,11 @@ class FFmpegBatchGUI:
             w, h = 1280, 720  # 降级默认值
     
         # 使用新函数按 crop -> rotate -> scale 顺序计算
-        return self.compute_final_size_with_order(w, h, main_track.enc_settings)
+        # 2026-10-28：末尾再接「拼接」放大 —— 链尾 split 网格让成帧变成 列×行 倍，
+        # 画布（位置编辑器的窗口）必须同尺寸，否则背景帧被拉伸、子视频落位基准也错。
+        # `tiled_frame_size` 与链内插桩共用 `tile_grid_of` 判据，画布/pad 两档自动不生效。
+        _rw, _rh = self.compute_final_size_with_order(w, h, main_track.enc_settings)
+        return tiled_frame_size(_rw, _rh, main_track.enc_settings)
     
     def _get_video_render_size(self, track, filt_frame=None):
         """
@@ -52180,16 +53590,7 @@ class FFmpegBatchGUI:
         若提供了 filt_frame，则从该控件读取设置，否则从 track.enc_settings 读取。
         """
         if filt_frame is not None:
-            settings = {
-                "crop_enabled": filt_frame.crop_enabled.get(),
-                "crop_width": filt_frame.crop_width.get(),
-                "crop_height": filt_frame.crop_height.get(),
-                "scale_enabled": filt_frame.scale_enabled.get(),
-                "scale_method": filt_frame.scale_method.get(),
-                "scale_width": filt_frame.scale_width.get(),
-                "scale_height": filt_frame.scale_height.get(),
-                "rotate": filt_frame.rotate.get()
-            }
+            settings = material_size_settings(track, filt_frame)
         else:
             settings = track.enc_settings
     
@@ -52199,7 +53600,10 @@ class FFmpegBatchGUI:
             return 320, 240  # 返回安全默认值
     
         # 使用统一顺序计算（crop -> rotate -> scale）
-        return self.compute_final_size_with_order(w, h, settings)
+        # 2026-10-28：末尾接「拼接」放大（成片真实帧 = 每格 × 列行）。这是**素材真实成帧尺寸**，
+        # 位置编辑器的内容盒 / 缩放倍率基准 / 平铺布局都读它 ⇒ 必须与成片同尺寸。
+        _rw, _rh = self.compute_final_size_with_order(w, h, settings)
+        return tiled_frame_size(_rw, _rh, settings)
     
     def _to_canvas_coords(self, x, y, scale, scale_y=None):
         # scale_y：SAR 拉伸预览时 y 轴独立因子（2026-09-07）；None=与 x 同（正常文件不变）
@@ -52365,6 +53769,9 @@ class FFmpegBatchGUI:
                                 rect_x, rect_y, rect_w, rect_h,
                                 on_apply, title=None,
                                 aspect_ratio=None, bg_draw_func=None,
+                            bg_draw_below_content=False,  # 2026-10-24：文字水印兄弟条应压在当前条真实帧之下
+                                                       # （默认 False=旧行为：其他子视频虚线框高于当前内容帧）
+                                                       # True=bg_draw 叠加层降到 content_img 之下，当前条始终在最前
                                 allow_resize=True,
                                 show_canvas_controls=False,
                                 coord_mode='top_left',
@@ -52473,6 +53880,19 @@ class FFmpegBatchGUI:
                                                      #   临时文件），直接把字节喂给后续 ffmpeg 管道。
                                                      #   与 `content_file` 二选一：**本参数优先**；都不给 = 旧
                                                      #   行为（虚线框）。静态快捷键退出同理。
+                                bg_time_ref=None,    # 2026-10-24：背景帧时刻的「输出口」（1 元素 list，如 [0.0]）。
+                                                     #   非 None 时：每次重画叠加层前把当前 bg_cur_time 写进
+                                                     #   bg_time_ref[0]，供 bg_draw_func 按时刻判显隐（文字水印
+                                                     #   兄弟条「只看此刻」）。None=旧调用方逐字节不变。
+                                sib_filter_var=None,  # 2026-10-24：「只看此刻」开关（条件调用）。
+                                                     #   传 BooleanVar 才在「真实帧」右边创建勾选框；勾选/取消
+                                                     #   即时重画叠加层（不重取背景帧）。None=不创建。
+                                content_pre_filter=None,  # 2026-10-28：内容帧取帧前的预处理滤镜串。
+                                                     #   唯一用途 = 素材自己的「拼接」（链尾 split 网格）：
+                                                     #   `content_file` 抽的是**原始单帧**，成片却是 N 倍网格
+                                                     #   ⇒ 不预拼，框内永远是单张原始视频、且被拉伸。
+                                                     #   片段由调用方经 `app._tile_pre_filter(enc_settings)`
+                                                     #   生成（与链内同一判据/同一生成器）。None=旧行为。
         ):
         """
         通用叠加/偏移可视化编辑器（核心重构函数）
@@ -52721,13 +54141,31 @@ class FFmpegBatchGUI:
                 _cy = str(_cs.get("crop_top", "0") or "0").strip()
                 if _cw and _ch:
                     _content_crop_f = f"crop={_cw}:{_ch}:{_cx}:{_cy}"
-        # 合成链前置滤镜（在 scale 之前）：crop → chroma → format=rgba。
-        # ⚠️ 子视频无裁剪/无绿幕时 _cf 为空，行为与修复前完全一致（不回归）。
+        # 🔴 2026-10-28（用户报障：裁剪保存后重开位置编辑器 → 尺寸是拼接后的、画面却是
+        #   「一张大的单裁剪画面」）：裁剪必须与「拼接」在**取帧前置**里按 crop → tile
+        #   的顺序一次做完，绝不能拆成两段 ——
+        #     · 链内（成片）：crop 在**链首**、split 网格在**链尾** ⇒ 裁的是每格；
+        #     · 编辑器取帧：若 crop 留给下面 `_cf` 在 `_raw` 上做，那时 `_raw` 已被 tile
+        #       拼成 N 倍网格 ⇒ crop 从网格左上角裁掉「一格大小」，看到的就是大图里的一小块，
+        #       而外侧尺寸仍按 N 倍算 ⇒ **尺寸对、画面错**（用户看到的现象）。
+        #   `content_pre_filter` 是调用方给的「素材自身拼接片段」（`_tile_pre_filter`）；
+        #   合并后交给 `_extract_frame_scaled(pre_vf=…)`，它拼在 `-vf` 最前面 ⇒ 拿到的是
+        #   「先裁、后拼」的正确画面，`_raw` 从此**已经是**成片里那一格该有的样子。
+        #   ⚠️ `content_ppm`（组盒合成图 / 全内存帧）路径不经过 pre_vf，调用方此时两个参数
+        #     都传 None ⇒ 这里恒为空，行为不变。
+        _content_pre_f = ",".join(
+            [x for x in (_content_crop_f, content_pre_filter) if x]) or None
+        # 合成链前置滤镜：作用在**已预处理**的 `_raw` 上 ⇒ 只剩 chroma → format=rgba。
+        # ⚠️ 子视频无绿幕时 _cf 为空，行为与修复前完全一致（不回归）。
         _cf = ""
-        if _content_crop_f:
-            _cf += _content_crop_f + ","
         if _content_chroma_f:
             _cf += _content_chroma_f + ",format=rgba,"
+        # 「不透明降级腿」专用前置串：`content_alpha=False` 时下面**不走 `_raw`**，
+        # 而是 `-ss` 重新解源文件 ⇒ 拿不到 `_content_pre_f`，crop 仍要在链首补回来。
+        # ⚠️ 拼接不适用：`build_end_split_filters`（无边框档）是无标签的 `;` 多段子图，
+        #    塞不进 `[0:v]…` 逗号链；且该腿只在「既无内容文件也无内存帧」时才可能命中，
+        #    那种情况 `_raw` 恒为 None、早在取帧段就 return 了。
+        _cf_src = (_content_crop_f + "," if _content_crop_f else "") + _cf
         # 2026-10-05：背景帧 → PNG 文件的缓存 [path, stamp]。键 = id(bg_img_obj)。
         # ⚠️ 为什么要把 Tk 图倒出来给 ffmpeg 当底图：Tk 的 canvas **不会**把带 alpha 的
         #   image item 的透明区与下层 item 混合（透明区直接露 canvas 底色 = 黑），
@@ -52771,7 +54209,13 @@ class FFmpegBatchGUI:
                 return bytes(content_ppm)
             if not content_file:
                 return None
-            _w, _h, _d = _extract_frame_scaled(app.ffmpeg_cmd, content_file, frame_sec=t)
+            # 2026-10-28：`pre_vf` 让内容帧带上素材自己的「裁剪 + 拼接」（原始单帧 →
+            #   先裁 → 再拼网格），顺序与成片链一致（crop 链首 / split 链尾）。
+            #   ⚠️ 用合并后的 `_content_pre_f`，**不要**退回裸 `content_pre_filter`：
+            #   那样 crop 会重新落到下游 `_cf` 上、作用在已拼好的 N 倍网格上。
+            #   缓存键含 pre_vf（`_frame_cache_key`），不会和别处的原始帧互相命中。
+            _w, _h, _d = _extract_frame_scaled(app.ffmpeg_cmd, content_file, frame_sec=t,
+                                               pre_vf=_content_pre_f)
             return _d or None
 
         def _prefetch_other_end(key, t):
@@ -52816,10 +54260,15 @@ class FFmpegBatchGUI:
             return int(round((cx - PAD) / scale_x)), int(round((cy - PAD) / scale_y))
 
         # ---- 主视频背景帧（可选）：后台线程取帧，主线程绘制，置于最底层 ----
-        def _draw_bg_frame():
+        def _draw_bg_frame(report_status=False):
             """（可选）提取主视频当前帧作为画布背景。pad 时按 main_offset 摆放主视频
             内容，超出画布的部分保持黑色（画布 bg=black）。未配置/失败则保持纯黑旧行为。
-            后台线程取帧（与裁剪编辑器同套），主线程 via after(0) 绘制，绝不阻塞 GUI。"""
+            后台线程取帧（与裁剪编辑器同套），主线程 via after(0) 绘制，绝不阻塞 GUI。
+
+            report_status=True（仅「重新获取帧」按钮那一路）⇒ 完成时把状态行的中间态
+            「⏳ 正在提取 …」收尾成终态。开窗时那次自动取帧**不写**：状态行里是
+            「红色矩形可拖拽移动。」这类用法提示，不该被一行进度回报顶掉
+            （与波形面板「首次生成不覆盖说明文字」同一口径）。"""
             if not bg_file or not os.path.exists(bg_file):
                 return
             nonlocal bg_img_obj, bg_img_id, bg_loading_id, bg_cur_time
@@ -52880,9 +54329,15 @@ class FFmpegBatchGUI:
                     with suppress(Exception):
                         bg_refresh_btn.config(state=tk.NORMAL, text=_("重新获取帧"))
                     # 取帧时刻超出时长 → 已回退到开头：明确告知，免得用户以为画面不对
-                    if _fallback_note[0]:
+                    # 🔴 2026-10-24（用户报「画面已换、提取完毕，提示还停在下面」）：
+                    # 「⏳ 正在提取…」是**中间态**，成功路径必须收尾成终态 —— 旧代码只在
+                    # 回退时才写 status，正常成功就永远停在那句「正在提取」。口径照裁剪编辑器
+                    # （`✅ 已更新画面 (时间: x.xxs)`）：既确认完成，也回报实际时刻。
+                    # `report_status` 只为「重新获取帧」那一路置位（开窗首帧不顶掉用法提示）。
+                    if report_status:
                         with suppress(Exception):
-                            status_var.set(_("背景帧") + _fallback_note[0])
+                            status_var.set(_('✅ 背景帧已更新 ({0:.2f}s)').format(bg_cur_time)
+                                           + _fallback_note[0])
                 except Exception as _e:
                     _on_fail(_('绘制失败: {0}').format(_e))
 
@@ -53145,6 +54600,26 @@ class FFmpegBatchGUI:
                 return float(rot_slider["var"].get() or 0.0)
             return 0.0
 
+        def _content_covers_canvas():
+            """当前内容帧是不是「铺满整块画布的不透明合成图」（角度≠0 或开了绿幕）。
+
+            与 `_do_render_content` / `_set_rect_live` 的轻量-合成判据同源：
+            `content_rgba` 的旋转分支、`content_alpha` 的旋转/绿幕分支产出的都是
+            整画布合成图（末级 format=rgb → 管道 -c:v ppm，PPM 无 alpha），
+            位置已固化进像素、且整块不透明。
+            """
+            return bool(content_alpha and (abs(current_angle) >= 0.5 or _content_chroma_f))
+
+        def _bg_draw_anchor():
+            """bg_draw（其它条目/文字水印兄弟条）该压到谁之下 —— 每次现算，不缓存。
+
+            规则本体在模块级 `_bg_draw_lower_target`（含「为什么合成图要反过来」的长注释），
+            这里只负责把「此刻是否铺满画布的合成图」喂进去。
+            2026-10-24 用户实测：旋转≠0 时一松手兄弟条全消失（旋转过程中抓手显示时还在）
+            —— 就是被那张整画布不透明合成图压住了。
+            """
+            return _bg_draw_lower_target(bg_draw_below_content, _content_covers_canvas())
+
         def _restack_bg():
             """把其他子视频虚线框（bg_draw）抬到黑色底衬 / 背景帧 / 内容合成图之上、活动矩形之下。
 
@@ -53157,7 +54632,10 @@ class FFmpegBatchGUI:
             with suppress(Exception):
                 canvas.tag_raise("bg_draw")  # 先抬到最顶
             with suppress(Exception):
-                canvas.tag_lower("bg_draw", "rect")  # 再压到活动矩形之下（仍高于黑层）
+                # 默认压到活动矩形之下；文字水印模式(bg_draw_below_content)下再压到当前条
+                # 真实帧 content_img 之下，使当前编辑条始终在最前、兄弟条作参考垫底。
+                # 2026-10-24：合成图（角度≠0/绿幕）时改压到 rect 之下，见 _bg_draw_anchor。
+                canvas.tag_lower("bg_draw", _bg_draw_anchor())
 
         def _invoke_bg_draw():
             """初次绘制 bg_draw_func 的叠加层（其他子视频虚线框）。
@@ -53169,9 +54647,14 @@ class FFmpegBatchGUI:
             """
             if bg_draw_func is None:
                 return
+            # 2026-10-24：把「当前帧时刻」交给 bg_draw_func（文字水印兄弟条「只看此刻」用它
+            # 判各条目时段）。放在唯一的绘制入口 ⇒ 任何触发重画的地方都拿到最新时刻，不会漏写。
+            if bg_time_ref is not None:
+                bg_time_ref[0] = bg_cur_time
             try:
                 _before = set(canvas.find_all())
                 bg_draw_func(canvas, scale_x, scale_y)
+                _anchor = _bg_draw_anchor()
                 for _i in canvas.find_all():
                     if _i in _before:
                         continue
@@ -53180,7 +54663,7 @@ class FFmpegBatchGUI:
                     with suppress(Exception):
                         canvas.addtag_withtag("bg_draw", _i)
                     with suppress(Exception):
-                        canvas.tag_lower(_i, "rect")
+                        canvas.tag_lower(_i, _anchor)
             except Exception:
                 pass
 
@@ -53199,13 +54682,14 @@ class FFmpegBatchGUI:
                 _before = set(canvas.find_all())
                 bg_live_draw_func(canvas, scale_x, scale_y,
                                   (current_x, current_y, current_w, current_h, _cur_rot_val()))
+                _anchor = _bg_draw_anchor()
                 for _i in canvas.find_all():
                     if _i in _before:
                         continue
                     with suppress(Exception):
                         canvas.move(_i, PAD, PAD)
                     with suppress(Exception):
-                        canvas.tag_lower(_i, "rect")
+                        canvas.tag_lower(_i, _anchor)
             except Exception:
                 pass
 
@@ -53358,6 +54842,7 @@ class FFmpegBatchGUI:
                         with suppress(Exception):
                             bg_time_var.set(f"{_nt:.2f}")   # 时间输入框同步
                         _draw_bg_frame()                    # 背景帧按新时刻重取
+                        _invoke_bg_draw()                   # 叠加层按新时刻重判显隐（兄弟条「只看此刻」）
             if se_var is not None:
                 with suppress(Exception):
                     se_var.set(which)
@@ -53606,11 +55091,12 @@ class FFmpegBatchGUI:
                         _ct = _content_rot_cache.get(_geom_key)
                         if _ct is None:
                             # 仅进编辑器/切端/改尺寸时跑一次：缩放内容到 box 显示尺寸（不旋转）。
-                            # 2026-10-14：角度=0（无绿幕）小图也接子视频裁剪（Bug2）——crop 在
-                            # scale 之前，作用于原生整帧 ⇒ 显示「裁剪局部放大」（无裁剪时
-                            # _content_crop_f 为空，行为不变）。
-                            _crop_pre = (_content_crop_f + ",") if _content_crop_f else ""
-                            graph = f"[0:v]{_crop_pre}scale={_disp_cw}:{_disp_ch}:eval=frame[src]"
+                            # 2026-10-14：角度=0（无绿幕）小图也接子视频裁剪（Bug2）。
+                            # 🔴 2026-10-28：裁剪与拼接现在都在取帧前置 `_content_pre_f` 里
+                            #   一次做完（crop → tile），`_raw` 已是「该显示的那一格」⇒ 这里
+                            #   只做纯缩放。**不要再往这里加 crop**：`_raw` 是 N 倍网格，
+                            #   在此裁剪等于从网格左上角挖一块（用户报障的现象）。
+                            graph = f"[0:v]scale={_disp_cw}:{_disp_ch}:eval=frame[src]"
                             _cmd = [app.ffmpeg_cmd, "-f", "image2pipe", "-c:v", "ppm", "-i", "pipe:0",
                                     "-filter_complex", graph, "-map", "[src]",
                                     "-frames:v", "1", "-f", "image2pipe", "-c:v", "ppm", "pipe:1"]
@@ -53750,9 +55236,12 @@ class FFmpegBatchGUI:
                     _restack_ghost()
                     return
                 else:
+                    # ⚠️ 这条腿 = 「不透明降级」：没有内存帧可用，只能 `-ss` 重新解源文件。
+                    #    它拿不到 `_content_pre_f`（拼接片段是 `;` 多段子图，塞不进 `[0:v]`
+                    #    逗号链）⇒ 用 `_cf_src` 至少保住 crop，画面不会被拉伸成整帧。
                     graph = (
                         f"color=c=black:s={canvas_w}x{canvas_h}[bg];"
-                        f"[0:v]{_cf}scale=w='2*round({content_src_w}*{sc}/2)'"
+                        f"[0:v]{_cf_src}scale=w='2*round({content_src_w}*{sc}/2)'"
                         f":h='2*round({content_src_h}*{sc}/2)':eval=frame[src];"
                         f"[src]rotate=angle='{current_angle}*PI/180'"
                         f":ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=black@0[rot];"
@@ -54374,7 +55863,12 @@ class FFmpegBatchGUI:
                 bg_cur_time = max(0.0, float(_sec))
                 bg_refresh_btn.config(state=tk.DISABLED, text=_("提取中…"))
                 status_var.set(_('⏳ 正在提取 {0:.2f}s 画面…').format(bg_cur_time))
-                _draw_bg_frame()
+                # report_status=True：本次是用户主动触发 ⇒ 完成/失败后把上面这句中间态
+                # 收尾成终态（开窗首帧那次不写，免得顶掉「拖拽移动」这类用法提示）。
+                _draw_bg_frame(report_status=True)
+                # 2026-10-24：叠加层（兄弟条）也要按新时刻重判显隐 —— 否则「只看此刻」勾上后
+                # 改了帧时间，画面换了但兄弟条还是上一时刻的那批。
+                _invoke_bg_draw()
             bg_refresh_btn = ttk.Button(bg_ctrl, text=_("重新获取帧"), command=_on_bg_refresh)
             bg_refresh_btn.pack(side=tk.LEFT, padx=4)
 
@@ -54441,6 +55935,24 @@ class FFmpegBatchGUI:
                     "· 勾选=框内显示真实内容（子视频=该时刻真实画面；文字水印=真实文字）。\n"
                     "· 取消=回退红蓝虚拟框（矩形内填斜纹），省掉 ffmpeg 开销、拖动无闪烁。\n"
                     "全局默认值在「更多设置 → 预览窗口 → 位置编辑器显示框内真实帧」。"),
+                    wraplength=320)
+
+        # ---- 「只看此刻」过滤开关（2026-10-24，条件调用：仅文字水印兄弟条）----
+        # 为什么是开关而不是默认过滤：创作时两种需求来回切换 —— 有时要跨时段看别的条目
+        # 作参考（对齐/避重叠），有时又要排除时段外的干扰。默认不勾 = 全画（旧行为）。
+        # 勾选后按**当前帧时刻**（帧时间框那个 t）判各条目 enable 时段，与导出侧同语义。
+        if sib_filter_var is not None:
+            _sib_f_cb = ttk.Checkbutton(_free_frame, text=_("只看此刻"),
+                                        variable=sib_filter_var,
+                                        command=_invoke_bg_draw)
+            _sib_f_cb.pack(side=tk.LEFT, padx=(10, 0))
+            ToolTip(_sib_f_cb,
+                    _("只画「当前帧时刻」正在显示的其它条目（勾选=排除时段外干扰）。\n"
+                    "· 取消（默认）：全部画出，便于跨时段对齐、避重叠、看配色。\n"
+                    "· 勾选：按各条目自己的「显示时段/循环」判断，此刻不在时段的隐藏。\n"
+                    "判定时刻 = 上方「帧时间(秒)」；改时间并重新获取帧后立即生效。\n"
+                    "判据与导出成片一致（循环条目在间隔期也算不可见）。\n"
+                    "本窗口没有主视频背景帧时，时刻恒为 0 秒。"),
                     wraplength=320)
 
         if extra_info:
@@ -55354,9 +56866,9 @@ class FFmpegBatchGUI:
                 tap_label=self._merge_group_row_label(_gid, _mems), out_png=_out,
                 scene="group_box")
             # C1-f2（2026-10-20）：执行机器统一到 `run_frame_capture`（旧写法无 timeout）。
-            # ⚠️ 本条是**落盘**模式：stdout 本来就是空的 ⇒ status 恒为 "empty"，
-            #    判据必须看 rc（与旧代码 `returncode == 0` 等价），不能用 `cap.ok`。
-            cap = run_frame_capture(_cmd, stderr_mode="devnull")
+            # ⚠️ 本条是**落盘**模式：stdout 本来就是空的 ⇒ `expect_stdout=False`
+            #    （不报 "empty"，rc=0 即 "ok"），产物照样查文件。
+            cap = run_frame_capture(_cmd, stderr_mode="devnull", expect_stdout=False)
             if cap.rc == 0 and os.path.exists(_png):
                 return _png
         except Exception:
@@ -55570,18 +57082,33 @@ class FFmpegBatchGUI:
                 ov_x_var.set(str(new_x))
             if ov_y_var is not None:
                 ov_y_var.set(str(new_y))
+            # 🔴 2026-10-28（用户实测「位置编辑器保存一次、尺寸就再拼一次 ⇒ 无限递增」）：
+            #   编辑器里的矩形是**成帧尺寸**（含链尾拼接的 N 倍），而 `scale_*` 是**链内**
+            #   的目标（每格）⇒ 必须折回每格再写。原样写 ⇒ 640 → (640×2) → (1280×2) …
+            # ⚠️ 判据必须与「读」同源：本窗口是从滤镜窗里打开的，`enc_settings` 还是上次
+            #   保存的旧值（拼接控件是实时值）⇒ 直接用 `enc_settings` 会折不动、等于没修。
+            #   `material_size_settings` = `_get_video_render_size` 用的同一份合成设置。
+            _sc_w, _sc_h = untiled_frame_size(
+                new_w, new_h,
+                (material_size_settings(track, filt_frame)
+                 if filt_frame is not None else track.enc_settings))
             track.enc_settings["scale_enabled"] = True
-            track.enc_settings["scale_width"] = str(new_w)
-            track.enc_settings["scale_height"] = str(new_h)
+            track.enc_settings["scale_width"] = str(_sc_w)
+            track.enc_settings["scale_height"] = str(_sc_h)
             track.enc_settings["scale_method"] = "exact"
             if filt_frame is not None:
                 filt_frame.scale_enabled.set(True)
                 filt_frame.scale_method.set("exact")
-                filt_frame.scale_width.set(str(new_w))
-                filt_frame.scale_height.set(str(new_h))
+                filt_frame.scale_width.set(str(_sc_w))
+                filt_frame.scale_height.set(str(_sc_h))
             track.overlay_enabled = True
             self.merge_refresh_ui()
-            self._append_info_ui(f"[可视化-从] 已保存位置: ({new_x}, {new_y}) 大小: {new_w}x{new_h}")
+            self._append_info_ui(
+                _("[可视化-从] 已保存位置: ({0}, {1}) 大小: {2}x{3}").format(
+                    new_x, new_y, new_w, new_h)
+                + (_("（拼接每格 {0}x{1}）").format(_sc_w, _sc_h)
+                   if (_sc_w, _sc_h) != (int(round(float(new_w))),
+                                         int(round(float(new_h)))) else ""))
 
         def apply_angle(new_angle):
             """编辑器「应用」时写回旋转角度。
@@ -55731,6 +57258,9 @@ class FFmpegBatchGUI:
             #   content_src 同步用**盒尺寸**；合成图里抠像/叠加都已算完 ⇒ **不**再传
             #   content_chroma_settings（否则二次抠像）。生成失败 ⇒ 逐字节落回旧行为。
             content_file=(None if _gc_png else (track.file_path or None)),
+            # 2026-10-28：子视频自己开了「拼接」⇒ 内容帧也要拼（否则框内永远是单张原片、
+            # 还被按 N 倍宽的内容盒拉伸）。组盒模式的内容是合成图（已算完）⇒ 不预拼。
+            content_pre_filter=(None if _gc_png else self._tile_pre_filter(track.enc_settings)),
             # 🔴 2026-10-17：组盒模式直接给**内存字节** ⇒ 编辑器全程零临时文件。
             content_ppm=(_gc_png or None),
             content_alpha=bool(_gc_png
@@ -55926,6 +57456,13 @@ class FFmpegBatchGUI:
 
     def export_convert_project(self):
         """导出转换页项目到 .fflgproject（全量设置快照，含视频/文字水印，带 convert 标记）"""
+        # 空项目拦在另存为对话框之前（2026-10-26，与封装页 save_merge_project 同口径）。
+        # 转换页的「项目」= 一个输入文件 + 全套参数；没有输入文件时它退化成一份预设，
+        # 该走「保存当前参数为预设」（那才是可复用的东西，且不产生 .fflgproject）。
+        if alert_if(not self.input_file.get().strip(), _("提示"),
+                    _("还没有选择输入文件，没有可导出的项目。\n\n"
+                      "只想保存这套参数：用上面的「保存当前参数为预设」。"), 'info'):
+            return
         file_path = filedialog.asksaveasfilename(
             title=_("导出转换项目"),
             defaultextension=".fflgproject",
@@ -56544,6 +58081,29 @@ class FFmpegBatchGUI:
         encoder_lower = encoder.lower()
         return any(kw in encoder_lower for kw in hw_keywords)
 
+    def _ffmpeg_ready(self):
+        """ffmpeg 可用吗？不可用就弹窗说明并返回 False（2026-10-23）。
+
+        预览 / 取帧 / 黑边 / 合并等 6 处早有 alert_if(not ffmpeg_cmd)，唯独真正开跑的
+        「开始编码 / 开始队列」没有 —— 路径配错（非 None 但文件不在）会静默启线程，
+        用户最终只看到 ffmpeg 的英文报错。两个入口共用本方法，文案单一来源。
+        解决方式对齐 docs/setupFFmpeg.md 的「三种集中位置 + 软件内手动指定」。
+        """
+        if self.ffmpeg_cmd and os.path.exists(self.ffmpeg_cmd):
+            return True
+        # cond 恒真 ＝ 无条件弹一次（保持与全局 alert_if 同一出口）
+        alert_if(True, _("找不到 ffmpeg"),
+                 _("没有可用的 ffmpeg 可执行文件，无法开始转换。\n\n"
+                   "当前路径：{0}\n\n"
+                   "解决方式（三选一）：\n"
+                   "  · 把 ffmpeg.exe 放到本程序所在目录\n"
+                   "      （或主程序下的 _internal\\ / bin\\ 子目录，会自动扫描一级子目录）\n"
+                   "  · 把它所在目录加入系统环境变量 PATH\n"
+                   "  · 在「信息与播放器」页勾选「启用自定义 FFmpeg 目录」，指定它的所在目录\n\n"
+                   "详细步骤（下载地址、PATH 配置、验证方法）见 docs/setupFFmpeg.md")
+                 .format(self.ffmpeg_cmd or _("（未配置）")), 'error')
+        return False
+
     def start_queue(self):
         if self.is_processing:
             if not self.running_futures and not self.pending_tasks:
@@ -56556,6 +58116,10 @@ class FFmpegBatchGUI:
             self.executor = None
         self.pending_tasks = [t for t in self.tasks if t.status == _("等待")]
         if alert_if(not self.pending_tasks, _("提示"), _("没有等待中的任务"), 'info'):
+            return
+        # ffmpeg 不可用就别启动队列（2026-10-23）：否则 N 个任务各自报一次错。
+        # 只在「有任务要跑」时才查 —— 空队列先报「没有等待中的任务」更有用。
+        if not self._ffmpeg_ready():
             return
         # 图片主视频 + 输出尺寸非偶数 → 拦下（不自动偶数化，理由见 _check_image_main_even_size）
         # 逐个过一遍：有问题的任务会在信息区单独报出，本次队列整体不启动，
@@ -57708,8 +59272,37 @@ class FFmpegBatchGUI:
 
     def transcode_single(self):
         input_file = self.input_file.get()
+        # ① 输入框空、但任务列表里有「等待」任务 → 先问要不要转去「开始队列」（2026-10-23）。
+        #    新手最常见的卡点：点几次「添加到任务列表」再点「开始编码」，结果队列一个都不跑，
+        #    而且毫无提示（本方法只读 input_file，与 self.tasks 无关）。
+        if not input_file.strip():
+            _waiting = sum(1 for t in getattr(self, "tasks", [])
+                           if getattr(t, "status", "") == _("等待"))
+            if _waiting and messagebox.askyesno(
+                    _("有等待中的任务"),
+                    _("任务列表里有 {0} 个等待中的任务。\n\n"
+                      "要现在开始队列吗？\n\n"
+                      "· 选「是」＝ 开始队列（列表里的任务全部转换）\n"
+                      "· 选「否」＝ 继续单文件转换，请先在输入框里选择文件").format(_waiting)):
+                self.start_queue()
+                return
         if alert_if(not input_file or not os.path.exists(input_file), _("错误"), _("请选择有效的输入文件"), 'error'):
             return
+        # ② ffmpeg 不可用就别放行（2026-10-23）：文案与守卫见 _ffmpeg_ready
+        if not self._ffmpeg_ready():
+            return
+        # ③ 扩展名不像媒体就问一句（2026-10-23）：拖入 .txt/.pdf 时原来会直接拼出
+        #    `-i 说明.txt` 并启线程，新手最终只看到 ffmpeg 的英文报错。
+        #    ⚠️ 只提示不硬拦 —— ffmpeg 能读的容器多于 _INPUT_MEDIA_EXTS，确认后照常转换。
+        _ext = os.path.splitext(input_file)[1].lower()
+        if _ext and _ext not in _INPUT_MEDIA_EXTS:
+            if not messagebox.askyesno(
+                    _("文件类型不确定"),
+                    _("这个文件看起来不是视频 / 音频 / 图片：\n{0}\n\n"
+                      "仍要尝试转换吗？\n"
+                      "（后缀 {1} 不在常见媒体格式里，转换大概率失败）")
+                    .format(os.path.basename(input_file), _ext)):
+                return
         settings = self.get_current_settings()
         # 图片主视频 + 输出尺寸非偶数 → 拦下（不自动偶数化，理由见 _check_image_main_even_size）
         if not self._check_image_main_even_size(input_file, settings):
@@ -58155,74 +59748,20 @@ class FFmpegBatchGUI:
                                     self._append_info_ui(_('[任务编辑] 文字水印画布尺寸: {0}x{1}（按任务渲染设置计算）').format(canvas_w, canvas_h))
                         else:
                             self._append_info_ui(_("[任务编辑] 无法定位主视频，文字水印画布使用默认 1280x720"))
-                        text = tw.get("text", "")
-                        fs = _opt_int(tw.get("font_size", 48), 48)
-                        # 内容盒估算（2026-09-03 与 impl/渲染端同源：estimate_text_size + 2×pad8）
-                        # 2026-09-25：与渲染端统一用 _tw_effective_text（multiline 开=高盒、关=矮盒）。
-                        _eff_text2 = _tw_effective_text(tw)
-                        _est2w, _est2h = estimate_text_size(_eff_text2, "", fs)
-                        wm_w = _est2w + 16
-                        wm_h = _est2h + 16
-                        # 2026-10-05：框内渲染**真实文字**（与独立/轨迹两个文字水印位置编辑器
-                        # 同款）。此前本入口（队列任务编辑→文字水印可视化）框内是空参考框。
-                        # ⚠️ 全局开关关闭时跳过（省一次 ffmpeg，编辑器回退虚拟框）。
-                        _tw2_png = None
-                        _rf_v2 = getattr(self, "editor_real_frame", None)
-                        if _rf_v2 is None or bool(_rf_v2.get()):
-                            _tw2_png = _render_text_watermark_preview_png(
-                                self.ffmpeg_cmd, tw, int(wm_w), int(wm_h))
-                        x_var = tk.StringVar(value=tw.get("overlay_x", "10"))
-                        y_var = tk.StringVar(value=tw.get("overlay_y", "10"))
-                        def on_tw_apply(nx, ny, nw, nh, ncw, nch):
-                            tw["overlay_x"] = str(nx)
-                            tw["overlay_y"] = str(ny)
-                            # 矩形高度反推字体大小（与 impl 同款：(nh−16)/(1.2×行数)）
-                            try:
-                                if nh > 0:
-                                    _nlines = max(1, _eff_text2.count("\n") + 1)
-                                    _nf = max(8, int(round((nh - 16) / (1.2 * _nlines))))
-                                    _of = int(tw.get("font_size", 48))
-                                    if _nf != _of:
-                                        tw["font_size"] = _nf
-                                        self._append_info_ui(_('[文字水印] 字体大小已更新: {0} → {1}').format(_of, _nf))
-                            except (ValueError, TypeError):
-                                pass
-                            update_preview()
-                            self._append_info_ui(_('[文字水印] 位置已设置: ({0}, {1})').format(nx, ny))
-                        # 文字水印静态旋转角度（-180..180），旋转后为 hypot 正方形包围盒
-                        _tw2_ra = _opt_float(tw.get("rotate", 0) or 0, 0.0)
-                        _tw2_spin = bool(tw.get("spin_enabled", False))
-                        # 初始坐标：safe_eval_expr 可能返回 0（合法位置），必须用 None 判断而非 `or 10`，
-                        # 否则 y=0 会被 `0 or 10` 顶成 10，看起来「y 没返回数值」。
-                        # 定位语义=内容盒（wm_w/wm_h）左上（2026-09-03：旋转 d×d 由编辑器内部
-                        # 自动中心对齐，这里不得用 d 求值——否则 x/y 表达式如 w-40 按 d 折算后
-                        # 与渲染端内容盒语义错位）。
-                        _init_x2 = safe_eval_expr(x_var.get(), {"W": canvas_w, "H": canvas_h, "w": wm_w, "h": wm_h})
-                        _init_y2 = safe_eval_expr(y_var.get(), {"W": canvas_w, "H": canvas_h, "w": wm_w, "h": wm_h})
-
-                        def apply_tw2_angle(new_angle):
-                            tw["rotate"] = float(new_angle or 0.0)
-                            update_preview()
-                            self._append_info_ui(_('[文字水印] 旋转角度已更新: {0}°').format(new_angle))
-
-                        self._generic_overlay_editor(
-                            win, canvas_w, canvas_h,
-                            10 if _init_x2 is None else _init_x2,
-                            10 if _init_y2 is None else _init_y2,
-                            wm_w, wm_h, on_tw_apply, _("可视化编辑文字水印位置"), None,
-                            bg_draw_func=None, rect_label=_('文字水印'),
-                            min_visible_pixels=0, show_scale_tip=False,
-                            rotate_angle=_tw2_ra, angle_cb=apply_tw2_angle,
-                            show_nudge=False,   # 队列任务文字水印位置编辑器：无微调按钮
-                            # 2026-10-05：框内渲染真实文字（drawtext→透明 PNG），不再是空参考框。
-                            # content_rgba=True 走角度≈0 零 ffmpeg 跟随 / 角度≠0 旋转重合成。
-                            content_file=_tw2_png, content_alpha=True, content_rgba=True,
-                            draw_diagonal=False,
-                            # 2026-09-03（问题③）：背景帧=队列任务自身主视频 + 其 crop/rotate
-                            # 预处理——此前未传 main_video_file → 恒黑画布
-                            main_video_file=_in if (_in and os.path.exists(_in)) else None,
-                            coord_box=True,
-                            bg_pre_filter=_main_bg_pre_filter(task.settings) if task.settings else None)
+                        # 2026-10-24 收敛：这里原来内联了一份 _generic_overlay_editor 构造
+                        # （bg_draw_func=None ⇒ 完全没有兄弟条；框内真实文字/旋转/画布换算
+                        # 都得在两处同步改）。改为调公共 impl，只把三处真实差异参数化：
+                        #   · 队列任务文字水印是**单条 dict**（不是条目表）⇒ 没有兄弟条，
+                        #     也不能让 _collect_tw_siblings 去抓主界面对话框的 items（错源）；
+                        #   · 角度回写不该顺带改主界面文字水印对话框的旋转数值框；
+                        #   · scope="task" 不是真页面：只为让 _resolve_editor_bg 的「按页兜底」
+                        #     落空（未知页 → (None,None)）⇒ 任务输入失效时仍是纯黑画布，
+                        #     与收敛前的 main_video_file=None 完全一致，不偷用转换页/封装页主视频。
+                        _open_tw_position_editor_impl(
+                            self, tw, canvas_w, canvas_h, update_preview, win,
+                            ctx_file=_in or None, ctx_settings=task.settings,
+                            scope="task",
+                            collect_siblings=False, sync_dialog_angle=False)
                         return
                     messagebox.showwarning(_("提示"), _("请先在任务设置中输入水印文件路径，或启用文字水印"))
                     return
@@ -59038,15 +60577,18 @@ class FFmpegBatchGUI:
         cols_var = tk.IntVar(value=int(eh.get("split_cols", 1) or 1))
         ttk.Spinbox(r1, from_=1, to=5, width=4, textvariable=cols_var).pack(side=tk.LEFT, padx=2)
         ttk.Label(r1, text=_("(总格数 = 行×列，限制 2-5)"), foreground="gray").pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Label(f1, text=_("行=1 → 横排 hstack；列=1 → 竖排 vstack；行>1且列>1 → 网格"),
+        ttk.Label(f1, text=_("行=1 → 横排 hstack；列=1 → 竖排 vstack；行>1且列>1 → 一步 xstack"),
                   foreground="gray").pack(anchor=tk.W, pady=(2, 0))
         ToolTip(f1,
                 _("把视频画面复制成 N 份（2-5）拼接成网格，类似监控墙。\n"
-                "行=1 列=3 → 3 份横排 [v1][v2][v3]hstack；\n"
-                "行=3 列=1 → 3 份竖排 vstack；\n"
-                "行=2 列=2 → 2x2 网格（每行先 hstack 再整体 vstack）。\n"
+                "行=1 列=3 → 3 份横排：split=3,hstack=inputs=3；\n"
+                "行=3 列=1 → 3 份竖排：split=3,vstack=inputs=3；\n"
+                "行=2 列=2 → 2×2 网格：split=4,xstack=inputs=4:layout=…\n"
+                "     （一步拼完，不再有 [v1][v2] 之类的中间标签段）。\n"
+                "总格数（行×列）必须 2-5：超了「确定」时会被拦下；\n"
+                "    老工程里越界的值按「未启用拼接」处理，不会折成别的格数。\n"
                 "最终输出画面 = 每份都是完整画面缩小后的拼接效果。"),
-                wraplength=380)
+                wraplength=400)
 
         # ---------- 功能2：末端 concat 图片/视频 ----------
         f2 = ttk.LabelFrame(left_col, text=_("末端 concat（图片/视频）"), padding="6")
@@ -59226,7 +60768,9 @@ class FFmpegBatchGUI:
                 _eh = {}
             # 🔴 2026-10-20：合并页有子视频/组时，成片主画面是**合成帧**；末端预览若仍
             #   只取主视频单源，调网格与边框时看到的构图与成品无关（用户实测报障）。
-            #   合成版取不到（单轨 / 构图异常）⇒ 静默回落下面的单源老路径（行为不变）。
+            # 🔴 2026-10-28：单轨工程也要走（节点里插的效果只存在于合成图）；仅
+            #   「单轨且无任何视频节点效果」才回落 —— 见 _has_any_video_node_fx。
+            #   合成版取不到（无节点效果的单轨 / 构图异常）⇒ 静默回落下面的单源老路径。
             if preview_page == "merge":
                 with suppress(Exception):
                     _ccmd = self._pv_end_composite_cmd(_eh, t, box_w, box_h)
@@ -60681,12 +62225,19 @@ class FFmpegBatchGUI:
                 # 读 PPM 头即可（ppm_size），不必为此把整图塞进 PhotoImage。
                 _orig = ppm_size(png)
                 _sub_file = track.file_path
+                _n_before = len(node_fx_items(self.node_fx.get(_k)))
                 # 2026-10-16：下面这一整段（取帧器 / 预览回调 / overlay 接线 / 建窗）
                 # 抽成 `_open_node_effect_editor` —— 列表里的**虚拟组父行**双击走同一
                 # 入口，两条路在「把节点当独立素材打开视频轨道设置」上必须逐项一致。
                 self._open_node_effect_editor(
                     _k, _lab, _orig, _sub_file, track, sub_videos)
-                tv.set(_k, column="fx", value=node_effect_summary(self.node_fx.get(_k)))
+                # 2026-10-28：套用了效果 ⇒ 该节点输出可能变了（缩放/裁剪/画布都改尺寸），
+                # 与自定义命令同口径重建（否则下一次套用仍拿旧帧尺寸当坐标空间基准）。
+                # 直接关窗没存任何效果时不重建，保持「点开又关」的零开销。
+                if len(node_fx_items(self.node_fx.get(_k))) != _n_before:
+                    _fx_changed_refresh(_k, _lab)
+                else:
+                    tv.set(_k, column="fx", value=node_effect_summary(self.node_fx.get(_k)))
 
             def _on_clear():
                 _k, _lab = _selected()
@@ -60701,6 +62252,28 @@ class FFmpegBatchGUI:
                     _rebuild()   # 原地刷新：重取图 + 重建列表与预览缓存（等价于关窗重开）
                 else:
                     messagebox.showinfo(_("提示"), _("该节点没有已保存的效果"))
+
+            def _fx_changed_refresh(_k, _lab):
+                """该节点的效果列表变了之后：原地刷新对话框（等价关窗重开）+ 保住选中。
+
+                🔴 2026-10-28（用户报「视频节点里插入 split 链后，各处右侧预览尺寸没变、
+                画面是 split 后的挤压画面」）：
+                自定义命令 / 效果顺序都会改变该节点的**输出**（典型
+                `split=N,hstack=inputs=N` ⇒ 输出宽 ×N），而本对话框打开时捕获的
+                nodes / rows / `_frames` 全是那一刻的图快照。只 tv.set + 刷命令预览的话：
+                  · `_frames` 里还是插入前的帧 ⇒ `_on_apply` 拿 `ppm_size(旧帧)` 当
+                    `orig_size` —— 它是编辑器**坐标空间基准** ⇒ 尺寸"没变"；
+                  · 编辑器内部却按**新图**实时取背景帧（`_make_node_frame_extractor`），
+                    再 `scale=旧宽:旧高` **强制**缩放 ⇒ 新画面被压扁（挤压）。
+                与「清除效果」同口径：`_rebuild()` = 重取图 + 重建列表 + 清取帧/格式缓存。
+                """
+                self.merge_update_command_preview()
+                _rebuild()
+                with suppress(Exception):
+                    if _k and tv.exists(_k):
+                        tv.selection_set(_k)
+                        tv.focus(_k)
+                        _request_frame(_k, _read_seek())
 
             def _on_order():
                 """「自由顺序」L1（2026-10-02）：该节点挂的 N 条效果 —— 排序 / 删除 / 编辑。
@@ -60869,7 +62442,7 @@ class FFmpegBatchGUI:
                 self._append_info_ui(
                     _('[节点] {0} 效果顺序已更新').format(node_label_friendly(_lab))
                     + (_('（共 {0} 条）').format(len(_items)) if _items else _("（已清空）")))
-                self.merge_update_command_preview()
+                _fx_changed_refresh(_k, _lab)
 
             def _on_custom():
                 """自由插入命令（2026-09-27）：直接写 ffmpeg 滤镜串，插在该节点之后。
@@ -61014,7 +62587,7 @@ class FFmpegBatchGUI:
                         _("追加（第 %d 条）") % len(node_fx_items(self.node_fx.get(_k)))
                         if _res[1] else _("更新"),
                         _res[0]))
-                self.merge_update_command_preview()
+                _fx_changed_refresh(_k, _lab)
 
             def _on_refresh():
                 """按当前取帧时间重取选中节点的画面（改了时间又不想按回车时用）。"""
@@ -62739,14 +64312,44 @@ class FFmpegBatchGUI:
             messagebox.showinfo(_("成功"), _('主视频内平铺完成\n网格: {0}×{1}\n子视频: {2} 个\n统一尺寸: {3}×{4}\n（主视频铺底不动，未新增画布）').format(cols, rows, n, u_w, u_h))
 
 
+    def _merge_project_has_content(self):
+        """封装页「到底有没有东西可存」：主视频 或 至少一条**有效**轨道。
+
+        2026-10-26 用户实测：「封装页空项目点击保存项目居然真能保存」。原先
+        `save_merge_project` 一进来就弹另存为、选完路径直接 dump，空项目会写出
+        一份 `merge_video:"" + tracks:[]` 的文件 —— 事后「📂 加载项目」只会得到
+        一片空白，纯噪音。
+
+        判据刻意只看**素材**（2026-10-26 用户选定「素材判据」）：文字水印 / 节点效果
+        都挂在轨道上，没有素材时它们本来也不生效，算进来只会让「空页能不能存」变得
+        取决于用户看不懂的字段。
+
+        ⚠️ 占位轨（`_placeholder`，文件正在解析）不算内容 —— `_build_merge_state_dict`
+          本就会跳过它们；算进来的话会出现「说有内容、却存出 0 条轨」的自相矛盾。
+
+        ⚠️ 不用 `merge_start` 那套 `_has_video`（它还要「至少一条**启用**轨」）：
+          保存是快照，全轨禁用的项目照样该能存下来，只是现在跑不了而已。
+        """
+        if self.merge_video.get().strip():
+            return True
+        return any(not t.enc_settings.get("_placeholder", False)
+                   for t in self.merge_tracks)
+
     def save_merge_project(self):
         """手动保存合并项目到 .fflgproject 文件。
 
         返回值（2026-09-16 修复「保存取消仍误报发送成功」）：
           True  = 已成功写入项目文件
-          False = 用户取消（未选路径）或写入失败
+          False = 用户取消（未选路径）、空项目、或写入失败
         调用方据此决定是否提示「发送成功 / 已保存」。
         """
+        # 空项目直接拦在**另存为对话框之前**（2026-10-26）：让用户先选一遍路径、
+        # 再得到一个空文件，比不让他点更糟。提示里说清「没什么可存」，不是报错。
+        if alert_if(not self._merge_project_has_content(), _("提示"),
+                    _("当前封装页还没有任何素材（主视频和各轨道都是空的），"
+                      "没有可保存的项目。\n\n"
+                      "先拖入视频/音频，或者用「📂 加载项目」打开已有项目。"), 'info'):
+            return False
         file_path = filedialog.asksaveasfilename(
             title=_("保存合并项目"),
             defaultextension=".fflgproject",
@@ -62834,7 +64437,10 @@ class FFmpegBatchGUI:
         # ⚠️ 撤销快照：先拍下加载前的整页状态（任何对话框之前），供右上「↶ 撤销」还原
         _undo_snap = self._build_merge_state_dict()
         # 如果有未保存的更改，提示是否保存当前项目
-        if self.merge_tracks and messagebox.askyesno(_("未保存的项目"), _("当前有轨道，是否先保存当前项目？\n（选“是”保存，选“否”直接加载新项目）")):
+        # 2026-10-26：判据从 `self.merge_tracks` 改成 `_merge_project_has_content()`
+        # —— 只剩占位轨时问「是否先保存」会立刻被 save 的空项目守卫弹一句「没有可保存的
+        # 项目」，自己打自己脸。
+        if self._merge_project_has_content() and messagebox.askyesno(_("未保存的项目"), _("当前有轨道，是否先保存当前项目？\n（选“是”保存，选“否”直接加载新项目）")):
             self.save_merge_project()
             # 用户可能取消保存，但继续加载，没问题
         
@@ -63125,7 +64731,7 @@ class FFmpegBatchGUI:
 
     
         # 检测是否为图片
-        img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
+        img_exts = _MEDIA_IMAGE_EXTS
         is_image = os.path.splitext(path)[1].lower() in img_exts
     
         if is_image:
@@ -63241,9 +64847,9 @@ class FFmpegBatchGUI:
         audio_files = []
         image_files = []
         other_files = []
-        video_exts = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.ts', '.webm')
-        img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
-        audio_exts = ('.mp3', '.aac', '.m4a', '.wav', '.flac', '.ogg', '.opus', '.ac3', '.dts')
+        video_exts = _MEDIA_VIDEO_EXTS
+        img_exts = _MEDIA_IMAGE_EXTS
+        audio_exts = _MEDIA_AUDIO_EXTS
     
         for f in all_files:  # 注意：使用 all_files，而不是 files
             ext = os.path.splitext(f)[1].lower()
@@ -63415,10 +65021,10 @@ class FFmpegBatchGUI:
             return
     
         # 分类（使用 all_files）
-        video_exts = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.ts', '.webm')
-        img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
-        audio_exts = ('.mp3', '.aac', '.m4a', '.wav', '.flac', '.ogg', '.opus', '.ac3', '.dts')
-        subtitle_exts = ('.srt', '.ass', '.ssa', '.vtt', '.idx', '.sup')
+        video_exts = _MEDIA_VIDEO_EXTS
+        img_exts = _MEDIA_IMAGE_EXTS
+        audio_exts = _MEDIA_AUDIO_EXTS
+        subtitle_exts = _MEDIA_SUBTITLE_EXTS
     
         video_files = []
         image_files = []
@@ -63534,8 +65140,8 @@ class FFmpegBatchGUI:
         串联模式后台解析完成后的回调：删除占位，添加真实流，处理错误。
         允许重复添加（不去重）。
         """
-        audio_exts = ('.mp3', '.aac', '.m4a', '.wav', '.flac', '.ogg', '.opus', '.ac3', '.dts')
-        subtitle_exts = ('.srt', '.ass', '.ssa', '.vtt', '.idx', '.sup')
+        audio_exts = _MEDIA_AUDIO_EXTS
+        subtitle_exts = _MEDIA_SUBTITLE_EXTS
     
         self._batch_update = True
         try:
@@ -63645,7 +65251,7 @@ class FFmpegBatchGUI:
             return
     
         # 检测是否为图片
-        img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
+        img_exts = _MEDIA_IMAGE_EXTS
         is_image = os.path.splitext(path)[1].lower() in img_exts
     
         if is_image:
@@ -66576,6 +68182,12 @@ class FFmpegBatchGUI:
                 settings_sw["rotate"] = "none"
             else:
                 settings_sw = settings
+            # 拼接（2026-10-28）：串行合并**不生效** —— 每段后面紧跟 `forced`（pre_norm 的
+            # `scale=主视频尺寸`）把段拉齐到 concat 要求的同一规格，链内先拼会让那道 scale
+            # 把网格硬缩回目标尺寸（每格被拉扁）。串行模式下画中画是关的、入口本来也看不到，
+            # 这里剥掉只是兜底：老预设/老工程带着 tile_enabled 进来也不会压扁。
+            if settings_sw.get("tile_enabled", False):
+                settings_sw = {**settings_sw, "tile_enabled": False}
             video_filters = build_video_filter_chain(
                 settings_sw,
                 include_subtitle=False, include_speed=True, include_trim=True,
@@ -69770,6 +71382,9 @@ class FFmpegBatchGUI:
             _frame_w, _frame_h = _pg1[0], _pg1[1]  # pad 画布帧 = pad 尺寸
         else:
             _frame_w, _frame_h = _rend_w, _rend_h
+        # 🔴 2026-10-28：帧尺寸含链尾「拼接」（见另一个预览构建器同款注释）。`_rend_*` 保持每格
+        # 尺寸供下面的 `_pwf` 写 `scale_width/height`，否则单格被二次乘。
+        _frame_w, _frame_h = tiled_frame_size(_frame_w, _frame_h, _ms)
         _main_w, _main_h = _frame_w, _frame_h
         # 工作分辨率上限（2026-09-21）：4K+ 主视频在 CPU 滤镜图上跑全分辨率 overlay 极吃力（mpv 走
         # GPU 不显；实测 4K 缩放后 hqdn3d/unsharp 5.2x、nlmeans 15.9x 提速，见 _PIPE_WORK_MAX_W）。
@@ -70015,6 +71630,10 @@ class FFmpegBatchGUI:
                 _rw, _rh = compute_rendered_size(_ow, _oh, _s)
                 if _rw <= 0 or _rh <= 0:
                     _rw, _rh = _ow, _oh
+                # 2026-10-28：子视频自己开「拼接」时，画面流是 N 倍网格 ⇒ 定位/尺寸基准
+                # 必须同尺寸（与成片 `_overlay_content_size` 同源），否则预览里子视频按单格
+                # 尺寸摆位、画面却是 N 倍宽（越界/错位）。
+                _rw, _rh = tiled_frame_size(_rw, _rh, _s)
             except Exception:
                 _rw, _rh = 320, 240
             # 画布模式（2026-08-31 两段式）：下游定位/blend/对角线的基准尺寸 = 内容盒
@@ -70078,7 +71697,12 @@ class FFmpegBatchGUI:
                 chroma_settings=_s if _s.get("chroma_enabled", False) else None,
                 loop_size=_loop_size,
                 window_start=_pwin_start, window_end=_pwin_end, window_loop_count=_pwin_loop,
-                force_scale=None if _sub_cv_on else (_rw, _rh),  # 渲染尺寸缩放；画布模式交给第 2 段
+                # 🔴 2026-10-28（用户实测「ffplay/mpv、管道预览里 2×2 被算了两次」）：
+                #   `force_scale` 落在链内**缩放位**，而「拼接」段在**链尾** ⇒ 必须是**每格**
+                #   尺寸。`_rw/_rh` 是**成帧**尺寸（`tiled_frame_size`，供 overlay 定位用）
+                #   ⇒ 拿它当 force_scale 会「先放大 N 倍、再拼一次」= N² 倍（实测 160×90 的
+                #   子视频拼 2×2 → 图上先 `scale=320:180` 再 xstack ⇒ 640×360，比成片大一倍）。
+                force_scale=None if _sub_cv_on else untiled_frame_size(_rw, _rh, _s),
             )
             _sp = []
             if _sb and _sb != "null":
@@ -72852,8 +74476,10 @@ class FFmpegBatchGUI:
             # 串行主视频：模拟拼接+转场后的缩略图
             self._show_concat_contact_sheet_async(enabled_videos)
         else:
-            # 普通单文件缩略图
-            self._show_contact_sheet_async(track.file_path)
+            # 普通单文件缩略图（含「选中的就是子视频轨」）—— 必须用**该轨自己的**
+            # enc_settings，否则网格/调色/look 跟着转换页设置走，用户看到的是别人的效果
+            # （2026-10-23 用户实测「封装页子文件设了网格，右键缩略图里没有」）。
+            self._show_contact_sheet_async(track.file_path, track.enc_settings)
 
     def _contact_sheet_selected_task(self):
         """对队列选中的第一个任务生成缩略图"""
@@ -72864,7 +74490,9 @@ class FFmpegBatchGUI:
         task = self.tasks[idx]
         if alert_if(not os.path.exists(task.input), _("提示"), _('输入文件不存在: {0}').format(task.input)):
             return
-        self._show_contact_sheet_async(task.input)
+        # 队列任务同样用**任务自己的**设置快照（task.settings 深拷贝只为一致性），
+        # 否则预览的是面板当前设置、与即将转出的成片不符（2026-10-23，与封装页同口径）
+        self._show_contact_sheet_async(task.input, getattr(task, "settings", None))
 
     def merge_move_up_selected(self):
         indices = self._get_selected_track_indices()
@@ -73161,7 +74789,9 @@ class FFmpegBatchGUI:
         w, h = self._cached_video_rotated_dimensions(track.file_path, track.enc_settings)
         if w is None:
             return None
-        return compute_rendered_size(w, h, track.enc_settings)
+        # 2026-10-28：拼接（链尾网格）也算 —— 编辑器虚线框/列表规格要与成片同尺寸
+        _rw, _rh = compute_rendered_size(w, h, track.enc_settings)
+        return tiled_frame_size(_rw, _rh, track.enc_settings)
 
     def merge_preview_track(self, track_idx, with_snapshot: bool = False):
         """预览单个轨道（2026-08-30）：滤镜变速 setpts（preview_filter_speed，与转换一致）与
@@ -73352,6 +74982,9 @@ class FFmpegBatchGUI:
             if orig_w is None or orig_h is None:
                 orig_w, orig_h = 1280, 720
             final_w, final_h = compute_rendered_size(orig_w, orig_h, track.enc_settings)
+            # 2026-10-28：单轨预览的屏幕适配也按**真实成帧**（含链尾拼接网格），
+            # 否则 N 倍宽的图被按原始比例压回框内（上下黑边/变形）。
+            final_w, final_h = tiled_frame_size(final_w, final_h, track.enc_settings)
     
             screen_w = self.root.winfo_screenwidth()
             screen_h = self.root.winfo_screenheight()
@@ -73744,7 +75377,8 @@ class FFmpegBatchGUI:
     # ---------- 画中画合成快照（方案1：静态单帧真实合成，独立窗口） ----------
     def _build_pip_snapshot_cmd(self, track, sub_videos, tap_label=None, out_png=None,
                                 tap_seek=None, node_fx_override=None,
-                                append_vf=None, pipe_ppm=False, scene="frame_snapshot"):
+                                append_vf=None, pipe_ppm=False, scene="frame_snapshot",
+                                fit_scale=True):
         """
         复用 _build_overlay_filter_complex 生成与最终成片完全一致的 filter_complex，
         输出 1 帧 PNG 作为合成快照。子视频集合与 _build_pip_cmd 一致：
@@ -73757,6 +75391,16 @@ class FFmpegBatchGUI:
           · `pipe_ppm`：输出改走 `-f image2pipe -vcodec ppm -`（纯内存，零临时文件），
             不再写 out_png。False = 旧行为。
         ⚠️ 两者都为 None/False 时本函数与改动前**完全等价**（E1 零回归硬门）。
+
+        fit_scale（2026-10-28，用户报「末端处理右侧预览尺寸不对、画面被压扁」）：
+          False = **不做**「按设置推算的输出画布」那道自适应缩放（`_append_fit_scale`）。
+          那道缩放是**硬 `scale=W:H`**（非等比），它的尺寸基准来自
+          `_compute_output_canvas(enc_settings)` —— 只看设置里的 pad/crop/scale，**完全不知道
+          图内节点做了什么**。图内节点插了 `split+hstack` 后真实成帧是 2 倍宽（3840×1080），
+          却被硬缩到设置推算的 1920×1080 ⇒ 画面被横向压扁（屏幕 1080p 时
+          `max_h = 1080-100` ⇒ 连 1080p 都会触发，不是偶发）。
+          ⇒ 只有「要拿真实成帧继续改（末端网格/边框）或自己会装框」的调用方才传 False；
+            其余快照路径（缩略图 / 坐标编辑器基准帧）依赖该尺寸 = 画布尺寸，保持 True 不动。
 
         seek（2026-09-21）：只取 1 帧，截取起点不再由图内精确 trim 硬扛，改由输入级 `-ss`
         定位（见下方长注释）——大文件 + 远起点（用户实测 143s/221s 的 4K）不再从 0 解码。
@@ -73886,8 +75530,16 @@ class FFmpegBatchGUI:
             # ---- 缩放：镜像播放器预览的自适应缩放逻辑（和红框同一个规则） ----
             # 主视频启用 pad 时，最终输出画布为 pad 画布尺寸（含偏移），
             # 不再用主视频自身的渲染尺寸，否则快照窗口尺寸与画布不符。
+            # ⚠️ fit_scale=False 时整段跳过（见 docstring）：该缩放是硬 W:H，尺寸基准只认设置，
+            #    图内节点改了画幅时必然压扁 —— 末端处理预览就是唯一这样的调用方。
             final_w, final_h = self._compute_output_canvas(track.enc_settings, track.file_path)
-            complex_filter, map_label = self._append_fit_scale(complex_filter, final_v_label, final_w, final_h)
+            if fit_scale:
+                complex_filter, map_label = self._append_fit_scale(complex_filter, final_v_label, final_w, final_h)
+            else:
+                # 不缩放 ⇒ 直接映射最终标签（必须显式给，`_append_fit_scale` 是 map_label 的
+                # 唯一出生点；不给就是 NameError，而调用方 `except Exception` 会把它吞成
+                # 「预览不可用」，查起来毫无线索）。
+                map_label = final_v_label
 
         # ---- tap_seek 快路径（2026-09-26「节点按时间取帧」，用户 23 反馈太慢）----
         # 复用缩略图抽帧口径（_seek_frame_ppm）：输入级 -ss + setpts=PTS+T/TB 恢复时间戳。
@@ -74002,6 +75654,24 @@ class FFmpegBatchGUI:
             cmd.extend(["-vframes", "1", "-update", "1", out_png])
         return cmd, out_png
 
+    def _has_any_video_node_fx(self):
+        """是否有任何**视频**节点效果（`self.node_fx` 里存在非空效果项）。
+
+        用途只有一个：单轨工程要不要走**合成预览**分支（`_pv_end_composite_cmd`）。
+        单轨 + 无节点效果时，合成链对单源没有额外信息、只更慢，且与既有单源预览
+        等价 ⇒ 保持老路径（零回归）；但节点里插了 `split` / `scale` / 抠像这类效果时，
+        节点效果**只存在于合成图里**（单源路径拿的是「源 + 设置链」，根本不建节点图）
+        ⇒ 必须升到合成分支，否则末端预览看到的不是成片那一帧（用户 2026-10-28 报障）。
+
+        ⚠️ `[{}]` 这种「一条什么都没配的残留项」不算 —— 历史上只读路径凭空建过
+        `grp:<gid>` 空壳，若把它当效果会让这类老工程白白换成更慢的合成分支。
+        """
+        for _v in (getattr(self, "node_fx", None) or {}).values():
+            for _it in node_fx_items(_v):
+                if _it:
+                    return True
+        return False
+
     def _pv_end_composite_cmd(self, end_settings, t, box_w, box_h):
         """「末端处理」右侧预览的**合成版**取帧命令；不适用返回 None（调用方回落单源）。
 
@@ -74011,23 +75681,41 @@ class FFmpegBatchGUI:
         而预览拿的是主视频那一张原图 ⇒ 调网格行列与四边距时，看到的构图与成品无关。
         走 `_build_pip_snapshot_cmd` 的 `append_vf` 通道补上这一段：
             合成整帧（与成片同图、同输出画布）→ 末端网格/边框 → 装框到预览小框。
-        位置正确性：非 tap 模式下复杂图先经 `_append_fit_scale` 收到**输出画布**，
-        `append_vf` 接在其后 ⇒ 网格/边框看到的正是成品那一帧的尺寸与像素。
+        位置正确性：复杂图**原尺寸**（不做 `_append_fit_scale`，见下），`append_vf` 接在后
+        ⇒ 网格/边框看到的正是成品那一帧的尺寸与像素。
 
-        ⛔ 单轨项目**不走**这条路（`len(evs) < 2`）：合成链对单源没有额外信息、只更慢，
-        且与既有预览逐像素等价 ⇒ 保持零回归。
+        🔴 2026-10-28（用户：「视频节点里插了 split 链，末端处理右侧预览尺寸不对、画面被压扁」）：
+        本函数原先把非 tap 模式的 `_append_fit_scale` 一起带上 —— 那是**硬 `scale=W:H`**，
+        尺寸基准来自 `_compute_output_canvas`（只看设置，不知道图内节点）。节点插了
+        `split+hstack` 后真实成帧是 2 倍宽，却按设置推算的 16:9 画布硬缩 ⇒ **横向压扁**；
+        1080p 屏幕下 `max_h = 1080-100 < 1080` ⇒ 任何 1080p 工程都会触发，不是偶发。
+        ⇒ 传 `fit_scale=False`：合成帧保持原尺寸，末端网格/边框作用在**真实像素**上，
+        最后只由 `_pv_fit_scale`（`force_original_aspect_ratio=decrease`）等比装进预览框。
+        （这也正是「效果预览」一直正确的原因：它走 tap 分支 + `_pv_fit_scale`，从不经过那道硬缩。）
+
+        🔴 2026-10-28（用户：「一起修吧」—— 单轨工程也要能看到节点效果）：
+        原先单轨一律 `len(evs) < 2 → None`（回落单源）。但**节点里插的效果根本不存在于
+        单源路径**：`build_end_preview_cmd` 拿的是「源 + 设置链」，它不建节点图 ⇒ 单轨工程
+        在末端预览里永远看不到节点插入的 `split` / `scale`。
+        实测（单轨 320×180，节点 `v_main_proc` 后插 `split=2,hstack=inputs=2`）：
+        合成分支 rc=0、成帧 640×180 ⇒ 升到合成分支即可看到。
+        ⇒ 闸门改为「单轨 **且** 无任何视频节点效果」才回落；有节点效果就合成。
+        单轨无节点效果的用户路径**逐字节不变**（零回归，且不付构图开销）。
+
         ⛔ 转换页**不走**（调用方以 `preview_page == "merge"` 把闸）——`merge_tracks` 是
         合并页的列表，转换页拿它去合成会拼出一张与当前文件毫无关系的画。
         """
         evs = self._get_enabled_video_tracks()
-        if len(evs) < 2:
+        if not evs:
+            return None
+        if len(evs) < 2 and not self._has_any_video_node_fx():
             return None
         _tail = [x for x in build_end_overlay_frags(end_settings) if x]
         _tail.append(_pv_fit_scale(box_w, box_h))
         try:
             cmd, _u = self._build_pip_snapshot_cmd(
                 evs[0], evs[1:], tap_seek=t, append_vf=",".join(_tail),
-                pipe_ppm=True, scene="end_preview")
+                pipe_ppm=True, scene="end_preview", fit_scale=False)
         except Exception:
             return None
         return cmd or None
@@ -74059,6 +75747,12 @@ class FFmpegBatchGUI:
             return app._node_fx_excl(node_key, exclude_keys)
 
         def _extractor(input_file, frame_sec, target_width, target_height, pre_vf=None):
+            # ⚠️ 2026-10-28（crop / tile 顺序）：这里**刻意忽略 `pre_vf`** —— 节点效果窗口的
+            #   图形编辑器（裁剪 / delogo / 遮罩 / 画布）是**像素域**，框选坐标是「每格」的，
+            #   背景帧必须停在链尾「拼接」**之前**（与成片里 crop 在链首同理）。
+            #   若把调用方给的 `bg_pre_filter`（可能含 `_main_bg_pre_filter` 的网格片段）
+            #   套上去，背景就变成 N 倍网格 ⇒ 坐标空间整体错位。
+            #   `input_file` 同理被忽略：源是节点图（`_build_pip_snapshot_cmd`），不是裸文件。
             # 注意：本函数在编辑器后台线程跑，绝不碰 Tk（cursor/after），只跑 ffmpeg。
             #
             # 🔴 2026-10-17（用户：「你这个父行标签的取帧有落盘行为吗？我希望的是全内存
@@ -74206,8 +75900,14 @@ class FFmpegBatchGUI:
             # 注入两次命中主链（PTS 变 2t）、子链一次都没注入。异路径时两者数值巧合相等，
             # 故长期未暴露（2026-09-10 定位，实测 ffmpeg 仍 rc=0，属「静默画错」不是报错）。
             sub_infos.append((i + 1, sv.file_path, sv_settings))
+        # 主视频设置：用该轨自己的快照（网格/调色/look 才跟着主轨走），只关**时间类**
+        # 滤镜 —— 抽帧按源文件 t 秒 seek，链内 trim/speed 会让画面与时刻错位
+        # （2026-10-23，与 _show_contact_sheet_async 同口径）
+        _main_st = copy.deepcopy(track.enc_settings)
+        for _k in ("trim_enabled", "speed_enabled"):
+            _main_st[_k] = False
         title = _('缩略图（画中画合成） · {0}').format(os.path.basename(track.file_path))
-        self._show_seek_sheet_async(track.file_path, track.enc_settings, sub_infos,
+        self._show_seek_sheet_async(track.file_path, _main_st, sub_infos,
                                     title, _("正在生成缩略图…"))
 
     def _show_concat_contact_sheet_async(self, video_tracks):
@@ -74243,9 +75943,11 @@ class FFmpegBatchGUI:
             d = self._get_media_duration(t.file_path) or 0.0
             durs.append(d)
 
-        # 抽帧计划：(段文件, 段内时间, 该段是否带 alpha) 列表，凑满 8 帧。
+        # 抽帧计划：(段文件, 段内时间, 该段是否带 alpha, 该段设置) 列表，凑满 8 帧。
         # 2026-10-09：串行各段并列拼成输出，「带 alpha」逐段取自该段 enc_settings
         # （=_settings_needs_alpha），供棋盘格透明指示用（与 _merge_needs_alpha 的 concat 判据同源）。
+        # 2026-10-23：**顺带带上该段自己的设置** —— 原先 worker 传 `[]` 空滤镜，
+        # 各段的降噪/eq/look/网格在缩略图里全丢（用户报「其他滤镜也不齐全」）。
         plans = []
         if n >= 8:
             # 间隔取：均匀选 8 段，每段 1 帧（段中点）
@@ -74253,7 +75955,8 @@ class FFmpegBatchGUI:
                 idx = round(i * (n - 1) / 7.0) if n > 1 else 0
                 d = durs[idx]
                 plans.append((video_tracks[idx].file_path, d * 0.5 if d > 0 else 0.0,
-                              self._settings_needs_alpha(video_tracks[idx].enc_settings)))
+                              self._settings_needs_alpha(video_tracks[idx].enc_settings),
+                              video_tracks[idx].enc_settings))
         else:
             # 重复取：每段 base 帧，前 rem 段 +1，段内均分取点
             base, rem = divmod(8, n)
@@ -74263,7 +75966,8 @@ class FFmpegBatchGUI:
                 _alpha_i = self._settings_needs_alpha(video_tracks[i].enc_settings)
                 for k in range(quota):
                     plans.append((video_tracks[i].file_path,
-                                  d * (k + 0.5) / quota if d > 0 else 0.0, _alpha_i))
+                                  d * (k + 0.5) / quota if d > 0 else 0.0, _alpha_i,
+                                  video_tracks[i].enc_settings))
 
         def _show_win():
             w = ui["win"]
@@ -74278,8 +75982,13 @@ class FFmpegBatchGUI:
 
         def worker():
             frames = []
-            for fp, t, _alpha in plans:
-                data = self._seek_frame_ppm(fp, [], None, None, t, main_alpha=_alpha)
+            _graph_cache = {}      # 同一段会被取多帧（n<8 时），滤镜图只建一次
+            for fp, t, _alpha, _st in plans:
+                _key = id(_st)
+                if _key not in _graph_cache:
+                    _graph_cache[_key] = self._build_sheet_graph_for(fp, _st)
+                _cf, _vl = _graph_cache[_key]
+                data = self._seek_frame_ppm(fp, [], _cf, _vl, t, main_alpha=_alpha)
                 if data:
                     frames.append(data)
             if frames:
@@ -74545,6 +76254,37 @@ class FFmpegBatchGUI:
         cmd += ["-frames:v", "1", "-f", "image2pipe", "-vcodec", "ppm", "pipe:1"]
         return cmd
 
+    def _build_sheet_graph_for(self, file_path, settings):
+        """单文件缩略图 / 串行某一段：把**该文件自己**的滤镜链拼成 filter_complex 片段。
+
+        返回 `(graph, label)`；无需滤镜时 `(None, None)`（调用方退回纯抽帧，行为与旧版一致）。
+
+        2026-10-23：`_show_concat_contact_sheet_async` 原先给 `_seek_frame_ppm` 传
+        `complex_filter=None`，即 8 帧全是**裸抽帧** —— 各段的降噪 / eq / look / 网格全部
+        丢失（用户报「封装页子文件设了网格，右键缩略图里没有，其他滤镜也不齐全」）。
+
+        时间类滤镜一律关（截取 / 变速）：抽帧是按源文件的 t 秒 `-ss` 取的，链内再 trim /
+        变速会让画面与时刻错位；`build_seek_frame_cmd` 自己会补 `setpts=PTS+t/TB`。
+        画布（pad / canvas_mode）不经这里 —— 它属于 overlay 装配层，串行单段没有叠加对象。
+        """
+        if not isinstance(settings, dict):
+            return None, None
+        _st = dict(settings)
+        _st["hw_filter_mode"] = "cpu"     # 与成片同款：避免显存/内存混用导致滤镜失败
+        _st["trim_enabled"] = False
+        _st["speed_enabled"] = False
+        try:
+            _vf = build_video_filter_chain(
+                _st, include_trim=False, include_speed=False, include_subtitle=False,
+                enhance_settings=_st.get("enhance") or {},
+                chroma_settings=_st if _st.get("chroma_enabled", False) else None,
+                include_alpha=True)
+        except Exception:
+            return None, None
+        if not _vf or _vf == "null":
+            return None, None
+        return "[0:v]setpts=PTS-STARTPTS,{}[v_sheet_main]".format(_vf), "[v_sheet_main]"
+
     def _seek_frame_ppm(self, main_file, sub_infos, complex_filter, final_v_label, t,
                         main_alpha=False):
         """seek 到 t 秒抽 1 帧（含子视频合成），scale=320 后 PPM 管道输出（零磁盘写）；失败返回 None。
@@ -74647,27 +76387,29 @@ class FFmpegBatchGUI:
         # 文字水印（与成片一致；仅设置文字水印时同样生效）
         tw_settings = main_settings.get("text_watermark", {}) if isinstance(main_settings, dict) else {}
         tw_active = bool(tw_settings.get("enabled")) and bool((tw_settings.get("text", "") or "").strip())
-        # 有子视频或文字水印时构建合成滤镜（一次，8 点复用）
+        # 2026-10-23：**无条件**构建合成图（原先是「有子视频或文字水印才建」）。
+        # 纯单文件走 `-vf` 分支时只有 `setpts` + `scale`，主视频自己的降噪 / eq / look /
+        # 网格 / 画布 / pad 全都不生效 —— 用户报「封装页子视频设了网格，右键缩略图里没有，
+        # 其他滤镜也不齐全」就是这条。合成图一次构建、8 个取帧点复用。
         complex_filter = final_v_label = None
-        if sub_infos or tw_active:
-            try:
-                complex_filter, final_v_label = self._build_overlay_filter_complex(
-                    0, main_settings, sub_infos,
-                    include_subtitle_main=False,
-                    enhance_settings=main_settings.get("enhance", {}),
-                    reverse=False,
-                    main_file_path=main_file
-                )
-                if tw_active:
-                    tw_frag = build_text_watermark_chain(
-                        main_settings, main_label=final_v_label, out_label="[v_tw_sheet]")
-                    if tw_frag:
-                        complex_filter = f"{complex_filter};{tw_frag}"
-                        final_v_label = "[v_tw_sheet]"
-            except Exception as e:
-                self._append_info_ui(_('[缩略图] 合成滤镜构建失败，按纯抽帧处理: {0}').format(e))
-                sub_infos = []
-                complex_filter = final_v_label = None
+        try:
+            complex_filter, final_v_label = self._build_overlay_filter_complex(
+                0, main_settings, sub_infos,
+                include_subtitle_main=False,
+                enhance_settings=main_settings.get("enhance", {}),
+                reverse=False,
+                main_file_path=main_file
+            )
+            if tw_active:
+                tw_frag = build_text_watermark_chain(
+                    main_settings, main_label=final_v_label, out_label="[v_tw_sheet]")
+                if tw_frag:
+                    complex_filter = f"{complex_filter};{tw_frag}"
+                    final_v_label = "[v_tw_sheet]"
+        except Exception as e:
+            self._append_info_ui(_('[缩略图] 合成滤镜构建失败，按纯抽帧处理: {0}').format(e))
+            sub_infos = []
+            complex_filter = final_v_label = None
 
         def _show_win():
             w = ui["win"]
@@ -74719,9 +76461,14 @@ class FFmpegBatchGUI:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _show_contact_sheet_async(self, file_path):
+    def _show_contact_sheet_async(self, file_path, settings=None):
         """生成视频缩略图拼图：seek 分段抽帧（只解码 8 帧，8K 素材秒出）
-        + 当前水印设置合成（统一路径：未启用水印时子视频为空，等价纯抽帧）。"""
+        + 当前水印设置合成（统一路径：未启用水印时子视频为空，等价纯抽帧）。
+
+        `settings`（2026-10-23）：该文件「自己的」设置快照。封装页 / 队列按轨生成缩略图时
+        必须传 `track.enc_settings` / 任务设置，否则会用转换页全局设置 —— 用户实测
+        「子视频轨设了网格，右键缩略图里没有」就是这条（滤镜跟着错误的对象走）。
+        不传 = 转换页当前设置（转码页/队列旧调用方行为不变）。"""
         if not file_path or not os.path.exists(file_path):
             self._append_info_ui(_("[缩略图] 文件不存在"))
             return
@@ -74737,12 +76484,16 @@ class FFmpegBatchGUI:
             if wm_for_sub.get("encoder") == "copy":
                 wm_for_sub["encoder"] = "libx265"
             sub_infos.append((1, wm_file, wm_for_sub))
-        # 主视频设置：禁用裁剪/缩放/旋转/截取，画布=原始尺寸，只叠加水印（与成片一致）
-        main_settings = self.get_current_settings()
+        # 主视频设置（2026-10-23）：默认取转换页全局设置；封装页对**某一轨**生成缩略图时
+        # 由调用方传该轨自己的 enc_settings —— 否则子视频轨的网格/调色/look 全都不显示
+        # （此前恒用转换页设置，同一条轨道在成片里有网格、缩略图里却没有）。
+        # 只关**时间类**滤镜（截取/变速：抽帧按源文件 t 秒 seek，链内 trim/speed 会让画面
+        # 与时刻错位）。裁剪/缩放/旋转照设置走 —— 它们本来就是「效果」，缩略图必须体现。
+        main_settings = copy.deepcopy(settings) if isinstance(settings, dict) else self.get_current_settings()
         if not isinstance(main_settings, dict):
             main_settings = {}
         main_settings = copy.deepcopy(main_settings)
-        for k in ("crop_enabled", "scale_enabled", "rotate_enabled", "trim_enabled"):
+        for k in ("trim_enabled", "speed_enabled"):
             main_settings[k] = False
         title = _('缩略图 · {0}').format(os.path.basename(file_path))
         self._show_seek_sheet_async(file_path, main_settings, sub_infos, title, _("正在生成缩略图…"))
@@ -74831,7 +76582,18 @@ class FFmpegBatchGUI:
             page_filt = ttk.Frame(notebook)
             notebook.add(page_filt, text=_("视频滤镜"))
             # 2026-08-27：封装页隐藏「烧录字幕」行（封装页走外部字幕轨道模式；转换页/队列编辑仍显示）
-            filt_frame = VideoFilterFrame(page_filt, app=self, refresh_cb=self.merge_update_command_preview, context="merge")
+            # 拼接入口（2026-10-28）：**只在画中画模式**下出现（用户定案：不对老 UI 有影响）。
+            # pip_enabled_var 由三处素材设置窗的调用方透传（未开画中画/转换页 = None）。
+            # ⛔ 节点语境（frame_extractor 有值 = 视频节点 / 组父行 的效果窗）**不显示**：
+            #    那里的保存目标是 `node_fx` 的**效果项**，走 `node_effect_chain` ——
+            #    拼接属「素材出口」层面，挂到中间节点上会把画面撑成 N 倍、下游坐标全错位
+            #    （与 scale / format 同类，那批在 node_effect_chain 里就是关掉的）。
+            _show_tile = False
+            if pip_enabled_var is not None and frame_extractor is None:
+                with suppress(Exception):
+                    _show_tile = bool(pip_enabled_var.get())
+            filt_frame = VideoFilterFrame(page_filt, app=self, refresh_cb=self.merge_update_command_preview,
+                                          context="merge", show_tile=_show_tile)
             if file_path:
                 filt_frame.current_file = file_path
             # 2026-09-26「节点效果编辑器按时间取帧」：节点语境下把「节点时间轴取帧器」挂到
@@ -75364,6 +77126,12 @@ class FFmpegBatchGUI:
                             if orig_w is None or orig_h is None:
                                 orig_w, orig_h = 1280, 720
                             main_w, main_h = self.compute_final_size_with_order(orig_w, orig_h, main_settings)
+                        # 🔴 2026-10-28（同「尺寸与画面同源」）：主视频开「拼接」时**成帧是 N 倍**，
+                        #   而 `bg_pre_filter=_main_bg_pre_filter(main_settings)` 取的背景帧已经是
+                        #   N 倍宽 ⇒ 画布必须折成同一尺寸，否则背景被压进单格画布、水印整体错位。
+                        #   上面三条 `main_video_size` 来源传的都是**每格**尺寸（未乘），这里统一乘一次；
+                        #   未开拼接 / 画布模式 / pad 画布 ⇒ 恒等（零回归）。
+                        main_w, main_h = tiled_frame_size(main_w, main_h, main_settings)
                     
                         wm_file = initial_settings.get("file_path", "")
                         if alert_if(not wm_file or not os.path.exists(wm_file), _("提示"), _("水印文件未设置或不存在")):
@@ -75756,7 +77524,13 @@ class FFmpegBatchGUI:
             # ================== 新增结束 ==================
 
             # ---- 窗口居中 ----
-            center_window(win, 700, 310)
+            # 🔴 multi 专有差异（2026-10-28 用户要求）—— **port 时别把它改回 700**：
+            #   base 是 `center_window(win, 700, 310)`；英文界面绝大多数标签比中文长
+            #   （"Position, size, rotate" / "Bitrate control" / "Encoder & quality" …），
+            #   700 宽下本窗「视频滤镜」「位置」两页的行会被挤到换行、末列控件被截。
+            #   ⇒ multi 单独 +50 = 750（高度不动）。这不是漏 port，是刻意的本地化加宽；
+            #   若哪天 base 也加宽，请两边取各自的值，别强行对齐。
+            center_window(win, 750, 310)
 
             # ---- 保存按钮 ----
             def save():
@@ -77510,8 +79284,8 @@ class FFmpegBatchGUI:
     
         if current_tab == 0:
             # 转码标签页：添加到任务队列
-            # 定义视频扩展名列表
-            video_exts = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.ts', '.webm', '.m2ts', '.mpg', '.mpeg', '.wmv', '.3gp', '.webp', '.gif')
+            # 视频 + 图片都入队（图片当主视频转），清单统一走 _MEDIA_DROP_EXTS
+            video_exts = _MEDIA_DROP_EXTS
             for item in files:
                 if os.path.isfile(item):
                     # 如果是视频文件，直接添加
@@ -77581,9 +79355,8 @@ class FFmpegBatchGUI:
             if os.path.isdir(path):
                 self._append_info_ui(_("[封装] 忽略文件夹: {0}，请选择文件").format(os.path.basename(path)))
                 return
-            video_exts = ['.mp4','.mkv','.avi','.mov','.flv','.ts','.webm',
-                          '.png','.jpg','.jpeg','.bmp','.gif','.webp']
-            img_exts = ['.png','.jpg','.jpeg','.bmp','.gif','.webp']
+            video_exts = _MEDIA_DROP_EXTS
+            img_exts = _MEDIA_IMAGE_EXTS
             ext = os.path.splitext(path)[1].lower()
             if ext in video_exts:
                 if not self.merge_video.get():
@@ -77601,8 +79374,7 @@ class FFmpegBatchGUI:
                 if not self.merge_video.get():
                     self._append_info_ui(_("[封装] 请先拖入视频文件作为主视频，然后才能添加字幕/音频: {0}").format(os.path.basename(path)))
                     return
-                audio_exts = ['.mp3','.aac','.m4a','.wav','.flac','.ogg','.opus','.ac3','.dts']
-                if ext in audio_exts:
+                if ext in _MEDIA_AUDIO_EXTS:
                     self.merge_add_external("audio", path)
                 else:
                     self.merge_add_external("subtitle", path)
@@ -77686,8 +79458,7 @@ class FFmpegBatchGUI:
         """
         # 分类文件
         files_sorted = sorted(files, key=lambda x: os.path.basename(x).lower())
-        video_exts = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.ts', '.webm', '.m2ts', '.mpg', '.mpeg', '.wmv',
-                      '.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
+        video_exts = _MEDIA_DROP_EXTS
         video_files = []
         other_files = []
         for f in files_sorted:
@@ -80721,6 +82492,15 @@ class FFmpegBatchGUI:
         detail_top.pack(fill=tk.X, pady=(0,2))
         ttk.Button(detail_top, text=_("清空日志"), command=lambda: self.detail_text.delete(1.0, tk.END)).pack(side=tk.RIGHT, padx=2)
         ttk.Button(detail_top, text=_("保存日志"), command=lambda: self.save_log(self.detail_text)).pack(side=tk.RIGHT, padx=2)
+        # 「停」快捷入口（2026-10-27）：与设置页「停止所有转码」共用同一 command 和同一份 tooltip 文案。
+        # 用 side=LEFT 独占左端，与右侧「保存日志 / 清空日志」两个日志操作按钮分开，避免误触。
+        # width=4 实测 38px（ttk 默认 87px 且与字数无关），单字按钮收窄以省横向空间。
+        _stop_quick = ttk.Button(detail_top, text=_("停"), command=self.stop_all_transcodes, width=4)
+        _stop_quick.pack(side=tk.LEFT, padx=2)
+        ToolTip(_stop_quick,
+                _("向所有正在运行的 FFmpeg 进程发送停止信号。\n"
+                "主要用于紧急停止因水印/画中画循环参数截断失效而无限延伸的转码，\n"
+                "无需手动去任务管理器结束进程。"))
         self.detail_text = scrolledtext.ScrolledText(detail_frame, bg='#EAF4FC', fg='black',
                                                      selectbackground='#CCF09C', selectforeground='black',
                                                      font=("Microsoft YaHei",8,"normal"), wrap=tk.WORD)
@@ -84065,10 +85845,151 @@ _SYNC_TRACK_COLORS = (
 )
 _SYNC_ANCHOR_COLOR = "#7F77DD"   # 锚点标记（紫）
 _SYNC_CURSOR_COLOR = "#e8590c"   # 播放头（橙）
+_SYNC_BOUND_COLOR = "#888780"    # 素材起 / 止竖线（灰实线；区别于紫锚点、橙光标）
+_SYNC_VOID_COLOR = "#F1EFE8"     # 「无素材区」底色（该轨在这一段根本没有画面/声音）
+# ---- 帧网格（2026-10-26）----
+# FFmpeg 对**视频**取「第一个 pts ≥ T 的帧」，即 `ceil(T·fps)`：给 0.123456 @30fps
+# 实际从 0.133333 开始（晚 9.9 ms，单向偏晚、从不少于 T）。音频 `atrim` 是**采样级**、
+# 不吸附帧 ⇒ 同一个 T 出发时音画会差 0~1 帧。T 落在帧网格上（T=k/fps）时 ceil 退化成
+# 恒等，偏差归零。全套实测（trim / -ss 输入侧 / -ss 输出侧 / 音频 / 结尾半开区间）
+# 见 `research/frame-grid/README.md`。
+_SYNC_GRID_COLOR = "#0F9D58"     # 合法帧刻度（**绿**）。2026-10-26 用户：「希望这个格子的
+                                 # 参考颜色改成别的，比如绿色之类的，因为原来的打点虚线就是
+                                 # 蓝色的」—— 初版给的是浅蓝 #8ab4f8，和锚点虚线 #7F77DD
+                                 # 一眼分不清。绿与下列四色都不撞：锚点紫蓝、光标橙、起止灰、
+                                 # 波形深青 #0F6E56（本色更亮更纯，且波形填充是极浅绿）。
+_SYNC_GRID_FLOOR_COLOR = "#7FD3A0"   # 左（≤T 的那一帧）：更淡，因为 ffmpeg 不会用它
+_SYNC_GRID_OFF_COLOR = "#b8860b"     # 「光标不在帧网格上」的读数色（琥珀，暗底也认得出）
+_SYNC_GRID_EPS = 1e-6            # 判定「已在网格上」的容差（秒）。`_fmt_sec6` 6 位小数
+                                 # 最多带来 0.5e-6 的表示误差，这里留 2 倍余量
+_SYNC_GRID_HIT_Y = 13            # 顶部三角的点击区高（三角本身 6px，留余量给手抖）
+_SYNC_GRID_HIT_X = 7             # 点击区半宽（三角半宽 4 + 3）
 _SYNC_GAIN_MAX = 200.0           # 波形显示增益上限：只有「真·抖动噪声」（< -66 dBFS）
                                  # 才够不着它而仍是矮线；真实轻音一律能抬到看得见
 _SYNC_GAIN_TARGET = 0.92         # 归一化基准振幅占半高比例
 _SYNC_GAIN_PCT = 0.96            # 基准取「96% 分位」而非绝对峰值（见 _sync_peak_gain）
+
+# 汇总表列定义：(列 id, 表头, 宽度权重, 对齐)。
+# 权重依据内容宽度 —— 轨道名最长（"主轨: …/xxx.mp4"）给最大；「漂移(%)」只显示
+# 百分比给最小。窗口拉宽时 `_on_tree_resize` 按这些权重等比分配控件宽度
+# （2026-10-25 用户：原来前面几列太窄、最后一列太宽，且拉窗口只有最后一列变宽）。
+# 🔴 表头这里是**中文 canonical**，故意不包 `_()`（模块级包 `_()` 会把显示名冻在导入时
+#    的语言）—— multi 的显示名在 `_build_ui` 的 `heading(cid, text=_(head))` 处翻译。
+_SYNC_TABLE_COLS = (
+    ("who", "轨道", 2.8, tk.W),
+    ("s", "起始", 1.5, tk.E),
+    ("e", "结尾", 1.5, tk.E),
+    ("dur", "区间长度", 1.6, tk.E),
+    ("da", "起始差", 1.5, tk.E),
+    ("db", "结尾差", 1.5, tk.E),
+    ("drift", "漂移(%)", 1.2, tk.E),
+)
+_SYNC_TABLE_MIN_W = 44           # 每列最小宽（列头不糊）
+
+# ---- 「写回时间」的历史（2026-10-26 用户：「加个历史记录 → ①不用二次确认干扰操作
+#      ②不怕出错」）----
+# 一次写回会同时改「视频轨 + 同源音频轨」的这 4 个 key，所以一条历史 = **整批原子
+# 回滚**，绝不能拆成逐轨条目（拆了就可能只回滚一半，比不做更糟）。
+_SYNC_WB_KEYS = ("trim_enabled", "precise_trim", "trim_start", "trim_end")
+_SYNC_WB_HIST_MAX = 20           # 最多留几次写回（一条 ≈ 6 轨 × 4 key ≈ 300 字节）
+_SYNC_ALIGN_KEEP = 10            # 「对齐档案」最多留几组（按轨道集合指纹去重）
+_SYNC_NAME_MAX_W = 26            # 轨头文件名显示宽度上限（中文算 2、英文算 1）
+
+
+def _sync_short_name(name, budget=_SYNC_NAME_MAX_W):
+    """轨头用的短文件名：按**显示宽度**截断，保住扩展名，中间不留空。
+
+    用户 2026-10-26：「波形上的轨道名，钳制到一定长度，不然按钮都被挤压没了，
+    下面列表有详细名字的」—— 轨头一行要放 8 个按钮 + 2 个读数，文件名一长
+    （尤其中文名，一个字符顶两个宽）就把按钮挤出去。完整名字在下方汇总表里。
+
+    按显示宽而不是字符数：`第01集-开幕式片段.mp4` 只有 13 个字，实际宽度 25+，
+    按 len 截会在中文名上仍然爆宽。
+    """
+    def _w(s):
+        return sum(2 if ord(c) > 0x2E80 else 1 for c in s)
+
+    if not name:
+        return ""
+    if _w(name) <= budget:
+        return name
+    root, ext = os.path.splitext(name)
+    keep = max(4, budget - _w(ext) - 1)      # 末尾「…」占 1，扩展名必须留着
+    out = ""
+    for c in root:
+        cw = 2 if ord(c) > 0x2E80 else 1
+        if _w(out) + cw > keep:
+            break
+        out += c
+    return (out or "…") + "…" + ext
+
+
+def _sync_table_widths(total_w, ratios=None):
+    """把表格总宽按比例分成各列宽度（累计边界取整）。
+
+    `ratios` 缺省 = `_SYNC_TABLE_COLS` 的设计权重；拖动列头后改用实测比例
+    （见 `_sync_table_rebalance`），这样窗口再拉宽时仍按「你拖过之后的比例」走。
+    逐列各自 round 会让总宽与 total_w 差几个像素（右边缘露白 / 冒出横向滚动）；
+    用累计边界算，最后一条边界正好落在 total_w。每列保底 `_SYNC_TABLE_MIN_W`。
+    """
+    cols = [c for c, _h, _r, _a in _SYNC_TABLE_COLS]
+    rs = list(ratios or [r for _c, _h, r, _a in _SYNC_TABLE_COLS])
+    if len(rs) != len(cols) or sum(rs) <= 0:
+        rs = [r for _c, _h, r, _a in _SYNC_TABLE_COLS]
+    total = float(sum(rs))
+    out, acc, prev = {}, 0.0, 0
+    for cid, r in zip(cols, rs):
+        acc += r
+        edge = int(round(total_w * acc / total))
+        out[cid] = max(_SYNC_TABLE_MIN_W, edge - prev)
+        prev = edge
+    return out
+
+
+def _sync_table_rebalance(widths, total_w, anchor, minw=_SYNC_TABLE_MIN_W):
+    """拖动列头后重新分配列宽 → list（长度同 widths，总和恰为 total_w）。
+
+    用户 2026-10-25：「拖动时不要挤出窗口，要钳制在列表里，其他列可以被压缩」。
+    规则：
+      · 被拖的那一列 `anchor` **保留**用户拖出来的宽度，但不超过
+        `总宽 − 其余列最小宽总和`（否则它自己就把窗口挤爆）；
+      · 其余列按**各自原宽的比例**压缩/扩张补满剩余宽度，谁都不会低于 minw；
+      · 取整差额补到最宽的那一列，保证总和**精确等于** total_w（不产生横向滚动）。
+    """
+    n = len(widths)
+    if n <= 0:
+        return []
+    total_w = max(int(total_w), minw * n)
+    anchor = max(0, min(n - 1, int(anchor)))
+    cur = [max(minw, int(x)) for x in widths]
+    a = max(minw, min(cur[anchor], total_w - minw * (n - 1)))
+    idx = [i for i in range(n) if i != anchor]
+    out = [0] * n
+    out[anchor] = a
+    rest = total_w - a
+    base = [float(max(1, cur[i])) for i in idx]
+    bsum = sum(base) or 1.0
+    acc, used = 0.0, 0
+    for k, i in enumerate(idx):
+        acc += base[k]
+        edge = int(round(rest * acc / bsum))
+        wi = max(minw, edge - used)
+        out[i] = wi
+        used += wi
+    diff = total_w - sum(out)
+    if diff:
+        for i in sorted(idx, key=lambda j: out[j], reverse=True):
+            if diff == 0:
+                break
+            if diff > 0:
+                out[i] += diff
+                diff = 0
+            else:
+                take = min(out[i] - minw, -diff)
+                out[i] -= take
+                diff += take
+    return out
+
 
 
 def _sync_parse_fps(stream):
@@ -84086,16 +86007,29 @@ def _sync_parse_fps(stream):
     return None
 
 
-def _sync_normalize_offset(off, fps):
-    """把偏移吸附到 1/fps 的帧网格（与封装页「帧网格即真源」的定位纪律一致）。"""
-    try:
-        off = float(off)
-    except (TypeError, ValueError):
-        return 0.0
-    if not fps or fps <= 0:
-        return off
-    step = 1.0 / float(fps)
-    return round(off / step) * step
+def _sync_is_vfr(stream):
+    """该视频流是否**可变帧率**（帧不在均匀网格上）。
+
+    为什么要判（2026-10-26）：「吸附到合法帧」的前提是帧落在 `k/fps` 这个均匀网格上，
+    而 VFR 素材的帧 pts 根本不在网格上 —— 对它「吸附」会吸到一个**不存在**的时刻，
+    比不吸更糟。判据抄项目已有的 VFR 口径（`r_frame_rate` 与 `avg_frame_rate`
+    相差 > 5%）。探测不到任一项时**按 CFR 处理**：宁可给刻度，也别一律禁用。
+    """
+    def _rate(key):
+        raw = str((stream or {}).get(key) or "")
+        num, _unused, den = raw.partition("/")
+        try:
+            num = float(num)
+            den = float(den) if den else 1.0
+        except (TypeError, ValueError):
+            return 0.0
+        return (num / den) if (num > 0 and den > 0) else 0.0
+
+    a = _rate("avg_frame_rate")
+    r = _rate("r_frame_rate")
+    if a <= 0 or r <= 0:
+        return False
+    return abs(a - r) / max(a, r) > 0.05
 
 
 def _sync_peak_gain(peaks, cap=_SYNC_GAIN_MAX, target=_SYNC_GAIN_TARGET,
@@ -84133,35 +86067,27 @@ def _sync_peak_gain(peaks, cap=_SYNC_GAIN_MAX, target=_SYNC_GAIN_TARGET,
 # ============ 多流同步参考：局部音频匹配（2026-09-13 追加） ============
 # 用户原话：「有没有能按当前光标给当前和其他轨道打点的按钮, 现在我要每一条手动点,
 #            会有1-2帧偏差的, 手抖的话」
-# 做法：**包络筛候选 + 波形定夺**（2026-09-14 重写）。纯 Python、零第三方
-#   依赖（项目铁律禁 numpy）。
-#   级0：20ms/帧的 RMS 能量包络上做 ZNCC 全窗打分 → 只保留「最佳−0.25」以内的
-#        候选（实测压到 ~5%），**不用来定夺**
-#   级1：250Hz 波形 ZNCC 在候选 ±2 帧内算分 → 定大致位置；分数过低则全窗兜底
-#   级2：1kHz 在 ±6 格内细化（约 1ms）
-#   级3：8kHz 在 ±8 样本内精搜（0.125ms）——远超人工点选的 1~2 帧误差
+# 做法（2026-09-14 首版：**包络筛候选 + 波形定夺**；2026-10-26 重写为
+#   **onset 包络定夺 + 波形精修**）。纯 Python、零第三方依赖（项目铁律禁 numpy）。
+#   级0：onset 包络（log-RMS 的正差分，10ms/帧）ZNCC 全窗打分 → **定夺**落点
+#   级1~3：波形逐级精修（250Hz → 1kHz → 8kHz），但**只在波形可信时**才采纳
+#          （`_SYNC_WAVE_TRUST`），否则原样返回 onset 的位置
 #
 # ⚠️ 为什么这么改：
-#   ① 旧版互相关**没有去均值**（NCC 而非 ZNCC）——任意两段「电平平稳且同号」
-#      的信号都会给出虚高的 r。静音/准静音正是这类信号，实机把「参考轨结尾静音」
-#      和「比对轨开头静音」对齐在了一起（用户 2026-09-14 反馈）。改 ZNCC 后
-#      静音窗口分母为 0，天然出局。
-#   ② 包络**只筛不定夺**（真机实测 2026-09-14）：0.3s 模板只有 15 个包络点，
-#      随机撞脸严重——同一对素材上波形层真值排第 1、包络层真值只排第 11。
-#      但包络便宜（0.1s vs 2.1s），当预筛正好：候选砍掉 95%，真值仍幸存。
-#   ③ 置信度用**全速率波形 ZNCC** 上报：真值处 ~0.99、错位置 ~0（实测），
-#      动态范围远好于包络相关度，早停阈值才有意义。
-#
-# 以「当前偏移」为猜测中心，按 _SYNC_WIN_LEVELS 逐级向外扩窗搜索：
-# 全局搜索会被音乐/周期音的旁瓣骗走，逐级扩窗既保住局部搜索的可靠性，
-# 又能覆盖「首次打点偏移未知、真实事件在几十秒外」的情况。
-# 2026-09-13 加三级扩窗（5→15→45）；2026-09-14 起上限可在界面上选，并把
-# 「够好就停」的阈值由 0.5 提到 _SYNC_MATCH_STRONG：
-#   0.5 太松——±5s 窗内只要有个凑合的假峰（对白/环境音很容易到 0.5）就提前
-#   break，后面 15s/45s 两级根本不会跑，真实事件压根没被找到。这正是
-#   「已经扩到 45 秒了却还是不好用」的根因（用户 2026-09-14 反馈）。
+#   ① 互相关**必须去均值**（ZNCC 而非 NCC）——任意两段「电平平稳且同号」的信号
+#      都会给出虚高的 r。静音/准静音正是这类信号，实机把「参考轨结尾静音」和
+#      「比对轨开头静音」对齐在了一起（用户 2026-09-14 反馈）。去均值后平窗口
+#      分母为 0 → 直接出局。
+#   ② 2026-10-26：**波形不能当定夺特征**。波形比对的是采样级相位，只在两条轨是
+#      同一份音频的字节级副本时才成立；不同来源一搅（混响 / 麦频响 / 叠加音源 /
+#      动态压缩），真值处波形相关度崩塌、音乐与周期音的旁瓣反而更高 → 命中位置
+#      乱跳几十帧。用户在真实素材上实测：整条轨波形 ZNCC 仅 0.008，而旧算法平均
+#      错 3.384 s（约 85 帧 @25fps），15 次采样**一次都没对**。
+#   ③ 换 onset 定夺 + 解码加高通 + 模板 0.3s→1.2s 后，同一素材 0/15 → **14/15**，
+#      平均|偏差| 3.384 s → 0.193 s。详见 research/audio-sync-features/。
 _SYNC_MATCH_SR = 8000          # 匹配用采样率（与波形解码一致）
-_SYNC_MATCH_TPL = 0.30         # 模板时长（秒）
+_SYNC_MATCH_TPL = 1.20         # 模板时长（秒）。⚠️ 0.3s 在真实素材上只有 15 个
+                               # 包络点，撞脸严重；1.2s 起才有足够点数（实测 2/15→12/15）
 _SYNC_MATCH_WIN = 5.0          # 搜索窗口首级（±秒，以当前偏移为猜测中心）
 _SYNC_WIN_LEVELS = (5.0, 15.0, 45.0)   # 逐级扩窗档位（默认跑到 ±45s）
 _SYNC_WIN_MAX_LEVEL = 120.0    # 界面上可选的最大窗口（±秒）
@@ -84185,10 +86111,32 @@ def sync_win_frame_sel_map():
 _SYNC_WIN_FRAME_DEFAULT = 5        # 「帧」档默认 ±5 帧
 _SYNC_WIN_FRAME_MAX = 3000         # 「帧」档帧数上限（防手滑填几万帧把搜索拖死）
 _SYNC_MATCH_MIN_GAP = 0.12     # 「最佳−次佳」相关系数差下限，低于此值提示匹配不唯一
-_SYNC_MATCH_STRONG = 0.75      # 「够好就不必再扩窗」的相关系数下限（包络相关度）
-_SYNC_MATCH_WEAK = 0.35        # 包络相关度低于此值 → 标「匹配不唯一，请核对」
-_SYNC_ENV_FRAME = 0.02         # 能量包络帧长（秒）→ 8kHz 下 160 样本
-_SYNC_ENV_KEEP = 0.25          # 包络预筛：保留「最佳 − 0.25」以内的候选（真机实测：压到 ~5%，真值仍幸存）
+                               # 实测（真实素材 15 次采样）：命中时 gap 中位 0.233、
+                               # 失手时 0.011 —— gap 比 score 更能区分真假，别动它
+_SYNC_MATCH_STRONG = 0.55      # 「够好就不必再扩窗」的 onset 相关系数下限
+                               # ⚠️ 2026-10-26 由 0.75 下调：score 语义从**波形**换成了
+                               # onset 后分布整体下移（命中中位 0.598、失手 0.402），
+                               # 0.75 会让早停永不触发、每次都跑满 4 级扩窗
+_SYNC_MATCH_WEAK = 0.35        # onset 相关度低于此值 → 标「匹配不唯一，请核对」
+                               # （命中时最低 0.404 > 0.35，不会误标）
+# 2026-10-26：定夺特征由「波形」换成 **onset 包络**（log-RMS 的正差分）。
+# 波形比对的是**采样级相位**，只在两条轨是同一份音频的字节级副本时才成立；
+# 不同来源一搅（混响 / 麦频响 / 另一路音源叠加 / 动态压缩），真值处的波形
+# 相关度崩塌，而音乐与周期音的旁瓣反而更高 → 命中位置乱跳几十帧（用户实测）。
+# 实测见 research/audio-sync-features/：混响下 250Hz 波形最佳峰偏离真值 28 帧，
+# onset 包络仍命中；换定夺特征后同一场景 2/4 → 3/4。
+_SYNC_ENV_FRAME = 0.010        # onset 底层 RMS 帧长（秒）→ 8kHz 下 80 样本
+                               # ⚠️ 别用 2ms：素材安静时（本例 RMS 仅 ~200/32768）
+                               # 2ms 帧的 RMS 几乎全是噪声，onset 被淹（实测 0/15）
+                               # 原 20ms 只够当预筛（0.3s 模板才 15 点、撞脸严重）
+# 匹配专用解码时挂的高通滤镜（置空 = 关闭）。⚠️ 只作用于**匹配用** PCM，
+# 波形显示与导出都不受影响。风噪 / 低频轰鸣会把能量包络垫平，是「波形平缓」
+# 类素材匹配不上的主因——实测同一对素材，轨2↔轨3 包络相关度 0.200 → 0.536。
+_SYNC_MATCH_HPF = "highpass=f=400"
+_SYNC_HPF_ARGS = ["-af", _SYNC_MATCH_HPF] if _SYNC_MATCH_HPF else []
+_SYNC_ONSET_FLOOR_DB = -60.0   # log 地板：静音帧的 dB 值，防 log(0)
+_SYNC_WAVE_TRUST = 0.5         # 波形精修的可信门槛：波形层分数低于此值 →
+                               # 不采纳波形给出的位置，直接用 onset 的位置
 _SYNC_TPL_MIN_RMS = 90.0       # 模板能量门控（s16 满幅 32768，90 ≈ -51 dBFS）
 _SYNC_ENERGY_RATIO = 8.0       # 候选窗口与模板的电平比上限（±18 dB），超出即跳过
 
@@ -84197,12 +86145,15 @@ def _sync_decode_pcm(ff_exe, file_path, t0, t1, sr=_SYNC_MATCH_SR):
     """把 [t0, t1) 解码成单声道 s16 样本列表（ffmpeg 内存管道，无临时文件）。
 
     `-ss/-t` 放在 `-i` 之前（input seek），只解需要的那几秒，快。
+    ⚠️ 这里会挂上 `_SYNC_MATCH_HPF` 高通（2026-10-26）：匹配只关心「起音在什么时候」，
+    而风噪 / 低频轰鸣会把能量包络垫平，让所有 lag 都长得差不多。
     """
     if not ff_exe or not file_path or (t1 - t0) <= 0.02:
         return []
     args = [ff_exe, "-v", "error",
             "-ss", _ffsec(max(0.0, t0)), "-t", _ffsec(t1 - t0),
-            "-i", file_path, "-vn", "-map", "0:a:0?",
+            "-i", file_path, "-vn"] + _SYNC_HPF_ARGS + [
+            "-map", "0:a:0?",
             "-ac", "1", "-ar", str(sr), "-f", "s16le", "pipe:1"]
     flags = _ffmpeg_spawn_flags()
     try:
@@ -84254,6 +86205,34 @@ def _sync_envelope(pcm, frame):
     inv = 1.0 / frame
     return [((sq[k + frame] - sq[k]) * inv) ** 0.5
             for k in range(0, n - frame + 1, frame)]
+
+
+def _sync_onset_env(pcm, frame=None):
+    """**onset 强度包络** = log-RMS 的**正差分**（2026-10-26 加）。
+
+    长度比 `_sync_envelope` 少 1（正差分丢掉首点）。两个变换各自解决一件事：
+
+      · log    —— 把设备间的电平差（增益、动态压缩）变成**平移**，ZNCC 归一化后
+                  不再受影响；线性 RMS 包络会被响度差直接带偏。
+      · 正差分 —— 只保留「能量在涨」的时刻（起音 / 音效 / 剪切点）。平稳段
+                  （含被杂音垫高的底噪）差分恒为 0，ZNCC 分母为 0 → 自动出局，
+                  这正是「静音对静音」这类假匹配的解药。
+
+    ⚠️ 只做 log、不做差分是不行的：log 包络太光滑，会给**任意** lag 打出高分
+    （HolgiB/audiosync 原话 "too smooth and scores arbitrary offsets"）。
+    """
+    fr = frame if frame else max(2, int(_SYNC_ENV_FRAME * _SYNC_MATCH_SR))
+    env = _sync_envelope(pcm, fr)
+    if len(env) < 3:
+        return []
+    lg = []
+    for v in env:
+        if v <= 0.0:
+            lg.append(_SYNC_ONSET_FLOOR_DB)
+        else:
+            db = 20.0 * math.log10(v / 32768.0)
+            lg.append(db if db > _SYNC_ONSET_FLOOR_DB else _SYNC_ONSET_FLOOR_DB)
+    return [max(0.0, lg[i] - lg[i - 1]) for i in range(1, len(lg))]
 
 
 def _sync_ncc_curve(tpl, hay, lo, hi, min_rms_ratio=0.0):
@@ -84391,98 +86370,89 @@ def _sync_sub_sample_peak(rs, k):
 
 
 def _sync_match_point(tpl, hay, sr=_SYNC_MATCH_SR, diag=None):
-    """在 hay 里找 tpl 的最佳起点：**包络筛候选 + 波形定夺**（2026-09-14 重写）。
+    """在 hay 里找 tpl 的最佳起点：**onset 包络定夺 + 波形精修**（2026-10-26 重写）。
 
     返回 (lag_samples, score, gap)：
       lag_samples —— 以 sr 为单位的样本偏移（hay 起点 = 0）；失败 → None
-                     **末级做了亚样本插值 → 可能是小数**，调用方按 sr 除即可
-      score       —— 最终 8kHz 全速率的波形 ZNCC（置信度，越接近 1 越可信）
-      gap         —— 包络层的「最佳 − 次佳」（次佳取半个模板长以外），
-                     越小越可能是周期音造成的假峰
+                     onset 层做了亚帧插值 → 可能是小数
+      score       —— **onset 层的 ZNCC**（置信度）。⚠️ 2026-10-26 起不再上报波形
+                     分数：混响 / 叠加音源下真值处的波形分数本来就低，拿它当置信度
+                     会把正确命中误标成「匹配不唯一，请核对」。
+      gap         —— onset 层「最佳 − 次佳」（次佳取半个模板长以外），
+                     越小越可能是周期音 / 重复段落造成的假峰
 
-    diag —— 可选的 dict，写回诊断量（不影响返回值，旧调用方不传即无开销）：
-      peak_width_ms —— 末级相关峰的半高宽（毫秒），峰越窄这次命中越可信
-      sub_sample    —— 亚样本偏移量（样本单位），0 = 退化成整数样本
+    diag —— 可选 dict，写回诊断量（不影响返回值，旧调用方不传即无开销）：
+      peak_width_ms —— 相关峰的半高宽（毫秒），峰越窄这次命中越可信
+      sub_sample    —— 亚样本偏移（样本单位），0 = 退化成整数
 
-    ⚠️ 包络只用来**筛候选、不定夺**（真机实测结论，见下）：
-      同一对素材（20s、真值延迟 2.37s、电平 0.7×）实测：
-        250Hz 波形 ZNCC —— 真值排第 1（0.571，次名 0.474）
-        20ms 包络 ZNCC  —— 真值只排第 11（0.786，榜首是错位置 0.885）
-      原因：0.3s 模板只有 15 个包络点，样本太少、随机撞脸严重；波形层有 75 个点。
-      → 包络便宜（0.1s vs 2.1s）、能把候选压到 ~5% 而真值仍幸存，正好当预筛；
-        最后谁对由波形说了算，且分数过低时自动退回全窗兜底（宁可慢，不能漏）。
+    ⚠️ **为什么不再拿波形定夺**（2026-10-26，用户实测「乱同步前后几十帧」）：
+      波形比对的是**采样级相位**，只在两条轨是同一份音频的字节级副本时才成立。
+      不同来源一搅 —— 混响、麦频响、另一路音源叠加、动态压缩 —— 真值处的波形
+      相关度就崩塌了，而音乐与周期音的旁瓣反而更高，于是命中的是假峰。
+      实测（research/audio-sync-features/）混响场景：250Hz 波形最佳峰偏离真值
+      28 帧，onset 包络仍命中；把定夺权换过来后同一场景 2/4 → 3/4。
+      「搜索范围选 ±5 帧也不对」不是窗口没生效（`_match_wins` 帧档确实是单级），
+      而是那 ±0.2s 里波形的最佳峰本来就不在真值——窗口再小只会在错位置上更自信。
+
+    ⚠️ **波形精修只在波形可信时才采纳**（`_SYNC_WAVE_TRUST`）：
+      两条轨同源时波形能给出 0.125ms 的精度，值得用；不同来源时波形是噪声，
+      采纳它只会把 onset 已经找对的位置又挪偏。分数不够就原样返回 onset 的位置
+      ——宁可精度是 2ms（25fps 一帧 40ms，够用），也不要为了精度丢掉正确性。
     """
     L = len(tpl)
     if L < 64 or len(hay) <= L:
         return None, -2.0, 0.0
-    frame = max(4, int(_SYNC_ENV_FRAME * sr))     # 8kHz → 160 样本（20ms）
-    f0, f1 = 32, 8                                # 8000 → 250Hz / 1000Hz
-    keep, gap = None, 1.0
-    te, he = _sync_envelope(tpl, frame), _sync_envelope(hay, frame)
-    if len(te) >= 3 and len(he) > len(te):
-        top = len(he) - len(te)
-        rse = _sync_ncc_curve(te, he, 0, top, min_rms_ratio=_SYNC_ENERGY_RATIO)
-        if not rse:
-            # 能量门控把候选全拒了（设备间电平差超过 ±18dB）→ 放宽再筛一次
-            rse = _sync_ncc_curve(te, he, 0, top)
-        _le, be, se = _sync_pick(rse, 0, max(1, len(te) // 2))
-        if _le is not None:
-            gap = max(0.0, be - se) if se > -1.5 else 1.0
-            keep = [i for i, r in enumerate(rse) if r >= be - _SYNC_ENV_KEEP]
+    # ---- 级0：onset 包络**定夺**（不再只是预筛）----
+    fr = max(2, int(_SYNC_ENV_FRAME * sr))          # 8kHz → 80 样本（10ms）
+    te = _sync_onset_env(tpl, fr)
+    he = _sync_onset_env(hay, fr)
+    if len(te) < 3 or len(he) <= len(te):
+        return None, -2.0, 0.0
+    top = len(he) - len(te)
+    rse = _sync_ncc_curve(te, he, 0, top)
+    if not rse:
+        return None, -2.0, 0.0
+    le, be, se = _sync_pick(rse, 0, max(1, len(te) // 2))
+    if le is None:
+        return None, -2.0, 0.0
+    gap = max(0.0, be - se) if se > -1.5 else 1.0
+    delta_e, width_e = _sync_sub_sample_peak(rse, le)
+    lag_env = (le + delta_e) * fr                   # 帧 → 样本（含亚帧）
+    if diag is not None:
+        diag["peak_width_ms"] = width_e * fr * 1000.0 / float(sr)
+        diag["sub_sample"] = delta_e * fr
+    # ---- 级1~3：波形精修；波形不可信则直接用 onset 的位置 ----
+    f0, f1 = 32, 8                                  # 8000 → 250Hz / 1000Hz
     T, H = _sync_downsample(tpl, f0), _sync_downsample(hay, f0)
     if len(H) <= len(T):
-        return None, -2.0, gap
-    span = max(4, (2 * frame) // f0)              # 包络只能定到 ±1 帧 → 放宽到 ±2
-    best_lag, best_sc, best_i = None, -2.0, None
-    scored = []                                   # [(250Hz分, 候选帧号, lag)]
-    for i in (keep or ()):
-        c = (i * frame) // f0
-        la, sc, _unused = _sync_ncc_search(T, H, max(0, c - span),
-                                     min(len(H) - len(T), c + span))
-        if la is None:
-            continue
-        scored.append((sc, i, la))
-        if sc > best_sc:
-            best_lag, best_sc, best_i = la, sc, i
-    if best_i is not None:
-        # 「次佳」= 相隔一个模板长以外的候选区里的最高分。相邻 lag 的分数几乎
-        # 一样（实测 perfect 命中时 gap 只有 0.04），只有隔开一个模板长才算
-        # 真正的「另一个候选」，gap 才能当唯一性判据用。
-        second = -2.0
-        for sc, i, _unused in scored:
-            if abs(i - best_i) <= len(te):
-                continue
-            if sc > second:
-                second = sc
-        gap = max(0.0, best_sc - second) if second > -1.5 else 1.0
-    if best_lag is None or best_sc < _SYNC_MATCH_WEAK:
-        # 候选被筛没了 / 分数太低 → 全窗兜底（旧行为，慢但不会漏）
-        la, sc, _unused = _sync_ncc_search(T, H, 0, len(H) - len(T))
-        if la is not None and sc > best_sc:
-            best_lag, best_sc = la, sc
-    if best_lag is None:
-        return None, -2.0, gap
+        return lag_env, be, gap
+    span = max(2, int(round(4 * fr)) // f0)         # ±4 个 onset 帧（8kHz：±8ms）
+    c0 = int(round(lag_env)) // f0
+    la, sc, _unused = _sync_ncc_search(T, H, max(0, c0 - span),
+                                       min(len(H) - len(T), c0 + span),
+                                       min_rms_ratio=_SYNC_ENERGY_RATIO)
+    if la is None or sc < _SYNC_WAVE_TRUST:
+        return lag_env, be, gap
     # 级2：1kHz 在 ±6 格内细化
     t1, h1 = _sync_downsample(tpl, f1), _sync_downsample(hay, f1)
-    c1 = best_lag * (f0 // f1)
+    c1 = la * (f0 // f1)
     lag1, _unused, _unused = _sync_ncc_search(t1, h1, max(0, c1 - 6),
-                                  min(len(h1) - len(t1), c1 + 6))
+                                              min(len(h1) - len(t1), c1 + 6))
     if lag1 is None:
         lag1 = c1
-    # 级3：8kHz 全速率在 ±8 样本内精搜；整数样本只到 0.125ms，
-    #      再叠一层抛物线插值把峰顶算到亚样本（2026-09-23）。
+    # 级3：8kHz 全速率在 ±8 样本内精搜 + 抛物线插值到亚样本
     c2 = lag1 * f1
     lo2 = max(0, c2 - 8)
     hi2 = min(len(hay) - L, c2 + 8)
     rs2 = _sync_ncc_curve(tpl, hay, lo2, hi2)
     lag2, sc2, _unused = _sync_pick(rs2, lo2)
     if lag2 is None:
-        return None, -2.0, gap
+        return lag_env, be, gap
     delta, width = _sync_sub_sample_peak(rs2, lag2 - lo2)
     if diag is not None:
         diag["peak_width_ms"] = width * 1000.0 / float(sr)
         diag["sub_sample"] = delta
-    return lag2 + delta, sc2, gap
+    return lag2 + delta, be, gap
 
 
 def _sync_overlap_span(offsets, durs):
@@ -84697,57 +86667,118 @@ def _sync_decode_peaks(file_path, ff_exe, duration=None, buckets=_SYNC_WAVE_BUCK
 # 用户原话：「在按光标对齐后面加个功能"取当前帧对比" 点击后取所有轨道当前帧
 #            平铺拼接对比, 注意缩放控制在屏幕内」
 # 做法：每条轨各取一帧（取该轨**自身时间轴**的光标处——与「按光标对齐」同口径，
-# 对齐后各轨光标指的就是同一个事件），ffmpeg 统一缩放到等大格子（保持原始比例、
-# 居中补黑边，绝不拉伸），Tk 里按网格平铺。图像走 PPM 内存管道，不落临时文件。
-_SYNC_FRAME_MAX_COLS = 3         # 最多 3 列：列再多每格就小到看不清了
-_SYNC_FRAME_ASPECT = 16.0 / 9.0  # 格子比例（竖屏素材居中补黑边）
+# 对齐后各轨光标指的就是同一个事件），按**各自显示比例**缩放到「同一高度」后紧排。
+# 图像走 PPM 内存管道，不落临时文件。
+#
+# 🔴 2026-10-25 改（用户：「每个画面都左右大黑边，特别是竖屏」「靠近一点」）：
+#    旧版把每帧 `scale=…:force_original_aspect_ratio=decrease` + `pad` 塞进**固定
+#    16:9** 的等宽格 —— 竖屏素材在 16:9 格里只占 1/3 宽，两边各一大块黑边；
+#    4:3 也补边。现在改为「同高 + 按各自比例定宽」，竖屏自然成窄列，黑边归零，
+#    省下的宽度直接变成画面高度（画面更大、更清楚）。格间只留 _SYNC_FRAME_GAP
+#    的细缝（用户：小缝就够，不需要像素级无缝的单张合成图）。
+_SYNC_FRAME_GAP = 2              # 格间细缝（也是各轨的视觉分隔线）
 _SYNC_FRAME_SCREEN_W = 0.92      # 窗口最多占屏宽 / 屏高这么多
 _SYNC_FRAME_SCREEN_H = 0.90
 _SYNC_FRAME_CHROME_W = 48        # 窗口装饰：边框 + 内边距
 _SYNC_FRAME_CHROME_H = 130       # 标题栏 + 顶部提示 + 底部按钮 + 边框
 _SYNC_FRAME_CAP_H = 30           # 每格下方的文字说明
-_SYNC_FRAME_MIN_W = 96           # 格子下限（极小屏宁可超屏也不做成邮票）
-_SYNC_FRAME_MIN_H = 54
+_SYNC_FRAME_MIN_H = 54           # 行高下限（极小屏宁可超屏也不做成邮票）
+_SYNC_FRAME_FALLBACK_ASPECT = 16.0 / 9.0   # 比例未知时的占位（下次刷新会自纠）
 
 
-def _sync_frame_grid(n, screen_w, screen_h):
-    """算平铺网格 → (cols, rows, tile_w, tile_h)；保证整窗装得进屏幕。
+def _sync_frame_widths(aspects, tile_h):
+    """同一行高下，各轨的格子宽度 = 行高 × 该轨显示宽高比。"""
+    out = []
+    for a in aspects:
+        try:
+            a = float(a)
+        except (TypeError, ValueError):
+            a = 0.0
+        if not (0.05 < a < 20.0):        # 明显异常（0 / 极端）→ 用占位比例
+            a = _SYNC_FRAME_FALLBACK_ASPECT
+        out.append(max(8, int(round(tile_h * a))))
+    return out
 
-    纯函数（无 Tk / 无 IO，可单测）：先按「列数 ≈ √n、最多 3 列」定网格，
-    再按可用宽定格子宽、按 16:9 定高；若总高超出可用高，就按高反算宽。
+
+def _sync_frame_rows(widths, avail_w, gap):
+    """贪心装箱：一行排不下就换行 → (rows, cells)。
+
+    rows = [[每格宽, ...], ...]；cells[i] = (row, col)（第 i 个条目的位置）。
+    纯函数（无 Tk / 无 IO，可单测）。
     """
-    n = max(1, int(n))
-    cols = 1
-    while cols * cols < n and cols < _SYNC_FRAME_MAX_COLS:
-        cols += 1
-    if cols > n:
-        cols = n
-    rows = (n + cols - 1) // cols
-    avail_w = int(screen_w * _SYNC_FRAME_SCREEN_W) - _SYNC_FRAME_CHROME_W
-    avail_h = (int(screen_h * _SYNC_FRAME_SCREEN_H) - _SYNC_FRAME_CHROME_H
-               - rows * _SYNC_FRAME_CAP_H)
-    avail_w = max(_SYNC_FRAME_MIN_W, avail_w)
-    avail_h = max(_SYNC_FRAME_MIN_H, avail_h)
-    tw = avail_w // cols
-    th = int(tw / _SYNC_FRAME_ASPECT)
-    if th * rows > avail_h:
-        th = avail_h // rows
-        tw = int(th * _SYNC_FRAME_ASPECT)
-    tw = max(_SYNC_FRAME_MIN_W, tw - tw % 2)
-    th = max(_SYNC_FRAME_MIN_H, th - th % 2)
-    return cols, rows, tw, th
+    rows, cells = [], []
+    row, cur = [], 0
+    for w in widths:
+        need = w + (gap if row else 0)
+        if row and cur + need > avail_w:
+            rows.append(row)
+            row, cur = [], 0
+            need = w
+        cells.append((len(rows), len(row)))
+        row.append(w)
+        cur += need
+    if row:
+        rows.append(row)
+    return rows, cells
+
+
+def _sync_frame_layout(aspects, screen_w, screen_h):
+    """同高紧排布局 → (tile_h, sizes, cells)；保证整窗装得进屏幕。
+
+    - `sizes[i] = (w, h)`：第 i 格的像素尺寸（**所有格同高**，宽按各自比例）；
+    - `cells[i] = (row, col)`：该格在紧排网格里的位置。
+    行高取「既装得进屏宽（含换行后的行宽）又装得进屏高」的最大值 —— 这样画面
+    尽可能大。`_fits()` 对行高是单调的（行高↑ ⇒ 每格更宽、行数不减、总高不降），
+    所以直接二分。极小屏连下限都装不下时退回下限（宁可超屏也不做成邮票）。
+    """
+    asp = list(aspects or [])
+    if not asp:
+        asp = [_SYNC_FRAME_FALLBACK_ASPECT]
+    avail_w = max(64, int(screen_w * _SYNC_FRAME_SCREEN_W) - _SYNC_FRAME_CHROME_W)
+    avail_h = max(64, int(screen_h * _SYNC_FRAME_SCREEN_H) - _SYNC_FRAME_CHROME_H)
+
+    def _pack(tile_h):
+        widths = _sync_frame_widths(asp, tile_h)
+        rows, cells = _sync_frame_rows(widths, avail_w, _SYNC_FRAME_GAP)
+        return widths, rows, cells
+
+    def _fits(tile_h):
+        widths, rows, _cells = _pack(tile_h)
+        if any(w > avail_w for w in widths):
+            return False
+        return len(rows) * (tile_h + _SYNC_FRAME_CAP_H) <= avail_h
+
+    hi = max(_SYNC_FRAME_MIN_H,
+             min(avail_h - _SYNC_FRAME_CAP_H, avail_w))
+    if _fits(hi):
+        h = hi
+    elif not _fits(_SYNC_FRAME_MIN_H):
+        h = _SYNC_FRAME_MIN_H
+    else:
+        lo = _SYNC_FRAME_MIN_H
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if _fits(mid):
+                lo = mid
+            else:
+                hi = mid - 1
+        h = lo
+    widths, _rows, cells = _pack(h)
+    return h, [(w, h) for w in widths], cells
 
 
 def _sync_grab_frame(ff_exe, file_path, t, tw, th, timeout=60):
-    """取 file_path 在 t 秒处的一帧 → PPM bytes（缩到 tw×th，保持比例居中补黑边）。
+    """取 file_path 在 t 秒处的一帧 → PPM bytes（缩到 tw×th，**不补黑边**）。
+
+    `tw`/`th` 由 `_sync_frame_layout` 按该轨自己的显示比例算出（同高、宽按比例），
+    所以这里直接 `scale=tw:th` 即可铺满整格 —— 不再有 `pad` 补出来的左右黑边。
 
     `-ss` 前置（input seek：只解目标附近，快；ffmpeg 会解码到目标时间戳，
     不是只落关键帧）。失败（超时 / 光标超尾 / 无视频流）一律返回 None。
     """
     if not ff_exe or not file_path or tw <= 0 or th <= 0:
         return None
-    vf = ("scale=%d:%d:force_original_aspect_ratio=decrease,"
-          "pad=%d:%d:(ow-iw)/2:(oh-ih)/2,setsar=1" % (tw, th, tw, th))
+    vf = "scale=%d:%d:flags=bicubic,setsar=1" % (tw, th)
     args = [ff_exe, "-v", "error", "-hide_banner",
             "-ss", _ffsec(max(0.0, float(t))), "-i", file_path,
             "-an", "-sn", "-frames:v", "1",
@@ -84793,6 +86824,12 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         #   · 无头测试把 _start_probe 打桩 → 恒 False → 上述两条路径完全不触发，
         #     旧断言（画布项数等）逐字不受影响
         self._generating = [False] * self.n
+        # 探测在跑（主线程读）：`_start_probe` 里**同步**置 True（不给 _poll 抢跑的窗口），
+        # worker 自己（且只有当代际号仍是自己的时候）在 finally 里置 False。
+        # 用途：用户点「重新生成波形」后，_poll 靠它判断整轮是否真跑完 → 把
+        # hint_var 的「正在重新生成波形…」收尾成终态（见 _regen_waves 注释）。
+        self._probe_running = False
+        self._regen_pending = False   # 「重新生成波形」的中间态待收尾（仅用户主动触发时为 True）
         self._wave_last = [0.0] * self.n   # 各轨上次重绘时刻（渐进节流用）
         self.gains = [1.0] * self.n     # 显示增益（仅观感，见 _sync_peak_gain）
         self._auto_gains = [1.0] * self.n   # 自动检测值（手动覆盖时的回落基准）
@@ -84800,16 +86837,26 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         # 自动归一化顾不了「前段平线后段正常」的两头（用户 2026-09-13），手动填更直接
         self._probe_gen = 0             # 探测代际号：重新生成时旧线程自行退出
         self.gain_entries = []
+        # 每轨「移动光标到」输入框（轨头，打结尾右边）—— **保留**。
+        # 2026-10-26：光标控制行另外加了一份「到 [时间] s」（作用于当前轨），两者
+        # 共用同一个动作 `_goto_cursor_entry`，但各读各的输入框：它们都是**命令输入**
+        # 而非状态镜像，不存在「改一个另一个不同步」的问题。
+        self.goto_vars = []
         self.cursors = [0.0] * self.n
         self.offsets = [0.0] * self.n
         self.fps_list = [None] * self.n
+        # 每轨是否 VFR（帧不在均匀网格上）⇒ 该轨不画帧刻度、不吸附（见 `_sync_is_vfr`）
+        self.vfr = [False] * self.n
+        # 每轨轨头读数 Label（不止要文本，还要能改颜色提示「不在帧网格上」）
+        self.readout_lbls = []
+        self._snap_guard = False        # 本次按下已由「点三角吸附」处理 → 随后的 drag 让路
+        self.aspects = [None] * self.n   # 显示宽高比（含元数据旋转 / 用户 rotate）→ 帧对比紧排用
         self.ref_i = 0
         self.fps = 0.0
         self.active_i = 1 if self.n > 1 else 0
         self.anchors = []            # [{"label": "起始", "vals": [t_i, ...]}]
         self.drift = [None] * self.n  # 漂移（speed_factor − 1），需两个锚点
         self._view = None            # 参考轴视图窗口 (t0, t1)
-        self._dot = None             # 打点会话 {vals: [t|None, ...]}
         self._stop = False
         self._procs = [None] * self.n
         self._play_pos = [None] * self.n   # 播放中该轨位置（秒，轨自身时间轴；None=未播）
@@ -84819,7 +86866,17 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         self._pan = None
         self._poll_job = None
         self._topmost = tk.BooleanVar(value=False)   # 「总在最前」默认关（见 __init__ 去 transient 的注释）
+        self._fullw_prev = None      # 「铺满宽度」前的尺寸/位置（None = 当前没铺满）
         self._restored_note = ""     # 自动恢复上次结果的提示（构建完 UI 后刷到 hint_var）
+        # 写回历史（2026-10-26）：每次「写回时间」前，把将要动到的轨道（视频 + 同源
+        # 音频）那 4 个 key 的「原值」连同「是否存在」记一条，可逐步回滚。
+        # 随档案落盘到 `sync_ref_last.json`（见 `_archive_dict`），跨会话仍能还原
+        # —— 这也是敢把二次确认删掉的理由（关了窗才发现写错也能救）。
+        self._wb_hist = []
+        # 对齐档案：最近几组「不同轨道集合」的对齐结果。旧版 `sync_ref_last.json`
+        # 只有一个槽位 —— 做完 A 组再做 B 组，A 组当场被覆盖（用户 2026-10-26：
+        # 「这个文件利用率不高」）。现在按轨道集合指纹各留一份。
+        self._align_hist = []
 
         self._build_ui()
         self._reset_view()
@@ -84879,26 +86936,22 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         tm.pack(side=tk.LEFT, padx=(14, 0))
         ToolTip(tm, _("默认**关闭**：本窗可以和主窗自由切换（复制结果到别处时不会被挡住）。\n"
                     "勾上后常驻最前，适合一边看波形一边在主窗操作。"))
+        # 「铺满宽度」（2026-10-26 用户要求）：系统「最大化」会把窗口顶到屏幕最上，
+        # 而且一拖标题栏就掉回小尺寸。这颗按钮只把**宽**拉到屏幕宽、x 归 0，
+        # 高度与 y 一个字节不动 ⇒ 窗口只向左右长、标题栏停在原处，仍能照常拖动。
+        # 再点一次还原到铺满前的 geometry（波形 canvas / 汇总表都有 <Configure>
+        # 重绘，铺满后自动按新宽度重算，不用手动刷新）。
+        fw = ttk.Button(top, text=_("铺满宽度"), width=9, command=self._toggle_full_width)
+        fw.pack(side=tk.LEFT, padx=(6, 0))
+        ToolTip(fw, _("把窗口左右拉满屏幕宽度，**高度和纵向位置不动** —— 所以标题栏还在原处，\n"
+                    "能照常拖动（系统「最大化」会贴到屏幕最上，一拖标题栏就还原，故不再用它）。\n"
+                    "再点一次 = 回到铺满之前的尺寸与位置。"))
 
-        # 打点目标必须显式（2026-09-13 实机反馈「这表格看不懂啊」）：
-        # 旧版只有一个「打点」，锚点名字由 len(anchors) 顺序决定 → 用户混用
-        # 「时间预览回填」与「打点会话」后就打出 #3/#4，而「起始/结尾」两格是空的。
-        # 现在固定成两个槽位，各自一个按钮，写哪一格由用户点哪个按钮决定。
-        self.dot_btn2 = ttk.Button(top, text=_("打结尾"),
-                                   command=lambda: self._toggle_dot(_("结尾")))
-        self.dot_btn2.pack(side=tk.RIGHT)
-        ToolTip(self.dot_btn2, _("进入打点会话：按提示在每条轨道波形上点同一个事件（拍手声等），\n"
-                               "这一轮写进「结尾」格。再次点击 = 取消本次会话。"))
-        self.dot_btn = ttk.Button(top, text=_("打起始"),
-                                  command=lambda: self._toggle_dot(_("起始")))
-        self.dot_btn.pack(side=tk.RIGHT, padx=(0, 6))
-        ToolTip(self.dot_btn, _("进入打点会话：按提示在每条轨道波形上点同一个事件（拍手声等），\n"
-                              "这一轮写进「起始」格。再次点击 = 取消本次会话。\n"
-                              "提示：波形上点一下也能设定该轨光标，逐帧微调后用该轨轨头\n"
-                              "「打起始(all) / 打结尾(all)」一键写入全部轨更准。"))
-        btns_lbl = ttk.Button(top, text=_("自动对齐（待开发）"))
-        btns_lbl.state(["disabled"])
-        btns_lbl.pack(side=tk.RIGHT, padx=(0, 6))
+        # 顶部两颗「打起始 / 打结尾」已删除（2026-10-25 用户：「不好用，一般都是用的
+        # 轨道里的 all」）—— 打点统一走轨头「打起始(all) / 打结尾(all)」（按已对齐的
+        # 偏移一次写入全部轨），顶部不再有第二套「逐轨轮流点」的会话入口。
+        # 那颗「自动对齐（待开发）」占位按钮已删（2026-10-26 用户：界面里不要留死按钮）：
+        # 它从加进来起就是 disabled，只占位置、还在顶栏里挤掉了真正能用的按钮。
         rgb = ttk.Button(top, text=_("重新生成波形"), command=self._regen_waves)
         rgb.pack(side=tk.RIGHT, padx=(0, 6))
         ToolTip(rgb, _("重新解码全部轨道的包络并重算自动增益。\n"
@@ -84918,6 +86971,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         self.badges = []
         self.gain_vars = []
         self.readout_vars = []
+        self.dur_vars = []          # 轨头「素材 0.000→12.345 s」（起止竖线的数值版）
         self.play_btns = []
         self.preview_btns = []
         for i, tr in enumerate(self.tracks):
@@ -84927,24 +86981,38 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             head.pack(fill=tk.X)
             idx = getattr(tr, "index", i + 1)
             base = os.path.basename(getattr(tr, "file_path", "") or "")
-            ttk.Label(head, text=_('轨道 {0} · {1}').format(idx, base)).pack(side=tk.LEFT)
+            # 轨头这一行要塞 8 个按钮 + 2 个读数，文件名一长就把按钮挤没了（用户
+            # 2026-10-26：「钳制到一定长度，下面列表有详细名字的」）→ 按显示宽度截断，
+            # 完整名字在下方汇总表「轨道」列，鼠标悬停也看得到。
+            _nlbl = ttk.Label(head, text=_('轨道 {0} · {1}').format(idx, _sync_short_name(base)))
+            _nlbl.pack(side=tk.LEFT)
+            if base and _sync_short_name(base) != base:
+                ToolTip(_nlbl, _("完整名称：\n{0}\n\n"
+                                 "（轨头宽度有限，这里只显示截断版；下方汇总表里是完整名。）").format(base))
             badge = ttk.Label(head, text=_("参考") if i == self.ref_i else _("待对齐"),
                               foreground="#185FA5" if i == self.ref_i else "#854F0B")
             badge.pack(side=tk.LEFT, padx=(8, 0))
             self.badges.append(badge)
+            # 「增益×」合并成一个框（2026-10-26 用户：「可以合并，因为不太关心他显示
+            # 是多少，偶尔改是因为视频是拼接视频，中间一段的增益高，导致别的地方压的
+            # 小，手动改一下显示，其他时候完全不会关注这个增益，所以他合并是最好的，
+            # 节约空间」；并明确「不能收，就放轨头」——增益是按音频最高段算的，
+            # 其他段会小，随手改才顺手）。
+            # 原先「显示增益 ×8.0（手动）」Label + 「增益×」Entry 是两个控件，
+            # 现在合成**一个** Entry：框里就是当前生效值，改动回车即手动覆盖，
+            # 手动值后缀 `*`（自动值无标记）。省掉整条灰色文字标签的宽度。
             gv = tk.StringVar(value="")
             self.gain_vars.append(gv)
-            ttk.Label(head, textvariable=gv, foreground="#888888").pack(side=tk.LEFT,
-                                                                      padx=(8, 0))
             _lbltt45 = ttk.Label(head, text=_("增益×"), foreground="#888888")
-            _lbltt45.pack(side=tk.LEFT,
-                                                                     padx=(10, 2))
-            ge = ttk.Entry(head, width=5)
+            _lbltt45.pack(side=tk.LEFT, padx=(10, 2))
+            ge = ttk.Entry(head, width=6, textvariable=gv, justify=tk.RIGHT)
             ge.pack(side=tk.LEFT)
             ge.bind("<Return>", lambda _e, i=i: self._apply_gain_entry(i))
             ToolTip(_lbltt45, _("手动显示增益（只改观感，不影响对齐计算）：填正数如 8 或 8.5，\n"
-                        "回车生效；留空回车 = 恢复自动。长视频前段被压成平线时，\n"
-                        "把该轨增益调大即可；过大削顶属正常（超出 ±32768 截断）。"))
+                        "回车生效；清空回车 = 恢复自动。长视频前段被压成平线时，\n"
+                        "把该轨增益调大即可；过大削顶属正常（超出 ±32768 截断）。\n\n"
+                        "框里显示的就是**当前生效值**：末尾带 `*` = 手动覆盖，\n"
+                        "无标记 = 自动（按该轨 96% 分位归一化）。"))
             self.gain_entries.append(ge)
             pb = ttk.Button(head, text=_("播放"), width=6,
                             command=lambda i=i: self._toggle_play(i))
@@ -84982,9 +87050,43 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             aeb.pack(side=tk.LEFT, padx=(4, 0))
             ToolTip(aeb, _("一键打结尾（全部轨）：以这条轨当前光标处为这个事件，\n"
                          "其余轨按已对齐的偏移反算同一时刻，整行写入「结尾」格。"))
+            # 「移动光标到」（2026-10-26 用户：「波形上的打结尾后面添加控件『移动光标到:
+            # 数值』，这样我可以把从播放器获取的帧转场的时间定位到波形上」）：
+            # 波形上点一下只能粗定位、±1 帧要一格格试，这里直接填时间一步到位。
+            # 口径 = **本轨自身时间**（与轨头右侧读数、下方汇总表同一口径，用户原话
+            # 「比如 2:30秒，那大概就是150秒光标位置」）；`2:30` / `1:02:03` / `150.5`
+            # 都认（复用 time_to_seconds）。
+            # ⚠️ 2026-10-26：光标控制行另有一份「到 [时间] s」（作用于**当前轨**、可点
+            # 按钮不必回车）。**轨头这份保留**（用户：「我只让你在光标里加，没让你删除」）
+            # —— 轨头的意义是「就地指定这一条轨」，不用先把「当前轨」切过去。
+            # 两处共用 `_goto_cursor_entry`，各读各的输入框（命令输入，无同步问题）。
+            _glbl = ttk.Label(head, text=_("移动光标到"))
+            _glbl.pack(side=tk.LEFT, padx=(10, 2))
+            gv = tk.StringVar(value="")
+            self.goto_vars.append(gv)
+            ge2 = ttk.Entry(head, textvariable=gv, width=8, justify=tk.RIGHT)
+            ge2.pack(side=tk.LEFT)
+            ge2.bind("<Return>", lambda _e, i=i: self._goto_cursor_entry(i))
+            ttk.Label(head, text="s").pack(side=tk.LEFT, padx=(1, 0))
+            ToolTip(_glbl, _("把这条轨的光标直接移到填的时间（**本轨自身时间**，与右边读数同口径）。\n"
+                           "填 150 / 150.5 / 2:30 / 1:02:03 都可以，回车生效。\n"
+                           "用途：从播放器 / 时间预览拿到转场时刻，不必在波形上一格格点。\n\n"
+                           "★ 下面「光标」那行还有一个同样的「到 [时间] s」，那个作用于\n"
+                           "   「当前轨」且能点按钮（不必回车）——轨头这个则是就地指定本轨。"))
+            ToolTip(ge2, _("回车 = 光标跳到这个时间点（只挪光标，不改偏移、不打点）。\n"
+                         "超过素材长度也能填，但光标会落在波形右侧之外，状态栏会提醒。\n"
+                         "取时间：简易时间预览里「复制时间」**右键** →「复制当前时间」。"))
+            # 素材起止的数值版（自身时间 0 → dur，与「到起点 / 到终点」同口径）：
+            # 画布上只有线，数字放这里 —— 波形行高只有 44~62px，画布塞数字会和波形打架。
+            dv = tk.StringVar(value="")
+            self.dur_vars.append(dv)
+            ttk.Label(head, textvariable=dv, foreground="#888888").pack(side=tk.RIGHT,
+                                                                        padx=(0, 10))
             rd = tk.StringVar(value="0.000 s")
             self.readout_vars.append(rd)
-            ttk.Label(head, textvariable=rd).pack(side=tk.RIGHT)
+            _rdlbl = ttk.Label(head, textvariable=rd)
+            _rdlbl.pack(side=tk.RIGHT)
+            self.readout_lbls.append(_rdlbl)
 
             cv = tk.Canvas(row, height=self.row_h, width=960,
                            highlightthickness=1, highlightbackground="#d5d5d5",
@@ -85024,6 +87126,55 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         ent.bind("<Return>", lambda e: self._commit_offset_entry())
         ttk.Label(ctl, text="s").pack(side=tk.LEFT, padx=(2, 8))
 
+        # ---------- 光标差 + 偏移微调（2026-10-26 用户要求，与上面同一行） ----------
+        # ① 「光标差」= 当前轨光标与参考轨光标在**屏幕上**的距离 —— 两轨各自时间轴的
+        #    光标值之差会被几十秒的轨道整体偏移污染（用户实测：「肉眼看差 0.0 几，
+        #    却显示 40 多秒」）。真值见 `_cursor_delta`。
+        #    用只读 Entry 而不是 Label：能选中 + Ctrl+C 拿去粘贴（用户：「光标差那里
+        #    开放编辑就能复制」）；但**不做可写** —— 它是派生量，可改会立刻变成第二个
+        #    事实来源，重演「列表一个值、轨道另一个值」的割裂。
+        # ② 微调 = 对当前轨 offsets 做任意秒数的纯增量加减（用户：「比现在的轨道上的
+        #    加一帧减一帧更加精细的一个档位」），默认 0.001 s：1 帧 @25fps 是 40 ms，
+        #    细 40 倍。只改偏移：光标在自身时间轴上的值 / 锚点 / 漂移 / 外部截取都不动。
+        ttk.Label(ctl, text=_("光标差")).pack(side=tk.LEFT, padx=(6, 2))
+        self.delta_var = tk.StringVar(value="—")
+        self.delta_ent = ttk.Entry(ctl, textvariable=self.delta_var, width=10,
+                                   justify=tk.RIGHT, state="readonly")
+        self.delta_ent.pack(side=tk.LEFT)
+        ttk.Label(ctl, text="s").pack(side=tk.LEFT, padx=(2, 6))
+        ToolTip(self.delta_ent,
+                _("当前轨光标与参考轨光标**在屏幕上的距离**（已含各轨偏移），正 = 本轨光标"
+                "在参考轨光标右边。\n"
+                "· 点哪条波形「当前轨」就切到哪条，这里立刻跟着变（参考轨自己是基准，显示 —）。\n"
+                "· 可选中复制（Ctrl+C）；只读，因为它由光标和偏移实时算出，改了没有意义。\n"
+                "⚠️ 要对齐方向是**反的**：两光标落在同一竖线 ⇒ 偏移该「减」掉这个差。\n"
+                "   ⇒ 点右边「取」把它填进微调框，再点「−」即对齐（「+」是反方向）。"))
+        _dn = ttk.Button(ctl, text="−", width=2,
+                         command=lambda: self._nudge_offset_precise(-1))
+        _dn.pack(side=tk.LEFT)
+        self.step_var = tk.StringVar(value="0.001")
+        _se = ttk.Entry(ctl, textvariable=self.step_var, width=8, justify=tk.RIGHT)
+        _se.pack(side=tk.LEFT, padx=(2, 1))
+        ttk.Label(ctl, text="s").pack(side=tk.LEFT, padx=(1, 1))
+        _dp = ttk.Button(ctl, text="+", width=2,
+                         command=lambda: self._nudge_offset_precise(1))
+        _dp.pack(side=tk.LEFT)
+        ToolTip(_se,
+                _("「−」「+」每次加减多少秒（任意值，默认 0.001 = 1 毫秒；\n"
+                "1 帧 @25fps 是 0.040 秒，所以这一档细 40 倍）。填负数再按「+」= 反向。"))
+        ToolTip(_dn,
+                _("当前轨偏移 −= 中间那个秒数。纯增量、**不吸附帧网格**\n"
+                "（吸网格会让 ± 不可逆，与上面「±1 帧」同一纪律）。\n"
+                "只移动轨道：波形 / 光标 / 锚点整条一起平移；光标在自身时间轴上的值、\n"
+                "锚点、漂移、外部轨道截取全都不动，也不进写回历史。"))
+        ToolTip(_dp, _("当前轨偏移 += 中间那个秒数。纯增量、不吸附帧网格；只移动轨道。"))
+        _tk = ttk.Button(ctl, text=_("取"), width=3, command=self._take_delta)
+        _tk.pack(side=tk.LEFT, padx=(4, 0))
+        ToolTip(_tk,
+                _("把左边的「光标差」（全精度原值）填进微调框，不用手抄。\n"
+                "填完点「−」= 本轨整体向参考轨靠拢、两个光标重合；\n"
+                "点「+」= 反方向（把它当纯数值用）。"))
+
         # 光标精调（2026-09-13 实机反馈「打点有没有能准确选中他们的按钮」）：
         # 波形上点一下只能粗定位；这里给逐帧微调 + 一键写成锚点，
         # 替代「凭手感恰好点在拍手声上」——正是用户说的「重新选到那个打点的地方有点难」。
@@ -85039,6 +87190,35 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         ttk.Button(ctl1b, text=_("+10 帧"),
                    command=lambda: self._nudge_cursor(10), width=6).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Button(ctl1b, text=_("到起点"), command=self._goto_cursor_start, width=6).pack(side=tk.LEFT, padx=(0, 2))
+        # 「到 [时间] s」（2026-10-26 用户要求）：位置刻意夹在「到起点」「到终点」
+        # 之间 ⇒ 三颗连成一组「光标定位」（起点 / 指定时刻 / 终点）。
+        # 「到」本身做成按钮（用户：「有时候不想点回车，可以点按钮」）：从播放器 /
+        # 时间预览抄来一个时刻粘上，直接点「到」即可，焦点不必留在输入框里。
+        # ⚠️ 轨头那个「移动光标到」**照旧保留**（就地指定某条轨）；这一格作用于
+        # **当前轨**，两者共用 `_goto_cursor_entry`、各读各的输入框。
+        # 动作对象恒为「当前轨」，切轨后输入框内容保留——它是命令输入而非状态镜像，
+        # 所以不像「偏移」框那样随切轨刷新。
+        self.goto_var = tk.StringVar(value="")
+        self.goto_btn = ttk.Button(
+            ctl1b, text=_("到"), width=2,
+            command=lambda: self._goto_cursor_entry(self.active_i, self.goto_var.get()))
+        self.goto_btn.pack(side=tk.LEFT)
+        self.goto_ent = ttk.Entry(ctl1b, textvariable=self.goto_var, width=8,
+                                  justify=tk.RIGHT)
+        self.goto_ent.pack(side=tk.LEFT, padx=(2, 1))
+        self.goto_ent.bind(
+            "<Return>",
+            lambda _e: self._goto_cursor_entry(self.active_i, self.goto_var.get()))
+        ttk.Label(ctl1b, text="s").pack(side=tk.LEFT, padx=(0, 4))
+        ToolTip(self.goto_btn,
+                _("把「当前轨」的光标移到右边填的时间（**本轨自身时间**，与轨头读数同口径）。\n"
+                "粘好时间直接点这里，不用按回车。\n\n"
+                "★ 时间从哪来：「简易时间预览」窗口里定位好那一帧 → 在它的\n"
+                "   「复制时间」按钮上**按右键** → 「复制当前时间」，粘到这里即可。"))
+        ToolTip(self.goto_ent,
+                _("填 150 / 150.5 / 2:30 / 1:02:03 都可以，回车或点左边的「到」生效。\n"
+                "只挪光标，不改偏移、不打点。超过素材长度也能填，但光标会落在\n"
+                "波形右侧之外，状态栏会提醒。"))
         ttk.Button(ctl1b, text=_("到终点"), command=self._goto_cursor_end, width=6).pack(side=tk.LEFT, padx=(0, 10))
         self.auto_btn = ttk.Button(ctl1b, text=_("自动找点"), command=self._auto_find_all)
         self.auto_btn.pack(side=tk.LEFT)
@@ -85051,7 +87231,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         self.win_var = tk.StringVar(value="5")
         self.win_box = ttk.Combobox(ctl1b, textvariable=self.win_var, width=4,
                                     state="readonly",
-                                                                         values=(sync_win_frame_disp(), "5", "15", "45", "120"))
+                                    values=(sync_win_frame_disp(), "5", "15", "45", "120"))
         self.win_box.pack(side=tk.LEFT)
         self.frame_var = tk.StringVar(value=str(_SYNC_WIN_FRAME_DEFAULT))
         self.frame_box = ttk.Entry(ctl1b, textvariable=self.frame_var, width=3,
@@ -85069,23 +87249,24 @@ class MultiSyncReferenceDialog(tk.Toplevel):
                 "小窗口里找到「足够像」的就停，不够像才继续往外扩。\n"
                 "偏差几十秒、不知道差在哪 → 选 45 或 120（越慢，越要核对）。"))
         ToolTip(self.frame_box,
-                _("「帧」档的窗口大小（帧）。默认 {0} 帧"
-                "（25fps ≈ ±0.2 秒）；\n"
-                "越大容错越高，但窗内重新出现第二个相似段落的风险也越高。").format(_SYNC_WIN_FRAME_DEFAULT))
+                _('「帧」档的窗口大小（帧）。默认 {0} 帧（25fps ≈ ±0.2 秒）；\n越大容错越高，但窗内重新出现第二个相似段落的风险也越高。').format(_SYNC_WIN_FRAME_DEFAULT))
         ToolTip(self.auto_btn,
-                _("以「当前轨」光标处的音频为模板，在其余轨道上自动找出同一个事件\n"
-                "（能量包络预筛 + 波形零均值互相关 + 亚样本插值，精度优于 0.1ms）。\n"
-                "搜索范围 = 右边的下拉（默认 ±5 秒；选「帧」= 帧级精修，窗口只有几帧）。\n"
-                "「在 ± 多少内命中、相似度多少」，相似度低于 0.35 或存在另一个\n"
-                "同样像的候选区时，会单独标「匹配不唯一」让你核对。\n"
-                "⚠️ 光标若落在静音上会直接报错（静音只能跟静音对上，结果必错）——\n"
+                _("以「当前轨」光标前后各 0.6 秒的音频为模板，在其余轨道上自动找出同一段声音\n"
+                "搜索范围 = 右边的下拉（默认 ±5 秒；选「帧」= 窗口只几帧，又快又准）。\n"
+                "命中后状态栏给「在 ± 多少秒内命中、相似度多少」；相似度低于 0.35、\n"
+                "或还有另一个同样像的候选时，会单独标「匹配不唯一」让你核对。\n"
+                "⚠️ 光标落在静音上会直接报错（静音只能跟静音对上，结果必错）——\n"
                 "   请把光标挪到有声音的地方再点本按钮。\n"
-                "命中只挪光标、不直接写锚点——看好再按该轨轨头「打起始(all) / 打结尾(all)」。"))
+                "命中只挪光标、不写锚点——看好再按该轨轨头「打起始(all) / 打结尾(all)」。"))
         # 「设为起始 / 设为结尾」两个按钮已于 2026-09-14 移除：它们调用的是
         # `_write_anchor_all(k)`（i0 默认 = 当前轨），与当前轨轨头那个
         # 「打起始(all) / 打结尾(all)」**完全同一个函数、同一个结果**，
         # 只是一个写死成「当前轨」、一个每轨都有。留着纯属重复入口。
-        ttk.Label(ctl1b, text=_("波形点一下设光标 → 逐帧微调 → 自动找点 → 轨头「打xx(all)」写入全部轨"),
+        # 尾注缩短（2026-10-26）：原句 40 多字（「波形点一下设光标 → 逐帧微调 →
+        # 自动找点 → 轨头「打xx(all)」写入全部轨」），而本行前面又插进了「到 [时间] s」
+        # 三件套 —— pack 的最后一项先被压掉，留着就等于看不见。引导本来该由 tooltip
+        # 与结构承担，这里只留最小提示。
+        ttk.Label(ctl1b, text=_("点波形设光标 → 微调 → 轨头「打…(all)」落笔"),
                   foreground="gray").pack(side=tk.LEFT, padx=(10, 0))
 
         ctl2 = ttk.Frame(main)
@@ -85093,12 +87274,38 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         ttk.Button(ctl2, text=_("缩小"), command=lambda: self._zoom(1.4)).pack(side=tk.LEFT)
         ttk.Button(ctl2, text=_("放大"), command=lambda: self._zoom(1 / 1.4)).pack(side=tk.LEFT, padx=2)
         ttk.Button(ctl2, text=_("适应重叠区"), command=self._fit_overlap).pack(side=tk.LEFT, padx=2)
-        ttk.Button(ctl2, text=_("全长"), command=self._reset_view).pack(side=tk.LEFT, padx=2)
+        # 「全长」= 回到初始视图（波形看全片）；顺手把汇总表列宽也还原成默认比例
+        # （2026-10-25 用户：「把恢复列宽的逻辑绑进从截取读回」→「或者绑进那个 全长」）。
+        self.full_btn = ttk.Button(ctl2, text=_("全长"),
+                                   command=lambda: self._reset_view(reset_cols=True))
+        self.full_btn.pack(side=tk.LEFT, padx=2)
+        ToolTip(self.full_btn,
+                _("波形视图回到全长（缩放到所有轨道的完整重叠范围）。\n"
+                "顺带把汇总表列宽**恢复成默认比例**（拖乱了列头时点这里还原）。"))
         ttk.Button(ctl2, text=_("清除标记"), command=self._clear_anchors).pack(side=tk.LEFT, padx=2)
-        self.undo_btn = ttk.Button(ctl2, text=_("撤销打点"), command=self._undo_dot)
+        # 2026-10-26 改名：原「撤销打点」是打点会话时代的名字（那个会话机已整块删除），
+        # 现在撤的是**最后一次落笔的槽位**（结尾 → 起始 倒序），叫「撤销一步」才不会误导。
+        self.undo_btn = ttk.Button(ctl2, text=_("撤销一步"), command=self._undo_dot)
         self.undo_btn.pack(side=tk.LEFT, padx=2)
-        self.align_btn = ttk.Button(ctl2, text=_("按光标对齐"), command=self._align_by_cursors)
+        # 2026-10-26 加两字：「按光标对齐」→ **「按光标对齐波形」**。
+        # 起因是用户「窗口里最混淆的 2 个按钮是同步光标和按光标对齐」，而他不要
+        # 我给的替换词（「你给的文字也不咋滴」），选了自己认可的最小改动：
+        # 保留原名、补出**被对齐的对象**（波形），靠「波形」二字区分。
+        # 两颗按钮的实质差异：同步光标只改 `cursors`（光标跑、波形不动）；
+        # 这一颗改 `offsets`（整条轨连波形带光标一起平移）—— 互逆运算，不是同义词。
+        self.align_btn = ttk.Button(ctl2, text=_("按光标对齐波形"),
+                                    command=self._align_by_cursors)
         self.align_btn.pack(side=tk.LEFT, padx=(10, 0))
+        ToolTip(self.align_btn,
+                _("把**波形**对齐：以参考轨的光标为基准，把每条轨整体左右平移（改偏移），\n"
+                "让各轨光标处的同一事件落在同一个位置上。\n\n"
+                "和轨头那颗「同步光标」的区别（两颗是反着的）：\n"
+                "  ·「同步光标」只挪光标竖线 → 波形原地不动，用来**核对**是不是同一事件；\n"
+                "  ·「按光标对齐波形」挪的是整条轨 → 波形和光标一起走，真的**改对齐结果**。\n\n"
+                "前提：各轨光标得先落在同一个事件上（波形上点 / ±帧微调 / 自动找点）。\n"
+                "参考轨自己不动（偏移恒为 0），不要拿它当被对齐的对象。\n\n"
+                "⚠ 会覆盖此前用「±帧」手工微调好的偏移，并对全部轨生效；\n"
+                "不打起始/结尾、不动锚点。对得准不准看下面汇总表的「起始差 / 结尾差」。"))
         # 取当前帧对比（2026-09-14，用户原话「在按光标对齐后面加个功能"取当前帧对比"」）：
         # 波形是听的，这里给眼睛看的——同一事件在各轨上到底是不是同一画面，一屏见分晓。
         self.frame_btn = ttk.Button(ctl2, text=_("取当前帧对比"),
@@ -85107,7 +87314,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         ToolTip(self.frame_btn,
                 _("把**每条轨道**当前光标处的那一帧取出来，平铺成网格同屏对比：\n"
                 "对齐对上了 → 各格画面应当一致；没对上 → 一眼看出差在哪。\n"
-                "取的是各轨**自己时间轴**上的光标处（与「按光标对齐」同口径），\n"
+                "取的是各轨**自己时间轴**上的光标处（与「按光标对齐波形」同口径），\n"
                 "所以先让各轨光标落到同一事件（自动找点 / 逐轨在波形上点）再取。\n"
                 "画面按原始比例缩放、整窗绝不超出屏幕；窗口不关，回去挪光标后\n"
                 "点对比窗里的「重新取帧」即可刷新。"))
@@ -85125,11 +87332,17 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         self.write_back_btn = ttk.Button(ctl2, text=_("写回时间"),
                                          command=self._push_alignment_to_tracks)
         self.write_back_btn.pack(side=tk.RIGHT, padx=(0, 6))
+        # 右键 = 写回历史（2026-10-26 用户拍板的入口形式 A）：左键**直接写回、不再弹
+        # 二次确认**，右键给后悔药 —— 不额外占按钮位，与「把复位列宽塞进『全长』」同路数。
+        # 用 Button-3（Windows 右键惯例）；ttk.Button 的 Button-3 不会触发 command。
+        self.write_back_btn.bind("<Button-3>", self._popup_wb_menu)
         ToolTip(self.write_back_btn,
                 _("把对齐好的「起始/结尾」写回**外部轨道**的截取设置（trim_enabled /\n"
                 "precise_trim / trim_start / trim_end，视频与音频同 key）：写后各轨在封装页\n"
                 "按自身时间轴被截到对齐窗口，成片里各轨都从 0 播同一段 → 同步自动保留。\n"
-                "同源音频轨（同文件）会一并写回；缺起始或结尾的轨被跳过。写前二次确认。"))
+                "同源音频轨（同文件）会一并写回；缺起始或结尾的轨被跳过。\n"
+                "**不再弹确认**：写之前会自动记一条历史，右键本按钮可撤销（最多 20 步，\n"
+                "跨会话也有效）。"))
         # 「复制时间」按钮（写回时间的左边）：只复制选中行那两个值
         self.copy_time_btn = ttk.Button(ctl2, text=_("复制时间"),
                                         command=self._copy_selected_time)
@@ -85137,32 +87350,60 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         ToolTip(self.copy_time_btn,
                 _("复制**汇总表当前选中行**的 `-ss X -to Y`（不含轨道名），\n"
                 "可直接粘进 trim 窗口 / 命令行。没选中行时按「当前轨」那一行走。"))
+        # 「时间预览(管道)」（2026-10-25 用户：删掉外部播放器那颗，只留管道版；
+        # 文案精简、tooltip 只留「先手动写回再点预览」）。纯预览：播轨道当前的截取值，
+        # 不写回、不弹确认、不碰任何轨道数据。
+        self.preview_btn_pipe = ttk.Button(
+            ctl2, text=_("时间预览(管道)"),
+            command=self._open_time_preview)
+        self.preview_btn_pipe.pack(side=tk.RIGHT, padx=(0, 4))
+        ToolTip(self.preview_btn_pipe, _("先手动写回，再点预览。"))
 
         tbl_wrap = ttk.Frame(main)
         tbl_wrap.pack(fill=tk.X, pady=(8, 0))
         cols = ("who", "s", "e", "dur", "da", "db", "drift")
         self.tree = ttk.Treeview(tbl_wrap, columns=cols, show="headings",
                                  height=max(3, self.n))
-        for cid, head, w, anc, st in (
-                ("who", _("轨道"), 168, tk.W, False),
-                ("s", _("起始"), 96, tk.E, False),
-                ("e", _("结尾"), 96, tk.E, False),
-                ("dur", _("区间长度"), 104, tk.E, False),
-                ("da", _("起始差"), 96, tk.E, False),
-                ("db", _("结尾差"), 96, tk.E, False),
-                ("drift", _("漂移(%)"), 92, tk.E, True)):
-            self.tree.heading(cid, text=head)
-            self.tree.column(cid, width=w, anchor=anc, stretch=st)
+        # 列宽（2026-10-25 用户：前面几列太窄、最后「漂移」太宽；手动拉宽窗口时
+        # 希望整行按**原始分配比例**一起拉伸，而不是只有最后一列变宽）。
+        # 做法：所有列 stretch=False —— Tk 自带的 stretch 会把剩余宽度全塞给开着的
+        # 那一列（本表原本只开 drift ⇒ 拉窗口时只有最后一列长、前面纹丝不动）；
+        # 改由 `_on_tree_resize` 按 `_SYNC_TABLE_COLS` 的权重把控件当前宽度等比分配。
+        _init_w = _sync_table_widths(1000)   # 窗口最小宽 1000（见 __init__ 的
+                                             # max(1000, reqwidth)）→ 首帧就按它分好
+        self._col_ratio = [r for _c, _h, r, _a in _SYNC_TABLE_COLS]   # 当前比例（拖动后更新）
+        for cid, head, _r, anc in _SYNC_TABLE_COLS:
+            # 🔴 multi 专有：`_SYNC_TABLE_COLS` 是**模块级**常量，里面的表头是中文 canonical
+            # （base 与 multi 同一份）。模块级不能包 `_()`（`_()` 依赖 load_language() 之后的
+            # TRANS，包在模块级会把显示名冻在导入时的语言），所以在**渲染点**包一层 ——
+            # 英文界面下表头才会跟着变。base 无此层，属预期的结构性差异。
+            self.tree.heading(cid, text=_(head))
+            self.tree.column(cid, width=_init_w[cid], minwidth=_SYNC_TABLE_MIN_W,
+                             anchor=anc, stretch=False)
         self.tree.pack(fill=tk.X)
+        self.tree.bind("<Configure>", self._on_tree_resize)
+        self.tree.after_idle(self._on_tree_resize)
         self.tree.bind("<Double-1>", self._on_table_double)
+        # 拖动列头（2026-10-25 用户：「拖动时不要挤出窗口，要钳制在列表里，其他列可以
+        # 被压缩」）：ttk 自己拖分隔条只改被拖那一列，总宽超出控件 → 右侧列被挤出可视区。
+        # 这里在**按下**记住拖的是哪一列，**松手**时按 `_sync_table_rebalance` 重新分配：
+        # 被拖列保宽、其余列等比压缩，总和精确等于控件宽（不产生横向滚动）。
+        self.tree.bind("<ButtonPress-1>", self._on_tree_col_press, add="+")
+        self.tree.bind("<ButtonRelease-1>", self._on_tree_col_release, add="+")
         ToolTip(self.tree,
                 _("每轨一行：「基准」= 参考轨，「比对 N」= 其余轨道（顺序同上）。\n"
                 "起始 / 结尾 = 该轨自己的时间（秒），手填截取直接用这两列。\n"
                 "起始差 / 结尾差 = 本轨 − 基准（正数 = 该事件在本轨上出现得更晚）。\n"
                 "区间长度 = 结尾 − 起始；漂移(%) = 两端长度的相对差（不为 0 说明设备时钟有快慢，需变速补偿）。\n"
-                "双击某行 = 复制该轨全部数值（不含轨道名）。"))
+                "双击某行 = 复制该轨全部数值（不含轨道名）。\n\n"
+                "★ 帧网格（2026-10-26）：FFmpeg 取「第一个不早于 T 的帧」= ceil(T×帧率)，\n"
+                "   不是最近帧、也不等于你说的那个小数 —— 0.123456 @30fps 实际从 0.133333 开始。\n"
+                "   波形顶部绿色小三角 = 该轨的合法帧（左淡右实），点一下就把光标吸到那一帧。\n"
+                "   轨头读数带 * 且变琥珀 = 光标不在帧网格上（ffmpeg 会往后挪到下一帧）。\n"
+                "   音频不受此约束（atrim 是采样级），所以「音画差 0~1 帧」只会在视频这一侧发生。"))
 
         self._refresh_table()
+        self._refresh_delta_label()      # 首帧就有值（不必等 _poll 第一跳）
 
     # ---------- 视图与坐标（横轴恒为「参考轨时间」） ----------
     def _span(self):
@@ -85189,8 +87430,12 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             his.append(self.offsets[i] + d)
         return (min(los), max(his))
 
-    def _reset_view(self):
+    def _reset_view(self, reset_cols=False):
         self._view = self._full_span()
+        if reset_cols:
+            # 2026-10-25 用户：「或者把恢复列宽的逻辑绑进那个 全长」——「全长」本来就是
+            # 「回到初始视图」的语义，顺手把汇总表列宽也还原成默认比例（不另占按钮位）。
+            self._reset_table_cols(quiet=True)
         self._redraw_all()
 
     def _fit_overlap(self):
@@ -85222,6 +87467,9 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         for i in range(self.n):
             self._redraw_wave(i)
         self._refresh_readouts()
+        # 光标差一并刷：`_redraw_all` 是「整批状态变了」的公共出口（同步光标 / 打点 /
+        # 按光标对齐 / 换参考轨 / 从截取读回 …），在这里刷一次就全带上，不必逐处补。
+        self._refresh_delta_label()
 
     def _redraw_wave(self, i):
         """画第 i 道波形（min/max 包络多边形，照抄 SimplePreviewer._draw_wave）。"""
@@ -85234,13 +87482,39 @@ class MultiSyncReferenceDialog(tk.Toplevel):
                 h = self.row_h
             mid = h // 2
             amp = h / 2 - 6
-            cv.create_line(0, mid, w, mid, fill="#ececec")
 
             fill_c, line_c = _SYNC_TRACK_COLORS[i % len(_SYNC_TRACK_COLORS)]
             peaks = self.peaks[i]
             dur = self.durs[i] or 0.0
             off = self.offsets[i]
             gain = self.gains[i] or 1.0     # 显示增益（归一化，只影响观感）
+
+            # 素材起止（自身时间 0 / dur）→ 参考轴坐标；与「到起点 / 到终点」按钮同口径。
+            # 为什么要先铺「无素材区」灰底（2026-10-25 用户：「不按到起点和到终点这 2 个
+            # 按钮完全不知道在那里，因为有静音干扰」）：基线横贯整道画布、素材之外却什么
+            # 都不画 ⇒ 「静音（一条平线）」和「这里根本没有素材（一片空白）」长得一样，
+            # 起止位置无从判断。灰底 + 界限竖线把两者分开。
+            # ⚠️ 顺序不能反：灰底 → 基线 → 波形 → 起止线 → 锚点/光标，否则会被波形盖住。
+            bx0 = bx1 = None
+            if dur > 0:
+                bx0 = self._x_of(w, off)
+                bx1 = self._x_of(w, off + dur)
+                if bx0 > bx1:
+                    bx0, bx1 = bx1, bx0
+                _vl = min(max(bx0, 0.0), float(w))
+                _vr = min(max(bx1, 0.0), float(w))
+                if _vl > 0:
+                    cv.create_rectangle(0, 0, _vl, h, fill=_SYNC_VOID_COLOR,
+                                        outline="", tags="void")
+                if _vr < w:
+                    cv.create_rectangle(_vr, 0, w, h, fill=_SYNC_VOID_COLOR,
+                                        outline="", tags="void")
+            with suppress(Exception):
+                # 自身时间恒从 0 起，写「0→dur」而不是「0.000→…」：省宽度，信息不丢
+                self.dur_vars[i].set(
+                    _('素材 0→{0} s').format(_fmt_sec6(dur)) if dur > 0 else _("素材 —"))
+
+            cv.create_line(0, mid, w, mid, fill="#ececec")
             drawn = 0
             if peaks and dur > 0:
                 N = len(peaks)
@@ -85296,23 +87570,70 @@ class MultiSyncReferenceDialog(tk.Toplevel):
                         cv.create_line(fx, 2, fx, h - 2, fill="#B4B2A9",
                                        dash=(3, 3), tags="genfront")
 
-            # 已记录的锚点（紫虚线）；打点会话中本轮已点的用实线
+            # 素材起止竖线（画在波形之上；具体数值在轨头，画布只留「起 / 止」两字）
+            if bx0 is not None:
+                for _bx, _txt, _anc in ((bx0, _("起"), "w"), (bx1, _("止"), "e")):
+                    if not (-2 <= _bx <= w + 2):
+                        continue
+                    cv.create_line(_bx, 0, _bx, h, fill=_SYNC_BOUND_COLOR,
+                                   width=1, tags="bound")
+                    _tid = cv.create_text(_bx + (3 if _anc == "w" else -3), 9,
+                                          text=_txt, anchor=_anc,
+                                          fill=_SYNC_BOUND_COLOR, tags="bound")
+                    _bb = cv.bbox(_tid)
+                    if _bb:     # 文字垫白底：波形顶到行高上沿时不至于和字糊在一起
+                        cv.tag_lower(cv.create_rectangle(
+                            _bb[0] - 1, _bb[1], _bb[2] + 1, _bb[3],
+                            fill="#ffffff", outline="", tags="bound"), _tid)
+
+            # 已记录的锚点（紫虚线 + **底部**三角）
+            # 2026-10-26 用户：「给打点的虚拟线加个下面的三角…现在的格子参考线是上面的三角」
+            # ⇒ 顶部三角归帧网格（绿、实心朝下），锚点占底部（紫、朝上）。形状镜像 + 颜色不同，
+            # 两种标记同时出现也认不错；y=h-6..h 正好是波形下沿（amp=h/2-6）之外那 6px，
+            # 不会压住波形。⚠️ 锚点三角**不是**点击热区（吸附只认顶部，见 `_try_snap_frame`）。
+            _anc_hx, _anc_hy = 4, 6
             for a in self.anchors:
                 tau = a["vals"][i]
                 if tau is None:
                     continue
-                cv.create_line(self._x_of(w, tau + off), 0,
-                               self._x_of(w, tau + off), h,
+                _ax = self._x_of(w, tau + off)
+                cv.create_line(_ax, 0, _ax, h,
                                fill=_SYNC_ANCHOR_COLOR, dash=(3, 3), tags="anchor")
-            if self._dot and self._dot["vals"][i] is not None:
-                xx = self._x_of(w, self._dot["vals"][i] + off)
-                cv.create_line(xx, 0, xx, h, fill=_SYNC_ANCHOR_COLOR,
-                               width=2, tags="anchor")
+                if -_anc_hx - 2 <= _ax <= w + _anc_hx + 2:
+                    cv.create_polygon(_ax - _anc_hx, h, _ax + _anc_hx, h,
+                                      _ax, h - _anc_hy,
+                                      fill=_SYNC_ANCHOR_COLOR, outline="",
+                                      tags="anchor")
+
+            # 帧网格（2026-10-26）：ffmpeg 对视频取 ceil(T·fps) 那一帧。光标不在网格上时
+            # 画两条候选帧 + **顶部**小三角（绿；点一下就把光标吸过去，见 `_try_snap_frame`），
+            # 光标自己也改虚线 —— 一眼就能看出「这个数 ffmpeg 不会用，它会往后挪到哪」。
+            # 网格在**本轨自身时间**上算（各轨帧率可能不同，绝不能用参考轨的 fps）。
+            _gks = self._frame_k(i, self.cursors[i])
+            _gfps = self._grid_fps(i)
+            _g_on = True
+            if _gks is not None and _gfps:
+                _g_on = (_gks[0] == _gks[1])
+                # 先在网格上时两条重合 ⇒ 只画 ceil 那条（否则实线虚线叠一起发糊）
+                for _k, _is_ceil in (((_gks[1], True),) if _g_on
+                                     else ((_gks[0], False), (_gks[1], True))):
+                    _gx = self._x_of(w, _k / _gfps + off)
+                    if not (-3 <= _gx <= w + 3):
+                        continue
+                    _gc = (_SYNC_GRID_COLOR if _is_ceil
+                           else _SYNC_GRID_FLOOR_COLOR)
+                    cv.create_line(_gx, 0, _gx, h, fill=_gc,
+                                   dash=() if _is_ceil else (2, 4),
+                                   tags="fgrid")
+                    # 三角画在最上层（y=0..6），它是点击热区，不能被波形/白底盖住
+                    cv.create_polygon(_gx - 4, 0, _gx + 4, 0, _gx, 6,
+                                      fill=_gc, outline="", tags="fgrid")
 
             x = self._x_of(w, self.cursors[i] + off)
             if -2 <= x <= w + 2:
                 cv.create_line(x, 0, x, h, fill=_SYNC_CURSOR_COLOR,
-                               width=2, tags="cursor")
+                               width=2, tags="cursor",
+                               dash=() if _g_on else (5, 3))
 
             if i == self.ref_i:
                 cv.create_rectangle(0, 0, w - 1, h - 1, outline="#1f6feb",
@@ -85325,21 +87646,34 @@ class MultiSyncReferenceDialog(tk.Toplevel):
 
     def _refresh_readouts(self):
         for i in range(self.n):
-            self.readout_vars[i].set(_fmt_sec6(self.cursors[i]) + " s")
+            self._sync_readout(i)       # 文本 + 帧网格颜色一起刷（别只 set 文本）
 
     # ---------- 探测与解码（后台线程，绝不碰 Tk） ----------
     def _start_probe(self):
         self._probe_gen += 1
+        # 🔴 必须在主线程**同步**置位：若等 worker 里再置，_poll（150ms 一跳）有机会
+        # 在「跑起来了」之前看到 running=False ⇒ 把「正在重新生成波形…」提前收尾。
+        self._probe_running = True
         threading.Thread(target=self._probe_worker, args=(self._probe_gen,),
                          daemon=True).start()
         self._poll()
 
     def _probe_worker(self, gen=0):
+        """线程入口：跑一轮逐轨探测，**无论从哪条路径退出**都把 `_probe_running` 落回
+        False（`_poll` 靠它把「正在重新生成波形…」收尾）。被新一轮作废的旧线程不得
+        清掉新一轮的标记 ⇒ 只在「代际号仍是自己的」时候落。"""
+        try:
+            self._probe_worker_body(gen)
+        finally:
+            if gen == self._probe_gen:
+                self._probe_running = False
+
+    def _probe_worker_body(self, gen=0):
         for i, tr in enumerate(self.tracks):
             if self._stop or gen != self._probe_gen:
                 return
             path = getattr(tr, "file_path", "") or ""
-            dur, fps, info = 0.0, None, None
+            dur, fps, info, vfr = 0.0, None, None, False
             try:
                 info = self.app._get_cached_stream_info(path)
             except Exception:
@@ -85349,6 +87683,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
                 for s in streams:
                     if s.get("codec_type") == "video":
                         fps = _sync_parse_fps(s)
+                        vfr = _sync_is_vfr(s)
                         break
                 dur = _opt_float((info.get("format") or {}).get("duration") or 0.0, 0.0)
                 if dur <= 0:
@@ -85358,6 +87693,19 @@ class MultiSyncReferenceDialog(tk.Toplevel):
                             break
             self.durs[i] = dur
             self.fps_list[i] = fps
+            self.vfr[i] = vfr
+            self._dirty.add(i)      # 帧网格变了（fps / VFR 判定）⇒ 重画一次刻度
+            # 显示宽高比（2026-10-25）：帧对比按「同高 + 各自比例」紧排，需要每轨的
+            # 真实显示比例。走 `_cached_video_rotated_dimensions`（缓存优先）——
+            # 手机竖屏常是 1920x1080 + rotate=90 元数据，直接读 width/height 会得到
+            # 16:9 ⇒ 帧对比里竖屏画面被塞成横的。worker 线程里取（与上面
+            # `_get_cached_stream_info` 同纪律，绝不碰 Tk）。
+            try:
+                _w, _h = self.app._cached_video_rotated_dimensions(
+                    path, dict(getattr(tr, "enc_settings", {}) or {}))
+                self.aspects[i] = (float(_w) / float(_h)) if (_w and _h) else None
+            except Exception:
+                self.aspects[i] = None
             # 渐进式（2026-09-17）：先把该轨的桶数组挂上去并置「生成中」，让解码线程
             # 就地往里填 —— UI 就能从左到右把波形画出来（同 SimplePreviewer._gen_wave）。
             # ⚠️ 必须先清空：否则「重新生成波形」时旧波形会和新波形混画在同一张图上。
@@ -85421,46 +87769,94 @@ class MultiSyncReferenceDialog(tk.Toplevel):
                 self._redraw_wave(i)
                 self._dirty.discard(i)
             self._sync_fps_label()
+        # 「重新生成波形」的中间态收尾（用户主动触发才写终态；开窗首次生成不动说明文字）
+        if self._regen_pending and not self._probe_running:
+            self._regen_pending = False
+            _n = sum(1 for i in range(self.n) if self.peaks[i] and not self._generating[i])
+            with suppress(Exception):
+                self.hint_var.set(
+                    _('✅ 波形已重新生成（{0}/{1} 轨；手动增益已保留）。').format(_n, self.n) if _n else
+                    _("⚠ 波形重新生成未能完成（0 轨有数据，见下方日志）。"))
         self._sync_gain_labels()
+        self._refresh_delta_label()   # 光标差读数兜底刷新（点波形等路径另有即时刷）
         self._follow_play()
         try:
             self._poll_job = self.after(150, self._poll)
         except Exception:
             self._poll_job = None
 
-    def _sync_gain_labels(self):
-        """轨头显示实际应用了多大的显示增益（避免被误读成「两轨响度一样」）。"""
+    def _sync_gain_labels(self, force=False):
+        """把当前生效的显示增益回填到轨头那个唯一的「增益×」框（值即状态）。
+
+        2026-10-26 合并成一个控件后，**一个框表达两件事**：
+          - 数字  = 当前生效增益（自动归一化值 或 手填值）；
+          - 后缀 `*` = 手动覆盖（自动值无标记）。
+        与方法名保留不改的理由：它是「刷新增益显示」的唯一出口，测试与
+        `_poll` 都按名字调；改名收益为零而风险是全仓搜索。
+        ≈1.0（几乎不用放大）时留空 —— 沿用原先「≈1 不显示」的取舍：每轨都写
+        `1.0` 反而看不出哪轨被放大过。
+
+        ⚠️ `force=False` 时**跳过正被编辑的那个框**：合并后这个框既是显示也是输入，
+        而本方法会在「重新生成波形」收尾时被调一次（可能导致 6 轨解码完时用户正好在
+        某轨里打字 → 输入内容被静默吃掉）。调用方明确要归位时才传 `force=True`。
+        """
         for i in range(self.n):
             g = self.gains[i] or 1.0
-            tag = _("（手动）") if self._manual_gains[i] is not None else ""
-            txt = "" if abs(g - 1.0) <= 0.05 else _('显示增益 ×{0:.1f}{1}').format(g, tag)
+            if abs(g - 1.0) <= 0.05:
+                txt = ""
+            else:
+                txt = f"{g:.1f}" + ("*" if self._manual_gains[i] is not None else "")
             with suppress(Exception):
+                if not force and i < len(self.gain_entries) \
+                        and self.focus_get() is self.gain_entries[i]:
+                    continue
                 self.gain_vars[i].set(txt)
 
     def _apply_gain_entry(self, i):
-        """轨头「增益×」输入框回车：填正数=手动覆盖，留空=恢复自动（不弹窗）。"""
-        txt = self.gain_entries[i].get().strip()
+        """轨头「增益×」回车：填正数 = 手动覆盖（回填带 `*`），清空 = 恢复自动。
+
+        合并成一个框后多一层判据：**自动态下把框里那个自动值原样回车 = no-op**。
+        框里显示的既然是生效值，用户路过按一下回车不该把「自动」变成「手动」——
+        那会让 `_manual_gains` 悄悄被钉死，此后重新生成波形不再跟随自动值。
+        """
+        txt = self.gain_entries[i].get().strip().rstrip("*").strip()
         if txt == "":
             self._manual_gains[i] = None
             self.gains[i] = self._auto_gains[i]
             g = self.gains[i] or 1.0
-            self.hint_var.set(_('已恢复自动显示增益 ×{0:.1f}（自动值只按 96% 分位归一化，长视频安静段被压平是单一全局增益的固有特性）。').format(g))
+            self.hint_var.set(_("已恢复自动显示增益 ×{0:.1f}（自动值只按 96% 分位归一化，"
+                                "长视频安静段被压平是单一全局增益的固有特性）。").format(g))
         else:
             try:
                 g = float(txt)
                 if not (g > 0):
                     raise ValueError
             except ValueError:
-                self.hint_var.set(_("增益无效：请填正数（如 8 或 8.5），留空回车 = 自动。"))
+                self.hint_var.set(_("增益无效：请填正数（如 8 或 8.5），清空回车 = 自动。"))
+                return
+            # 自动态 + 值没变 = 用户只是路过回车，保持自动（见 docstring）
+            if (self._manual_gains[i] is None
+                    and abs(g - (self.gains[i] or 1.0)) < 1e-9):
+                self._sync_gain_labels(force=True)    # 显示格式归位（去掉可能的 `*`）
+                self.hint_var.set(
+                    _("增益仍是自动的 ×{0:.1f}（填一个不同的数值才转手动）。").format(g))
                 return
             self._manual_gains[i] = g
             self.gains[i] = g
-            self.hint_var.set(_('已手动设置显示增益 ×{0:g}（只改观感；过大削顶属正常）。').format(g))
+            self.hint_var.set(
+                _("已手动设置显示增益 ×{0:g}（只改观感；过大削顶属正常）。").format(g))
         self._dirty.add(i)
-        self._sync_gain_labels()
+        # force=True：刚在这格里回车，焦点还在这格上（`force=False` 会把自己跳过，
+        # 表现就是「填了手动值却看不到 `*`」）。
+        self._sync_gain_labels(force=True)
 
     def _regen_waves(self):
         """重新生成全部轨波形：重新解码包络并重算自动增益（手动增益保留）。"""
+        # 🔴 设置了中间态就必须有终态（2026-10-24 用户报位置编辑器版同款 bug）：
+        # 这句「正在重新生成波形…」以前**永远没人收尾**，解码完提示还挂着。
+        # 收尾放在 `_poll`（主线程、每 150ms 一跳），判据 = `_probe_running` 落回 False。
+        # 只对**用户主动点按**的这一路收尾：开窗时的首次生成不能覆盖下方那段用法说明。
+        self._regen_pending = True
         self._start_probe()
         self.hint_var.set(_("正在重新生成波形（重新解码包络；手动增益保留）…"))
 
@@ -85522,6 +87918,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         with suppress(Exception):
             self.active_combo.current(i)
         self.offset_var.set(_fmt_sec6(self.offsets[i]))
+        self._refresh_delta_label()     # 换轨 = 换成这条轨与参考轨的光标差
         self._redraw_wave(old)
         self._redraw_wave(i)
 
@@ -85551,40 +87948,88 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         self._refresh_table()
 
     # ---------- 画布交互 ----------
+    def _snap_cursor(self, i, tau):
+        """把光标吸到某条**合法帧**上（2026-10-26）。
+
+        与 `_nudge` 的「纯增量、绝不吸附」不冲突：这是用户**显式点三角**的动作，
+        不是微调路径。微调 / 打点 / 手输 / 拖拽一律仍产出精确值（用户 2026-10-25
+        明确要求过，见 `_nudge` docstring）。这里只在用户点名「要这一帧」时量化。
+        """
+        tau = max(0.0, float(tau))
+        old = self.cursors[i]
+        self.cursors[i] = tau
+        self._snap_guard = True         # 本次按下已处理 ⇒ 随后的 drag 让路
+        self._redraw_wave(i)
+        self._sync_readout(i)
+        self._refresh_delta_label()
+        idx = _('轨道{0}').format(i + 1)
+        f = self._grid_fps(i)
+        tail = ""
+        if self._off_grid(i, old):
+            g = self._grid_time(i, old)
+            if g is not None:
+                tail = (_('（原 {0} s 不在帧网格上，ffmpeg 本会从 {1} s 开始）').format(_fmt_sec6(old), _fmt_sec6(g)))
+        if f:
+            self.hint_var.set(
+                _('已把{0}的光标吸到第 {1} 帧 = {2} s（帧率 {3:g}）；与 ffmpeg 取帧口径一致{4}').format(idx, int(round(tau * f)), _fmt_sec6(tau), f, tail))
+        else:
+            self.hint_var.set(_('已把{0}的光标吸到 {1} s{2}').format(idx, _fmt_sec6(tau), tail))
+
+    def _try_snap_frame(self, i, ev):
+        """点波形顶部绿色三角 = 把光标吸到那一帧；命中返回 True。
+
+        为什么用几何判定而不是 canvas `tag_bind`：同一个画布还绑着 `<B1-Motion>`
+        的 scrub，按住三角稍一动就会把刚吸好的值覆盖掉。几何判定能在 `_on_click`
+        里一次 resolve 并置 `_snap_guard`，让紧随其后的 drag 直接让路。
+        """
+        if int(getattr(ev, "y", 999)) > _SYNC_GRID_HIT_Y:
+            return False
+        ks = self._frame_k(i, self.cursors[i])
+        f = self._grid_fps(i)
+        if ks is None or not f:
+            return False
+        w = self._canvas_w(i)
+        off = self.offsets[i]
+        # ceil 优先：两条重合时它就是唯一那条；不重合时它是「ffmpeg 会用的那一帧」
+        for k in ((ks[1],) if ks[0] == ks[1] else (ks[1], ks[0])):
+            if abs(ev.x - self._x_of(w, k / f + off)) <= _SYNC_GRID_HIT_X:
+                self._snap_cursor(i, k / f)
+                return True
+        return False
+
     def _on_click(self, i, ev):
         self._set_active(i)
-        t_ref = self._t_of(self._canvas_w(i), ev.x)
-        if self._dot is not None:
-            if self._dot["vals"][i] is None:
-                self._dot["vals"][i] = t_ref - self.offsets[i]
-                self._dot["order"].append(i)
-                self._dot_step()
+        self._snap_guard = False
+        if self._try_snap_frame(i, ev):
             return
+        t_ref = self._t_of(self._canvas_w(i), ev.x)
         if self._procs[i] is not None:
             self._stop_play(i)      # 播放中点波形 = 定位并停下，否则光标立刻被拉走
         self.cursors[i] = max(0.0, t_ref - self.offsets[i])
         self._redraw_wave(i)
-        self.readout_vars[i].set(_fmt_sec6(self.cursors[i]) + " s")
+        self._sync_readout(i)
+        self._refresh_delta_label()     # 点/拖完立刻看到与参考轨的差，不等 _poll 下一跳
 
     def _on_drag(self, i, ev):
         """左键拖动 = 光标 scrub（只移动本轨光标，绝不改偏移）。
         2026-09-16 改：原实现左键拖动改本轨偏移（对齐用），但拖动完全不可控、
         加 Shift 也拖不准，已彻底去掉；偏移对齐改走「±帧」按钮 +「按光标对齐」。
-        打点模式（_dot）下不 scrub，避免与锚点标记互相干扰；参考轨也允许 scrub
-        光标（只是定位，不影响其偏移恒 0 的基准地位）。"""
-        if self._dot is not None:
-            return
+        参考轨也允许 scrub 光标（只是定位，不影响其偏移恒 0 的基准地位）。"""
+        if self._snap_guard:
+            return          # 本次按下已由「点三角吸附」处理，别再 scrub 把结果覆盖掉
         if self._procs[i] is not None:
             self._stop_play(i)      # 播放中拖 = 定位并停下，否则光标被拉走
         t_ref = self._t_of(self._canvas_w(i), ev.x)
         self.cursors[i] = max(0.0, t_ref - self.offsets[i])
         self._redraw_wave(i)
-        self.readout_vars[i].set(_fmt_sec6(self.cursors[i]) + " s")
+        self._sync_readout(i)
+        self._refresh_delta_label()     # 点/拖完立刻看到与参考轨的差，不等 _poll 下一跳
 
     def _on_release(self, i, _ev):
         """左键拖动已改为纯光标 scrub（不改偏移），这里只清拖拽状态。
         偏移不再在拖动结束时吸附——对齐改走「±帧」按钮 +「按光标对齐」。"""
         self._drag = None
+        self._snap_guard = False        # 一次按下-松开一个周期，下一击重新判定
 
     def _on_wheel(self, i, ev):
         w = self._canvas_w(i)
@@ -85735,7 +88180,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         if not (0 <= i < self.n):
             return
         self.cursors[i] = max(0.0, t)
-        self.readout_vars[i].set(_fmt_sec6(self.cursors[i]) + " s")
+        self._sync_readout(i)
         self._redraw_wave(i)
         self.hint_var.set(
             _('时间预览：已把「{0}」的光标移到 {1} s（未打点、未改偏移）。').format(self._track_disp(i), _fmt_sec6(self.cursors[i])))
@@ -85762,15 +88207,15 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         「按光标对齐」/ 轨头「打起始(all)·打结尾(all)」/「从截取读回」。
         不吸附帧网格：写入什么就是什么，保「时间预览 / 逐帧微调」的精度
         （与「按光标对齐」口径一致）。"""
+        # 🔴 multi 专有（base 是 `src="时间预览"` 的默认真值）：默认值必须**延迟**求值，
+        # 否则模块导入那一刻就把显示名冻在当时的语言里。`src` 只用于末尾提示文案，
+        # 不参与任何判断 ⇒ 这层差异是结构性的，canon 审计会长期把它报成 DIFF（预期）。
         if src is None:
             src = _("时间预览")
         try:
             v = float(sec)
         except (TypeError, ValueError):
             return
-        if self._dot is not None:        # 与打点会话互斥，避免两套输入交叉写同一格
-            self._dot = None
-            self._sync_dot_buttons()
         label = _("起始") if k == 0 else _("结尾")
         self._slot(label)["vals"][i] = v
         self.cursors[i] = max(0.0, v)    # 只挪本轨光标 → 随后可用「打起始(all)」
@@ -85796,19 +88241,191 @@ class MultiSyncReferenceDialog(tk.Toplevel):
     def _frame_step(self):
         return 1.0 / self._eff_fps()
 
+    # ---------- 帧网格（2026-10-26）----------
+    # 语义来自 `research/frame-grid/README.md` 的实测：视频取 ceil(T·fps) 那一帧、
+    # 音频采样级不吸附。这里只做**诊断 + 刻度**，不改任何现有取值的语义
+    # （`_nudge` / 打点 / 手输仍然产出精确值，用户 2026-10-25 明确要求过）。
+    def _grid_fps(self, i):
+        """第 i 轨的帧网格帧率；None = 该轨没有可用网格（未探测到 / VFR）。
+
+        必须用**本轨**帧率：各轨素材帧率可以不同（30fps 混 25fps 是常态），
+        拿参考轨的 fps 去算别人的网格会算出一条根本不存在的线。
+        """
+        if not (0 <= i < len(self.fps_list)):
+            return None
+        if i < len(self.vfr) and self.vfr[i]:
+            return None
+        try:
+            f = float(self.fps_list[i] or 0.0)
+        except (TypeError, ValueError):
+            return None
+        return f if f > 0 else None
+
+    def _frame_k(self, i, tau):
+        """本轨自身时间 tau 落在哪两帧之间 → (k_floor, k_ceil)；None = 无网格。
+
+        `_SYNC_GRID_EPS` 的作用是把「6 位小数表示误差」吸收掉：`_fmt_sec6` 把
+        `1/60` 写成 `0.016667`（偏大 3.3e-7 s），不吸收的话
+        `ceil(0.016667·60) = 2` 会把「本来就在第 1 帧」判成「不在网格上」。
+        """
+        f = self._grid_fps(i)
+        if not f:
+            return None
+        q = max(0.0, float(tau)) * f
+        eps = _SYNC_GRID_EPS * f
+        return (max(0, int(math.floor(q + eps))),
+                max(0, int(math.ceil(q - eps))))
+
+    def _grid_time(self, i, tau):
+        """ffmpeg 真正会用的起点 = `ceil(tau·fps)/fps`；None = 无网格。
+
+        tau 已在网格上时返回 tau 本身（ceil 恒等）⇒ 吸过去**画面不变**，
+        只是把「0.123456 这种 ffmpeg 不会用的虚值」写成它真会用的时间。
+        """
+        ks = self._frame_k(i, tau)
+        f = self._grid_fps(i)
+        if ks is None or not f:
+            return None
+        return ks[1] / f
+
+    def _off_grid(self, i, tau):
+        """tau 是否**不**落在网格上。无网格（未探测到 / VFR）时恒 False ——
+        报不出所以然就别报警，否则每轨都染黄反而看不出真问题。
+        """
+        ks = self._frame_k(i, tau)
+        return bool(ks is not None and ks[0] != ks[1])
+
+    def _sync_readout(self, i):
+        """轨头读数：文本 + 颜色。
+
+        不在帧网格上 ⇒ 数值加 `*` 并染琥珀（`*` 与增益的「手动值」同一个记号：
+        都在说「这个数不是你看到的那个自动值」），提示 ffmpeg 会取**下一帧**。
+        """
+        val = _fmt_sec6(self.cursors[i])
+        off = self._off_grid(i, self.cursors[i])
+        self.readout_vars[i].set(val + ("* s" if off else " s"))
+        if i < len(self.readout_lbls):
+            try:
+                self.readout_lbls[i].configure(
+                    foreground=(_SYNC_GRID_OFF_COLOR if off else ""))
+            except tk.TclError:
+                # 个别主题不吃空串（表示"回到 style 默认"）⇒ 退回显式黑
+                with suppress(Exception):
+                    self.readout_lbls[i].configure(foreground="#000000")
+
     def _guard_ref(self):
         if alert_if(self.active_i == self.ref_i, _("提示"), _("参考轨是基准，偏移恒为 0；请先在「当前轨」里切换轨道。"), 'info', parent=self):
             return True
         return False
 
     def _nudge(self, frames):
+        """当前轨偏移 ±N 帧：在当前偏移上**纯增量**加/减，绝不吸附帧网格。
+
+        用户 2026-10-25 实测「按一次 +1 帧、再按 −1 帧，回不到原来的位置」——
+        根因是旧实现把结果吸到 1/fps 网格，而
+        「按光标对齐 / 打点 / 手输」产出的偏移是**精确值（明确不吸附）**，
+        于是第一次 ±1 帧就把精确偏移吸到最近的网格点，再按回来也回不到原值。
+        改为纯增量后 ±N 可逆；帧长仍取自探测到的 fps（探测不到才 25 兜底）。
+        """
         if self._guard_ref():
             return
-        self.offsets[self.active_i] = _sync_normalize_offset(
-            self.offsets[self.active_i] + frames * self._frame_step(), self._eff_fps())
+        self.offsets[self.active_i] += frames * self._frame_step()
         self.offset_var.set(_fmt_sec6(self.offsets[self.active_i]))
+        self._refresh_delta_label()     # 偏移一变，屏幕上的光标距离跟着变
         self._redraw_wave(self.active_i)
         self._refresh_table()
+
+    def _cursor_delta(self, i=None):
+        """光标差 = 两条轨光标在**屏幕上（参考轴上）**的距离，单位秒。
+
+        🔴 用户 2026-10-26 实测纠正，第一版算错了对象：「我肉眼看的差都只有 0.0 几，
+        但是显示 40 多秒」—— 根因：各轨素材起点不同，`offsets` 间可能差几十秒；
+        初版只减 `cursors`（各自时间轴上的光标值），等于把这段整体偏移混进了「光标差」。
+
+        正确口径：画布横轴恒为参考轨时间，光标画在 `光标 + 偏移` 处（见 `_redraw_wave`），
+        所以屏幕上读到的距离 = `(cursors[i] + offsets[i]) − (cursors[ref] + offsets[ref])`。
+        正 = 本轨这个光标落在参考轨光标的**右边**（更晚）；用户同一句确认了符号：
+        「参考轨道的光标在右边，下面的光标在左边就是 −」。
+
+        ⚠️ 它**不**等于偏移，两者符号相反：两轨光标落在同一 x 的条件是
+        `offset -= Δ`（正是「取 → 减」按钮和 `_align_by_cursors` 干的事）。
+        """
+        i = self.active_i if i is None else i
+        if not (0 <= i < self.n):
+            return 0.0
+        return ((float(self.cursors[i]) + float(self.offsets[i]))
+                - (float(self.cursors[self.ref_i]) + float(self.offsets[self.ref_i])))
+
+    def _refresh_delta_label(self):
+        """把当前轨的光标差刷到读数上（纯只读显示，不存任何状态）。
+
+        由 `_poll` 每 150 ms 兜一次底 —— 所有会动光标或偏移的路径（自动找点 / 同步光标 /
+        时间预览 / 逐帧微调 / 偏移微调 / 载入存档 / 切参考轨）都不必各自记得刷新：一个
+        事实一个来源，显示永远从 `cursors + offsets` 现算，绝不会和轨道状态分叉。交互
+        路径（点波形、逐帧微调、填时间）另外顺手调一次，只为「点完立刻看到」，不必等
+        下一跳。
+        """
+        if not hasattr(self, "delta_var"):
+            return
+        i = self.active_i
+        if i == self.ref_i:
+            txt = "—"       # 参考轨是基准，光标差恒 0，显示 0 反而像「有值」
+        else:
+            d = self._cursor_delta(i)
+            txt = ("+" + _fmt_sec6(d)) if d >= 0 else _fmt_sec6(d)
+        with suppress(Exception):
+            self.delta_var.set(txt)
+
+    def _take_delta(self):
+        """「取光标差」：把 Δ 的原值（全精度）填进微调框，省手抄。"""
+        i = self.active_i
+        if i == self.ref_i:
+            self.hint_var.set(
+                _("当前轨就是参考轨（基准），光标差恒为 0，没有可取的值；"
+                  "先在「当前轨」里切到要比对的那条轨。"))
+            return
+        d = self._cursor_delta(i)
+        with suppress(Exception):
+            self.step_var.set(_fmt_sec6(d))
+        self.hint_var.set(
+            _('已把光标差 {0} s（屏幕上两条光标的距离）填进微调框：'
+              '点「−」= 本轨整体{1} {2} s → 两个光标落在同一竖线（点「+」是反方向）。').format(
+                  _fmt_sec6(d), _('左移') if d > 0 else _('右移'), _fmt_sec6(abs(d))))
+
+    def _nudge_offset_precise(self, sign):
+        """当前轨偏移 ± 微调框里的秒数（用户 2026-10-26：比「±1 帧」更细的一档）。
+
+        `sign` = +1 / −1（界面上就是「+」「−」两颗）。纯增量、**不吸附帧网格**
+        ——与 `_nudge` 同一纪律：吸网格会让 ± 不可逆，第一次就把精确偏移吃掉。
+        只改 `offsets[active_i]`：光标在自身时间轴上的值、锚点、漂移、外部轨道截取
+        一律不动（波形 / 光标 / 锚点作为一条轨道整体平移，这正是用户说的「只移动轨道」）。
+        参考轨是基准、偏移恒 0，用 `_guard_ref` 直接挡掉（与「±1 帧」「归零」一致）。
+        """
+        if self._guard_ref():
+            return
+        raw = ""
+        with suppress(Exception):
+            raw = self.step_var.get().strip()
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            with suppress(Exception):
+                self.step_var.set("0.001")
+            self.hint_var.set(
+                _("偏移微调：中间那格要填秒数（例 0.001 = 1 毫秒），已恢复 0.001。"))
+            return
+        i = self.active_i
+        self.offsets[i] += sign * v
+        with suppress(Exception):
+            self.offset_var.set(_fmt_sec6(self.offsets[i]))
+        self._refresh_delta_label()     # 偏移一变，屏幕上的光标距离跟着变
+        self._redraw_wave(i)
+        self._refresh_table()
+        self.hint_var.set(
+            _('偏移微调：{0} {1} s → 「{2}」偏移 = {3} s'
+              '（纯增量、不吸附帧网格；光标 / 锚点 / 写回未动）。').format(
+                  '+' if sign > 0 else '−', _fmt_sec6(abs(v)),
+                  self._track_disp(i), _fmt_sec6(self.offsets[i])))
 
     def _nudge_cursor(self, frames):
         """微调【当前轨光标】（区别于上面的偏移微调）。
@@ -85820,14 +88437,16 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         """
         i = self.active_i
         self.cursors[i] = max(0.0, self.cursors[i] + frames * self._frame_step())
-        self.readout_vars[i].set(_fmt_sec6(self.cursors[i]) + " s")
+        self._sync_readout(i)
+        self._refresh_delta_label()     # 逐帧微调后光标差同步变
         self._redraw_wave(i)
 
     def _goto_cursor_start(self):
         """把【当前轨】光标移到本轨起点（自身时间轴 0.0 s）；只挪光标，不动偏移/锚点。"""
         i = self.active_i
         self.cursors[i] = 0.0
-        self.readout_vars[i].set(_fmt_sec6(0.0) + " s")
+        self._sync_readout(i)
+        self._refresh_delta_label()
         self._redraw_wave(i)
         self.hint_var.set(_('已把「{0}」的光标移到起点（0.000 s）。').format(self._track_disp(i)))
 
@@ -85836,16 +88455,62 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         i = self.active_i
         d = self.durs[i] or 0.0
         self.cursors[i] = max(0.0, d)
-        self.readout_vars[i].set(_fmt_sec6(self.cursors[i]) + " s")
+        self._sync_readout(i)
+        self._refresh_delta_label()
         self._redraw_wave(i)
         self.hint_var.set(
             _('已把「{0}」的光标移到末尾（{1} s）。').format(self._track_disp(i), _fmt_sec6(self.cursors[i])))
+
+    def _goto_cursor_entry(self, i=None, raw=None):
+        """把第 i 轨的光标直接移到填的时间（本轨自身时间轴）。
+
+        用户 2026-10-26：「波形上的打结尾后面添加控件『移动光标到:数值』，这样我可以
+        把从播放器获取的帧转场的时间定位到波形上」。填的就是**本轨自身时间**，与轨头
+        右侧 `5.000000 s` 读数、下方汇总表同一口径；`2:30` 这类写法也认
+        （复用 `time_to_seconds`，与全程序其它时间输入框同一套解析）。
+
+        两个入口、一个动作：
+          · 轨头「移动光标到 [__] s」（每轨一个）→ `raw=None`，从 `goto_vars[i]` 取，
+            就地指定这一条轨，不必先切「当前轨」；
+          · 光标控制行「到 [__] s」→ 按钮/回车把 `goto_var` 的值当 `raw` 传进来，
+            作用于当前轨、不必按回车。
+        两处都是**命令输入**（不是状态镜像），各自独立、互不同步也不冲突。
+        """
+        i = self.active_i if i is None else i
+        if not (0 <= i < self.n):
+            return
+        if raw is None:
+            raw = ""
+            if i < len(self.goto_vars):
+                with suppress(Exception):
+                    raw = self.goto_vars[i].get().strip()
+        raw = str(raw).strip()
+        v = time_to_seconds(raw) if raw else None
+        if v is None:
+            self.hint_var.set(
+                _("要填时间（秒）：150 / 150.5 / 2:30 / 1:02:03 都行，"
+                  "现在填的是「{0}」。").format(raw))
+            return
+        v = max(0.0, float(v))
+        self.cursors[i] = v
+        self._sync_readout(i)
+        self._refresh_delta_label()
+        self._redraw_wave(i)
+        dur = self.durs[i] or 0.0
+        tail = ""
+        if dur > 0 and v > dur + 1e-6:
+            tail = _("（注意：已超出本轨素材长度 {0} s，光标落在波形右外侧）").format(
+                _fmt_sec6(dur))
+        self.hint_var.set(
+            _("已把「{0}」的光标移到 {1} s{2}。").format(
+                self._track_disp(i), _fmt_sec6(v), tail))
 
     def _zero_offset(self):
         if self._guard_ref():
             return
         self.offsets[self.active_i] = 0.0
         self.offset_var.set("0.000")
+        self._refresh_delta_label()
         self._redraw_wave(self.active_i)
         self._refresh_table()
 
@@ -85860,6 +88525,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             return
         self.offsets[self.active_i] = v      # 手输尊重原值，不吸附帧网格
         self.offset_var.set(_fmt_sec6(v))
+        self._refresh_delta_label()
         self._redraw_wave(self.active_i)
         self._refresh_table()
 
@@ -85868,8 +88534,8 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         """保证 anchors[0]/[1] 恒为「起始」「结尾」（值可为 None）。
 
         为什么要有槽位（2026-09-13 实机反馈「这表格看不懂啊」）：旧版按
-        `len(self.anchors)` 给锚点起名，用户把「时间预览回填」与「打点会话」
-        混着用，就打出 [起始(空), 结尾(半格), #3, #4] 这种状态——真正想要的
+        `len(self.anchors)` 给锚点起名，用户把几种打点入口混着用，
+        就打出 [起始(空), 结尾(半格), #3, #4] 这种状态——真正想要的
         两组数据藏在 #3/#4 里，而「起始/结尾」两格是空的。
         """
         while len(self.anchors) < 2:
@@ -85894,70 +88560,6 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         """「起始」与「结尾」两格是否都已有值（都满 = 漂移可算）。"""
         self._ensure_slots()
         return all(any(v is not None for v in a["vals"]) for a in self.anchors[:2])
-
-    # ---------- 打点会话（逐轨标记同一事件） ----------
-    def _sync_dot_buttons(self):
-        """按钮文字跟随会话状态（ttk 禁 .state(["disabled"])，用文字表达当前态）。"""
-        cur = self._dot["target"] if self._dot is not None else None
-        for tgt, btn in ((_("起始"), self.dot_btn), (_("结尾"), self.dot_btn2)):
-            btn.config(text=(_('取消打{0}').format(tgt) if cur == tgt else _('打{0}').format(tgt)))
-
-    def _toggle_dot(self, target=None):
-        if target is None:
-            target = _("起始")
-        if self._dot is not None:
-            same = (self._dot["target"] == target)
-            self._dot = None
-            self._sync_dot_buttons()
-            self._redraw_all()
-            self.hint_var.set(
-                (_('已取消「打{0}」').format(target) if same
-                 else _('已切换为「打{0}」（上一轮未点满，未记录）').format(target))
-                + _("；此前记录的锚点保留。"))
-            if same:
-                return
-        self._dot = {"vals": [None] * self.n, "order": [], "target": target}
-        self._sync_dot_buttons()
-        self._dot_hint()
-        self._redraw_all()
-
-    def _dot_hint(self, prefix=None):
-        if self._dot is None:
-            return
-        tgt = self._dot["target"]
-        pend = [i for i in range(self.n) if self._dot["vals"][i] is None]
-        if not pend:
-            return
-        nxt = pend[0]
-        idx = self._track_disp(nxt)
-        msg = (_('正在打「{0}」：请在「{1}」的波形上点击该事件的位置（还剩 {2} 条未点；可任意顺序）').format(tgt, idx, len(pend)))
-        self.hint_var.set((prefix + " " if prefix else "") + msg)
-
-    def _dot_step(self):
-        if self._dot is None:
-            return
-        vals = self._dot["vals"]
-        self._redraw_all()
-        if any(v is None for v in vals):
-            self._dot_hint()
-            return
-        target = self._dot["target"]
-        self._dot = None
-        self._sync_dot_buttons()
-        self._finish_anchor(target, list(vals))
-
-    def _finish_anchor(self, label, vals):
-        """把整轮的值写进「起始 / 结尾」槽位（覆盖整行，允许重打覆盖）。"""
-        self._slot(label)["vals"] = list(vals)
-        self._apply_anchors()
-        self._redraw_all()
-        self._refresh_table()
-        if self._pair_filled():
-            self.hint_var.set(
-                _('已记录「{0}」，各轨按偏移平移对齐；汇总表的「漂移」列给出速度差（不为 0 说明设备时钟有快慢，需变速补偿）。').format(label))
-        else:
-            self.hint_var.set(
-                _('已记录「{0}」，各轨按偏移平移对齐。建议到片尾再打一轮「打结尾」，可算出速度漂移。').format(label))
 
     def _apply_anchors(self):
         """用锚点求各轨相对参考轨的偏移与漂移；偏移全量重算（不吸附帧网格，保采样精度）。"""
@@ -85990,36 +88592,24 @@ class MultiSyncReferenceDialog(tk.Toplevel):
     def _clear_anchors(self):
         self.anchors = []
         self.drift = [None] * self.n
-        self._dot = None
-        self._sync_dot_buttons()
         self.hint_var.set(_("已清除「起始 / 结尾」全部标记（偏移值保留）"))
         self._redraw_all()
         self._refresh_table()
 
     def _undo_dot(self):
-        """撤销打点（用户 2026-09-13 要求），两种语义合一：
-        ① 正在打点 → 撤掉本轮最后点的那一条（按点击顺序回退，不丢其它轨）；
-        ② 否则 → 清空最后一个「有值」的槽位（起始 → 结尾 倒序）；
-           槽位全空 → 偏移归零，回到「未对齐」初始态。"""
-        if self._dot is not None:
-            order = self._dot["order"]
-            while order:
-                i = order.pop()
-                if self._dot["vals"][i] is not None:
-                    self._dot["vals"][i] = None
-                    idx = self._track_disp(i)
-                    self._redraw_all()
-                    self._dot_hint(_('已撤销「{0}」上的打点；').format(idx))
-                    return
-            self._toggle_dot(self._dot["target"])   # 本轮一条都没点 → 直接退出会话
-            return
+        """撤销一步：清空最后一个「有值」的槽位（结尾 → 起始 倒序）；
+        槽位全空 → 偏移归零，回到「未对齐」初始态。
+
+        方法名沿用打点会话时代的 `_undo_dot`（调用方/测试都按这个名字找），但那个
+        会话机已整块删除：这里撤的是**落笔的槽位**、不是「上一次点击」，所以界面
+        文案已改为「撤销一步」。改文案不改方法名，免得连测试断言一起翻。"""
         target = None
         for a in reversed(self.anchors[:2]):
             if any(v is not None for v in a["vals"]):
                 target = a
                 break
         if target is None:
-            self.hint_var.set(_("没有可撤销的打点：锚点全为空，且当前不在打点会话中"))
+            self.hint_var.set(_("没有可撤销的标记：起始 / 结尾 都还是空的"))
             return
         gone = target["label"]
         target["vals"] = [None] * self.n
@@ -86033,7 +88623,7 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             tail = _("锚点已全部撤销，偏移归零（回到未对齐状态）。")
         self._redraw_all()
         self._refresh_table()
-        self.hint_var.set(_('已清空「{0}」这一格；{1}').format(gone, tail))
+        self.hint_var.set(_("已清空「{0}」这一格；{1}").format(gone, tail))
 
     def _align_by_cursors(self):
         """按各轨光标一键对齐（用户 2026-09-13 要求）：
@@ -86366,6 +88956,77 @@ class MultiSyncReferenceDialog(tk.Toplevel):
                 self._fmt_d(da), self._fmt_d(db), dv])
         return rows
 
+    def _on_tree_resize(self, event=None):
+        """汇总表列宽 = 控件当前宽度按**当前比例**（`self._col_ratio`）等比分配。
+
+        所有列 `stretch=False`：不用 ttk 自带的 stretch —— 它把剩余宽度全给
+        stretch=True 的那一列（本表原本只开了「漂移」）⇒ 窗口一拉宽，只有最后一列
+        变宽、前面纹丝不动。这里按比例整体重算：窗口多宽，各列按比例分多宽。
+        比例初值取自 `_SYNC_TABLE_COLS` 的设计权重，**手动拖过列头后**换成拖动结果
+        （见 `_on_tree_col_release`），所以拉窗口时保留你调过的分配。
+
+        用累计边界取整：逐列各自 round 会让总宽和控件宽度差几个像素（右边缘露白或
+        冒出横向滚动）；累计法保证最后一条边界正好落在右边缘。
+        `_tree_w` 记上次宽度，宽度没变就不重算（Configure 会随行数/焦点抖动）。
+        """
+        w = int(getattr(event, "width", 0) or 0) or self.tree.winfo_width()
+        if w <= 1 or getattr(self, "_tree_w", None) == w:
+            return
+        self._tree_w = w
+        for cid, cw in _sync_table_widths(w, getattr(self, "_col_ratio", None)).items():
+            self.tree.column(cid, width=cw)
+
+    # ---------- 列头拖动（钳制在列表内） ----------
+    def _on_tree_col_press(self, event):
+        """按下时记下「是不是在拖列分隔条、拖的是哪一列」（松手后据此重分配）。"""
+        self._col_drag = None
+        with suppress(Exception):
+            if self.tree.identify_region(event.x, event.y) == "separator":
+                col = self.tree.identify_column(event.x)     # "#n"
+                if col.startswith("#"):
+                    self._col_drag = int(col[1:]) - 1
+        return None
+
+    def _on_tree_col_release(self, _event=None):
+        """松手：把被拖出来的宽度**收回列表内** —— 其余列等比压缩补位。
+
+        ttk 原生行为只改被拖那一列，总宽一超控件，右侧列就被挤出可视区（用户
+        2026-10-25 实机反馈）。这里按 `_sync_table_rebalance` 重新分配，并把结果
+        记成新的比例 —— 之后手动拉宽窗口仍按「你拖过之后的比例」铺满。
+        """
+        idx = getattr(self, "_col_drag", None)
+        self._col_drag = None
+        if idx is None:
+            return None
+        w = self.tree.winfo_width()
+        if w <= 1:
+            return None
+        cur = [self.tree.column(c, "width") for c, _h, _r, _a in _SYNC_TABLE_COLS]
+        new = _sync_table_rebalance(cur, w, idx)
+        for (cid, _h, _r, _a), cw in zip(_SYNC_TABLE_COLS, new):
+            with suppress(Exception):
+                self.tree.column(cid, width=cw)
+        tot = float(sum(new)) or 1.0
+        self._col_ratio = [x / tot for x in new]
+        self._tree_w = w
+        return None
+
+    def _reset_table_cols(self, quiet=False):
+        """恢复汇总表默认列宽比例（拖乱了 / 拖窄了某一列时一键还原）。
+
+        绑定在「全长」按钮里（2026-10-25 用户：「把恢复列宽的逻辑绑进…全长」）：
+        点「全长」= 回到初始视图，顺手把列宽还原成默认比例，不额外占按钮位。
+        `quiet=True` 时不动 hint_var（调用方自己会写提示）。
+        """
+        self._col_ratio = [r for _c, _h, r, _a in _SYNC_TABLE_COLS]
+        w = self.tree.winfo_width()
+        if w > 1:
+            self._tree_w = w
+            for cid, cw in _sync_table_widths(w, self._col_ratio).items():
+                self.tree.column(cid, width=cw)
+        if not quiet:
+            self.hint_var.set(_("已恢复汇总表默认列宽。"))
+
     def _refresh_table(self):
         try:
             for iid in self.tree.get_children():
@@ -86415,35 +89076,66 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         self._copy_text(txt)
         self.hint_var.set(_('已复制「{0}」的时间：{1}{2}').format(self._track_disp(i), txt, note))
 
+    def _anchors_from_tracks(self, only=None, clear_missing=False):
+        """按各轨已设的截取值重建「起始/结尾」锚点
+        → (起始条数, 结尾条数, 清空条数, 缺截取的显示名 list)。
+
+        🔴 本窗**唯一**的「轨道 → 锚点」实现：按钮「从截取读回」与写回历史回退共用。
+        为什么必须共用（2026-10-26 用户实测）：锚点是「轨道截取设置」的第二份拷贝，
+        两边各存一份必然对不上 —— 用户原话「波形列表是一个值，但是轨道上是另外一个值，
+        读回的时候是另外的」「撤销后列表和波形是写回那次的值，但是读回后是原始值，这样
+        的割裂让我怀疑，原始值写回的时候有被改吗」。现在回退也走这里派生，列表/波形
+        与轨道天然一致，不用再点读回。
+
+        `only` = 窗口内轨序号集合（None = 全部轨）：回退只镜像该次写回涉及的轨，
+        别把无关轨手打的点一起清掉。
+        `clear_missing` = 轨道没有有效截取时是否把该轨锚点**清空**。按钮读回传 False
+        （"接着调"语义，没设截取的轨保留手打点）；回退传 True（"回到写回前"必须精确，
+        否则写回之后才打的点会留在列表里，看着还是新值）。
+        """
+        got_s = got_e = cleared = 0
+        missing = []
+        self._ensure_slots()
+        s_vals = self._slot(_("起始"))["vals"]
+        e_vals = self._slot(_("结尾"))["vals"]
+        for i, tr in enumerate(self.tracks):
+            if only is not None and i not in only:
+                continue
+            es = getattr(tr, "enc_settings", None) or {}
+            ts = te = None
+            if es.get("trim_enabled", False):
+                _s = _opt_float(es.get("trim_start"))
+                _e = _opt_float(es.get("trim_end"))
+                if _s is not None and _s >= 0:
+                    ts = _s
+                if _e is not None and _e > 0:
+                    te = _e
+            if ts is None and te is None:
+                missing.append(self._track_disp(i))
+                if clear_missing:
+                    if s_vals[i] is not None or e_vals[i] is not None:
+                        cleared += 1
+                    s_vals[i] = e_vals[i] = None
+                continue
+            if ts is not None:
+                s_vals[i] = ts
+                self.cursors[i] = max(0.0, ts)
+                got_s += 1
+            if te is not None:
+                e_vals[i] = te
+                got_e += 1
+        return got_s, got_e, cleared, missing
+
     def _read_back_from_tracks(self):
         """从各轨已设的截取数值（trim_start / trim_end）反向生成打点。
 
         读进「起始 / 结尾」槽位后走 _apply_anchors 重算偏移（基准轨起始 − 本轨起始），
         等价于「按光标对齐」的自动版——上次的结果只要还在轨道上，就能一键接着调。
         只读轨道，不写回任何东西。
-        """
-        _num = _opt_float  # 空串/None/非法 → None（2026-09-22 抽公共）
 
-        s_slot = self._slot(_("起始"))
-        e_slot = self._slot(_("结尾"))
-        got_s = got_e = 0
-        missing = []
-        for i, tr in enumerate(self.tracks):
-            es = getattr(tr, "enc_settings", None) or {}
-            if not es.get("trim_enabled", False):
-                missing.append(self._track_disp(i))
-                continue
-            ts = _num(es.get("trim_start"))
-            te = _num(es.get("trim_end"))
-            if ts is not None and ts >= 0:
-                s_slot["vals"][i] = ts
-                self.cursors[i] = max(0.0, ts)
-                got_s += 1
-            if te is not None and te > 0:
-                e_slot["vals"][i] = te
-                got_e += 1
-            if ts is None and te is None:
-                missing.append(self._track_disp(i))
+        镜像逻辑在 `_anchors_from_tracks`（写回历史回退也用它，见那里的说明）。
+        """
+        got_s, got_e, _cleared, missing = self._anchors_from_tracks()
         if got_s == 0 and got_e == 0:
             self.hint_var.set(
                 _("没有任何轨道读到截取数值：先在封装页给这些轨道设好截取起点/终点"
@@ -86461,7 +89153,13 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         """「写回时间」：把对齐好的「起始/结尾」写回外部 merge 轨道的截取设置。
 
         与 _read_back_from_tracks（只读、不写回）相反，这是方案 A 的反向动作：
-        直接改写 self.tracks[i].enc_settings，因此写前弹二次确认。
+        直接改写 `enc_settings`。
+
+        ⚠️ 2026-10-26 起**不再弹二次确认**（用户：「加个历史记录 → ①不用二次确认干扰
+        操作 ②不怕出错」）。兜底改由「写前自动记一条历史」承担，三层安全网：
+          ① 历史里存的是被覆盖**之前**的原值，且区分「原本没这个 key」与「原本是 False」；
+          ② 历史随 `sync_ref_last.json` 落盘 ⇒ **关窗后**才发现写错也能救；
+          ③ 还原前比对「当前值 vs 记录里的后态」，写回后又被别处改过的轨**跳过不覆盖**。
 
         为何「几乎免费」（2026-09-14）：窗口已经握着真实轨道对象（self.tracks），
         且每轨的 slot 值本来就在「它自己时间轴」上（参考轨 [T0,T1]；比对轨
@@ -86480,21 +89178,57 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             self.hint_var.set(
                 _("还没有完整的「起始/结尾」打点：先在各轨波形上打点（或用「从截取读回」），"
                 "再点「写回时间」。"))
-            return
-        # 二次确认：此动作越了方案 A「只读」初衷，且会改写外部轨道数据
-        if not messagebox.askyesno(
-                _("写回时间到外部轨道"),
-                _("将把当前对齐的「起始/结尾」写入下方轨道的截取设置\n"
-                "（视频与同源音频都会被截到对齐窗口）。\n\n"
-                "此操作会改写外部封装页的轨道数据，是否继续？")):
-            self.hint_var.set(_("已取消写回（未改动任何轨道数据）。"))
-            return
-        # 同源音频轨：按「(路径, 组内序号)」配对——第 k 个**视频**轨匹配第 k 个
-        # 同文件**音频**轨。「组内序号」必须在「视频轨集合」里数（不是在所有同文件
-        # 轨道里数），否则音频排在视频上面时两者序号错开 → 漏写第一条音频。
+            return None
+        # 计划里已经含「视频轨 + 对应同源音频轨」，写回与历史快照共用同一份解析结果
+        # —— 两边各解析一遍必然漂移：同一文件重复出现时「组内序号」数错一格，就会把
+        #    音频写到别的轨上，而历史还按错的那份来回滚。
+        plan, skipped = self._wb_plan()
+        if not plan:
+            self.hint_var.set(
+                _("没有可写回的轨道：每条轨都缺起始/结尾（要 起始 < 结尾 才写）。"))
+            return None
+        before = self._wb_snap(plan)        # ← 写前快照，必须早于任何一次赋值
+        for it in plan:
+            for tr in (it["video"], it["audio"]):
+                if tr is None:
+                    continue
+                es = tr.enc_settings
+                es["trim_enabled"] = True
+                es["precise_trim"] = True
+                es["trim_start"] = it["ts"]
+                es["trim_end"] = it["te"]
+        after = self._wb_snap(plan)
+        written_v = [it["name"] for it in plan]
+        # 值一模一样（例如连点两次写回）⇒ 不记历史，免得占满后悔药位子
+        recorded = self._wb_record(before, after, plan)
+        self._after_wb_change()          # 主窗轨道列表 + 命令预览
+        self._autosave_state()           # 写回即定稿 → 顺手存档（对齐档案 + 写回历史）
+        msg = _("已将对齐时间写回 %d 条视频轨道（含同源音频）的截取设置。") % len(written_v)
+        if written_v:
+            msg += _("　") + _("、").join(written_v)
+        if skipped:
+            msg += _("　未写回（缺起始/结尾）：") + _("、").join(skipped)
+        msg += (_("　可右键「写回时间」撤销这一次。") if recorded
+                else _("　截取设置本就是这个值，未新增历史。"))
+        self.hint_var.set(msg)
+        return written_v, skipped
+
+    # ---------- 写回历史（右键「写回时间」，2026-10-26） ----------
+
+    def _wb_plan(self):
+        """写回计划 → (plan, skipped)。
+
+        plan 每项：`i` 窗口内轨序号 / `name` 显示名 / `path` 归一化路径 /
+        `vgi` 该视频轨在「同文件视频轨」里的组内序号 / `video` 视频轨对象 /
+        `audio` 同源音频轨对象或 None / `ts`·`te` 已格式化的秒字符串。
+
+        原「配对」逻辑原本内联在 `_push_alignment_to_tracks` 里；抽出来是为了让**写回**
+        与**写前快照**用同一份解析结果（各算一遍必漂移，见调用处注释）。
+        配对口径不变：第 k 个**视频**轨 ↔ 第 k 个同文件**音频**轨，序号只在同类里数。
+        """
         MT = getattr(self.app, "merge_tracks", []) or []
-        mt_video_groups = {}  # path -> [视频轨的 MT 序号]，按出现顺序
-        mt_audio_groups = {}  # path -> [音频轨的 MT 序号]，按出现顺序
+        mt_video_groups = {}   # path -> [视频轨的 MT 序号]，按出现顺序
+        mt_audio_groups = {}   # path -> [音频轨的 MT 序号]，按出现顺序
         for idx, t in enumerate(MT):
             fp = normalize_path(getattr(t, "file_path", "") or "")
             if not fp:
@@ -86503,56 +89237,509 @@ class MultiSyncReferenceDialog(tk.Toplevel):
                 mt_audio_groups.setdefault(fp, []).append(idx)
             else:
                 mt_video_groups.setdefault(fp, []).append(idx)
-        written_v, skipped = [], []
+        plan, skipped = [], []
         for i in range(self.n):
             a, b = self._anchor_pair(i)
             if a is None or b is None or b <= a:
                 skipped.append(self._track_disp(i))
                 continue
             tr = self.tracks[i]
-            ts, te = _fmt_sec6(a), _fmt_sec6(b)
-            # 视频轨（窗口里的轨道本体）
-            es = tr.enc_settings
-            es["trim_enabled"] = True
-            es["precise_trim"] = True
-            es["trim_start"] = ts
-            es["trim_end"] = te
-            written_v.append(self._track_disp(i))
-            # 同源音频轨：取与本视频轨相同的「视频组内序号」只写那一条，保证
-            # 「视频 + 音频都截到对齐窗口」且同一文件重复时各自匹配、互不覆盖。
-            fp = normalize_path(getattr(tr, "file_path", ""))
-            vg = mt_video_groups.get(fp)
-            if vg:
-                try:
-                    wi = MT.index(tr)
-                except ValueError:
-                    wi = None
-                if wi is not None and wi in vg:
-                    gi = vg.index(wi)
-                    ag = mt_audio_groups.get(fp, [])
-                    if 0 <= gi < len(ag):
-                        at = MT[ag[gi]]
-                        aes = at.enc_settings
-                        aes["trim_enabled"] = True
-                        aes["precise_trim"] = True
-                        aes["trim_start"] = ts
-                        aes["trim_end"] = te
-        # 刷新主窗口：轨道列表 + 命令预览（让写入立即可见）
+            fp = normalize_path(getattr(tr, "file_path", "") or "")
+            vg = mt_video_groups.get(fp) or []
+            try:
+                wi = MT.index(tr)
+            except ValueError:
+                wi = None
+            vgi = vg.index(wi) if (wi is not None and wi in vg) else None
+            at = None
+            if vgi is not None:
+                ag = mt_audio_groups.get(fp, [])
+                if 0 <= vgi < len(ag):
+                    at = MT[ag[vgi]]
+            plan.append({"i": i, "name": self._track_disp(i), "path": fp,
+                         "vgi": vgi, "video": tr, "audio": at,
+                         "ts": _fmt_sec6(a), "te": _fmt_sec6(b)})
+        return plan, skipped
+
+    @staticmethod
+    def _wb_vals_of(tr):
+        """轨道当前那 4 个 key 的形态 → `{key: [存在?, 值]}`（与历史条目同格式）。"""
+        es = getattr(tr, "enc_settings", None) or {}
+        return {k: ([True, es[k]] if k in es else [False, None])
+                for k in _SYNC_WB_KEYS}
+
+    def _wb_snap(self, plan):
+        """写前/写后快照 → 条目 list（顺序与 plan 严格对应，便于逐项比对）。
+
+        `vals[k] = [存在?, 值]` —— **必须区分「原本是 False」与「原本没这个键」**：
+        写回会无条件造出这 4 个键，还原时若把它们一律置 False，`enc_settings` 上仍留着
+        "动过"的痕迹（对拍旧行为/回退到干净状态时是错的），所以不存在的要 `pop` 掉。
+        """
+        items = []
+        for it in plan:
+            for role, tr in (("video", it["video"]), ("audio", it["audio"])):
+                if tr is None:
+                    continue
+                items.append({"path": it["path"], "role": role,
+                              "gi": it["vgi"], "track": tr,
+                              "vals": self._wb_vals_of(tr)})
+        return items
+
+    def _wb_record(self, before, after, plan):
+        """登记一次写回 → True=真记了一条，False=值没变化（不占历史位）。"""
+        if [it["vals"] for it in before] == [it["vals"] for it in after]:
+            return False
+        n_a = sum(1 for it in plan if it["audio"] is not None)
+        a, b = self._anchor_pair(self.ref_i)
+        # 标签只给人扫一眼（右键菜单一行、历史窗一列）：3 位小数足够，别搬汇总表那套
+        # 6 位（菜单项会被挤到换行）；没有音频轨时不写「+ 0 音频」。
+        label = _("%d 视频") % len(plan)
+        if n_a:
+            label += _(" + %d 音频") % n_a
+        if a is not None and b is not None:
+            label += _(" · 基准 %.3f→%.3f") % (a, b)
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._wb_hist.append({
+            "ts": now,
+            "hhmm": now[11:],
+            "label": label,
+            # `track` 对象引用只在本会话有效：还原时优先用它（精确命中），落盘读回来的
+            # 条目没有它，回退到 (path, role, 组内序号) —— 见 `_wb_locate`。
+            "before": before,
+            "after": after,
+        })
+        self._wb_hist = self._wb_hist[-_SYNC_WB_HIST_MAX:]
+        self._refresh_wb_win()
+        return True
+
+    @staticmethod
+    def _wb_name(it):
+        """历史条目 → 报错/提示里给人看的名字。"""
+        base = os.path.basename(it.get("path") or "") or _("（未知文件）")
+        return base + (_("（音频）") if it.get("role") == "audio" else "")
+
+    def _wb_locate(self, it):
+        """历史条目 → 当前轨道对象（None = 这条轨已经不在了）。
+
+        优先内存里的对象引用（本会话精确命中）；落盘读回来的条目没有引用，就按
+        `(归一化路径, role, 组内序号)` 在当前 `merge_tracks` 里重新定位 —— 与
+        `_apply_state` 的「路径 + 组内序号」同口径，同一文件重复出现时各自对上。
+        """
+        tr = it.get("track")
+        MT = getattr(self.app, "merge_tracks", []) or []
+        if tr is not None:
+            for t in MT:
+                if t is tr:
+                    return t
+        fp = it.get("path") or ""
+        gi = it.get("gi")
+        if not fp or gi is None:
+            return None
+        role = it.get("role") or "video"
+        same = []
+        for t in MT:
+            if normalize_path(getattr(t, "file_path", "") or "") != fp:
+                continue
+            if (getattr(t, "type", "") == "audio") == (role == "audio"):
+                same.append(t)
+        return same[gi] if 0 <= gi < len(same) else None
+
+    def _wb_win_idx(self, it):
+        """历史条目 → **窗口内**轨序号（None = 本窗没有对应行，如同源音频轨）。
+
+        与 `_wb_locate` 不同：那个返回 merge_tracks 里的轨道对象（可能是一条本窗没显示的
+        音频轨），这里要的是 `self.tracks` 的下标 —— 回退时要把锚点/波形镜像到「窗口里
+        哪一行」。口径仍是 (归一化路径, 组内序号)，与 `_apply_state` 一致。
+        """
+        if it.get("role") == "audio":
+            return None
+        fp = it.get("path") or ""
+        gi = it.get("gi")
+        if not fp or gi is None:
+            return None
+        same = [i for i, t in enumerate(self.tracks)
+                if normalize_path(getattr(t, "file_path", "") or "") == fp]
+        return same[gi] if 0 <= gi < len(same) else None
+
+    def _wb_apply(self, items, exp=None):
+        """把一组 `[存在?, 值]` 写回轨道 → (命中数, 已移除名单, 被别处改过名单)。
+
+        `exp` = 该条历史的「后态」（同下标）。当前值与它不一致 ⇒ 这条轨在写回之后被
+        别处改过（截取窗口 / 导入项目 / 前一次还原）。**照样覆盖**，只单独列出来告知
+        —— 用户 2026-10-26：「我要的是累积记录的值，可以随时选择」：点了就该生效，
+        不能点了没反应；但也绝不静默吞掉"你后来的改动被覆盖了"这件事。
+        """
+        done, gone, moved = 0, [], []
+        for k, it in enumerate(items):
+            tr = self._wb_locate(it)
+            if tr is None:
+                gone.append(self._wb_name(it))
+                continue
+            if exp is not None and k < len(exp) \
+                    and self._wb_vals_of(tr) != (exp[k].get("vals") or {}):
+                moved.append(self._wb_name(it))
+            es = getattr(tr, "enc_settings", None)
+            if es is None:
+                gone.append(self._wb_name(it))
+                continue
+            for key, pair in (it.get("vals") or {}).items():
+                if key not in _SYNC_WB_KEYS:
+                    continue
+                ok = isinstance(pair, (list, tuple)) and len(pair) == 2
+                had, val = (bool(pair[0]), pair[1]) if ok else (False, None)
+                if had:
+                    es[key] = val
+                else:
+                    es.pop(key, None)     # 原本没这个键 → 还原成「没有」
+            done += 1
+        return done, gone, moved
+
+    @staticmethod
+    def _wb_item_dump(it):
+        """历史条目 → JSON 安全形态（丢掉 track 引用；定位靠 path + role + 组内序号）。"""
+        return {"path": it.get("path", ""), "role": it.get("role", ""),
+                "gi": it.get("gi"), "vals": it.get("vals") or {}}
+
+    def _wb_dump(self):
+        return [{"ts": e.get("ts", ""), "label": e.get("label", ""),
+                 "before": [self._wb_item_dump(x) for x in (e.get("before") or [])],
+                 "after": [self._wb_item_dump(x) for x in (e.get("after") or [])]}
+                for e in self._wb_hist]
+
+    def _wb_items_clean(self, seq):
+        """档案里的条目列表 → 校验清洗（坏条目整条丢，绝不让一条脏数据废掉全部历史）。"""
+        out = []
+        for it in (seq or []):
+            if not isinstance(it, dict):
+                continue
+            vals = it.get("vals")
+            if not isinstance(vals, dict):
+                continue
+            clean = {}
+            for k in _SYNC_WB_KEYS:
+                pair = vals.get(k)
+                if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                    clean[k] = [bool(pair[0]), pair[1]]
+            if not clean:
+                continue
+            gi = it.get("gi")
+            out.append({"path": str(it.get("path") or ""),
+                        "role": "audio" if it.get("role") == "audio" else "video",
+                        "gi": gi if isinstance(gi, int) else None,
+                        "vals": clean})
+        return out
+
+    def _wb_load(self, seq):
+        """档案里的 `writebacks` → 内存历史（条目里没有 track 引用，见 `_wb_locate`）。"""
+        out = []
+        for e in (seq or []):
+            if not isinstance(e, dict):
+                continue
+            b = self._wb_items_clean(e.get("before"))
+            a = self._wb_items_clean(e.get("after"))
+            if not b or len(a) != len(b):
+                continue          # 前后态对不上就没法做冲突判定 → 整条不要
+            out.append({"ts": str(e.get("ts") or ""),
+                        "hhmm": str(e.get("ts") or "")[11:],
+                        "label": str(e.get("label") or ""),
+                        "before": b, "after": a})
+        return out[-_SYNC_WB_HIST_MAX:]
+
+    def _after_wb_change(self):
+        """写回 / 还原之后统一刷新主窗（轨道列表 + 命令预览，让结果立刻可见）。"""
         try:
             self.app.merge_update_track_list()
             self.app.merge_update_command_preview()
         except Exception:
             pass
-        msg = _("已将对齐时间写回 %d 条视频轨道（含同源音频）的截取设置。") % len(written_v)
-        if written_v:
-            msg += "　" + "、".join(written_v)
-        if skipped:
-            msg += _("　未写回（缺起始/结尾）：") + "、".join(skipped)
+
+    def _restore_writeback_at(self, idx):
+        """回到历史上第 idx 条**之前**的状态（idx = -1 = 最近一次）→ bool。
+
+        2026-10-26 用户实测两轮反馈的最终形态：
+          ① **记录一条不删** —— 历史是累积时间线，任何一条随时可以再点回去；
+          ② **轨道与列表/波形必须是同一个值**。初版只还原轨道，汇总表停在写回时的值，
+             得手点「从截取读回」；第二版给本窗存了份 `align` 快照，可那份快照取的正是
+             **写回那一刻**的打点（= 写回值本身），于是撤销后轨道是原始值、列表是写回值，
+             割裂照旧（用户：「这样的割裂让我怀疑，原始值写回的时候有被改吗」）。
+             现在**不存快照，直接按还原后的轨道派生**（`_anchors_from_tracks`）——
+             一个事实只有一个来源，撤销完列表/波形就是原始值，读不读回都一样。
+        还原只往回走、不重做：想要"那之后"的状态，再点一次「写回时间」即可。
+        """
+        n = len(self._wb_hist)
+        if not n:
+            return False
+        absi = idx if idx >= 0 else n + idx
+        if not (0 <= absi < n):
+            return False
+        entry = self._wb_hist[absi]
+        done, gone, moved = self._wb_apply(entry.get("before") or [],
+                                          exp=entry.get("after") or [])
+        if done == 0:
+            why = _("、").join(gone[:4])
+            self.hint_var.set(
+                _("没能还原：涉及轨道已不在当前轨道列表里")
+                + (_('（{0}）').format(why) if why else "") + _("。"))
+            return False
+        # 本窗锚点/波形按**还原后的轨道**重建（只镜像该次写回涉及的轨，别清无关轨）
+        only = set()
+        for it in (entry.get("before") or []):
+            wi = self._wb_win_idx(it)
+            if wi is not None:
+                only.add(wi)
+        got_s, got_e, cleared, _miss = self._anchors_from_tracks(
+            only=only, clear_missing=True)
+        if self.anchors and self.anchors[0]["vals"][self.ref_i] is None:
+            # 参考轨的起始被清掉了：`_apply_anchors` 会早退，偏移会僵在旧值（脏数据），
+            # 这里直接归零；不清的话汇总表会显示一组"没有基准"的偏移。
+            self.offsets = [0.0] * self.n
+            self.drift = [None] * self.n
+            with suppress(Exception):
+                self.offset_var.set(_fmt_sec6(0.0))
+        else:
+            self._apply_anchors()
+        self._redraw_all()
+        self._refresh_table()
+        self._after_wb_change()
+        self._autosave_state()
+        when = entry.get("hhmm") or entry.get("ts", "")
+        msg = _("已回到「%s」这一步之前：%d 条轨道的截取设置已还原") % (when, done)
+        if got_s or got_e:
+            msg += _("，列表/波形按轨道同步（起始 %d / 结尾 %d 条）") % (got_s, got_e)
+        if cleared:
+            msg += _("，%d 条轨本来没设截取、标记已清空") % cleared
+        if moved:
+            msg += _("　写回后被别处改过，已按历史覆盖：") + _("、").join(moved)
+        if gone:
+            msg += _("　已不在轨道列表（跳过）：") + _("、").join(gone)
+        msg += _("　历史全部保留，可再点其它步。")
         self.hint_var.set(msg)
+        self._refresh_wb_win()
+        return True
+
+    def _undo_last_writeback(self):
+        """右键菜单「撤销这次写回」= 还原最近一条。"""
+        self._restore_writeback_at(-1)
+
+    def _clear_writeback_history(self):
+        """清空历史记录（**只删记录，不动任何轨道数据**）。"""
+        n = len(self._wb_hist)
+        if not n:
+            return
+        self._wb_hist = []
+        self._autosave_state()
+        self._refresh_wb_win()
+        self.hint_var.set(_('已清除 {0} 条写回历史（轨道数据未动）。').format(n))
+
+    @staticmethod
+    def _wb_vals_txt(items):
+        """历史条目的 before / after → 「93.815→171.207」（取第一条视频轨做代表）。
+
+        为什么要给人看这个（2026-10-26 用户）：「这样的割裂让我怀疑，原始值写回的时候
+        有被改吗」—— 把「被覆盖前的原值」直接摆在列表里，一眼就能确认它没被动过，
+        不用靠"撤销一次试试"来验证。多轨时只取首条做代表：每轨各有各的值，一列塞不下，
+        想看某条轨的具体值去汇总表对。
+        """
+        for it in (items or []):
+            if it.get("role") != "video":
+                continue
+            vals = it.get("vals") or {}
+            got = []
+            for k in ("trim_start", "trim_end"):
+                pair = vals.get(k)
+                if isinstance(pair, (list, tuple)) and len(pair) == 2 and pair[0]:
+                    try:
+                        got.append("%.3f" % float(pair[1]))
+                    except Exception:
+                        got.append(str(pair[1]))
+                else:
+                    got.append("—")
+            if got and got[0] == "—" and got[1] == "—":
+                return _("（无截取）")      # 比「—→—」好认：一眼看出原本压根没设过截取
+            return "%s→%s" % (got[0], got[1]) if got else "—"
+        return _("（无视频轨）")
+
+    def _show_writeback_history(self):
+        """写回历史小窗：列出每一笔，选中 →「还原到这一步之前」（双击同效）。"""
+        win = getattr(self, "_wb_win", None)
+        if win is not None:
+            # 窗口可能已被外部 destroy（父窗销毁 / 直接 root.destroy）—— 留着死引用的话
+            # 再点「还原到更早的一次」只会静默 deiconify 失败、看起来像按钮坏了。
+            alive = False
+            with suppress(Exception):
+                alive = bool(win.winfo_exists())
+            if not alive:
+                self._wb_win = None
+                self._wb_win_tree = None
+            else:
+                with suppress(Exception):
+                    win.deiconify()
+                    win.lift()
+                    win.focus_set()
+                self._refresh_wb_win()
+                return
+        win = tk.Toplevel(self)
+        win.title(_("写回历史"))
+        win.transient(self)
+        wrap = ttk.Frame(win, padding=10)
+        wrap.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(wrap, foreground="#666666",
+                  text=_('每次「写回时间」之前都会记一条：内容是各轨被覆盖**之前**的截取设置（「原值」一列就是它，回退时原样放回；最多留 {0} 步，随档案落盘）。').format(_SYNC_WB_HIST_MAX)
+                  ).pack(anchor="w")
+        ttk.Label(wrap, foreground="#666666",
+                  text=_("选中一条 →「回到这一步之前」= 轨道截取设置与列表/波形一起回到那一刻。"
+                       "记录**不会**因为回退而消失：随便点哪一条都行，随时可以再回到另一步。")
+                  ).pack(anchor="w", pady=(0, 6))
+        tv = ttk.Treeview(wrap, columns=("when", "vals", "what"), show="headings",
+                          height=min(10, max(3, len(self._wb_hist))))
+        tv.heading("when", text=_("时间"))
+        tv.heading("vals", text=_("原值 → 写回值（首条轨）"))
+        tv.heading("what", text=_("这一笔改了什么"))
+        tv.column("when", width=76, anchor="w", stretch=False)
+        tv.column("vals", width=196, anchor="w", stretch=False)
+        tv.column("what", width=300, anchor="w")
+        tv.pack(fill=tk.BOTH, expand=True)
+        btns = ttk.Frame(wrap)
+        btns.pack(fill=tk.X, pady=(8, 0))
+
+        def _do(_e=None):
+            sel = tv.selection()
+            if not sel:
+                self.hint_var.set(_("先在列表里选一条历史。"))
+                return
+            self._restore_writeback_at(int(sel[0]))
+
+        def _close():
+            self._wb_win = None
+            self._wb_win_tree = None
+            with suppress(Exception):
+                win.destroy()
+
+        ttk.Button(btns, text=_("回到这一步之前"), command=_do).pack(side=tk.LEFT)
+        ttk.Button(btns, text=_("关闭"), command=_close).pack(side=tk.RIGHT)
+        tv.bind("<Double-1>", _do)      # 双击 = 直接回退（与汇总表「双击复制」同一套直觉）
+        win.protocol("WM_DELETE_WINDOW", _close)
+        self._wb_win = win
+        self._wb_win_tree = tv
+        self._refresh_wb_win()
+        with suppress(Exception):
+            win.update_idletasks()
+            w = max(520, win.winfo_reqwidth())
+            h = win.winfo_reqheight()
+            x = self.winfo_rootx() + max(0, (self.winfo_width() - w) // 2)
+            y = self.winfo_rooty() + 80
+            win.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _refresh_wb_win(self):
+        """历史窗还在就按 `_wb_hist` 重画（最新一笔在最上面，与右键菜单的"这次"对得上）。"""
+        tv = getattr(self, "_wb_win_tree", None)
+        win = getattr(self, "_wb_win", None)
+        if tv is None or win is None:
+            return
+        try:
+            if not win.winfo_exists():
+                self._wb_win = None
+                self._wb_win_tree = None
+                return
+            # 重画时保住选中：记录不再随回退消失，用户常常连着点几步，选中一丢就找不到
+            # 刚才点的是哪一条了（双击回退后尤其明显）。
+            keep = []
+            with suppress(Exception):
+                keep = list(tv.selection())
+            for iid in tv.get_children():
+                tv.delete(iid)
+            for i in range(len(self._wb_hist) - 1, -1, -1):
+                e = self._wb_hist[i]
+                tv.insert("", "end", iid=str(i),
+                          values=(e.get("hhmm") or e.get("ts", ""),
+                                  "%s → %s" % (self._wb_vals_txt(e.get("before")),
+                                               self._wb_vals_txt(e.get("after"))),
+                                  e.get("label", "")))
+            for s in keep:
+                with suppress(Exception):
+                    if tv.exists(s):
+                        tv.selection_add(s)
+        except Exception:
+            pass
+
+    def _popup_wb_menu(self, event=None):
+        """右键「写回时间」→ 写回历史菜单（2026-10-26 用户拍板的入口形式 A）。
+
+        左键 = 直接写回（无确认）；右键 = 后悔药，不额外占按钮位。
+        历史为空时给一行灰字，而不是弹出个空菜单让人以为功能坏了。
+        """
+        m = tk.Menu(self.write_back_btn, tearoff=0)
+        n = len(self._wb_hist)
+        if n:
+            e = self._wb_hist[-1]
+            when = e.get("hhmm") or str(e.get("ts", ""))[-8:]
+            m.add_command(
+                label=_("↶ 撤销这次写回（%s　%s）") % (when, e.get("label", "")),
+                command=self._undo_last_writeback)
+            m.add_command(label=_("打开历史记录…（共 %d 步）") % n,
+                          command=self._show_writeback_history)
+            m.add_separator()
+            m.add_command(label=_("清除写回历史（不动轨道）"),
+                          command=self._clear_writeback_history)
+        else:
+            m.add_command(label=_("（还没有写回记录）"), state="disabled")
+        try:
+            if event is not None:
+                m.tk_popup(event.x_root, event.y_root)
+            else:
+                m.tk_popup(self.write_back_btn.winfo_rootx(),
+                           self.write_back_btn.winfo_rooty()
+                           + self.write_back_btn.winfo_height())
+        finally:
+            with suppress(Exception):
+                m.grab_release()
+
+    def _open_time_preview(self):
+        """「时间预览(管道)」按钮：只启动内置时间引擎预览，**不写回**。
+
+        播的就是轨道**当前**的截取值（用户 2026-10-25：「我默认用户先写回、后预览」），
+        所以想看成片里的对齐效果，得先点右下角「写回时间」。
+        """
+        _why = self._preview_block_reason()
+        if _why:
+            self.hint_var.set(_("未启动预览：") + _why)
+            return
+        try:
+            self.app._live_preview_pipe()
+        except Exception as e:
+            self.hint_var.set(_('⚠ 启动预览失败：{0}').format(e))
+
+    def _preview_block_reason(self):
+        """复刻封装页时间预览的前置条件 → 返回「不能预览」的原因（None = 可以）。
+
+        为什么要在本窗先自查：`_time_preview_pipe_merge` 遇到「单轨模式 + 多个
+        视频轨启用」只往日志写一行，而本窗盖在上面 → 用户点完只会觉得「按钮没反应」。
+        """
+        if not callable(getattr(self.app, "_live_preview_pipe", None)):
+            return _("当前主窗口版本不支持时间预览（管道）")
+        try:
+            _enabled_v = [t for t in (self.app.merge_tracks or [])
+                          if getattr(t, "enabled", False)
+                          and getattr(t, "type", "") == "video"]
+        except Exception:
+            _enabled_v = []
+        if not _enabled_v:
+            return _("封装页没有启用的视频轨")
+        _mode_ok = False
+        for _name in ("pip_enabled", "concat_enabled"):
+            try:
+                if bool(getattr(self.app, _name).get()):
+                    _mode_ok = True
+                    break
+            except Exception:
+                continue
+        if not _mode_ok and len(_enabled_v) > 1:
+            return (_('当前是单轨模式但有 {0} 个视频轨启用 → 先在封装页勾选「启用画中画」或「串行合并」').format(len(_enabled_v)))
+        return None
 
     # ---------- 存档：保存 / 载入 / 自动恢复 ----------
     def _state_dict(self):
-        """当前对齐结果 → 可 JSON 化的 dict。
+        """当前对齐结果 → 可 JSON 化的 dict（= 档案里的 `current` 块）。
 
         按**文件路径**记录（不是序号）：换一次选中的轨道顺序、或重新选了同几个文件，
         都能对上。"""
@@ -86579,8 +89766,80 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             })
         return out
 
+    def _align_fp(self):
+        """轨道集合指纹：判断「这一批轨道」是不是上次那一批。
+
+        用本窗收下的文件路径序列（顺序敏感）。换一次选中顺序会算成另一批 —— 这是有意的：
+        顺序变了，各轨的偏移/参考轨含义也变了，混在一起比分开更难认。
+        """
+        return "\x01".join(normalize_path(getattr(t, "file_path", "") or "")
+                           for t in self.tracks)
+
+    def _remember_alignment(self):
+        """把当前对齐结果并进「对齐档案」（同指纹只留最新一份，超出上限丢最旧）。
+
+        为什么要有它：`sync_ref_last.json` 原本只有一个槽位 —— 做完 A 组再做 B 组，
+        A 组当场被覆盖（用户 2026-10-26：「这个文件利用率不高」）。现在换了轨道集合
+        也还留着旧账，`_restore_last` 照样只恢复"同一批"那一份，互不串味。
+        """
+        if not self.n:
+            return
+        snap = None
+        with suppress(Exception):
+            snap = self._state_dict()
+        if not snap:
+            return
+        fp = self._align_fp()
+        snap["fp"] = fp
+        self._align_hist = [x for x in self._align_hist
+                            if isinstance(x, dict) and x.get("fp") != fp]
+        self._align_hist.append(snap)
+        self._align_hist = self._align_hist[-_SYNC_ALIGN_KEEP:]
+
+    def _archive_dict(self):
+        """配置目录自动存档的完整档案（version 2）。
+
+        三块分工：
+          · current    —— 上次关窗/写回那一刻的对齐（version 1 老结构，旧版能直接读）
+          · alignments —— 最近几组**不同轨道集合**的对齐结果（按指纹去重）
+          · writebacks —— 「写回时间」历史（可逐步回滚外部轨道截取设置，跨会话有效）
+        """
+        with suppress(Exception):
+            self._remember_alignment()
+        return {
+            "kind": "KliFFmpegGUI.sync_reference",
+            "version": 2,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "current": self._state_dict(),
+            "alignments": copy.deepcopy(self._align_hist),
+            "writebacks": self._wb_dump(),
+        }
+
+    def _read_archive(self, data):
+        """档案 → (对齐片段, 对齐档案, 写回历史)。
+
+        version 1 的老文件整份就是一个对齐片段（`alignments`/`writebacks` 留空）。
+        不是本工具的 JSON / 结构坏了 → 第一项为 None，调用方按"没存档"处理。
+        """
+        if not isinstance(data, dict):
+            return None, [], []
+        if "sync_reference" not in str(data.get("kind", "")):
+            return None, [], []
+        ver = data.get("version")
+        if isinstance(ver, int) and ver >= 2:
+            cur = data.get("current")
+            aligns = [x for x in (data.get("alignments") or []) if isinstance(x, dict)]
+            return (cur if isinstance(cur, dict) else None), aligns, \
+                self._wb_load(data.get("writebacks"))
+        return data, [], []
+
     def _apply_state(self, data):
-        """把存档写回本窗 → (命中轨数, 总轨数, 说明)。只读文件、按路径匹配。"""
+        """把存档写回本窗 → (命中轨数, 总轨数, 说明)。只读文件、按路径匹配。
+
+        `start`/`end` 为 null 的格**不动** —— "部分匹配只恢复对得上的那几条"是「载入对齐 /
+        自动恢复」一直以来的语义。（写回历史回退**不**走这里：它要精确回到写回前，改由
+        `_anchors_from_tracks(clear_missing=True)` 按轨道派生，见那里的说明。）
+        """
         if not isinstance(data, dict):
             return 0, self.n, _("读出来的不是对象（不是本工具导出的 JSON）")
         if "sync_reference" not in str(data.get("kind", "")):
@@ -86662,14 +89921,19 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             d = ""
         return os.path.join(d, "sync_ref_last.json") if d else ""
 
-    def _save_state_to(self, path):
+    def _write_state_file(self, path, payload):
+        """落盘一份 JSON（两处存档共用；原先同一段 dump 写了两遍）。"""
         try:
             with open(path, "w", encoding="utf-8") as f:
-                json.dump(self._state_dict(), f, ensure_ascii=False, indent=2)
+                json.dump(payload, f, ensure_ascii=False, indent=2)
             return True
         except Exception as e:
             self.hint_var.set(_('保存失败：{0}').format(e))
             return False
+
+    def _save_state_to(self, path):
+        # 「另存为」只导出**对齐片段**（version 1）：干净、旧版能读，不带历史/档案
+        return self._write_state_file(path, self._state_dict())
 
     def _save_state_as(self):
         path = filedialog.asksaveasfilename(
@@ -86706,36 +89970,87 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             self.hint_var.set(_('已载入对齐结果（{0} 条轨道）{1}').format(hit, tail))
 
     def _autosave_state(self):
+        """写配置目录的完整档案（关窗时 + 每次写回/还原后各一次）。
+
+        调用点从"只在关窗"扩到"写回即存"（2026-10-26）：写回那一刻对齐已经定稿，正是
+        该落盘的时机；原来一天只写一次，程序被强杀就全丢 —— 用户说的「利用率不高」。
+        """
         p = self._autosave_path()
         if not p:
             return
-        try:
-            with open(p, "w", encoding="utf-8") as f:
-                json.dump(self._state_dict(), f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass        # 自动存档失败绝不影响关窗
+        with suppress(Exception):
+            payload = self._archive_dict()
+        if not payload:
+            return
+        self._write_state_file(p, payload)   # 失败也不抛：自动存档绝不影响关窗
 
     def _restore_last(self):
-        """打开窗口时自动恢复上次结果（同一批轨道才恢复；对不上不打扰）。"""
+        """打开窗口时自动恢复上次结果（同一批轨道才恢复；对不上不打扰）。
+
+        档案 v2 还捎回两块：`alignments`（历史对齐，供以后翻旧账）与 `writebacks`
+        （写回历史 —— **这是敢把写回二次确认删掉的底气**：上次会话写错的，这次开窗
+        右键「写回时间」还能撤回）。
+        """
         p = self._autosave_path()
         if not p or not os.path.exists(p):
             return
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
+        # 🩹 改走 read_json_file_guarded：旧写法是裸 json.load，遇到半截文件直接抛
+        data, err = read_json_file_guarded(p)
+        if err or data is None:
             return
-        hit, total, _msg = self._apply_state(data)
+        cur, aligns, wbs = self._read_archive(data)
+        self._align_hist = aligns[-_SYNC_ALIGN_KEEP:]
+        self._wb_hist = wbs
+        if cur is None:
+            return
+        hit, total, _msg = self._apply_state(cur)
         if hit == 0:
             return
-        when = str(data.get("saved_at", "") or "")
+        when = str(cur.get("saved_at", "") or "")
         tail = f"（{when}）" if when else ""
         if hit < total:
             self.hint_var.set(
-                _('已恢复上次的对齐结果：{0}/{1} 条轨道对得上{2}，其余需重新对齐。').format(hit, total, tail)
-)
+                _('已恢复上次的对齐结果：{0}/{1} 条轨道对得上{2}，其余需重新对齐。').format(hit, total, tail))
         else:
             self.hint_var.set(_('已恢复上次的对齐结果{0}（不想要就点「清除标记」）。').format(tail))
+        if self._wb_hist:
+            self.hint_var.set(
+                self.hint_var.get()
+                + _('\u3000另有 {0} 步写回历史可撤回（右键「写回时间」）。').format(len(self._wb_hist)))
+
+    def _geometry_tuple(self):
+        """当前窗口 geometry → (w, h, x, y)。
+
+        ⚠️ 用 `wm_geometry()` 解析而不是 `winfo_width()`：后者在窗口还没映射时是 1，
+        照它记「铺满前的尺寸」会存成 1×1，还原时窗口就成了一条缝。
+        """
+        m = re.match(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", self.wm_geometry() or "")
+        if m:
+            return tuple(int(g) for g in m.groups())
+        self.update_idletasks()
+        return (max(1, self.winfo_width()), max(1, self.winfo_height()),
+                self.winfo_x(), self.winfo_y())
+
+    def _toggle_full_width(self):
+        """「铺满宽度」：只改宽与 x，高和 y 原样 —— 详见按钮处注释。
+
+        状态由 `_fullw_prev` 是否为 None 决定（不另设布尔量：快照本身就是状态，
+        两处记同一件事迟早分叉）。铺满后再手动拖窗口、再点还原，仍回到铺满前的
+        那一份尺寸 —— 这正是「先记后还原」的语义，不做二次猜测。
+        """
+        w, h, x, y = self._geometry_tuple()
+        if self._fullw_prev is None:
+            sw = self.winfo_screenwidth()
+            self._fullw_prev = (w, h, x, y)
+            self.geometry(f"{max(sw, w)}x{h}+0+{y}")
+            self.hint_var.set(
+                _('已铺满宽度（{0} px）：高度 {1} px 与纵向位置 +{2} 没动，'
+                  '标题栏仍在原处，可照常拖动。再点一次「铺满宽度」还原。').format(max(sw, w), h, y))
+        else:
+            pw, ph, px, py = self._fullw_prev
+            self._fullw_prev = None
+            self.geometry(f"{pw}x{ph}+{px}+{py}")
+            self.hint_var.set(_('已还原窗口尺寸与位置（{0}×{1} at +{2}+{3}）。').format(pw, ph, px, py))
 
     def _apply_topmost(self):
         """顶部「总在最前」勾选（默认关，见 __init__ 里去掉 transient 的注释）。"""
@@ -86774,8 +90089,25 @@ class MultiSyncReferenceDialog(tk.Toplevel):
             else:
                 k += 1
                 name = _("比对%d · %s") % (k, disp)
+            asp = self.aspects[i] if i < len(self.aspects) else None
+            if not asp:
+                # 探测还没落定（窗口刚开就点对比）→ 顺手补一次。`_cached_video_rotated_dimensions`
+                # 是**缓存优先**（拖入文件时已填充），正常是零成本命中；拿不到就返回 None，
+                # 布局按 16:9 兜底，下次「重新取帧」自纠。
+                try:
+                    _w, _h = self.app._cached_video_rotated_dimensions(
+                        getattr(self.tracks[i], "file_path", "") or "",
+                        dict(getattr(self.tracks[i], "enc_settings", {}) or {}))
+                    if _w and _h:
+                        asp = float(_w) / float(_h)
+                        self.aspects[i] = asp
+                except Exception:
+                    asp = None
             out.append({"path": getattr(self.tracks[i], "file_path", "") or "",
                         "t": t,
+                        # 显示宽高比：紧排布局按它定格宽（None → 布局兜 16:9，
+                        # 探测落定后再刷新即自纠）
+                        "aspect": asp,
                         "caption": _("%s　%s s") % (name, _fmt_sec6(t))})
         return out
 
@@ -86808,6 +90140,12 @@ class MultiSyncReferenceDialog(tk.Toplevel):
         for i in range(self.n):
             self._stop_play(i)
         self._autosave_state()       # 关窗前自动存一份（下次打开同批轨道自动恢复）
+        wbw = getattr(self, "_wb_win", None)        # 写回历史窗非模态，一并带走
+        if wbw is not None:
+            with suppress(Exception):
+                wbw.destroy()
+            self._wb_win = None
+            self._wb_win_tree = None
         fw = getattr(self, "_frame_win", None)     # 对比窗非模态，关主窗时一并带走
         if fw is not None:
             with suppress(Exception):
@@ -86840,7 +90178,7 @@ class SyncFrameCompareDialog(tk.Toplevel):
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.cells = []          # [(img_label, cap_label)]
         self.imgs = []           # 持有 PhotoImage 引用，防 GC 后图像变空白
-        self.tile = (96, 54)
+        self.sizes = []          # 每格的 (w, h)：同高、宽按各轨显示比例（见 _sync_frame_layout）
         self._gen = 0
         self._busy = False
         self._pending = None     # 线程产物：(shots, entries, gen)
@@ -86873,21 +90211,33 @@ class SyncFrameCompareDialog(tk.Toplevel):
         ToolTip(tm, _("默认关闭：本窗可以和同步参考窗自由切换（挪光标时不会被挡住）。"))
         ttk.Button(btns, text=_("关闭"), command=self._close).pack(side=tk.RIGHT)
 
-    def _ensure_grid(self, n):
-        """按轨道数铺格子（轨道数不变则复用旧格，只换图，避免闪烁）。"""
-        if len(self.cells) == n:
+    def _ensure_grid(self, sizes, cells):
+        """按 `_sync_frame_layout` 的结果铺「同高紧排」格子（尺寸没变则复用，只换图）。
+
+        为什么不用 `grid`：grid 的列宽由该列最宽的格决定 —— 竖屏窄列和横屏宽列
+        混排时会被强行拉齐，两侧又回到「空洞」。这里改成**每行一个 Frame、行内
+        用 pack(side=LEFT) 紧挨**，各格保持自己的宽度（行高相同）。
+        尺寸变化（探测落定后比例变了 / 轨道数变了）才重建。
+        """
+        if self.cells and list(sizes) == self.sizes:
             return
         for c in list(self.grid_frame.winfo_children()):
             c.destroy()
         self.cells = []
         self.imgs = []
-        cols, _rows, tw, th = _sync_frame_grid(n, self.winfo_screenwidth(),
-                                               self.winfo_screenheight())
-        self.tile = (tw, th)
-        for k in range(n):
-            r, c = divmod(k, cols)
-            cell = ttk.Frame(self.grid_frame)
-            cell.grid(row=r, column=c, padx=3, pady=(0, 2))
+        self.sizes = list(sizes)
+        row_frames = []
+        for k, (row, col) in enumerate(cells):
+            if k >= len(sizes):
+                break
+            tw, th = sizes[k]
+            while len(row_frames) <= row:
+                rf = ttk.Frame(self.grid_frame)
+                rf.pack(anchor=tk.W)        # 行左对齐（网格整体仍居中）
+                row_frames.append(rf)
+            cell = ttk.Frame(row_frames[row])
+            cell.pack(side=tk.LEFT,
+                      padx=(0 if col == 0 else _SYNC_FRAME_GAP, 0))
             # 固定尺寸的黑色盒：取帧中占位、取到后居中贴图，窗口尺寸不跳
             box = tk.Frame(cell, width=tw, height=th, background="#000000")
             box.pack()
@@ -86915,15 +90265,20 @@ class SyncFrameCompareDialog(tk.Toplevel):
         self._busy = True
         self.re_btn.config(state=tk.DISABLED)
         self.hint_var.set(_("正在取帧…（共 %d 条轨道）") % len(entries))
-        self._ensure_grid(len(entries))
+        # 同高紧排：每轨按自身显示比例定格宽（竖屏自然成窄列，不再有 pad 黑边）
+        _th, sizes, cells = _sync_frame_layout(
+            [e.get("aspect") for e in entries],
+            self.winfo_screenwidth(), self.winfo_screenheight())
+        self._ensure_grid(sizes, cells)
         self._gen += 1
         gen = self._gen
-        ff, tw, th = self.ff, self.tile[0], self.tile[1]
+        ff = self.ff
         self._place()               # 先用占位格把窗口摆好（尺寸已定，取到图不再跳动）
 
         def worker():
             shots = []
-            for e in entries:
+            for k, e in enumerate(entries):
+                tw, th = sizes[k] if k < len(sizes) else (_th * 16 // 9, _th)
                 shots.append(_sync_grab_frame(ff, e.get("path", ""),
                                               e.get("t", 0.0), tw, th))
                 if gen != self._gen:
@@ -86979,7 +90334,7 @@ class SyncFrameCompareDialog(tk.Toplevel):
         self._place()
 
     def _place(self):
-        """按内容重算窗口尺寸并居中（缩放已在 _sync_frame_grid 里卡在屏幕内）。"""
+        """按内容重算窗口尺寸并居中（缩放已在 _sync_frame_layout 里卡在屏幕内）。"""
         self.update_idletasks()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         w = min(max(200, self.winfo_reqwidth()), int(sw * _SYNC_FRAME_SCREEN_W))
@@ -88945,7 +92300,21 @@ class CommandTreeEditor:
         self._btn(bar, _("管道预览"), self._on_pipe_preview)
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
         # 2026-10-14：应用封装页视频/音频轨道设置窗生成的滤镜串，填入选中子链「内容」列
-        self._btn(bar, _("应用视频滤镜"), lambda: self._apply_track_filter("v"))
+        _btn_apply_v = self._btn(bar, _("应用视频滤镜"), lambda: self._apply_track_filter("v"))
+        # 2026-10-24：给「应用视频滤镜」加**边界说明**（用户定案：不补全功能，但要让
+        #   「哪些控件能生效」一眼看见）。根因 —— 命令编辑器是**无轨宿主**（无
+        #   `track_obj`），设置窗里凡是写 `enc_settings` 的字段都没有下游
+        #   （`build_video_filter_chain` 13062–13750 不吃 overlay_x/y / blend_mode /
+        #   rotate_angle / move_*），只有「🎨 可视化编辑坐标」和 X/Y 走 `cmd_set_overlay_xy`
+        #   真正写回链里的 `overlay=x:y`。详见 research/cmd-tree-editor/README.md §27。
+        #   ⚠️ port 到 multi 时本串是**新增文案**，须进 wrapped_strings.json + build_lang.py。
+        ToolTip(_btn_apply_v,
+                _("从封装页「视频滤镜」设置窗生成滤镜串，填入选中子链的「内容」列。\n"
+                  "⚠️ 本窗口编的是**命令文本**，没有轨道对象，所以设置窗里只有一部分控件能落地：\n"
+                  "  · 「叠加/偏移」页：只有「🎨 可视化编辑坐标」和 X/Y 会写回链里的 overlay=x:y；\n"
+                  "  · 混合模式 / 旋转 / 持续旋转 / 轨迹 / 放开边界：在本窗口**没有下游**，保存后不会生成滤镜串。\n"
+                  "这些请先在封装页的轨道设置窗（或转换页水印编辑器）里配好，再回来微调命令文本。"),
+                wraplength=460)
         self._btn(bar, _("应用音频滤镜"), lambda: self._apply_track_filter("a"))
         # 2026-10-15：禁用预览开关——勾选后完全关闭右侧出图预览（选中行自动出图 / 重新取帧
         # 都不跑 ffmpeg），让用户专注手打代码不被取帧卡顿。节点图高亮（编辑属性）保留。
