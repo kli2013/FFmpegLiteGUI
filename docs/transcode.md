@@ -132,7 +132,10 @@
   - **unsharp（USM）**：经典锐化，通用性好。
   - **cas（对比度自适应）**：细节更自然，适合缩放/补帧后的画面。
 - **反胶卷过带**（IVTC）：将 60i 转换为 24p（fieldmatch+decimate）。
-- **去块滤波（deblock）**：强度下拉 `weak / medium / strong` + 块尺寸下拉 `4 / 8`（对应 ffmpeg `deblock=filter=strong:block=8` 等；旧的数值强度自动映射为 weak）。
+- **去块滤波（deblock）**：强度下拉 `weak / strong` + 块尺寸下拉 `4 / 8`（对应 ffmpeg `deblock=filter=strong:block=8` 等；旧的数值强度自动映射为 weak）。
+  ⚠️ ffmpeg 的 `filter` 参数只有 `weak(0)` / `strong(1)`，**`medium` 是非法值**：实测
+  `deblock=filter=medium` 会报 `Undefined constant or missing '(' in 'medium'`，整条命令直接失败。
+  故下拉只提供两档；旧预设/项目文件里若存过 `medium`，界面回显与命令生成两处都会回落 `weak`。
 - **色彩空间转换**（colormatrix）：可选 `bt709:bt2020`、`bt2020:bt709`、`bt601:bt709`、`bt709:bt601`。
 - **颜色校正**（eq）：亮度、对比度、饱和度、伽马滑块。
 - **色相调整**（hue）：色相角度和色饱和度。

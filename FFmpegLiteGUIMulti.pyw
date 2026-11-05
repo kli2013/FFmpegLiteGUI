@@ -30,8 +30,33 @@ from contextlib import suppress
 import types
 
 
+# ================== simpledialog 按钮中文化（单点收口，2026-11-03） ==================
+def _cn_dialog_buttonbox(self):
+    """`simpledialog.Dialog` 的中文按钮条（确定 / 取消）。
+
+    标准库把按钮文本**硬编码**成英文（`Lib/tkinter/simpledialog.py` 里
+    `Button(box, text="OK")` / `text="Cancel"`），所以凡是走 simpledialog 的窗口都会
+    露出两个英文按钮：`EditSegmentDialog`（分段拼接 → 双击「编辑片段」）以及
+    `simpledialog.askstring`（保存预设 / 保存水印模板 / 编辑章节时间…）。
+    用户 2026-11-03 报了「编辑片段」那个窗口。
+
+    做法：**逐行复刻标准库实现**（同样的 Frame/Button、width=10、
+    `default=ACTIVE`、Return/Escape 绑定、按钮条 pack 位置），只换文案 ——
+    行为、布局、键盘操作与标准库完全一致，纯文案差异。
+    之所以改在基类上（而不是只改 `EditSegmentDialog`）：这是同一处硬编码造成的一类
+    现象，收口一处后 askstring 那些窗口自动一起中文化，不必逐个重写。
+    """
+    box = tk.Frame(self)
+    w = tk.Button(box, text=_("确定"), width=10, command=self.ok, default=tk.ACTIVE)
+    w.pack(side=tk.LEFT, padx=5, pady=5)
+    w = tk.Button(box, text=_("取消"), width=10, command=self.cancel)
+    w.pack(side=tk.LEFT, padx=5, pady=5)
+    self.bind("<Return>", self.ok)
+    self.bind("<Escape>", self.cancel)
+    box.pack()
 
 
+simpledialog.Dialog.buttonbox = _cn_dialog_buttonbox
 
 
 # --- 依赖检测 ---
@@ -205,13 +230,6 @@ CMD_ROW_TRIM = "trim"      # 截取设置行（trim_start / trim_end / precise�
 # 值需要按 filtergraph 拆子链的选项（2026-10-13）
 CMD_FILTER_OPTS = frozenset({"-filter_complex", "-lavfi", "-vf", "-af",
                              "-filter:v", "-filter:a", "-filter"})
-# 「单流滤镜链」子集：值是 **一条链**（滤镜用逗号连接），不像 -filter_complex 那样是多段图。
-# 差别只在铺平粒度：这类按顶层 `,` 再拆一层（见 cmd_split_filters），拼回时也用 `,`。
-CMD_SIMPLE_FILTER_OPTS = frozenset({"-vf", "-af", "-filter:v", "-filter:a", "-filter"})
-# trim 结构化行并回时只认的视频滤镜行（2026-10-13）：trim 是主视频的设置，
-# 用户把 trim 行挪到 -af 前面时不能把它并进音频链（会拼出非法段）。
-CMD_TRIM_REINJECT_OPTS = frozenset({"-vf", "-filter:v", "-filter",
-                                    "-filter_complex", "-lavfi"})
 
 # **只有输入侧语义**的选项（2026-10-30）：写在它要作用的 `-i` 之前才有效；
 # 若被排到最后一个 `-i` 之后，就没有下一个输入来吸收它。实测（n9.0.1）后果分两档：
@@ -231,6 +249,13 @@ CMD_INPUT_ONLY_HARD_OPTS = frozenset({"-stream_loop", "-itsoffset"})
 # 其中 `-loop` 在输出侧还撞车一次（gif muxer 的循环次数、libwebp 同理）⇒ 输出为
 # 这两种格式时放过，否则每次编辑 gif 命令都误报。
 CMD_LOOP_MUXER_EXTS = (".gif", ".webp")
+# 「单流滤镜链」子集：值是 **一条链**（滤镜用逗号连接），不像 -filter_complex 那样是多段图。
+# 差别只在铺平粒度：这类按顶层 `,` 再拆一层（见 cmd_split_filters），拼回时也用 `,`。
+CMD_SIMPLE_FILTER_OPTS = frozenset({"-vf", "-af", "-filter:v", "-filter:a", "-filter"})
+# trim 结构化行并回时只认的视频滤镜行（2026-10-13）：trim 是主视频的设置，
+# 用户把 trim 行挪到 -af 前面时不能把它并进音频链（会拼出非法段）。
+CMD_TRIM_REINJECT_OPTS = frozenset({"-vf", "-filter:v", "-filter",
+                                    "-filter_complex", "-lavfi"})
 # 全局开关：作用于**整条命令**、不属于任何一个文件（`-i` 输入 / 输出文件都不属于）。
 #
 # 用途（2026-10-30 起**升级为行为约束**，不再只是配色）：
@@ -1030,8 +1055,8 @@ CMD_OPT_ALIAS = {
     "-t": "duration.trim",
     "-y": "overwrite.allow",
     "-n": "overwrite.deny",
-    "-nostdin": "no_stdin",
-    "-hide_banner": "hide_banner",
+    "-nostdin": "input.no_stdin",
+    "-hide_banner": "log.hide_banner",
     "-loglevel": "log.level",
     "-report": "log.report",
     # —— 编码器 / 质量 ——
@@ -1060,7 +1085,7 @@ CMD_OPT_ALIAS = {
     "-tag:a": "audio.tag",
     "-x264-params": "x264.params",
     "-x265-params": "x265.params",
-    "-threads": "threads",
+    "-threads": "encode.threads",
     "-pix_fmt": "video.pix_fmt",
     "-r": "frame.rate",
     "-fps_mode": "frame.sync",
@@ -1122,8 +1147,8 @@ CMD_OPT_ALIAS_TEXT = {
     "duration.trim": "时长·截取",
     "overwrite.allow": "覆盖·允许",
     "overwrite.deny": "覆盖·禁止",
-    "no_stdin": "不读标准输入",
-    "hide_banner": "隐藏版本横幅",
+    "input.no_stdin": "不读标准输入",
+    "log.hide_banner": "隐藏版本横幅",
     "log.level": "日志·级别",
     "log.report": "日志·写报告文件",
     "codec.all": "编码器·全部流",
@@ -1149,7 +1174,7 @@ CMD_OPT_ALIAS_TEXT = {
     "audio.tag": "音频·编码标签",
     "x264.params": "x264·高级参数",
     "x265.params": "x265·高级参数",
-    "threads": "线程数",
+    "encode.threads": "线程数",
     "video.pix_fmt": "视频·像素格式",
     "frame.rate": "帧率",
     "frame.sync": "帧率·同步模式",
@@ -3803,6 +3828,7 @@ def center_window(win: tk.Toplevel, width: int, height: int, offset_y: int = 0):
     win.update_idletasks()
 
 
+
 def _reveal_dialog(ui, center=True):
     """内容就绪后再显示弹窗（缩略图/取帧窗共用）。
 
@@ -5628,6 +5654,73 @@ def _trim_speed_from_settings(settings):
     return ts, sp
 
 
+def _pv_mpv_window(start_time, duration, graph_speed, is_complex):
+    """把**素材域**的 (起, 长) 换成 mpv 命令行要用的值。返回 `(start, duration)`。
+
+    🔴 唯一换算点（2026-11-02 实测，research/preview-speed-model）：
+      · `--vf=lavfi=[…]` 路线：mpv 的 `--start`/`--length`/`time-pos` 全部判定在
+        **图输出时间轴**上。图内 `setpts=1/s*PTS` 把 PTS 压成「源/s」⇒ 窗口必须同除 s，
+        否则「截取 5–10 + 2×」会播成素材 10–20（用户实测原话）。
+      · `--lavfi-complex` 路线（画中画/串行）：`--start` 是 demuxer seek、与图内 setpts 无关，
+        图本身已 `setpts=PTS-STARTPTS` 归零 ⇒ **绝不能除**（实测会 0 帧/错段）。
+    除 s 只会让 seek 目标更小（更早、更快），不会比现状慢 ⇒ 对 seek 性能无副作用。
+    """
+    # 数值解析统一走 _opt_float（None/空串/非法 → 兜底，0 也算无效 ⇒ 视为 1.0，
+    # 与旧 `or 1.0` 同义）。下面两个量允许是**时间字符串**（"00:01:05"）⇒ 解析失败时
+    # 原样带回，不换算（换算公式只对秒数成立）。
+    sp = _opt_float(graph_speed, 1.0) or 1.0
+    if is_complex or not (sp > 0 and abs(sp - 1.0) > 1e-6):
+        return start_time, duration
+    _st_n = _opt_float(start_time, None)
+    st = start_time if _st_n is None else _st_n / sp
+    _du_n = _opt_float(duration, None)
+    du = duration if _du_n is None else _du_n / sp
+    return st, du
+
+
+def _pv_audio_speed_factor(settings, filter_speed_on):
+    """预览图里**实际生效的段变速因子**（1.0 = 未变速）。视频 setpts 与音频 atempo 的唯一判据。
+
+    为什么必须同源（2026-11-02 实测，见 research/preview-speed-model/README.md）：
+    播放器以**音频时钟**为主时钟。视频 setpts 折半而音频不动时，mpv/ffplay 会丢帧把画面
+    **拖回 1×**（实测：5s 画面 + 30s 未变速素材 ⇒ 播了 29.6s 才停），而窗口参数又按压缩后
+    的时间轴平移（截取 5–10 实际播成 10–20）⇒ 正是「速度好像没变、区间却错了」这个
+    看起来自相矛盾的现象。故：图里有 setpts 就必须有 atempo，且两边倍率都取自本函数。
+    """
+    if not filter_speed_on or not settings:
+        return 1.0
+    if not settings.get("speed_enabled", False):
+        return 1.0
+    try:
+        sp = float(str(settings.get("speed_factor", "1.0") or "1.0"))
+    except (ValueError, TypeError):
+        return 1.0
+    return sp if (sp > 0 and abs(sp - 1.0) > 1e-6) else 1.0
+
+
+def _pv_atempo_factor(settings, filter_speed_on):
+    """预览里**音频**该用的 atempo 倍率（1.0 = 不变速）。挂 -af 时**只能挂一条**。
+
+    优先级（2026-11-02 用户拍板）：
+      1) 音频自己的变速设置（audio_speed_enabled + audio_speed_factor）—— 用户显式意图，照用；
+      2) 否则跟随视频倍率（`_pv_audio_speed_factor`）—— 只变视频时音频当主时钟会把画面拖回 1×
+         （实测 5s 画面 + 30s 素材 ⇒ 播 29.6s）。
+
+    🔴 atempo 在滤镜链上是**相乘**的：视频倍率一条 + 音频设置一条 ⇒ 视频2×+音频2× 播成 4×。
+       2026-11-02 就是这个坑（用户问「音频独立变速会不会多重变速」）：转换页普通预览与封装单轨
+       预览原先各有一条按 audio_speed_* 的 atempo，加上为修主时钟补的视频倍率 atempo ⇒ 叠乘。
+       故两处调用点的旧音频 atempo 已删，统一由本函数给出**唯一**倍率。
+    """
+    if not filter_speed_on or not settings:
+        return 1.0
+    if settings.get("audio_speed_enabled", False):
+        # 数值解析统一走 _opt_float（0 / 空 / 非法 → 1.0 ⇒ 落到下面跟随视频倍率）
+        af = _opt_float(settings.get("audio_speed_factor"), 1.0) or 1.0
+        if af > 0 and abs(af - 1.0) > 1e-6:
+            return af
+    return _pv_audio_speed_factor(settings, filter_speed_on)
+
+
 def _motion_trim_base(settings, used_combo=False, pre_seek=0.0):
     """运动表达式时间换算基准（统一入口，2026-08-30）。
 
@@ -6165,17 +6258,28 @@ def _append_bitrate_args(cmd_list, settings):
         cmd_list.extend(["-bufsize", bufsize + "k"])
 
 def _trimmed_duration(main_video, raw_duration):
-    """按主视频轨的 trim 设置算出「有效时长」未设 trim 则原样返回"""
+    """按主视频轨的 trim / 变速设置算出「有效时长」；都没设则原样返回。
+
+    🔴 2026-11-02：补上视频变速。此前只算截取 ⇒ 主视频开 2× 时，画中画/封装的段长、
+    tpad 基准与输出 `-t` 全按**未变速**长度算，成片被 `-t` 多留一倍（尾部定格/黑帧）；
+    而主视频链明明带 `setpts=1/f*PTS`（`build_video_filter_chain(include_speed=True)`）。
+    口径与 `_get_effective_duration`（50785）一致：先截取、再 ÷ speed_factor。
+    """
     main_duration = raw_duration
-    if main_video.enc_settings.get("trim_enabled", False):
-        start = main_video.enc_settings.get("trim_start", "0").strip()
-        end = main_video.enc_settings.get("trim_end", "").strip()
+    _es = main_video.enc_settings
+    if _es.get("trim_enabled", False):
+        start = _es.get("trim_start", "0").strip()
+        end = _es.get("trim_end", "").strip()
         start_sec = time_to_seconds(start) if start else 0.0
         end_sec = time_to_seconds(end) if end else None
         if end_sec and end_sec > start_sec:
             main_duration = end_sec - start_sec
         elif raw_duration:
             main_duration = raw_duration - start_sec
+    if main_duration and _es.get("speed_enabled", False):
+        _sp = _opt_float(_es.get("speed_factor", "1.0"), 1.0) or 1.0
+        if _sp > 0 and _sp != 1.0:
+            main_duration = main_duration / _sp
     return main_duration
 
 def _ensure_sheet_btn_row(self, ui):
@@ -6774,7 +6878,10 @@ def build_waypoint_expr(waypoints, sw="w", sh="h", spin_speed=60.0,
         return None, None, None, None, None
     HIDE = -100000
     # ---- 统一段预处理（时间换算 / clamp / cut / 时间轴量化），与区间表构造器同源 ----
-    _pp = _wp_prep(wps)
+    # 🔴 trim_start / speed_factor 必须透传：_wp_prep 才是「原始 → 输出时间线」换算的唯一入口。
+    #   2026-10-22 `43ecebd` 把换算从本函数体内搬进 _wp_prep 时漏传这两个 ⇒ 参数被吞、
+    #   截取/变速段的轨迹仍按原始时间落阈值（2026-11-02 审计发现，见 tests/_verify_wp_prep_forward.py）。
+    _pp = _wp_prep(wps, trim_start, speed_factor)
     if _pp is None:
         return None, None, None, None, None
     valid, end, cut_seg, _tinfo = _pp
@@ -10612,13 +10719,61 @@ _REGION_EFFECT_FILTERS = {
     # --- 邻域运算：卷积类，必须外扩 ---
     # （sobel 已删：输出是梯度幅值图，效果强弱完全取决于区域纹理，平滑内容下
     #   近似均匀暗块、肉眼无感（2026-09-07 实测，scale 参数亦无视觉改善），不可靠。）
-    "unsharp": {"tpl": "unsharp=5:5:{s}", "tag": "e", "default": "1.5", "neighbor": True, "bleed": 8},
-    "avgblur": {"tpl": "avgblur={s}",     "tag": "e", "default": "5", "neighbor": True, "bleed": 24},
-    "median":  {"tpl": "median={s}",      "tag": "e", "default": "3", "neighbor": True, "bleed": 8},
+    "unsharp": {"tpl": "unsharp=5:5:{s}", "tag": "e", "default": "1.5", "neighbor": True, "bleed": 8,
+                # luma_amount 官方域 -2~5（4.3 与 9.0 一致）；越界 = 整条命令失败
+                "clamp": (-2, 5, "f")},
+    "avgblur": {"tpl": "avgblur={s}",     "tag": "e", "default": "5", "neighbor": True, "bleed": 24,
+                "clamp": (1, 1024, "i")},
+    "median":  {"tpl": "median={s}",      "tag": "e", "default": "3", "neighbor": True, "bleed": 8,
+                # radius 官方域 1~127（0 也报 out of range）
+                "clamp": (1, 127, "i")},
 }
 
 # 局部模糊（boxblur/gblur）同样是卷积类，局部模式下一并外扩
 _REGION_BLUR_BLEED = {"boxblur": 24, "gblur": 24}
+
+# 局部模糊的数值域（2026-11-04，实测见 research/ffmpeg-capability-map/numeric-ranges.md）
+# boxblur/gblur 不在 _REGION_EFFECT_FILTERS 里（它们有独立分支 + 局部外扩），
+# 所以范围单独列；元组语义与那边的 "clamp" 字段一致：(lo, hi, kind, 默认值)。
+#   · gblur  : -h 明写 `(from 0 to 1024)`（4.3 与 9.0 逐字一致）
+#   · boxblur: -h 是 <string> **无范围**，实测硬上限 `>= 0 and < 32`；
+#              chroma 另受 min(W,H)/4 限制（64x64 上 radius=16 就报错）
+#              ⇒ 31 只保证「帧 ≥128px」安全，更小的代理帧仍可能失败（固有约束，静态表救不了）。
+_REGION_BLUR_CLAMP = {
+    "boxblur": (0, 31, "i", "5"),
+    "gblur": (0, 1024, "f", "2.0"),
+}
+
+
+def _clamp_num(raw, lo, hi, kind="i", default=None):
+    """把用户填的数值夹进滤镜的官方有效域 → 字符串（kind: "i" 整数 / "f" 浮点）。
+
+    为什么必须夹：越界不是"效果变弱"，而是 **ffmpeg 硬报错、整条命令失败**
+    （实测 n9.0.1：`unsharp=5:5:9` → `out of range [-2 - 5]` + `Result too large`；
+      `median=0` / `avgblur=0` / `gblur=sigma=2000` 同样整条不产出文件）。
+    空值 / 非数字先回落到 default，再夹一次 —— 两道都做，避免表里的 default 自己越界。
+    **未越界时原样返回用户串**（"1.50" 保持 "1.50"），不为了 clamp 去重排版。
+    """
+    def _num(x):
+        try:
+            v = float(x)
+        except (TypeError, ValueError):
+            return None
+        return v if math.isfinite(v) else None
+
+    v = _num(raw)
+    if v is not None and lo <= v <= hi:
+        # 整数域仍要截掉小数（沿用 pixelize 的老行为 int(float(x))，不是四舍五入）
+        return str(raw).strip() if kind == "f" else str(int(v))
+    if v is None:
+        v = _num(default)
+    if v is None:
+        v = (lo + hi) / 2.0
+    v = max(lo, min(hi, v))
+    if kind == "f":
+        s = f"{v:.4f}"
+        return s.rstrip("0").rstrip(".") if "." in s else s
+    return str(int(v))
 
 
 def _region_enable_suffix(enable_expr: str, filter_str: str) -> str:
@@ -10671,6 +10826,145 @@ def _build_chroma_filter(chroma_settings) -> str:
     return f"chromakey={color}:{similarity}:{blend}"
 
 
+# ---------------------------------------------------------------------------
+# removelogo 遮罩（2026-11-02）：手画黑白图 → 归一化缓存 → `removelogo=f=<pgm>`
+#
+# 为什么必须归一化（本机 n9 实测，依据 research/removelogo-mask/README.md）：
+#   · `f=` 的位图必须与**该滤镜位置**的帧尺寸 1:1，不符 = 硬失败
+#     （`Failed to configure input pad`，报错里既没有尺寸也没有「遮罩」二字）；
+#   · PNG / 彩色 / 带 alpha 都能读，但灰度阈值不干净（16 → 不处理、31 → 当整帧病灶）；
+#   · 绝对路径要**两层**转义 `C\\:/…`（单层 `\:` 一样断）；`[ ] ' , ;` 会截断 filtergraph。
+# ⇒ 导入时统一转成「目标尺寸 + 纯 0/255」的 PGM 落缓存；生成侧只吃缓存路径，
+#   **不在 `build_video_filter_chain` 里跑子进程**（那个函数只拼字符串）。
+_REMOVELOGO_MASK_SUBDIR = "kli_removelogo_mask"
+# 「画什么算要擦」的亮度阈值：白 = 擦除区（ffmpeg 官方语义）。
+# ⚠️ 取 24 而不是 128（实测依据）：`format=gray` 转出来的是 luma，饱和色的 luma 很低
+#    —— 纯红≈76、纯蓝≈29（limited range 更低），用户若用红/蓝画笔，阈值 128 会把整个
+#    病灶判成「保留」= 静默不生效。24 能同时收下红/蓝/绿，又不会把纯黑底（0）算进来。
+#    ⚠️ 不要试图去猜 ffmpeg 自己那套阈值（实测 16 不处理、31 就整帧当病灶，且不线性）；
+#    我们输出的是**纯 0/255**，走的永远是干净域。
+_REMOVELOGO_MASK_THRESHOLD = 24
+
+
+def _removelogo_mask_dir():
+    """遮罩缓存目录（系统 temp 下的固定子目录；可随时重建，用户原图另存 path）。"""
+    d = os.path.join(tempfile.gettempdir(), _REMOVELOGO_MASK_SUBDIR)
+    with suppress(OSError):
+        os.makedirs(d, exist_ok=True)
+    return d
+
+
+def removelogo_mask_cache_path(src_path, w, h):
+    """(用户原图, 目标帧宽高) → 归一化缓存的**确定性**路径。
+
+    名字里带「原图 mtime + 目标尺寸 + 路径哈希」：
+      · 原图改一次（手画后重存）⇒ mtime 变 ⇒ 换新缓存，不会吃旧图；
+      · 目标尺寸变（节点缩放改了）⇒ 换新文件，不会拿旧尺寸硬跑；
+      · 路径哈希 ⇒ 不同目录同名图不互相覆盖。
+    """
+    try:
+        _mt = int(os.path.getmtime(src_path))
+    except (OSError, TypeError, ValueError):
+        _mt = 0
+    _stem = os.path.splitext(os.path.basename(str(src_path or "mask")))[0]
+    _stem = re.sub(r"[^0-9A-Za-z_.-]+", "_", _stem)[:32] or "mask"
+    _tag = hashlib.md5(os.path.abspath(str(src_path or "")).encode("utf-8", "replace")).hexdigest()[:8]
+    return os.path.join(_removelogo_mask_dir(),
+                        "%s_%d_%dx%d_%s.pgm" % (_stem, _mt, int(w), int(h), _tag))
+
+
+def pgm_white_ratio(path):
+    """读 P5 PGM 的白像素占比（0.0~1.0）；读不动返回 None。
+
+    用途 = 「遮罩搞反了」的廉价体检：白 = 擦除区，用户若拿**白底黑字**的图来，归一化后
+    几乎全白 ⇒ removelogo 会把整幅当病灶（1080p 单帧几十秒）。直接在选图这一步拦下，
+    比让他等半小时再回来看结果强。
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        if not data.startswith(b"P5"):
+            return None
+        _i, _n, _vals = 2, len(data), []
+        while len(_vals) < 3 and _i < _n:
+            if data[_i:_i + 1].isspace():
+                _i += 1
+                continue
+            if data[_i:_i + 1] == b"#":
+                while _i < _n and data[_i:_i + 1] not in (b"\n", b"\r"):
+                    _i += 1
+                continue
+            _j = _i
+            while _j < _n and not data[_j:_j + 1].isspace():
+                _j += 1
+            _vals.append(int(data[_i:_j]))
+            _i = _j
+        if len(_vals) < 3:
+            return None
+        _w, _h, _max = _vals
+        _px = data[_i + 1:_i + 1 + _w * _h]
+        if not _px:
+            return None
+        return sum(1 for b in _px if b >= 128) / float(len(_px))
+    except Exception:
+        return None
+
+
+def normalize_removelogo_mask(ffmpeg_cmd, src_path, w, h, force=False):
+    """把手画遮罩归一化成 w×h 的纯黑白 PGM。返回 (ok, 路径或原因)。
+
+    链：`format=gray → scale（双线性）→ lut 二值化`。
+    ⚠️ **先缩再切**：反过来（先切再缩）1px 细笔画在缩小时会整片消失。
+    `lut` 表达式里的逗号用单引号包住，否则被 filtergraph 当选项分隔符。
+    """
+    if not ffmpeg_cmd:
+        return False, _("未找到 ffmpeg，无法归一化遮罩")
+    if not src_path or not os.path.exists(src_path):
+        return False, _("遮罩原图不存在：%s") % (src_path or _("（空）"))
+    try:
+        _w, _h = int(w), int(h)
+    except (TypeError, ValueError):
+        return False, _("目标尺寸无效（%s×%s）") % (w, h)
+    if _w <= 0 or _h <= 0:
+        return False, _("目标尺寸无效（%d×%d）") % (_w, _h)
+    out = removelogo_mask_cache_path(src_path, _w, _h)
+    if os.path.exists(out) and not force:
+        return True, out
+    _th = int(_REMOVELOGO_MASK_THRESHOLD)
+    vf = ("format=gray,scale=%d:%d,lut=y='if(gt(val,%d),255,0)'" % (_w, _h, _th))
+    # ⚠️ 临时名必须**保留 .pgm 后缀**（ffmpeg 按扩展名选 muxer；写成 `xxx.pgm.part`
+    #    会直接 `Error opening output files: Invalid argument`，实测踩过）。
+    _tmp = out + ".part.pgm"
+    cmd = [str(ffmpeg_cmd), "-hide_banner", "-loglevel", "error", "-y",
+           "-i", src_path, "-vf", vf, "-frames:v", "1", _tmp]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=60,
+                           creationflags=_ffmpeg_spawn_flags())
+    except Exception as e:
+        return False, _("归一化遮罩失败：%s") % e
+    if r.returncode != 0 or not os.path.exists(_tmp):
+        _msg = (r.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        return False, _("归一化遮罩失败：%s") % (_msg[-1] if _msg else _("ffmpeg 未产出文件"))
+    with suppress(OSError):
+        os.replace(_tmp, out)
+    return True, out
+
+
+def removelogo_mask_arg(path):
+    """遮罩路径 → `removelogo=f=` 的参数值。
+
+    复用 `cmd_movie_path_safe`（正斜杠归一 + 盘符冒号**两层**转义 + 含 `[ ] ' , ;`
+    时在同目录建安全名硬链接）；它返回 None 时退回朴素两层转义 —— 让 ffmpeg 自己报
+    「打不开这个文件」，而不是把整条命令悄悄丢掉。
+    """
+    _p = None
+    with suppress(Exception):
+        _p = cmd_movie_path_safe(path)
+    if _p:
+        return _p
+    return str(path or "").replace("\\", "/").replace(":", "\\\\:")
+
+
 def _effective_blur_items(settings: Dict[str, Any]) -> list:
     """去水印/模糊多区域列表统一出口：blur_items 优先，无列表时回退旧单键。"""
     items = settings.get("blur_items")
@@ -10687,6 +10981,9 @@ def _effective_blur_items(settings: Dict[str, Any]) -> list:
         "region_only": settings.get("blur_region_only", False),
         "full_frame": False,
         "enable_start": "", "enable_end": "", "enable_cycle": "", "enable_show": "",
+        # removelogo（2026-11-02）：旧单键回退里没有遮罩概念，但键要带上 ——
+        # 否则 `_form_to_item_dict` 写回 / 列表摘要 / 归一化校验三处都要各自兜 None。
+        "mask_path": "", "mask_src_path": "", "mask_w": 0, "mask_h": 0,
     }]
 
 
@@ -10714,8 +11011,9 @@ def _mask_shape_movie_path(path):
     build_video_filter_chain 是模块级函数拿不到 self._movie_path_safe（实例方法），
     此处独立实现同款两步：反斜杠→正斜杠、冒号双重转义 \\\\（filtergraph 层 + movie 参数层
     各吃一次转义，单层 \\: 会被 graph 解析成裸冒号 → avformat_open_input 'C' 截断，
-    与 _movie_path_safe 调用方 .replace(":", "\\\\:") 同款）。路径含 filtergraph 语法字符
-    [ ] ' , ; 时（实测无法转义，见 _movie_path_safe 注释）→ 源文件同目录建临时硬链接
+    与 `_movie_path_safe` 同款口径（转义已收进那个函数内部，2026-11-02）。路径含
+    filtergraph 语法字符 [ ] ' , ; 时（实测无法转义，见 _movie_path_safe 注释）→
+    源文件同目录建临时硬链接
     改名（同盘必成功，不复制），登记进 _PREVIEW_LINKS 由程序退出统一清理；失败返回 None。
     """
     if not path or not os.path.exists(path):
@@ -14129,6 +14427,7 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
                               include_trim: bool = True, include_format: bool = True, include_scale: bool = True,
                               enhance_settings=None, reverse=False, graph_id: str = "",
                               include_fade: bool = True, clip_duration=None,
+                              fade_output_duration=None, fade_speed_factor=None,
                               include_negate: bool = True,
                               include_mask: bool = True,
                               chroma_settings=None, loop_size=None, force_scale=None,
@@ -14152,6 +14451,11 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
 
     注意：「局部模糊」会生成带标签的分支子图（split/overlay），返回值可能是包含 ';' 的
     完整 filtergraph，而不再是单纯的逗号串。-vf 与 filter_complex 均支持该语法。
+
+    fade_output_duration：截取后的输出时长（源轴秒、未除变速），只用于定位**视频淡出**起点。
+    不传时退回 `clip_duration`（源全时长）＋ 精准截取自我扣减的旧口径 —— 于是
+    快速截取 / 组合跳转这类「输入级 -ss/-to 截取」的调用点必须传它，否则淡出起点落在
+    输出之外，`fade=t=out` 会被 ffmpeg 静默丢弃。
     """
     filters = []
 
@@ -14280,6 +14584,17 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
                         f"delogo=x='{_xexpr}':y='{_yexpr}':w={w}:h={h}{_sfx_en}")
                 else:
                     filters.append(f"delogo=x={x}:y={y}:w={w}:h={h}{_sfx_en}")
+            elif blur_type == "removelogo":
+                # 任意形状遮罩去水印（2026-11-02）。与 delogo 的三点根本差别：
+                #   ① **没有 x/y/w/h** —— 形状由遮罩位图自己决定 ⇒ 不吃坐标、不吃轨迹；
+                #   ② 不套 split/crop/overlay —— 它是原地补，块外零改动、没有接缝；
+                #   ③ 慢得多（成本 ∝ 病灶**厚度²**，单线程），大遮罩会出现 0.x 倍速。
+                # 遮罩文件必须是归一化缓存里的 0/255 PGM，尺寸 = **此处帧尺寸**
+                # （区域链恒在 crop/rotate/scale 之前 ⇒ 主链 = 源基底尺寸；
+                #   节点/组语境 = 节点画布尺寸，由 `_region_frame_size` 统一给出）。
+                _mp = str(_bi.get("mask_path", "") or "").strip()
+                if _mp:
+                    filters.append(f"removelogo=f={removelogo_mask_arg(_mp)}{_sfx_en}")
             elif blur_type in _REGION_EFFECT_FILTERS:
                 # 区域效果（2026-09-07）：局部反色 / 镜像 / 去色 / 纯色 / 锐化 / 描边 …
                 # 全部走同一条并行子图，恒局部（不看 region_only）。新增类型只改
@@ -14290,14 +14605,12 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
                     _sv = str(strength).strip() or str(_spec.get("default", ""))
                     _cl = _spec.get("clamp")
                     if _cl:
-                        # 有取值域的滤镜（pixelize 1~1024）必须夹住：0 / 负数 / 非数字
-                        # 都是 **ffmpeg 硬报错**（整条命令失败），不能像无域参数那样透传。
-                        # 空值/乱填一律回落到该类型默认值，再夹一次域。
-                        try:
-                            _iv = int(float(_sv))
-                        except Exception:
-                            _iv = int(float(_spec.get("default", _cl[0])))
-                        _sv = str(max(int(_cl[0]), min(int(_cl[1]), _iv)))
+                        # 有取值域的滤镜必须夹住：0 / 负数 / 非数字都是 **ffmpeg 硬报错**
+                        # （整条命令失败），不能像无域参数那样透传。
+                        # 2 元组 = 整数域（pixelize 1~1024）；3 元组第 3 位显式给 "f"。
+                        _sv = _clamp_num(_sv, _cl[0], _cl[1],
+                                         _cl[2] if len(_cl) > 2 else "i",
+                                         _spec.get("default", _cl[0]))
                     _f = _tpl.format(s=_sv)
                 else:
                     _f = _tpl
@@ -14325,6 +14638,11 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
                         f"[{_bg}][{_bl}]overlay={x}:{y}"
                     )
             elif blur_type in ("boxblur", "gblur"):
+                _bcl = _REGION_BLUR_CLAMP.get(blur_type)
+                if _bcl:
+                    # 半径/sigma 越界是硬报错（boxblur 填 999 → "must be >= 0 and < 32"），
+                    # 不是"模糊弱一点"。夹到这个滤镜自己的域上（见 _REGION_BLUR_CLAMP 注释）。
+                    strength = _clamp_num(strength, _bcl[0], _bcl[1], _bcl[2], _bcl[3])
                 if blur_type == "boxblur":
                     _blur_f = f"boxblur={strength}:{strength}{_sfx_en}"
                 else:
@@ -14455,11 +14773,15 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
     # ----- 增强滤镜统一时间段（2026-09-30）：捕获本块起点，块末统一挂 enable -----
     enh_start_idx = len(filters)
 
-    # ----- 去块滤波（2026-08-27：强度 weak/medium/strong + 块尺寸 4/8，覆盖 HandBrake 式 strength/blocksize） -----
+    # ----- 去块滤波（2026-08-27：强度 weak/strong + 块尺寸 4/8，覆盖 HandBrake 式 strength/blocksize） -----
+    # 🔴 ffmpeg 的 deblock 只有 filter=weak(0)|strong(1)，**没有 medium**：
+    #    实测 `deblock=filter=medium` 报 `Undefined constant or missing '(' in 'medium'`
+    #    ⇒ 整条命令失败。2026-11-05 已从下拉里删掉 medium，旧预设里的值在这里回落 weak。
     if enhance_settings and enhance_settings.get("deblock_enabled", False):
         _f = str(enhance_settings.get("deblock_strength", "weak") or "weak")
-        # 旧值兼容：旧字段存数值（如 4，当时作 block 用）→ 映射 weak
-        if _f not in ("weak", "medium", "strong"):
+        # 旧值兼容：旧字段存数值（如 4，当时作 block 用）→ 映射 weak；
+        # 旧预设存过 medium（非法值）→ 同样回落 weak，绝不透传给 ffmpeg
+        if _f not in ("weak", "strong"):
             _f = "weak"
         _blk = int(enhance_settings.get("deblock_block", 4) or 4)
         if _blk not in (4, 8):
@@ -14754,38 +15076,29 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
             max_tiles=TILE_MAX_TILES))
 
     # ----- 淡入淡出（片段首尾淡入黑 / 淡出黑，视频） -----
+    # 🔴 时间基准（2026-11-02，真机实证）：本段**排在 window 锚定 `setpts=PTS-STARTPTS+ws/TB`
+    #   之后** ⇒ 画中画/水印子视频看到的时间戳从 `show_start` 起，不是 0。此处仍写
+    #   `fade=t=in:st=0` 就永远不满足 `t<d`（fade 只对 `st <= t < st+d` 生效，`t<st` 原样输出）
+    #   ⇒ 用户看到「子视频硬切、没有淡入」。起点一律加位移量 `_fade_off`。
     if include_fade and settings.get("fade_enabled", False):
         fin = settings.get("fade_in", "")
         fout = settings.get("fade_out", "")
         fin_s = time_to_seconds(fin) if fin else 0.0
         fout_s = time_to_seconds(fout) if fout else 0.0
+        # 位移量 = 上面 window 分支注入的 `setpts=PTS-STARTPTS+window_start/TB`（判据同款）。
+        _fade_off = 0.0
+        if (window_start is not None and window_end is not None
+                and window_end > window_start):
+            _fade_off = float(window_start)
         if fin_s > 0:
-            filters.append(f"fade=t=in:st=0:d={fin_s:.3f}")
+            filters.append(f"fade=t=in:st={_fade_off:.3f}:d={fin_s:.3f}")
         if fout_s > 0:
-            if clip_duration and clip_duration > 0:
-                # 淡出起点按输出时长定位（fade 在变速 setpts 之后，t=输出时间线）。
-                # clip_duration 语义=源全时长；本链自身的 截取/变速 会缩短输出，
-                # 2026-09-13 前直接用 clip_duration → 截取后淡出点落在输出之外（淡出丢失）。
-                _od = clip_duration
-                if include_trim and settings.get("precise_trim", False) and settings.get("trim_enabled", False):
-                    _fs_raw = settings.get("trim_start", "").strip()
-                    _fe_raw = settings.get("trim_end", "").strip()
-                    _fs = time_to_seconds(_fs_raw) if _fs_raw else 0.0
-                    _fe = time_to_seconds(_fe_raw) if _fe_raw else None
-                    if _fe is not None and _fe > _fs:
-                        _od = _fe - _fs
-                    else:
-                        _od = max(0.0, _od - _fs)
-                if settings.get("speed_enabled", False):
-                    try:
-                        _fsp = float(settings.get("speed_factor", "1.0") or "1.0")
-                        if _fsp > 0 and _fsp != 1.0:
-                            _od = _od / _fsp
-                    except ValueError:
-                        pass
-                st = max(0.0, _od - fout_s)
-                filters.append(f"fade=t=out:st={st:.3f}:d={fout_s:.3f}")
-            # 未知时长时无法精确定位淡出起点，跳过淡出（淡入仍生效）
+            # 起点口径唯一出处 = video_fade_out_start（淡出定位判据，2026-11-02）：
+            # 时长未知时它返回 None ⇒ 跳过淡出（淡入仍生效），不再在这里分支。
+            st = video_fade_out_start(settings, fout_s, clip_duration, fade_output_duration,
+                                      speed_factor=fade_speed_factor)
+            if st is not None:
+                filters.append(f"fade=t=out:st={_fade_off + st:.3f}:d={fout_s:.3f}")
 
     filter_chain = ",".join(filters) if filters else "null"
     
@@ -14989,24 +15302,483 @@ def build_preview_filter_chain(settings: Dict[str, Any], target_height: int = 96
     else:
         return f"scale=-2:{target_height}"
 
-def build_atempo_chain(factor: float) -> str:
-    """构建音频变速滤镜链，支持大于2倍或小于0.5倍的场景"""
+# ---- atempo 拆链阈值：从本机二进制读，读不到退回保守值（2026-11-04）----
+# 为什么要探测：tempo 的合法域改过（更老的版本是 0.5~2.0；4.3 起实测已是 0.5~100）。
+#   写死 2.0 ⇒ 新机白白多拆一次（结果等价，多一次重采样）；
+#   写死 100 ⇒ 用户配了更老的二进制时 **直接报错**（Result too large）。
+# 读不到一律回退 (0.5, 2.0)：**最差结果 = 改造前的输出，绝不产生新错误**。
+_ATEMPO_RANGE_FALLBACK = (0.5, 2.0)
+_ATEMPO_RANGE_CACHE = {}      # {ffmpeg路径: (lo, hi) 或 None(探测过但读不到)}
+# 当前生效的 ffmpeg 路径：由 `FFmpegBatchGUI._update_ffmpeg_paths` 写入。
+# 模块级图构建函数拿不到 self，靠它取（None = 还没初始化 ⇒ 走保守回退）。
+_ACTIVE_FFMPEG_CMD = None
+
+
+def _set_active_ffmpeg_cmd(cmd):
+    """记下当前 ffmpeg 路径（仅供能力探测；不参与任何命令拼装）。"""
+    global _ACTIVE_FFMPEG_CMD
+    _ACTIVE_FFMPEG_CMD = cmd or None
+
+
+def ffmpeg_filter_opt_range(ffmpeg_cmd, filter_name, opt_name):
+    """从 `-h filter=X` 读单个参数的数值域 → (lo, hi)；读不到 ⇒ None。
+
+    复用 `cmd_filter_help` 的「按 (路径, 名字) 缓存」，同一滤镜只 spawn 一次。
+    上界写成 `INT_MAX` 之类非数值时 `float()` 失败 ⇒ 返回 None（不猜）。
+    """
+    if not ffmpeg_cmd:
+        return None
+    try:
+        info = cmd_filter_help(str(ffmpeg_cmd), str(filter_name))
+        if not info.get("ok"):
+            return None
+        for opt in info.get("opts") or []:
+            if opt.get("name") != opt_name:
+                continue
+            m = re.match(r"^\s*(\S+)\s*~\s*(\S+)\s*$", opt.get("rng") or "")
+            if not m:
+                return None
+            lo, hi = float(m.group(1)), float(m.group(2))
+            if math.isfinite(lo) and math.isfinite(hi) and lo > 0 and hi >= lo:
+                return (lo, hi)
+            return None
+    except Exception:
+        return None
+    return None
+
+
+def atempo_tempo_range(ffmpeg_cmd=None):
+    """atempo 的 tempo 合法域 → (lo, hi)；探测失败 / 域不可信 ⇒ (0.5, 2.0)。
+
+    `lo <= 1 <= hi` 是硬校验：拆链的两个 while 靠它收敛，
+    拿到 `(0.2, 0.9)` 这种可疑域会让 `r` 永远除不尽 ⇒ 必须回退而不是硬用。
+    """
+    cmd = ffmpeg_cmd or _ACTIVE_FFMPEG_CMD
+    if not cmd:
+        return _ATEMPO_RANGE_FALLBACK
+    key = str(cmd)
+    if key not in _ATEMPO_RANGE_CACHE:
+        _ATEMPO_RANGE_CACHE[key] = ffmpeg_filter_opt_range(cmd, "atempo", "tempo")
+    rng = _ATEMPO_RANGE_CACHE[key]
+    if not rng or not (rng[0] <= 1.0 <= rng[1]):
+        return _ATEMPO_RANGE_FALLBACK
+    return rng
+
+
+def build_atempo_chain(factor: float, ffmpeg_cmd=None) -> str:
+    """构建音频变速滤镜链，拆几条由本机 atempo 的合法域决定。
+
+    2026-11-04 更正：4.3 的 `-h` 已经是 `(from 0.5 to 100)`，且实测 4.3 上 `atempo=4`
+    直接跑通 ⇒ 老代码里的 2.0/0.5 阈值不是"兼容 4.3"的必需品，是历史遗留。
+    现在探测成功就用二进制自报的域（新机 factor=4 → 单条 `atempo=4`），
+    探测失败回退 2.0/0.5（输出与旧版逐字相同）。
+    """
     if factor <= 0 or factor == 1.0:
         return ""
+    # 🔴 非有限倍率（UI 是自由输入框 ⇒ 用户能填 `inf` / `1e999`，float() 都合法）
+    # 会让下面的 while 永不收敛（inf/2 还是 inf）⇒ **界面卡死**，只能杀进程。
+    # 按「无效输入 = 不变速」处理：返回空串 ⇒ 命令里干脆不出现 atempo。
+    # （2026-11-03 审计：数值解析收口时一并加固，正常倍率行为逐字不变。）
+    if not math.isfinite(factor):
+        return ""
+    lo, hi = atempo_tempo_range(ffmpeg_cmd)
     chain = []
     r = factor
-    while r > 2.0:
-        chain.append(2.0)
-        r /= 2.0
-    while r < 0.5:
-        chain.append(0.5)
-        r /= 0.5
+    while r > hi:
+        chain.append(hi)
+        r /= hi
+    while r < lo:
+        chain.append(lo)
+        r /= lo
     if abs(r - 1.0) > 1e-6:
         chain.append(r)
     if not chain:
         return ""
     atempo_filters = [f"atempo={v:.10f}".rstrip('0').rstrip('.') for v in chain]
     return ",".join(atempo_filters)
+
+
+def afade_out_start(settings: dict, fade_out_sec: float,
+                    source_duration: Optional[float] = None,
+                    trim_duration: Optional[float] = None,
+                    base_is_output: bool = False) -> Optional[float]:
+    """淡出起点（按**输出时间线** t=0 起算）。淡出定位的唯一判据（2026-11-02 统一）。
+
+    此前三份实现各写一套：`_build_audio_encoding_params` 用**源全时长**、
+    `_apply_audio_trim_and_encode` 用「截取后时长 ÷ 变速」（2026-09-13 修过的那份）、
+    分段拼接独立音频用 `a_end`（既不减去起点也不除变速）。用源全时长的那几支，
+    起点落在输出末尾之后 ⇒ **afade 静默失效**：实测 5s 流 + `afade=out:st=28` 的
+    MD5 与裸流完全相同，ffmpeg 不报警告。
+
+    :param settings: 设置字典（读 audio_speed_enabled / audio_speed_factor）
+    :param fade_out_sec: 淡出时长（秒）
+    :param source_duration: 源全时长；仅在 trim_duration 缺省（无截取）时使用
+    :param trim_duration: 截取后时长（源轴秒）。链首 `atrim+asetpts` 或输入级 `-ss`
+        都会把输出 t 归零，故有它时必须按它定位，再按音频变速倍率压缩
+        （atempo 恒在 afade 之前）。
+    :param base_is_output: **调用方给的时长已经在输出轴上**（已除过变速、已扣过截取）
+        ⇒ 只做 `max(0, 时长 − 淡出)`，不再读 settings 的变速、不再用 trim_duration。
+        2026-11-03：`_build_afade_suffix`（段级钳制之后）与 `_build_audio_filters`
+        （`_audio_effective_duration` 的返回值）各自内联了这行算式，是同一件事的第 3、4
+        份实现，一并收进来。
+    :return: 淡出起点秒（≥0）；**时长未知返回 None**（2026-11-03 定案）。
+
+    🔴 「时长未知 ⇒ None」而不是 ⇒ 0：0 会让调用方拼出 `afade=t=out:st=0:d=N`
+    ⇒ **整段音频从开头线性渐弱**，ffmpeg 不报警，用户只听到「声音莫名越来越小」。
+    视频侧 `video_fade_out_start` 一直是返回 None 让调用方跳过淡出，两判据此前语义
+    正好相反（2026-11-03 审计 P2-1）。现在两侧统一：拿不到时长 ⇒ 不挂淡出。
+    调用方**必须**判空（`if st is not None:`），别直接 `.3f` 格式化。
+    """
+    if base_is_output:
+        if source_duration is None:
+            return None
+        return max(0.0, float(source_duration) - float(fade_out_sec or 0.0))
+    if trim_duration is not None and trim_duration > 0:
+        base = float(trim_duration)
+        if settings.get("audio_speed_enabled", False):
+            sp = _opt_float(settings.get("audio_speed_factor", "1.0"), 1.0) or 1.0
+            if sp > 0 and sp != 1.0:
+                base = base / sp
+    elif source_duration is not None:
+        base = float(source_duration)
+    else:
+        return None
+    return max(0.0, base - float(fade_out_sec or 0.0))
+
+
+_TIMED_VF_NAMES = frozenset((
+    "fade", "eq", "hue", "rotate", "zoompan", "drawtext", "drawbox", "drawgrid",
+    "overlay", "blend", "tmix", "tblend", "scroll", "subtitles", "ass", "noise",
+    "vignette", "lutyuv", "colorbalance", "curves", "select", "framestep",
+))
+
+
+def vf_chain_is_timed(vf: str) -> bool:
+    """滤镜链是否需要「连续帧推进」才有意义（2026-11-03）。
+
+    图片主视频只解码出**单帧** ⇒ 链里若含时间相关滤镜（fade 的淡入淡出、eq 的
+    enable 窗口、drawtext 的 t 表达式、overlay 的动态落位…），只在 t=0 求值一次：
+    `fade=t=in` 直接把整张图压成全黑（用户实测第 15 条）。
+
+    判据只看**滤镜名**（`name=`，逗号或链首起头）+ `enable=` 开关，绝不用朴素的
+    `"t=" in vf` —— `format=` 里就含 `t=`，那样会把纯空间链也误判成时间链，
+    白白把「单帧停留 N 秒」的轻量预览变成 30fps 连续渲染。
+
+    :param vf: 逗号链（不含 `;` 多段图；多段图走 lavfi-complex 另一条路）
+    :return: True = 需要把单帧 loop 成连续流
+    """
+    if not vf:
+        return False
+    names = re.findall(r"(?:^|,)\s*([a-zA-Z0-9_]+)=", vf)
+    if any(n in _TIMED_VF_NAMES for n in names):
+        return True
+    return "enable=" in vf
+
+
+def audio_fade_view(settings: dict) -> dict:
+    """合并页视频轨设置 → **音频链**该用的淡入淡出视图（2026-11-03 用户定案）。
+
+    病根：视频轨的 `fade_enabled` 本意是「画面淡入黑 / 淡出黑」（`fade=`），但音频链历史实现
+    直接读同一个键 ⇒「视频一淡、声音跟着淡」。用户明确不接受这种隐式跟随：
+    「淡入淡出这些音频预览就不该跟随视频，没设置为什么要跟随」。
+
+    规则（唯一出口，调用方不再各自判）：
+      · settings 里**没有** `audio_follow_video_fade` ⇒ 原样返回。
+        这类设置要么来自转换页音频区、要么是独立音频轨条目 —— 它们的 fade 本来就是
+        **音频自己**的意图，与本开关无关，绝不能被遮掉；
+      · 勾了「音频跟随」⇒ 原样返回（沿用视频轨的淡入/淡出秒数，即旧行为）；
+      · 没勾 ⇒ 返回副本并把 `fade_enabled` 置 False ⇒ 音频链不生成任何 afade。
+
+    ⚠️ 只用于「拿视频轨设置去建音频链」的地方。视频链（`build_video_filter_chain` 的
+    `fade=`）必须始终用**原始** settings，否则画面淡入淡出会被一起关掉。
+    """
+    if not isinstance(settings, dict):
+        return settings
+    if "audio_follow_video_fade" not in settings:
+        return settings
+    if settings.get("audio_follow_video_fade", False):
+        return settings
+    _o = dict(settings)
+    _o["fade_enabled"] = False
+    return _o
+
+
+def merge_audio_follow_fade(audio_settings: dict, video_settings: dict) -> dict:
+    """把视频轨「音频跟随」的淡入淡出语义并进独立音频轨设置（2026-11-03 用户实测）。
+
+    病根：普通/画中画管道路径（直读分支）与 mpv 路径，音频链都改读**独立音频轨**
+    （type="audio"）的 enc_settings；但该条目通常是空的（fade 三键不存在）。当用户
+    「给主视频设淡入淡出 + 勾音频跟随」时，视频轨的 fade 跟随之意没被带进音频链 ⇒
+    音频整个不淡（用户实测：普通/画中画管道没淡入淡出，串行合并有 —— 后者走合成
+    音频图、建图时就拼了 afade，不经过这里）。
+
+    规则（音频轨**启用**淡入淡出才独立优先、否则跟随视频 —— 与 speed 同判据）：
+      · 视频轨没勾「音频跟随」⇒ 原样返回（音频只认音频轨自己的 fade，无即不淡）；
+      · 勾了 ⇒ 音频轨自己 `fade_enabled=True` 则保留其三键（独立优先）；否则
+        （False 或缺键，含「设过又关掉」残留的 False）用视频轨三键覆盖（跟随）。
+
+    ⚠️ 不能用 setdefault：音频轨若残留 `fade_enabled=False`（设过又关掉），setdefault
+    会因「键已存在」而不覆盖，把视频轨的 True 挡掉（用户实测「勾了跟随却没淡」）。
+
+    ⚠️ **不写** `audio_follow_video_fade` 键：`audio_fade_view` 靠「该键是否存在」区分
+    视频轨设置与音频轨设置，把此键并进音频轨会让它被误判成「视频轨设置」，从而按
+    follow 开关屏蔽/放行 —— 破坏音频轨的独立意图。合并后保持「无 follow 键」，
+    `audio_fade_view` 原样放行，fade 由合并后的 fade_enabled 决定。
+    """
+    if not isinstance(audio_settings, dict) or not isinstance(video_settings, dict):
+        return audio_settings
+    if not video_settings.get("audio_follow_video_fade", False):
+        return audio_settings
+    _o = dict(audio_settings)
+    if not audio_settings.get("fade_enabled", False):
+        # 音频轨自己没启用淡入淡出（False 或缺键，含「设过又关掉」残留的 False）⇒ 跟随视频轨
+        _o["fade_enabled"] = video_settings.get("fade_enabled", False)
+        _o["fade_in"] = video_settings.get("fade_in", "")
+        _o["fade_out"] = video_settings.get("fade_out", "")
+    return _o
+
+
+def concat_audio_fade_settings(tracks, path, video_settings):
+    """串行合并：视频轨对应音频段的**淡入淡出**设置（2026-11-03 用户实测）。
+
+    串行合并从设计上忽略独立音频轨（导出 `audio_tracks=[]`、预览同步），音频走各视频轨
+    的内嵌音轨 ⇒ 在音频轨上设的淡入淡出整个不生效。本函数把「同路径 type="audio" 条目」的
+    fade 并进视频轨设置（独立音频轨优先、未设才跟随视频轨 —— 与 speed 同判据），供串行合并
+    音频链的 `_build_afade_suffix` 使用。
+
+    ⚠️ 只对淡入淡出三键做独立优先；trim/speed/tone 仍读视频轨 settings（内嵌音轨跟随视频段）。
+    ⚠️ 找不到匹配音频轨时原样返回 `video_settings`（行为逐字节不变）。
+    """
+    _a = None
+    for t in (tracks or []):
+        if (getattr(t, "type", "") == "audio" and getattr(t, "enabled", True)
+                and normalize_path(getattr(t, "file_path", "") or "") == normalize_path(path or "")):
+            _a = t
+            break
+    if _a is None:
+        return video_settings
+    return merge_audio_follow_fade(dict(getattr(_a, "enc_settings", None) or {}), video_settings)
+
+
+def preview_afade_filters(settings: dict, *, seek_offset: float = 0.0,
+                          window_duration: Optional[float] = None,
+                          speed_factor: float = 1.0) -> list:
+    """预览侧 afade 串（**播放器时间轴 = 文件绝对时间**）。第三步补的预览缺口。
+
+    与导出侧（`afade_out_start`）的差别只在**时间基准**，语义完全一致：
+
+    · 导出：链内 `atrim+asetpts` 把 t 归零到截取起点 ⇒ 淡出起点 = 窗口时长/变速 − 淡出时长。
+    · 预览：预览链**不做**图内 trim（`trim_enabled` 在入口就被置 False），截取交给播放器
+      `--start` / `-ss`。播放器**不归零**滤镜时间戳 —— 实测（`tests/_probe_mpv_afade_timebase.py`）：
+
+      | 引擎 | 手段 | 滤镜看到的 pts |
+      |---|---|---|
+      | mpv | `--start=3` + `--af` | 文件绝对（st=4 的淡出落在播放 1.6s ≈ 绝对 4.6s） |
+      | ffplay | `-ss 3` + `-af` | 文件绝对（`ashowinfo` 首个 `pts_time=3.000`） |
+      | ffmpeg 管道 | 输入级 `-ss` | **归零**（管道图另走「0 基 from pipe_start」桥接，故本函数不接管道） |
+
+    `atempo` 从 **0 起压缩整条时间轴** ⇒ 源时刻 T 经 atempo 后的时间戳 = `T / sp`。
+    故两边起点都要先按源轴求和、**再**除 sp（2026-11-03 实测，见
+    `research/probe_pv_afade_axis2_20261103.py`）：
+
+    ============  =========================  ==========================
+    写法          sp=2、seek=5、win=10、淡2   实测听感
+    ============  =========================  ==========================
+    `seek + win/sp - fade`（旧）  st=5.0 / 8.0   前 2.5s **完全静音**、
+                                                淡入迟到 2.5s、淡出落在窗口外
+    `(seek+win-fade)/sp`（现）    st=2.5 / 6.5   0-1s 淡入、3.5-5s 淡出 ✓
+    ============  =========================  ==========================
+
+    旧式在 sp≠1 时把「已除过 sp 的窗口」和「未除的起点」相加 ⇒ 混轴。sp=1 两式等价，
+    故本改动对所有未变速路径逐字无变化。
+
+    :param settings: 设置字典（读 fade_enabled / fade_in / fade_out）
+    :param seek_offset: 播放器跳转起点（= 截取起点，源轴秒）；无截取传 0
+    :param window_duration: 播放窗口长度（源轴秒，**未**除变速）；None/0 ⇒ 不接淡出
+    :param speed_factor: **实际**进入链的 atempo 倍率（mpv `--speed` 代劳时传 1.0）
+    :return: list[str]；未启用或无窗口时为空列表
+    """
+    if not settings.get("fade_enabled", False):
+        return []
+    # 合并页视频轨：未勾「音频跟随」⇒ 这里只淡画面，音频不淡（判据见 audio_fade_view）
+    settings = audio_fade_view(settings)
+    if not settings.get("fade_enabled", False):
+        return []
+    fin = settings.get("fade_in", "")
+    fout = settings.get("fade_out", "")
+    fin_s = time_to_seconds(fin) if fin else 0.0
+    fout_s = time_to_seconds(fout) if fout else 0.0
+    sp = _opt_float(speed_factor or 1.0, 1.0) or 1.0
+    if sp <= 0:
+        sp = 1.0
+    seek = max(0.0, float(seek_offset or 0.0))
+    out = []
+    if fin_s > 0:
+        # 淡入落在「播放起点」= 源轴 seek 处；经 atempo 后该时刻的戳是 seek/sp
+        out.append(f"afade=t=in:st={seek / sp:.3f}:d={fin_s:.3f}")
+    if fout_s > 0 and window_duration and window_duration > 0:
+        # 先按源轴求和再除 sp（禁写成 seek + win/sp - fade：那是混轴）
+        st = (seek + float(window_duration) - fout_s) / sp
+        out.append(f"afade=t=out:st={max(0.0, st):.3f}:d={fout_s:.3f}")
+    return out
+
+
+def video_fade_out_start(settings: dict, fade_out_sec: float,
+                         source_duration: Optional[float] = None,
+                         trimmed_output_duration: Optional[float] = None,
+                         speed_factor: Optional[float] = None) -> Optional[float]:
+    """视频淡出起点（按**输出时间线** t=0 起算）；时长未知返回 None（调用方跳过淡出）。
+
+    与 `afade_out_start`（音频侧）同构，是**视频淡出定位的唯一判据**（2026-11-02）。
+    音频那侧曾分裂成三份实现；视频这侧只有一份，但**转换页那个调用点没传时长**
+    ⇒ `fade=t=out` 恒被「未知时长」分支跳过，用户开「淡入淡出」时其实只有音频在淡
+    （真机实测：视频链里只有 `fade=t=in`，音频链有 `afade=t=out`）。
+
+    :param settings: 设置字典（读 trim_* / speed_*）
+    :param fade_out_sec: 淡出时长（秒）
+    :param source_duration: 源全时长（`clip_duration` 的既有语义，源轴秒）
+    :param trimmed_output_duration: 截取后的输出时长（源轴秒、**未**除变速）。给了就优先用——
+        输入级 `-ss/-to`（快速截取 / 组合跳转）与链内 `trim+setpts`（精准截取）都会把
+        输出时间线归零，故三种截取模式一律按它定位。
+    :param speed_factor: **实际**进入链的变速倍率（2026-11-02）。None = 读 settings
+        （既有调用点逐字不变）；传 1.0 = 「时长已经是输出轴，别再除」——`include_speed=False`
+        的调用点（预览关掉滤镜变速开关、或时长本身取自 `-t` 口径）必须用它，否则会多除一次。
+    :return: 淡出起点秒（≥0）；时长未知返回 None
+    """
+    if trimmed_output_duration is not None and trimmed_output_duration > 0:
+        base = float(trimmed_output_duration)
+    elif source_duration is not None and source_duration > 0:
+        base = float(source_duration)
+        # 旧口径（既有调用点靠这条）：只传了源全时长时，链内精准截取要自己扣掉起点。
+        if settings.get("trim_enabled", False) and settings.get("precise_trim", False):
+            _fs_raw = settings.get("trim_start", "").strip()
+            _fe_raw = settings.get("trim_end", "").strip()
+            _fs = time_to_seconds(_fs_raw) if _fs_raw else 0.0
+            _fe = time_to_seconds(_fe_raw) if _fe_raw else None
+            if _fe is not None and _fe > _fs:
+                base = _fe - _fs
+            else:
+                base = max(0.0, base - _fs)
+    else:
+        return None
+    # fade 排在变速 setpts 之后 ⇒ 输出时间线已被压缩
+    if speed_factor is not None:
+        _sp = float(speed_factor or 1.0)
+    elif settings.get("speed_enabled", False):
+        _sp = _opt_float(settings.get("speed_factor", "1.0"), 1.0) or 1.0
+    else:
+        _sp = 1.0
+    if _sp > 0 and _sp != 1.0:
+        base = base / _sp
+    return max(0.0, base - float(fade_out_sec or 0.0))
+
+
+def build_audio_tone_chain(settings, *, speed_factor=None, include_volume=True,
+                           include_speed=True, include_hp=True, include_lp=True,
+                           include_denoise=True, include_loudnorm=True,
+                           include_channel=True, include_eq=True):
+    """音频「音色链」的唯一实现（2026-11-02 统一）。
+
+    同一串滤镜此前在 base 里有 **5 份**独立拼装：
+    `_build_audio_encoding_params`（转换页无截取/组合跳转/快速截取/水印）、
+    `_apply_audio_trim_and_encode`（转换页精准截取）、
+    `_build_audio_filters`（封装/画中画/串行/多条预览）、
+    `_generate_segment_concat_command` 内联段（转换页分段拼接）、
+    `_preview_with_settings`（转换页预览）。
+    五份的**缺格**与**顺序**各不相同，最典型的是预览少了 hp/lp/loudnorm/channel，
+    且 atempo 夹在 denoise 之前 ⇒ 同一份工程预览与成片听感不一致。
+
+    规范顺序（下面按此顺序追加）::
+
+        hp → lp → volume → atempo → denoise → eq → loudnorm → channel
+
+    · hp/lp 在 denoise **之前**：afftdn 的噪底估计基于输入频谱，先把隆隆声/喷麦切掉
+      估得更准（原来 `_build_audio_filters` 是反的）。
+    · volume/atempo 与 hp/lp/eq 都是线性，先后不可听辨，固定一处写法避免再分叉。
+    · eq 在 denoise **之后**、loudnorm **之前**（2026-11-03 定案）：先降噪再整形频响；
+      EQ 增益随后被 loudnorm 归一并受其 TP 限制 ⇒ 调 EQ 只改「音色」不漂移「响度」、
+      不突破峰值。原「loudnorm→channel→eq」里 EQ 在归一之后会绕过响度，已修正。
+    · channel 仍在 loudnorm **之后**（保持既有顺序，未纳入本次 EQ 顺序调整）。
+
+    不含 atrim / adelay / afade / areverse / 音频分段 / soxr —— 这些与时间轴相关，
+    由调用方在链前（trim/adelay）或链后（fade/reverse/段效果/soxr）各自追加。
+
+    :param settings: 设置字典（轨道 enc_settings 或转换页 settings 均可）
+    :param speed_factor: 变速倍率。**None** = 按 `audio_speed_enabled`/`audio_speed_factor`
+        自己判断（导出侧口径）；显式传值时按该倍率变速（预览传 `_pv_atempo_factor`
+        的结果，可能是「跟随视频」得来的倍率）。
+    :return: list[str]；没有任何项启用时为空列表
+    """
+    parts = []
+    # 高低频截止（先去喷麦/隆隆声，降噪的噪底估计更准）
+    # 2026-11-04：f 的自由输入框（增强页 / 轨道设置）会原样进滤镜，越界是 AVOption
+    # 硬报错 ⇒ 这里夹到官方域 (0~999999)；空/乱填回落默认值。
+    if include_hp and settings.get("hp_enabled"):
+        parts.append("highpass=f=%s" % _clamp_num(
+            settings.get("hp_freq", 200), 0, 999999, "i", 200))
+    if include_lp and settings.get("lp_enabled"):
+        parts.append("lowpass=f=%s" % _clamp_num(
+            settings.get("lp_freq", 3000), 0, 999999, "i", 3000))
+    # 音量
+    if include_volume and settings.get("volume_enabled", False):
+        vol = _opt_float(settings.get("volume", 1.0), 1.0)
+        if vol is not None and vol != 1.0:
+            parts.append(f"volume={vol:.2f}")
+    # 变速（唯一一条 atempo，倍率由调用方定）
+    if include_speed:
+        if speed_factor is None and settings.get("audio_speed_enabled", False):
+            speed_factor = _opt_float(settings.get("audio_speed_factor", "1.0"), 1.0)
+        if speed_factor and speed_factor != 1.0:
+            atempo = build_atempo_chain(speed_factor)
+            if atempo:
+                parts.append(atempo)
+    # 降噪
+    if include_denoise and settings.get("denoise_enabled", False):
+        if settings.get("denoise_method") == "arnndn":
+            parts.append("arnndn")
+        else:
+            # denoise_nr / denoise_nf UI 无入口（见 _build_audio_encoding_params 注释），
+            # 保留 .get 是给手写工程/预设覆盖用 —— 五份实现从此读同一处默认值。
+            # 越界（如预设里写了 nf=-100）同样是硬报错 ⇒ 夹到 afftdn 官方域。
+            nr = _clamp_num(settings.get("denoise_nr", 12), 0.01, 97, "f", 12)
+            nf = _clamp_num(settings.get("denoise_nf", -30), -80, -20, "f", -30)
+            parts.append(f"afftdn=nr={nr}:nf={nf}")
+    # 均衡器（EQ）：低/中/高 三段增益（dB）—— 在 loudnorm 之前，保证 EQ 只改音色、响度仍归一
+    # 2026-11-04：bass/treble/equalizer 的 g 官方域都是 -900~900，越界硬报错 ⇒ 夹住。
+    if include_eq and settings.get("eq_enabled", False):
+        eq_low = _opt_float(settings.get("eq_low", 0) or 0, 0.0)
+        eq_mid = _opt_float(settings.get("eq_mid", 0) or 0, 0.0)
+        eq_high = _opt_float(settings.get("eq_high", 0) or 0, 0.0)
+        eq_low = float(_clamp_num(eq_low, -900, 900, "f", 0.0))
+        eq_mid = float(_clamp_num(eq_mid, -900, 900, "f", 0.0))
+        eq_high = float(_clamp_num(eq_high, -900, 900, "f", 0.0))
+        if eq_low != 0.0:
+            parts.append(f"bass=g={eq_low:.1f}")
+        if eq_mid != 0.0:
+            parts.append(f"equalizer=f=1000:width_type=h:width=200:g={eq_mid:.1f}")
+        if eq_high != 0.0:
+            parts.append(f"treble=g={eq_high:.1f}")
+    # 响度标准化（音色链的最后一道增益整形，之后仅剩声道映射）
+    # 2026-11-04：I 走既有 loudnorm_i_norm（钳 -70~-5）；LRA/TP 在 UI 上无入口，
+    # 只可能来自手写工程/预设 —— 越界同样是 AVOption 硬报错，一并夹到官方域。
+    if include_loudnorm and settings.get("loudnorm_enabled", False):
+        parts.append("loudnorm=I={}:LRA={}:TP={}".format(
+            loudnorm_i_norm(settings.get("loudnorm_i", -23))[1],
+            _clamp_num(settings.get("loudnorm_lra", 7), 1, 50, "f", 7),
+            _clamp_num(settings.get("loudnorm_tp", -2), -9, 0, "f", -2)))
+    # 声道 / 单声道
+    if include_channel:
+        mode = settings.get("channel_mode", "stereo")
+        if mode == "mono":
+            parts.append("pan=mono|c0=0.5*c0+0.5*c1")
+        elif mode == "left":
+            parts.append("pan=mono|c0=c0")
+        elif mode == "right":
+            parts.append("pan=mono|c0=c1")
+        elif mode == "swap":
+            parts.append("pan=stereo|c0=c1|c1=c0")
+    return parts
+
 
 # ================== 文字水印 drawtext 辅助 ==================
 
@@ -17592,8 +18364,34 @@ def _cmd_has_output_option(cmd_list, *opts):
     return any(o in tail for o in opts)
 
 
+def _append_duration_limit(cmd_list, *, audio_enabled, has_audio_stream, duration=None,
+                           app=None, tag=_("[时长]")):
+    """「有音频 → -shortest / 无音频 → -t 时长 / 都算不出 → -shortest」的**唯一**决策点。
+
+    2026-11-02 收口：此前这段三岔判断在 `_ensure_tw_duration_limit` 与水印路径的兜底
+    分支里各写一遍（字面量 -shortest / -t 分散在两处），任一处调整就会两边不一致。
+    判据本身没变：`-shortest` 靠有限音频流截断（实测对 color 无限源不终止，故无音频绝不用），
+    无音频必须 `-t` 精确截断。
+
+    :param duration: 输出时长（秒）。无音频时用它；算不出才退 -shortest。
+    :param app: 传入时用于 ``_append_info_ui`` 报「无法计算时长」的警告。
+    :return: 实际采用的方式："-shortest" 或 "-t"
+    """
+    if audio_enabled and has_audio_stream:
+        cmd_list.append("-shortest")
+        return "-shortest"
+    if duration and duration > 0:
+        cmd_list.extend(["-t", f"{duration:.3f}"])
+        return "-t"
+    cmd_list.append("-shortest")
+    if app is not None:
+        with suppress(Exception):
+            app._append_info_ui(_('{0} 警告：无法计算主视频时长，使用 -shortest 控制输出。').format(tag))
+    return "-shortest"
+
+
 def _ensure_tw_duration_limit(app, cmd_list, *, input_path=None, main_duration=None,
-                              audio_enabled=True, tag=None,
+                              audio_enabled=True, tag=_("[文字水印]"),
                               image_display_duration=None):
     """文字水印旋转/持续旋转(spin)时，build_text_watermark_filtergraph 使用
     color=c=black@0:s=WxH:d=999999 的无限时长透明源；若命令尚未加任何时长限制，
@@ -17609,8 +18407,6 @@ def _ensure_tw_duration_limit(app, cmd_list, *, input_path=None, main_duration=N
     不影响正常有界输出。模块级辅助，app 传入调用方实例（需 _get_cached_stream_info /
     _get_media_duration / _append_info_ui）。只就地 append 到 cmd_list。"""
     # 仅当命令确实包含文字水印的无限透明源时才需要限制
-    if tag is None:
-        tag = _("[文字水印]")
     if not any("color=c=black@0" in str(a) for a in cmd_list):
         return
     # 输出侧已有限制（别处已加输出级 -t / -shortest）则跳过，避免重复。
@@ -17623,11 +18419,10 @@ def _ensure_tw_duration_limit(app, cmd_list, *, input_path=None, main_duration=N
         if info and any(s.get("codec_type") == "audio"
                         for s in info.get("streams", [])):
             has_audio_stream = True
-    # 有音频：优先 -shortest（音频有限流可正确截断）
+    # 有音频：优先 -shortest（音频有限流可正确截断）；否则必须 -t 精确截断
     if audio_enabled and has_audio_stream:
-        cmd_list.append("-shortest")
-        return
-    # 无音频 / 音频禁用：必须用 -t 精确截断，避免 -shortest 对 color 无限源卡死
+        return _append_duration_limit(
+            cmd_list, audio_enabled=True, has_audio_stream=True)
     eff = main_duration
     # 静态图片主视频：无真实时长概念（ffprobe 对图片常返回 N/A 或 0.04 等小值），
     # 统一按默认 10s 处理（与 merge_build_cmd_list 的图片默认时长逻辑一致），
@@ -17641,14 +18436,9 @@ def _ensure_tw_duration_limit(app, cmd_list, *, input_path=None, main_duration=N
             eff = app._get_media_duration(input_path)
         except Exception:
             eff = None
-    if eff and eff > 0:
-        cmd_list.extend(["-t", f"{eff:.3f}"])
-    else:
-        # 兜底：连时长都算不出，退 -shortest（可能卡，但总比无限输出好）
-        cmd_list.append("-shortest")
-        with suppress(Exception):
-            app._append_info_ui(
-                _('{0} 警告：无法计算主视频时长，使用 -shortest 控制输出。').format(tag))
+    return _append_duration_limit(
+        cmd_list, audio_enabled=False, has_audio_stream=False,
+        duration=eff, app=app, tag=tag)
 
 
 def _eff_image_display_duration(settings, default=10.0):
@@ -22386,6 +23176,14 @@ def _describe_filter_error(name, msg):
         return (_("去水印区域不在画面内 —— delogo 要求区域四周至少各留 1 像素"
                 "（X≥1、Y≥1、X+宽≤画面宽-1、Y+高≤画面高-1）；"
                 "当前是贴边或越界了，把坐标往画面中间挪、或把区域缩小即可"))
+    if name == "removelogo" and "failed to configure input pad" in msg.lower():
+        # ffmpeg 对遮罩尺寸不符只吐这一句（既没有尺寸也没有「遮罩」二字，实测 n9）。
+        return (_("去水印遮罩与画面尺寸对不上 —— removelogo 要求遮罩位图与**该滤镜处的画面**"
+                "严格 1:1（例如 1920×1080 的素材就得是 1920×1080 的遮罩）；"
+                "请回「去水印/模糊设置」里重新点一次「浏览…」让它按当前尺寸重新生成"))
+    if name == "removelogo":
+        return (_("去水印遮罩（removelogo）：%s —— 多为遮罩文件被删/改名，"
+                "或遮罩尺寸与画面不符；回设置窗重新选一次遮罩即可") % msg)
     return _("滤镜 %s：%s") % (name, msg)
 
 
@@ -23270,6 +24068,12 @@ class VideoFilterFrame(ttk.LabelFrame):
         # 空列表 → 用上方单实例键（旧版兼容）。get_settings 输出列表，生成遍历列表。
         self._blur_items = []
 
+        # removelogo 遮罩内存态（2026-11-02）：与表单同源，`_form_to_item_dict` 从这里读。
+        # _mask_src = 用户手画原图（回显给他看的路径）；_mask_path = 归一化缓存 PGM。
+        self._mask_src = ""
+        self._mask_path = ""
+        self._mask_wh = (0, 0)
+
         self.enhance_settings = {
             "denoise_enabled": False,
             "denoise_mode": "hqdn3d",       # 2026-08-27：hqdn3d 轻量 / nlmeans 高质量（慢）
@@ -23280,7 +24084,7 @@ class VideoFilterFrame(ttk.LabelFrame):
             "sharpen_strength": 1.0,
             "ivtc_enabled": False,
             "deblock_enabled": False,
-            "deblock_strength": "weak",     # 2026-08-27：weak/medium/strong（旧数值 4 → 兼容 weak）
+            "deblock_strength": "weak",     # weak/strong（旧数值 4 或 medium → 兼容 weak）
             "deblock_block": 4,             # 2026-08-27：4/8
             "colorspace_enabled": False,
             "colorspace_matrix": "bt709:bt2020",
@@ -23958,7 +24762,8 @@ class VideoFilterFrame(ttk.LabelFrame):
         chk_ivtc.pack(anchor=tk.W)
 
     
-        # 去块滤波（2026-08-27：强度 weak/medium/strong + 块尺寸 4/8，覆盖 HandBrake 式 strength/blocksize）
+        # 去块滤波（2026-08-27：强度 weak/strong + 块尺寸 4/8，覆盖 HandBrake 式 strength/blocksize；
+        # medium 是非法值，ffmpeg 只认 weak/strong，2026-11-05 已移除）
         deblock_frame = ttk.LabelFrame(left_frame, text=_("去块滤波 (deblock)"), padding="5")
         deblock_frame.pack(fill=tk.X, pady=5)
         self.deblock_enabled = tk.BooleanVar(value=self.enhance_settings.get("deblock_enabled", False))
@@ -23966,17 +24771,17 @@ class VideoFilterFrame(ttk.LabelFrame):
         row4 = ttk.Frame(deblock_frame); row4.pack(fill=tk.X, pady=2)
         ttk.Label(row4, text=_("强度:")).pack(side=tk.LEFT)
         _db_old = self.enhance_settings.get("deblock_strength", "weak")
-        _db_init = "weak" if str(_db_old) not in ("weak", "medium", "strong") else str(_db_old)
+        _db_init = "weak" if str(_db_old) not in ("weak", "strong") else str(_db_old)
         self.deblock_strength = tk.StringVar(value=_db_init)
         ttk.Combobox(row4, textvariable=self.deblock_strength, state="readonly", width=8,
-                     values=("weak", "medium", "strong")).pack(side=tk.LEFT, padx=(2, 12))
+                     values=("weak", "strong")).pack(side=tk.LEFT, padx=(2, 12))
         ttk.Label(row4, text=_("块尺寸:")).pack(side=tk.LEFT)
         self.deblock_block = tk.IntVar(value=int(self.enhance_settings.get("deblock_block", 4) or 4))
         ttk.Combobox(row4, textvariable=self.deblock_block, state="readonly", width=6,
                      values=(4, 8)).pack(side=tk.LEFT, padx=(2, 6))
         ToolTip(deblock_frame,
                 _("去块滤波（ffmpeg deblock）：\n"
-                "• 强度：weak/medium/strong\n"
+                "• 强度：weak / strong（medium 不是合法值，ffmpeg 只认这两档）\n"
                 "• 块尺寸：4 / 8（blocksize，4 更精细、8 更彻底）\n"
                 "对应 ffmpeg: deblock=filter=strong:block=8 等"))
     
@@ -30403,6 +31208,13 @@ class BlurFilterDialog(tk.Toplevel):
             "enable_show": self.enable_show_var.get().strip(),
             # 轨迹航点（内存态，由 _open_delogo_trajectory 回写；仅 delogo 消费）
             "waypoints": list(getattr(self, "_current_waypoints", []) or []),
+            # removelogo 遮罩（2026-11-02）：mask_path = 归一化缓存 PGM（生成侧唯一消费的键），
+            # mask_src_path/mask_w/mask_h 只用于回显与校验。x/y/w/h 照旧写但生成侧不读
+            # —— 保持表单映射形状不变，避免 12 个变量 trace 的既有路径出现分叉。
+            "mask_path": str(getattr(self, "_mask_path", "") or ""),
+            "mask_src_path": str(getattr(self, "_mask_src", "") or ""),
+            "mask_w": int((getattr(self, "_mask_wh", (0, 0)) or (0, 0))[0] or 0),
+            "mask_h": int((getattr(self, "_mask_wh", (0, 0)) or (0, 0))[1] or 0),
         }
 
     def _preview_settings(self):
@@ -30414,6 +31226,13 @@ class BlurFilterDialog(tk.Toplevel):
         if not self.enabled_var.get():
             return None
         _it = dict(self._form_to_item_dict())
+        # removelogo：没有坐标，只看遮罩到位没有（尺寸/存在性由 _preview_precheck 说清）
+        if _it["type"] == "removelogo":
+            _mp = str(_it.get("mask_path", "") or "").strip()
+            if not _mp or not os.path.exists(_mp):
+                return None
+            _it["enabled"] = True
+            return {"blur_enabled": True, "blur_items": [_it]}
         # delogo 恒区域；其余类型只有勾了「仅应用到选定区域」才要坐标
         _need_xy = (_it["type"] == "delogo") or bool(_it["region_only"])
         # 2026-10-09：delogo 表达式轨迹（waypoints）由表达式驱动 x/y，不依赖静态 x/y 填空
@@ -30484,7 +31303,8 @@ class BlurFilterDialog(tk.Toplevel):
         静默夹紧会造成「预览看着好、导出照样失败」的假象，比报错更糟。
         """
         _it = dict(self._form_to_item_dict())
-        if str(_it.get("type") or "") != "delogo":
+        _ft = str(_it.get("type") or "")
+        if _ft not in ("delogo", "removelogo"):
             return True, ""
         # ⚠️「启用去水印/模糊」总开关关着时 `_preview_settings()` 返回 None ⇒ 拼出来的
         # 命令里**根本没有 delogo**（2026-10-06 用户就是在这个状态下以为「预览坏了」：
@@ -30494,37 +31314,31 @@ class BlurFilterDialog(tk.Toplevel):
         _en = getattr(self, "enabled_var", None)
         if _en is not None and not _en.get():
             return True, ""
+        # removelogo（2026-11-02）：没有坐标可校验，改判「遮罩到位且尺寸对得上」。
+        # ⚠️ 尺寸必须按**本滤镜处的帧尺寸**判（`_region_frame_size`），不是源存储尺寸 ——
+        #    竖拍/autorotate、节点缩放下两者不同，用错就会「预检通过、导出硬失败」。
+        if _ft == "removelogo":
+            if not str(self.mask_var.get() or "").strip():
+                return False, (_("removelogo 需要一张手画遮罩：点下方「浏览…」选图"
+                               "（白 = 擦除区，黑 = 保留）"))
+            _mp = str(_it.get("mask_path", "") or "").strip()
+            if not _mp or not os.path.exists(_mp):
+                return False, (_("removelogo 的遮罩缓存不存在（%s）—— 重新点一次「浏览…」"
+                               "按当前画面尺寸重建") % (os.path.basename(_mp) if _mp else _("空路径")))
+            _mw = int(_it.get("mask_w", 0) or 0)
+            _mh = int(_it.get("mask_h", 0) or 0)
+            _fw, _fh = self._region_frame_size(src)
+            if _fw and _fh and _mw and _mh and (_mw != _fw or _mh != _fh):
+                return False, (_("遮罩尺寸 %d×%d 与当前画面 %d×%d 不符 —— removelogo 要求严格 1:1"
+                               "（改过缩放/旋转/换了素材都会变），重新点一次「浏览…」即可")
+                               % (_mw, _mh, _fw, _fh))
+            return True, ""
         _label = {"x": "X", "y": "Y", "w": _("宽"), "h": _("高")}
 
-        def _node_canvas_size():
-            """节点语境（2026-10-16）：越界判定的基准 = **节点输出尺寸**，不是源文件尺寸。
-
-            组内节点的画面是**包装盒尺寸**（挂在 filt_frame.node_frame_orig_size 上），
-            拿主视频宽高去判 delogo 越界会误报/漏报 —— 与「右侧预览一直是主视频兜底画面」
-            是同一处语境缺失。非节点语境 → (None, None)，调用方回落 ffprobe 量源文件。
-
-            🔴 2026-10-16 二轮（用户实测：「他显示的画面是正确的, 但是选框的比例是和原始
-            包装盒大小的比例, 所以选的位置被放大后就会超出位置」）：`node_frame_orig_size`
-            是**未缩放**的包装盒，而编辑器里看到的画面是**缩放后**的 —— 父行（独立素材）
-            开了 scale 时，`_node_fx_excl` **保留 scale**（只刨 crop/rotate），渲染帧 =>
-            **缩放后尺寸**。⇒ 判定基准必须与渲染帧**严格同尺寸**，否则选框按未缩放盒的
-            比例画、画面按缩放后尺寸显示 ⇒ 选出的区域一放大就跑到框外（管道预览里
-            delogo 一旦越界就 `Error reinitializing filters!` ⇒ 永远「正在加载预览」）。
-            取法与遮罩蓝框（`open_watermark_overlay_editor` 里同款注释）**完全一致**：
-            「包装盒作底 + 只套 scale」→ `compute_final_size_with_order`。scale 未开或
-            求不出 ⇒ 回落未缩放盒（老行为逐字节不变）。
-            """
-            _os = getattr(self.filter_frame, "node_frame_orig_size", None)
-            try:
-                if _os:
-                    _app = getattr(self.filter_frame, "app", None)
-                    if _app is not None and hasattr(_app, "_node_canvas_space_size"):
-                        _sz = _app._node_canvas_space_size(self.filter_frame, _os)
-                        return int(_sz[0]), int(_sz[1])
-                    return int(_os[0]), int(_os[1])
-            except (ValueError, TypeError, IndexError, AttributeError):
-                pass
-            return None, None        # 2026-10-09：delogo 表达式轨迹（waypoints）—— x/y 是表达式、按源原生时间驱动，
+        # 🔴 帧尺寸基准的唯一出处：`_region_frame_size`（节点/组 = 渲染帧尺寸，普通 = 源基底）。
+        #   历史：这里原先是内联的 `_node_canvas_size` 闭包 + ffprobe 回落，2026-11-02 抽成
+        #   方法 —— removelogo 的遮罩尺寸必须与这套基准**逐像素一致**，两份实现必然漂移。
+        # 2026-10-09：delogo 表达式轨迹（waypoints）—— x/y 是表达式、按源原生时间驱动，
         # 不再做「空值/非数字」判定（那样会误杀表达式）；改做段墙预检（撞墙=ffmpeg 静默
         # 0 帧，必须提前拦下）。w/h 恒静态、仍做 >0 与「不超过画面」判定。
         _wps = _it.get("waypoints") or []
@@ -30546,13 +31360,7 @@ class BlurFilterDialog(tk.Toplevel):
                                    "请填具体像素）") % (_label[_k], _raw))
             if _v["w"] <= 0 or _v["h"] <= 0:
                 return False, _("去水印宽高必须大于 0（当前 %dx%d）") % (_v["w"], _v["h"])
-            _app = getattr(self.filter_frame, "app", None)
-            _fp = getattr(_app, "ffprobe_cmd", None)
-            _W, _H = _node_canvas_size()
-            if not _W or not _H:
-                with suppress(Exception):
-                    # 基底域（autorotate 在滤镜链之前；理由见下方 delogo 越界说明）
-                    _W, _H = get_video_base_dimensions(_fp, src)
+            _W, _H = self._region_frame_size(src)
             if _W and _H:
                 if _v["w"] > _W - 1 or _v["h"] > _H - 1:
                     return False, (_("去水印区域宽/高超出画面：宽=%d（画面宽 %d，需 ≤%d）／"
@@ -30582,7 +31390,6 @@ class BlurFilterDialog(tk.Toplevel):
         if _v["x"] < 1 or _v["y"] < 1:
             return False, (_("去水印区域必须离画面上/左边≥1 像素（当前 X=%d Y=%d，最小 1）")
                            % (_v["x"], _v["y"]))
-        _app = getattr(self.filter_frame, "app", None)
         # 🔴 2026-10-29（域审计 + 本机实测推翻旧结论）：基准必须取**基底**
         #   （元数据旋转后、用户旋转前）：
         #     · ffmpeg 的 autorotate 发生在**滤镜链之前** —— 本机 9.0.1 实测：320x180 +
@@ -30594,11 +31401,8 @@ class BlurFilterDialog(tk.Toplevel):
         #   与本机实测相反（那次用的素材很可能没读到 display matrix）⇒ 按它取
         #   `get_video_dimensions`（存储尺寸）对 rotation=90 素材是 **X 轴过松、Y 轴过严**
         #   （合法区域被拦、非法放行，ffmpeg 才吐一句看不懂的 `Logo area is outside`）。
-        _fp = getattr(_app, "ffprobe_cmd", None)
-        _W, _H = _node_canvas_size()
-        if not _W or not _H:
-            with suppress(Exception):
-                _W, _H = get_video_base_dimensions(_fp, src)
+        #   ⇒ 2026-11-02 起这套「基底域」口径收进 `_region_frame_size` 一处，本函数只调它。
+        _W, _H = self._region_frame_size(src)
         if not _W or not _H:
             return True, ""      # 量不到尺寸就放行，交给 ffmpeg 自己判
         # ⚠️ 这里**不要再**给「素材比区域还小」单开一条提示分支（2026-10-06 加过又删）：
@@ -30622,6 +31426,13 @@ class BlurFilterDialog(tk.Toplevel):
             # 而不是陈述一个他看不懂的状态。
             return (_("「启用去水印/模糊」未勾选 —— 当前右侧是未处理原帧；"
                     "勾选该开关即可预览去水印效果"), None)
+        if self.type_var.get() == "removelogo":
+            _mp = str(getattr(self, "_mask_path", "") or "").strip()
+            if not str(self.mask_var.get() or "").strip():
+                return _("removelogo 还没选遮罩 —— 点下方「浏览…」选一张手画黑白图（白=擦）"), None
+            if not _mp or not os.path.exists(_mp):
+                return _("removelogo 的遮罩缓存失效 —— 重新点一次「浏览…」按当前尺寸重建"), None
+            return _("遮罩去水印（白=擦除）：块外像素不动、无接缝；本方法较慢，建议先小段试"), None
         if not (self.x_var.get().strip() and self.y_var.get().strip()):
             return _("坐标未填，无法定位区域"), None
         return _("局部滤镜坐标以【原始画面】为准（与导出一致）；按住图片看原图"), None
@@ -30677,7 +31488,7 @@ class BlurFilterDialog(tk.Toplevel):
         _lbltt10.grid(row=2, column=0, sticky="w", pady=5)
         self.type_var = tk.StringVar(value=self.filter_frame._blur_type.get())
         type_combo = ttk.Combobox(main, textvariable=self.type_var,
-                                  values=["delogo", "boxblur", "gblur", "pixelize", "negate",
+                                  values=["delogo", "removelogo", "boxblur", "gblur", "pixelize", "negate",
                                           "hflip", "vflip", "swapuv", "desat", "eq_bright",
                                           "unsharp", "avgblur", "median",
                                           "black", "white"],
@@ -30687,6 +31498,10 @@ class BlurFilterDialog(tk.Toplevel):
         ToolTip(_lbltt10,
             _("【滤镜类型说明】\n"
             "• delogo：智能去水印滤镜，需指定区域坐标（用周围像素填充），本身就只作用于选定区域。\n"
+            "• removelogo：按**手画黑白遮罩**擦除任意形状（白=擦、黑=保留）。没有区域坐标，\n"
+            "  改用下方「浏览…」选一张自己画的图：斜带、不规则台标都行，块外一个像素都不动、\n"
+            "  没有接缝。代价是**很慢**（耗时约为病灶厚度的平方，1080p 满宽 40px 厚只剩 0.7 倍速，\n"
+            "  200×80 小台标约 1 倍速，320×320 会掉到 0.4 帧/秒）；遮罩必须是**静态**的，不能跟轨迹。\n"
             "• boxblur / gblur：模糊滤镜；勾「仅应用到选定区域」=局部模糊，不勾=全帧模糊。\n"
             "• pixelize：马赛克打码（隐私遮挡，按块取平均色）；勾「仅应用到选定区域」\n"
             "  =只糊坐标框内，不勾=整幅打码；块尺寸越大越糊，1 等于没有效果。\n"
@@ -30867,10 +31682,47 @@ class BlurFilterDialog(tk.Toplevel):
                 _("打开轨迹控制弹窗：用列表轨迹让去水印区域随时间移动（只平移 X/Y，宽高不变）。\n"
                 "delogo 必须始终框住一个画内有效区域，故不支持「隐藏/出画」语义。\n"
                 "仅 delogo 类型可用，其他模糊/局部滤镜此按钮为灰。"))
+        # ⚠️ removelogo 用不上「可视化选区」（选区是矩形，遮罩是任意形状）⇒ 由
+        # update_coord_state 一并灰掉；持有引用是因为它是局部变量。
+        self._btn_visual = btn_visual
+
+        # ---- removelogo 遮罩文件（2026-11-02）----
+        # 「下面参数控件变浏览」的落点：类型 = removelogo 时坐标区整块灰掉、本行出现。
+        self.mask_frame = ttk.LabelFrame(main, text=_("遮罩文件 (仅 removelogo 有效)"), padding="4")
+        self.mask_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=3)
+        _mask_row = ttk.Frame(self.mask_frame)
+        _mask_row.pack(fill=tk.X, pady=1)
+        ttk.Label(_mask_row, text=_("遮罩:")).pack(side=tk.LEFT)
+        self.mask_var = tk.StringVar(value="")
+        # state="readonly"：路径只由「浏览…」写入。手敲路径 = 尺寸必然不对 + 可能带
+        # `[ ] ' , ;` 直接截断滤镜图，这两件事都不该由输入框承担。
+        self.mask_entry = ttk.Entry(_mask_row, textvariable=self.mask_var,
+                                    state="readonly", width=32)
+        self.mask_entry.pack(side=tk.LEFT, padx=(2, 4))
+        self.mask_btn = ttk.Button(_mask_row, text=_("浏览…"), width=7,
+                                   command=self._pick_removelogo_mask)
+        self.mask_btn.pack(side=tk.LEFT, padx=1)
+        self.mask_clear_btn = ttk.Button(_mask_row, text=_("清除"), width=5,
+                                         command=self._clear_removelogo_mask)
+        self.mask_clear_btn.pack(side=tk.LEFT, padx=1)
+        self.mask_info = ttk.Label(self.mask_frame, text="", foreground="gray")
+        self.mask_info.pack(anchor="w")
+        ToolTip(self.mask_frame,
+                _("removelogo 按这张黑白图擦除：**白 = 要擦的病灶，黑 = 原样保留**。\n"
+                "画的时候请用纯黑底 + 纯白画笔（边缘软一点没关系，程序会二值化）。\n\n"
+                "点「浏览…」后程序会立刻按【本滤镜处的画面尺寸】把它归一化成缓存图：\n"
+                "  · 尺寸不符会被缩放到位 —— removelogo 要求遮罩与画面严格 1:1，\n"
+                "    不符是硬失败（ffmpeg 只吐一句看不懂的 Failed to configure input pad）；\n"
+                "  · 灰阶/彩色/透明边统一二值化（实测灰度阈值不干净：16 不处理、31 就整帧当病灶）；\n"
+                "  · 缓存文件名是安全的 ASCII，避免路径里的 [ ] ' , ; 截断滤镜图。\n\n"
+                "⚠️ 遮罩是**静态**的：removelogo 没有坐标参数，不能跟轨迹随时间平移。\n"
+                "⚠️ 很慢：耗时约为病灶「厚度」的平方且单线程 —— 1080p 满宽 40px 带 ≈0.7 倍速，\n"
+                "   200×80 小台标 ≈1 倍速，320×320 会掉到约 0.4 帧/秒。建议先小段试。\n"
+                "多个病灶请画进同一张图（成本相加，别建多条）。"))
 
         # ---- 显示时段 / 循环控制（起始/结束/周期/单次，与文字水印同套 enable 表达式）----
         time_frame = ttk.LabelFrame(main, text=_("显示时段 / 循环 (可选)"), padding="4")
-        time_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=3)
+        time_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=3)
         seg_row = ttk.Frame(time_frame)
         seg_row.pack(fill=tk.X, pady=1)
         _lbltt12 = ttk.Label(seg_row, text=_("起始:"))
@@ -30907,7 +31759,7 @@ class BlurFilterDialog(tk.Toplevel):
 
         # ---- 操作按钮 ----
         btn_frame = ttk.Frame(main)
-        btn_frame.grid(row=6, column=0, columnspan=3, pady=15)
+        btn_frame.grid(row=7, column=0, columnspan=3, pady=15)
         ttk.Button(btn_frame, text=_("应用"), command=self.apply).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text=_("取消"), command=self.destroy).pack(side=tk.LEFT, padx=5)
 
@@ -30922,7 +31774,7 @@ class BlurFilterDialog(tk.Toplevel):
             status_extra=self._preview_status_extra,
             precheck=self._preview_precheck,
             time_value="3", title=_("实时预览（内存中）"),
-            hint=None,
+            hint=_("按住图片看原图，松开看效果"),
             tip=_("右侧显示的是**当前列表选中项**的效果（delogo / 局部模糊 / 区域效果）。\n"
                 "坐标以原始画面为准 —— 与正式导出同源同坐标。\n"
                 "改类型 / 坐标 / 强度 / 勾「局部滤镜」都会实时刷新。\n"
@@ -30942,7 +31794,8 @@ class BlurFilterDialog(tk.Toplevel):
         for _v in (self.x_var, self.y_var, self.w_var, self.h_var,
                    self.strength_var, self.region_var, self.enabled_var,
                    self.enable_start_var, self.enable_end_var,
-                   self.enable_cycle_var, self.enable_show_var, self.type_var):
+                   self.enable_cycle_var, self.enable_show_var, self.type_var,
+                   self.mask_var):
             with suppress(Exception):
                 _v.trace_add("write", _preview_kick)
 
@@ -30963,7 +31816,7 @@ class BlurFilterDialog(tk.Toplevel):
         for _v in (self.x_var, self.y_var, self.w_var, self.h_var,
                    self.type_var, self.strength_var, self.enabled_var, self.region_var,
                    self.enable_start_var, self.enable_end_var,
-                   self.enable_cycle_var, self.enable_show_var):
+                   self.enable_cycle_var, self.enable_show_var, self.mask_var):
             with suppress(Exception):
                 _v.trace_add("write", self._sync_current_to_tree)
 
@@ -30976,6 +31829,9 @@ class BlurFilterDialog(tk.Toplevel):
                        "unsharp", "avgblur", "median", "pixelize", "black", "white")
 
     # 有强度参数的类型：type -> (强度框标签, 默认值)。不在此表里的类型强度框禁用。
+    # ⚠️ 数值域**不在这里**：生成端查 `_REGION_EFFECT_FILTERS[类型]["clamp"]`
+    #    和 `_REGION_BLUR_CLAMP`（boxblur/gblur），由 `_clamp_num` 统一夹。
+    #    本表只负责 UI 文案与"切类型时填什么默认值"，不要在此重复一份范围。
     # 🔴 类体 dict 同样是 import 期求值（与「默认参数」坑一致）：写成 `_("半径:")` 会被冻成
     #    中文，英文界面里局部模糊的强度标签不翻译。改为静态方法，每次调用现查 TRANS
     #    （4 个调用点全在运行时）。键与默认值不变，只是求值时机挪后。
@@ -31009,9 +31865,14 @@ class BlurFilterDialog(tk.Toplevel):
     
     def update_coord_state(self):
         ftype = self.type_var.get()
+        _is_rl = (ftype == "removelogo")
         # delogo 恒区域；区域效果勾「仅应用到选定区域」时需坐标（不勾=全帧免坐标）；
-        # boxblur/gblur 仅勾局部时需坐标
-        if ftype == "delogo":
+        # boxblur/gblur 仅勾局部时需坐标。
+        # removelogo **没有坐标概念**：形状由遮罩位图自己决定（滤镜不接受 x/y/w/h）
+        # ⇒ 坐标区整块灰掉，改用下方「遮罩文件」行。
+        if _is_rl:
+            need_coord = False
+        elif ftype == "delogo":
             need_coord = True
         elif ftype in self._REGION_EFFECTS:
             need_coord = bool(self.region_var.get())
@@ -31020,12 +31881,191 @@ class BlurFilterDialog(tk.Toplevel):
         state = "normal" if need_coord else "disabled"
         for entry in getattr(self, "_coord_entries", []):
             entry.config(state=state)
-        # 统一开关仅 delogo 不可用（恒区域）；其余类型都用它切换 局部/全帧
+        # 统一开关仅 delogo / removelogo 不可用（两者都恒区域）；其余类型用它切换 局部/全帧
         if hasattr(self, "region_chk"):
-            self.region_chk.config(state="disabled" if ftype == "delogo" else "normal")
-        # 轨迹控制按钮：仅 delogo 可点，其他局部滤镜灰掉（用户拍板只给 delogo 接）
+            self.region_chk.config(
+                state="disabled" if (_is_rl or ftype == "delogo") else "normal")
+        # 轨迹控制按钮：仅 delogo 可点（用户拍板只给 delogo 接；removelogo 静态遮罩跟不了）
         if hasattr(self, "traj_btn"):
             self.traj_btn.config(state="normal" if ftype == "delogo" else "disabled")
+        # 可视化选区：矩形选区对 removelogo 无意义（遮罩是任意形状）
+        _bv = getattr(self, "_btn_visual", None)
+        if _bv is not None:
+            with suppress(Exception):
+                _bv.config(state="disabled" if _is_rl else "normal")
+        # 遮罩文件行：只有 removelogo 显示且可用
+        if hasattr(self, "mask_frame"):
+            with suppress(Exception):
+                self.mask_entry.config(state="readonly" if _is_rl else "disabled")
+                self.mask_btn.config(state="normal" if _is_rl else "disabled")
+                self.mask_clear_btn.config(state="normal" if _is_rl else "disabled")
+                if _is_rl:
+                    self.mask_frame.grid()
+                else:
+                    self.mask_frame.grid_remove()
+
+    def _region_frame_size(self, src=None):
+        """removelogo 遮罩 / delogo 越界判定共用的「该滤镜处的帧尺寸」唯一出处。
+
+        ⚠️ 为什么不能直接用源文件存储尺寸（2026-10-29 域审计 + 本机实测）：
+          · ffmpeg 的 autorotate 在**滤镜链之前**（竖拍素材进链时已经是 1080×1920）；
+          · 用户的「旋转」是链内 transpose，在 crop/delogo **之后**；
+          · 区域链恒在 crop/rotate/scale **之前** ⇒ 帧 = 源**基底**尺寸
+            （`get_video_base_dimensions` 就是这个口径）。
+        removelogo 的遮罩必须与这里返回的尺寸严格 1:1（实测不符即 `Failed to configure
+        input pad`，且报错不含尺寸）。
+
+        节点/组语境（2026-10-16）：画面是**节点渲染帧**（包装盒 + scale），不是源文件尺寸；
+        拿源尺寸做遮罩会让 nodo 语境一律失败。`node_frame_orig_size` 存在时走
+        `_node_canvas_space_size`（已含 scale），取不到才回落源基底。
+        """
+        _os = getattr(self.filter_frame, "node_frame_orig_size", None)
+        try:
+            if _os:
+                _app = getattr(self.filter_frame, "app", None)
+                if _app is not None and hasattr(_app, "_node_canvas_space_size"):
+                    _sz = _app._node_canvas_space_size(self.filter_frame, _os)
+                    if _sz and _sz[0]:
+                        return int(_sz[0]), int(_sz[1])
+                return int(_os[0]), int(_os[1])
+        except (ValueError, TypeError, IndexError, AttributeError):
+            pass
+        _app = getattr(self.filter_frame, "app", None)
+        _fp = getattr(_app, "ffprobe_cmd", None)
+        _path = src or self._resolve_source()
+        if _path and os.path.exists(_path):
+            with suppress(Exception):
+                # 优先走 app 的缓存版（同一素材反复选遮罩/切项时不再反复 ffprobe）
+                if _app is not None and hasattr(_app, "_cached_video_base_dimensions"):
+                    _w, _h = _app._cached_video_base_dimensions(_path)
+                else:
+                    _w, _h = get_video_base_dimensions(_fp, _path)
+                if _w and _h:
+                    return int(_w), int(_h)
+        return None, None
+
+    def _update_mask_info(self):
+        """遮罩行下方的灰字状态：已归一化到多少、或为什么还没生效。"""
+        if not hasattr(self, "mask_info"):
+            return
+        try:
+            _mp = str(getattr(self, "_mask_path", "") or "").strip()
+            _w, _h = getattr(self, "_mask_wh", (0, 0)) or (0, 0)
+            if not str(self.mask_var.get()).strip():
+                self.mask_info.config(text=_("未选择遮罩（removelogo 必须选一张：白=擦、黑=保留）"))
+            elif not _mp:
+                self.mask_info.config(text=_("⚠️ 尚未归一化 —— 请重新点「浏览…」"))
+            elif not os.path.exists(_mp):
+                self.mask_info.config(text=_("⚠️ 缓存遮罩已丢失 —— 请重新点「浏览…」重建"))
+            else:
+                self.mask_info.config(
+                    text=_("已归一化：%d×%d　白=擦除 / 黑=保留（本方法较慢）") % (int(_w), int(_h)))
+        except Exception:
+            pass
+
+    def _pick_removelogo_mask(self):
+        """选一张手画黑白图 → **立刻**按本滤镜处的帧尺寸归一化成缓存 PGM。
+
+        归一化是必需项（不是可选优化），三条实测坑都在这步一次抹平：
+        尺寸不符硬失败 / 灰度阈值不干净 / 路径里的 `[ ] ' , ;` 截断滤镜图。
+        """
+        _app = getattr(self.filter_frame, "app", None)
+        _ffm = getattr(_app, "ffmpeg_cmd", None) if _app else None
+        if alert_if(not _ffm, _("提示"), _("未找到 ffmpeg，无法归一化遮罩")):
+            return
+        _w, _h = self._region_frame_size()
+        if alert_if(not (_w and _h), _("提示"),
+                    _("量不到画面尺寸 —— 请先选择要处理的视频文件，再选遮罩")):
+            return
+        _cur = str(self.mask_var.get() or "").strip()
+        _p = filedialog.askopenfilename(
+            parent=self, title=_("选择遮罩图（白 = 擦除区，黑 = 保留）"),
+            initialdir=(os.path.dirname(_cur) if _cur and os.path.exists(_cur) else None),
+            filetypes=[(_("图片"), "*.png *.bmp *.jpg *.jpeg *.pgm *.ppm *.tif *.tiff"),
+                       (_("所有文件"), "*.*")])
+        if not _p:
+            return
+        _ok, _res = normalize_removelogo_mask(_ffm, _p, _w, _h, force=True)
+        if alert_if(not _ok, _("遮罩归一化失败"), _res, kind='error', parent=self):
+            return
+        # 「遮罩搞反了」体检（白=擦除）：全黑 = 什么都不擦；大半个画面白 = 多半拿白底图来了，
+        # 那等于整幅当病灶（1080p 单帧几十秒）。两种都在这里拦，别让他等半小时。
+        _wr = pgm_white_ratio(_res)
+        if _wr is not None:
+            if alert_if(
+                    _wr <= 0.0, _("遮罩里没有可擦区域"),
+                    _("归一化后整张图都是黑的 —— removelogo 的约定是【白 = 擦除，黑 = 保留】，\n"
+                    "全黑等于什么都不擦。请把要擦掉的部分涂成白色（或换成反色的一张）。"),
+                    kind='error', parent=self):
+                return
+            if _wr > 0.5 and not messagebox.askyesno(
+                    _("遮罩好像反了"),
+                    _("这张遮罩有 %.0f%% 的面积是白色 = 要擦掉。\n\n"
+                    "removelogo 的约定是【白 = 擦除，黑 = 保留】；这么大面积通常是拿白底黑字的图"
+                    "来了，那样会把大半个画面当病灶（1080p 可能慢到几秒到几十秒一帧）。\n\n"
+                    "仍要使用这张吗？") % (_wr * 100), parent=self):
+                return
+        self._loading_form = True
+        try:
+            _tk_setv(self.mask_var, _p)
+        finally:
+            self._loading_form = False
+        self._mask_src = _p
+        self._mask_path = _res
+        self._mask_wh = (int(_w), int(_h))
+        self._update_mask_info()
+        # 选中遮罩 = 明确「这一项要擦」⇒ 与「画完选区即启用」同款：当前项标记启用 + 开总开关
+        with suppress(Exception):
+            self.enabled_var.set(True)
+            _idx = self._current_item_idx()
+            if _idx is not None and 0 <= _idx < len(self.items):
+                self.items[_idx].update(self._form_to_item_dict())
+                self.items[_idx]["enabled"] = True
+                self._refresh_blur_tree()
+
+    def _ensure_mask_cache(self):
+        """缓存 PGM 丢了 / 尺寸变了就按当前帧尺寸重建。返回 (ok, 路径或原因)。
+
+        为什么需要「自愈」：缓存落在系统 temp（会被清理），而设置/项目里存的是路径
+        ⇒ 不清不痒地留着一条失效路径，导出时才炸。选择该项 / 预览前都过一遍这里。
+        """
+        _src = str(getattr(self, "_mask_src", "") or "").strip()
+        if not _src or not os.path.exists(_src):
+            return False, _("没有可用的遮罩原图（请重新点「浏览…」）")
+        _app = getattr(self.filter_frame, "app", None)
+        _ffm = getattr(_app, "ffmpeg_cmd", None) if _app else None
+        _w, _h = self._region_frame_size()
+        if not (_w and _h):
+            return False, _("量不到画面尺寸")
+        if not _ffm:
+            return False, _("未找到 ffmpeg")
+        _want = removelogo_mask_cache_path(_src, _w, _h)
+        if os.path.exists(_want):
+            self._mask_path = _want
+            self._mask_wh = (int(_w), int(_h))
+            return True, _want
+        _ok, _res = normalize_removelogo_mask(_ffm, _src, _w, _h)
+        if not _ok:
+            return False, _res
+        self._mask_path = _res
+        self._mask_wh = (int(_w), int(_h))
+        return True, _res
+
+    def _clear_removelogo_mask(self):
+        self._loading_form = True
+        try:
+            _tk_setv(self.mask_var, "")
+        finally:
+            self._loading_form = False
+        self._mask_src = ""
+        self._mask_path = ""
+        self._mask_wh = (0, 0)
+        self._update_mask_info()
+        with suppress(Exception):
+            _idx = self._current_item_idx()
+            if _idx is not None and 0 <= _idx < len(self.items):
+                self.items[_idx].update(self._form_to_item_dict())
+                self._refresh_blur_tree()
 
     def _open_delogo_trajectory(self):
         """delogo 轨迹控制弹窗：列表轨迹让去水印区域随时间平移（X/Y），宽高恒取表单。
@@ -31239,11 +32279,16 @@ class BlurFilterDialog(tk.Toplevel):
         else:
             # delogo 与无强度的区域效果：强度清空
             self.strength_var.set("")
-        # delogo 恒区域，开关关掉；其余类型保留当前 局部/全帧 选择（换类型不打断）
-        if ftype == "delogo":
+        # delogo / removelogo 都恒区域，开关关掉；其余类型保留当前 局部/全帧 选择（换类型不打断）
+        if ftype in ("delogo", "removelogo"):
             self.region_var.set(False)
         self.update_strength_state()
         self.update_coord_state()
+        # removelogo 一选上就提示「缺什么」——不然它长得像一个不需要任何参数的滤镜，
+        # 用户会直接点应用，导出一条不含该滤镜的命令。
+        if ftype == "removelogo" and not str(self.mask_var.get() or "").strip():
+            with suppress(Exception):
+                self.preview.schedule()
 
     def on_region_toggle(self):
         self.update_coord_state()
@@ -31399,6 +32444,14 @@ class BlurFilterDialog(tk.Toplevel):
             _t = it.get("type", "delogo")
             if it.get("full_frame", False) and _t in self._REGION_EFFECTS:
                 _sum = _("全帧")
+            elif _t == "removelogo":
+                # removelogo 没有坐标，摘要改报遮罩（不然列表里全是 (1,1) 100x100 的假象）
+                _ms = str(it.get("mask_src_path", "") or "").strip()
+                _sum = (_("遮罩 %s") % os.path.basename(_ms)) if _ms else _("⚠ 未选遮罩")
+                _mw = int(it.get("mask_w", 0) or 0)
+                _mh = int(it.get("mask_h", 0) or 0)
+                if _mw and _mh:
+                    _sum += " %dx%d" % (_mw, _mh)
             else:
                 _sum = f"({it.get('x','0')},{it.get('y','0')}) {it.get('w','100')}x{it.get('h','100')}"
             _s = it.get("strength", "")
@@ -31469,6 +32522,17 @@ class BlurFilterDialog(tk.Toplevel):
             _tk_setv(self.enable_end_var, it.get("enable_end", ""))
             _tk_setv(self.enable_cycle_var, it.get("enable_cycle", ""))
             _tk_setv(self.enable_show_var, it.get("enable_show", ""))
+            # removelogo 遮罩回显（2026-11-02）：原图路径给人看，缓存 PGM 给生成侧用。
+            # 缓存可能被系统清掉（temp）或被改尺寸（节点缩放改了）⇒ 这里顺手自愈一次；
+            # 失败只留空，由 `_update_mask_info` 提示「重新点浏览」，绝不带着失效路径去导出。
+            self._mask_src = str(it.get("mask_src_path", "") or "")
+            self._mask_path = str(it.get("mask_path", "") or "")
+            self._mask_wh = (int(it.get("mask_w", 0) or 0), int(it.get("mask_h", 0) or 0))
+            if self._mask_src:
+                with suppress(Exception):
+                    self._ensure_mask_cache()
+            _tk_setv(self.mask_var, self._mask_src)
+            self._update_mask_info()
             # 不再调 on_type_change()：它只负责「类型下拉变动」时的联动，加载表单不该改数据
             self.update_strength_state()
             self.update_coord_state()
@@ -31530,7 +32594,8 @@ class BlurFilterDialog(tk.Toplevel):
                            "w": "100", "h": "100", "strength": "", "region_only": False,
                            "full_frame": False,
                            "enable_start": "", "enable_end": "", "enable_cycle": "",
-                           "enable_show": "", "waypoints": []})
+                           "enable_show": "", "waypoints": [],
+                           "mask_path": "", "mask_src_path": "", "mask_w": 0, "mask_h": 0})
         self._refresh_blur_tree()
         self.tree.selection_set(str(len(self.items) - 1))
         self._last_sel = len(self.items) - 1
@@ -31628,6 +32693,29 @@ class BlurFilterDialog(tk.Toplevel):
                 continue
             ftype = it.get("type", "delogo")
             region = it.get("region_only", False)
+            if ftype == "removelogo":
+                # removelogo **没有坐标**（形状由遮罩位图定）⇒ 唯一必需品是遮罩。
+                # 顺手自愈：遮罩尺寸 ≠ 当前帧尺寸（改过缩放/旋转/换素材）或缓存被清掉时，
+                # 按当前尺寸重建一次 —— 否则会导出一条注定 `Failed to configure input pad` 的命令。
+                _srcp = str(it.get("mask_src_path", "") or "").strip()
+                _mp2 = str(it.get("mask_path", "") or "").strip()
+                _fw, _fh = self._region_frame_size()
+                _mw = int(it.get("mask_w", 0) or 0)
+                _mh = int(it.get("mask_h", 0) or 0)
+                if (_fw and _fh and _srcp and os.path.exists(_srcp)
+                        and (not os.path.exists(_mp2) or _mw != _fw or _mh != _fh)):
+                    _ffm = getattr(getattr(self.filter_frame, "app", None), "ffmpeg_cmd", None)
+                    _ok2, _res2 = normalize_removelogo_mask(_ffm, _srcp, _fw, _fh, force=True)
+                    if _ok2:
+                        it["mask_path"] = _res2
+                        it["mask_w"], it["mask_h"] = int(_fw), int(_fh)
+                        _mp2 = _res2
+                if alert_if(not _mp2 or not os.path.exists(_mp2), _("错误"),
+                            _("removelogo 需要先选遮罩：点「遮罩文件」那一行的「浏览…」，"
+                            "选一张「白=擦除、黑=保留」的图（选完会自动按画面尺寸归一化）"),
+                            'error'):
+                    return
+                continue
             # 全帧仅对区域效果类型有效；勾了全帧不需要坐标
             full = bool(it.get("full_frame", False)) and ftype in self._REGION_EFFECTS
             if not full and (ftype == "delogo" or ftype in self._REGION_EFFECTS or region):
@@ -31793,6 +32881,29 @@ def _aseg_num(x):
     return s.rstrip("0").rstrip(".") if "." in s else s
 
 
+# 音频段参数的官方数值域（2026-11-04，`-h` 实测：4.3 与 9.0.1 逐字一致）。
+# 键 = (效果类型, 参数序号)，值 = (lo, hi, kind, 默认值)。越界是 **AVOption 硬报错**
+# ⇒ 整段音频链失败，所以生成端必须夹（不是"声音小一点"）。
+# 详见 research/ffmpeg-capability-map/numeric-ranges.md §2。
+_ASEG_PARAM_RANGE = {
+    ("denoise", 0): (0.01, 97, "f", 12.0),      # afftdn nr
+    ("denoise", 1): (-80, -20, "f", -30.0),     # afftdn nf
+    ("highpass", 0): (0, 999999, "i", 200.0),   # highpass f
+    ("lowpass", 0): (0, 999999, "i", 3000.0),   # lowpass f
+    ("eq_low", 0): (-900, 900, "f", 0.0),       # bass g
+    ("eq_mid", 0): (-900, 900, "f", 0.0),       # equalizer g
+    ("eq_high", 0): (-900, 900, "f", 0.0),      # treble g
+}
+
+
+def _aseg_clamp(t, idx, val, default):
+    """段参数 → 已夹进官方域并格式化好的串（未登记的 (类型, 序号) 原样走 `_aseg_num`）。"""
+    rng = _ASEG_PARAM_RANGE.get((t, idx))
+    if not rng:
+        return _aseg_num(_opt_float(val, default))
+    return _clamp_num(val, rng[0], rng[1], rng[2], default)
+
+
 def _aseg_filter_body(t, p1, p2):
     """效果类型 + 参数 → 滤镜主体串（不含 enable）。"""
     if t == "mute":
@@ -31800,18 +32911,18 @@ def _aseg_filter_body(t, p1, p2):
     if t == "volume":
         return f"volume={_aseg_num(_opt_float(p1, 1.0))}"
     if t == "denoise":
-        return (f"afftdn=nr={_aseg_num(_opt_float(p1, 12.0))}"
-                f":nf={_aseg_num(_opt_float(p2, -30.0))}")
+        return (f"afftdn=nr={_aseg_clamp(t, 0, p1, 12.0)}"
+                f":nf={_aseg_clamp(t, 1, p2, -30.0)}")
     if t == "highpass":
-        return f"highpass=f={_aseg_num(_opt_float(p1, 200.0))}"
+        return f"highpass=f={_aseg_clamp(t, 0, p1, 200.0)}"
     if t == "lowpass":
-        return f"lowpass=f={_aseg_num(_opt_float(p1, 3000.0))}"
+        return f"lowpass=f={_aseg_clamp(t, 0, p1, 3000.0)}"
     if t == "eq_low":
-        return f"bass=g={_aseg_num(_opt_float(p1, 0.0))}"
+        return f"bass=g={_aseg_clamp(t, 0, p1, 0.0)}"
     if t == "eq_mid":
-        return f"equalizer=f=1000:width_type=h:width=200:g={_aseg_num(_opt_float(p1, 0.0))}"
+        return f"equalizer=f=1000:width_type=h:width=200:g={_aseg_clamp(t, 0, p1, 0.0)}"
     if t == "eq_high":
-        return f"treble=g={_aseg_num(_opt_float(p1, 0.0))}"
+        return f"treble=g={_aseg_clamp(t, 0, p1, 0.0)}"
     return ""
 
 
@@ -33640,7 +34751,8 @@ class SimplePreviewer:
                  lavfi_complex=None, pipe_aspect=None, pipe_duration=None,
                  pipe_start=None, pipe_out_mode=False,
                  pipe_audio_graph=None, pipe_audio_map=None, initial_time=None,
-                 wp_mark=None, pipe_alpha=False):
+                 wp_mark=None, pipe_alpha=False, pipe_play_end=None, pipe_speed=None,
+                 pipe_audio_settings=None):
         """initial_marks: 打开预览时回溯调用方已有时间 [(s, e), ...]（秒/字符串/None 混合），
         探测完成后重建为标记段显示在段落条上，可直接「复制时间」粘到别处（如音频窗口）。
         on_send_*（2026-08-29 回滚恢复）：单对单「发送到」按钮，mark_row 原位、点击即发，
@@ -33687,6 +34799,15 @@ class SimplePreviewer:
         self._pipe_aspect = pipe_aspect
         self._pipe_dur = pipe_duration
         self._pipe_start = pipe_start
+        # pipe_play_end（2026-11-02）：**素材绝对秒**的段末。None ⇒ 完全旧行为（播到素材尾）。
+        # 为什么单独一个参数、而不是复用 pipe_duration：`_pipe_dur` 是「成片输出时间轴总长」，
+        # 它同时决定**进度条长度**，塞段长进去会踩 100347 记的「定位落段尾」旧坑；
+        # 这里只钳制**播放终点**（图尾 trim=end / 输出侧 -t），不动进度条口径。
+        self._pipe_play_end = pipe_play_end
+        # pipe_speed（2026-11-02）：图内视频已 `setpts=1/s*PTS` 的倍数。管道预览的**音频**是
+        # 另一个 `ffplay -nodisp` 进程直读源文件（见 _a_start），图里的 setpts 管不到它 ⇒
+        # 不在这里也给音频挂 atempo，就是「画面 2×、声音 1×」，而音频又是主时钟 ⇒ 画面被拖回 1×。
+        self._pipe_speed = pipe_speed
         # 🔴 串行合并（out_mode）的 `_pipe_start` **恒 0** ⇒ 进度条/时间读数 = **成片时间轴**
         #    并**故意从 0 开始**（设计，不是 bug）：多段 trim 顺序拼接后成品必须 0 基，否则
         #    第 2 段起整段时间错位。研究依据 + 物证见 research/seek-model/README.md §4.1。
@@ -33697,6 +34818,13 @@ class SimplePreviewer:
         self._pipe_out_mode = bool(pipe_out_mode)
         self._pipe_audio_graph = pipe_audio_graph or None
         self._pipe_audio_map = pipe_audio_map or "[ao]"
+        # pipe_audio_settings（2026-11-02 第五步）：直读分支（无合成音频图）的 ffplay `-af`
+        # 要在 `atrim+asetpts` 之后补音色链、之前补淡入淡出。管道预览**声音是另一个 ffplay
+        # 进程直读源文件**，视频图里的音色滤镜管不到它 ⇒ 此前轻量预览听不到 EQ/降噪/音量，
+        # 也听不到淡入淡出（同一份工程预览与成片不一致）。
+        # ⛔ 默认 None ⇒ 所有「只是打开素材看时间」的调用点（波形/取时间）行为逐字节不变：
+        #   它们不该带音色处理，加了反而是错。
+        self._pipe_audio_settings = pipe_audio_settings or None
         # 透明指示棋盘底（2026-10-12）：True 才在管道尾链垫格子；默认 False = 旧调用方逐字节不变
         self._pipe_alpha = bool(pipe_alpha)
         # #5（2026-10-08）：开窗后落到的**素材时刻**（秒）。仅列表轨迹面板「重开本管道」下传
@@ -35505,6 +36633,50 @@ class SimplePreviewer:
             self.mark_status.config(text=_("画面模式：已回到帧浏览器（定位到音频当前位置）"))
 
     # ---------- ffplay 播放核心（内核：粗 -ss + atrim 精修 + 状态行解析） ----------
+    # ---------- ffplay 播放核心（内核：粗 -ss + atrim 精修 + 状态行解析） ----------
+    def _pipe_afade_abs_filters(self):
+        """直读分支的淡入淡出（**源绝对时间轴**）。2026-11-02 第五步。
+
+        与 `preview_afade_filters` 同一份判据，只差「起点从哪来」：那里由调用方给
+        `seek_offset`，这里用预览会话自身的 `_pipe_start`（截取起点）/ `_pipe_play_end`
+        （段末）/ `_dur`（无截取时的素材尾）。
+
+        为什么能按绝对值写：本分支的 `-af` 排在 ffplay `-ss coarse` **之后**，实测滤镜
+        看到的是**文件绝对时间**（`ashowinfo` 首个 `pts_time` = seek 值），`atrim=start=at`
+        本来就是绝对值口径 ⇒ fade 与它同轴。
+
+        ⚠️ 调用方必须把结果排在 `atempo` **之前**：atempo 只压缩增量、不动首个 pts，
+        淡出起点一旦先按输出轴折算就与源轴错开变速倍率。
+
+        三条「宁可不淡」的判据（淡错位置比不淡更难查）：
+          · 没给 `pipe_audio_settings` ⇒ 只是打开素材看时间（波形/取时间点）⇒ 不淡；
+          · 成片时间轴模式（`_pipe_out_mode`）又没给段末 ⇒ `_dur` 是**成片**时长，
+            与素材轴不同源 ⇒ 不淡；
+          · 段长算不出来 ⇒ 不淡（淡入仍按截取起点落位）。
+
+        :return: list[str]，可直接并进 `-af`
+        """
+        _s = getattr(self, "_pipe_audio_settings", None)
+        if not _s or not _s.get("fade_enabled", False):
+            return []
+        try:
+            _start = max(0.0, float(getattr(self, "_pipe_start", None) or 0.0))
+        except (TypeError, ValueError):
+            _start = 0.0
+        _end = None
+        try:
+            _pe = getattr(self, "_pipe_play_end", None)
+            if _pe is not None and float(_pe) > _start:
+                _end = float(_pe)
+        except (TypeError, ValueError):
+            _end = None
+        if _end is None and not self._pipe_out_mode and self._dur:
+            _end = float(self._dur)
+        # speed_factor=1.0：fade 排在 atempo 之前 ⇒ 看到的是源轴，不能再除变速
+        return preview_afade_filters(
+            _s, seek_offset=_start,
+            window_duration=(_end - _start) if _end is not None else None,
+            speed_factor=1.0)
     def _a_start(self, at):
         """启动 ffplay 直读（-nodisp -autoexit）。_a_gen+1 作废旧代 reader 事件。
         at=音频应出声的绝对源时间（A/V 模式调用方已 +latency 补偿启动延迟）。
@@ -35533,6 +36705,23 @@ class SimplePreviewer:
         # 若只在此处定义，lavfi 分支走到 _atrace 必 NameError，且异常会沿调用链炸死
         # _pump 的 after 循环（画面冻结在首帧、音频被 _poll 仲裁每 0.7s 重启一次——
         # 2026-09-20 用户实测 concat 预览「画面不动+声音反复重播」的根因）。
+        # 段变速（2026-11-02）：视频管道图里已有 `setpts=1/s*PTS`，而**音频是另一个 ffplay
+        # 进程直读源文件**（本函数），图里的 setpts 管不到它 ⇒ 必须自己挂同倍率 atempo。
+        # 否则「画面 2×、声音 1×」，而音频是主时钟 ⇒ 画面被丢帧拖回 1×，看起来「变速没生效」。
+        # 数值解析统一走 _opt_float（0 / None / 空 / 非法 → 1.0，与旧 `or 1.0` 同义）
+        _pv_s = _opt_float(getattr(self, "_pipe_speed", None), 1.0) or 1.0
+        _pv_at = (build_atempo_chain(_pv_s)
+                  if (_pv_s > 0 and abs(_pv_s - 1.0) > 1e-6) else "")
+        # 音色链（2026-11-02 第五步）：直读分支此前只有 atrim+atempo ⇒ 轻量预览听不到
+        # 高通/低通/音量/降噪/声道/EQ。与其余预览路径同源（`build_audio_tone_chain`），
+        # 跳过 loudnorm —— 单遍 loudnorm 在每次 seek 的短窗口重新收敛 ⇒ 音量抽动。
+        # 没有 pipe_audio_settings 时退回旧行为（只 atempo），逐字节不变。
+        _pv_aset = getattr(self, "_pipe_audio_settings", None)
+        if _pv_aset:
+            _pv_tone = build_audio_tone_chain(_pv_aset, speed_factor=_pv_s,
+                                              include_loudnorm=False)
+        else:
+            _pv_tone = [_pv_at] if _pv_at else []
         if _lavfi_graph:
             # 复合音频图（cmd_preview_target 自供 amovie=主文件；串行合并/多输入文本路径）
             # 没有输入级 -ss，否则 ffplay 会从 0 解码到 at（≈7-8s@1100s，用户实测「改 trim 后
@@ -35560,18 +36749,24 @@ class SimplePreviewer:
             cmd = [self._ffplay, "-nodisp", "-autoexit", "-vn", "-sn",
                    "-volume", str(max(0, min(100, self.volume))),
                    "-f", "lavfi", "-i",
-                   "%s;%satrim=start=%s,asetpts=PTS-STARTPTS"
+                   "%s;%satrim=start=%s,asetpts=PTS-STARTPTS%s"
                    % (_lavfi_graph, getattr(self, "_pipe_audio_map", "[ao]"),
-                      _ffsec(at))]
+                      _ffsec(at), (("," + _pv_at) if _pv_at else ""))]
         else:
             # ffplay 的 -ss 是 demuxer 级 seek（默认流=视频），视频容器里寻址只能落在
             # 视频关键帧（实测 36.00→33.80）。修法=粗+精两段：-ss coarse 瞬间跳到目标前
             # 15s，atrim=start=at 把关键帧→目标之间解码后丢弃（音频无关键帧概念 →
             # 落点采样级精确），asetpts 归零 → 状态行时钟=距目标相对时间。
+            # 淡入淡出（2026-11-02 第五步）：排在 atrim **之前**（= 文件绝对轴，与 atrim
+            # 同轴），atempo 之前（见 _pipe_afade_abs_filters docstring）。
+            _af_parts = list(self._pipe_afade_abs_filters())
+            _af_parts.append("atrim=start=" + _ffsec(at))
+            _af_parts.append("asetpts=PTS-STARTPTS")
+            _af_parts.extend(_pv_tone)
             cmd = [self._ffplay, "-nodisp", "-autoexit", "-vn", "-sn",
                    "-volume", str(max(0, min(100, self.volume))),
                    "-ss", _ffsec(coarse),
-                   "-af", "atrim=start=" + _ffsec(at) + ",asetpts=PTS-STARTPTS",
+                   "-af", ",".join(_af_parts),
                    self.file]
         flags = _ffmpeg_spawn_flags()
         try:
@@ -35926,7 +37121,15 @@ class SimplePreviewer:
         else:
             args = [self.ff, "-v", "error", "-i", path, "-map", "0:a:0?",
                     # 2026-09-18：采样率改从「更多设置」读取（_GLOBAL_SETTINGS 由 _sync_global_settings 同步）
-                    "-ac", "1", "-ar", str(eff_sr), "-f", "s16le", "pipe:1"]
+                    "-ac", "1", "-ar", str(eff_sr)]
+            # 淡入淡出（2026-11-03）：波形是「素材原始包络」，此前直读分支不挂 afade ⇒
+            # 波形看不出淡入淡出（声音 ffplay -af 有、波形没有，用户实机反馈）。与声音侧
+            # 同源（`_pipe_afade_abs_filters`，源绝对时间轴），把 afade 也喂给波形解码——
+            # 波形与耳朵听到的包络一致。串行合并走上方 if 分支（图内已含 afade），不经过此。
+            _w_af = list(self._pipe_afade_abs_filters())
+            if _w_af:
+                args += ["-af", ",".join(_w_af)]
+            args += ["-f", "s16le", "pipe:1"]
         flags = _ffmpeg_spawn_flags()
         try:
             p = subprocess.Popen(args, stdout=subprocess.PIPE,
@@ -36962,9 +38165,9 @@ class SimplePreviewer:
     def _unescape_movie_path(raw):
         """movie= 里的转义路径 → 真实文件路径（改写外部 -i 输入用）。
 
-        生成端口径（全部调用点一致，含 PiP 子视频 39588 / 画布 / 水印）：
-        `_movie_path_safe(p).replace("\\", "/").replace(":", "\\\\:")`
-        → 先把反斜杠全变正斜杠，再把盘符冒号写成 `\\\\:`（**两个**反斜杠，因为该字符串要过
+        生成端口径（全部调用点一致，含 PiP 子视频 / 画布 / 水印）：
+        `_movie_path_safe(p)` —— 转义已在函数内部完成（2026-11-02 收口，调用方不再自己
+        .replace）→ 反斜杠全变正斜杠，盘符冒号写成 `\\\\:`（**两个**反斜杠，因为该字符串要过
         filtergraph + filter-args **两层**转义解析）。
 
         实测（tests/_probe_movie_escape_roundtrip.py）这个逆变换对普通英文 / 含空格 / 含中文 /
@@ -37356,6 +38559,29 @@ class SimplePreviewer:
         # （否则取用时 NameError，会被 try/except 吞掉 → 临时文件整个不写 = 丢了线索）。
         _lim_pre = None       # 时长上限（pipe_dur → _dur → 无限源兜底）
         _remain = 0.0         # 图尾 trim 的窗口长度 = 上限 − sec
+        # 段末钳制（2026-11-02）：调用方给的「素材绝对段末」⇒ 播到就 EOF。
+        # 本方法的时长体系只有 _pipe_dur（成片总长）与 _dur（素材探测总长），**段长从来不进来**
+        # ⇒ 截取后预览一路播到片尾（用户实测：段 5–10、30s 素材 ⇒ 5→30 才停、进度条 25）。
+        # 只钳制**播放终点**，不动 _pipe_dur（它同时决定进度条长度，且 100347 记着
+        # 「传了会被 _run_probe 覆盖真实时长 ⇒ 定位落段尾」的坑）。
+        _play_end = _opt_float(getattr(self, "_pipe_play_end", None), 0.0)
+        _seg_cap = (_play_end - _pstart) if _play_end > 0 else None
+        if _seg_cap is not None and _seg_cap <= 0:
+            _seg_cap = None          # 段末 ≤ 段起 ⇒ 无意义，按旧行为
+        # ---- 出口时间域换算（2026-11-02，与 mpv vf 窗口是同一个坑）-------------------
+        # 变速预览的 `_pipe_graph` 里已有 `setpts=1/s*PTS`，而图尾 `trim=start/end`、输出侧
+        # `-t` / `-ss` 全部判定在**压缩后的图输出域**：graph_t = 素材_t_rel / s。
+        # 本方法内部所有量（_back / _seg_cap / _dur）都是**素材域**秒数 ⇒ 写进命令前必须同除 s。
+        # 否则截取 5–10 + 变速 2× ⇒ `trim=end=5` 吃掉 10 秒素材（用户实测从 5 播到 15）。
+        # 串行 out_mode 的 `_pipe_graph` 是成片轴（段内 trim 已把速度吃进时间轴）⇒ 恒不换算。
+        # ⚠️ 只换算「出口」：图内 trim、_rewrite_movie_inputs、_split_sub_trims 全是素材域，
+        #    动它们等于把源级 trim 也砍半 ⇒ 子画面直接错段。
+        _gsp = 1.0
+        if not _out_mode:
+            # 数值解析统一走 _opt_float（0 / None / 空 / 非法 → 1.0，与旧 `or 1.0` 同义）
+            _gs0 = _opt_float(getattr(self, "_pipe_speed", None), 1.0) or 1.0
+            if _gs0 > 0 and abs(_gs0 - 1.0) > 1e-6:
+                _gsp = _gs0
         if _out_mode:
             # 输出时间轴模式（串行合并）：图 = 多段 xfade 的成片时间轴。
             # 【方向A · 首段深 trim 提速（2026-10-13）】各段链自带**素材绝对** trim：
@@ -37427,7 +38653,6 @@ class SimplePreviewer:
             #   ts 计会被误截；fps/trim 均保时间线，实测证实。
             #   sec≈0（无截取且未 seek）时不注入任何桥接 = 与旧管道行为逐字节一致。
             _sec_s = "%.6f" % max(0.0, sec)
-            _back_s = "%.6f" % _back
             _pre = max(0.0, sec - 2.0 / max(self._fps, 1.0))
             # 虚拟/生成源（color:/gen:）是 lavfi 生成流，无法输入级 -ss seek → 强制非桥接，
             # 改走输出侧 -ss post 定位（下方 not _bridge 分支）。
@@ -37514,6 +38739,8 @@ class SimplePreviewer:
                     _lim_pre = float(self._dur)
                 if _lim_pre is None and "=999999" in _pipe_graph:
                     _lim_pre = 3600.0   # 图内有无限源且时长未知 → 兜底防跑飞（关窗即 kill）
+                if _seg_cap is not None:             # 段末钳制：优先于素材总长（见上）
+                    _lim_pre = _seg_cap if _lim_pre is None else min(_lim_pre, _seg_cap)
                 if _lim_pre:
                     # ⚠️ 口径修正（2026-09-21 实测复现）：这里必须用 **_back**（0 基段内偏移），
                     # 不能减 sec（素材绝对秒）。_lim_pre 首选 self._pipe_dur = **成片时长**（0 基
@@ -37523,8 +38750,10 @@ class SimplePreviewer:
                     # `_lim - _back`，此处保持同口径；_lim_pre 退化为素材总长时也只是放宽上限
                     # （上限偏大无害，偏小才会截断）。
                     _remain = max(0.5, _lim_pre - _back)
-                    _bridge_tail = ("trim=start=%s:end=%.6f,setpts=PTS-STARTPTS,"
-                                    % (_back_s, _back + _remain))
+                    # 换算到图输出域（÷s）：调速后图内 PTS 已被 setpts 压缩，trim 的
+                    # start/end 与素材秒不是 1:1（见上方 _gsp 注释）。
+                    _bridge_tail = ("trim=start=%.6f:end=%.6f,setpts=PTS-STARTPTS,"
+                                    % (_back / _gsp, (_back + _remain) / _gsp))
         if _bridge_tail:
             # 桥接模式：图尾钳制插在 fps 之后（fps/trim 均保时间线，实测 pts 走查证实），
             # 丢弃 seek 点前的 2 帧回退帧并封顶剩余时长（承担旧输出侧 -ss post + -t 的职责）
@@ -37590,7 +38819,8 @@ class SimplePreviewer:
                 # 旧两段式精定位：输出侧 -ss post 丢弃 2 帧回退。桥接模式下输出侧 -ss 会
                 # 撞上素材口径 pts（全部被误丢）→ 改由图尾 trim=start=sec 承担同样的丢弃。
                 post = max(0.0, sec - pre)
-                cmd.extend(["-ss", "%.6f" % post])
+                # 输出侧 -ss 同样在图输出域 ⇒ 变速时同除 s（否则 2 帧回退被放大成 2*s 帧）
+                cmd.extend(["-ss", "%.6f" % (post / _gsp)])
         cmd.extend(["-filter_complex", _pipe_graph + ";" + _tail,
                     "-map", "[pv_out]"])
         # 输出级时长上限（必须在输出文件名 pipe:1 之前）；seek 后按剩余时长收敛。
@@ -37606,9 +38836,12 @@ class SimplePreviewer:
                 _lim = float(self._dur)
             if _lim is None and "=999999" in _pipe_graph:
                 _lim = 3600.0      # 图内有无限源且时长未知 → 兜底防跑飞（用户关窗即 kill）
+            if _seg_cap is not None:                 # 段末钳制（2026-11-02，见方法内注释）
+                _lim = _seg_cap if _lim is None else min(_lim, _seg_cap)
             if _lim:
                 _lim = max(0.5, _lim - _back)
-                cmd.extend(["-t", "%.6f" % _lim])
+                # 输出侧 -t 计的是**图输出域**秒数（与图尾 trim 同域）⇒ 变速时同除 s
+                cmd.extend(["-t", "%.6f" % (_lim / _gsp)])
         cmd.extend(["-an", "-sn", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
         # ── 诊断留痕（2026-09-21）───────────────────────────────────────────────
         # 管道 ffmpeg 的 stderr 走 DEVNULL：一旦图/seek 有问题，ffmpeg 立即退出而我们
@@ -37631,14 +38864,14 @@ class SimplePreviewer:
             # 只读普通属性（无 Tk 调用）⇒ worker 线程安全。
             _diag = (_("[管道预览] sec=%.6f pipe_start=%.6f back=%.6f pre=%.6f out_seek=%.6f "
                      "bridge=%s out_mode=%s | plan=%s slow=%s anchor=%.6f | "
-                     "sub=%s branch=%s | lim_pre=%s remain=%s dur=%s pipe_dur=%s "
+                     "sub=%s branch=%s | lim_pre=%s remain=%s dur=%s pipe_dur=%s gsp=%.3f "
                      "| win: prev_anchor=%.6f cur_us=%.6f fps=%.6f has_v=%.0f audio=%s")
                      % (sec, _pstart, _back, _pre, _out_seek, _bridge, _out_mode,
                         (_pv_plan.mode if _pv_plan else "-"),
                         (_pv_plan.slow if _pv_plan else "-"),
                         (_pv_plan.anchor if _pv_plan else sec),
                         _sub_inputs, _branch_inputs,
-                        _lim_pre, _remain, self._dur, self._pipe_dur,
+                        _lim_pre, _remain, self._dur, self._pipe_dur, _gsp,
                         float(self._v_anchor or 0.0), float(self._current_us or 0) / 1e6,
                         float(self._fps or 0.0), 1.0 if self.has_video else 0.0,
                         bool(getattr(self, "_pipe_out_mode", False))))
@@ -43437,6 +44670,11 @@ class Track:
                     "audio_source_type": "self",      # "self" | "silence" | "external"
                     "external_audio_path": "",
                     "external_audio_stream": "0:a:0",
+                    # 「音频跟随」（2026-11-03 用户定案）：本轨的 fade_enabled 是**画面**淡入黑/
+                    # 淡出黑；音频要不要跟着淡只由这个勾选框决定。默认 False = 不跟随 ——
+                    # 音频没设置就不淡。判据唯一出口 audio_fade_view()（靠本键是否存在
+                    # 区分「视频轨设置」与「转换页/音频轨设置」，故视频轨务必始终带此键）。
+                    "audio_follow_video_fade": False,
                     "enhance": {
                         "denoise_enabled": False,
                         "denoise_spatial": 4.0,
@@ -43472,6 +44710,10 @@ class Track:
 
             # 对于视频，从 enc_settings 恢复属性（兼容旧代码）
             if typ == "video":
+                # 「音频跟随」：老工程 / 手写工程可能缺这个键 ⇒ 补默认 False（不跟随）。
+                # 缺键会让 audio_fade_view 误判成「转换页设置」而放行 ⇒ 声音跟着视频淡。
+                if "audio_follow_video_fade" not in self.enc_settings:
+                    self.enc_settings["audio_follow_video_fade"] = False
                 # 默认 True 与 Track 默认 enc_settings 保持一致（2026-09-24）
                 self.overlay_enabled = self.enc_settings.get("overlay_enabled", True)
                 self.overlay_x = self.enc_settings.get("overlay_x", DEFAULT_OVERLAY_X)
@@ -45504,6 +46746,7 @@ class FFmpegBatchGUI:
                 if not self.ffplay_cmd:
                     self._append_info_ui(_("警告：指定 FFmpeg 目录下未找到 ffplay，预览功能可能受限"))
                 _probe_ffmpeg_major(self.ffmpeg_cmd)
+                _set_active_ffmpeg_cmd(self.ffmpeg_cmd)   # 供 atempo 域探测（换目录后按路径重新探测）
                 return
             else:
                 self._append_info_ui(_("警告：指定 FFmpeg 目录下未找到 ffmpeg，将使用系统 PATH 中的版本"))
@@ -45515,6 +46758,7 @@ class FFmpegBatchGUI:
         self.ffprobe_cmd = normalize_path(ffprobe) if ffprobe else None
         self.ffplay_cmd = normalize_path(ffplay) if ffplay else None
         _probe_ffmpeg_major(self.ffmpeg_cmd)
+        _set_active_ffmpeg_cmd(self.ffmpeg_cmd)   # 供 atempo 域探测（缓存按路径分键）
 
     # 停止流程时限：发 q 后的收尾宽限（秒）/ terminate 后的宽限 / 轮询间隔（毫秒）
     _STOP_GRACE_Q = 15.0
@@ -46058,88 +47302,42 @@ class FFmpegBatchGUI:
 
         return cmd_list
     
-    def _build_audio_encoding_params(self, cmd_list: List[str], settings: dict, input_path: str = None) -> List[str]:
+    def _build_audio_encoding_params(self, cmd_list: List[str], settings: dict, input_path: str = None,
+                                     trim_duration: float = None) -> List[str]:
+        """普通音频编码参数（不做 atrim）。
+
+        :param trim_duration: 输出时长（源轴秒）。仅在「截取由链外完成」时传：
+            组合跳转（输入级 -ss/-t）与快速截取（输入级 -ss/-to）。仅用于
+            淡出定位（见 afade_out_start）——本函数**不**注入 atrim。
+        """
         if not settings.get("audio_enabled", True):
             cmd_list.append("-an")
             return cmd_list
     
-        speed_factor = float(settings.get("audio_speed_factor", "1.0"))
-        audio_needs_speed = settings.get("audio_speed_enabled", False) and speed_factor != 1.0
-        volume = settings.get("volume", 1.0)
-        volume_enabled = settings.get("volume_enabled", False)
-        audio_needs_volume = volume_enabled and volume != 1.0
-    
         acodec = settings.get("audio_codec", "aac")
-        audio_filters = []
-        if settings.get("hp_enabled"):
-            audio_filters.append(f"highpass=f={settings.get('hp_freq', 200)}")
-        if settings.get("lp_enabled"):
-            audio_filters.append(f"lowpass=f={settings.get('lp_freq', 3000)}")
-        if audio_needs_volume:
-            audio_filters.append(f"volume={volume:.2f}")
-        if audio_needs_speed:
-            atempo = build_atempo_chain(speed_factor)
-            if atempo:
-                audio_filters.append(atempo)
+        # 音色链（hp→lp→volume→atempo→降噪→响度→声道→EQ）唯一实现，见 build_audio_tone_chain。
+        # 注意 denoise_nr/denoise_nf（afftdn 噪底）与 loudnorm_lra/loudnorm_tp 在 UI 上**没有
+        # 入口**，恒定取函数内默认值；保留 .get 是让手写工程文件 / 外部预设能覆盖（2026-10-29 审计）。
+        audio_filters = build_audio_tone_chain(settings)
 
-        # 降噪
-        # ⚠️ denoise_nr/denoise_nf（afftdn 的噪底参数）与下面的 loudnorm_lra/loudnorm_tp
-        # 在 UI 上**没有入口**，故 `get_settings()` 不产出这几个键、全库也没有写入侧 ——
-        # 它们恒定取下面的默认值（与工具箱模板串 `LRA=7:TP=-2` 一致）。保留 `.get` 是为了
-        # 让手写工程文件 / 外部预设能覆盖；不是死键漏写（2026-10-29 审计结论）。
-        if settings.get("denoise_enabled", False):
-            if settings.get("denoise_method") == "arnndn":
-                audio_filters.append("arnndn")
-            else:
-                nr = settings.get("denoise_nr", 12)
-                nf = settings.get("denoise_nf", -30)
-                audio_filters.append(f"afftdn=nr={nr}:nf={nf}")
-
-        # 响度标准化
-        if settings.get("loudnorm_enabled", False):
-            i = settings.get("loudnorm_i", -23)
-            lra = settings.get("loudnorm_lra", 7)
-            tp = settings.get("loudnorm_tp", -2)
-            audio_filters.append(f"loudnorm=I={i}:LRA={lra}:TP={tp}")
-
-        # 声道 / 单声道
-        mode = settings.get("channel_mode", "stereo")
-        if mode == "mono":
-            audio_filters.append("pan=mono|c0=0.5*c0+0.5*c1")
-        elif mode == "left":
-            audio_filters.append("pan=mono|c0=c0")
-        elif mode == "right":
-            audio_filters.append("pan=mono|c0=c1")
-        elif mode == "swap":
-            audio_filters.append("pan=stereo|c0=c1|c1=c0")
-
-        # 均衡器（EQ）：低/中/高 三段增益
-        if settings.get("eq_enabled", False):
-            eq_low = _opt_float(settings.get("eq_low", 0) or 0, 0.0)
-            eq_mid = _opt_float(settings.get("eq_mid", 0) or 0, 0.0)
-            eq_high = _opt_float(settings.get("eq_high", 0) or 0, 0.0)
-            if eq_low != 0:
-                audio_filters.append(f"bass=g={eq_low:.1f}")
-            if eq_mid != 0:
-                audio_filters.append(f"equalizer=f=1000:width_type=h:width=200:g={eq_mid:.1f}")
-            if eq_high != 0:
-                audio_filters.append(f"treble=g={eq_high:.1f}")
-
-        # 淡入淡出
-        if settings.get("fade_enabled", False):
-            fin = settings.get("fade_in", "")
-            fout = settings.get("fade_out", "")
+        # 淡入淡出（「音频跟随」判据见 audio_fade_view：合并页视频轨未勾 ⇒ 只淡画面、声音不淡）
+        _afd_s = audio_fade_view(settings)
+        if _afd_s.get("fade_enabled", False):
+            fin = _afd_s.get("fade_in", "")
+            fout = _afd_s.get("fade_out", "")
             fin_s = time_to_seconds(fin) if fin else 0.0
             fout_s = time_to_seconds(fout) if fout else 0.0
             if fin_s > 0:
                 audio_filters.append(f"afade=t=in:st=0:d={fin_s:.3f}")
             if fout_s > 0:
+                # 2026-11-02 统一：起点唯一判据 afade_out_start。此前这里恒用源全时长，
+                # 组合跳转 / 快速截取时起点落在输出末尾之后 ⇒ 淡出整段丢失（无警告）。
+                # 2026-11-03：判据在时长未知时返回 None ⇒ 不挂淡出（不许落到 st=0，
+                # 那会让整段音频从开头渐弱，比丢淡出更像 bug）。
                 total = self._get_media_duration(input_path) if input_path else None
-                if total:
-                    st = max(0.0, total - fout_s)
+                st = afade_out_start(settings, fout_s, total, trim_duration)
+                if st is not None:
                     audio_filters.append(f"afade=t=out:st={st:.3f}:d={fout_s:.3f}")
-                else:
-                    audio_filters.append(f"afade=t=out:st=0:d={fout_s:.3f}")
     
         # 音频倒放（放在分段之前，确保分段时间基准为最终输出时间线）
         if settings.get('audio_reverse', False):
@@ -46203,56 +47401,15 @@ class FFmpegBatchGUI:
             af_filters.append(f"atrim=start={_ffsec(start_sec)}:duration={_ffsec(duration)}")
             af_filters.append("asetpts=PTS-STARTPTS")
     
-        # 合并其他音频滤镜（音量、变速等）
-        speed_factor = float(settings.get("audio_speed_factor", "1.0"))
-        if settings.get("audio_speed_enabled", False) and speed_factor != 1.0:
-            atempo = build_atempo_chain(speed_factor)
-            if atempo:
-                af_filters.append(atempo)
-        volume = settings.get("volume", 1.0)
-        if settings.get("volume_enabled", False) and volume != 1.0:
-            af_filters.append(f"volume={volume:.2f}")
+        # 音色链（hp→lp→volume→atempo→降噪→响度→声道→EQ）：唯一实现，见 build_audio_tone_chain。
+        # 本函数只负责「链首 atrim+asetpts」（把 t 归零）与链尾 fade/倒放/分段/soxr。
+        af_filters.extend(build_audio_tone_chain(settings))
 
-        # 降噪 / 响度 / 声道 / 淡入淡出 / 倒放
-        if settings.get("hp_enabled"):
-            af_filters.append(f"highpass=f={settings.get('hp_freq', 200)}")
-        if settings.get("lp_enabled"):
-            af_filters.append(f"lowpass=f={settings.get('lp_freq', 3000)}")
-        if settings.get("denoise_enabled", False):
-            if settings.get("denoise_method") == "arnndn":
-                af_filters.append("arnndn")
-            else:
-                af_filters.append("afftdn=nr=12:nf=-30")
-        if settings.get("loudnorm_enabled", False):
-            _ln_i = settings.get("loudnorm_i", -23)
-            _ln_lra = settings.get("loudnorm_lra", 7)
-            _ln_tp = settings.get("loudnorm_tp", -2)
-            af_filters.append(f"loudnorm=I={_ln_i}:LRA={_ln_lra}:TP={_ln_tp}")
-        mode = settings.get("channel_mode", "stereo")
-        if mode == "mono":
-            af_filters.append("pan=mono|c0=0.5*c0+0.5*c1")
-        elif mode == "left":
-            af_filters.append("pan=mono|c0=c0")
-        elif mode == "right":
-            af_filters.append("pan=mono|c0=c1")
-        elif mode == "swap":
-            af_filters.append("pan=stereo|c0=c1|c1=c0")
-
-        # 均衡器（EQ）：低/中/高 三段增益
-        if settings.get("eq_enabled", False):
-            eq_low = _opt_float(settings.get("eq_low", 0) or 0, 0.0)
-            eq_mid = _opt_float(settings.get("eq_mid", 0) or 0, 0.0)
-            eq_high = _opt_float(settings.get("eq_high", 0) or 0, 0.0)
-            if eq_low != 0:
-                af_filters.append(f"bass=g={eq_low:.1f}")
-            if eq_mid != 0:
-                af_filters.append(f"equalizer=f=1000:width_type=h:width=200:g={eq_mid:.1f}")
-            if eq_high != 0:
-                af_filters.append(f"treble=g={eq_high:.1f}")
-
-        if settings.get("fade_enabled", False):
-            fin = settings.get("fade_in", "")
-            fout = settings.get("fade_out", "")
+        # 「音频跟随」判据见 audio_fade_view：合并页视频轨未勾 ⇒ 只淡画面、声音不淡
+        _afd_s = audio_fade_view(settings)
+        if _afd_s.get("fade_enabled", False):
+            fin = _afd_s.get("fade_in", "")
+            fout = _afd_s.get("fade_out", "")
             fin_s = time_to_seconds(fin) if fin else 0.0
             fout_s = time_to_seconds(fout) if fout else 0.0
             if fin_s > 0:
@@ -46261,24 +47418,15 @@ class FFmpegBatchGUI:
                 # 2026-09-13 修复：本函数链首 atrim+asetpts 已把 t 归零（atempo 变速紧随
                 # 其后），淡出起点须按「截取后时长（再除变速）」定位；此前用源全时长，
                 # 截取后淡出点落在输出之外 → 淡出丢失。未走 atrim 时保持源全时长口径。
-                if start_sec is not None and duration > 0:
-                    _ad = duration
-                    if settings.get("audio_speed_enabled", False):
-                        try:
-                            _asp = float(settings.get("audio_speed_factor", "1.0") or "1.0")
-                            if _asp > 0 and _asp != 1.0:
-                                _ad = _ad / _asp
-                        except ValueError:
-                            pass
-                    st = max(0.0, _ad - fout_s)
+                # 2026-11-02：算法搬进 afade_out_start，与其余两条路径共用一份判据。
+                # 2026-11-03：时长未知 ⇒ 判据返回 None ⇒ 跳过淡出（不再用 st=0 兜底）。
+                _has_trim = start_sec is not None and duration > 0
+                total = None if _has_trim else (
+                    self._get_media_duration(input_path) if input_path else None)
+                st = afade_out_start(settings, fout_s, total,
+                                     duration if _has_trim else None)
+                if st is not None:
                     af_filters.append(f"afade=t=out:st={st:.3f}:d={fout_s:.3f}")
-                else:
-                    total = self._get_media_duration(input_path) if input_path else None
-                    if total:
-                        st = max(0.0, total - fout_s)
-                        af_filters.append(f"afade=t=out:st={st:.3f}:d={fout_s:.3f}")
-                    else:
-                        af_filters.append(f"afade=t=out:st=0:d={fout_s:.3f}")
         if settings.get('audio_reverse', False):
             af_filters.append("areverse")
 
@@ -46477,11 +47625,16 @@ class FFmpegBatchGUI:
                     f"atrim=start={_ffsec(start)}:end={_ffsec(end)}",
                     "asetpts=PTS-STARTPTS"
                 ]
-                # 逐段音频变速（不再使用全局变速）
-                if seg_speed_factor != 1.0:
-                    atempo_chain = build_atempo_chain(seg_speed_factor)
-                    if atempo_chain:
-                        audio_filter_parts.append(atempo_chain)
+                # 音色链（hp→lp→volume→atempo→降噪→响度→声道→EQ）：唯一实现，见
+                # build_audio_tone_chain。
+                # 🔴 2026-11-03：本支此前**完全没接**音色链 —— 399364e 收口时只补了下面
+                # 「音频独立截取」那一支，逐段这一支漏了 ⇒ 转换页开着「分段」时，EQ /
+                # 响度标准化 / 降噪 / 声道 / 高通低通 **全部无效**，命令里一个字都不变
+                # （用户实测：怎么设命令都没变化）。
+                # 逐段变速由 speed_factor 传入（tone 内部同款 build_atempo_chain）——
+                # 绝不能在外面再手写一条，否则就是双倍速。
+                audio_filter_parts.extend(
+                    build_audio_tone_chain(settings, speed_factor=seg_speed_factor))
                 # 逐段音频倒放（不再使用全局倒放）
                 if seg_reverse:
                     audio_filter_parts.append("areverse")
@@ -46507,55 +47660,39 @@ class FFmpegBatchGUI:
                 audio_trim_parts.append("anull")
             audio_trim_parts.append("asetpts=PTS-STARTPTS")
 
-            # 全局音频滤镜（音量 / 变速 / 倒放 / EQ / 降噪 / 响度 / 声道 / 淡入淡出）
-            speed_factor = float(settings.get("audio_speed_factor", "1.0"))
-            if settings.get("audio_speed_enabled", False) and speed_factor != 1.0:
-                atempo_chain = build_atempo_chain(speed_factor)
-                if atempo_chain:
-                    audio_trim_parts.append(atempo_chain)
-            volume_val = settings.get("volume", 1.0)
-            if settings.get("volume_enabled", False) and volume_val != 1.0:
-                audio_trim_parts.append(f"volume={volume_val:.2f}")
-            if settings.get("audio_reverse", False):
-                audio_trim_parts.append("areverse")
-            if settings.get("hp_enabled"):
-                audio_trim_parts.append(f"highpass=f={settings.get('hp_freq', 200)}")
-            if settings.get("lp_enabled"):
-                audio_trim_parts.append(f"lowpass=f={settings.get('lp_freq', 3000)}")
-            if settings.get("denoise_enabled", False):
-                if settings.get("denoise_method") == "arnndn":
-                    audio_trim_parts.append("arnndn")
-                else:
-                    audio_trim_parts.append("afftdn=nr=12:nf=-30")
-            if settings.get("loudnorm_enabled", False):
-                _ln_i = settings.get("loudnorm_i", -23)
-                _ln_lra = settings.get("loudnorm_lra", 7)
-                _ln_tp = settings.get("loudnorm_tp", -2)
-                audio_trim_parts.append(f"loudnorm=I={_ln_i}:LRA={_ln_lra}:TP={_ln_tp}")
-            mode = settings.get("channel_mode", "stereo")
-            if mode == "mono":
-                audio_trim_parts.append("pan=mono|c0=0.5*c0+0.5*c1")
-            elif mode == "left":
-                audio_trim_parts.append("pan=mono|c0=c0")
-            elif mode == "right":
-                audio_trim_parts.append("pan=mono|c0=c1")
-            elif mode == "swap":
-                audio_trim_parts.append("pan=stereo|c0=c1|c1=c0")
-            if settings.get("eq_enabled", False):
-                eq_low = _opt_float(settings.get("eq_low", 0) or 0, 0.0)
-                eq_mid = _opt_float(settings.get("eq_mid", 0) or 0, 0.0)
-                eq_high = _opt_float(settings.get("eq_high", 0) or 0, 0.0)
-                if eq_low != 0.0 or eq_mid != 0.0 or eq_high != 0.0:
-                    audio_trim_parts.append(f"equalizer=f=100:width=200:g={eq_low},"
-                                            f"equalizer=f=1000:width=1000:g={eq_mid},"
-                                            f"equalizer=f=8000:width=4000:g={eq_high}")
-            if settings.get("fade_enabled", False):
-                fi = settings.get("fade_in", "").strip()
+            # 音色链（hp→lp→volume→atempo→降噪→响度→声道→EQ）：唯一实现，见 build_audio_tone_chain。
+            # 本段只负责链首 atrim+asetpts 与链尾 fade/倒放/soxr。
+            audio_trim_parts.extend(build_audio_tone_chain(settings))
+            # 「音频跟随」判据见 audio_fade_view（合并页视频轨未勾 ⇒ 声音不淡）
+            _afd_s = audio_fade_view(settings)
+            if _afd_s.get("fade_enabled", False):
+                fi = _afd_s.get("fade_in", "").strip()
                 if fi:
                     audio_trim_parts.append(f"afade=t=in:d={fi}")
-                fo = settings.get("fade_out", "").strip()
+                fo = _afd_s.get("fade_out", "").strip()
                 if fo:
-                    audio_trim_parts.append(f"afade=t=out:st={a_end - float(fo) if a_end else 0}:d={fo}")
+                    # 2026-11-02 统一：本链首 atrim(start=a_start,end=a_end)+asetpts 已把 t
+                    # 归零、atempo 紧随其后 ⇒ 起点 = (a_end−a_start)÷变速 − 淡出时长。
+                    # 此前直接用 a_end（不减起点、不除变速），淡出点偏后 ⇒ 静默丢失。
+                    # 2026-11-03：a_end 缺失且源时长探测失败 ⇒ 判据返回 None ⇒ 跳过淡出。
+                    _fo_s = _opt_float(fo, 0.0) or 0.0
+                    _fo_trim = None
+                    if a_start is not None and a_end is not None and a_end > a_start:
+                        _fo_trim = a_end - a_start
+                    elif a_start is not None:
+                        # 只填了起点（atrim 无 end）：按「源长 − 起点」估算输出长度
+                        _tot = self._get_media_duration(input_path)
+                        if _tot:
+                            _fo_trim = max(0.0, _tot - a_start)
+                    _fo_st = afade_out_start(settings, _fo_s, None, _fo_trim)
+                    if _fo_st is not None:
+                        audio_trim_parts.append(
+                            f"afade=t=out:st={_fo_st:.3f}:d={_fo_s:.3f}")
+            # 倒放：与其余三条导出路径一致放在 fade 之后（原来夹在 hp/lp 之前）。
+            # reverse 只是整体倒序，对线性滤镜等价；与 fade 同时启用时差异可见 ——
+            # 统一取「先淡出再倒放」的既有主流口径（fade-out 变成开头的淡入）。
+            if settings.get("audio_reverse", False):
+                audio_trim_parts.append("areverse")
             # soxr 高质量重采样（对标 HandBrake）：非 auto 采样率时追加到链尾
             _sx = audio_soxr_resample_filter(settings)
             if _sx:
@@ -47672,6 +48809,16 @@ class FFmpegBatchGUI:
             enhance_settings=sub_enhance,
             graph_id=f"s{sub_idx}",
             include_fade=include_fade,
+            # 2026-11-02：视频淡出定位必须知道「本段输出时长」，否则
+            # `video_fade_out_start` 拿到 None ⇒ 淡出被整段跳过（画中画子视频「硬切、不淡」）。
+            # · 有显示窗口：按窗口长（loop 撑满时窗口长就是输出长）；窗口不位移时（转场链成员
+            #   传 win_override=(0, 段长)）同样是段长。
+            # · 无窗口：只给源全时长，由 precise_trim 的旧口径自扣 trim_start（子链恒 True）。
+            clip_duration=_sub_dur,
+            fade_output_duration=(
+                (_win_end - _win_start)
+                if (_has_window and _win_end is not None and _win_end > _win_start)
+                else None),
             chroma_settings=sub_settings if sub_settings.get("chroma_enabled", False) else None,
             loop_size=loop_size,
             window_start=_win_start, window_end=_win_end, window_loop_count=_win_loop,
@@ -48426,6 +49573,13 @@ class FFmpegBatchGUI:
         # 口径一致），让图片原样参与 overlay（实测 rc=0 且叠加层正常出现）。
         _main_static = bool(main_file_path) and _is_static_image_file(main_file_path)
         _main_setpts = "setpts=PTS+0/TB" if _main_static else "setpts=PTS-STARTPTS"
+        # 视频淡出的定位时长（2026-11-02）：`main_effective_duration` 是「输出时间线」长度
+        # （已 ÷speed，与 `-t` 同源）⇒ 按输出轴直接定位，配 `fade_speed_factor=1.0`
+        # 告诉判据「别再除变速」。图片主视频没有时间轴（_main_static），不参与淡出。
+        _main_fade_dur = None
+        if (not _main_static) and main_effective_duration is not None \
+                and main_effective_duration > 0:
+            _main_fade_dur = float(main_effective_duration)
         main_vf = build_video_filter_chain(
             main_settings_sw,
             include_subtitle=include_subtitle_main,
@@ -48435,6 +49589,12 @@ class FFmpegBatchGUI:
             graph_id=f"m{main_idx}",
             include_fade=include_fade,
             clip_duration=self._get_media_duration(main_file_path) if main_file_path else None,
+            # 2026-11-02：主视频淡出定位。有截取（快速截取=输入级 -ss / 精准截取=链内
+            # trim+setpts）时输出时间线归零，按**截取后的有效时长**定位；不给就退回源全时长
+            # ⇒ `st` 落到输出之外，`fade=t=out` 被 ffmpeg 静默丢弃（用户实测「主视频有淡入
+            # 没淡出」）。main_effective_duration 由画中画调用方传入（与 `-t` 同源）。
+            fade_output_duration=_main_fade_dur,
+            fade_speed_factor=(1.0 if _main_fade_dur else None),
             # 2026-10-09：画中画/水印主视频也支持绿幕抠像（抠图 → 输出透明素材）。
             # 缩略图/contact sheet 等旧调用方无 chroma 键 → None，行为逐字节一致。
             chroma_settings=main_settings if main_settings.get("chroma_enabled", False) else None,
@@ -48562,9 +49722,9 @@ class FFmpegBatchGUI:
                 for _mi in _ms:
                     _mss = sub_infos[_mi][2] or {}
                     if str(_mss.get('blend_mode') or 'normal').strip().lower() != 'normal':
-                        _nm = _mname.get(_mi) or _("子视频{0}").format(_mi + 1)
+                        _nm = _mname.get(_mi) or _("子视频%d") % (_mi + 1)
                         _grp_ign_blend.append(
-                            _("{0}（组内主）").format(_nm) if _mi == _b else _nm)
+                            _("%s（组内主）") % _nm if _mi == _b else _nm)
                 _bw = _bh = None
                 try:
                     _bw, _bh = self._overlay_content_size(sub_infos[_b][1], _bss)
@@ -48658,8 +49818,8 @@ class FFmpegBatchGUI:
             _ign = _("、").join(_grp_ign_blend)
             self._log_once(
                 "grp_ign_blend:%s" % _ign,
-                _("[分组] 组内成员配的混合模式（{0}）**在组内无效**（组内没有主视频像素可混），"
-                  "已忽略；要让整组与主视频混合，请在**组父行**的设置窗里配。").format(_ign))
+                _("[分组] 组内成员配的混合模式（%s）**在组内无效**（组内没有主视频像素可混），"
+                "已忽略；要让整组与主视频混合，请在**组父行**的设置窗里配。") % _ign)
         _grp_of = {_i: _g for _g, _d in _grp_ok.items() for _i in _d["mems"]}
         if _groups and not _grp_ok:
             self._append_info_ui(
@@ -48709,7 +49869,7 @@ class FFmpegBatchGUI:
         # 会互相干涉（后一个 blend 拿到的"主视频"已被前一个改过）。
         # 单 blend / 全 normal 不 split → 零行为变化；split 是帧引用（零拷贝），性能无感。
         _blend_count = 0
-        # 🔴 `_grp_of` 的键是 **enumerate 序号**（分组规划按 `enumerate(sub_infos)`
+        # 🔴 `_grp_of` 的键是 **enumerate 序号**（分组规划 42798 按 `enumerate(sub_infos)`
         #    收集），**不是** `sub_idx`（元组第一项，通常 1 起）⇒ 这里必须也用 enumerate，
         #    否则组员永远匹配不上、组成员的 blend 会被多算一份 split 副本（副本没人消费
         #    ⇒ 只能补 nullsink，看起来像"失败回退"；实测复现见
@@ -49083,7 +50243,7 @@ class FFmpegBatchGUI:
                     self._group_blend_note(
                         "grpblend:%s:dis" % _gkey,
                         _("[混合模式] 组 %s 父行配了 blend，但父行的「启用叠加」是**关闭**的"
-                          " ⇒ 整组不显示，blend 自然也无从混合。") % _gkey)
+                        " ⇒ 整组不显示，blend 自然也无从混合。") % _gkey)
                 if _gblend is not None:
                     _bmode, _bx, _by, _bw, _bh, _bgx, _bgy = _gblend
                     # 多路 blend 隔离：与子视频共用 split 出来的「主视频原始帧」副本
@@ -49407,7 +50567,7 @@ class FFmpegBatchGUI:
                            else os.path.basename(sub_file or ""))
                 self._append_info_ui(
                     _("[封装] 子视频 %d%s 未勾选「启用叠加」：其滤镜链（绿幕/遮罩/缩放等）"
-                      "已生成但不会叠加显示；如需显示请到轨道编辑勾选「启用叠加」")
+                    "已生成但不会叠加显示；如需显示请到轨道编辑勾选「启用叠加」")
                     % (i + 1, ("（%s）" % _off_nm) if _off_nm else ""))
 
         # ---- 收尾：多 blend 隔离的 split 副本必须**全部**被消费 ----
@@ -51316,25 +52476,31 @@ class FFmpegBatchGUI:
         return _is_static_image_file(path)
 
     def _movie_path_safe(self, path, idx=0):
-        """movie 滤镜路径安全化：ffmpeg filtergraph 语法层不支持 [ ] ' , ; 等字符
-        （实测无法转义），含特殊字符时在源文件**同目录**创建临时硬链接
-        （同盘必成功，不复制；失败则返回原路径）。文件名 ffmpeg_preview{h}_cache{idx}{ext}，
-        缓存按源路径复用（重复预览不重复建）；程序退出统一清理。"""
-        if not path or not os.path.exists(path):
-            return path
-        if not re.search(r"[\[\]',;]", path):
-            return path
-        if path in _PREVIEW_LINKS and os.path.exists(_PREVIEW_LINKS[path]):
-            return _PREVIEW_LINKS[path]
-        h = hashlib.md5(path.encode("utf-8")).hexdigest()[:12]
-        ext = os.path.splitext(path)[1] or ".mp4"
-        target = os.path.join(os.path.dirname(path), f"ffmpeg_preview{h}_cache{idx}{ext}")
-        try:
-            os.link(path, target)
-        except OSError:
-            return path
-        _PREVIEW_LINKS[path] = target
-        return target
+        """filtergraph 里 movie=/amovie= 的路径 **唯一出口**（2026-11-02 收口）。
+
+        返回**已完成两步转义**的字符串：反斜杠→正斜杠 + 冒号 `\\\\:` 双重转义
+        （graph 层与 movie 参数层各吃一次；只写单层会被解析成裸冒号 ⇒
+        avformat_open_input 在 'C' 处截断）。⇒ 调用方**不得**再自己 `.replace`：
+        此前 9 处调用点各抄一遍同串，漏一处就是一张断开的图。
+
+        含 filtergraph 语法字符 [ ] ' , ; 时（实测无法转义）→ 源文件同目录建临时硬链接
+        改名（同盘必成功、不复制），登记 `_PREVIEW_LINKS` 由程序退出统一清理。
+        命名复用 `_mask_shape_movie_path`（同一个文件只产生一份链接、一份缓存；
+        旧实现是 `ffmpeg_preview{h}_cache{idx}`，与遮罩形状图各自一套）。
+
+        :param idx: 仅为兼容旧调用点保留。统一命名后按路径 hash 唯一，不再需要区分。
+        链接失败 / 文件不存在 → 退回「原路径 + 正确转义」并提示（字符串契约不变，不返 None）。
+        """
+        safe = None
+        with suppress(Exception):
+            safe = _mask_shape_movie_path(path)
+        if safe:
+            return safe
+        if path and os.path.exists(path):
+            self._log_once(
+                "movie_hardlink_fail",
+                _("[预览] 路径含 [ ] ' , ; 且无法创建临时硬链接，滤镜图可能解析失败：{0}").format(path))
+        return str(path or "").replace("\\", "/").replace(":", "\\\\:")
 
     def _check_mpv_usable(self) -> bool:
         """检测 mpv 二进制是否真正可用（存在 + 能启动 --version）。
@@ -51497,7 +52663,7 @@ class FFmpegBatchGUI:
                      or "[afsub" in s or "[afw" in s)]
         if not _segs:
             return ""
-        _esc = self._movie_path_safe(main_file).replace("\\", "/").replace(":", "\\\\:")
+        _esc = self._movie_path_safe(main_file)
         _out = []
         for _s in _segs:
             if "[aid1]" in _s:
@@ -51532,7 +52698,8 @@ class FFmpegBatchGUI:
     def preview_with_player(self, input_path, filters=None, audio_only=False, volume=None,
                             extra_args=None, start_time=None, duration=None,
                             lavfi_complex=None, mpv_only_args=None,
-                            image_duration=None, lavfi_input=None, precise_seek=False):
+                            image_duration=None, lavfi_input=None, precise_seek=False,
+                            graph_speed=1.0):
         """
         启动播放器预览
         :param start_time: 起始时间（秒或时间字符串），仅 ffplay 使用，mpv 通过 extra_args 传递 --start
@@ -51551,6 +52718,10 @@ class FFmpegBatchGUI:
                `--hr-seek=yes --hr-seek-framedrop=no`；ffplay 因 `-ss` 本身就只落关键帧，改为把
                偏移交给**图内绝对 `trim=start=S`** 吸收（帧戳不归零 ⇒ 滤镜 t 仍是原始时间，
                语义不变）。默认 False = 完全旧行为（封装页实时预览 lavfi 图不可传）。
+        :param graph_speed: 图内**视频变速**倍数（`setpts=1/graph_speed*PTS` 已烘进 filter_chain）。
+               只有 mpv 的 `--vf` 路线需要它：该路线 `--start`/`--length` 判定在**图输出时间轴**
+               上，窗口要同除（见 `_build_mpv` 内注释）。ffplay 与 `--lavfi-complex` 路线都用
+               素材域，传了也不参与计算。默认 1.0 = 零行为变化。
         """
         # 精确优先分流（2026-10-13）：**唯一决策源 = 统一 Seek 模型**（research/seek-model）。
         # 「player_preview」场景 = 外部播放器 seek：图内已有绝对 trim 的（封装页实时预览）
@@ -51616,10 +52787,19 @@ class FFmpegBatchGUI:
 
         def _build_mpv():
             player = self.mpv_path.get().strip() or "mpv"
+            # ---- 变速窗口的时间域（2026-11-02）----
+            # vf 模式要同除 s、complex 模式绝不能除 —— 判据与实测数据全在 `_pv_mpv_window` 里。
+            # `audio_only` 不用窗口参数，直接跳过换算（零行为变化）。
+            _st_win, _du_win = _pv_mpv_window(
+                start_time, duration, 1.0 if audio_only else graph_speed,
+                bool(lavfi_complex))
             # 颜色虚拟源：位置输入改 av://lavfi:<spec>（真机实测可播且保 alpha；裸哨兵 /
             # lavfi: / ffmpeg://lavfi: 一律 exit 1）。解析失败退回原串（让 mpv 自己报错，
             # 至少不再静默错播）。
             c = [player, (_virtual_mpv_input(file_path) or file_path) if _color_in else file_path]
+            # 图片主视频 + 普通滤镜链：单帧必须改写成连续流（见下方 --vf 分支注释）。
+            # 标记位供末尾在 --length / --image-display-duration 之间二选一。
+            _img_vf_loop = False
             if not audio_only:
                 _fit_vf = ""
                 if lavfi_complex:
@@ -51631,6 +52811,28 @@ class FFmpegBatchGUI:
                     if _meta_rot_lc:
                         # 图内已补 transpose ⇒ 必须关掉 mpv 渲染阶段的 autorotate，
                         # 否则「图内转一次 + 渲染再转一次」= 双重旋转（与 --vf 分支同口径）。
+                        c.append("--video-rotate=no")
+                elif _filters_disp and image_duration is not None \
+                        and _is_static_image_file(file_path) \
+                        and vf_chain_is_timed(_filters_disp):
+                    # 图片主视频 + 滤镜链 ⇒ 必须先把单帧变成「连续流」，否则 fade / 任何
+                    # 时间相关滤镜只在第一帧上求值一次（t 恒为 0）：
+                    #   · fade=t=in ⇒ 首帧全黑 ⇒ **整个预览全黑**（用户实测第 15 条）；
+                    #   · 其它时间滤镜同理（倒计时/轨迹不动）。
+                    # mpv 的 `--vf=lavfi` 是 push 模型：输入图片只有 1 帧，滤镜侧拿不到后续帧，
+                    # 所以不能只靠 `--image-display-duration`（它只让那一帧停留 N 秒）。
+                    # 实测（`research/probe_img_preview_fade_20261103.py`，mpv 编码输出）：
+                    #   P1 直挂 fade + image-display-duration ⇒ 输出仅 1 帧、无时长（全黑）
+                    #   P2 loop + fps=30 + setpts=N/30/TB + 尾 trim ⇒ 3.967s / 30fps、
+                    #      亮度 16→117→27（1s 淡入、1.5s 淡出，曲线正确）
+                    # 故：图首 loop 单帧 → fps 强制 30 → **用 N 重建 PTS**（loop 复制帧的 PTS
+                    # 不可靠，图片源时基 1000fps），链尾 trim 到显示时长收尾。
+                    _vf_use = (f"loop=loop=-1:size=1:start=0,fps=30,"
+                               f"setpts=N/30/TB,{_filters_disp},"
+                               f"trim=0:{float(image_duration):g},setpts=PTS-STARTPTS")
+                    _img_vf_loop = True
+                    c.append(f"--vf=lavfi=[{_vf_use}]")
+                    if _meta_rot_vf:
                         c.append("--video-rotate=no")
                 elif _filters_disp:
                     # 使用 lavfi=[...] 语法（mpv 官方推荐），不再需要 graph= 与额外的引号转义；
@@ -51665,7 +52867,7 @@ class FFmpegBatchGUI:
                 if _fit_vf:
                     c.append(f"--vf=lavfi=[{_fit_vf}]")
             if start_time is not None:
-                c.append(f"--start={start_time}")
+                c.append(f"--start={_st_win}")
                 if (lavfi_complex or filters) and not _precise_seek:
                     # 【秒开】关掉 hr-seek（mpv 精确 seek）。原因（research/mpv-seek §8 实测）：
                     # 预览图是「主/子各经 trim=start=S,setpts=PTS-STARTPTS 归零」的 0 基模型，
@@ -51683,7 +52885,7 @@ class FFmpegBatchGUI:
                     c.append("--hr-seek=yes")
                     c.append("--hr-seek-framedrop=no")
             if duration is not None:
-                c.append(f"--length={duration}")
+                c.append(f"--length={_du_win}")
             if image_duration is not None and _is_static_image_file(file_path):
                 # 图片主视频：按用户「显示时长」停留 N 秒。
                 # 关键分支：若 lavfi_complex 已被 wrap_image_static_timed_complex 改写
@@ -51692,7 +52894,10 @@ class FFmpegBatchGUI:
                 # t 仍卡死，倒计时/轨迹/旋转不动（即用户最初报告的现象）。这精确镜像用户
                 # 已验证可用的 fade 命令：color r=d + --length，连续基源作主时间轴。
                 # 未改写的图片+复杂图（如画布图，首节点非 [VIN]{base_vf}[v0]）保持原行为。
-                if lavfi_complex and "[cd_base]" in lavfi_complex:
+                if (lavfi_complex and "[cd_base]" in lavfi_complex) or _img_vf_loop:
+                    # 已改写成连续流（[cd_base] 连续基源 / --vf 里的 loop+fps）⇒ 由 --length
+                    # 驱动播放；此时再用 --image-display-duration 只会让「单帧」停留 N 秒，
+                    # 图内时间轴仍然不动。
                     c.append(f"--length={image_duration:g}")
                 else:
                     c.append(f"--image-display-duration={image_duration:g}")
@@ -51747,10 +52952,13 @@ class FFmpegBatchGUI:
                         _th = _th if _th % 2 == 0 else _th - 1
                         _tw = max(_tw, 2); _th = max(_th, 2)
                         _fit_vf = f"format=yuv420p,scale={_tw}:{_th}"
+                # 🔴 别跟着 mpv 一起除 s（2026-11-02 实测）：ffplay 的 `-ss`/`-t` 判定在**素材域**，
+                # 图内 setpts 压不压 PTS 都不动它们（`-ss 5 -t 5` + setpts 0.5 仍裁在素材 10）。
+                # 故这里原样传，A/V 靠 atempo 同步就够；除 s 反而会把区间切短 s 倍。
                 if start_time is not None and not _img_main and _has_graph:
-                    c.extend(["-ss", str(start_time)])   # 滤镜图：输入级 -ss（图内 trim 兜底）
+                    c.extend(["-ss", str(start_time)])   # 滤镜图：输入级 -ss（素材域，图内 trim 兜底）
                 if duration is not None and not _img_main and _has_graph:
-                    c.extend(["-t", str(duration)])      # 滤镜图：输入级 -t
+                    c.extend(["-t", str(duration)])      # 滤镜图：输入级 -t（素材域）
                 if _img_main:
                     # 循环交给【图内 loop 滤镜】（下方 ffplay_image_main_vf）：
                     # ffplay 的 -loop 1 对 image2 实测无效（1 帧即退，0.64s）。
@@ -51801,7 +53009,8 @@ class FFmpegBatchGUI:
                         _looped = ffplay_image_main_vf(_vf_val, image_duration)
                         if _looped != _vf_val:
                             self._append_info_ui(
-                                _('[预览] 图片主视频：图内 loop 单帧 + 末端 trim=0:{0:g} 收尾（ffplay 的 -loop 1 对图片无效）').format(image_duration))
+                                f"[预览] 图片主视频：图内 loop 单帧 + 末端 trim=0:{image_duration:g}"
+                                f" 收尾（ffplay 的 -loop 1 对图片无效）")
                         else:
                             self._append_info_ui(
                                 _("[预览] 图片主视频：滤镜图无 [in] 占位，无法注入 loop 前缀"
@@ -51830,7 +53039,7 @@ class FFmpegBatchGUI:
                     if lavfi_input:
                         c.extend(["-window_title", _("预览: 颜色虚拟源")])
                     else:
-                        c.extend(["-window_title", _('预览: {0}').format(os.path.basename(file_path))])
+                        c.extend(["-window_title", f"预览: {os.path.basename(file_path)}"])
             return c
 
         # 颜色源虽设了 lavfi_input（给 ffplay 用 -f lavfi -i），但 mpv 侧走 av://lavfi: 位置
@@ -51861,7 +53070,7 @@ class FFmpegBatchGUI:
             self._mpv_verified = True   # 已实测失败，后续预览直接回退不再重试子进程
             raw = self.mpv_path.get().strip()
             _e = getattr(self, "_last_spawn_err", None)
-            self._append_info_ui(_('[预览] mpv 启动失败（{0}）：{1}，已回退 ffplay').format(raw, _e))
+            self._append_info_ui(f"[预览] mpv 启动失败（{raw}）：{_e}，已回退 ffplay")
             fb = _build_ffplay()
             if fb is None:
                 self._append_info_ui(_("未找到 ffplay，无法预览。"))
@@ -52034,7 +53243,8 @@ class FFmpegBatchGUI:
                                 filter_chain, start_sec=None, duration=None,
                                 aspect=None, out_timeline_dur=None, out_start=0.0,
                                 pipe_audio_graph=None, pipe_audio_map=None,
-                                extra_kw=None, pipe_alpha=None):
+                                extra_kw=None, pipe_alpha=None, play_end=None,
+                                pipe_speed=None, pipe_audio_settings=None):
         """「时间预览引擎」入口（2026-09-20 Phase 1）：把预览合成图喂给内置时间预览窗口。
 
         与其它预览入口的区别：不启动 mpv/ffplay，而是用 ffmpeg -filter_complex 渲染合成画面
@@ -52138,11 +53348,22 @@ class FFmpegBatchGUI:
             pipe_audio_map=pipe_audio_map,
             # 透明指示棋盘底（2026-10-12）：由 settings 自动判，见 docstring
             pipe_alpha=pipe_alpha,
+            # 段末钳制（2026-11-02）：素材绝对秒；None = 旧行为（播到素材尾）
+            pipe_play_end=play_end,
+            # 图内视频变速倍数（2026-11-02）：只给音频 ffplay 补同倍率 atempo 用
+            pipe_speed=pipe_speed,
+            # 音色链/淡入淡出（2026-11-02 第五步）：直读分支（无 pipe_audio_graph）据此挂
+            # hp/lp/volume/降噪/声道/EQ + fade。
+            # 2026-11-03 补 `pipe_audio_settings` 入参：画中画的「主声」是**独立音频轨**，
+            # 而本参数默认取 `settings`（主**视频**轨）⇒ 同一份工程「mpv 预览听得到主声 EQ、
+            # 管道预览听不到」（用户实测）。调用方有独立主音频条目时显式下传它，其余调用方
+            # 不传 ⇒ 仍走 `settings`，逐字节不变。
+            pipe_audio_settings=(pipe_audio_settings or settings or None),
             wp_mark=_wp_mark)
         self.show_time_picker(_parent, file_path, **_sp_kw)
 
     def _preview_base_chain(self, settings, pipe_engine=False, trim_enabled=None,
-                            trim_start=""):
+                            trim_start="", fade_window=None, fade_speed=None):
         """预览基础视频滤镜链（2026-10-13 从 `_preview_with_settings` 抽出）。
 
         为什么抽：命令编辑器（S2）要把树里的滤镜段对齐/注入核心预览图，需要**同一份
@@ -52152,6 +53373,12 @@ class FFmpegBatchGUI:
         :param trim_enabled/trim_start: 调用方保存的**覆盖前**截取参数
             （`_preview_with_settings` 已把 settings["trim_enabled"] 置 False，
             直接读副本会永不跳转；命令编辑器传未变动的快照，缺省读 settings 原值）。
+        :param fade_window/fade_speed: 视频**淡出**定位用的时长（源轴绝对秒 = 截取起点 +
+            窗口长）与调用方实际进链的变速倍率（2026-11-03）。缺省 None ⇒ 与旧行为逐字
+            一致（= 时长未知 ⇒ `fade=t=out` 被跳过）。
+            🔴 预览链 `include_trim=False` ⇒ 链看到的是**整条文件**的绝对时间轴，淡出必须
+            按「起点+窗口」定位；不传就只有淡入（用户实测：普通模式预览没淡出，画中画有
+            —— 画中画那条自己传了窗口长）。
         :return: build_video_filter_chain 的串（可能含 `;` 子图）；空串 = 无基础滤镜。
         """
         _ft_speed = bool(self.preview_filter_speed.get())
@@ -52186,6 +53413,10 @@ class FFmpegBatchGUI:
             reverse=False,
             motion_trim_start=_pipe_ts,
             motion_speed_factor=_pipe_sp,
+            # 视频淡出定位（2026-11-03）：None ⇒ 时长未知 ⇒ 判据返回 None ⇒ 跳过淡出，
+            # 与旧行为逐字一致；传了才可能出 `fade=t=out`。
+            fade_output_duration=fade_window,
+            fade_speed_factor=fade_speed,
             # 2026-10-09：主视频绿幕抠像也要进预览（用户报「效果预览/单体预览/实时预览
             # 都没接入主视频的绿幕抠图」）。settings 即本语境主视频设置（转换页
             # get_current_settings / 封装页主轨 enc_settings）→ 直接喂 chroma。
@@ -52198,7 +53429,7 @@ class FFmpegBatchGUI:
 
     def _preview_with_settings(self, file_path: str, settings: dict, with_snapshot: bool = False,
                                pipe_engine: bool = False, extra_kw=None,
-                               base_chain_hook=None):
+                               base_chain_hook=None, audio_settings=None):
         """
         预览（2026-08-30）：滤镜变速 setpts（preview_filter_speed，与转换一致）与
         mpv 整体变速 --speed / 整体倒放 --play-direction=backward（preview_realtime_*，
@@ -52212,7 +53443,7 @@ class FFmpegBatchGUI:
         """
         # 虚拟/生成源（color:/gen: 哨兵串）非磁盘文件，os.path.exists 恒 False —— 放行
         if not file_path or (not _is_virtual_source(file_path) and not os.path.exists(file_path)):
-            self._append_info_ui(_('文件不存在: {0}').format(file_path))
+            self._append_info_ui(f"文件不存在: {file_path}")
             return
 
         # ---- 快照模式：只弹合成快照窗口，不启动播放器预览 ----
@@ -52271,6 +53502,9 @@ class FFmpegBatchGUI:
             settings["speed_enabled"] = False
         # 滤镜倒放预览已取消（2026-08-30）：预览滤镜链强制不含 reverse
         settings['reverse_enabled'] = False
+        # 段变速因子（图内**实际**生效的那个）：视频 setpts 与音频 atempo 必须同源。
+        # 必须在上面 speed_enabled 归一化**之后**取，否则开关关掉时仍会算出非 1.0。
+        _pv_sp = _pv_audio_speed_factor(settings, _ft_speed)
         mpv_only_args = []
         if _rt_speed and _orig_speed_enabled:
             try:
@@ -52333,9 +53567,28 @@ class FFmpegBatchGUI:
         # 2026-10-13：抽成 `_preview_base_chain` —— 命令编辑器要用**同一份口径**把树里
         # 的滤镜段对齐到核心图（编辑器自己复刻一遍构建参数必漂移，见其 docstring）。
         # trim_enabled 已在上面被置 False，故截取起点/时长必须显式传保存下来的原值。
+        # 视频淡出定位（2026-11-03）：预览链 include_trim=False ⇒ 链看到的是整条文件的
+        # 绝对时间轴，淡出必须按「截取起点 + 窗口长」定位。算不出来就传 None（→ 跳过淡出，
+        # 与旧行为一致）。窗口尾部口径与下方音频 `preview_afade_filters` 完全同款。
+        _pv_fade_end = None
+        _pv_seek_v = time_to_seconds(_preview_trim_start) if _preview_trim_start else 0.0
+        if _preview_trim_enabled:
+            _pv_pe_v = time_to_seconds(_preview_trim_end) if _preview_trim_end else None
+            if _pv_pe_v is not None and _pv_pe_v > (_pv_seek_v or 0.0):
+                _pv_fade_end = float(_pv_pe_v)
+        if _pv_fade_end is None:
+            # 只给开始 / 无截取：窗口尾 = 素材末尾；图片的「末尾」是显示时长（ffprobe 只给
+            # ~0.04s，与导出侧同口径）。
+            _pv_tot_v = (_eff_image_display_duration(settings)
+                         if _is_static_image_file(file_path)
+                         else self._get_media_duration(file_path))
+            if _pv_tot_v:
+                _pv_fade_end = max(0.0, float(_pv_tot_v))
         base_vf = self._preview_base_chain(settings, pipe_engine=pipe_engine,
                                            trim_enabled=_preview_trim_enabled,
-                                           trim_start=_preview_trim_start)
+                                           trim_start=_preview_trim_start,
+                                           fade_window=_pv_fade_end,
+                                           fade_speed=_pv_sp)
         if base_chain_hook is not None:
             try:
                 _hooked = base_chain_hook(base_vf)
@@ -52400,7 +53653,7 @@ class FFmpegBatchGUI:
                     eff_w = eff_h = d
                     x_val = x_val - (d - wm_w) / 2.0
                     y_val = y_val - (d - wm_h) / 2.0
-                    self._append_info_ui(_('[预览] 水印启用了旋转，蓝色正方形占位 {0}x{1} 与红色原始矩形同时显示').format(d, d))
+                    self._append_info_ui(f"[预览] 水印启用了旋转，蓝色正方形占位 {d}x{d} 与红色原始矩形同时显示")
                     cx = x_val + d / 2.0
                     cy = y_val + d / 2.0
                     # 蓝色正方形占位 + 红色斜矩形；仅 spin 时红框轴对齐
@@ -52414,7 +53667,7 @@ class FFmpegBatchGUI:
                     drawbox_expr = ",".join(parts)
                 else:
                     drawbox_expr = f"x={x_val:.1f}:y={y_val:.1f}:w={wm_w}:h={wm_h}:color=red@0.3:t=3"
-                self._append_info_ui(_('[预览] 水印虚拟框: 位置({0:.1f}, {1:.1f}) 尺寸{2}x{3}').format(x_val, y_val, eff_w, eff_h))
+                self._append_info_ui(f"[预览] 水印虚拟框: 位置({x_val:.1f}, {y_val:.1f}) 尺寸{eff_w}x{eff_h}")
     
         # ----- 3. 文字水印判定：旋转/spin/轨迹需复杂图，普通 drawtext 走 -vf 链 -----
         # 2026-08-26 多实例：_tw_rotate = 任一启用项需要旋转子图（不只看首条）；
@@ -52521,12 +53774,12 @@ class FFmpegBatchGUI:
             if target_w < 2: target_w = 2
             if target_h < 2: target_h = 2
             scale_expr = f"scale={target_w}:{target_h}"
-            self._append_info_ui(_('[预览] 视频总尺寸 {0}x{1} 超出屏幕，单份缩放到 {2}x{3}').format(_total_w, _total_h, target_w, target_h))
+            self._append_info_ui(f"[预览] 视频总尺寸 {_total_w}x{_total_h} 超出屏幕，单份缩放到 {target_w}x{target_h}")
         elif _fit_on:
-            self._append_info_ui(_('[预览] 视频尺寸 {0}x{1} 适合屏幕，保持原始').format(_total_w, _total_h))
+            self._append_info_ui(f"[预览] 视频尺寸 {_total_w}x{_total_h} 适合屏幕，保持原始")
         else:
             self._append_info_ui(
-                _('[预览] 已勾选「原始大小」：视频尺寸 {0}x{1} 保持原始，不做屏幕适配').format(_total_w, _total_h))
+                f"[预览] 已勾选「原始大小」：视频尺寸 {_total_w}x{_total_h} 保持原始，不做屏幕适配")
         # ---- 边框随预览缩放等比缩小（2026-10-06，紧接缩放决策之后）----
         # 缩放倍数 = 屏幕适配 × 管道工作分辨率上限（_pwf 在本函数更早已定）。两者都 ≤1，
         # 乘起来仍是「预览尺寸 / 成片尺寸」的总倍数，正是 scale_preview_border_px 要的口径。
@@ -52553,7 +53806,7 @@ class FFmpegBatchGUI:
         # 边框边距非空性不受缩放影响（helper 钳到 ≥2px），故 _bp_before 无需重算。
         if _eh_bfactor < 1.0 and _eh_scale.get("border_enabled", False):
             self._append_info_ui(
-                _('[预览] 末端边框按预览缩放等比缩小（×{0:.3f}），取整后与成片有细微出入，以成片为准').format(_eh_bfactor))
+                f"[预览] 末端边框按预览缩放等比缩小（×{_eh_bfactor:.3f}），取整后与成片有细微出入，以成片为准")
         # 管道预览画面框基准（2026-09-20）：末端处理前的【单格】输出尺寸——超屏时 scale 已把
         # tile 缩到 target_w×target_h，未超屏就是 final 尺寸。画布模式会在下方画布分支覆盖成
         # 画布尺寸（比例与源不同）。管道分支用它 × 网格行列 + 边框边距算真实输出比例。
@@ -52765,12 +54018,12 @@ class FFmpegBatchGUI:
                         fg.combine("[canvas]", f"overlay={_pox}:{_poy}:shortest=1", "v_main_pad")
                     # 画布基准更新：blend clamp/基准求值按 pad 画布（overlay 目标流=v_main_pad）
                     _main_w, _main_h = _pwc, _phc
-                    self._append_info_ui(_('[预览] 主视频画布偏移：{0}x{1} @ ({2},{3})').format(_pwc, _phc, _pox, _poy))
+                    self._append_info_ui(f"[预览] 主视频画布偏移：{_pwc}x{_phc} @ ({_pox},{_poy})")
                 # movie 源：路径统一正斜杠 + 冒号转义 \\:（movie 滤镜参数解析中 \ 是转义符，
                 # Windows 反斜杠路径必须转成正斜杠，否则 \U \A 等会被当作无效转义）；
                 # 含 [ ] ' , ; 等 filtergraph 特殊字符的路径先用临时硬链接/副本规避
                 # （实测这些字符无法转义，全报错）。
-                path_esc = self._movie_path_safe(wm_file).replace("\\", "/").replace(":", "\\\\:")
+                path_esc = self._movie_path_safe(wm_file)
                 # 子视频滤镜链：直接复用主滤镜构建函数（排除倒放/加速/字幕/像素格式等 mpv 预览不支持的），
                 # trim/loop/裁剪/缩放/绿幕/颜色校正/反色 全在 chain 内（movie 层只载入，chain 统一循环）；
                 # 链外仅保留透明度/自旋转。
@@ -53044,7 +54297,8 @@ class FFmpegBatchGUI:
                     _dgp = self._blend_downgrade_pad(settings, file_path)
                     if _dgp:
                         self._append_info_ui(
-                            _('[混合模式] pad 画布 {0}x{1} 大于主视频渲染尺寸，blend({2}) 已降级为普通叠加（脱离主视频像素的混合无意义）').format(_dgp[0], _dgp[1], _blend2))
+                            f"[混合模式] pad 画布 {_dgp[0]}x{_dgp[1]} 大于主视频渲染尺寸，"
+                            f"blend({_blend2}) 已降级为普通叠加（脱离主视频像素的混合无意义）")
                         _blend2 = 'normal'
                 if _blend2 != 'normal':
                     # 区域化 blend（与正式命令/合并页预览共用 _make_blend_region）：
@@ -53187,7 +54441,7 @@ class FFmpegBatchGUI:
                         else:
                             # 水印完全在画布外，跳过混合（保持主画面）
                             fg.chain("null", "v_wm")
-                    self._append_info_ui(_('[预览] 图片水印：mpv 区域化 blend 真实合成（{0}）').format(_blend2))
+                    self._append_info_ui(f"[预览] 图片水印：mpv 区域化 blend 真实合成（{_blend2}）")
                 else:
                     # 🔴 2026-10-23：长列表水印轨迹的 x/y 也搬 sendcmd —— 与文本水印旋转
                     #    子图同一个病：x/y 是扁平累加表达式，96 段即整图 Invalid argument /
@@ -53227,7 +54481,7 @@ class FFmpegBatchGUI:
                     else:
                         # 兜底：拿不到任何时长信息退回 shortest=1
                         fg.combine_top("[sub_rot]", f"overlay=x='{x_expr}':y='{y_expr}':enable='1':shortest=1", "v_wm")
-                self._append_info_ui(_("[预览] 图片水印：mpv movie 真实合成（{0}x{1}）").format(wm_w2, wm_h2))
+                self._append_info_ui(f"[预览] 图片水印：mpv movie 真实合成（{wm_w2}x{wm_h2}）")
             # ---- 文字水印：普通 drawtext（含显示时段/循环 enable）或旋转子图都接入 ----
             # 旋转时走透明层子图（eof_action=pass）；非旋转直接 drawtext 片段（enable 由
             # _build_drawtext_enable 生成：显示时段 between / 循环 lt(mod(t,L),D)）。
@@ -53288,43 +54542,41 @@ class FFmpegBatchGUI:
                 filter_parts.append(scale_expr)
             filter_chain = ",".join(filter_parts) if filter_parts else ""
     
-        # ----- 4. 音频滤镜（变速 / 音量 / EQ / 降噪） -----
+        # ----- 4. 音频滤镜（与导出共用 build_audio_tone_chain） -----
         extra_args = []
-        af_filters = []
-        if settings.get("audio_speed_enabled", False):
-            try:
-                factor = float(settings.get("audio_speed_factor", "1.0"))
-                if factor != 1.0 and factor > 0:
-                    atempo = build_atempo_chain(factor)
-                    if atempo:
-                        af_filters.append(atempo)
-            except ValueError:
-                pass
-        if settings.get("volume_enabled", False):
-            try:
-                vol = float(settings.get("volume", 1.0))
-                if vol != 1.0:
-                    af_filters.append(f"volume={vol:.2f}")
-            except (ValueError, TypeError):
-                pass
-        if settings.get("eq_enabled", False):
-            try:
-                eq_low = float(settings.get("eq_low", 0) or 0)
-                eq_mid = float(settings.get("eq_mid", 0) or 0)
-                eq_high = float(settings.get("eq_high", 0) or 0)
-                if eq_low != 0:
-                    af_filters.append(f"bass=g={eq_low:.1f}")
-                if eq_mid != 0:
-                    af_filters.append(f"equalizer=f=1000:width_type=h:width=200:g={eq_mid:.1f}")
-                if eq_high != 0:
-                    af_filters.append(f"treble=g={eq_high:.1f}")
-            except (ValueError, TypeError):
-                pass
-        if settings.get("denoise_enabled", False):
-            if settings.get("denoise_method") == "arnndn":
-                af_filters.append("arnndn")
-            else:
-                af_filters.append("afftdn=nr=12:nf=-30")
+        # 独立音频轨设置（2026-11-03）：合并页普通模式单轨预览下传 —— 音频链的 EQ / 淡入淡出
+        # 读**独立音频轨**，画面链仍读 `settings`（视频轨）。转换页预览不传 ⇒ 回 settings，
+        # 逐字节不变（转换页 settings 同时含视频 + 音频键）。
+        _a_set = audio_settings if audio_settings is not None else settings
+        # 音频变速**只挂一条**（2026-11-02 二版）：倍率唯一判据是 _pv_atempo_factor
+        # （音频设置优先，未设才跟随视频）；两条 atempo 拼进同一条 -af 会相乘 ⇒ 播成 4×。
+        _pv_at_seg = _pv_atempo_factor(_a_set, _ft_speed)
+        af_filters = build_audio_tone_chain(_a_set, speed_factor=_pv_at_seg,
+                                            include_loudnorm=False)
+        # 淡入淡出（2026-11-02 第三步）：此前预览整条链都不接 fade —— 开了「淡入淡出」只有
+        # 成片在淡，预览听不出。预览链无图内 trim，afade 落在**文件绝对时间**上（实测见
+        # preview_afade_filters 文档），故起点 = 截取起点 + 导出侧同款值。
+        # 两处**故意**不接：① 管道图已被 _launch_video_pipe 桥接成「0 基 from pipe_start」，
+        # 是另一套坐标轴；② 实时倒放（backward）的播放方向与输出时间线相反。
+        if not pipe_engine and "--play-direction=backward" not in mpv_only_args:
+            _pv_seek0 = 0.0
+            _pv_win = None
+            if _preview_trim_enabled:
+                _pv_seek0 = time_to_seconds(_preview_trim_start) if _preview_trim_start else 0.0
+                _pv_pe = time_to_seconds(_preview_trim_end) if _preview_trim_end else None
+                if _pv_pe is not None and _pv_pe > _pv_seek0:
+                    _pv_win = _pv_pe - _pv_seek0
+            if _pv_win is None:
+                # 只给开始（播到末尾）或无截取：窗口尾 = 素材末尾。图片主视频的「末尾」是
+                # 显示时长（ffprobe 只给 ~0.04s），与导出侧同口径。
+                _pv_tot = (_eff_image_display_duration(settings)
+                           if _is_static_image_file(file_path)
+                           else self._get_media_duration(file_path))
+                if _pv_tot:
+                    _pv_win = max(0.0, float(_pv_tot) - _pv_seek0)
+            af_filters.extend(preview_afade_filters(
+                _a_set, seek_offset=_pv_seek0, window_duration=_pv_win,
+                speed_factor=_pv_at_seg))
         if af_filters:
             af_chain = ",".join(af_filters)
             extra_args.extend(["-af", af_chain])
@@ -53332,6 +54584,9 @@ class FFmpegBatchGUI:
         # ----- 5. 截取参数 -----
         start_sec = None
         duration = None
+        # 段末（素材绝对秒）：只给管道路径钳制播放终点用（管道只认 _pipe_dur/_dur，
+        # 见 _launch_video_pipe 里的 _seg_cap）。
+        _play_end = None
         # 实时倒放时跳过 --start/--length：backward 模式的跳转语义是"从某位置倒着播"，
         # 与正向截取起点不符 → 直接整段从末尾倒放（小文件实时预览即可）。
         _rev_active = "--play-direction=backward" in mpv_only_args
@@ -53341,6 +54596,7 @@ class FFmpegBatchGUI:
             end_sec = time_to_seconds(_preview_trim_end) if _preview_trim_end else None
             if start_sec is not None and end_sec is not None and end_sec > start_sec:
                 duration = end_sec - start_sec
+                _play_end = end_sec
             # 只有开始时间，播放到末尾
         if _rev_active:
             self._append_info_ui(_("[预览] 实时倒放预览：整段从末尾向前播放（忽略截取起点跳转）。"))
@@ -53460,7 +54716,8 @@ class FFmpegBatchGUI:
             lavfi_complex_str = wrap_image_static_timed_complex(
                 lavfi_complex_str, base_vf, _iw, _ih, _img_dur)
             self._append_info_ui(
-                _('[预览] 图片主视频含时间滤镜：前置连续基源驱动动画（color r=30 d={0:g}，图片作被保持次输入）').format(_img_dur))
+                f"[预览] 图片主视频含时间滤镜：前置连续基源驱动动画"
+                f"（color r=30 d={_img_dur:g}，图片作被保持次输入）")
 
         # ----- 6. 调用播放器（或：管道合成模式走内置时间预览引擎） -----
         if pipe_engine:
@@ -53511,6 +54768,9 @@ class FFmpegBatchGUI:
             _par = (float(_pow) / _poh) if _poh > 0 else None
             self._open_pipe_time_preview(file_path, settings, lavfi_complex_str,
                                          filter_chain, start_sec, duration, aspect=_par,
+                                         play_end=_play_end,
+                                         pipe_speed=_pv_sp,
+                                         pipe_audio_settings=audio_settings,
                                          extra_kw=extra_kw)
             return
         self.preview_with_player(
@@ -53523,6 +54783,7 @@ class FFmpegBatchGUI:
             mpv_only_args=mpv_only_args,
             image_duration=_eff_image_display_duration(settings),
             precise_seek=True,   # 转换页普通预览：图内无 trim 兜底 ⇒ 精确优先（2026-10-13）
+            graph_speed=_pv_sp,  # 图内 setpts 倍数 ⇒ mpv vf 窗口要同除（见 _build_mpv）
         )
 
     # ---------- 输出路径生成与命令构建 ----------
@@ -54665,6 +55926,22 @@ class FFmpegBatchGUI:
             else:
                 # 构建视频滤镜（包含字幕、变速等），组合跳转时跳过 trim
                 enhance_settings = settings.get("enhance", {})
+                # 🔴 2026-11-02：视频淡出起点需要「输出时长」，此前这里**一个都没传**
+                #   ⇒ fade=t=out 恒被「未知时长」分支跳过（实测只有 fade=t=in，音频却有
+                #   afade=t=out）。四条路各自算一份：
+                #   · 图片主视频：ffprobe 的 0.04 不是时长，用「显示时长」
+                #   · 精准 / 组合跳转：duration_for_audio 已是 end−start（源轴）
+                #   · 快速截取（输入级 -ss/-to）：combo/precise 之外 duration_for_audio 为 None，补算
+                #   · 无截取：源全时长（链内再按变速折算）
+                _fade_src = _fade_outdur = None
+                if settings.get("fade_enabled", False) and settings.get("fade_out", "").strip():
+                    if self._is_static_image(input_path):
+                        _fade_src = _eff_image_display_duration(settings)
+                    else:
+                        _fade_src = self._get_media_duration(input_path)
+                        _fade_outdur = duration_for_audio
+                        if _fade_outdur is None and settings.get("trim_enabled", False):
+                            _fade_outdur = self._calculate_trim_duration(settings, input_path)[1]
                 vf = build_video_filter_chain(
                     settings,
                     include_subtitle=True,
@@ -54673,6 +55950,8 @@ class FFmpegBatchGUI:
                     enhance_settings=enhance_settings,
                     reverse=settings.get('reverse_enabled', False),
                     motion_trim_start=_motion_ts, motion_speed_factor=_motion_sp,
+                    clip_duration=_fade_src,
+                    fade_output_duration=_fade_outdur,
                     # 2026-10-09：转换页主视频也支持绿幕抠像（抠图 → 导出透明素材）。
                     # 未启用时 None，行为与旧调用方逐字一致。
                     chroma_settings=settings if settings.get("chroma_enabled", False) else None,
@@ -54784,12 +56063,22 @@ class FFmpegBatchGUI:
                 # 全部·原样保留：所有源音轨直接 copy（忽略滤镜）
                 cmd_list.extend(["-c:a", "copy"])
             elif used_combo:
-                # 组合跳转已用 -ss 截取整个流，音频直接编码（不使用 atrim）
-                cmd_list = self._build_audio_encoding_params(cmd_list, settings, input_path)
+                # 组合跳转已用 -ss 截取整个流，音频直接编码（不使用 atrim）。
+                # ⚠️ 淡出定位仍要传输出时长：输入级 -ss/-t 已把输出 t 归零且砍成
+                #    duration_for_audio 秒，不传则起点按源全时长算 ⇒ 淡出落在输出之外。
+                cmd_list = self._build_audio_encoding_params(
+                    cmd_list, settings, input_path, duration_for_audio)
             elif precise_trim and settings.get("trim_enabled", False) and duration_for_audio is not None and duration_for_audio > 0:
                 self._apply_audio_trim_and_encode(cmd_list, settings, input_path, start_sec, duration_for_audio, map_audio=False)
             else:
-                cmd_list = self._build_audio_encoding_params(cmd_list, settings, input_path)
+                # 快速截取（输入级 -ss/-to）：af 链里没有 atrim，输出同样被砍成
+                # 「end−start」秒 ⇒ 淡出定位需要这个时长。combo/precise 之外
+                # duration_for_audio 恒为 None，这里单独补算（只取时长，不动 start_sec）。
+                _fade_dur = duration_for_audio
+                if _fade_dur is None and settings.get("trim_enabled", False):
+                    _fade_dur = self._calculate_trim_duration(settings, input_path)[1]
+                cmd_list = self._build_audio_encoding_params(
+                    cmd_list, settings, input_path, _fade_dur)
     
         # 帧同步（2026-09-16「帧设置」）：默认「自动」= 交给 ffmpeg 决定。
         # ⚠️ 必须放在自定义参数【之前】：ffmpeg 同一输出选项「后写覆盖前写」，
@@ -55001,7 +56290,7 @@ class FFmpegBatchGUI:
         complex_filter, final_v_label = self._build_overlay_filter_complex(
             0, settings, sub_infos, include_subtitle_main=True,
             enhance_settings=enhance_settings,
-            # ⚠️ 必须传（2026-10-07 修，与 base 同款）：不传则默认空串 → blend 分支的
+            # ⚠️ 必须传（2026-10-07 修）：不传则默认空串 → blend 分支的
             # _compute_output_canvas 拿不到真实画布 → 兜底 1280x720 →
             # 「表达式轨迹(h/v/diamond/corners)」的包围盒按 1280 宽算，
             # crop=<比主视频宽的尺寸> → "Invalid too big or non positive size"
@@ -55040,7 +56329,10 @@ class FFmpegBatchGUI:
                 self._apply_audio_trim_and_encode(cmd_list, settings, input_path, start_sec, duration_for_sub, map_audio=True)
             else:
                 cmd_list.extend(["-map", "0:a:0"])
-                cmd_list = self._build_audio_encoding_params(cmd_list, settings, input_path)
+                # 淡出定位：水印路径的截取在图内完成（t 归零），输出被收成
+                # duration_for_sub 秒 ⇒ 传它，否则起点按源全时长算、淡出丢失。
+                cmd_list = self._build_audio_encoding_params(
+                    cmd_list, settings, input_path, duration_for_sub)
         else:
             cmd_list.append("-an")
     
@@ -55080,23 +56372,22 @@ class FFmpegBatchGUI:
                 image_display_duration=_eff_image_display_duration(settings),
                 tag=_("[水印]"))
         if len(cmd_list) == _n_before:
-            # 兜底没动手（命令里没有无限画布、或已存在时长限制）→ 走原有逻辑
+            # 兜底没动手（命令里没有无限画布、或已存在时长限制）→ 走同一条时长决策
+            # （2026-11-02 收口：-shortest / -t 的字面量不再在这里手写一遍）
             if settings.get("audio_enabled", True) and has_audio_stream:
-                cmd_list.append("-shortest")
+                _append_duration_limit(cmd_list, audio_enabled=True, has_audio_stream=True)
             elif _user_t:
                 self._append_info_ui(_("[水印] 检测到自定义参数已指定时长限制，跳过自动时长控制。"))
             else:
+                _lim_dur = main_duration
                 if self._is_static_image(input_path):
                     # 图片主视频：-loop 1 无限源，无音频时 -shortest 不终止 → 必须用 -t 收尾。
                     # 长度取「截取」面板的「显示时长」(img_duration)，不再硬编码 10 秒；
                     # ffprobe 对图片返回的 0.04 之类小值绝不能当真实时长用。
-                    _img_dur = _eff_image_display_duration(settings)
-                    cmd_list.extend(["-t", f"{_img_dur:.3f}"])
-                elif main_duration and main_duration > 0:
-                    cmd_list.extend(["-t", f"{main_duration:.3f}"])
-                else:
-                    cmd_list.append("-shortest")
-                    self._append_info_ui(_("[水印] 警告：无法计算主视频时长，使用 -shortest 控制输出。"))
+                    _lim_dur = _eff_image_display_duration(settings)
+                _append_duration_limit(
+                    cmd_list, audio_enabled=False, has_audio_stream=False,
+                    duration=_lim_dur, app=self, tag=_("[水印]"))
     
         cmd_list.append(output_path)
 
@@ -58612,10 +59903,19 @@ class FFmpegBatchGUI:
                                                             # signature(canvas, scale_x, scale_y=None)。
                                                             # 与 bg_shape_outlines（遮罩形状轮廓）**并存**：
                                                             # 两条都调，互不覆盖。None=旧行为。
-                                  content_mask_settings=None):  # 2026-11-01：本层自身遮罩（透传
+                                  content_mask_settings=None,  # 2026-11-01：本层自身遮罩（透传
                                                             # _generic_overlay_editor）——框内只显示
                                                             # 遮罩保留的区域。None=旧调用零变化。
                                                             # ⚠️ 必须放签名最末（旧的按位置传参不受影响）。
+                                  content_pre_filter=None):  # 2026-11-02：内容帧取帧前的预处理串
+                                                            # （子视频开了「拼接」⇒ `_tile_pre_filter`
+                                                            # 的网格/split 片段）。透传 _generic_overlay_editor
+                                                            # 同名参数（它把 crop→遮罩→本片段串成一条）。
+                                                            # 🔴 `_edit_wp_point`（轨迹控制→时间预览(管道)→坐标）
+                                                            # 自 2026-10-28（7989ce0）起就在传它，但本包装器
+                                                            # 漏了这个形参 ⇒ 一点「坐标」必抛 TypeError：
+                                                            # unexpected keyword argument 'content_pre_filter'。
+                                                            # ⚠️ 仍放签名最末（旧的按位置传参不受影响）。
         """
         水印可视化编辑器，支持回写位置和缩放尺寸，以及更新水印字典和滤镜框架。
         free_layout=True 时放开边界（子视频可拖出画布、可比主视频大）。
@@ -58785,7 +60085,11 @@ class FFmpegBatchGUI:
                                      rot_slider=rot_slider,
                                      content_chroma_settings=content_chroma_settings,  # 2026-10-11：透传子视频绿幕设置
                                      # 2026-11-01：本层自身遮罩（框内只显示遮罩保留的区域；None=旧调用不变）
-                                     content_mask_settings=content_mask_settings)
+                                     content_mask_settings=content_mask_settings,
+                                     # 2026-11-02：内容帧预处理（子视频「拼接」网格）——与普通位置编辑器
+                                     #   `open_visual_overlay_editor` 同口径，同样交给 _generic_overlay_editor
+                                     #   与 crop / 遮罩合成一条链；None=旧调用逐字节不变。
+                                     content_pre_filter=content_pre_filter)
 
     # ---------- 从视频位置可视化编辑器 ----------
     def _merge_group_base_track(self, track, enabled_videos=None):
@@ -60668,7 +61972,8 @@ class FFmpegBatchGUI:
                          pipe_duration=None, pipe_start=None, pipe_out_mode=False,
                          pipe_audio_graph=None, pipe_audio_map=None,
                          mark_rows=None, on_mark_edit=None, on_coord_request=None,
-                         initial_time=None, wp_mark=None, pipe_alpha=False):
+                         initial_time=None, wp_mark=None, pipe_alpha=False,
+                         pipe_play_end=None, pipe_speed=None, pipe_audio_settings=None):
         """统一时间预览入口（2026-08-29 阶段2）：构造 SimplePreviewer 的薄封装。
 
         内部自动读取 get_time_context() 提供成片时间换算，调用方无需再传
@@ -60706,7 +62011,13 @@ class FFmpegBatchGUI:
                             # #3：未保存坐标标记（仅列表轨迹来源的管道预览下传）
                             wp_mark=wp_mark,
                             # 透明指示棋盘底（2026-10-12）：True 才垫格子，见 __init__ docstring
-                            pipe_alpha=pipe_alpha)
+                            pipe_alpha=pipe_alpha,
+                            # 段末钳制（2026-11-02）：素材绝对秒；None = 旧行为（播到素材尾）
+                            pipe_play_end=pipe_play_end,
+                            # 图内视频变速倍数（2026-11-02）：音频 ffplay 补同倍率 atempo
+                            pipe_speed=pipe_speed,
+                            # 直读分支音色链/淡入淡出（2026-11-02）：None = 旧行为（裸 atempo）
+                            pipe_audio_settings=pipe_audio_settings)
         except Exception as e:
             with suppress(Exception):
                 self._append_info_ui(_('[时间预览] 打开失败: {0}').format(e))
@@ -66709,13 +68020,15 @@ class FFmpegBatchGUI:
             self.node_fx = _node_fx_map_from_state(state.get("node_fx"))
             if self.node_fx:
                 self._append_info_ui(
-                    _('[节点效果] 已载入 {0} 个；链的结构没变就会自动插回，变了会跳过并提示重选（视频节点里可查看/清除）').format(len(self.node_fx)))
+                    f"[节点效果] 已载入 {len(self.node_fx)} 个；链的结构没变就会自动插回，"
+                    f"变了会跳过并提示重选（视频节点里可查看/清除）")
 
             # 音频节点效果（2026-09-26）：与 node_fx 同口径，缺失时清空。
             self.node_audio_fx = _node_fx_map_from_state(state.get("node_audio_fx"))
             if self.node_audio_fx:
                 self._append_info_ui(
-                    _('[音频节点] 已载入 {0} 个；链的结构没变就会自动插回，变了会跳过并提示重选（音频节点里可查看/清除）').format(len(self.node_audio_fx)))
+                    f"[音频节点] 已载入 {len(self.node_audio_fx)} 个；链的结构没变就会自动插回，"
+                    f"变了会跳过并提示重选（音频节点里可查看/清除）")
     
             # 恢复轨道（⚠️ 项目文件可能被手改/截断 ⇒ 一律 .get，缺 enc_settings 只跳过该条，
             # 不让一条坏记录把整个加载打成 KeyError 半加载；转换页那侧同理全程 .get）
@@ -66745,6 +68058,11 @@ class FFmpegBatchGUI:
                 track.source = track_dict.get("source",
                                               _virtual_source_kind(track.file_path) or "file")
                 if track.type == "video":
+                    # 「音频跟随」（2026-11-03）：老工程没有这个键 ⇒ 补默认 False（不跟随）。
+                    # 判据 audio_fade_view 靠「键是否存在」区分「视频轨设置」与「转换页/音频轨
+                    # 设置」，缺键会退回旧行为（声音跟着视频淡），与用户定案正相反。
+                    if "audio_follow_video_fade" not in track.enc_settings:
+                        track.enc_settings["audio_follow_video_fade"] = False
                     track.overlay_enabled = track.enc_settings.get("overlay_enabled", True)
                     track.overlay_x = track.enc_settings.get("overlay_x", DEFAULT_OVERLAY_X)
                     track.overlay_y = track.enc_settings.get("overlay_y", DEFAULT_OVERLAY_Y)
@@ -66755,7 +68073,7 @@ class FFmpegBatchGUI:
                     track.offset_y = track.enc_settings.get("offset_y", "0")
                 self.merge_tracks.append(track)
             if _skipped_tracks:
-                self._append_info_ui(_('[项目] 已跳过 {0} 条无效或缺少 enc_settings 的轨道记录').format(_skipped_tracks))
+                self._append_info_ui(f"[项目] 已跳过 {_skipped_tracks} 条无效或缺少 enc_settings 的轨道记录")
     
         finally:
             self._suppress_main_video_trace = False
@@ -68933,6 +70251,11 @@ class FFmpegBatchGUI:
         include_reverse 作为默认倒放标志，若轨道有 audio_reverse 则优先使用。
         三种合并模式（普通封装/画中画/串行重编码）共用此函数以保证音频能力一致。
 
+        2026-11-02：**音色段**（hp/lp/volume/atempo/降噪/响度/声道/EQ）已改调
+        `build_audio_tone_chain`（全库唯一实现），本函数只剩「链首 atrim+adelay」
+        与「链尾 fade/倒放/分段/soxr/自由结束」这些与时间轴相关的部分。
+        include_* 系列开关原样透传给统一实现，语义不变。
+
         include_segments=False 的唯一用途：串行 concat 模式会在本函数返回的链之后
         再追加「段级时长钳制 atrim+apad」与「段级淡入淡出」，链尾会被改变，
         此时分段滤镜由调用方自行追加到最末尾，保证 t 的时间基准正确。
@@ -68967,81 +70290,38 @@ class FFmpegBatchGUI:
         if off_s > 0:
             filters.append(f"adelay=delays={off_s*1000:.0f}:all=1")
 
-        # 音量
-        if include_volume and track_settings.get("volume_enabled", False):
-            vol = track_settings.get("volume", 1.0)
-            if vol != 1.0:
-                filters.append(f"volume={vol:.2f}")
+        # 音色链（hp→lp→volume→atempo→降噪→响度→声道→EQ）：唯一实现，见 build_audio_tone_chain。
+        # 顺序与转换页/封装页完全一致；本函数只负责链首 atrim+adelay 与链尾 fade/倒放/分段/soxr。
+        # 注意顺序变化（2026-11-02）：hp/lp 原来排在 denoise **之后**，现在按规范顺序挪到前面
+        # —— afftdn 的噪底估计基于输入频谱，先切掉隆隆声/喷麦估得更准。
+        filters.extend(build_audio_tone_chain(
+            track_settings,
+            include_volume=include_volume, include_speed=include_speed,
+            include_hp=include_hp, include_lp=include_lp,
+            include_denoise=include_denoise, include_loudnorm=include_loudnorm,
+            include_channel=include_channel))
 
-        # 变速（音频）
-        if include_speed and track_settings.get("audio_speed_enabled", False):
-            factor = float(track_settings.get("audio_speed_factor", "1.0"))
-            if factor != 1.0 and factor > 0:
-                atempo = build_atempo_chain(factor)
-                if atempo:
-                    filters.append(atempo)
-
-        # 降噪
-        if include_denoise and track_settings.get("denoise_enabled", False):
-            if track_settings.get("denoise_method") == "arnndn":
-                filters.append("arnndn")
-            else:
-                nr = track_settings.get("denoise_nr", 12)
-                nf = track_settings.get("denoise_nf", -30)
-                filters.append(f"afftdn=nr={nr}:nf={nf}")
-
-        # 高频/低频截止（去喷麦/去隆隆声）
-        if include_hp and track_settings.get("hp_enabled"):
-            filters.append(f"highpass=f={track_settings.get('hp_freq', 200)}")
-        if include_lp and track_settings.get("lp_enabled"):
-            filters.append(f"lowpass=f={track_settings.get('lp_freq', 3000)}")
-
-        # 响度标准化
-        if include_loudnorm and track_settings.get("loudnorm_enabled", False):
-            i = track_settings.get("loudnorm_i", -23)
-            lra = track_settings.get("loudnorm_lra", 7)
-            tp = track_settings.get("loudnorm_tp", -2)
-            filters.append(f"loudnorm=I={i}:LRA={lra}:TP={tp}")
-
-        # 声道 / 单声道
-        if include_channel:
-            mode = track_settings.get("channel_mode", "stereo")
-            if mode == "mono":
-                filters.append("pan=mono|c0=0.5*c0+0.5*c1")
-            elif mode == "left":
-                filters.append("pan=mono|c0=c0")
-            elif mode == "right":
-                filters.append("pan=mono|c0=c1")
-            elif mode == "swap":
-                filters.append("pan=stereo|c0=c1|c1=c0")
-
-        # 均衡器（EQ）：低/中/高 三段增益（dB）
-        if track_settings.get("eq_enabled", False):
-            eq_low = _opt_float(track_settings.get("eq_low", 0) or 0, 0.0)
-            eq_mid = _opt_float(track_settings.get("eq_mid", 0) or 0, 0.0)
-            eq_high = _opt_float(track_settings.get("eq_high", 0) or 0, 0.0)
-            if eq_low != 0:
-                filters.append(f"bass=g={eq_low:.1f}")
-            if eq_mid != 0:
-                filters.append(f"equalizer=f=1000:width_type=h:width=200:g={eq_mid:.1f}")
-            if eq_high != 0:
-                filters.append(f"treble=g={eq_high:.1f}")
-
-        # 淡入淡出
-        if include_fade and track_settings.get("fade_enabled", False):
-            fin = track_settings.get("fade_in", "")
-            fout = track_settings.get("fade_out", "")
+        # 淡入淡出（「音频跟随」判据见 audio_fade_view：合并页视频轨未勾 ⇒ 只淡画面、声音不淡）
+        _afd_s = audio_fade_view(track_settings)
+        if include_fade and _afd_s.get("fade_enabled", False):
+            fin = _afd_s.get("fade_in", "")
+            fout = _afd_s.get("fade_out", "")
             fin_s = time_to_seconds(fin) if fin else 0.0
             fout_s = time_to_seconds(fout) if fout else 0.0
             if fin_s > 0:
                 filters.append(f"afade=t=in:st=0:d={fin_s:.3f}")
             if fout_s > 0:
-                eff_dur = self._audio_effective_duration(track_settings, include_trim, include_speed)
-                if eff_dur:
-                    st = max(0.0, eff_dur - fout_s)
+                # 起点唯一判据 afade_out_start（base_is_output=True）：`_audio_effective_duration`
+                # 已经是输出轴（扣过截取、除过变速），这里不再折算。
+                # 2026-11-03：原本是 `max(0, eff_dur − fout)` + 一个「时长未知 ⇒ st=0」的
+                # else 分支，属同一算式的第 4 份实现；现改为「时长未知 ⇒ 判据返回 None ⇒
+                # 不挂淡出」，与视频侧 video_fade_out_start 同语义。
+                st = afade_out_start(track_settings, fout_s,
+                                     self._audio_effective_duration(
+                                         track_settings, include_trim, include_speed),
+                                     base_is_output=True)
+                if st is not None:
                     filters.append(f"afade=t=out:st={st:.3f}:d={fout_s:.3f}")
-                else:
-                    filters.append(f"afade=t=out:st=0:d={fout_s:.3f}")
 
         # 倒放：优先使用轨道独立设置，否则使用传入的 include_reverse
         track_reverse = track_settings.get("audio_reverse")
@@ -69122,7 +70402,15 @@ class FFmpegBatchGUI:
 
 
     def _build_afade_suffix(self, settings, duration):
-        """按 settings 的淡入淡出设置构建 afade 串（用于段级钳制之后，淡出精确落在段末）。"""
+        u"""按 settings 的淡入淡出设置构建 afade 串（用于段级钳制之后，淡出精确落在段末）。
+
+        `duration` 是**段级钳制之后**的输出时长（已扣截取、已除变速）⇒ 淡出起点交给
+        唯一判据 `afade_out_start(..., base_is_output=True)`，本函数只负责拼串。
+
+        「音频跟随」（2026-11-03）：settings 来自合并页视频轨时，未勾「音频跟随」⇒ 返回空串
+        （画面照淡、声音不淡）。判据统一在 `audio_fade_view`，转换页/音频轨条目不受影响。
+        """
+        settings = audio_fade_view(settings)
         if not settings.get("fade_enabled", False):
             return ""
         fin = settings.get("fade_in", "")
@@ -69133,8 +70421,11 @@ class FFmpegBatchGUI:
         if fin_s > 0:
             parts.append(f"afade=t=in:st=0:d={fin_s:.3f}")
         if fout_s > 0 and duration and duration > 0:
-            st = max(0.0, duration - fout_s)
-            parts.append(f"afade=t=out:st={st:.3f}:d={fout_s:.3f}")
+            st = afade_out_start(settings, fout_s, duration, base_is_output=True)
+            # 判据在时长未知时返回 None（上面已按 duration 守卫，这里只是防呆：
+            # 万一哪天守卫被去掉，也不会拼出 st=0 的「整段渐弱」）。
+            if st is not None:
+                parts.append(f"afade=t=out:st={st:.3f}:d={fout_s:.3f}")
         return ",".join(parts)
 
 
@@ -70525,7 +71816,7 @@ class FFmpegBatchGUI:
         self._last_merge_total_dur = total_dur
         n_trans = sum(1 for t in trans_effective if t is not None)
         if n_trans:
-            self._append_info_ui(_('[串联-编] 使用逐轨 xfade 交叉溶解转场（{0} 处）').format(n_trans))
+            self._append_info_ui(f"[串联-编] 使用逐轨 xfade 交叉溶解转场（{n_trans} 处）")
 
         # 串行合并音频归一：concat / acrossfade 都要求各音频段采样率 / 声道布局 / 采样格式一致。
         # 策略：1 段不归一；2 段跟随主视频（首段）；≥3 段跟随多数轨（逐维度众数）。
@@ -70541,7 +71832,12 @@ class FFmpegBatchGUI:
         #   程序不检测是否同源文件，仅 UI 提示 + 勾选时双重确认，由用户自行确认列表文件一致。
         a_labels = []
         _at_set = main_video.enc_settings if main_video is not None else {}
-        _use_global_audio_trim = bool(_at_set.get("audio_trim_enabled", False))
+        # ⚠ 2026-11-03 用户定案：串行合并**一律忽略**「音频独立截取（不分段）」。
+        # 原因：它把整条合并音频换成「从主视频源文件截的一段」，只要任一段视频的长度/截取
+        # 与这段音频对不上，后续所有分段就整体错位，而且要到成片才暴露。UI 仍保留（用户
+        # 要求不要移除界面），但命令生成端不再读这个键 —— 判据恒为 False。
+        # 老项目里残留的 audio_trim_enabled=True 因此也不会再静默接管音频输出。
+        _use_global_audio_trim = False
         if _use_global_audio_trim and main_video is not None and main_video.file_path:
             _astr = (_at_set.get("audio_trim_start", "") or "").strip()
             _aend = (_at_set.get("audio_trim_end", "") or "").strip()
@@ -70556,13 +71852,29 @@ class FFmpegBatchGUI:
                 _at_parts.append("anull")
             _at_parts.append("asetpts=PTS-STARTPTS")
             _at_chain = ",".join(_at_parts)
+            # 音色链 + 淡入淡出（2026-11-02 第五步）：本支此前只有 atrim ⇒「音频独立截取」
+            # 模式下音量/EQ/降噪/淡入淡出全部被丢掉（其它模式都有）。链首 atrim+asetpts
+            # 已把 t 归零 ⇒ 淡出起点按**截取后时长**定位。
+            _gt_tone = build_audio_tone_chain(_at_set, include_speed=False)
+            if _gt_tone:
+                _at_chain = f"{_at_chain},{','.join(_gt_tone)}"
+            _gt_dur = ((_ae - _as) if (_as is not None and _ae is not None and _ae > _as)
+                       else None)
+            if _gt_dur is None and _as is not None:
+                _gt_total = self._get_media_duration(main_video.file_path)
+                if _gt_total:
+                    _gt_dur = max(0.0, float(_gt_total) - _as)
+            _gt_fade = self._build_afade_suffix(_at_set, _gt_dur)
+            if _gt_fade:
+                _at_chain = f"{_at_chain},{_gt_fade}"
             if audio_concat_normalize:
                 _at_chain = f"{audio_concat_normalize},{_at_chain}"
             # 主视频即输入 0（video_tracks[0]），其嵌入音频为 [0:a]
             filter_parts.append(f"[0:a]{_at_chain}[amain]")
             a_labels.append("[amain]")
             self._append_info_ui(
-                _('[串联-编] 音频独立截取（不分段）已接管全部音频输出（源文件 {0}，起始 {1} 结束 {2}）').format(os.path.basename(main_video.file_path), _astr or '0', _aend or _("末尾")))
+                f"[串联-编] 音频独立截取（不分段）已接管全部音频输出（源文件 {os.path.basename(main_video.file_path)}，"
+                f"起始 {_astr or '0'} 结束 {_aend or '末尾'}）")
         elif audio_tracks:
             for j, audio in enumerate(audio_tracks):
                 a_idx = file_index[audio.file_path]
@@ -70604,7 +71916,7 @@ class FFmpegBatchGUI:
                 # 段级钳制 atrim=0:T 会截断分段时间轴，且无可靠手段确认音频时间 → 直接屏蔽）。
                 filter_parts.append(f"[{a_idx}:a]{chain}[a{j}]")
                 a_labels.append(f"[a{j}]")
-            self._append_info_ui(_('[串联-编] 音频段已逐段钳制到对应视频段时长（防止偏移/变速导致累计错位）'))
+            self._append_info_ui(f"[串联-编] 音频段已逐段钳制到对应视频段时长（防止偏移/变速导致累计错位）")
         else:
             for i, track in enumerate(video_tracks):
                 settings = track.enc_settings.copy()
@@ -70649,16 +71961,29 @@ class FFmpegBatchGUI:
                     # 避免嵌入音轨比视频段短/长导致 concat 后累计错位。
                     audio_filters.append(f"atrim=0:{_ffsec(effective_duration)}")
                     audio_filters.append(f"apad=whole_dur={effective_duration:.3f}")
+                    # 音色链（2026-11-02 第五步）：本支是「视频自带音轨」——串行重编码里唯一
+                    # 没接音色链的一支（独立音频轨走 `_build_audio_filters`，早就有了）⇒
+                    # 串行合并里给段设的 音量/EQ/降噪/声道/高通低通 实际上从未生效。
+                    # include_speed=False：变速已由 `_append_audio_speed_reverse` 挂过。
+                    # 预览侧 `_build_concat_audio_graph_mpv` 同款同位置一并补（只差 loudnorm），
+                    # 否则会变成「预览有、成片没有」的反向不一致。
+                    audio_filters.extend(build_audio_tone_chain(settings,
+                                                                include_speed=False))
                     audio_chain = ",".join(audio_filters)
                     if audio_concat_normalize:
                         audio_chain = f"{audio_concat_normalize},{audio_chain}"
                     # 逐轨转场与音频淡入淡出互斥（视频自带音轨跟随其视频段）
-                    if settings.get("fade_enabled", False):
+                    # 淡入淡出设置（2026-11-03）：串行合并忽略独立音频轨 ⇒ 音频轨自己设的 fade
+                    # 不生效（用户实测）。这里把同路径 type="audio" 条目的 fade 并进来（独立优先、
+                    # 未设才跟随视频轨，与普通/画中画同判据 concat_audio_fade_settings）。
+                    _fade_set = concat_audio_fade_settings(self.merge_tracks,
+                                                           track.file_path, settings)
+                    if _fade_set.get("fade_enabled", False):
                         if trans_effective[i] is not None:
-                            settings["fade_out"] = ""
+                            _fade_set["fade_out"] = ""
                         if i > 0 and trans_effective[i - 1] is not None:
-                            settings["fade_in"] = ""
-                    f_suffix = self._build_afade_suffix(settings, effective_duration)
+                            _fade_set["fade_in"] = ""
+                    f_suffix = self._build_afade_suffix(_fade_set, effective_duration)
                     if f_suffix:
                         audio_chain = f"{audio_chain},{f_suffix}"
                     filter_parts.append(f"[{i}:a]{audio_chain}[a{i}]")
@@ -70724,7 +72049,7 @@ class FFmpegBatchGUI:
         if len(a_labels) == 1:
             filter_parts.append(f"{a_labels[0]}anull[aout]")
         if n_trans:
-            self._append_info_ui(_('[串联-编] 音频使用 acrossfade 交叉溶解转场（跟随逐轨转场开关）'))
+            self._append_info_ui(f"[串联-编] 音频使用 acrossfade 交叉溶解转场（跟随逐轨转场开关）")
 
         # ----- 7. 音频映射：音量等已全部下放到每条独立音轨（_build_audio_filters），
         #           不再在此套用全局音量，避免与主视频音量重复叠加 -----
@@ -70735,7 +72060,8 @@ class FFmpegBatchGUI:
         # 级联回 [aout]（同名标签复用，与画中画 [amain] 级联同款）；BGM 仍在其后叠加。
         if _concat_stream_left:
             self._append_info_ui(
-                _('[串联-编] {0} 条「独立音轨」在串行重编码模式下不参与输出（可改用「混音进主音频」或 BGM）').format(len(_concat_stream_left)))
+                f"[串联-编] {len(_concat_stream_left)} 条「独立音轨」在串行重编码模式下不参与输出"
+                f"（可改用「混音进主音频」或 BGM）")
         if _free_mix_tracks:
             _free_total = sum(seg_durations) - sum(t[1] for t in trans_effective if t is not None)
             _free_norm = (audio_concat_normalize
@@ -70753,7 +72079,7 @@ class FFmpegBatchGUI:
                     f"[aout][{_flbl}]amix=inputs=2:duration=longest:normalize=0[aout]")
                 _fk += 1
             if _fk:
-                self._append_info_ui(_('[串联-编] 已混入 {0} 条自由音频（整段最终混音）').format(_fk))
+                self._append_info_ui(f"[串联-编] 已混入 {_fk} 条自由音频（整段最终混音）")
 
         # ----- 6b. 全局背景音乐 (BGM) 叠加（仅主视频音频绑定页启用时） -----
         # 外部音频循环铺满整段合并输出，按设定音量降低后混在 [aout] 原音之下。
@@ -70798,7 +72124,7 @@ class FFmpegBatchGUI:
                 )
                 amap = "[afinal]"
                 self._append_info_ui(
-                    _('[串联-编] 已叠加背景音乐（{0}，音量 {1:.2f}，混在原音之下）').format(os.path.basename(_bgm_path), _bgm_vol)
+                    f"[串联-编] 已叠加背景音乐（{os.path.basename(_bgm_path)}，音量 {_bgm_vol:.2f}，混在原音之下）"
                 )
 
         # ----- 8. 组合所有滤镜 -----
@@ -70822,7 +72148,7 @@ class FFmpegBatchGUI:
                     else ("aout" if "[aout]" in self._last_graph else "out"),
                     anchor_nodes=graph_nodes(self._last_graph))
             except Exception as _e:
-                self._append_info_ui(_('[音频节点] 串行合并叠加失败（按原图继续）: {0}').format(_e))
+                self._append_info_ui(f"[音频节点] 串行合并叠加失败（按原图继续）: {_e}")
                 all_filters = self._last_graph
         else:
             all_filters = self._last_graph
@@ -70875,7 +72201,7 @@ class FFmpegBatchGUI:
             image_display_duration=total_dur)
 
         cmd.append(output_norm)
-        self._append_info_ui(_('[串联-编] 使用 filter_complex 重新编码模式（{0} 个片段）').format(n))
+        self._append_info_ui(f"[串联-编] 使用 filter_complex 重新编码模式（{n} 个片段）")
         return cmd
     
     def merge_build_cmd_list(self, output_override=None, preview=False) -> List[str]:
@@ -73288,7 +74614,7 @@ class FFmpegBatchGUI:
         _sv_max = max(1, min(30, self.sub_video_preview_max.get()))
         if len(sub_videos) > _sv_max:
             self._append_info_ui(
-                _('[预览] 子视频数量 {0} 超过 {1} 个，实时预览仅支持前 {2} 个').format(len(sub_videos), _sv_max, _sv_max))
+                f"[预览] 子视频数量 {len(sub_videos)} 超过 {_sv_max} 个，实时预览仅支持前 {_sv_max} 个")
             sub_videos = sub_videos[:_sv_max]
         main_file = normalize_path(main_video.file_path)
         # 2026-10-09：主视频是否为「颜色虚拟源」。颜色源不是真实文件 → 不能把哨兵串当位置输入
@@ -73551,7 +74877,12 @@ class FFmpegBatchGUI:
         _main_is_image = self._is_static_image(main_file)
         _IMAGE_PREVIEW_SEC = _eff_image_display_duration(_ms)
         if _main_is_image:
-            _main_prefix = "loop=loop=-1:size=1:start=0,setpts=PTS-STARTPTS,"
+            # 图片主视频：loop 单帧 → 连续流。⚠️ 必须 `fps=30` + **用 N 重建 PTS**，
+            # 不能只 `setpts=PTS-STARTPTS`：图片源时基是 1000fps、loop 复制帧的 PTS 步进
+            # 不可靠 ⇒ 渐变只有两三帧、看起来就是硬切（用户实测第 15 条画中画模式）。
+            # 实测（`research/probe_img_preview_fade_20261103.py`）：fps=30 + setpts=N/30/TB
+            # 出 30fps 连续流，fade 亮度曲线 16→117→27 正常。
+            _main_prefix = "loop=loop=-1:size=1:start=0,fps=30,setpts=N/30/TB,"
         else:
             _main_prefix = _main_trim_prefix
         # 主视频画布模式（位置、尺寸、旋转）：2026-09-02 开放（抄统一尝试版 33498），
@@ -73609,9 +74940,31 @@ class FFmpegBatchGUI:
             _ms_cv["crop_enabled"] = False
             _ms_cv["scale_enabled"] = False
             _ms_cv["rotate"] = "none"
+        # ---- 主视频段变速（2026-11-02，消除与转换页/单轨的口径分裂）----
+        # 原先这里硬写 `include_speed=False`（主视频不变速、只有子视频跟随开关）⇒ 用户实测
+        # 「普通模式 2× 会跑、画中画 2× 像没变」。改为**跟随同一个滤镜变速开关**：
+        # 开关关 ⇒ 一行 setpts 都不生成（逐字节旧行为）；开关开 ⇒ 与其余三条路线同源。
+        # ⚠️ 表达式换算不必额外处理：build_video_filter_chain 读 `_trim_speed_from_settings`，
+        #   speed_enabled 为真时它本来就把轨迹/水印/画布的 t 写成输出时间线（旧代码反而是
+        #   「表达式按输出线算、PTS 却没压缩」的自相矛盾）。
+        _main_ftp = bool(self.preview_filter_speed.get())
+        _pip_sp = _pv_audio_speed_factor(_ms, _main_ftp)
+        # 视频淡出定位（2026-11-02）：与导出侧同口径 —— 按**本段输出时长**定位。
+        # `_pv_main_eff` 是「已 ÷speed」的有效时长；但本链 `include_speed=_main_ftp`，
+        # 开关关时链内不变速 ⇒ 时长要还原成源轴（否则淡出会提前 sp 倍）。
+        # 传 `fade_speed_factor=1.0` = 「这里给的已经是输出轴，判据别再除」。
+        _pv_fade_dur = None
+        if _pv_main_eff and _pv_main_eff > 0:
+            _pv_fade_dur = float(_pv_main_eff)
+            if not _main_ftp and _ms.get("speed_enabled", False):
+                _mspf = _opt_float(_ms.get("speed_factor", "1.0"), 1.0) or 1.0
+                if _mspf > 0:
+                    _pv_fade_dur *= _mspf
         base_vf = build_video_filter_chain(
-            _ms_cv, include_subtitle=False, include_speed=False, include_trim=False,
+            _ms_cv, include_subtitle=False, include_speed=_main_ftp, include_trim=False,
             enhance_settings=_ms.get("enhance", {}), reverse=False,
+            fade_output_duration=_pv_fade_dur,
+            fade_speed_factor=(1.0 if _pv_fade_dur else None),
             # 2026-10-09：画中画实时预览的主视频也要绿幕抠像（用户报「实时预览没接入
             # 主视频抠图」）。未启用时 None → 逐字节旧行为。
             chroma_settings=_ms_cv if _ms_cv.get("chroma_enabled", False) else None,
@@ -73673,7 +75026,8 @@ class FFmpegBatchGUI:
                     cur = "[v_main_canvas_s]"
                 _main_w, _main_h = _mbbw, _mbbh
                 self._append_info_ui(
-                    _('[预览] 主视频画布模式已启用：内容基准 {0}x{1}，画布 {2}x{3}').format(_mdim[0] or 1280, _mdim[1] or 720, _main_w, _main_h))
+                    f"[预览] 主视频画布模式已启用：内容基准 {_mdim[0] or 1280}x{_mdim[1] or 720}，"
+                    f"画布 {_main_w}x{_main_h}")
             else:
                 self._append_info_ui(_("[预览] 主视频画布模式生成失败，已按普通主视频处理"))
         # 主视频有效结束时长（结尾强制收尾 trim 用）：截取后时长优先，图片给默认 10s
@@ -73732,7 +75086,7 @@ class FFmpegBatchGUI:
             # 必须同步为 pad 尺寸——轨迹 clamp / 基准位置求值 ctx / _blend_static_geometry
             # 全用它，否则轨迹被锁死主视频源尺寸、普通叠加基准位置也错位。
             _main_w, _main_h = _pwc, _phc
-            self._append_info_ui(_('[预览] 主视频画布偏移：{0}x{1} @ ({2},{3})').format(_pwc, _phc, _ox, _oy))
+            self._append_info_ui(f"[预览] 主视频画布偏移：{_pwc}x{_phc} @ ({_ox},{_oy})")
 
         # ---- 转场链：主视频进链 split + 真时间轴延长（与正式命令
         # _build_overlay_filter_complex 的「链规划 → 主进链 split → 底 tpad」同序）----
@@ -73762,7 +75116,8 @@ class FFmpegBatchGUI:
                 f"{cur}tpad=stop_mode=add:stop_duration={_pv_total - _pv_main_eff:.6f}{_pv_pad_col}[v_main_ext_pv]")
             cur = "[v_main_ext_pv]"
             self._append_info_ui(
-                _('[预览] 子素材显示时段超出主视频时长（{0:.3f}s），已延长预览时间轴到 {1:.3f}s（尾部补黑帧）').format(_pv_main_eff, _pv_total))
+                f"[预览] 子素材显示时段超出主视频时长（{_pv_main_eff:.3f}s），"
+                f"已延长预览时间轴到 {_pv_total:.3f}s（尾部补黑帧）")
 
         # ---- 多 blend 子视频区域隔离（需求3）：主视频 split 出原始帧副本 ----
         # 非 normal blend 子视频 ≥2 个时，blend 主区域从主视频【原始帧】副本取
@@ -73819,7 +75174,8 @@ class FFmpegBatchGUI:
             # 用户无从判断到底是设置问题还是渲染问题。
             if not force_overlay and not _s.get('overlay_enabled', True):
                 self._append_info_ui(
-                    _('[预览] 子视频 {0} 未勾选「启用叠加」：预览与成片都不显示它（如需显示，请到该轨道的「视频轨道设置」里勾选「启用叠加」）').format(_k + 1))
+                    f"[预览] 子视频 {_k + 1} 未勾选「启用叠加」：预览与成片都不显示它"
+                    f"（如需显示，请到该轨道的「视频轨道设置」里勾选「启用叠加」）")
                 return None
             try:
                 # 2026-10-29：基底域 —— 子链在预览里由 `movie=` 载入（不读 display matrix），
@@ -73851,7 +75207,7 @@ class FFmpegBatchGUI:
             # （用户实测「主视频和子视频中间很大空隙」，只有管道预览有；f=上限/原始宽 → 原始越大
             # 空隙越大）。换算见 _pipe_scale_pos_settings（与转换页水印/文字水印同一实现）。
             _s_pos = _pipe_scale_pos_settings(_s, _pwf)
-            _path_esc = self._movie_path_safe(_sfile, _k).replace("\\", "/").replace(":", "\\\\:")
+            _path_esc = self._movie_path_safe(_sfile, _k)
             # 子视频滤镜链：复用主滤镜构建函数（字幕/像素格式等 mpv 预览不支持的排除），
             # trim/loop/裁剪/缩放/绿幕/颜色校正/反色/变速 全在 chain 内（movie 层只载入，chain 统一循环）；
             # 链外仅保留透明度/自旋转。滤镜倒放预览已取消（2026-08-30）：reverse 恒 False。
@@ -73897,6 +75253,16 @@ class FFmpegBatchGUI:
                 chroma_settings=_s if _s.get("chroma_enabled", False) else None,
                 loop_size=_loop_size,
                 window_start=_pwin_start, window_end=_pwin_end, window_loop_count=_pwin_loop,
+                # 2026-11-02：视频淡出定位（与导出 `_build_sub_layer_node` 同口径）。
+                # 有显示窗口 ⇒ 窗口长（loop 撑满时它就是输出长）；无窗口 ⇒ 只给源时长，
+                # 由 precise_trim 的旧口径自扣 trim_start（子链恒 True）。
+                clip_duration=_s_dur,
+                fade_output_duration=(
+                    (_pwin_end - _pwin_start)
+                    if (_phas_win and _pwin_end is not None and _pwin_end > _pwin_start)
+                    else None),
+                # 本链的变速由开关决定 ⇒ 因子按「实际进链」传，别让判据照 settings 多除一次。
+                fade_speed_factor=_pv_audio_speed_factor(_sb_settings, _ft_speed_on),
                 # 🔴 2026-10-28（用户实测「ffplay/mpv、管道预览里 2×2 被算了两次」）：
                 #   `force_scale` 落在链内**缩放位**，而「拼接」段在**链尾** ⇒ 必须是**每格**
                 #   尺寸。`_rw/_rh` 是**成帧**尺寸（`tiled_frame_size`，供 overlay 定位用）
@@ -74285,7 +75651,9 @@ class FFmpegBatchGUI:
                     _ch["penable"] = f"between(t,{_ch['start']:.6g},{_ch['start'] + _acc_len:.6g})"
                     with suppress(Exception):
                         self._append_info_ui(
-                            _('[预览] 子视频 {0}…{1} 已合成转场链：{2:.2f}s~{3:.2f}s（{4} 段，链内统一 {5}x{6}）').format(_mem[0] + 1, _mem[-1] + 1, _ch['start'], _ch['start'] + _acc_len, len(_mem), _ch['size'][0], _ch['size'][1]))
+                            f"[预览] 子视频 {_mem[0] + 1}…{_mem[-1] + 1} 已合成转场链："
+                            f"{_ch['start']:.2f}s~{_ch['start'] + _acc_len:.2f}s"
+                            f"（{len(_mem)} 段，链内统一 {_ch['size'][0]}x{_ch['size'][1]}）")
 
         # ---- 阶段 A3：分组节点合成（成员层 → overlay 成组节点 [v_grp_<g>_<k>]）----
         # 单画布方案（2026-10-17，与导出 `_build_overlay_filter_complex` 阶段 A3 逐项
@@ -74543,7 +75911,7 @@ class FFmpegBatchGUI:
                     self._group_blend_note(
                         "grpblend:%s:dis" % _kkey,
                         _("[混合模式] 组 %s 父行配了 blend，但父行的「启用叠加」是**关闭**的"
-                          " ⇒ 整组不显示，blend 自然也无从混合。") % _kkey)
+                        " ⇒ 整组不显示，blend 自然也无从混合。") % _kkey)
                 if _gbl is not None:
                     _gmode, _gbx, _gby, _gbw, _gbh, _gpx, _gpy = _gbl
                     if _regional:
@@ -74674,7 +76042,8 @@ class FFmpegBatchGUI:
                 _dgp = self._blend_downgrade_pad(_ms, main_file)
                 if _dgp:
                     self._append_info_ui(
-                        _('[混合模式] pad 画布 {0}x{1} 大于主视频渲染尺寸，blend({2}) 已降级为普通叠加（脱离主视频像素的混合无意义）').format(_dgp[0], _dgp[1], _blend_mode))
+                        f"[混合模式] pad 画布 {_dgp[0]}x{_dgp[1]} 大于主视频渲染尺寸，"
+                        f"blend({_blend_mode}) 已降级为普通叠加（脱离主视频像素的混合无意义）")
                     _blend_mode = 'normal'
             if _blend_mode != 'normal':
                 # 自旋转/静态角度时子视频链输出为 hypot 正方形画布 → blend 区域必须用对角线
@@ -74812,7 +76181,7 @@ class FFmpegBatchGUI:
                     else:
                         # mode 未知（理论不发生）→ 兜底静态基准位置 blend
                         self._append_info_ui(
-                            _('[预览] 子视频 {0} 混合模式+轨迹控制：轨迹模式不支持，已按基准位置 blend').format(_k + 1))
+                            f"[预览] 子视频 {_k+1} 混合模式+轨迹控制：轨迹模式不支持，已按基准位置 blend")
                         _bbx, _bby, _bbw, _bbh, _bsx, _bsy = self._blend_static_geometry(
                             int(_bxv - _offPx), int(_byv - _offPy), _bw_src, _bh_src, _main_w, _main_h)
                         if _bbw >= 2 and _bbh >= 2:
@@ -74954,13 +76323,13 @@ class FFmpegBatchGUI:
             cur = "[v_bp]"
             fg.extend(_pip_split_parts(cur, "[v_po2]", build_split_border_cfg(_pip_eh)))
             cur = "[v_po2]"
-            self._append_info_ui(_('[预览] 实时预览：多画面拼接 {0}x{1}（等宽边框）').format(_pip_rows, _pip_cols))
+            self._append_info_ui(f"[预览] 实时预览：多画面拼接 {_pip_rows}x{_pip_cols}（等宽边框）")
             fg.raw(f"{cur}null[vo]")
         else:
             if _pip_split_ok:
                 fg.extend(_pip_split_parts(cur, "[v_split]"))
                 cur = "[v_split]"
-                self._append_info_ui(_('[预览] 实时预览：多画面拼接 {0}x{1}').format(_pip_rows, _pip_cols))
+                self._append_info_ui(f"[预览] 实时预览：多画面拼接 {_pip_rows}x{_pip_cols}")
             if _bp_pip:
                 _bp_tail = "," + _bp_pip
                 self._append_info_ui(_("[预览] 实时预览：已叠加末端边框"))
@@ -75000,6 +76369,7 @@ class FFmpegBatchGUI:
         # 主音频条目「忽略」→ 静音底子（volume=0 垫底，混音照常；[aid1] 仍被图引用，
         # 防 mpv 把未消费的主音轨当普通轨直通漏声；2026-09-30）
         _main_ignored = False
+        _pv_main_a = None
         try:
             _pv_main_a = next((t for t in enabled_tracks if t.type == "audio"
                                and normalize_path(t.file_path) == _main_path_n), None)
@@ -75008,6 +76378,56 @@ class FFmpegBatchGUI:
         except Exception:
             _main_ignored = False
         _pm = "volume=0," if _main_ignored else ""
+        # ---- 主声音色链（2026-11-02 第 3 项）----
+        # 此前主声是裸 `anull`（或只有 atrim 直通），而**同一张图里**的子声走
+        # `_build_audio_filters`（含 hp/lp/volume/降噪/声道/EQ）⇒ 主声与子声口径不一致：
+        # 用户在预览里听得到子视频的 EQ/降噪，主视频却没有。导出侧主声本来就调
+        # `_build_audio_filters`（见 `_build_pip_audio`），这里补的是**预览独有的缺口**。
+        # · include_speed=False：主声变速由整条输出上的 `--af atempo` 追加（见本函数末
+        #   的 mpv/ffplay 分支）⇒ 图内再 atempo 会变两次速。
+        # · include_loudnorm=False：预览惯例（单遍 loudnorm 在短窗口反复收敛 → 音量抽动），
+        #   与 `_preview_with_settings` / `merge_preview_track` 两处同款。
+        # · 主音频轨不存在（未添加音频条目 / 主视频自带音轨）⇒ 没有音色设置可读 ⇒ 空链，
+        #   与旧行为逐字节一致。
+        _pv_main_tone = ""
+        if _pv_main_a is not None:
+            try:
+                _tone_src = dict(_pv_main_a.enc_settings)
+                _tone_src["_file_path"] = main_video.file_path
+                _tone_f = build_audio_tone_chain(
+                    _tone_src, speed_factor=1.0, include_speed=False,
+                    include_loudnorm=False)
+                if _tone_f:
+                    _pv_main_tone = "," + ",".join(_tone_f)
+            except Exception:
+                _pv_main_tone = ""
+        # ---- 主声淡入淡出（2026-11-03）----
+        # 导出侧主声走 `_build_audio_filters`（含 afade），预览此前只补了音色链 ⇒ 在音频轨上
+        # 设的淡入淡出「成片有、预览没有」（用户实测第 11 条）。两种图坐标轴不同，必须分开：
+        #   · 链内已 `atrim+asetpts` 归零（截取分支 / 混音主声床）→ **输出轴**，与导出同判据；
+        #   · else `[aid1]anull` 直通（不 trim、截取交给播放器 `--start`）→ **文件绝对轴**，
+        #     与转换页预览同用 `preview_afade_filters`。
+        def _pv_main_fade(_dur):
+            """主声 afade 串（带前导逗号）；_dur = 链内归零后的有效输出时长，None/0 ⇒ 空。"""
+            if _pv_main_a is None or not _dur or float(_dur) <= 0:
+                return ""
+            _e = merge_audio_follow_fade(dict(_pv_main_a.enc_settings), _ms)
+            _e["_file_path"] = main_video.file_path
+            _s = self._build_afade_suffix(_e, float(_dur))
+            return ("," + _s) if _s else ""
+
+        _pv_main_fade_abs = ""
+        if _pv_main_a is not None and not pipe_engine:
+            _e = merge_audio_follow_fade(dict(_pv_main_a.enc_settings), _ms)
+            _e["_file_path"] = main_video.file_path
+            _w = None
+            if _esec is not None and _esec > (_ssec or 0.0):
+                _w = float(_esec) - (_ssec or 0.0)
+            elif _main_dur:
+                _w = max(0.0, float(_main_dur) - (_ssec or 0.0))
+            _fs = preview_afade_filters(_e, seek_offset=(_ssec or 0.0), window_duration=_w)
+            if _fs:
+                _pv_main_fade_abs = "," + ",".join(_fs)
         if not _pv_mix_mode:
             if _has_audio:
                 if _main_trim_prefix and not pipe_engine:
@@ -75028,9 +76448,10 @@ class FFmpegBatchGUI:
                     if _main_end_dur and _main_end_dur > 0:
                         _a_chain += (f",atrim=0:{_ffsec(_main_end_dur)},"
                                      f"apad=whole_dur={_main_end_dur:.3f}")
-                    fg.raw(f"[aid1]{_pm}{_a_chain}[ao]")
+                    fg.raw(f"[aid1]{_pm}{_a_chain}{_pv_main_tone}"
+                           f"{_pv_main_fade(_main_end_dur)}[ao]")
                 else:
-                    fg.raw(f"[aid1]{_pm}anull[ao]")
+                    fg.raw(f"[aid1]{_pm}anull{_pv_main_tone}{_pv_main_fade_abs}[ao]")
         else:
             # 混音/替换子声预览：主声床（有界到时间轴总长）+ 各子声（aloop 镜像显示窗口 +
             # adelay 落位）逐条 amix 叠加；替换窗并集内主声静音。时间轴延长时各条一并有界，
@@ -75066,7 +76487,7 @@ class FFmpegBatchGUI:
                     _a_chain += f",atrim=0:{_ffsec(_T)},apad=whole_dur={_T:.3f}"
                 if _main_ignored:
                     _a_chain = f"volume=0,{_a_chain}"
-                fg.raw(f"[aid1]{_a_chain}[amain_pv]")
+                fg.raw(f"[aid1]{_a_chain}{_pv_main_tone}{_pv_main_fade(_T)}[amain_pv]")
             else:
                 # 主视频无音频：静音源垫底（anullsrc 无限源 → atrim 收口）
                 _an = "anullsrc=r=48000:cl=stereo"
@@ -75180,7 +76601,7 @@ class FFmpegBatchGUI:
                 _fenc["audio_offset"] = "0"
                 _ffe = str(_fenc.get("audio_free_end", "") or "").strip()
                 _fenc["audio_free_end"] = ""
-                _fesc = self._movie_path_safe(_ft.file_path).replace("\\", "/").replace(":", "\\\\:")
+                _fesc = self._movie_path_safe(_ft.file_path)
                 fg.raw(f"amovie={_fesc}[afsub{_fn}]")
                 _fap = []
                 _afx2 = self._build_audio_filters(
@@ -75209,7 +76630,7 @@ class FFmpegBatchGUI:
             fg.raw("[amain_pv]anull[ao]")
             if _pv_mixed:
                 self._append_info_ui(
-                    _('[预览] 已混入 {0} 条音频（子视频混音/替换 + 独立音频混音，与导出一致）').format(_pv_mixed))
+                    f"[预览] 已混入 {_pv_mixed} 条音频（子视频混音/替换 + 独立音频混音，与导出一致）")
         graph = fg.build()
 
         # ---- 「节点标签」同步到预览（2026-09-26）----
@@ -75254,14 +76675,14 @@ class FFmpegBatchGUI:
                     anchor_nodes=graph_nodes(_pv_anchor),
                     anchor_graph=_pv_anchor)
             except Exception as _e:
-                self._append_info_ui(_('[节点] 预览叠加节点效果失败（按原图继续）: {0}').format(_e))
+                self._append_info_ui(f"[节点] 预览叠加节点效果失败（按原图继续）: {_e}")
             if getattr(self, "node_audio_fx", None):
                 try:
                     graph, _pv_node_lbl = self._apply_node_audio_fx(
                         graph, ("ao" if "[ao]" in graph else "out"),
                         anchor_nodes=graph_nodes(getattr(self, "_last_graph", "") or ""))
                 except Exception as _e:
-                    self._append_info_ui(_('[音频节点] 预览叠加失败（按原图继续）: {0}').format(_e))
+                    self._append_info_ui(f"[音频节点] 预览叠加失败（按原图继续）: {_e}")
 
         # ---- 【时间预览引擎】管道合成模式（2026-09-20 Phase 2，用户拍板开放封装页）----
         # 同一张 PiP 合成图改喂内置时间预览窗口：ffmpeg -filter_complex → rawvideo 管道，
@@ -75292,8 +76713,19 @@ class FFmpegBatchGUI:
                 _pipe_w = _main_w * _pip_cols
                 _pipe_h = _main_h * _pip_rows
             _pipe_ar = (float(_pipe_w) / _pipe_h) if _pipe_h > 0 else None
+            # 管道引擎的音频设置 = **主声那一份**（2026-11-03）：本引擎不播图里的音频段
+            # （`_lavfi_complex_to_ffmpeg_pipe` 会把它们删净），另起 ffplay 直读主文件，
+            # 音色/淡入淡出只认 `_pipe_audio_settings`。此前传的是 `dict(_ms)`（主视频轨）
+            # ⇒ 在**独立音频轨**上设的 EQ/淡出只在 mpv 预览听得到，管道预览全丢
+            # （用户实测「mpv 主声 EQ 有效、管道无效」）。有主音频条目就用它，否则维持视频轨。
+            _pa_set = dict(_ms)
+            _pa_set["_file_path"] = main_file
+            if _pv_main_a is not None:
+                _pa_set = merge_audio_follow_fade(dict(_pv_main_a.enc_settings), _ms)
+                _pa_set["_file_path"] = main_file
             self._append_info_ui(
-                _('[时间预览] 画中画管道合成预览：{0} 个子视频 movie 合成（ffmpeg -filter_complex → rawvideo；子视频跟随进度条同步 seek）').format(len(sub_videos)))
+                f"[时间预览] 画中画管道合成预览：{len(sub_videos)} 个子视频 movie 合成"
+                f"（ffmpeg -filter_complex → rawvideo；子视频跟随进度条同步 seek）")
             if _pv_out_mode:
                 # 路线A（research/pipe-pip-chain）：链图 = 输出时间轴——xfade offset / adelay /
                 # enable / cbase d 全是 0 基绝对值，管道的 pts 平移桥接会让整链错位（拖动后
@@ -75303,7 +76735,8 @@ class FFmpegBatchGUI:
                 _pv_out = _pv_total if (_pv_total and _pv_total > 0) else (
                     _pv_main_eff if (_pv_main_eff and _pv_main_eff > 0) else _main_limit)
                 self._append_info_ui(
-                    _('[时间预览] 含转场链 → 输出时间轴模式（总长 {0:.2f}s；拖动从 0 解码后输出侧裁剪，seek 较慢但与导出逐帧一致）').format(_pv_out))
+                    f"[时间预览] 含转场链 → 输出时间轴模式（总长 {_pv_out:.2f}s；"
+                    f"拖动从 0 解码后输出侧裁剪，seek 较慢但与导出逐帧一致）")
                 # 合成音频图下传（串行合并同款）：out_mode 的输出时间轴与主文件音轨时间轴
                 # 不对齐（图内主声床 atrim=_ssec 后 0 基 + 子声 adelay 落位），引擎直读主文件
                 # 只会放出「第一个视频的完整音频」（用户实测）→ 抽混音段成独立 lavfi 图，
@@ -75317,11 +76750,16 @@ class FFmpegBatchGUI:
                                              # 透明指示棋盘（2026-10-12）：显式下传画中画口径 ——
                                              # 主视频透明，或「主视频之后那段」里显示的子视频带透明。
                                              pipe_alpha=_pv_needs_alpha,
+                                             pipe_speed=_pip_sp,
+                                             pipe_audio_settings=_pa_set,
                                              extra_kw=extra_kw)
             else:
                 self._open_pipe_time_preview(main_file, dict(_ms), graph, None, _ssec,
                                              aspect=_pipe_ar,
-                                             pipe_alpha=_pv_needs_alpha, extra_kw=extra_kw)
+                                             pipe_alpha=_pv_needs_alpha,
+                                             pipe_speed=_pip_sp,
+                                             pipe_audio_settings=_pa_set,
+                                             extra_kw=extra_kw)
             return
 
         # 【mpv/ffplay 回退路径】子视频 movie= 注入各自 trim 起点的 seek_point：回退分支走
@@ -75369,7 +76807,15 @@ class FFmpegBatchGUI:
                 # 【秒开】关掉 hr-seek（同 preview_with_player 的说明）：图内 trim=start=_ssec
                 # 已精确裁切，mpv 不必再消耗 _ssec 秒滤镜输出才出首帧；画面仍逐帧准确。
                 cmd.append("--hr-seek=no")
-            self._append_info_ui(_('[预览] 画中画实时预览：mpv lavfi-complex（{0} 个子视频 movie 合成，可能卡顿）').format(len(sub_videos)))
+            if _pip_sp != 1.0:
+                # A/V 一起变（2026-11-02）：图内音频是 `[aid1]anull` 直通，只能靠 --af 追加 atempo。
+                # 实测 complex 下 --af 照常生效（30s 素材 + atempo=4 ⇒ 7.1s 放完）。
+                # 不加这一段就是「视频 2×、音频 1×」⇒ 音频当主时钟把画面拖回 1×，
+                # 同时图内 PTS 已压缩 ⇒ 起点被推到 2S（用户报的 PiP 表现正是错的）。
+                _pip_at = build_atempo_chain(_pip_sp)
+                if _pip_at:
+                    cmd.append(f"--af={_pip_at}")
+            self._append_info_ui(f"[预览] 画中画实时预览：mpv lavfi-complex（{len(sub_videos)} 个子视频 movie 合成，可能卡顿）")
             self._append_info_ui(_("执行命令: ") + format_cmd_for_display(cmd))
             try:
                 flags = _ffmpeg_spawn_flags()
@@ -75383,7 +76829,7 @@ class FFmpegBatchGUI:
                 # 兜底：Popen 抛 OSError=mpv 进程起不来（不可用），标记标志供后续预览直接回退/提示
                 self._mpv_usable = False
                 self._mpv_verified = True   # 已实测失败，后续预览直接回退不再重试子进程
-                self._append_info_ui(_('[预览] mpv 启动失败: {0}（已标记 mpv 不可用，请检查路径或用快照预览）').format(e))
+                self._append_info_ui(f"[预览] mpv 启动失败: {e}（已标记 mpv 不可用，请检查路径或用快照预览）")
         else:
             # ffplay 回退：图内 [vid1]→[in]、[vo]→[out]，主音频 passthrough 段([aid1]anull[ao])删除
             # （ffplay 主音轨随 -i 自动播放）。图片主视频的循环由图内 `loop=loop=-1` 滤镜承担
@@ -75406,8 +76852,7 @@ class FFmpegBatchGUI:
             # 颜色主视频不走尾垫 movie= 改写（会把颜色哨兵塞进 movie= 滤镜 → ffmpeg 打不开）；
             # 颜色源本身即图内 lavfi 输入，直接走下方 -f lavfi -i 主输入路径。
             if (not _main_is_color) and _pv_total and _main_limit and _pv_total > _main_limit + 0.05:
-                _main_movie = (self._movie_path_safe(main_file, 0)
-                               .replace("\\", "/").replace(":", "\\\\:"))
+                _main_movie = self._movie_path_safe(main_file, 0)
                 _spt = _ssec if (_main_trim_prefix and _ssec is not None) else None
                 _ff_graph = self._pip_graph_to_ffplay(_graph_pv, _main_movie,
                                                       seek_point=_spt, total=_pv_total)
@@ -75426,7 +76871,8 @@ class FFmpegBatchGUI:
                     _lav_cmd.extend(self._ffplay_fit_scale(_out_w, _out_h))
                     _lav_cmd.extend(["-window_title", f"预览(PiP): {os.path.basename(main_file)}"])
                     self._append_info_ui(
-                        _('[预览] 画中画实时预览：ffplay -f lavfi 整图（尾垫 {0:.2f}s → {1:.2f}s，autoexit 盯图 EOF 全片播完自动关窗；窗口内不支持 seek）').format(_main_limit, _pv_total))
+                        f"[预览] 画中画实时预览：ffplay -f lavfi 整图（尾垫 {_main_limit:.2f}s → "
+                        f"{_pv_total:.2f}s，autoexit 盯图 EOF 全片播完自动关窗；窗口内不支持 seek）")
                     self._append_info_ui(_("执行命令: ") + format_cmd_for_display(_lav_cmd))
                     self._spawn_player_stderr_scan(_lav_cmd, scan_ffplay=True)
                     return
@@ -75473,17 +76919,39 @@ class FFmpegBatchGUI:
             # 【子声混音同步升级】图内有混音段时把主声床 + amovie 子声整体搬进 -af，
             # 与 mpv --lavfi-complex 同口径出声（此前 ffplay 一律删混音段退回主音频直放
             # = 真时间轴后半段子声无声，用户实测「ffplay 只有第一段声音」）。
+            # A/V 一起变（2026-11-02）：ffplay 侧同理 —— 视频 setpts 压缩了 PTS，音频不跟就会
+            # 被当成主时钟拖回 1×（同 _pv_audio_speed_factor 的实测）。atempo 追加在 -af 链尾。
+            _pip_at = build_atempo_chain(_pip_sp) if _pip_sp != 1.0 else ""
             _ff_af = self._lavfi_mix_audio_to_ffplay_af(graph) if _has_audio else None
+            if _ff_af and _pip_at:
+                # 混音图尾是标签 [out] ⇒ 必须插在标签**前**；接在整串末尾会变成语法错误。
+                _ff_af = _ff_af.replace("[out]", "," + _pip_at + "[out]", 1)
             if _ff_af:
                 # 子声链每条一个段（[asubK]…[aswK]）；amix 段以 [amain_pv] 开头也含 "[asw"，
                 # 不能按包含计数（会把每条数成 2，9 个报 18）。独立音频轨段前缀 [afsub 同理单计。
                 _n_mix = sum(1 for s in _ff_af.split(";") if s.strip().startswith("[asub"))
                 _n_mix += sum(1 for s in _ff_af.split(";") if s.strip().startswith("[afsub"))
                 self._append_info_ui(
-                    _('[预览] ffplay -af 已混入 {0} 条音频（与 mpv 同口径）').format(_n_mix))
+                    f"[预览] ffplay -af 已混入 {_n_mix} 条音频（与 mpv 同口径）")
                 cmd.extend(["-af", _ff_af])
-            elif _main_trim_prefix and _ssec is not None and _has_audio:
-                cmd.extend(["-af", f"atrim=start={_ssec},asetpts=PTS-STARTPTS"])
+            else:
+                # 非混音：-af = 主声淡入淡出（文件绝对轴）→ 截取 atrim/asetpts → 变速 atempo。
+                # 🔴 淡入淡出（2026-11-03 Bug A）：此前非混音分支漏了 afade —— mpv 把主声
+                # 淡入淡出烤进图的 [aid1]anull…[ao] 段，而 _lavfi_complex_to_ffplay 只保留
+                # 视频段、音频段整段删除 ⇒ ffplay 画中画听不到淡入淡出（用户实测 mpv 能、
+                # ffplay 不能）。这里补回与 mpv 同判据的 afade（_pv_main_fade_abs 已按
+                # _ssec 定位、文件绝对轴），排在 atrim/atempo 之前。
+                _ff_af_parts = []
+                if _has_audio and _pv_main_fade_abs:
+                    _ff_af_parts.append(
+                        _pv_main_fade_abs[1:] if _pv_main_fade_abs.startswith(",")
+                        else _pv_main_fade_abs)
+                if _main_trim_prefix and _ssec is not None and _has_audio:
+                    _ff_af_parts.append(f"atrim=start={_ssec},asetpts=PTS-STARTPTS")
+                if _pip_at:
+                    _ff_af_parts.append(_pip_at)
+                if _ff_af_parts:
+                    cmd.extend(["-af", ",".join(_ff_af_parts)])
             # 缩放到屏幕内（_out_w/_out_h 已在 ffplay 分支开头算好，含画布/网格乘格）
             cmd.extend(self._ffplay_fit_scale(_out_w, _out_h))
             # -t 上限吃延长后的时间轴总长：真时间轴把输出延长到 _pv_total（尾部补黑帧），
@@ -75497,7 +76965,7 @@ class FFmpegBatchGUI:
             if "-window_title" not in cmd:
                 cmd.extend(["-window_title", f"预览(PiP): {os.path.basename(main_file)}"])
             self._append_info_ui(
-                _('[预览] 画中画实时预览：ffplay -vf（{0} 个子视频 movie 合成）').format(len(sub_videos)))
+                f"[预览] 画中画实时预览：ffplay -vf（{len(sub_videos)} 个子视频 movie 合成）")
             self._append_info_ui(_("执行命令: ") + format_cmd_for_display(cmd))
             self._spawn_player_stderr_scan(cmd, scan_ffplay=True)
 
@@ -75702,7 +77170,7 @@ class FFmpegBatchGUI:
                 s.get("codec_type") == "audio" for s in (info.get("streams") or []))
             if not has_a:
                 return False
-            safe = self._movie_path_safe(path, idx).replace("\\", "/").replace(":", "\\\\:")
+            safe = self._movie_path_safe(path, idx)
             src_parts.append(f"movie={safe}:s=a[{lbl}]")
             return True
 
@@ -75711,7 +77179,9 @@ class FFmpegBatchGUI:
         a_labels = []
         summary_bits = []
 
-        _use_global_audio_trim = bool(at_set.get("audio_trim_enabled", False))
+        # 与正式命令同款（2026-11-03）：串行合并忽略「音频独立截取（不分段）」。
+        # 预览必须和成片一致 —— 若预览照旧接管而成片不接管，就成了新的双源分歧。
+        _use_global_audio_trim = False
         _main_file = normalize_path(main_video.file_path) if main_video is not None else ""
         if _use_global_audio_trim and _main_file:
             _astr = (at_set.get("audio_trim_start", "") or "").strip()
@@ -75728,11 +77198,27 @@ class FFmpegBatchGUI:
                     _at_parts.append("anull")
                 _at_parts.append("asetpts=PTS-STARTPTS")
                 _at_chain = ",".join(_at_parts)
+                # 音色链 + 淡入淡出（2026-11-02 第五步）：与导出 `_build_concat_reencode_mode`
+                # 的「音频独立截取」支同款，只差跳过 loudnorm（预览惯例：短窗口重新收敛会抽动）。
+                _gt_tone = build_audio_tone_chain(at_set, include_speed=False,
+                                                  include_loudnorm=False)
+                if _gt_tone:
+                    _at_chain = f"{_at_chain},{','.join(_gt_tone)}"
+                _gt_dur = ((_ae - _as) if (_as is not None and _ae is not None and _ae > _as)
+                           else None)
+                if _gt_dur is None and _as is not None:
+                    _gt_total = self._get_media_duration(_main_file)
+                    if _gt_total:
+                        _gt_dur = max(0.0, float(_gt_total) - _as)
+                _gt_fade = self._build_afade_suffix(at_set, _gt_dur)
+                if _gt_fade:
+                    _at_chain = f"{_at_chain},{_gt_fade}"
                 if audio_concat_normalize:
                     _at_chain = f"{audio_concat_normalize},{_at_chain}"
                 audio_parts.append(f"[am_main]{_at_chain}[aout]")
                 summary_bits.append(
-                    _('音频独立截取（源 {0}，起始 {1} 结束 {2}）').format(os.path.basename(_main_file), _astr or '0', _aend or '末尾'))
+                    f"音频独立截取（源 {os.path.basename(_main_file)}，"
+                    f"起始 {_astr or '0'} 结束 {_aend or '末尾'}）")
             else:
                 # 正式命令此处直接取 [0:a]（图片主视频无音轨时会失败）；预览给安全兜底：
                 # 静音底噪 + 明确日志，避免整张图因一个不存在的音轨直接挂了。
@@ -75775,17 +77261,28 @@ class FFmpegBatchGUI:
                     # 段级时长钳制（同正式命令：短了补静音、长了裁尾，防跨段累计错位）
                     audio_filters.append(f"atrim=0:{_ffsec(effective_duration)}")
                     audio_filters.append(f"apad=whole_dur={effective_duration:.3f}")
+                    # 音色链（2026-11-02 第五步）：与导出 `_build_concat_reencode_mode`
+                    # 的「视频自带音轨」支同款同位置，只差跳过 loudnorm（预览惯例）。
+                    # include_speed=False：变速已由 _append_audio_speed_reverse 处理，
+                    # 再挂一次 atempo 就是双倍速。段级设置各不相同 ⇒ 必须逐段挂。
+                    audio_filters.extend(build_audio_tone_chain(
+                        settings, include_speed=False, include_loudnorm=False))
                     audio_chain = ",".join(audio_filters)
                     if audio_concat_normalize:
                         audio_chain = f"{audio_concat_normalize},{audio_chain}"
                     # 逐轨转场与音频淡入淡出互斥（与正式命令同规则）
-                    if settings.get("fade_enabled", False):
+                    # 淡入淡出设置（2026-11-03）：与导出同判据 —— 串行合并忽略独立音频轨，
+                    # 音频轨自己设的 fade 不生效；这里并进同路径 type="audio" 条目的 fade
+                    # （独立优先、未设才跟随视频轨）。
+                    _fade_set = concat_audio_fade_settings(self.merge_tracks,
+                                                           trk.file_path, settings)
+                    if _fade_set.get("fade_enabled", False):
                         if i < len(trans_effective) and trans_effective[i] is not None:
-                            settings["fade_out"] = ""
+                            _fade_set["fade_out"] = ""
                         if (i > 0 and i - 1 < len(trans_effective)
                                 and trans_effective[i - 1] is not None):
-                            settings["fade_in"] = ""
-                    f_suffix = self._build_afade_suffix(settings, effective_duration)
+                            _fade_set["fade_in"] = ""
+                    f_suffix = self._build_afade_suffix(_fade_set, effective_duration)
                     if f_suffix:
                         audio_chain = f"{audio_chain},{f_suffix}"
                     audio_parts.append(f"[am{i}]{audio_chain}[a{i}]")
@@ -75835,11 +77332,11 @@ class FFmpegBatchGUI:
                 "[aout][bgm]amix=inputs=2:duration=longest:normalize=0[afinal]")
             amap = "[afinal]"
             summary_bits.append(
-                _('背景音乐 {0}（音量 {1:.2f}）').format(os.path.basename(_bgm_path), _bgm_vol))
+                f"背景音乐 {os.path.basename(_bgm_path)}（音量 {_bgm_vol:.2f}）")
 
         if not summary_bits:
             summary_bits.append(_("逐轨音频（有音轨段用真实音轨、图片/无音轨段静音底噪）"))
-        return src_parts, audio_parts, amap, _("；").join(summary_bits)
+        return src_parts, audio_parts, amap, "；".join(summary_bits)
 
     def _concat_graph_to_ffplay(self, graph_str, main_movie, color_spec=None):
         """把「串行合并 lavfi 图」从 mpv 形态改写成 ffplay `-f lavfi -i` 形态（单图字符串版）。
@@ -76149,7 +77646,7 @@ class FFmpegBatchGUI:
                     # 主位置文件：图片 → [vid1] 作次输入
                     source_parts.append(f"[vid1]format={_src_fmt}[img{i}]")
                 else:
-                    safe = self._movie_path_safe(fp, i).replace("\\", "/").replace(":", "\\\\:")
+                    safe = self._movie_path_safe(fp, i)
                     source_parts.append(f"movie={safe}[img{i}]")
                 # 基源段与图源段互不依赖（filtergraph 按标签拓扑排序）→ 两分支共用一行，
                 # 不再各写一遍（旧版 if/else 里两行完全相同）。
@@ -76173,7 +77670,7 @@ class FFmpegBatchGUI:
                     source_parts.append(
                         f"[vid1]{(_crot0 + ',') if _crot0 else ''}format={_src_fmt}[{i}:v]")
                 else:
-                    safe = self._movie_path_safe(fp, i).replace("\\", "/").replace(":", "\\\\:")
+                    safe = self._movie_path_safe(fp, i)
                     # 🔴 2026-10-29：`movie=` 不读 display matrix，而成片里这些轨是**多 `-i`
                     # 输入**（ffmpeg 自动 autorotate）⇒ 不补 transpose 会让该轨的裁剪/缩放/
                     # 定位全按存储帧算（mpv/ffplay/管道三条预览路径同病）。位置与成片一致：
@@ -76269,7 +77766,7 @@ class FFmpegBatchGUI:
                 filter_parts[-1] = _seg0 + "," + _bp_c + "[vo]"
             if _split_c:
                 self._append_info_ui(
-                    _("[预览] 实时预览：多画面拼接 {0}x{1}").format(_cr, _cc)
+                    _('[预览] 实时预览：多画面拼接 {0}x{1}').format(_cr, _cc)
                     + (_("（等宽边框）") if _bp_before_c
                        else (_("（网格外框）") if _bp_c else "")))
             elif _bp_c:
@@ -76394,8 +77891,7 @@ class FFmpegBatchGUI:
             # 主输入不再是文件而是**整张图** ⇒ 主输入 EOF = 图 EOF = 整段拼接时长 ⇒
             # -autoexit 全播完才关窗（这正是旧版删掉这条回退的原因，现已破）。
             _main_movie = (None if _main_is_color else
-                           self._movie_path_safe(main_file, 0)
-                           .replace("\\", "/").replace(":", "\\\\:"))
+                           self._movie_path_safe(main_file, 0))
             # 与 mpv 同图：先注入 movie= 子输入 seek_point，再交给 _concat_graph_to_ffplay
             # 改写 [vid1]→movie（并补主视频轨 seek_point）。ffplay 不可 --start，只靠 seek_point。
             _inj_graph = graph_prepend_metadata_rotation(
@@ -76454,8 +77950,7 @@ class FFmpegBatchGUI:
                           if _main_is_color else main_file)
         cmd = [player, _mpv_main_file, f"--lavfi-complex={_graph_sc}", f"--length={total_dur:g}"] + _mpv_extra
         self._append_info_ui(
-            _("[预览] 滤镜版串行合并预览：mpv lavfi-complex（{0} 轨，"
-            "总时长 {1:.2f}s；含逐轨滤镜 + 转场 + 文字水印；音频：{2}）").format(len(video_tracks), total_dur, audio_summary))
+            _('[预览] 滤镜版串行合并预览：mpv lavfi-complex（{0} 轨，总时长 {1:.2f}s；含逐轨滤镜 + 转场 + 文字水印；音频：{2}）').format(len(video_tracks), total_dur, audio_summary))
         self._append_info_ui(_("执行命令: ") + format_cmd_for_display(cmd))
         try:
             flags = _ffmpeg_spawn_flags()
@@ -76597,12 +78092,35 @@ class FFmpegBatchGUI:
         _s = dict(_main.enc_settings or {})
         with suppress(Exception):
             _s["end_handling"] = copy.deepcopy(self._merge_end_handling)
+        # 独立音频轨设置（2026-11-03）：合并页把主视频的音频分离成 type="audio" 的同路径条目，
+        # EQ / 淡入淡出 / 音频独立变速都记在**它**上面；单轨预览此前只传视频轨设置 ⇒ 这些
+        # 音频设置整个丢失（用户实测「音频轨设淡入淡出/EQ，普通模式管道与 mpv 预览都听不到」）。
+        # 有主视频对应的音频轨就用它（画面链仍走视频轨 _s），否则保持旧行为（settings 自含音频键）。
+        _a_set = None
         try:
-            self._preview_with_settings(path, _s, pipe_engine=pipe_engine, extra_kw=extra_kw)
+            _a_track = next((t for t in self.merge_tracks
+                             if t.enabled and t.type == "audio"
+                             and normalize_path(t.file_path) == path), None)
+            if _a_track is not None:
+                # 淡入淡出跟随（2026-11-03）：视频轨勾「音频跟随」且音频轨自己没设 fade 时，
+                # 把视频轨的淡入/淡出并入（独立设置优先、未设才跟随 —— 见 merge_audio_follow_fade）。
+                # 否则「视频轨设淡入淡出+勾跟随」在存在独立音频轨时，音频链因音频轨无 fade 键
+                # 而整个不淡（用户实测：普通/画中画管道没淡入淡出）。
+                _a_set = merge_audio_follow_fade(dict(_a_track.enc_settings or {}), _s)
+                _a_set["_file_path"] = path
+                # 视频变速跟随：音频轨没有 speed 键时从视频轨取，供 _pv_atempo_factor
+                # 「音频独立变速优先、未设才跟随视频」判据使用（预览必须跟，否则音画不同步）。
+                _a_set.setdefault("speed_enabled", _s.get("speed_enabled", False))
+                _a_set.setdefault("speed_factor", _s.get("speed_factor", "1.0"))
+        except Exception:
+            _a_set = None
+        try:
+            self._preview_with_settings(path, _s, pipe_engine=pipe_engine, extra_kw=extra_kw,
+                                        audio_settings=_a_set)
         except Exception as e:
             _tag = _("时间预览引擎") if pipe_engine else _("实时预览")
-            self._append_info_ui(_('[{0}] 打开失败: {1}').format(_tag, e))
-            messagebox.showwarning(_("提示"), _('{0}启动失败：{1}').format(_tag, e))
+            self._append_info_ui(f"[{_tag}] 打开失败: {e}")
+            messagebox.showwarning(_("提示"), f"{_tag}启动失败：{e}")
 
     def _live_preview_pipe(self, extra_kw=None):
         """右键「实时预览（简易时间引擎）」：按当前合并模式选合成图，喂给内置时间预览窗口。
@@ -77115,6 +78633,8 @@ class FFmpegBatchGUI:
                 temp_settings["speed_enabled"] = False
             # 滤镜倒放预览已取消（2026-08-30）：预览滤镜链强制不含 reverse
             temp_settings['reverse_enabled'] = False
+            # 段变速因子（图内实际生效）：与转换页普通预览同一判据，见 _pv_audio_speed_factor
+            _pv_sp = _pv_audio_speed_factor(temp_settings, _ft_speed)
             mpv_only_args = []
             if _rt_speed and _orig_speed_enabled:
                 try:
@@ -77364,27 +78884,48 @@ class FFmpegBatchGUI:
                 else:
                     filters = tw_vf
 
-            # ---- 音频变速（仅 ffplay） ----
+            # ---- 音频链（与导出共用 build_audio_tone_chain） ----
             extra_args = []
-            af_filters = []
-            if is_main_video and track.enc_settings.get("audio_speed_enabled", False):
-                try:
-                    factor = float(track.enc_settings.get("audio_speed_factor", "1.0"))
-                    if factor != 1.0 and factor > 0:
-                        atempo = build_atempo_chain(factor)
-                        if atempo:
-                            af_filters.append(atempo)
-                except ValueError:
-                    pass
+            # 只挂**一条** atempo（2026-11-02 二版）：原来「本轨 audio_speed_* 一条 + 视频倍率一条」
+            # 拼进同一条 -af 会相乘 ⇒ 视频2×+音频2× 播成 4×。唯一判据见 _pv_atempo_factor。
+            # 旧代码的 `is_main_video` 门控一并去掉：子视频轨自己的 audio_speed 设置同样该被尊重。
+            # 2026-11-02 三版：整条音色链改调统一实现 —— 此前这里**只有一条 atempo**，
+            # 单轨预览完全听不到 音量/EQ/降噪/高低切/声道（与转换页预览同一个病）。
+            _pv_at_seg = _pv_atempo_factor(temp_settings, _ft_speed)
+            # mpv 实时变速开启时音频由 --speed 整体变速（A/V 同一倍率）⇒ 音色链里不能再带 atempo。
+            # 此处**故意不打印提示**：加一句新文案会新增 i18n key（multi 版要走三处联动）。
+            _mpv_speed_on = self.use_mpv.get() and any(
+                str(a).startswith("--speed=") for a in mpv_only_args)
+            af_filters = build_audio_tone_chain(
+                temp_settings,
+                speed_factor=_pv_at_seg,
+                include_speed=not _mpv_speed_on,
+                include_loudnorm=False)
+            # 淡入淡出（2026-11-02 第三步）：单轨预览同样缺 fade —— 与转换页预览共用判据
+            # preview_afade_filters（播放器时间轴 = 文件绝对时间，起点 = 截取起点 + 导出侧值）。
+            # 因子取「实际进链的那个」：mpv --speed 代劳时链里没有 atempo ⇒ 传 1.0，
+            # 否则 atempo 已压缩时间轴 ⇒ 传 _pv_at_seg。实时倒放不接（播放方向与输出时间线相反）。
+            if "--play-direction=backward" not in mpv_only_args:
+                _pv_seek0 = 0.0
+                _pv_win = None
+                if track.enc_settings.get("trim_enabled", False):
+                    _ps = track.enc_settings.get("trim_start", "").strip()
+                    _pe = track.enc_settings.get("trim_end", "").strip()
+                    _pv_seek0 = time_to_seconds(_ps) if _ps else 0.0
+                    _pv_pe = time_to_seconds(_pe) if _pe else None
+                    if _pv_pe is not None and _pv_pe > _pv_seek0:
+                        _pv_win = _pv_pe - _pv_seek0
+                if _pv_win is None:
+                    _pv_tot = self._get_media_duration(track.file_path)
+                    if _pv_tot:
+                        _pv_win = max(0.0, float(_pv_tot) - _pv_seek0)
+                af_filters.extend(preview_afade_filters(
+                    temp_settings, seek_offset=_pv_seek0, window_duration=_pv_win,
+                    speed_factor=1.0 if _mpv_speed_on else _pv_at_seg))
             if af_filters:
-                if self.use_mpv.get():
-                    # 实时变速开启时音频由 mpv --speed 同步变速（与视频同一倍率），不再警告
-                    _rt_speed_on = any(str(a).startswith("--speed=") for a in mpv_only_args)
-                    if not _rt_speed_on:
-                        self._append_info_ui(_("[预览] mpv 预览不支持音频变速，已忽略。"))
-                else:
-                    af_chain = ",".join(af_filters)
-                    extra_args.extend(["-af", af_chain])
+                # 2026-11-02：mpv 也走 --af。旧代码在此丢弃并提示「mpv 不支持音频变速」，
+                # 实测 mpv 0.41 的 --af 完全可用（atempo=4 让 30s 素材 7.1s 放完）。
+                extra_args.extend(["-af", ",".join(af_filters)])
     
             # ---- 截取参数（实时倒放时跳过 --start/--length：backward 模式整段倒放） ----
             start_sec = None
@@ -77404,7 +78945,8 @@ class FFmpegBatchGUI:
             self.preview_with_player(track.file_path, filters or "", extra_args=extra_args,
                                      start_time=start_sec, duration=duration,
                                      mpv_only_args=mpv_only_args,
-                                     precise_seek=True)   # 封装页单体预览：图内无 trim 兜底 ⇒ 精确优先
+                                     precise_seek=True,  # 封装页单体预览：图内无 trim 兜底 ⇒ 精确优先
+                                     graph_speed=_pv_sp)  # 图内 setpts 倍数 ⇒ mpv vf 窗口同除
             if pip_enabled and is_main_video and sub_videos:
                 self._append_info_ui(_("[预览] 占位框尺寸为从视频实际渲染大小"))
     
@@ -78999,6 +80541,12 @@ class FFmpegBatchGUI:
             fade_enabled_var = tk.BooleanVar(value=initial_settings.get("fade_enabled", False))
             fade_in_var = tk.StringVar(value=str(initial_settings.get("fade_in", "")))
             fade_out_var = tk.StringVar(value=str(initial_settings.get("fade_out", "")))
+            # 「音频跟随」（2026-11-03 用户定案）：视频轨的 fade_enabled 本意是**画面**淡入黑/淡出黑，
+            # 但历史实现里音频链读同一个键 ⇒ 「视频一淡、声音跟着淡」（用户明确不接受）。
+            # 勾上 = 保持旧行为（声音跟随视频的淡入淡出）；不勾 = 音频只认音频轨自己的设置，
+            # 没设置就不淡。判据唯一出口 = `audio_fade_view()`。
+            audio_follow_fade_var = tk.BooleanVar(
+                value=bool(initial_settings.get("audio_follow_video_fade", False)))
             # 串行转场（逐轨常驻属性，挂本段，末段无效）
             _tr_type_init = initial_settings.get("transition_type", "fade") or "fade"
             if _tr_type_init not in XFADE_TRANSITIONS:
@@ -79019,8 +80567,20 @@ class FFmpegBatchGUI:
                 notebook.add(page_fade, text=_("淡入淡出"))
                 fade_frame = ttk.Frame(page_fade, padding="10")
                 fade_frame.pack(fill=tk.X, pady=5)
-                ttk.Checkbutton(fade_frame, text=_("启用淡入淡出（片段首尾淡入黑 / 淡出黑）"),
-                                variable=fade_enabled_var).grid(row=0, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+                _fade_cb = ttk.Checkbutton(
+                    fade_frame, text=_("启用淡入淡出（片段首尾淡入黑 / 淡出黑）"),
+                    variable=fade_enabled_var)
+                _fade_cb.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+                # 「音频跟随」勾选框（2026-11-03）：位于「启用淡入淡出」右侧。
+                # 不勾（默认）= 上面这个开关**只管画面**，音频要淡必须在音频设置里单独开；
+                # 勾上 = 音频沿用本轨的淡入/淡出秒数（旧行为）。
+                _af_follow_cb = ttk.Checkbutton(
+                    fade_frame, text=_("音频跟随"), variable=audio_follow_fade_var)
+                _af_follow_cb.grid(row=0, column=2, sticky="w", padx=(12, 5), pady=5)
+                ToolTip(_af_follow_cb,
+                        _("勾选：音频沿用上面的淡入/淡出秒数（画面与声音一起淡）。\n"
+                        "不勾：这里只淡画面；声音是否淡由音频轨自己的淡入淡出决定，\n"
+                        "　　　音频没设置就不淡。"))
                 ttk.Label(fade_frame, text=_("淡入:")).grid(row=1, column=0, sticky="w", padx=5, pady=5)
                 ttk.Entry(fade_frame, textvariable=fade_in_var, width=7).grid(row=1, column=1, padx=5, pady=5, sticky="w")
                 ttk.Label(fade_frame, text=_("秒  淡出:")).grid(row=1, column=2, sticky="w", padx=5, pady=5)
@@ -79213,12 +80773,16 @@ class FFmpegBatchGUI:
             # 水印或画中画模式下，强制启用精准截取
             if is_watermark or (pip_enabled_var is not None and pip_enabled_var.get()):
                 trim_frame.precise_trim.set(True)
+                # 水印/画中画强制精准：清掉互斥的智能切割
+                trim_frame.smart_cut.set(False)
                 trim_frame.precise_check.config(state='disabled')
+                trim_frame.smartcut_check.config(state='disabled')
                 if not self._trim_precise_hint_shown:
                     self._append_info_ui(_("[设置] 水印/画中画模式下已自动启用精准截取。"))
                     self._trim_precise_hint_shown = True
             else:
                 trim_frame.precise_check.config(state='normal')
+                trim_frame.smartcut_check.config(state='normal')
                # trim_frame.precise_trim.set(False)
 
             # 设置回调（此时 trim_frame 已存在）
@@ -79726,6 +81290,11 @@ class FFmpegBatchGUI:
                         # 用户 2026-09-16：与「分段拼接设置窗口左下」同款模块；
                         # 跨分段生效——开启后从【主视频源文件】音频中单独截取一段，整段接管合并输出音频
                         # （忽略各分段自身的嵌入音频）。程序不检测是否同源，仅提示 + 勾选时双重确认。
+                        # ⚠ 2026-11-03 用户定案：串行合并命令端**已忽略**本模块所有取值
+                        # （`_build_concat_reencode_mode` / 预览 `_build_concat_audio_graph_mpv`
+                        # 都把音频独立截取判据强制为 False）——一旦启用，任一段的音频截取都会让
+                        # 后续分段错位，且偏差到成片才暴露。UI 保留（便于后续若做「按段对齐」
+                        # 再复用），但勾选不生效。
                         audio_trim_enabled_var = tk.BooleanVar(
                             value=bool(initial_settings.get("audio_trim_enabled", False)))
                         audio_trim_start_var = tk.StringVar(
@@ -79752,7 +81321,8 @@ class FFmpegBatchGUI:
                                 "本功能完全对齐转换页面分段拼接窗口内的模块，不是为不同文件列表设计的。\n"
                                 "目的还是在重新整合视频片段时不打断原始背景音乐的连续性。\n"
                                 "⚠ 程序不自动检测源文件是否一致——请自行确认本列表所有分段来自同一源文件，\n"
-                                "否则音频与画面会对不上。音频起止以【源文件】时间轴为准。"),
+                                "否则音频与画面会对不上。音频起止以【源文件】时间轴为准。\n"
+                                "⚠ 串行合并命令端已忽略本模块（2026-11-03）：勾选不会改变成片。"),
                                 wraplength=420)
                         # 蓝字参考：放启用复选框右边，简短（作为音频截取长度参考）
                         # 常驻标签 + 句柄，供「一键淡入淡出(all)/一键转场(all)」即时刷新
@@ -79787,13 +81357,7 @@ class FFmpegBatchGUI:
             # ================== 新增结束 ==================
 
             # ---- 窗口居中 ----
-            # 🔴 multi 专有差异（2026-10-28 用户要求）—— **port 时别把它改回 700**：
-            #   base 是 `center_window(win, 700, 310)`；英文界面绝大多数标签比中文长
-            #   （"Position, size, rotate" / "Bitrate control" / "Encoder & quality" …），
-            #   700 宽下本窗「视频滤镜」「位置」两页的行会被挤到换行、末列控件被截。
-            #   ⇒ multi 单独 +50 = 750（高度不动）。这不是漏 port，是刻意的本地化加宽；
-            #   若哪天 base 也加宽，请两边取各自的值，别强行对齐。
-            center_window(win, 750, 310)
+            center_window(win, 700, 310)
 
             # ---- 保存按钮 ----
             def save():
@@ -79818,6 +81382,11 @@ class FFmpegBatchGUI:
                         new_settings["file_path"] = initial_settings.get("file_path", "")
                         new_settings["duration"] = initial_settings.get("duration", None)
                     else:
+                        # 「音频跟随」（2026-11-03）：本页淡入淡出只管画面；音频要不要跟着淡
+                        # 由这个勾选框决定。三种模式（普通/画中画/串行）都存 —— 普通模式单轨
+                        # 预览与导出同样经过这里。判据出口见 audio_fade_view()。
+                        if track_obj is not None and getattr(track_obj, "type", None) == "video":
+                            new_settings["audio_follow_video_fade"] = audio_follow_fade_var.get()
                         # 音频绑定设置：画中画 + 串行模式的主视频均收集 BGM；音频源类型 / 音频独立截取仅串行
                         if (is_concat_mode or is_pip) and track_obj is not None and track_obj.type == "video":
                             if is_concat_mode:
@@ -79832,6 +81401,7 @@ class FFmpegBatchGUI:
                                 new_settings["pip_audio_follow_transition"] = pip_aft_var.get()
                             if is_concat_mode and is_main_video:
                                 # 音频独立截取（不分段）：仅主视频 concat 模式
+                                # （取值照存，但命令端已忽略——见 UI 处注释 2026-11-03）
                                 new_settings["audio_trim_enabled"] = audio_trim_enabled_var.get()
                                 new_settings["audio_trim_start"] = audio_trim_start_var.get().strip()
                                 new_settings["audio_trim_end"] = audio_trim_end_var.get().strip()
@@ -79870,7 +81440,7 @@ class FFmpegBatchGUI:
                 except Exception as e:
                     import traceback
                     traceback.print_exc()
-                    messagebox.showerror(_("保存错误"), _('发生错误：{0}\n请查看控制台详细错误。').format(e))
+                    messagebox.showerror(_("保存错误"), f"发生错误：{e}\n请查看控制台详细错误。")
                 finally:
                     try:
                         win.destroy()
@@ -80164,8 +81734,7 @@ class FFmpegBatchGUI:
                                 #   日志里一片安静，无处可查）。同一结论只报一次。
                                 self._log_once(
                                     "pv_graph_err:orig:%s" % type(_e_o).__name__,
-                                    _("[预览] 原帧构图失败（已退回纯主视频原帧）：{0!r}")
-                                    .format(_e_o))
+                                    _("[预览] 原帧构图失败（已退回纯主视频原帧）：%r") % (_e_o,))
                             if _cf_o and _lb_o:
                                 return self.build_seek_frame_cmd(
                                     src, [], _cf_o, _lb_o, t,
@@ -80210,8 +81779,8 @@ class FFmpegBatchGUI:
                             #   同一结论（异常类型 + 消息）只报一次，避免滑块拖动刷屏。
                             self._log_once(
                                 "pv_graph_err:proc:%s" % type(_e_pv).__name__,
-                                _("[预览] 叠加构图失败（本次预览退化为无叠加链，画面可能发黑）：{0!r}")
-                                .format(_e_pv))
+                                _("[预览] 叠加构图失败（本次预览退化为无叠加链，画面可能发黑）：%r")
+                                % (_e_pv,))
                         # ⚠️ fit_box=True：`scale=W:H` 是硬拉伸 → 16:9 会被压成正方形
                         # （2026-10-04 用户报「主视频和子视频都压扁」）。等比装框，
                         # 与 build_enhance_preview_cmd / build_blur_preview_cmd 同一口径。
