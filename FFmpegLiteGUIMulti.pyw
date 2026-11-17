@@ -1734,8 +1734,12 @@ def rows_to_fgmodel(rows):
     _nodes = []
     _produced = set()
     _idx = 0
+    # 简单滤镜行（`-vf` / `-af`）里「没有 pad 标签」的连续段：按真实语义它们是同一条
+    # 逗号串行链（`-vf a,b` = a 的输出喂 b），但拆成多条子链后没有任何标签可挂 ⇒
+    # 图里彼此孤立。这里记下「行号 → 该行的无 pad 节点序号」，建完节点后补隐式边。
+    _serial = {}
 
-    def _mk(_in_s, _content, _out_s, _ri, _ci):
+    def _mk(_in_s, _content, _out_s, _ri, _ci, _ser=False):
         """建一个 FGNode（闭包只为少写一遍 pad 推导；row_ref 由调用方给）。"""
         nonlocal _idx
         _in_pads = [FGPad(p, _cmd_pad_kind(p, _content))
@@ -1748,12 +1752,17 @@ def rows_to_fgmodel(rows):
                              _in_pads, _out_pads, _cmd_node_kind(_content),
                              row_ref=(_ri, _ci),
                              raw=(_in_s, _content, _out_s)))
+        if _ser and not _in_pads and not _out_pads:
+            _serial.setdefault(_ri, []).append(len(_nodes) - 1)
         _idx += 1
 
     for _ri, _r in enumerate(rows or []):
         _chains = _r.get("chains")
         if not _chains:
             continue
+        # 只有「单流滤镜链」行（`-vf` / `-af` / `-filter`）的段之间才是逗号串行语义；
+        # `-filter_complex` 的行内多条子链是靠标签连的，段序不等于数据流，不能补边。
+        _simple_row = _cmd_filter_opt_base(_r.get("opt")) in CMD_SIMPLE_FILTER_OPTS
         for _ci, _ch in enumerate(_chains):
             if isinstance(_ch, (list, tuple)):
                 _in_s, _content, _out_s = (list(_ch) + ["", "", ""])[:3]
@@ -1776,7 +1785,7 @@ def rows_to_fgmodel(rows):
                     _si, _sc, _so = cmd_split_chain_pads(_s)
                     _mk(_si, _sc, _so, _ri, _ci)
             else:
-                _mk(_in_s, _content, _out_s, _ri, _ci)
+                _mk(_in_s, _content, _out_s, _ri, _ci, _simple_row)
     # 边：上游 out_pad 名 == 下游 in_pad 名 —— **按链序绑定**（2026-10-20）。
     # 旧实现是「同名全连接」：每条 in_pad 连到**所有**同名 out_pad。
     # 同名标签「先产 → 消费 → 再产」的合法复用（典型：[amain][fx0]amix=…[amain]，
@@ -1799,6 +1808,15 @@ def rows_to_fgmodel(rows):
                     _src_i = _j          # 列表按节点序生成 ⇒ 最后命中的即「最近的」
             if _src_i >= 0:
                 _edges.append(FGEdge(_nodes[_src_i].nid, _p.name, _n.nid, _p.name))
+    # 🩹 2026-11-16（用户报「单视频命令点 `-vf format=…` 这行右栏不出图」）：
+    # 简单滤镜行按逗号拆出的相邻无 pad 段，补一条**隐式串行边**（pad 名留空）。
+    # 为什么要边而不是在出图侧另写一套：`fgmodel_subgraph_nodes` / `fgmodel_levels` /
+    # 节点图连线全部只认 edges ⇒ 不补边时选中第 2 段拿不到第 1 段，子图缺前序滤镜
+    # （出图会少效果）且节点图上几段互相平行、看不出是一条链。
+    # 只连同一行内、按列表顺序相邻的两段（节点列表本就按行/段序生成）。
+    for _ri, _idxs in _serial.items():
+        for _a, _b in zip(_idxs, _idxs[1:]):
+            _edges.append(FGEdge(_nodes[_a].nid, "", _nodes[_b].nid, ""))
     _inputs = sorted({_p.name for _n in _nodes for _p in _n.in_pads
                       if _p.name not in _produced})
     _consumed = {_q.name for _m in _nodes for _q in _m.in_pads}
@@ -1941,6 +1959,15 @@ def fgmodel_build_node_complex(model, target_nid):
     if _tgt and not _tgt.filters and _tgt.in_pads:
         _out_pad = _tgt.in_pads[0].name
     if not _out_pad:
+        # 🩹 2026-11-16（用户报「单视频命令点 `-vf format=yuv420p` 这行右栏不出图」）：
+        # **无标签的简单滤镜链**（`-vf` / `-af` / `-filter`）—— 逗号段既没有 in_pad 也没有
+        # out_pad，旧实现到这里直接 (None, None)，右栏于是显示「此节点无合法滤镜，不出图」。
+        # 真实语义 = 「第一路输入套这条逗号链」：补 `[0:v]`（音频链用 `[0:a]`）入口 +
+        # 一个合成出口标签，与 `-vf` 等价；前序段由 rows_to_fgmodel 的隐式串行边带进
+        # 子图（`-vf a,b` 选 b 时预览的是 a→b 的合成结果，不是只有 b）。
+        if _tgt is not None and _tgt.filters and not _tgt.in_pads and not _tgt.out_pads:
+            _src_pad = "[0:a]" if _tgt.kind == "a" else "[0:v]"
+            return _src_pad + ",".join(_chains) + "[__pvtgt]", "[__pvtgt]"
         return None, None
     # 🩹 2026-10-14：子图被截断后，某些输出 pad 在子图内部**没有消费者**
     # （典型：`[x]format=rgba,split=3[mka][mkas][mkml]` 只取 [mka] 这一路预览，
@@ -4699,6 +4726,36 @@ def _make_edge_adjuster(get_points, set_points, orig_w, orig_h, redraw, grow):
         set_points([(l, t), (r, b)])
         redraw()
     return adjust
+
+
+def _ratio_fit_rect(x1, y1, x2, y2, rw, rh):
+    """把「拖拽起止点」按 `rw:rh` 比例收口 → 修正后的 (x2, y2)（原始像素空间）。
+
+    可视化裁剪窗「锁定比例」的**纯函数内核**（2026-11-16）。抽到模块级是为了能无 Tk 单测：
+    这段是纯粹的比值换算，写进闭包里就只能靠真窗口拖拽验证。
+
+    规则：保留拖拽方向（左上/左下/右上/右下都行），取「宽/比例宽、高/比例高」里
+    **较小**的一档定边长 ⇒ 收口后的框恒落在手指拖出的矩形之内（不会顶出画面、
+    也不会超出手指范围）。
+    比例非法（<=0 / 非数 / 拖拽退化）⇒ 原样返回 (x2, y2)，调用方行为与旧版一致。
+    """
+    try:
+        rw = float(rw)
+        rh = float(rh)
+    except (TypeError, ValueError):
+        return x2, y2
+    if rw <= 0 or rh <= 0:
+        return x2, y2
+    dw = abs(x2 - x1)
+    dh = abs(y2 - y1)
+    if dw < 1 or dh < 1:
+        return x2, y2
+    k = min(dw / rw, dh / rh)
+    if k <= 0:
+        return x2, y2
+    sx = 1.0 if x2 >= x1 else -1.0
+    sy = 1.0 if y2 >= y1 else -1.0
+    return x1 + sx * k * rw, y1 + sy * k * rh
 
 
 def _make_on_lang_select(lang_var, custom_lang_entry, common_languages):
@@ -15138,12 +15195,43 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
         decoder = settings.get("hwaccel_decoder", "")
         native = settings.get("hwaccel_enabled", False) and _decoder_matches_api(decoder, filter_mode)
         enc_gpu = _is_gpu_encoder(settings.get("encoder", ""))
+        # 🔴 2026-11-08 用户报「勾了 fmt420，切硬件加速后 fmt 就没了」：
+        #   上方 14979 注释承诺「硬件链边界统一处理像素格式」，但软件 format= 在
+        #   _native 链里被跳过（显存帧吃不了），旧代码又只在 **CPU 编码器** 分支补
+        #   `hwdownload,format=<pix>`；GPU 编码器（nvenc/qsv/amf）的纯硬件链与混合链
+        #   都把帧直接送进编码器 ⇒ 用户勾的 yuv420p 在命令里彻底消失（10bit 源照样
+        #   输出 10bit）。定案口径＝「补齐边界格式」：只要勾了「指定」且走 GPU 编码器，
+        #   链末尾补一次 hwdl → format=<用户值> → hwupload，让设置逐字可见且真生效。
+        #   ⚠️ 闸门 need_pix 保证零回归：不勾「指定」/ include_format=False（预览、
+        #   子视频链）/ 非 native / CPU 编码器 / filter_mode=cpu 的行为逐字节不变。
+        #   代价是默认硬件命令多一次显存往返（默认就勾着「指定 yuv420p」）。
+        # 🔴 2026-11-08 第二轮（用户选「surface 归一化」）：所有 hwdownload 前统一插
+        #   硬件侧 `scale_*=format=nv12`，让 surface 恒 nv12 ⇒ 不再按用户输出格式猜
+        #   源位深（旧猜法在「8bit 源 + 勾 10bit 输出」真机 rc=127）。10bit 输出由
+        #   链尾软件 `format=<pix>` 在内存里落定；详见 `_hw_surface_norm_filter()`。
+        _pix_on = include_format and settings.get("pix_fmt_enabled", False)
+        _pix_user = str(settings.get("pix_fmt", "yuv420p") or "yuv420p")
+        _need_pix = _pix_on and native and enc_gpu
+        _fmt_tail = f"format={_pix_user}," if _pix_user != "nv12" else ""
+        _dl = "nv12"                       # 归一化后显存 surface 恒 nv12
+        _norm = _hw_surface_norm_filter(filter_mode)
+        # 所有含 hwdownload 的分支共用这一前缀，保证「先归一化、再下载」不被漏掉
+        _hwdl = (_norm + "," if _norm else "") + f"hwdownload,format={_dl}"
+        up = _hwupload_token(filter_mode, device)
         if native and not has_software_only and hw_filters:
             # 纯硬件链路：数据全程在显存，无需 hwdownload / hwupload
             chain = ",".join(hw_filters)
             if not enc_gpu:
                 pix = settings.get("pix_fmt", "yuv420p") if settings.get("pix_fmt_enabled", False) else "nv12"
-                chain = f"{chain},hwdownload,format={pix}"
+                # 旧代码直接 `hwdownload,format={pix}`(yuv420p) ⇒ 与 nv12 surface
+                # 不匹配，**8bit 源也 rc=127**（本机 QSV 实测）。先归一化并落 surface，
+                # 再在内存里转用户勾的格式；不勾「指定」时链尾不补 format=。
+                chain = f"{chain},{_hwdl}"
+                if pix != _dl:
+                    chain += f",format={pix}"
+            elif _need_pix:
+                # 纯硬件链：拉回内存落定格式，再上传回显存给 GPU 编码器
+                chain = f"{chain},{_hwdl},{_fmt_tail}{up}"
             return chain
         if not native:
             # 没有硬件解码 -> 帧在内存，无法 hwdownload，退回纯软件滤镜链
@@ -15151,14 +15239,20 @@ def build_video_filter_chain(settings: Dict[str, Any], include_subtitle: bool = 
         # 3) 混合链路：软件滤镜用 hwdownload 拉回内存处理，再 hwupload 回显存
         sw_chain = ",".join(filters)
         if not sw_chain or sw_chain == "null":
-            # 没有软件滤镜时不生成空白包裹（hwdownload,format=nv12,,hwupload=...）
-            return "null"
-        up = _hwupload_token(filter_mode, device)
+            if not _need_pix:
+                # 没有软件滤镜时不生成空白包裹（hwdownload,format=nv12,,hwupload=...）
+                return "null"
+            # 空软件链也要生成纯「格式落定」链，否则 -vf 整个消失（用户最容易踩的一种：
+            # 只勾 fmt420、不选任何滤镜、切硬件档 ⇒ 旧代码返回 "null"）。
+            return f"{_hwdl},{_fmt_tail}{up}"
         if enc_gpu:
-            return f"hwdownload,format=nv12,{sw_chain},{up}"
+            if _need_pix:
+                # 混合链：软件链跑完仍在内存，上传前补用户勾的格式
+                return f"{_hwdl},{sw_chain},{_fmt_tail}{up}"
+            return f"{_hwdl},{sw_chain},{up}"
         # CPU 编码器：处理完直接留在内存，并显式指定输出像素格式
         pix = settings.get("pix_fmt", "yuv420p") if settings.get("pix_fmt_enabled", False) else "nv12"
-        return f"hwdownload,format=nv12,{sw_chain},format={pix}"
+        return f"{_hwdl},{sw_chain},format={pix}"
 
     return filter_chain
 
@@ -15272,6 +15366,31 @@ def _hwupload_token(api: str, device: str) -> str:
     if api == "vaapi":
         return "hwupload=extra_hw_frames=64"
     return "hwupload"
+
+def _hw_surface_norm_filter(api: str) -> str:
+    """hwdownload 前把显存 surface 归一化成 nv12，使 `hwdownload,format=nv12` 恒成立。
+
+    🔴 2026-11-08 真机定案（QSV FFmpeg 9.0.1 / NVENC FFmpeg 7.1.5）：
+      `hwdownload` 的输出格式必须**精确匹配**显存 surface，写错即
+      `Invalid output format <fmt> for hwframe download`（8bit surface = nv12、
+      10bit = p010le；互写都 rc=127）。不写 format / 用 null 隔开也失败，因为
+      ffmpeg 会把链上后面的 `format=` 反推成 hwdownload 的输出格式。
+      纯函数拿不到源位深，旧法「按用户勾的 pix_fmt 推断 surface」会在
+      「8bit 源 + 勾 10bit 输出」时给出 p010le 而炸（真机 rc=127）。
+    ⇒ 不猜源：下载之前用硬件侧滤镜把 surface 统一转成 nv12。四个硬件 scale
+      滤镜的 `-h filter=` 都确认有 `format` 选项；与链上已有的 scale 串联可用
+      （QSV/NVENC × 8bit/10bit 源 × 8bit/10bit 输出共 6 条真机 rc=0）。
+      用户要的 10bit 输出由链尾软件 `format=<pix>` 在内存里落定，不依赖 surface。
+    ⚠️ 只在需要 hwdownload 的链里插；纯硬件链（无 hwdownload）不受影响。
+      本机无 AMD 卡，vaapi 分支按 `-h filter=scale_vaapi` 文档拼对、未端到端实测。
+    """
+    if api == "cuda":
+        return "scale_cuda=format=nv12"
+    if api == "qsv":
+        return "scale_qsv=format=nv12"
+    if api == "vaapi":
+        return "scale_vaapi=format=nv12"
+    return ""
 
 def build_preview_filter_chain(settings: Dict[str, Any], target_height: int = 960, reverse: bool = False) -> str:
     """生成预览用的滤镜链，强制缩放到指定高度"""
@@ -20556,6 +20675,42 @@ HW_MODE_ENCODER = {
     "vaapi": "hevc_amf",
 }
 
+# ---- 常用预设（转换页「输入 / 输出」区右上短按钮，2026-11-06 从 C 子项目重构）----
+# 全是内置常量、不读任何外部设置；点哪项只写哪项。速度档同时写「编码预设」+
+# 当前码控的质量值，档位值按该编码器 preset 表挑第一个命中（软件 veryfast…、
+# NVENC p1…p7、QSV、AMF、SVT-AV1 数字档、VP9），故 UI 不必按编码器族分派。
+QUICK_SPEED_TIERS = (
+    ("极快",   26),
+    ("快速",   24),
+    ("均衡",   23),
+    ("高画质", 21),
+    ("极致",   19),
+)
+QUICK_SPEED_CANDS = (
+    ("veryfast", "superfast", "ultrafast", "p1", "rt", "8", "speed"),
+    ("faster", "fast", "p2", "7", "6", "speed"),
+    ("medium", "p4", "balanced", "good", "5", "default"),
+    ("slow", "p6", "quality", "best", "3", "2", "1"),
+    ("slower", "veryslow", "p7", "quality", "best", "0"),
+)
+# 值 = HW_FILTER_MODE_OPTIONS 的 index；编码器 / 解码器 / 码控全交给
+# AdvancedFrame._on_filter_mode_change()，这里不另写一份 index 映射。
+QUICK_HW_TIERS = (
+    ("NVIDIA NVENC (CUDA) → hevc_nvenc", 1),
+    ("Intel QSV → hevc_qsv", 2),
+    ("AMD AMF (VAAPI) → hevc_amf", 3),
+    ("关闭硬件加速（还原软件编码器与 CRF）", 0),
+)
+QUICK_HEIGHT_TIERS = (
+    ("4K 2160p (3840×2160)", 2160),
+    ("2.5K 1440p (2560×1440)", 1440),
+    ("1080p (1920×1080)", 1080),
+    ("720p (1280×720)", 720),
+    ("576p PAL (720×576)", 576),
+    ("480p (854×480)", 480),
+    ("360p (640×360)", 360),
+)
+
 # ----- 提示类 -----
 class ToolTip:
     def __init__(self, widget, text, offset_x=15, offset_y=15, wraplength=400):
@@ -25801,6 +25956,30 @@ class VideoFilterFrame(ttk.LabelFrame):
                 nonlocal points
                 points = list(new_pts)
 
+            # ----- 锁定比例（2026-11-16 用户要求：自动检测黑边上面加 勾选 + 宽/高）-----
+            # 变量**无条件**创建：delogo / 局部滤镜语境不建这一块控件，但拖拽回调里会读
+            # `lock_ratio`，悬空就是拖一下就 NameError。
+            lock_ratio = tk.BooleanVar(value=False)
+            ratio_w_var = tk.StringVar(value="16")
+            ratio_h_var = tk.StringVar(value="9")
+
+            def _locked_rect(x1, y1, x2, y2):
+                """拖拽起止点 → 按「锁定比例 宽:高」收口后的终点（原始像素空间）。
+
+                未勾选 / 比例字段非法 ⇒ 原样返回，与旧版逐字节一致；换算本体在模块级
+                `_ratio_fit_rect`（纯函数，可无 Tk 单测）。
+                ⚠️ 只约束**鼠标拖拽新画**的框：自动检测黑边与宽高左上数值框给的是内容
+                真实边界，强行套比例会把该留的画面切掉（窗口 tooltip 里写明了）。
+                """
+                if not lock_ratio.get():
+                    return x2, y2
+                try:
+                    rw = float(ratio_w_var.get())
+                    rh = float(ratio_h_var.get())
+                except (TypeError, ValueError):
+                    return x2, y2
+                return _ratio_fit_rect(x1, y1, x2, y2, rw, rh)
+
             edge_adjust = _make_edge_adjuster(lambda: points, _set_points,
                                               orig_w, orig_h, redraw_crop_rect, grow=False)
 
@@ -25885,6 +26064,13 @@ class VideoFilterFrame(ttk.LabelFrame):
                 if drag_rect_id:
                     canvas.delete(drag_rect_id)
                 sx, sy = drag_start_display
+                # 锁定比例：在**原始像素**空间收口，再折回显示坐标画虚线
+                # （显示坐标带 SAR 缩放，直接按显示比例算会歪）。
+                if lock_ratio.get():
+                    _ox1, _oy1 = display_to_original(sx, sy)
+                    _ox2, _oy2 = display_to_original(cur_dx, cur_dy)
+                    _ox2, _oy2 = _locked_rect(_ox1, _oy1, _ox2, _oy2)
+                    cur_dx, cur_dy = original_to_display(_ox2, _oy2)
                 drag_rect_id = canvas.create_rectangle(
                     sx + PADDING, sy + PADDING,
                     cur_dx + PADDING, cur_dy + PADDING,
@@ -25910,6 +26096,8 @@ class VideoFilterFrame(ttk.LabelFrame):
                 sx, sy = drag_start_display
                 ox1, oy1 = display_to_original(sx, sy)
                 ox2, oy2 = display_to_original(ex, ey)
+                # 锁定比例：正式落点与拖拽中的虚线同口径（否则松手瞬间矩形会跳一下）
+                ox2, oy2 = _locked_rect(ox1, oy1, ox2, oy2)
                 if abs(ox2 - ox1) > 0 and abs(oy2 - oy1) > 0:
                     _set_points([(ox1, oy1), (ox2, oy2)])
                     if rect_id:
@@ -26024,29 +26212,31 @@ class VideoFilterFrame(ttk.LabelFrame):
                 old = self.current_file
                 self.current_file = input_file
                 try:
-                    self.auto_detect_crop()
+                    # 🔴 2026-11-16：检测**异步**（后台线程 + `after(0,…)` 写值），
+                    # 所以画框必须挂回调，不能在 `auto_detect_crop()` 返回后同步读
+                    # `self.crop_enabled` —— 那样读到的永远是上一次的结果（用户报
+                    # 「第一次点自动检测只填数值不画框，第二次点才画」）。
+                    self.auto_detect_crop(_after_detect)
                 finally:
                     self.current_file = old
-                if self.crop_enabled.get():
-                    try:
-                        w = int(self.crop_width.get())
-                        h = int(self.crop_height.get())
-                        x = int(self.crop_left.get())
-                        y = int(self.crop_top.get())
-                        nonlocal points, rect_id
-                        if rect_id:
-                            canvas.delete(rect_id)
-                        _set_points([(x, y), (x + w, y + h)])
-                        dx1, dy1 = original_to_display(x, y)
-                        dx2, dy2 = original_to_display(x + w, y + h)
-                        rect_id = canvas.create_rectangle(
-                            dx1 + PADDING, dy1 + PADDING,
-                            dx2 + PADDING, dy2 + PADDING,
-                            outline='red', width=2
-                        )
-                        update_info()
-                    except:
-                        pass
+            def _after_detect(w, h, x, y):
+                """检测完成后的画框回调（在检测线程排进主线程队列、且排在那串写值之后）。"""
+                nonlocal points, rect_id
+                try:
+                    _x, _y, _w, _h = int(x), int(y), int(w), int(h)
+                    if rect_id:
+                        canvas.delete(rect_id)
+                    _set_points([(_x, _y), (_x + _w, _y + _h)])
+                    dx1, dy1 = original_to_display(_x, _y)
+                    dx2, dy2 = original_to_display(_x + _w, _y + _h)
+                    rect_id = canvas.create_rectangle(
+                        dx1 + PADDING, dy1 + PADDING,
+                        dx2 + PADDING, dy2 + PADDING,
+                        outline='red', width=2
+                    )
+                    update_info()
+                except Exception:
+                    pass
     
             # ----- 时间跳转和重新获取画面 -----
             # 2026-09-02：时间框与「重新获取画面」合并到同一行（左时间 / 右按钮），
@@ -26196,7 +26386,50 @@ class VideoFilterFrame(ttk.LabelFrame):
             # ----- 其他按钮 -----
             btn_frame = ttk.Frame(right_frame)
             btn_frame.pack(fill=tk.X, pady=5)
-    
+
+            if show_black_border:
+                # 锁定比例块（2026-11-16 用户要求：放在「自动检测黑边」**上面**）
+                # 勾选后拖拽画框按 宽:高 收口（`_locked_rect`），宽/高可任意正整数，
+                # 1920:1080 与 16:9 等价（只取比值）。
+                _lock_row = ttk.Frame(btn_frame)
+                _lock_row.pack(fill=tk.X, pady=(0, 2))
+                _lock_chk = ttk.Checkbutton(_lock_row, text=_("锁定比例"), variable=lock_ratio)
+                _lock_chk.pack(side=tk.LEFT)
+                # 宽/高与勾选框同排（2026-11-17 用户改：原先两行可并一行，标签简化为「宽/高」）
+                ttk.Label(_lock_row, text=_("宽")).pack(side=tk.LEFT, padx=(6, 2))
+                _lock_w = ttk.Spinbox(_lock_row, from_=1, to=9999, width=5,
+                                      textvariable=ratio_w_var, state="normal")
+                _lock_w.pack(side=tk.LEFT)
+                ttk.Label(_lock_row, text=_("高")).pack(side=tk.LEFT, padx=(6, 2))
+                _lock_h = ttk.Spinbox(_lock_row, from_=1, to=9999, width=5,
+                                      textvariable=ratio_h_var, state="normal")
+                _lock_h.pack(side=tk.LEFT)
+
+                def _swap_ratio():
+                    """互换宽/高（16:9 ⇄ 9:16）；只改比值，不重画已有框。"""
+                    _w, _h = str(ratio_w_var.get()).strip(), str(ratio_h_var.get()).strip()
+                    ratio_w_var.set(_h)
+                    ratio_h_var.set(_w)
+
+                # ⇄ 与缩放行的交换按钮同符号（:24372），左键互换宽高
+                _swap_btn = ttk.Button(_lock_row, text="⇄", width=3, command=_swap_ratio)
+                _swap_btn.pack(side=tk.LEFT, padx=(6, 0))
+                ToolTip(_lock_chk,
+                        _("勾选后，用鼠标拖拽新画裁剪框时按此 宽:高 收口（只取比值，\n"
+                          "1920:1080 与 16:9 等价）。\n"
+                          "⚠️ 只约束拖拽画框：自动检测黑边 / 宽高数值框给的是内容真实边界，\n"
+                          "强行套比例会把该保留的画面切掉，故不受此项影响。"), wraplength=460)
+                ToolTip(_lock_w,
+                        _("锁定比例里的「宽」：与右侧「高」一起只表示比值。\n"
+                          "输入非法（0 / 非数字）时锁定不生效，画框行为退回未勾选状态。"),
+                        wraplength=440)
+                ToolTip(_lock_h,
+                        _("锁定比例里的「高」：与左侧「宽」一起只表示比值。"),
+                        wraplength=440)
+                ToolTip(_swap_btn,
+                        _("互换宽与高（16:9 ⇄ 9:16）。只换比值，不影响已画好的框；下次拖拽生效。"),
+                        wraplength=440)
+
             if show_black_border:
                 ttk.Button(btn_frame, text=_("自动检测黑边"), command=auto_detect).pack(fill=tk.X, pady=2)
 
@@ -28250,7 +28483,14 @@ class VideoFilterFrame(ttk.LabelFrame):
         win.grab_set()
         win.wait_window()
 
-    def auto_detect_crop(self):
+    def auto_detect_crop(self, on_done=None):
+        """跑 cropdetect 并把结果写回 `crop_*` 变量（异步）。
+
+        :param on_done: 可选回调 `f(w, h, x, y)`，在**主线程**、且在那串 `crop_*` 写值
+            之后执行。调用方需要「拿到本次结果」时必须用这个，不能在函数返回后同步读
+            `crop_*` —— 检测跑在后台线程，返回时写值还排在 `after(0,…)` 队列里
+            （2026-11-16 用户报「自动检测黑边第一次只填数值、第二次才画框」的根因）。
+        """
         input_file = getattr(self, 'current_file', None)
         if not input_file or not os.path.exists(input_file):
             # 2026-09-23：同 open_crop_editor，只有转换页语境才兜底到转换页输入文件
@@ -28350,6 +28590,12 @@ class VideoFilterFrame(ttk.LabelFrame):
                 self.app.root.after(0, lambda: self.crop_left.set(x))
                 self.app.root.after(0, lambda: self.crop_top.set(y))
                 self.app.root.after(0, lambda: self.crop_enabled.set(True))
+                if on_done is not None:
+                    # 回调必须同样排进主线程队列，且**排在**上面 5 个写值之后
+                    # （Tk 的 `after(0,…)` 按注册顺序执行）⇒ 回调里读 `crop_*` 拿到的是
+                    # 本次结果。绝不能在这里直接 `on_done(...)`：本函数跑在后台线程里。
+                    self.app.root.after(
+                        0, lambda: on_done(int(w), int(h), int(x), int(y)))
                 self.app._append_info_ui(_('[黑边检测] 推荐裁剪参数: crop={0}:{1}:{2}:{3}，已自动填入并启用裁剪。').format(w, h, x, y))
             except subprocess.TimeoutExpired:
                 self.app._append_info_ui(_("[黑边检测] 检测超时，请检查 ffmpeg 是否正常。"))
@@ -33653,9 +33899,9 @@ class AudioSegmentDialog:
         self._aseg_undo.refresh_buttons()      # 初始两键置灰（栈空）
 
         try:
-            center_window(win, 920, 470)
+            center_window(win, 920, 500)
         except Exception:
-            win.geometry("920x470")
+            win.geometry("920x500")
             win.deiconify()
         win.transient(self.parent.winfo_toplevel())
         win.wait_window()
@@ -33891,11 +34137,21 @@ class AudioFrame(ttk.LabelFrame):
         adv_row = ttk.Frame(inner)
         adv_row.pack(fill=tk.X, pady=(3,0))
         self.audio_speed_enabled = tk.BooleanVar(value=False)
-        ttk.Checkbutton(adv_row, text=_("变速"), variable=self.audio_speed_enabled).pack(side=tk.LEFT, padx=(0,3))
-        ttk.Label(adv_row, text=_("倍数:")).pack(side=tk.LEFT)
+        _chk_spd = ttk.Checkbutton(adv_row, text=_("变速"), variable=self.audio_speed_enabled)
+        _chk_spd.pack(side=tk.LEFT, padx=(0,3))
+        _lbl_spd = ttk.Label(adv_row, text=_("倍数:"))
+        _lbl_spd.pack(side=tk.LEFT)
         self.audio_speed_factor = tk.StringVar(value="1.0")
-        ttk.Entry(adv_row, textvariable=self.audio_speed_factor, width=7).pack(side=tk.LEFT, padx=3)
-        ToolTip(adv_row, _("音频变速（atempo），0.25~4.0，>2 自动串联多个 atempo"), wraplength=400)
+        _ent_spd = ttk.Entry(adv_row, textvariable=self.audio_speed_factor, width=7)
+        _ent_spd.pack(side=tk.LEFT, padx=3)
+        # 🔴 2026-11-16（用户报「音频变速的 tooltip 挂错控件，提示跑到右侧空白」）：
+        # ToolTip 用 `<Enter>/<Leave>` 挂在**控件自身**上，而子控件会吃掉指针事件、
+        # 父 Frame 永远收不到 Enter ⇒ 挂整行 Frame 的提示只有指针落在行的**空白区**
+        # 才弹，落在勾选框/输入框上反而没有。改为逐个叶子控件各挂一份。
+        _spd_tip = _("音频变速（atempo），0.25~4.0，>2 自动串联多个 atempo")
+        ToolTip(_chk_spd, _spd_tip, wraplength=400)
+        ToolTip(_lbl_spd, _spd_tip, wraplength=400)
+        ToolTip(_ent_spd, _spd_tip, wraplength=400)
 
         # 音频倒放独立控制（不再跟随主视频倒放）
         self.audio_reverse = tk.BooleanVar(value=False)
@@ -33910,13 +34166,15 @@ class AudioFrame(ttk.LabelFrame):
         seg_row.pack(fill=tk.X, pady=(3,0))
         self._seg_count_label = ttk.Label(seg_row, text="", foreground="#555555")
         self._seg_count_label.pack(side=tk.LEFT)
-        ttk.Button(seg_row, text=_("音频分段效果…"),
-                   command=self._open_audio_segment_dialog).pack(side=tk.LEFT, padx=(6,0))
-        ToolTip(seg_row,
-                _("在指定的若干时间段内施加音频效果（静音 / 局部音量 / 淡入淡出 / 降噪 / 滤波 / EQ），\n"
-                "段与段之间互不干扰，音频总时长不变。\n"
-                "时间填源文件里听到第几秒；启用截取/变速后会自动换算到输出时间线；会触发重新编码。"),
-                wraplength=460)
+        _btn_seg = ttk.Button(seg_row, text=_("音频分段效果…"),
+                              command=self._open_audio_segment_dialog)
+        _btn_seg.pack(side=tk.LEFT, padx=(6,0))
+        # 同上（2026-11-16）：提示挂整行 Frame 只有空白处才弹 ⇒ 逐个叶子控件各挂一份。
+        _seg_tip = (_("在指定的若干时间段内施加音频效果（静音 / 局部音量 / 淡入淡出 / 降噪 / 滤波 / EQ），\n"
+                      "段与段之间互不干扰，音频总时长不变。\n"
+                      "时间填源文件里听到第几秒；启用截取/变速后会自动换算到输出时间线；会触发重新编码。"))
+        ToolTip(_btn_seg, _seg_tip, wraplength=460)
+        ToolTip(self._seg_count_label, _seg_tip, wraplength=460)
         self._refresh_seg_label()
 
         # 高级音频设置（由弹窗修改，默认值）
@@ -39855,26 +40113,34 @@ class LoopChromaFrame(ttk.LabelFrame):
                 _("描边沿子视频当前的透明轮廓向外描边 —— 前置必须有 alpha：\n"
                 "抠图（绿幕/色键）结果、外部抠好的带透明素材、或本窗的遮罩。\n"
                 "素材本身不透明时，alpha 全 1，描边会退化成「整帧一个矩形框」；\n"
-                "那种情况请先把主体抠出来（勾选抠像）再开描边。"),
-                wraplength=460)
+                "那种情况请先把主体抠出来（勾选抠像）再开描边。"), wraplength=460)
 
         row = ttk.Frame(main)
         row.pack(fill=tk.X, pady=(8, 0))
         ttk.Label(row, text=_("颜色:")).pack(side=tk.LEFT)
-        swatch = tk.Label(row, text="      ", bg=_c0, relief="solid", bd=1)
-        swatch.pack(side=tk.LEFT, padx=(4, 6))
+        # 🔴 2026-11-16（用户报「这个窗口里没 hex」）：补可手输的 hex 框 —— 与文字水印
+        # 的「描边颜色」同口径（手输即时生效、选色回填同一个变量、色块实时跟随）。
+        _hex_entry = ttk.Entry(row, textvariable=t_color, width=10)
+        _hex_entry.pack(side=tk.LEFT, padx=(4, 4))
 
         def _pick_color():
             _c = colorchooser.askcolor(title=_("选择描边颜色"), parent=win,
                                        initialcolor=t_color.get())[1]
             if _c:
                 t_color.set(_c)
-                swatch.config(bg=_c)
 
         ttk.Button(row, text=_("选择…"), command=_pick_color, width=6).pack(side=tk.LEFT)
-        ttk.Label(row, text=_("宽度 (px):")).pack(side=tk.LEFT, padx=(16, 2))
-        ttk.Spinbox(row, from_=1, to=20, textvariable=t_width, width=5).pack(side=tk.LEFT)
-        ToolTip(row, _("宽度按最终渲染帧像素算（默认 4）。1~20 之间；超过 20 视觉上已不像描边。"), wraplength=440)
+        # 色块：随 t_color 实时变化（手输 / 选色都同步）；非法输入保持上一个合法色
+        make_color_swatch(row, t_color, fallback="#FFFFFF",
+                          tip=_("描边颜色色块：随上面所选/输入的颜色实时变化（#RRGGBB）。"))
+        _lbl_width = ttk.Label(row, text=_("宽度 (px):"))
+        _lbl_width.pack(side=tk.LEFT, padx=(16, 2))
+        _spn_width = ttk.Spinbox(row, from_=1, to=20, textvariable=t_width, width=5)
+        _spn_width.pack(side=tk.LEFT)
+        # 提示挂叶子控件（挂整行 Frame 只有空白处才弹，见 LoopChromaFrame 同款修复）
+        _w_tip = _("宽度按最终渲染帧像素算（默认 4）。1~20 之间；超过 20 视觉上已不像描边。")
+        ToolTip(_lbl_width, _w_tip, wraplength=440)
+        ToolTip(_spn_width, _w_tip, wraplength=440)
 
         # 按钮行：确定 col0 / 取消 col1（用户既定约定，勿换序）
         btn_row = ttk.Frame(main)
@@ -39882,7 +40148,9 @@ class LoopChromaFrame(ttk.LabelFrame):
 
         def _do_ok():
             self.outline_enabled.set(t_enabled.get())
-            self.outline_color.set(t_color.get())
+            # 空串会让 ffmpeg 那边拿不到颜色（`_outline_hex_to_rgb` 回落白色，色块也对不上）
+            # ⇒ 落库时兜底 #FFFFFF，与初值口径一致。
+            self.outline_color.set(str(t_color.get() or "").strip() or "#FFFFFF")
             _wv = _opt_int(str(t_width.get()).strip() or "4", 4)
             self.outline_width.set(str(max(1, min(20, _wv))))
             win.destroy()
@@ -47020,7 +47288,24 @@ class FFmpegBatchGUI:
                     init_val = f"vaapi={device}"
                 else:
                     init_val = f"vaapi=amd:{device}"
-            cmd_list.extend(["-init_hw_device", init_val])
+                # 🔴 2026-11-08 按 FFmpeg 文档 + 本机自省修的「必失败」硬错误：
+                #   vaapi 设备是 Linux libva/DRM 接口，Windows 上必然
+                #   `Failed to initialise VAAPI connection` → `Error parsing global
+                #   options: I/O error`（本机 FFmpeg 9.0.1 实测），**整条命令连解码
+                #   都到不了**。而 AMD 档在 Windows 走的是 `-hwaccel amf` + hevc_amf
+                #   （amf hwaccel 需 FFmpeg 8.0+，且依赖 amfrt64.dll），AMF 设备由
+                #   ffmpeg 自行创建，不需要 VAAPI 初始化。
+                #   ⇒ Windows 且「设备」框留空时不写 -init_hw_device；显式填了 DRM
+                #   节点（Linux 口径）或非 Windows 平台一律保留原行为。
+                #   ⚠️ 本机无 AMD 卡，AMF 整条链未经端到端编码验证；此处只消除
+                #   「解析全局选项阶段就必失败」的那一项，滤镜链结构不动。
+                if sys.platform == "win32" and not device:
+                    init_val = ""
+            # 🔴 必须留在 `if api in ("cuda","qsv","vaapi")` 块内：api == "cpu" 时
+            #    init_val 从未赋值，挪到块外会 UnboundLocalError（2026-11-08 用户实测
+            #    「生成命令时出错: cannot access local variable 'init_val'」）。
+            if init_val:
+                cmd_list.extend(["-init_hw_device", init_val])
         if not settings.get("hwaccel_enabled", False):
             return
         # settings 链已统一存命令值（get_settings 经 _hwaccel_disp_to_cmd），
@@ -47036,6 +47321,14 @@ class FFmpegBatchGUI:
             if decoder_key == "cuda":
                 cmd_list.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
             elif decoder_key == "amf":  # AMD 通用
+                # 🔴 FFmpeg 文档核对（2026-11-08，本机无 AMD 卡未端到端实测）：
+                #   · amf hwaccel 是 FFmpeg 8.0+ 才提供的（本机 9.0.1 的 -hwaccels
+                #     有 amf，7.1.5 没有）；运行时还需 amfrt64.dll（AMD 驱动）。
+                #   · hevc_amf 的 -rc 合法值 = cqp/cbr/vbr_peak/vbr_latency/qvbr/
+                #     hqvbr/hqcbr（见 append_amf_advanced_args 的 _AMF_RC_MODES），
+                #     **没有 vbr**；-cq 是 NVENC 专属，绝不能喂给 AMF。
+                #   ⇒ 码率控制一律走 auto_set_rate_control_by_codec 的 bitrate 档
+                #     （-b:v），别照抄 NVENC 的 "-rc vbr -cq"。
                 cmd_list.extend(["-hwaccel", "amf", "-hwaccel_output_format", "amf"])
             elif decoder_key == "qsv":
                 cmd_list.extend(["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"])
@@ -61041,6 +61334,21 @@ class FFmpegBatchGUI:
             return
         self._preview_with_settings(task.input, task.settings, with_snapshot=with_snapshot)
 
+    def _show_task_media_info(self, item):
+        """任务列表右键「查看媒体信息」：取该任务的主视频（input）。"""
+        try:
+            task = self.tasks[int(item)]
+        except (TypeError, ValueError, IndexError):
+            return
+        self._show_media_info_dialog(getattr(task, "input", ""))
+
+    def _show_selected_task_media_info(self):
+        """工具栏「预览选中任务」按钮右键：查看当前选中任务的媒体信息。"""
+        sel = self.task_tree.selection()
+        if alert_if(not sel, _("提示"), _("请先选中一个任务"), 'info'):
+            return
+        self._show_task_media_info(sel[0])
+
     def toggle_only_audio_mode(self):
         state = tk.DISABLED if self.audio_frame.only_audio.get() else tk.NORMAL
         self._set_recursive_state(self.video_encoder, state)
@@ -63566,7 +63874,7 @@ class FFmpegBatchGUI:
         btn_merge_preview.pack(side=tk.LEFT, padx=2)
         # 左键=常规预览；右键=弹出选择菜单（快照 / 缩略图）
         btn_merge_preview.bind("<Button-3>", lambda e: self._merge_preview_right_menu())
-        ToolTip(btn_merge_preview, _("左键：常规预览\n右键：快照 / 缩略图 选择菜单"), wraplength=320)
+        ToolTip(btn_merge_preview, _("左键：常规预览\n右键：快照 / 缩略图 / 查看媒体信息"), wraplength=320)
         ttk.Button(tool_frame, text=_("上移"), command=self.merge_move_up_selected, width=8).pack(side=tk.LEFT, padx=2)
         ttk.Button(tool_frame, text=_("下移"), command=self.merge_move_down_selected, width=8).pack(side=tk.LEFT, padx=2)
         ttk.Button(tool_frame, text=_("删除"), command=self.merge_delete_selected, width=8).pack(side=tk.LEFT, padx=2)
@@ -64748,6 +65056,7 @@ class FFmpegBatchGUI:
         menu.add_command(label=_("编辑轨道"), command=self.merge_edit_selected)
         menu.add_command(label=_("预览轨道"), command=self.merge_preview_selected)
         menu.add_command(label=_("预览轨道（快照 - 画中画合成）"), command=lambda: self.merge_preview_selected(with_snapshot=True))
+        menu.add_command(label=_("查看媒体信息"), command=self._merge_media_info_selected)
         # 实时预览（简易时间引擎）：同一张合成图改走内置时间预览窗口（ffmpeg 管道，不依赖 mpv，
         # 但画面小、性能有限，子视频多 / 滤镜重时同样可能卡顿；外部播放器（mpv/ffplay）性能通常更好）
         # —— 按当前模式自动选图：串行合并图 / 画中画图 / 单轨合成图。
@@ -72589,6 +72898,186 @@ class FFmpegBatchGUI:
     def merge_get_media_info(self, path):
         return self._get_cached_stream_info(path)
 
+    def _show_media_info_dialog(self, path):
+        """右键「查看媒体信息」的公共出口：ffprobe 常规数据 → 只读小窗。
+
+        数据走 `_get_cached_stream_info`（按 path+mtime 缓存）——拖入/探测过的文件
+        命中缓存即 0 次 ffprobe；虚拟源（color/gen）由缓存入口自行处理。
+        """
+        p = (path or "").strip()
+        if alert_if(not p, _("提示"), _("没有可查看的媒体文件"), 'info'):
+            return
+        if not _is_virtual_source(p) and not os.path.exists(p):
+            alert_if(True, _("提示"), _("文件不存在:\n%s") % p, 'error')
+            return
+        info = self._get_cached_stream_info(p)
+        if isinstance(info, dict) and not info.get("format") and not _is_virtual_source(p):
+            # `ffprobe_json` 只查 `-show_streams`，容器级字段（容器名/时长/大小/总码率）拿不到 →
+            # 补一次 `-show_entries format`，结果并入缓存 dict（同一文件只探一次）
+            _fmt = self._probe_format_once(p)
+            if _fmt:
+                info["format"] = _fmt
+        text = self._format_media_info_text(p, info)
+        _sc = getattr(self, "scaling", 1.0)
+        win = tk.Toplevel(self.root)
+        win.withdraw()
+        win.title(_("媒体信息 - %s") % (os.path.basename(p) or p))
+        win.transient(self.root)
+        # 按钮条先 pack 到底部（单按钮居中，Windows 惯例），正文再吃剩余空间
+        btns = ttk.Frame(win, padding=(8, 6))
+        btns.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Button(btns, text=_("关闭"), command=win.destroy, width=12).pack()
+        body = ttk.Frame(win, padding=(8, 8, 8, 0))
+        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        txt = scrolledtext.ScrolledText(body, wrap=tk.WORD, font=("Microsoft YaHei", 9),
+                                        height=22, width=80)
+        txt.pack(fill=tk.BOTH, expand=True)
+        txt.insert(tk.END, text)
+        txt.config(state=tk.DISABLED)
+        center_window(win, int(760 * _sc), int(540 * _sc))
+
+    def _format_media_info_text(self, path, info):
+        """把 ffprobe json（`_get_cached_stream_info` 的返回）格式化成常规数据文本。"""
+        def _hms(v):
+            try:
+                sec = float(v)
+            except (TypeError, ValueError):
+                return "-"
+            if sec < 0 or sec != sec:
+                return "-"
+            h = int(sec // 3600)
+            m = int((sec % 3600) // 60)
+            s = sec - h * 3600 - m * 60
+            return "%02d:%02d:%06.3f" % (h, m, s)
+
+        def _size(v):
+            try:
+                n = float(v)
+            except (TypeError, ValueError):
+                return "-"
+            if n < 0:
+                return "-"
+            for unit in ("B", "KB", "MB", "GB", "TB"):
+                if n < 1024.0 or unit == "TB":
+                    return ("%d %s" % (n, unit)) if unit == "B" else ("%.2f %s" % (n, unit))
+                n /= 1024.0
+            return "-"
+
+        def _br(v):
+            try:
+                n = float(v)
+            except (TypeError, ValueError):
+                return "-"
+            if n <= 0:
+                return "-"
+            return "%.1f kbps" % (n / 1000.0)
+
+        def _container(fmt):
+            # 容器显示名。取 ftyp 的 major_brand 细分，而不是 format_long_name。
+            #
+            # 🔴 format_long_name 是 demuxer 名，不是具体子格式：mov / mp4 / m4a /
+            #    3gp / 3g2 / mj2 整族共用一个 demuxer，长名一律 "QuickTime / MOV"
+            #    ⇒ 真正的 .mp4 会被显示成 MOV（用户 2026-11-14 实测质疑「容器是不是不对」）。
+            #    该家族按 brand 细分；取不到 brand（非 ISO BMFF 或有损探测）退回长名。
+            #    纯 ASCII 标签，不含中文 ⇒ 两个版本都不需要 i18n。
+            name = fmt.get("format_long_name") or fmt.get("format_name") or "-"
+            brand = ((fmt.get("tags") or {}).get("major_brand") or "").strip()
+            if not brand:
+                return name
+            low = brand.lower()
+            if low == "qt":
+                label = "QuickTime (MOV)"
+            elif low.startswith("3g2"):
+                label = "3G2 (ISO BMFF)"
+            elif low.startswith("3gp"):
+                label = "3GP (ISO BMFF)"
+            elif low.startswith("m4a") or low.startswith("m4b"):
+                label = "M4A (ISO BMFF)"
+            elif low.startswith("m4v"):
+                label = "M4V (ISO BMFF)"
+            elif low.startswith(("heic", "heix", "mif1", "msf1")):
+                label = "HEIF (ISO BMFF)"
+            else:
+                label = "MP4 (ISO BMFF)"
+            return "%s, brand=%s" % (label, brand)
+
+        def _fps(v):
+            if isinstance(v, str) and "/" in v:
+                try:
+                    a, b = v.split("/", 1)
+                    fb = float(b)
+                    v = (float(a) / fb) if fb else 0.0
+                except (TypeError, ValueError):
+                    pass
+            try:
+                return "%.3f fps" % float(v)
+            except (TypeError, ValueError):
+                return str(v) if v else "-"
+
+        lines = [_("文件: %s") % path]
+        if not info:
+            lines.append("")
+            lines.append(_("（ffprobe 未返回数据：可能不是有效媒体文件，或未找到 ffprobe）"))
+            return "\n".join(lines)
+
+        fmt = info.get("format") or {}
+        if fmt:
+            lines.append(_("容器: %s") % _container(fmt))
+            lines.append(_("时长: %s") % _hms(fmt.get("duration")))
+            lines.append(_("大小: %s") % _size(fmt.get("size")))
+            lines.append(_("总码率: %s") % _br(fmt.get("bit_rate")))
+
+        streams = info.get("streams") or []
+        lines.append("")
+        lines.append(_("流数量: %d") % len(streams))
+        _tname = {"video": _("视频"), "audio": _("音频"), "subtitle": _("字幕"),
+                  "data": _("数据"), "attachment": _("附件")}
+        for s in streams:
+            t = s.get("codec_type", "?")
+            _idx = s.get("index")
+            lines.append(_("── #%s %s ──") % ("?" if _idx is None else _idx,
+                                              _tname.get(t, t)))
+            lines.append(_("  编码: %s") % (s.get("codec_long_name") or s.get("codec_name") or "-"))
+            if t == "video":
+                w, h = s.get("width"), s.get("height")
+                lines.append(_("  分辨率: %sx%s") % ("?" if w is None else w,
+                                                    "?" if h is None else h))
+                lines.append(_("  帧率: %s") % _fps(s.get("avg_frame_rate") or s.get("r_frame_rate")))
+                if s.get("pix_fmt"):
+                    lines.append(_("  像素格式: %s") % s.get("pix_fmt"))
+                lines.append(_("  码率: %s") % _br(s.get("bit_rate")))
+            elif t == "audio":
+                lines.append(_("  采样率: %s Hz") % (s.get("sample_rate") or "-"))
+                _ch = s.get("channels")
+                lines.append(_("  声道: %s") % ("-" if _ch is None else _ch))
+                if s.get("channel_layout"):
+                    lines.append(_("  声道布局: %s") % s.get("channel_layout"))
+                lines.append(_("  码率: %s") % _br(s.get("bit_rate")))
+            _lang = (s.get("tags") or {}).get("language")
+            if _lang:
+                lines.append(_("  语言: %s") % _lang)
+            lines.append("")
+        return "\n".join(lines)
+
+    def _probe_format_once(self, path):
+        """补探容器级字段（容器名/时长/大小/总码率 + ftyp brand）—— `ffprobe_json` 只带 streams。
+
+        结果由调用方并入 `_get_cached_stream_info` 的缓存 dict，同一文件只探一次。
+        """
+        try:
+            cmd = [self.ffprobe_cmd, "-v", "error", "-show_entries",
+                   "format=format_name,format_long_name,duration,size,bit_rate"
+                   ":format_tags=major_brand",
+                   "-of", "json", path]
+            res = subprocess.run(cmd, capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace",
+                                 creationflags=_ffmpeg_spawn_flags(), timeout=10)
+            if res.returncode != 0:
+                return None
+            return (json.loads(res.stdout) or {}).get("format") or None
+        except Exception:
+            return None
+
     def _cached_video_dimensions(self, file_path):
         """
         获取视频原始宽高（不考虑旋转），优先读解析缓存（拖入文件时已填充 _stream_info_cache），
@@ -78194,6 +78683,7 @@ class FFmpegBatchGUI:
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label=_("快照（画中画合成）"), command=lambda: self.merge_preview_selected(with_snapshot=True))
         menu.add_command(label=_("缩略图"), command=self._contact_sheet_selected_track)
+        menu.add_command(label=_("查看媒体信息"), command=self._merge_media_info_selected)
         # 「时间预览引擎（主视频轨合成）」入口已删除（2026-09-20 用户确认）：它与下面的
         # 「实时预览（简易时间引擎）」功能重复——后者按模式自动分派（串行合并图 / 画中画图 /
         # 单轨合成图），前者在被覆盖后只剩冗余。_time_preview_pipe_merge 方法保留：
@@ -78222,11 +78712,121 @@ class FFmpegBatchGUI:
         y = self.root.winfo_pointery()
         menu.post(x, y)
 
+    def _merge_media_info_selected(self):
+        """封装页预览按钮右键「查看媒体信息」：取选中那条轨（流）的文件。"""
+        indices = self._get_selected_track_indices()
+        if alert_if(not indices, _("提示"), _("请先选中一条轨道"), 'info'):
+            return
+        self._show_media_info_dialog(getattr(self.merge_tracks[indices[0]], "file_path", ""))
+
+    def _quick_speed_preset_value(self, tier):
+        """速度档 → 当前编码器 preset 表里第一个命中的档位值。
+        copy / gif 这类没有 preset 概念的编码器返回 None（菜单整组灰掉）。"""
+        enc = self.video_encoder
+        codec = enc.vcodec.get()
+        if codec not in enc.ENCODER_PRESETS:
+            return None
+        values = list(enc.preset_combo['values']) or list(enc.ENCODER_PRESETS[codec])
+        return next((c for c in QUICK_SPEED_CANDS[tier] if c in values), None)
+
+    def _popup_quick_preset_menu(self, event=None):
+        """「输入 / 输出」区右上「预设」短按钮：左键 / 右键弹同一张常用预设菜单。
+
+        从 C 子项目 KliMiniTranscoder 的同名按钮重构（2026-11-06）。下拉会把这一行
+        撑宽，故用短按钮 + 宽菜单；三组扁平菜单点哪项只写哪项。左键没有 event，
+        坐标统一取当前指针位置（与转码页预览右键菜单同款）。
+        """
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label=_("常用预设 · 点选即写入对应控件"), state="disabled")
+        menu.add_separator()
+        menu.add_command(label=_("【编码速度档】写入「编码预设」+ 质量值"), state="disabled")
+        for i, (name, crf) in enumerate(QUICK_SPEED_TIERS):
+            val = self._quick_speed_preset_value(i)
+            label = "%s  %s  ·  CRF %d" % (_(name), val if val else _("(不适用)"), crf)
+            if val:
+                menu.add_command(label=label,
+                                 command=lambda t=i: self._apply_quick_speed_tier(t))
+            else:
+                menu.add_command(label=label, state="disabled")
+
+        menu.add_separator()
+        menu.add_command(label=_("【硬件加速档】编码器 + 硬件解码 + 滤镜加速"), state="disabled")
+        for label, idx in QUICK_HW_TIERS:
+            menu.add_command(label=_(label),
+                             command=lambda v=idx: self._apply_quick_hw_tier(v))
+        menu.add_command(label=_("若运行报错：升级显卡驱动，或改用较低版本的 FFmpeg 再试"),
+                         state="disabled")
+
+        menu.add_separator()
+        menu.add_command(label=_("【缩放高度】写入「启用缩放 → 高度(宽度自动)」"), state="disabled")
+        for label, h in QUICK_HEIGHT_TIERS:
+            menu.add_command(label=label,
+                             command=lambda v=h: self._apply_quick_height(v))
+        menu.add_separator()
+        menu.add_command(label=_("竖屏：点缩放行最右「⇄」交换宽高值"), state="disabled")
+        menu.add_command(label=_("再选「高度(宽度自动)」或「宽度(高度自动)」即可转换分辨率方向"),
+                         state="disabled")
+        with suppress(Exception):
+            menu.post(self.root.winfo_pointerx(), self.root.winfo_pointery())
+
+    def _apply_quick_speed_tier(self, tier):
+        """速度档：写「编码预设」+ 当前码控那份质量值。滑块的数值标签是
+        command 回调手动刷的，直接 .set() 不会动它，要同步一次（C 版 TBM_SETPOS 同款坑）。"""
+        val = self._quick_speed_preset_value(tier)
+        if not val:
+            return
+        enc = self.video_encoder
+        enc.preset.set(val)
+        crf = QUICK_SPEED_TIERS[tier][1]
+        rc = enc.rate_control_type.get()
+        if rc == "cq":
+            enc.cq_value.set(crf)
+            label = getattr(enc, "cq_label", None)
+        elif rc == "global_quality":
+            enc.global_quality.set(crf)
+            label = getattr(enc, "gq_label", None)
+        else:
+            # bitrate / compression 没有质量滑块：存进 CRF 那份，切回 CRF 即生效
+            enc.crf_value.set(crf)
+            label = getattr(enc, "crf_label", None)
+        if label is not None:
+            with suppress(Exception):
+                label.config(text=str(crf))
+        self.update_command_preview()
+
+    def _apply_quick_hw_tier(self, idx):
+        """硬件档：设「滤镜加速」下拉 + 显式跑既有联动（Combobox 的 .set()
+        不发 <<ComboboxSelected>>），编码器 / 解码器 / 码控全复用手动选下拉那条
+        路径，避免两条入口写出不同值。预设比手动联动多一步：替用户勾硬解。"""
+        adv = self.adv_frame
+        adv.hw_filter_mode_var.set(HW_FILTER_MODE_OPTIONS[idx])
+        # 下拉 textvariable 若绑「显示变量」（multi 双变量适配），写规范标签后
+        # 要按同一 index 同步显示值，否则下拉框看着没变；base 单变量时自动跳过。
+        disp = getattr(adv, "hw_filter_mode_disp", None)
+        if disp is not None:
+            with suppress(Exception):
+                disp.set(list(adv.hw_filter_mode_combo["values"])[idx])
+        adv._on_filter_mode_change()
+        adv.hwaccel_enabled.set(idx > 0)
+        self.update_command_preview()
+
+    def _apply_quick_height(self, h):
+        """缩放高度档：启用缩放、选「高度(宽度自动)」、填高度、清宽度。
+        base 的宽度/高度 Entry 与「精确宽×高」共用同一对变量，故清宽度同 C 版。"""
+        vf = self.video_filter
+        vf.scale_enabled.set(True)
+        vf.scale_method.set("height")
+        vf.scale_width.set("")
+        vf.scale_height.set(str(h))
+        self.update_command_preview()
+
     def _transcode_preview_right_menu(self):
         """转码页预览按钮右键：快照 / 缩略图 / 时间预览引擎 选择菜单"""
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label=_("快照（水印合成）"), command=lambda: self.preview_current_file(with_snapshot=True))
         menu.add_command(label=_("缩略图"), command=self._contact_sheet_current_file)
+        menu.add_command(label=_("查看媒体信息"),
+                         command=lambda: self._show_media_info_dialog(self.input_file.get().strip()))
         # 时间预览引擎（2026-09-20 Phase 1）：同一张合成图改走 ffmpeg -filter_complex → rawvideo
         # 管道，由内置 SimplePreviewer 渲染 —— 保留标记/波形/步进，且无需 mpv/ffplay。
         menu.add_command(label=_("实时预览（简易时间引擎，画面小）"), command=self._time_preview_pipe_current)
@@ -85706,6 +86306,7 @@ class FFmpegBatchGUI:
         menu.add_command(label=_("停止队列"), command=self.stop_queue)
         menu.add_command(label=_("预览选中任务"), command=self.preview_selected_task)
         menu.add_command(label=_("预览选中任务(快照)"), command=lambda: self.preview_selected_task(with_snapshot=True))
+        menu.add_command(label=_("查看媒体信息"), command=lambda: self._show_task_media_info(item))
         menu.add_command(label=_("创建缩略图"), command=self._contact_sheet_selected_task)
         menu.add_separator()
         menu.add_command(label=_("恢复列宽"), command=self.reset_task_tree_columns)
@@ -85968,6 +86569,19 @@ class FFmpegBatchGUI:
         container_combo = ttk.Combobox(suffix_frame, textvariable=self.output_container,
                                        values=["mp4", "mkv", "mov", "avi", "webm","gif","webp","jp2","mj2"], state="readonly", width=6)
         container_combo.pack(side=tk.LEFT, padx=5)
+        # 常用预设（C 子项目同名按钮的 Python 重构）：短按钮 + 左键/右键同一张菜单。
+        # 下拉会把这一行撑宽，故用短按钮 + 宽菜单；三组全是内置常量，不读外部设置。
+        self.quick_preset_btn = ttk.Button(suffix_frame, text=_("预设"), width=6,
+                                           command=self._popup_quick_preset_menu)
+        self.quick_preset_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.quick_preset_btn.bind("<Button-3>", self._popup_quick_preset_menu)
+        ToolTip(self.quick_preset_btn,
+                _("常用预设：左键或右键打开菜单。\n"
+                "• 编码速度档：写入「编码预设」+ 质量值（CRF / CQ / Global Quality）\n"
+                "• 硬件加速档：切换编码器、硬件解码与滤镜加速\n"
+                "• 缩放高度：启用缩放并写入指定高度（宽度自动）\n"
+                "点哪项只写哪项，不改其它参数。"),
+                wraplength=420)
     
         # 预设框架
         preset_frame = ttk.LabelFrame(settings_frame, text=_("参数预设"), padding="5")
@@ -86107,7 +86721,7 @@ class FFmpegBatchGUI:
         btn_preview.pack(side=tk.LEFT, padx=5, pady=5)
         # 左键=常规预览；右键=弹出选择菜单（快照 / 缩略图）
         btn_preview.bind("<Button-3>", lambda e: self._transcode_preview_right_menu())
-        ToolTip(btn_preview, _("左键：常规预览\n右键：快照 / 缩略图 选择菜单"), wraplength=320)
+        ToolTip(btn_preview, _("左键：常规预览\n右键：快照 / 缩略图 / 查看媒体信息"), wraplength=320)
     
         btn_refresh = tk.Button(bottom_btn_frame, text=_("刷新命令"), command=self.refresh_with_reset,
                                 height=btn_height, width=12, relief=tk.RAISED)
@@ -86176,7 +86790,12 @@ class FFmpegBatchGUI:
                           (_("停止队列"), self.stop_queue),
                           (_("导出为脚本"), self.export_script),
                           (_("预览选中任务"), self.preview_selected_task)]:
-            ttk.Button(tool_container, text=text, command=cmd).pack(side=tk.LEFT, padx=5)
+            _tb = ttk.Button(tool_container, text=text, command=cmd)
+            _tb.pack(side=tk.LEFT, padx=5)
+            # 「预览选中任务」按钮右键：查看选中任务的媒体信息（与任务列表右键同一出口）
+            if text == _("预览选中任务"):
+                _tb.bind("<Button-3>", lambda e: self._show_selected_task_media_info())
+                ToolTip(_tb, _("左键：预览选中任务\n右键：查看媒体信息"), wraplength=320)
 
         # 任务队列撤销/重做（2026-09-29：独立 scope=tasks，不占共享栏）
         self._task_undo_btn = ttk.Button(tool_container, text=_("↶ 撤销"), command=lambda: self._do_undo("tasks"))
