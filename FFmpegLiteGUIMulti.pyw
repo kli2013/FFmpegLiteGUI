@@ -4601,7 +4601,7 @@ def _cmd_editor_in_args(inputs, seek_t=0.0, dur_of=None, sub_seek=True,
 #    .m4v/.mts/.rmvb 在某些落点被当「非视频」忽略，同一个文件换个落点结论就不同）→ 全部收敛到
 #    下面四组 EXTS，所有 glob 串由它们派生。**加新格式只改这里，别在调用点另抄一份清单。**
 _MEDIA_VIDEO_EXTS = (
-    ".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".ts",
+    ".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".ts", ".tp",
     ".m2ts", ".mts", ".mpg", ".mpeg", ".m4v", ".wmv", ".3gp", ".3g2",
     ".ogv", ".rmvb", ".rm", ".asf", ".f4v", ".vob", ".mxf", ".divx", ".m2v", ".y4m", ".ivf",
 )
@@ -4633,6 +4633,95 @@ _MEDIA_DROP_EXTS = _MEDIA_VIDEO_EXTS + _MEDIA_IMAGE_EXTS
 #   集合外只会「问一句」，用户确认后照常转换。
 _INPUT_MEDIA_EXTS = (frozenset(_MEDIA_VIDEO_EXTS) | frozenset(_MEDIA_IMAGE_EXTS)
                      | frozenset(_MEDIA_AUDIO_EXTS))
+
+
+# ----- MKV 附加字体（2026-11-18）-----
+# 一项 = {"source": "embedded"|"external", "enabled": bool, "path": str,
+#         "filename": str, "mimetype": str, "stream": int}
+#   embedded = 输入 MKV 里已内嵌的字体流（ffprobe codec_type=attachment），
+#              stream = 该流在【附件类型内的序号】（从 0 计，-map N:t:M 用的是这个，
+#              不是 ffprobe 的全局 stream.index —— 后者对 attachment 往往对不上）。
+#   external = 用户新增的本地字体文件，path=磁盘路径
+# 只服务封装页普通混流；-attach 只被 Matroska 接受（实测 mp4 报错 / webm 静默丢弃）。
+_FONT_EXTS_FOR_ATTACH = (".ttf", ".ttc", ".otf")
+
+
+def font_attach_mimetype(path):
+    """按扩展名推断附件 mimetype（ffmpeg -metadata:s:t:N mimetype=... 必需，缺了 matroska 拒收）。"""
+    _ext = os.path.splitext(str(path or ""))[1].lower()
+    if _ext == ".otf":
+        return "application/vnd.ms-opentype"
+    if _ext == ".ttc":
+        return "font/collection"
+    return "application/x-truetype-font"
+
+
+def merge_font_attach_args(items, file_index=None, only_audio=False):
+    """把启用的字体项拼成 ffmpeg 输出参数（在输出路径之前注入）。
+
+    embedded: -map {输入序号}:t:{stream} -c:t:N copy  （保住源 MKV 里已有的字体）
+    external: -attach <path> -metadata:s:t:N mimetype=...  （新增本地字体）
+    N 为输出 attachment 流序号，按列表顺序从 0 递增；实测两类共存时索引连续。
+    :return: (args:list[str], count:int)
+    """
+    if only_audio or not items:
+        return [], 0
+    fi = file_index or {}
+    norm_fi = {normalize_path(k): v for k, v in fi.items()}
+    args = []
+    n = 0
+    for it in items:
+        if not isinstance(it, dict) or not it.get("enabled"):
+            continue
+        src = it.get("source")
+        if src == "embedded":
+            p = it.get("path") or ""
+            idx = fi.get(p)
+            if idx is None:
+                idx = norm_fi.get(normalize_path(p), 0)
+            args.extend(["-map", f"{idx}:t:{int(it.get('stream', 0))}",
+                         f"-c:t:{n}", "copy"])
+        elif src == "external":
+            p = it.get("path") or ""
+            if not p:
+                continue
+            mime = it.get("mimetype") or font_attach_mimetype(p)
+            args.extend(["-attach", p, f"-metadata:s:t:{n}", f"mimetype={mime}"])
+        else:
+            continue
+        n += 1
+    return args, n
+
+
+def collect_embedded_fonts(ffprobe_cmd, paths):
+    """从输入文件里探测已内嵌字体（codec_type=attachment 且像字体）。
+    返回字体项 list（未经去重）；非字体附件（图片/其他二进制）跳过。
+    """
+    out = []
+    for p in paths or []:
+        info = ffprobe_json(ffprobe_cmd, p)
+        attach_seq = 0   # -map N:t:M 的 M：附件类型内序号，不是全局 stream.index
+        for s in (info.get("streams") or []) if info else []:
+            if s.get("codec_type") != "attachment":
+                continue
+            seq = attach_seq
+            attach_seq += 1
+            tags = s.get("tags") or {}
+            fname = tags.get("filename") or ""
+            codec = (s.get("codec_name") or "").lower()
+            mime = tags.get("mimetype") or font_attach_mimetype(fname)
+            # 只收字体：codec_name 是 ttf/otf 或扩展名/mime 命中字体
+            _is_font = (codec in ("ttf", "otf", "ttc")
+                        or os.path.splitext(fname)[1].lower() in _FONT_EXTS_FOR_ATTACH
+                        or "font" in str(mime).lower()
+                        or "truetype" in str(mime).lower()
+                        or "opentype" in str(mime).lower())
+            if not _is_font:
+                continue
+            out.append({"source": "embedded", "enabled": True,
+                        "path": p, "filename": fname or "font",
+                        "mimetype": mime, "stream": seq})
+    return out
 
 
 def media_filetypes(include_audio=False, include_subtitle=False, all_files=True):
@@ -13370,6 +13459,316 @@ def node_fx_display():
     return {_k: _(_v) for _k, _v in _NODE_FX_DISPLAY.items()}
 
 
+# 区域效果 type（blur_items[].type）的显示名；未登记的用 type 原文。
+# 🔴 显示名走函数延迟求值：multi 侧包 _()，模块级调用会把译文冻在导入时（坑 26）。
+def _media_fx_type_display():
+    return {
+        "delogo": _("去水印"), "removelogo": _("移除水印"),
+        "negate": _("反色"), "hflip": _("镜像"), "unsharp": _("锐化"),
+        "boxblur": _("模糊"), "gblur": _("模糊"), "smartblur": _("模糊"),
+        "drawbox": _("描边"),
+    }
+
+
+def media_settings_filter_summary(settings, orig_size=None):
+    """把一份 settings 中「已启用的滤镜/效果」汇总成**带参数详情**的中文短句。
+
+    给「查看媒体信息」小窗做状态附录用：只读 settings 字典，零子进程、零探测。
+    ⚠️ 不复用 build_video_filter_chain —— 那是命令生成函数，部分项走独立参数
+       （chroma/reverse）、键名口径与 settings 不同，带标签子图还会被逗号切断，
+       用来做「勾了什么」的摘要会漏报/切坏。这里按 base 各 get_settings 的真实键
+       逐项登记，顺序贴近 build_video_filter_chain 的生效顺序。
+
+    :param settings: 设置字典（转换页 get_current_settings / 任务 task.settings /
+       封装轨 track.enc_settings）
+    :param orig_size: (w, h) 元数据旋转后的源尺寸，可选。给了就用唯一内核
+       `size_after_crop_rotate_scale` 逐段算出「裁剪/旋转/缩放」的实际尺寸，
+       与封装页「规格」列同口径；不给则这几项只显示开关名不显示尺寸。
+    :return: (video_details, audio_details)，均为 list[str]
+    """
+    if not isinstance(settings, dict):
+        return [], []
+    s = settings
+    v, a = [], []
+
+    # 🔴 未选择哨兵统一判定：base 的下拉/文本控件未选时可能给 'none'/'无'/'N/A'/
+    #    'false'/'0' 这类字符串，直接 bool() 或 %s 会显示「旋转 none°」「变速 nonex」。
+    #    这里统一过滤，避免每个调用点各写一遍判断（漏一个就复现一次）。
+    _NO_VAL = {"", "none", "no", "off", "false", "0", "0.0", "n/a", "na", "null",
+               "nil", "nan", "unknown", "unspecified", "disabled", "无", "关闭",
+               "默认", "未设置", "-"}
+    # 🔴 正则参与逻辑判断，绝不能包 _()（英文界面会变形 ⇒ 哨兵过滤失效）。
+    _tail_sentinel = re.compile(
+        r"\s+(?:none|n/?a|null|unknown|unspecified|无|默认|关闭)(?:°)?$", re.I)
+
+    def settled(val):
+        """是否有效的「已选择」值；字符串哨兵与 None 不算。数值 0 由调用点按语义判。"""
+        if val is None:
+            return False
+        if isinstance(val, str):
+            return val.strip().lower() not in _NO_VAL
+        return True
+
+    def clean(val, default=""):
+        return val if settled(val) else default
+
+    def rot_on(val):
+        """旋转：0 / '0' / 'none' / '无' 都是未旋转，不该显示。"""
+        if not settled(val):
+            return False
+        try:
+            return float(val) != 0.0
+        except (TypeError, ValueError):
+            return True
+
+    def put(dst, text):
+        if not text:
+            return
+        # 兜底：剥掉各调用点漏网的尾部哨兵（如「色彩 none」「字幕 unknown」）。
+        txt = str(text).strip()
+        txt = _tail_sentinel.sub("", txt).strip()
+        if txt and txt not in dst:
+            dst.append(txt)
+
+    def on(key, src=None):
+        val = (s if src is None else src).get(key)
+        return settled(val) and bool(val)
+
+    def named(key):
+        return settled(s.get(key))
+
+    def fmt_num(val, default=""):
+        """数值去掉无意义的 .0；哨兵/空值返回 default，非数字原样返回。"""
+        if not settled(val):
+            return default
+        try:
+            f = float(val)
+            return str(int(f)) if f == int(f) else ("%g" % f)
+        except (TypeError, ValueError):
+            return str(val)
+
+    def to_sec(val):
+        """截取起止：兼容「秒」与「MM:SS.mmm / H:MM:SS.mmm」（简易时间预览粘贴的格式）。"""
+        if val in (None, ""):
+            return None
+        txt = str(val).strip()
+        try:
+            return float(txt)
+        except (TypeError, ValueError):
+            pass
+        parts = txt.split(":")
+        try:
+            if len(parts) == 2:
+                return float(parts[0]) * 60 + float(parts[1])
+            if len(parts) == 3:
+                return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+        except (TypeError, ValueError):
+            pass
+        return None
+
+    def fmt_time(val):
+        sec = to_sec(val)
+        return _fmt_window_time(sec) if sec is not None else None
+
+    # 源尺寸链：每步用唯一内核单开求中间值，口径同 _get_video_size_chain（规格列）。
+    pw, ph = (orig_size if orig_size else (None, None))
+    has_size = bool(pw and ph and int(pw) > 0 and int(ph) > 0)
+
+    # ---------- 视频（按 base build_video_filter_chain 的生效顺序）----------
+    # 截取（时间维度，规格列也显示"始于"）：放最前，用户点名要看起始时间。
+    if on("trim_enabled") or on("precise_trim"):
+        _seg = []
+        _t0 = fmt_time(s.get("trim_start"))
+        if _t0:
+            _seg.append(_("始于 %s") % _t0)
+        _t1 = fmt_time(s.get("trim_end"))
+        if _t1:
+            _seg.append(_("至 %s") % _t1)
+        if on("smart_cut"):
+            _seg.append(_("智能切割"))
+        put(v, _("截取%s") % (" " + " ".join(_seg) if _seg else ""))
+
+    if named("deinterlace_filter"):
+        put(v, _("反交错 %s") % s.get("deinterlace_filter"))
+    if on("blur_enabled"):
+        _items = [it for it in (s.get("blur_items") or [])
+                  if isinstance(it, dict) and it.get("enabled", True)]
+        if not _items:
+            _items = [{"type": s.get("blur_type") or "delogo",
+                       "x": s.get("blur_x"), "y": s.get("blur_y"),
+                       "w": s.get("blur_w"), "h": s.get("blur_h")}]
+        for it in _items:
+            _t = it.get("type") or "delogo"
+            _label = _media_fx_type_display().get(_t, _t)
+            _xywh = [fmt_num(it.get(k)) for k in ("x", "y", "w", "h")]
+            if any(_xywh):
+                _label += " %s" % ",".join(x or "?" for x in _xywh)
+            put(v, _label)
+    if on("crop_enabled"):
+        _label = _("裁剪")
+        if has_size:
+            nw, nh = size_after_crop_rotate_scale(pw, ph, {
+                "crop_enabled": True, "crop_width": s.get("crop_width", ""),
+                "crop_height": s.get("crop_height", "")})
+            _label = _("裁剪 %sx%s") % (nw, nh)
+            pw, ph = nw, nh
+        _crop_pos = [fmt_num(s.get(k)) for k in ("crop_left", "crop_top")]
+        if any(x for x in _crop_pos if x not in (None, "", "0")):
+            _label += "+%s,%s" % (_crop_pos[0] or "0", _crop_pos[1] or "0")
+        put(v, _label)
+    if on("crop_pos_enabled"):
+        put(v, _("裁剪框位移 %d段") % len(s.get("crop_pos_segments") or []))
+    if on("canvas_mode"):
+        put(v, _("画布模式 %d段") % len(s.get("canvas_segments") or []))
+    if rot_on(s.get("rotate", 0)):
+        _rv = fmt_num(s.get("rotate"), "?")
+        _label = _("旋转 %s°") % _rv
+        if has_size:
+            nw, nh = size_after_crop_rotate_scale(pw, ph, {"rotate": s.get("rotate")})
+            _label = _("旋转 %s° %sx%s") % (_rv, nw, nh)
+            pw, ph = nw, nh
+        put(v, _label)
+    if on("vflip"):
+        put(v, _("垂直翻转"))
+    if on("hflip"):
+        put(v, _("水平翻转"))
+    if on("tile_enabled"):
+        put(v, _("拼接 %sx%s") % (fmt_num(s.get("tile_rows"), "?"),
+                              fmt_num(s.get("tile_cols"), "?")))
+    if on("scale_enabled"):
+        _label = _("缩放")
+        if has_size:
+            nw, nh = size_after_crop_rotate_scale(pw, ph, {
+                "scale_enabled": True, "scale_method": s.get("scale_method", "width"),
+                "scale_width": s.get("scale_width", ""), "scale_height": s.get("scale_height", "")})
+            _label = _("缩放 %sx%s") % (nw, nh)
+        else:
+            _m = s.get("scale_method", "width")
+            _val = s.get("scale_width", "") if _m == "width" else (
+                s.get("scale_height", "") if _m == "height" else
+                "%sx%s" % (s.get("scale_width", "?"), s.get("scale_height", "?")))
+            _label = _("缩放 %s%s") % (_val, "w" if _m == "width" else ("h" if _m == "height" else ""))
+        put(v, _label)
+    en = s.get("enhance") or {}
+    if on("ivtc_enabled", en):
+        put(v, "IVTC")
+    if on("deblock_enabled", en):
+        put(v, _("去块 %s") % en.get("deblock_strength", ""))
+    if on("denoise_enabled", en):
+        put(v, _("降噪 %s") % en.get("denoise_mode", ""))
+    if on("sharpen_enabled", en):
+        put(v, _("锐化 %s %s") % (en.get("sharpen_mode", ""), fmt_num(en.get("sharpen_strength"))))
+    if on("colorspace_enabled", en):
+        put(v, _("色彩空间 %s") % en.get("colorspace_matrix", ""))
+    _eq = [("%s=%s" % (k, fmt_num(en.get(k)))) for k in
+           ("eq_brightness", "eq_contrast", "eq_saturation", "eq_gamma")
+           if en.get(k, {"eq_brightness": 0.0, "eq_contrast": 1.0,
+                         "eq_saturation": 1.0, "eq_gamma": 1.0}[k]) !=
+              {"eq_brightness": 0.0, "eq_contrast": 1.0,
+               "eq_saturation": 1.0, "eq_gamma": 1.0}[k]]
+    if _eq:
+        put(v, _("色彩 %s") % " ".join(_eq))
+    if (en.get("hue_angle", 0.0) != 0.0 or en.get("hue_saturation", 0.0) != 0.0):
+        put(v, _("色相 角度%s 饱和%s") % (fmt_num(en.get("hue_angle")),
+                                     fmt_num(en.get("hue_saturation"))))
+    if str(en.get("style_preset") or "").strip():
+        put(v, _("风格 %s") % en.get("style_preset"))
+    if on("tonemap_enabled", en):
+        put(v, _("色调映射 %s") % en.get("tonemap_mode", ""))
+    if on("hdr_meta_enabled", en):
+        put(v, _("HDR元数据"))
+    if on("grid_enabled", en):
+        put(v, _("网格"))
+    if on("pix_fmt_enabled") and settled(s.get("pix_fmt")):
+        put(v, _("像素格式 %s") % s.get("pix_fmt"))
+    if on("speed_enabled"):
+        put(v, _("变速 %sx") % fmt_num(s.get("speed_factor"), "?"))
+    if on("reverse_enabled"):
+        put(v, _("倒放"))
+    # 视频淡入淡出（淡入黑 / 淡出黑，fade=）：与音频共用 fade_enabled 这一键，
+    # 但走的是画面 fade 滤镜，故视频行也要单列（用户点名"视频为什么没淡入淡出"）。
+    if on("fade_enabled"):
+        _vfade = []
+        if s.get("fade_in"):
+            _vfade.append(_("入%ss") % fmt_num(s.get("fade_in")))
+        if s.get("fade_out"):
+            _vfade.append(_("出%ss") % fmt_num(s.get("fade_out")))
+        put(v, _("淡入淡出%s") % (" " + " ".join(_vfade) if _vfade else ""))
+    if on("subtitle_enabled"):
+        _sub = clean(s.get("subtitle_path"))
+        put(v, _("字幕 %s") % (os.path.basename(str(_sub)) if _sub else ""))
+    if on("chroma_enabled"):
+        put(v, _("绿幕抠像 %s") % clean(s.get("chroma_color")))
+    if on("mask_enabled"):
+        put(v, _("遮罩 %d形") % len(s.get("mask_shapes") or []))
+    if on("outline_enabled"):
+        put(v, _("描边"))
+    if on("alpha_enabled"):
+        put(v, _("透明度 %s") % fmt_num(s.get("alpha_value"), ""))
+    if on("pip_enabled"):
+        put(v, _("画中画"))
+    wm = s.get("watermark") or {}
+    if isinstance(wm, dict) and wm.get("enabled"):
+        put(v, _("图片水印"))
+    tw_items = s.get("text_watermark_items")
+    _tw = [it for it in (tw_items or [])
+           if isinstance(it, dict) and (it.get("enabled") or it.get("text"))]
+    if _tw:
+        put(v, _("文字水印 %d条") % len(_tw))
+    elif isinstance(s.get("text_watermark"), dict) and s["text_watermark"].get("enabled"):
+        put(v, _("文字水印"))
+
+    # ---------- 音频（顺序贴近 build_audio_tone_chain：hp→lp→音量→变速→降噪→EQ→响度）----------
+    if on("hp_enabled"):
+        put(a, _("高频截止 %sHz") % fmt_num(s.get("hp_freq"), "?"))
+    if on("lp_enabled"):
+        put(a, _("低频截止 %sHz") % fmt_num(s.get("lp_freq"), "?"))
+    if on("volume_enabled"):
+        put(a, _("音量 %sx") % fmt_num(s.get("volume"), "?"))
+    if on("audio_speed_enabled"):
+        put(a, _("音频变速 %sx") % fmt_num(s.get("audio_speed_factor"), "?"))
+    if on("denoise_enabled"):
+        _dn = _("音频降噪 %s") % s.get("denoise_method", "")
+        if s.get("denoise_nr") is not None:
+            _dn += " NR%s" % fmt_num(s.get("denoise_nr"))
+        if s.get("denoise_nf") is not None:
+            _dn += " NF%s" % fmt_num(s.get("denoise_nf"))
+        put(a, _dn)
+    if on("eq_enabled"):
+        put(a, _("音频均衡 低%s 中%s 高%s") % (fmt_num(s.get("eq_low")),
+                                          fmt_num(s.get("eq_mid")), fmt_num(s.get("eq_high"))))
+    if on("loudnorm_enabled"):
+        _ln = _("响度统一 %sLUFS") % fmt_num(s.get("loudnorm_i"), "?")
+        if s.get("loudnorm_lra") is not None:
+            _ln += " LRA%s" % fmt_num(s.get("loudnorm_lra"))
+        if s.get("loudnorm_tp") is not None:
+            _ln += " TP%s" % fmt_num(s.get("loudnorm_tp"))
+        put(a, _ln)
+    _ch = clean(s.get("channel_mode", "stereo"), "stereo")
+    if _ch and _ch != "stereo":
+        put(a, _("声道 %s") % {"mono": _("单声道"), "left": _("仅左"), "right": _("仅右"),
+                            "swap": _("左右互换")}.get(_ch, _ch))
+    if on("soxr_enabled"):
+        put(a, _("重采样 SoXR"))
+    # 音频淡入淡出：与视频共用 fade_enabled，但按 audio_fade_view 契约区分——
+    # 视频轨没勾「音频跟随」时音频不淡（不能跟着视频淡），此时音频行不显示。
+    _afade = s if "audio_follow_video_fade" not in s else (
+        s if s.get("audio_follow_video_fade") else None)
+    if _afade is not None and on("fade_enabled", _afade):
+        _fade = []
+        if _afade.get("fade_in"):
+            _fade.append(_("入%ss") % fmt_num(_afade.get("fade_in")))
+        if _afade.get("fade_out"):
+            _fade.append(_("出%ss") % fmt_num(_afade.get("fade_out")))
+        put(a, _("淡入淡出%s") % (" " + " ".join(_fade) if _fade else ""))
+    if on("audio_reverse"):
+        put(a, _("音频倒放"))
+    _aseg = [x for x in (s.get("audio_segments") or []) if isinstance(x, dict) and x.get("enabled")]
+    if _aseg:
+        put(a, _("音频分段 %d段") % len(_aseg))
+    return v, a
+
+
 _CHAIN_NOOP = ("null", "anull", "copy", "acopy")
 
 
@@ -13757,6 +14156,86 @@ def _ppm_parse_header(data):
         return (_w, _h, _k)
     except Exception:
         return None
+
+
+# 频谱纵轴 Nyquist 标注用的 5x7 数字字形（零依赖，禁 PIL）。
+# 坐标口径来自 mcopy 移植说明 §4：PPM 原始像素、黑底白字；锚点见 _ppm_overlay_nyquist 内。
+_SPEC_DIGITS = {
+    "0": ("01110", "10001", "10011", "10101", "11001", "10001", "01110"),
+    "1": ("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
+    "2": ("01110", "10001", "00001", "00010", "00100", "01000", "11111"),
+    "3": ("11111", "00010", "00100", "00010", "00001", "10001", "01110"),
+    "4": ("00010", "00110", "01010", "10010", "11111", "00010", "00010"),
+    "5": ("11111", "10000", "11110", "00001", "00001", "10001", "01110"),
+    "6": ("00110", "01000", "10000", "11110", "10001", "10001", "01110"),
+    "7": ("11111", "00001", "00010", "00100", "01000", "01000", "01000"),
+    "8": ("01110", "10001", "10001", "01110", "10001", "10001", "01110"),
+    "9": ("01110", "10001", "10001", "01111", "00001", "00010", "01100"),
+}
+
+
+def _spectrum_sample_rate(info):
+    """从 ffprobe 的流信息取首个音频流 sample_rate；读不到返回 0。"""
+    try:
+        for _s in (info or {}).get("streams") or []:
+            if _s.get("codec_type") == "audio":
+                _sr = int(_s.get("sample_rate") or 0)
+                return _sr if _sr > 0 else 0
+    except Exception:
+        pass
+    return 0
+
+
+def _ppm_overlay_nyquist(data, label):
+    """在内存 PPM(P6) 的原图像素上叠 Nyquist 白字标注，返回新 PPM bytes。
+
+    showspectrumpic 的 fscale=log 刻度最高标签恒为 stop×0.796（48k → 19093.98），
+    没有任何参数能改刻度；数据用 stop=Nyquist 补到完整频段后，只能在显示层叠字说明。
+    坐标基准来自移植说明 §4（PPM 原始像素、5x7 字形按 `_k` 倍数缩放）；实际右缘锚与顶缘
+    见下方 `_x0, _y0`（已按真机微调），不写 Hz（字串太长会贴到时间轴起点 0）、
+    黑底不透明 + 白字。
+    零落盘、零第三方库（项目禁 PIL），直接在 P6 像素字节上画。
+    """
+    _h = _ppm_parse_header(data)
+    if not _h or not label:
+        return data
+    _w, _hh, _off = _h
+    _text = str(label)
+    _glyphs = [_SPEC_DIGITS.get(_c) for _c in _text]
+    if not _glyphs or any(_g is None for _g in _glyphs) or _w <= 0 or _hh <= 0:
+        return data
+    _k = 1.9                    # 5x7 字形缩放倍数：1.0=5x7px，2.0=10x14px，支持小数；base/multi 同步改本行
+    def _px(_v):
+        return int(round(_v * _k))          # 最近邻取整：相邻笔画无缝，1.2/1.5 等小数倍都可用
+    _gw, _gh = _px(5), _px(7)
+    _tw = _px((len(_glyphs) - 1) * (5 + 1)) + _px(5)
+    _x0, _y0 = 128 - _tw, 54
+    if _x0 < 1 or _y0 < 1 or _x0 + _tw >= _w or _y0 + _gh >= _hh:
+        return data
+    _buf = bytearray(data)
+
+    def _fill(_x1, _y1, _x2, _y2, _rgb):
+        _xa, _ya = max(0, _x1), max(0, _y1)
+        _xb, _yb = min(_w, _x2), min(_hh, _y2)
+        if _xa >= _xb or _ya >= _yb:
+            return
+        for _yy in range(_ya, _yb):
+            _p = _off + (_yy * _w + _xa) * 3
+            for _xx in range(_xa, _xb):
+                _buf[_p:_p + 3] = _rgb
+                _p += 3
+
+    # 黑底不透明：给字形外扩 1px，压在亮频谱上也读得清。
+    _fill(_x0 - 1, _y0 - 1, _x0 + _tw + 1, _y0 + _gh + 1, b"\x00\x00\x00")
+    for _i, _g in enumerate(_glyphs):
+        _gx = _x0 + _px(_i * (5 + 1))
+        for _r, _bits in enumerate(_g):
+            for _c, _bit in enumerate(_bits):
+                if _bit == "1":
+                    _fill(_gx + _px(_c), _y0 + _px(_r),
+                          _gx + _px(_c + 1), _y0 + _px(_r + 1),
+                          b"\xff\xff\xff")
+    return bytes(_buf)
 
 
 def ppm_size(data):
@@ -32443,6 +32922,23 @@ class BlurFilterDialog(tk.Toplevel):
                 _cw, _ch = (1280, 720)
         _bw = max(10.0, min(float(_cw), _bw))
         _bh = max(10.0, min(float(_ch), _bh))
+        # 🔴 2026-11-18（用户报障）：轨迹「起始坐标/结尾坐标」没保护 —— 放开边界或手输
+        #   会写出 0 / 负数，ffmpeg delogo 直接报「Logo area is outside of the frame」。
+        #   🔴 口径**复用本类 `_delogo_safe`（:32601）与区域窗校验（:31626/:31649）的实测结论**：
+        #   四周留 ≥1px ⇒ x∈[1, 宽-w-1]、y∈[1, 高-h-1]。不能照抄 _delogo_safe 函数本身 ——
+        #   它越界时**缩 w/h**，而轨迹只平移 x/y、w/h 是表单静态区域尺寸，缩框会改变去水印范围。
+        #   拖拽松手 on_drag_commit 与关窗收尾的最终 apply_xy 都走这唯一夹取口，双端共用。
+        _max_x = max(1.0, float(_cw) - float(_bw) - 1.0)
+        _max_y = max(1.0, float(_ch) - float(_bh) - 1.0)
+
+        def _safe_apply_xy(nx, ny):
+            try:
+                _x = min(max(1.0, float(nx)), _max_x)
+                _y = min(max(1.0, float(ny)), _max_y)
+            except (TypeError, ValueError):
+                _x, _y = 1.0, 1.0
+            apply_xy(_x, _y)
+
         vx = tk.StringVar(value=f"{int(round(cur_x or 0)):d}")
         vy = tk.StringVar(value=f"{int(round(cur_y or 0)):d}")
 
@@ -32485,10 +32981,11 @@ class BlurFilterDialog(tk.Toplevel):
         _app.open_watermark_overlay_editor(
             int(round(_cw)), int(round(_ch)), _bw, _bh, vx, vy,
             scale_enabled_var=None, scale_w_var=None, scale_h_var=None,
-            watermark_dict=None, filt_frame=None, parent=self, free_layout=True,
+            watermark_dict=None, filt_frame=None, parent=self, free_layout=False,
+            show_free_layout=False,   # 2026-11-18：这两颗按钮不许放开边界（编辑框内也不给勾）
             main_video_file=_vf,
             bg_pre_filter=None,
-            on_apply=_on_apply, on_drag_commit=apply_xy,
+            on_apply=_on_apply, on_drag_commit=_safe_apply_xy,
             initial_time=t0,
             aspect_ratio=None,
             angle_editable=False,
@@ -32512,7 +33009,7 @@ class BlurFilterDialog(tk.Toplevel):
             content_alpha=bool(_ctx_png or _ctx_ppm),
             draw_diagonal=True)
         try:
-            apply_xy(float(vx.get()), float(vy.get()))
+            _safe_apply_xy(vx.get(), vy.get())
         except Exception:
             pass
 
@@ -45787,6 +46284,8 @@ class FFmpegBatchGUI:
         # 合并模块变量
         self.merge_video = tk.StringVar()
         self.merge_tracks = []
+        # MKV 附加字体列表（2026-11-18）：见模块级 _FONT_EXTS_FOR_ATTACH 注释
+        self.merge_attach_items = []
         # 撤销/重做：每 scope 独立栈（2026-09-29 架构升级，替代单槽 _undo_slot）
         # scope: convert(视频转码) / merge(封装合并) / tasks(任务队列) / chapter / watermark
         self._undo_stacks = {"convert": [], "merge": [], "tasks": [], "chapter": [], "watermark": []}
@@ -57542,6 +58041,10 @@ class FFmpegBatchGUI:
                                                      #   坐标基准 = 遮罩前空间（crop→rotate→flip→scale 之后、
                                                      #   链尾拼接之前），与遮罩编辑器 `_cw/_ch` 同源。
                                                      #   None=旧调用方逐字节不变。
+                                show_free_layout=True,  # 2026-11-18：False=右栏**不创建**「放开边界」勾选框。
+                                                     #   delogo 轨迹航点坐标专用（x/y 必须恒 ≥1 且整框在帧内，
+                                                     #   放开边界会放出 0/负数 ⇒ ffmpeg delogo 报「区域出画」）。
+                                                     #   True=全部既有调用点逐字节不变（条件调用）。
         ):
         """
         通用叠加/偏移可视化编辑器（核心重构函数）
@@ -59609,12 +60112,15 @@ class FFmpegBatchGUI:
 
         _free_frame = ttk.Frame(right_frame)
         _free_frame.pack(anchor="w", pady=(2, 2))
-        _free_cb = ttk.Checkbutton(_free_frame, text=_("放开边界"), variable=_free_var,
-                                   command=_on_free_toggle)
-        _free_cb.pack(side=tk.LEFT)
-        ToolTip(_free_cb,
-                _("放开边界限制（自由布局）：允许内容比画布大、可拖出画布之外。\n"
-                "勾选后实时生效，无需返回上一层设置。"), wraplength=320)
+        # 🔴 2026-11-18：show_free_layout=False 时**只藏「放开边界」这一颗**；
+        #   _free_frame 本身仍要 pack —— 后面「真实帧 / 只看此刻」都挂在这个 frame 上。
+        if show_free_layout:
+            _free_cb = ttk.Checkbutton(_free_frame, text=_("放开边界"), variable=_free_var,
+                                       command=_on_free_toggle)
+            _free_cb.pack(side=tk.LEFT)
+            ToolTip(_free_cb,
+                    _("放开边界限制（自由布局）：允许内容比画布大、可拖出画布之外。\n"
+                    "勾选后实时生效，无需返回上一层设置。"), wraplength=320)
 
         # ---- 真实帧开关（2026-10-05，**窗口级临时**，与全局总开关解耦）----
         # 全局开关在「更多设置」，决定**新开**编辑器时的默认态；本按钮只改**当前窗口**，
@@ -60200,7 +60706,7 @@ class FFmpegBatchGUI:
                                                             # _generic_overlay_editor）——框内只显示
                                                             # 遮罩保留的区域。None=旧调用零变化。
                                                             # ⚠️ 必须放签名最末（旧的按位置传参不受影响）。
-                                  content_pre_filter=None):  # 2026-11-02：内容帧取帧前的预处理串
+                                  content_pre_filter=None,  # 2026-11-02：内容帧取帧前的预处理串
                                                             # （子视频开了「拼接」⇒ `_tile_pre_filter`
                                                             # 的网格/split 片段）。透传 _generic_overlay_editor
                                                             # 同名参数（它把 crop→遮罩→本片段串成一条）。
@@ -60209,6 +60715,8 @@ class FFmpegBatchGUI:
                                                             # 漏了这个形参 ⇒ 一点「坐标」必抛 TypeError：
                                                             # unexpected keyword argument 'content_pre_filter'。
                                                             # ⚠️ 仍放签名最末（旧的按位置传参不受影响）。
+                                  show_free_layout=True):   # 2026-11-18：透传 _generic_overlay_editor 同名参数；
+                                                            # False=右栏不创建「放开边界」勾选框（delogo 航点专用）。
         """
         水印可视化编辑器，支持回写位置和缩放尺寸，以及更新水印字典和滤镜框架。
         free_layout=True 时放开边界（子视频可拖出画布、可比主视频大）。
@@ -60337,6 +60845,7 @@ class FFmpegBatchGUI:
                                      min_visible_pixels=0,show_scale_tip=True,
                                      allow_negative_offset=free_layout,
                                      free_layout_var=free_layout_var,
+                                     show_free_layout=show_free_layout,  # 2026-11-18：False=隐藏「放开边界」勾选框
                                      rotate_angle=_wm_ra, angle_cb=apply_wm_angle,
                                      angle_editable=angle_editable,   # False=无旋转手柄（遮罩：链路不消费角度）
                                      show_nudge=False,   # 图片水印位置编辑器：无微调按钮
@@ -61340,7 +61849,16 @@ class FFmpegBatchGUI:
             task = self.tasks[int(item)]
         except (TypeError, ValueError, IndexError):
             return
-        self._show_media_info_dialog(getattr(task, "input", ""))
+        self._show_media_info_dialog(getattr(task, "input", ""),
+                                     getattr(task, "settings", None))
+
+    def _show_task_spectrum(self, item):
+        """任务列表右键「查看频谱」：与 _show_task_media_info 取**同一任务**的 input。"""
+        try:
+            task = self.tasks[int(item)]
+        except (TypeError, ValueError, IndexError):
+            return
+        self._show_spectrum_dialog(getattr(task, "input", ""))
 
     def _show_selected_task_media_info(self):
         """工具栏「预览选中任务」按钮右键：查看当前选中任务的媒体信息。"""
@@ -63931,7 +64449,11 @@ class FFmpegBatchGUI:
         btn_frame = ttk.Frame(parent)
         btn_frame.pack(fill=tk.X, pady=5)
         ttk.Button(btn_frame, text=_("添加外部音轨"), command=lambda: self.merge_add_external("audio")).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text=_("添加外部字幕"), command=lambda: self.merge_add_external("subtitle")).pack(side=tk.LEFT, padx=2)
+        btn_add_sub = ttk.Button(btn_frame, text=_("添加外部字幕"), command=lambda: self.merge_add_external("subtitle"))
+        btn_add_sub.pack(side=tk.LEFT, padx=2)
+        # 右键 = 字体/附件管理（探测源内嵌字体 + 附加本地字体，只出 mkv）
+        btn_add_sub.bind("<Button-3>", lambda e: self._open_font_attach_dialog())
+        ToolTip(btn_add_sub, _("左键：添加外部字幕\n右键：字体/附件管理（附加 MKV 内嵌字体）"), wraplength=300)
         # 2026-08-26：底部「清空轨道」与列表上方工具栏的「清空」重复 → 改为封装页
         # 独立的「文字水印」入口（封装页不再从转换页注入文字水印）
         ttk.Button(btn_frame, text=_("文字水印"), command=self.open_merge_text_watermark_dialog).pack(side=tk.LEFT, padx=2)
@@ -65057,6 +65579,7 @@ class FFmpegBatchGUI:
         menu.add_command(label=_("预览轨道"), command=self.merge_preview_selected)
         menu.add_command(label=_("预览轨道（快照 - 画中画合成）"), command=lambda: self.merge_preview_selected(with_snapshot=True))
         menu.add_command(label=_("查看媒体信息"), command=self._merge_media_info_selected)
+        menu.add_command(label=_("查看频谱（整段音频）"), command=self._merge_spectrum_selected)
         # 实时预览（简易时间引擎）：同一张合成图改走内置时间预览窗口（ffmpeg 管道，不依赖 mpv，
         # 但画面小、性能有限，子视频多 / 滤镜重时同样可能卡顿；外部播放器（mpv/ffplay）性能通常更好）
         # —— 按当前模式自动选图：串行合并图 / 画中画图 / 单轨合成图。
@@ -68202,6 +68725,8 @@ class FFmpegBatchGUI:
             # 绝不能让整个「保存项目」失败（保存失败比丢失一个效果严重得多）。
             "node_fx": _jsonable_node_fx(self),
             "node_audio_fx": _jsonable_node_audio_fx(self),
+            # MKV 附加字体（2026-11-18）；逐项只留 JSON 安全的标量
+            "attach_fonts": [dict(i) for i in (getattr(self, "merge_attach_items", None) or [])],
             "tracks": []
         }
         for track in self.merge_tracks:
@@ -68338,7 +68863,11 @@ class FFmpegBatchGUI:
                 self._append_info_ui(
                     f"[音频节点] 已载入 {len(self.node_audio_fx)} 个；链的结构没变就会自动插回，"
                     f"变了会跳过并提示重选（音频节点里可查看/清除）")
-    
+
+            # MKV 附加字体（2026-11-18）：缺失时清空（与 node_fx 同口径）
+            _af = state.get("attach_fonts")
+            self.merge_attach_items = [dict(i) for i in _af if isinstance(i, dict)] if isinstance(_af, list) else []
+
             # 恢复轨道（⚠️ 项目文件可能被手改/截断 ⇒ 一律 .get，缺 enc_settings 只跳过该条，
             # 不让一条坏记录把整个加载打成 KeyError 半加载；转换页那侧同理全程 .get）
             self.merge_tracks = []
@@ -72551,6 +73080,18 @@ class FFmpegBatchGUI:
 
         output_norm = normalize_path(output)
 
+        # 2026-11-18：有启用的附加字体 ⇒ 容器强制 MKV（实测 mp4 直接报错、webm 静默丢弃附件）。
+        # 放在 alpha 升 .mov 判据【之前】：两者同时成立时 alpha 的 mov 升级会覆盖；此处先记下
+        # 字体需求，alpha 分支后面据此跳过 mov（MKV 保字体优先，提示用户）。
+        _font_items = [i for i in (getattr(self, "merge_attach_items", None) or [])
+                       if isinstance(i, dict) and i.get("enabled")]
+        _has_attach_fonts = bool(_font_items) and not only_audio
+        if _has_attach_fonts:
+            _bn, _ex = os.path.splitext(output_norm)
+            if _ex.lower() != ".mkv":
+                output_norm = _bn + ".mkv"
+                self._append_info_ui(_("[字体] 已启用附加字体，输出容器强制为 .mkv（mp4/webm 不支持内嵌字体）"))
+
         # 2026-10-09：透明输出需求 → 容器须支持 alpha。判据只认**主视频**是否透明
         # （颜色源 alpha<255 / 抠像 / 遮罩 / alpha 输入；子视频带透明不算，见 _merge_needs_alpha）。
         # 非 alpha 容器（mp4/mkv/avi/flv）自动升级为 .mov（QuickTime 支持 yuva420p）。
@@ -72568,7 +73109,8 @@ class FFmpegBatchGUI:
         # 幂等），本处保留是为了让**容器扩展名**也跟着升 —— ProRes 4444 塞在 .mp4 里
         # alpha 同样会丢，两处必须同口径。
         _nfx_alpha = bool(self.pip_enabled.get()) and self._graph_alpha_from_node_fx()
-        if not only_audio and (self._merge_needs_alpha(enabled_tracks) or _nfx_alpha):
+        if (not only_audio and not _has_attach_fonts and
+                (self._merge_needs_alpha(enabled_tracks) or _nfx_alpha)):
             if _nfx_alpha:
                 self._log_alpha_once(
                     "merge_mov_nfx",
@@ -72694,6 +73236,23 @@ class FFmpegBatchGUI:
                 else:
                     self._append_info_ui(_("警告：手动时长格式无效，已忽略"))
 
+
+
+        # ---- MKV 附加字体统一注入（2026-11-18，三模式通用）----
+        # 必须在输出路径之前；_shorten_long_filters 只动滤镜串，不碰这些参数。
+        if _has_attach_fonts and cmd_list:
+            _font_files = []
+            for _t in enabled_tracks:
+                _fp = getattr(_t, "file_path", "")
+                if _fp and _fp not in _font_files:
+                    _font_files.append(_fp)
+            _font_fi = {f: i for i, f in enumerate(_font_files)}
+            _fargs, _fcnt = merge_font_attach_args(_font_items, _font_fi, only_audio)
+            if _fargs:
+                _out_path = cmd_list.pop()
+                cmd_list.extend(_fargs)
+                cmd_list.append(_out_path)
+                self._append_info_ui(_('[字体] 已附加 {0} 个字体到 MKV 输出').format(_fcnt))
 
 
         if not preview:
@@ -72898,11 +73457,16 @@ class FFmpegBatchGUI:
     def merge_get_media_info(self, path):
         return self._get_cached_stream_info(path)
 
-    def _show_media_info_dialog(self, path):
+    def _show_media_info_dialog(self, path, settings=None):
         """右键「查看媒体信息」的公共出口：ffprobe 常规数据 → 只读小窗。
 
         数据走 `_get_cached_stream_info`（按 path+mtime 缓存）——拖入/探测过的文件
         命中缓存即 0 次 ffprobe；虚拟源（color/gen）由缓存入口自行处理。
+
+        settings 为该素材对应的设置字典（转换页 get_current_settings / 任务
+        task.settings / 封装轨 track.enc_settings）；只用于末尾「已启用滤镜」附录，
+        纯只读，不触发任何命令/探测。三处右键入口各自传自己的那份，避免同一文件
+        在不同上下文显示错误的滤镜。
         """
         p = (path or "").strip()
         if alert_if(not p, _("提示"), _("没有可查看的媒体文件"), 'info'):
@@ -72917,7 +73481,7 @@ class FFmpegBatchGUI:
             _fmt = self._probe_format_once(p)
             if _fmt:
                 info["format"] = _fmt
-        text = self._format_media_info_text(p, info)
+        text = self._format_media_info_text(p, info, settings)
         _sc = getattr(self, "scaling", 1.0)
         win = tk.Toplevel(self.root)
         win.withdraw()
@@ -72929,15 +73493,21 @@ class FFmpegBatchGUI:
         ttk.Button(btns, text=_("关闭"), command=win.destroy, width=12).pack()
         body = ttk.Frame(win, padding=(8, 8, 8, 0))
         body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        # 配色沿用日志区（浅蓝底 + 绿色选中），两个日志 Text 也是这组值。
         txt = scrolledtext.ScrolledText(body, wrap=tk.WORD, font=("Microsoft YaHei", 9),
-                                        height=22, width=80)
+                                        height=22, width=80,
+                                        bg='#EAF4FC', fg='black',
+                                        selectbackground='#CCF09C', selectforeground='black')
         txt.pack(fill=tk.BOTH, expand=True)
         txt.insert(tk.END, text)
         txt.config(state=tk.DISABLED)
         center_window(win, int(760 * _sc), int(540 * _sc))
 
-    def _format_media_info_text(self, path, info):
-        """把 ffprobe json（`_get_cached_stream_info` 的返回）格式化成常规数据文本。"""
+    def _format_media_info_text(self, path, info, settings=None):
+        """把 ffprobe json（`_get_cached_stream_info` 的返回）格式化成常规数据文本。
+
+        settings 非空时在末尾追加「当前启用的滤镜」附录（只读 settings、零探测）。
+        """
         def _hms(v):
             try:
                 sec = float(v)
@@ -73014,6 +73584,88 @@ class FFmpegBatchGUI:
             except (TypeError, ValueError):
                 return str(v) if v else "-"
 
+        def _num(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        # 🔴 与摘要函数同口径的未选择哨兵：ffprobe / 控件可能给
+        #    'none' / 'N/A' / 'unknown' / 'false'，直接 if 会显示「旋转 none°」。
+        _NO_VAL = {"", "none", "no", "off", "false", "0", "0.0", "n/a", "na", "null",
+                   "nil", "nan", "unknown", "unspecified", "disabled", "无", "关闭",
+                   "默认", "未设置", "-"}
+
+        def settled(v):
+            if v is None:
+                return False
+            if isinstance(v, str):
+                return v.strip().lower() not in _NO_VAL
+            return True
+
+        def rot_valid(v):
+            """0 / '0' / 'none' / 'N/A' 都是未旋转，不该显示「旋转 none°」。"""
+            if not settled(v):
+                return False
+            try:
+                return float(v) != 0.0
+            except (TypeError, ValueError):
+                return True
+
+        def _rate(v):
+            if isinstance(v, str) and "/" in v:
+                a, b = v.split("/", 1)
+                try:
+                    return (float(a) / float(b)) if float(b) else None
+                except (TypeError, ValueError):
+                    return None
+            return _num(v)
+
+        def _color_name(v):
+            # ffprobe 用 SMPTE/ITU 短名，MediaInfo 用显示名 ⇒ 这里做同名映射。
+            _m = {"tv": "Limited", "pc": "Full", "bt709": "BT.709",
+                  "bt470bg": "BT.470BG", "smpte170m": "SMPTE 170M",
+                  "smpte240m": "SMPTE 240M", "bt2020": "BT.2020",
+                  "bt2020nc": "BT.2020 NC", "bt2020c": "BT.2020 C",
+                  "smpte2084": "SMPTE 2084 (PQ)", "arib-std-b67": "HLG",
+                  "unknown": _("未知"), "reserved": _("保留")}
+            return _m.get(str(v).lower(), str(v))
+
+        def _scan_name(v):
+            return {"progressive": _("逐行扫描"), "interlaced": _("隔行扫描"),
+                    "tt": _("隔行(上场优先)"), "bb": _("隔行(下场优先)")}.get(str(v).lower(), str(v))
+
+        def _pix_detail(px, bits):
+            """pix_fmt → (色彩空间, 色度抽样, 位深)，纯字符串解析、零探测。"""
+            if not px:
+                return None, None, bits
+            p = str(px).lower()
+            space = ("YUV" if p.startswith("yuv") else
+                     "RGB" if p.startswith(("rgb", "bgr", "gbr")) else
+                     _("灰度") if p.startswith("gray") else None)
+            sub = None
+            for cand in ("420", "422", "444", "411", "410", "440"):
+                if cand in p:
+                    sub = "%s:%s:%s" % (cand[0], cand[1], cand[2])
+                    break
+            if not bits:
+                m = re.search(r"(\d+)(?:le|be)?$", p)
+                if m:
+                    bits = int(m.group(1))
+            return space, sub, bits
+
+        def _stream_size(br_val, dur_val, total):
+            """按 码率×时长/8 估算单流大小，并与容器大小对比给占比。"""
+            b, d = _num(br_val), _num(dur_val)
+            if not b or not d or b <= 0 or d <= 0:
+                return None
+            sz = b * d / 8.0
+            txt = _size(sz)
+            t = _num(total)
+            if t and t > 0:
+                txt += " (%.0f%%)" % (sz / t * 100.0)
+            return txt
+
         lines = [_("文件: %s") % path]
         if not info:
             lines.append("")
@@ -73026,6 +73678,15 @@ class FFmpegBatchGUI:
             lines.append(_("时长: %s") % _hms(fmt.get("duration")))
             lines.append(_("大小: %s") % _size(fmt.get("size")))
             lines.append(_("总码率: %s") % _br(fmt.get("bit_rate")))
+            # ISO BMFF 的 compatible_brands 是 4 字符 brand 顺序拼接（isomiso2avc1mp41）
+            # ⇒ 拆成 isom/iso2/avc1/mp41，与 MediaInfo「编解码器 ID」括号内容同口径。
+            _compat = ((fmt.get("tags") or {}).get("compatible_brands") or "").strip()
+            if _compat:
+                _brands = [_compat[i:i + 4] for i in range(0, len(_compat), 4)]
+                _brands = [b for b in _brands
+                           if len(b) == 4 and all(32 <= ord(c) < 127 for c in b)]
+                if _brands:
+                    lines.append(_("兼容品牌: %s") % "/".join(_brands))
 
         streams = info.get("streams") or []
         lines.append("")
@@ -73035,28 +73696,192 @@ class FFmpegBatchGUI:
         for s in streams:
             t = s.get("codec_type", "?")
             _idx = s.get("index")
-            lines.append(_("── #%s %s ──") % ("?" if _idx is None else _idx,
-                                              _tname.get(t, t)))
+            _sid = s.get("id")
+            if isinstance(_sid, str) and _sid.lower().startswith("0x"):
+                try:
+                    _sid = int(_sid, 16)
+                except ValueError:
+                    pass
+            _head = "── #%s %s" % ("?" if _idx is None else _idx, _tname.get(t, t))
+            if _sid not in (None, "", 0):
+                _head += " (ID %s)" % _sid
+            lines.append(_head + " ──")
             lines.append(_("  编码: %s") % (s.get("codec_long_name") or s.get("codec_name") or "-"))
             if t == "video":
                 w, h = s.get("width"), s.get("height")
                 lines.append(_("  分辨率: %sx%s") % ("?" if w is None else w,
-                                                    "?" if h is None else h))
-                lines.append(_("  帧率: %s") % _fps(s.get("avg_frame_rate") or s.get("r_frame_rate")))
-                if s.get("pix_fmt"):
+                                                  "?" if h is None else h))
+                _rf, _afps = s.get("r_frame_rate"), s.get("avg_frame_rate")
+                lines.append(_("  帧率: %s") % _fps(_afps or _rf))
+                _rr, _ar = _rate(_rf), _rate(_afps)
+                if _rr and _ar:
+                    lines.append(_("  帧率模式: %s") %
+                                 (_("恒定") if abs(_rr - _ar) < 0.01 else _("可变")))
+                if settled(s.get("pix_fmt")):
                     lines.append(_("  像素格式: %s") % s.get("pix_fmt"))
+                _space, _sub, _bits = _pix_detail(s.get("pix_fmt"),
+                                                  s.get("bits_per_raw_sample") or None)
+                if _space:
+                    lines.append(_("  色彩空间: %s") % _space)
+                if _sub:
+                    lines.append(_("  色度抽样: %s") % _sub)
+                if _bits:
+                    lines.append(_("  位深: %s 位") % _bits)
+                if settled(s.get("field_order")):
+                    lines.append(_("  扫描类型: %s") % _scan_name(s.get("field_order")))
                 lines.append(_("  码率: %s") % _br(s.get("bit_rate")))
+                # 次要字段（`ffprobe_json` 已探测进 info，纯读取、零额外子进程）
+                if s.get("codec_tag_string") and settled(s.get("codec_tag_string")):
+                    _tag = s.get("codec_tag_string")
+                    if settled(s.get("mime_codec_string")) and s.get("mime_codec_string") != _tag:
+                        _tag += _(" (标识 %s)") % s.get("mime_codec_string")
+                    lines.append(_("  编码标签: %s") % _tag)
+                _prof = s.get("profile")
+                if settled(_prof):
+                    _lv = s.get("level")
+                    if _lv and str(_lv).isdigit() and int(_lv) >= 10:
+                        _prof = "%s@L%s.%s" % (_prof, int(_lv) // 10, int(_lv) % 10)
+                    lines.append(_("  档次: %s") % _prof)
+                if settled(s.get("display_aspect_ratio")):
+                    lines.append(_("  显示宽高比: %s") % s.get("display_aspect_ratio"))
+                if settled(s.get("sample_aspect_ratio")) and s.get("sample_aspect_ratio") != "1:1":
+                    lines.append(_("  像素宽高比: %s") % s.get("sample_aspect_ratio"))
+                for _ck, _cl in (("color_range", _("色彩范围")),
+                                 ("color_primaries", _("色彩原色")),
+                                 ("color_transfer", _("传输特性")),
+                                 ("color_space", _("矩阵系数"))):
+                    if settled(s.get(_ck)):
+                        lines.append("  %s: %s" % (_cl, _color_name(s.get(_ck))))
+                if settled(s.get("nb_frames")):
+                    lines.append(_("  总帧数: %s") % s.get("nb_frames"))
+                if s.get("duration") and float(s.get("duration") or 0) > 0:
+                    lines.append(_("  流时长: %s") % _hms(s.get("duration")))
+                _ss = _stream_size(s.get("bit_rate"), s.get("duration"), fmt.get("size"))
+                if _ss:
+                    lines.append(_("  流大小: %s") % _ss)
+                _bw, _wv, _hv = _num(s.get("bit_rate")), _num(w), _num(h)
+                if _bw and _bw > 0 and _wv and _hv and _ar and _ar > 0:
+                    lines.append(_("  像素密度: %.3f bits/px·帧") %
+                                 (_bw / (_wv * _hv * _ar)))
+                if s.get("has_b_frames"):
+                    lines.append(_("  B帧: %s") % s.get("has_b_frames"))
+                if s.get("is_avc"):
+                    _nal = s.get("nal_length_size")
+                    lines.append(_("  AVC 格式: AVCC%s") %
+                                 (_(" (NAL 长度 %s)") % _nal if _nal else ""))
+                if (s.get("disposition") or {}).get("default"):
+                    lines.append(_("  默认流: 是"))
+                _rot = None
+                for _sd in (s.get("side_data_list") or []):
+                    if isinstance(_sd, dict) and rot_valid(_sd.get("rotation")):
+                        _rot = _sd.get("rotation")
+                        break
+                if _rot is None:
+                    _rot = s.get("rotation")
+                if rot_valid(_rot):
+                    # 🔴 这是 ffprobe 的元数据旋转（播放器自动应用，不写进滤镜链），
+                    #    与 settings["rotate"] 的用户旋转是两件事 ⇒ 标签必须带「元数据」。
+                    lines.append(_("  元数据旋转: %s°") % _rot)
             elif t == "audio":
-                lines.append(_("  采样率: %s Hz") % (s.get("sample_rate") or "-"))
+                _sr0 = s.get("sample_rate")
+                if _sr0:
+                    try:
+                        lines.append(_("  采样率: %s Hz (%.1f kHz)") %
+                                     (_sr0, float(_sr0) / 1000.0))
+                    except (TypeError, ValueError):
+                        lines.append(_("  采样率: %s Hz") % _sr0)
+                else:
+                    lines.append(_("  采样率: -"))
+                _sr = _num(_sr0)
                 _ch = s.get("channels")
                 lines.append(_("  声道: %s") % ("-" if _ch is None else _ch))
-                if s.get("channel_layout"):
-                    lines.append(_("  声道布局: %s") % s.get("channel_layout"))
+                if settled(s.get("channel_layout")):
+                    _cl = s.get("channel_layout")
+                    _expand = {"stereo": "L R", "mono": "C",
+                               "5.1": "L R C LFE Ls Rs",
+                               "7.1": "L R C LFE Ls Rs Lr Rr"}
+                    lines.append(_("  声道布局: %s%s") %
+                                 (_cl, (" (%s)" % _expand[_cl]) if _cl in _expand else ""))
                 lines.append(_("  码率: %s") % _br(s.get("bit_rate")))
+                # 次要字段（同上，零额外探测）
+                if settled(s.get("sample_fmt")):
+                    lines.append(_("  采样格式: %s") % s.get("sample_fmt"))
+                _prof = s.get("profile")
+                if settled(_prof):
+                    lines.append(_("  档次: %s") % _prof)
+                if s.get("codec_tag_string") and settled(s.get("codec_tag_string")):
+                    _tag = s.get("codec_tag_string")
+                    if settled(s.get("mime_codec_string")) and s.get("mime_codec_string") != _tag:
+                        _tag += _(" (标识 %s)") % s.get("mime_codec_string")
+                    lines.append(_("  编码标签: %s") % _tag)
+                if settled(s.get("nb_frames")):
+                    lines.append(_("  总帧数: %s") % s.get("nb_frames"))
+                if s.get("duration") and float(s.get("duration") or 0) > 0:
+                    lines.append(_("  流时长: %s") % _hms(s.get("duration")))
+                _ss = _stream_size(s.get("bit_rate"), s.get("duration"), fmt.get("size"))
+                if _ss:
+                    lines.append(_("  流大小: %s") % _ss)
+                # AAC 帧长：HE-AAC(SBR/PS) = 2048 samples/帧，AAC-LC = 1024
+                if _sr and str(s.get("codec_name") or "") == "aac":
+                    _spf = 2048 if "HE-AAC" in str(_prof or "") else 1024
+                    lines.append(_("  音频帧率: %.3f fps (%d samples/帧)") %
+                                 (_sr / _spf, _spf))
+                _pad = _num(s.get("initial_padding"))
+                if _pad:
+                    lines.append(_("  初始延迟: %s samples (%.3f s)") %
+                                 (int(_pad), _pad / _sr if _sr else 0))
+                if (s.get("disposition") or {}).get("default"):
+                    lines.append(_("  默认流: 是"))
+                _loss = {"flac": _("无损"), "alac": _("无损"), "ape": _("无损"), "wv": _("无损"),
+                         "aac": _("有损"), "mp3": _("有损"), "opus": _("有损"), "vorbis": _("有损"),
+                         "ac3": _("有损"), "eac3": _("有损"), "dts": _("有损")}
+                _cn = str(s.get("codec_name") or "")
+                if _cn.startswith("pcm_"):
+                    lines.append(_("  压缩模式: 无损(PCM)"))
+                elif _cn in _loss:
+                    lines.append(_("  压缩模式: %s") % _loss[_cn])
+            _tags = s.get("tags") or {}
+            for _tk in ("title", "handler_name", "encoder"):
+                if settled(_tags.get(_tk)):
+                    lines.append("  %s: %s" % (_tk, _tags.get(_tk)))
             _lang = (s.get("tags") or {}).get("language")
-            if _lang:
+            if settled(_lang):
                 lines.append(_("  语言: %s") % _lang)
             lines.append("")
+
+        # 「当前启用的滤镜」附录：只读 settings，零探测、零子进程。
+        # 源尺寸直接从 info 的 video stream 取（已在手，零探测）——元数据旋转
+        # 由 side_data_list.rotation 反映，与 _cached_video_base_dimensions 同口径。
+        # 只在调用方传入了 settings 时才出现（三处右键入口都会传）。
+        if isinstance(settings, dict):
+            _orig = None
+            for _s0 in streams:
+                if _s0.get("codec_type") == "video" and _s0.get("width") and _s0.get("height"):
+                    _ow, _oh = _s0.get("width"), _s0.get("height")
+                    _rot = None
+                    for _sd in (_s0.get("side_data_list") or []):
+                        if isinstance(_sd, dict) and _sd.get("rotation") not in (None, 0):
+                            _rot = _sd.get("rotation")
+                            break
+                    if _rot is None:
+                        _rot = _s0.get("rotation")
+                    if str(_rot) in ("90", "270", "-90"):
+                        _ow, _oh = _oh, _ow
+                    _orig = (_ow, _oh)
+                    break
+            _vf, _af = media_settings_filter_summary(settings, _orig)
+            lines.append(_("── 当前启用的滤镜/效果 ──"))
+            if _vf or _af:
+                if _vf:
+                    lines.append(_("  视频:"))
+                    for _x in _vf:
+                        lines.append("    - %s" % _x)
+                if _af:
+                    lines.append(_("  音频:"))
+                    for _x in _af:
+                        lines.append("    - %s" % _x)
+            else:
+                lines.append(_("  （未启用任何滤镜/效果）"))
         return "\n".join(lines)
 
     def _probe_format_once(self, path):
@@ -73067,7 +73892,7 @@ class FFmpegBatchGUI:
         try:
             cmd = [self.ffprobe_cmd, "-v", "error", "-show_entries",
                    "format=format_name,format_long_name,duration,size,bit_rate"
-                   ":format_tags=major_brand",
+                   ":format_tags=major_brand,compatible_brands",
                    "-of", "json", path]
             res = subprocess.run(cmd, capture_output=True, text=True,
                                  encoding="utf-8", errors="replace",
@@ -73164,9 +73989,28 @@ class FFmpegBatchGUI:
             w, h = h, w
         return w, h
 
+    def _clear_embedded_font_choices(self):
+        """换主视频 / 替换素材：源内嵌字体的历史勾选态作废，外部字体保留。
+
+        源内嵌项每次开字体窗都会重新探测、默认全启用；merge_attach_items 里的
+        embedded 项唯一作用就是携带上次禁用的 (path, stream)。换源后旧勾选态
+        不该复活。外部字体是用户主动加的独立文件，与输入视频无关，不清。
+        工程加载走 _suppress_main_video_trace 不经过这里 ⇒ 工程里保存的禁用态仍有效。
+        """
+        items = getattr(self, "merge_attach_items", None) or []
+        _kept = [i for i in items if i.get("source") == "external"]
+        if len(_kept) != len(items):
+            self.merge_attach_items = _kept
+            self._append_info_ui(
+                _("[字体] 输入源已更换，清除 %d 项源内嵌字体的勾选状态") % (len(items) - len(_kept)))
+
+
     def merge_load_video_info(self):
         if self._suppress_main_video_trace:
             return
+        # 换主视频 = 新一批输入：源内嵌字体历史勾选态作废（外部字体保留）。
+        # 置于 trace 抑制检查之后 ⇒ 工程加载 / 自动同步主视频不经过这里。
+        self._clear_embedded_font_choices()
 
         path = self.merge_video.get().strip()
         if _is_virtual_source(path):
@@ -75001,6 +75845,9 @@ class FFmpegBatchGUI:
                 self.merge_video.set(path)
             finally:
                 self._suppress_main_video_trace = False
+        # 替换素材也是换输入源：源内嵌字体勾选态作废（外部字体保留）。
+        # 位于 _undo_snap 与 _after_snap 之间 ⇒ 撤销/重做可自动还原。
+        self._clear_embedded_font_choices()
 
         self.merge_refresh_ui()
         self._append_info_ui(
@@ -78684,6 +79531,7 @@ class FFmpegBatchGUI:
         menu.add_command(label=_("快照（画中画合成）"), command=lambda: self.merge_preview_selected(with_snapshot=True))
         menu.add_command(label=_("缩略图"), command=self._contact_sheet_selected_track)
         menu.add_command(label=_("查看媒体信息"), command=self._merge_media_info_selected)
+        menu.add_command(label=_("查看频谱（整段音频）"), command=self._merge_spectrum_selected)
         # 「时间预览引擎（主视频轨合成）」入口已删除（2026-09-20 用户确认）：它与下面的
         # 「实时预览（简易时间引擎）」功能重复——后者按模式自动分派（串行合并图 / 画中画图 /
         # 单轨合成图），前者在被覆盖后只剩冗余。_time_preview_pipe_merge 方法保留：
@@ -78712,12 +79560,179 @@ class FFmpegBatchGUI:
         y = self.root.winfo_pointery()
         menu.post(x, y)
 
+    # ---------- MKV 附加字体（2026-11-18）----------
+    def _open_font_attach_dialog(self):
+        """「添加外部字幕」右键入口：单窗口列表管理源内嵌字体 + 外部附加字体。
+
+        只服务封装页普通混流（-attach 只有 Matroska 支持）。窗口里勾选的项写回
+        self.merge_attach_items，随工程保存/加载；命令生成在 merge_build_cmd_list 尾部统一注入。
+        """
+        if getattr(self, "merge_only_audio", None) and self.merge_only_audio.get():
+            if alert_if(True, _("提示"), _("仅音频模式不支持附加字体"), 'info'):
+                return
+
+        # 每次开窗重新探测源内嵌字体（主视频 + 所有视频轨的来源文件），外部项保留
+        src_paths = []
+        mv = self.merge_video.get().strip()
+        if mv:
+            src_paths.append(mv)
+        for t in self.merge_tracks:
+            fp = getattr(t, "file_path", "")
+            if fp and fp not in src_paths:
+                src_paths.append(fp)
+        embedded = collect_embedded_fonts(self.ffprobe_cmd, src_paths)
+        # 已禁用的源字体项保留禁用态（按 path+stream 认人）
+        _was_off = {(i.get("path"), i.get("stream")) for i in self.merge_attach_items
+                    if i.get("source") == "embedded" and not i.get("enabled")}
+        for e in embedded:
+            if (e["path"], e["stream"]) in _was_off:
+                e["enabled"] = False
+        external = [i for i in self.merge_attach_items if i.get("source") == "external"]
+        # 去重（同名外部文件不重复挂）
+        seen = set()
+        for e in external:
+            key = (e.get("path") or e.get("filename") or "").lower()
+            if key in seen:
+                continue
+            seen.add(key)
+        self._font_dlg_items = embedded + external
+
+        win = tk.Toplevel(self.root)
+        win.withdraw()
+        win.title(_("字体 / 附件管理（MKV）"))
+        win.transient(self.root)
+        win.grab_set()
+        center_window(win, 720, 480)
+
+        main = ttk.Frame(win, padding="10")
+        main.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(main, text=_("探测到的字体来自输入文件（源内嵌），外部字体由你添加。只有勾选的会写进输出。"),
+                  foreground="#555", wraplength=680).pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(main, text=_("⚠️ 只有 MKV 容器支持内嵌字体，输出将自动改为 .mkv；字幕需为 ASS/SSA（SRT 无字体样式）。"),
+                  foreground="#a50", wraplength=680).pack(fill=tk.X, pady=(0, 8))
+
+        # 列表区独立成 frame：树和滚动条在内部左右排列；按钮栏作为 main 的最后一个
+        # 子控件固定在下方。避免树(side=LEFT,expand)与按钮栏(默认TOP)在同一 master 里
+        # 混用 pack 方向，把按钮挤到右边、默认开窗看不到。
+        list_frame = ttk.Frame(main)
+        list_frame.pack(fill=tk.BOTH, expand=True)
+
+        cols = ("on", "source", "name", "mime", "from")
+        tree = ttk.Treeview(list_frame, columns=cols, show="headings", selectmode="browse", height=13)
+        for c, txt, wd in (("on", _("启用"), 48), ("source", _("来源"), 80),
+                           ("name", _("字体文件"), 220), ("mime", _("类型"), 160),
+                           ("from", _("所在文件"), 180)):
+            tree.heading(c, text=txt)
+            tree.column(c, width=wd, anchor=tk.W)
+        tree.heading("on", text=_("启用"), command=lambda: self._font_tree_toggle(tree))
+        tree.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
+        sb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=tree.yview)
+        sb.pack(fill=tk.Y, side=tk.RIGHT)
+        tree.configure(yscrollcommand=sb.set)
+
+        def refresh():
+            tree.delete(*tree.get_children())
+            for i, it in enumerate(self._font_dlg_items):
+                tree.insert("", tk.END, iid=str(i), values=(
+                    _("启") if it.get("enabled") else _("禁"),
+                    _("源内嵌") if it.get("source") == "embedded" else _("外部"),
+                    it.get("filename") or os.path.basename(it.get("path") or "?"),
+                    it.get("mimetype") or "-",
+                    os.path.basename(it.get("path") or ""),
+                ))
+
+        def add_fonts():
+            paths = filedialog.askopenfilenames(
+                title=_("选择字体文件（可多选）"),
+                filetypes=[(_("字体文件"), "*.ttf *.ttc *.otf"), (_("所有文件"), "*.*")],
+                parent=win)
+            added = 0
+            for p in paths:
+                p = normalize_path(p)
+                if any((it.get("path") or "").lower() == p.lower()
+                       for it in self._font_dlg_items):
+                    continue
+                self._font_dlg_items.append({
+                    "source": "external", "enabled": True, "path": p,
+                    "filename": os.path.basename(p),
+                    "mimetype": font_attach_mimetype(p), "stream": -1,
+                })
+                added += 1
+            if added:
+                refresh()
+                self._append_info_ui(_('[字体] 已添加 {0} 个外部字体').format(added))
+
+        def del_font():
+            sel = tree.selection()
+            if not sel:
+                return
+            removed = False
+            for sid in reversed(sel):   # 倒序：external 删除时索引不漂移
+                idx = int(sid)
+                it = self._font_dlg_items[idx]
+                if it.get("source") == "embedded":
+                    # 源内嵌只禁不删（下次开窗仍在）：切换启用态，再点一次即恢复。
+                    # 直接 set 该格而 refresh() 整表重建，保留选中行，便于连点切换。
+                    it["enabled"] = not it.get("enabled", True)
+                    tree.set(sid, "on", _("启") if it["enabled"] else _("禁"))
+                else:
+                    # 外部字体：真移除（删了就没了，无禁用态概念）
+                    self._font_dlg_items.pop(idx)
+                    removed = True
+            if removed:
+                refresh()
+
+        def apply():
+            self.merge_attach_items = [dict(i) for i in self._font_dlg_items]
+            self._append_info_ui(_("[字体] 已保存字体附加设置（输出将为 MKV）"))
+            self.merge_update_command_preview()   # 字体改动要重建命令（-attach / 后缀 gate）
+            win.destroy()
+
+        btn = ttk.Frame(main)
+        btn.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(btn, text=_("添加字体…"), command=add_fonts).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn, text=_("切换启用 / 移除"), command=del_font).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn, text=_("确定"), command=apply).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(btn, text=_("取消"), command=win.destroy).pack(side=tk.RIGHT, padx=2)
+        tree.bind("<Double-1>", lambda e: self._font_tree_toggle(tree))
+        refresh()
+        win.after(10, lambda: (win.deiconify(), center_window(win, 720, 480)))
+
+    def _font_tree_toggle(self, tree):
+        """双击「启用」列/表头：切换选中项的启用态。"""
+        sel = tree.selection()
+        if not sel:
+            return
+        items = getattr(self, "_font_dlg_items", None)
+        if items is None:
+            return
+        sid = sel[0]
+        try:
+            idx = int(sid)
+        except ValueError:
+            return
+        it = items[idx]
+        it["enabled"] = not it.get("enabled")
+        tree.set(sid, "on", _("启") if it["enabled"] else _("禁"))
+
+
+
     def _merge_media_info_selected(self):
         """封装页预览按钮右键「查看媒体信息」：取选中那条轨（流）的文件。"""
         indices = self._get_selected_track_indices()
         if alert_if(not indices, _("提示"), _("请先选中一条轨道"), 'info'):
             return
-        self._show_media_info_dialog(getattr(self.merge_tracks[indices[0]], "file_path", ""))
+        _track = self.merge_tracks[indices[0]]
+        self._show_media_info_dialog(getattr(_track, "file_path", ""),
+                                     getattr(_track, "enc_settings", None))
+
+    def _merge_spectrum_selected(self):
+        """封装页右键「查看频谱」：与 _merge_media_info_selected 取**同一条**选中轨的文件。"""
+        indices = self._get_selected_track_indices()
+        if alert_if(not indices, _("提示"), _("请先选中一条轨道"), 'info'):
+            return
+        _track = self.merge_tracks[indices[0]]
+        self._show_spectrum_dialog(getattr(_track, "file_path", ""))
 
     def _quick_speed_preset_value(self, tier):
         """速度档 → 当前编码器 preset 表里第一个命中的档位值。
@@ -78740,9 +79755,14 @@ class FFmpegBatchGUI:
         menu.add_command(label=_("常用预设 · 点选即写入对应控件"), state="disabled")
         menu.add_separator()
         menu.add_command(label=_("【编码速度档】写入「编码预设」+ 质量值"), state="disabled")
+        # 2026-11-18：质量档标签按当前码控显示，与 _apply_quick_speed_tier 的写入
+        # 目标一致（此前写死 "CRF"，在 CQ/GQ 模式下看着别扭，功能本身没坏）。
+        # bitrate/compression 无质量滑块、写进 crf_value 那份，故仍显示 CRF。
+        rc = self.video_encoder.rate_control_type.get()
+        quality_name = {"cq": "CQ", "global_quality": "Global Quality"}.get(rc, "CRF")
         for i, (name, crf) in enumerate(QUICK_SPEED_TIERS):
             val = self._quick_speed_preset_value(i)
-            label = "%s  %s  ·  CRF %d" % (_(name), val if val else _("(不适用)"), crf)
+            label = "%s  %s  ·  %s %d" % (_(name), val if val else _("(不适用)"), quality_name, crf)
             if val:
                 menu.add_command(label=label,
                                  command=lambda t=i: self._apply_quick_speed_tier(t))
@@ -78826,7 +79846,10 @@ class FFmpegBatchGUI:
         menu.add_command(label=_("快照（水印合成）"), command=lambda: self.preview_current_file(with_snapshot=True))
         menu.add_command(label=_("缩略图"), command=self._contact_sheet_current_file)
         menu.add_command(label=_("查看媒体信息"),
-                         command=lambda: self._show_media_info_dialog(self.input_file.get().strip()))
+                         command=lambda: self._show_media_info_dialog(self.input_file.get().strip(),
+                                                                      self.get_current_settings()))
+        menu.add_command(label=_("查看频谱（整段音频）"),
+                         command=lambda: self._show_spectrum_dialog(self.input_file.get().strip()))
         # 时间预览引擎（2026-09-20 Phase 1）：同一张合成图改走 ffmpeg -filter_complex → rawvideo
         # 管道，由内置 SimplePreviewer 渲染 —— 保留标记/波形/步进，且无需 mpv/ffplay。
         menu.add_command(label=_("实时预览（简易时间引擎，画面小）"), command=self._time_preview_pipe_current)
@@ -79020,8 +80043,13 @@ class FFmpegBatchGUI:
         #    撤销安全：`_snap`（含 node_fx）在清空**前**已拍，↶ 撤销原样还原。
         _nfx = len(getattr(self, "node_fx", None) or {})
         _nafx = len(getattr(self, "node_audio_fx", None) or {})
+        _natt = len(getattr(self, "merge_attach_items", None) or [])
         self.node_fx.clear()
         self.node_audio_fx.clear()
+        # MKV 附加字体（2026-11-18）：字体项同样不住在轨道里，轨道清空必须一并清掉，
+        # 否则新拖入的文件会带着上一批的 -attach 字体。attach_fonts 已纳入
+        # _build/_restore_merge_state_dict ⇒ 快照区间内清空即自动获得撤销/重做。
+        self.merge_attach_items.clear()
         if isinstance(getattr(self, "_last_group_material_size", None), dict):
             self._last_group_material_size.clear()
         self.merge_update_track_list()
@@ -79033,6 +80061,8 @@ class FFmpegBatchGUI:
             self._append_info_ui(
                 _("[封装] 同时清除 %d 个节点效果（含组父行设置：轨道已空，"
                 "这些效果本就无处挂载、留着只会在新节点上复活）") % (_nfx + _nafx))
+        if _natt:
+            self._append_info_ui(_("[封装] 同时清除 %d 个附加字体设置") % _natt)
         _after_snap = self._build_merge_state_dict()
         self._push_history("merge", _("清空轨道"),
                            lambda: self._restore_merge_state_dict(copy.deepcopy(_snap)),
@@ -79588,6 +80618,59 @@ class FFmpegBatchGUI:
         cap = run_frame_capture(pipe_cmd, timeout=30, stderr_mode="devnull")
         return cap.data if cap.ok else None
 
+    def _show_spectrum_dialog(self, path, settings=None):
+        """右键「查看频谱」公共出口：整段音频 → showspectrumpic（log 刻度）→ 内存 PPM → 快照窗显示。
+
+        形态（2026-11-20 用户拍板）：静态全曲谱图 + log 对数频率刻度 + 整段音频。
+          · 横轴时间、纵轴频率(Hz, log)、颜色=幅度(dBFS)，legend=1 自带坐标与图例。
+          · 只画**音轨**：先 ffprobe 确认有音频流；虚拟源（无音轨）明确提示，不跑空 ffmpeg。
+          · 出图复用 `_ffmpeg_ppm_to_bytes`（ffmpeg_cmd_to_pipe → PPM pipe），零磁盘写；
+            复用 `_show_snapshot_async` / `_display_snapshot` 的窗口骨架（win_key='spectrum'）。
+          · settings 仅占位对齐 `_show_media_info_dialog` 的三处入口签名，频谱不依赖设置。
+
+        ⚠️ showspectrumpic 是 A→V 滤镜：必须 `[0:a:0]...[v]` + `-map [v]`，不能套 -vf（那是视频链）。
+        """
+        p = (path or "").strip()
+        if alert_if(not p, _("提示"), _("没有可查看的媒体文件"), 'info'):
+            return
+        if not self.ffmpeg_cmd:
+            return
+        if not _is_virtual_source(p) and not os.path.exists(p):
+            alert_if(True, _("提示"), _("文件不存在:\n%s") % p, 'error')
+            return
+        if _is_virtual_source(p):
+            alert_if(True, _("提示"), _("虚拟源（颜色/生成器）没有音轨，无法生成频谱"), 'info')
+            return
+        info = self._get_cached_stream_info(p)
+        _audio_streams = [s for s in (info or {}).get("streams") or []
+                          if s.get("codec_type") == "audio"]
+        if not _audio_streams:
+            alert_if(True, _("提示"), _("该文件没有音频流，无法生成频谱图"), 'info')
+            return
+        # 🔴 频谱纵轴两层问题（mcopy 移植说明 §2/§3，2026-11-21）：
+        #   ① showspectrumpic 不给 stop 时频率只到 Nyquist 的 79.6%（48k→19093Hz），
+        #      顶部是真的被切平不画 —— 必须按 ffprobe 的 sample_rate 拼 stop=Nyquist；
+        #   ② 刻度标签仍固定为 stop×0.796，FFmpeg 无参数可改 —— 只在显示层叠白字。
+        # 读不到 sample_rate 时 stop 与标注都不拼（不瞎写上限）。
+        _sr = _spectrum_sample_rate(info)
+        _nyq = str(_sr // 2) if _sr > 0 else ""
+        # out_png 只是 ffmpeg_cmd_to_pipe 的占位（会被剥掉改 pipe:1），永不落盘。
+        out_png = os.path.join(tempfile.gettempdir(), "spectrum_placeholder.png")
+        vf = ("[0:a:0]showspectrumpic=s=1200x620:legend=1:"
+              "fscale=log:scale=log:color=intensity")
+        if _nyq:
+            vf += ":stop=" + _nyq
+        vf += "[v]"
+        cmd = [self.ffmpeg_cmd, "-y", "-hide_banner", "-loglevel", "error",
+               "-i", p, "-filter_complex", vf, "-map", "[v]",
+               "-frames:v", "1", out_png]
+        def _display(d, _label=_nyq):
+            self._display_snapshot(_ppm_overlay_nyquist(d, _label) if _label else d,
+                                   "spectrum", prefix=_("频谱"))
+        self._show_snapshot_async(
+            cmd, out_png, "spectrum", _("频谱 · %s") % os.path.basename(p),
+            _("正在生成频谱（整段音频）…"), _display)
+
     def _show_snapshot_async(self, cmd, out_png, win_key, title, running_text, display_cb,
                              save_dir=None, save_name=""):
         """通用快照入口：构造命令 → 开/复用独立窗口（先显示'生成中'）→ 线程生成后回填。
@@ -79777,8 +80860,13 @@ class FFmpegBatchGUI:
             _f += 1
         return img_full.subsample(_f, _f), _("（显示已缩到 1/%d，保存仍是原尺寸）") % _f
 
-    def _display_snapshot(self, img_bytes, win_key):
-        """把生成的图像（内存 PPM bytes）显示到指定密钥的快照窗口（主线程执行）。"""
+    def _display_snapshot(self, img_bytes, win_key, prefix=None):
+        """把生成的图像（内存 PPM bytes）显示到指定密钥的快照窗口（主线程执行）。
+
+        prefix：状态栏文案前缀（None ⇒ 快照窗口默认「快照」；频谱窗口传「频谱」）。
+        """
+        if prefix is None:
+            prefix = _("快照")
         ui = getattr(self, "_snap_ui", {}).get(win_key)
         if ui is None or not ui["win"].winfo_exists():
             return
@@ -79791,13 +80879,13 @@ class FFmpegBatchGUI:
             img, _note = self._fit_display_image(img_bytes, img_full, _max_w, _max_h)
             ui["img"] = img  # 保活，防止被 GC（引用挂在窗口 ui 上）
             ui["label"].config(image=img, text="")
-            ui["status"].config(text=_("快照已生成") + _note)
+            ui["status"].config(text=_("{0}已生成").format(prefix) + _note)
             # 定位显示：按内容真实需求尺寸居中 + 底边留出任务栏（见 _place_image_window）；
             # ⚠️ 不再手写 img+12 / img+36 —— 那只算了图片和标题栏，会把窗口撑到底部
             # 状态栏掉进任务栏（用户实测「下面文字显示不全 / 看不到」）。
             self._place_image_window(ui["win"])
         except Exception as e:
-            ui["status"].config(text=_('快照显示失败: {0}').format(e))
+            ui["status"].config(text=_('{0}显示失败: {1}').format(prefix, e))
 
     # ---------- 画中画合成快照（方案1：静态单帧真实合成，独立窗口） ----------
     def _build_pip_snapshot_cmd(self, track, sub_videos, tap_label=None, out_png=None,
@@ -86307,6 +87395,7 @@ class FFmpegBatchGUI:
         menu.add_command(label=_("预览选中任务"), command=self.preview_selected_task)
         menu.add_command(label=_("预览选中任务(快照)"), command=lambda: self.preview_selected_task(with_snapshot=True))
         menu.add_command(label=_("查看媒体信息"), command=lambda: self._show_task_media_info(item))
+        menu.add_command(label=_("查看频谱（整段音频）"), command=lambda: self._show_task_spectrum(item))
         menu.add_command(label=_("创建缩略图"), command=self._contact_sheet_selected_task)
         menu.add_separator()
         menu.add_command(label=_("恢复列宽"), command=self.reset_task_tree_columns)
